@@ -807,11 +807,16 @@ describe("terminal robustness", () => {
     });
   });
 
-  it("a start for a run already seen stays metadata-only", () => {
+  it("a late duplicate start and an earlier run's replayed rows change nothing", () => {
     const run1 = { taskId: "replayed", taskType: "local_agent", toolUseId: "agent-call" };
     const run2 = { ...run1, toolUseId: "send-message-call" };
     const firstRun = [
       activity("task.started", run1),
+      activity("task.completed", { ...run1, status: "completed", summary: "run 1 done" }),
+    ];
+    const replayedFirstRun = [
+      activity("task.started", run1),
+      activity("task.updated", { ...run1, status: "failed", error: "stale" }),
       activity("task.completed", { ...run1, status: "completed", summary: "run 1 done" }),
     ];
     // A late duplicate of the current run's start.
@@ -820,15 +825,19 @@ describe("terminal robustness", () => {
       activationCount: 1,
       result: "run 1 done",
     });
-    // A replay of an earlier run's start after a newer run.
+    // An earlier run's rows replayed while a newer run is live...
+    expect(
+      fold([...firstRun, activity("task.started", run2), ...replayedFirstRun])[0],
+    ).toMatchObject({ status: "running", activationCount: 2, error: null, result: null });
+    // ...and after it settled.
     expect(
       fold([
         ...firstRun,
         activity("task.started", run2),
         activity("task.completed", { ...run2, status: "completed", summary: "run 2 done" }),
-        activity("task.started", run1),
+        ...replayedFirstRun,
       ])[0],
-    ).toMatchObject({ status: "completed", activationCount: 2, result: "run 2 done" });
+    ).toMatchObject({ status: "completed", activationCount: 2, error: null, result: "run 2 done" });
   });
 
   it("whichever row of a resumed run folds first reopens it", () => {

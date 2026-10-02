@@ -15,7 +15,8 @@
  * nonterminal state, provider-specific usage merges, first-write terminal
  * timestamps, reactivation clearing terminal detail, and order-robust
  * folding (completion can create an agent; a late start only fills
- * metadata; a row carrying a new run's toolUseId reopens a settled agent).
+ * metadata; a row carrying a new run's toolUseId reopens a settled agent and
+ * an earlier run's rows are ignored).
  */
 import type { OrchestrationThreadActivity } from "@t3tools/contracts";
 
@@ -395,6 +396,12 @@ function fillMetadata(agent: MutableAgent, payload: Record<string, unknown>): vo
   }
 }
 
+/** The toolUseIds a task's rows have carried, and its current run's. */
+interface TaskRun {
+  readonly seen: Set<string>;
+  current: string;
+}
+
 /**
  * Claude stamps every task row with the toolUseId of the call that started
  * its run: the Agent call, or the SendMessage call that resumed it (a resume
@@ -403,20 +410,30 @@ function fillMetadata(agent: MutableAgent, payload: Record<string, unknown>): vo
  * task carried belongs to a new run and reopens the agent. That row is not
  * always the start: rows with equal timestamps order by activity id. Rows
  * without a toolUseId (Codex children, workflow members) never reopen.
+ *
+ * Returns false for a row of an earlier run (a toolUseId seen before but no
+ * longer current), which the fold ignores: a replayed row must not settle or
+ * relabel the newer run.
  */
-function reopenForNewRun(
+function trackRun(
   agent: MutableAgent,
-  runToolUseIds: Map<string, Set<string>>,
+  runs: Map<string, TaskRun>,
   payload: Record<string, unknown>,
   at: string,
-): void {
+): boolean {
   const toolUseId = asString(payload.toolUseId);
-  if (!toolUseId) return;
-  const seen = runToolUseIds.get(agent.id);
-  if (seen?.has(toolUseId)) return;
-  if (seen) seen.add(toolUseId);
-  else runToolUseIds.set(agent.id, new Set([toolUseId]));
+  if (!toolUseId) return true;
+  const run = runs.get(agent.id);
+  if (run?.current === toolUseId) return true;
+  if (run?.seen.has(toolUseId)) return false;
+  if (run) {
+    run.seen.add(toolUseId);
+    run.current = toolUseId;
+  } else {
+    runs.set(agent.id, { seen: new Set([toolUseId]), current: toolUseId });
+  }
   if (isTerminalSubagentStatus(agent.status)) applyStatus(agent, "running", at);
+  return true;
 }
 
 function applyStatus(agent: MutableAgent, status: RuntimeSubagentStatus, at: string): void {
@@ -489,7 +506,7 @@ export function foldSubagentActivities(
   options?: { readonly sessionLive?: boolean },
 ): ReadonlyArray<RuntimeSubagent> {
   const agents = new Map<string, MutableAgent>();
-  const runToolUseIds = new Map<string, Set<string>>();
+  const runs = new Map<string, TaskRun>();
 
   for (const activity of activities) {
     if (typeof activity.payload !== "object" || activity.payload === null) {
@@ -507,13 +524,13 @@ export function foldSubagentActivities(
         // not the Agents surface (a "Run 12s stall" shell is not a subagent).
         if (isBackgroundTaskActivity(payload)) break;
         const agent = getOrCreate(agents, taskId, payload, at);
+        if (!trackRun(agent, runs, payload, at)) break;
         fillMetadata(agent, payload);
-        reopenForNewRun(agent, runToolUseIds, payload, at);
         // Order-robustness: a start row arriving after a terminal state is a
         // late/out-of-order delivery and only fills metadata — it must not
         // reopen the run. Reactivation comes exclusively from explicit
         // status transitions (task.updated / progress status) and from a new
-        // run's toolUseId (reopenForNewRun). Guard on the status itself, not
+        // run's toolUseId (trackRun). Guard on the status itself, not
         // activationCount: a task first seen via a terminal task.updated has
         // zero activations but is still settled (review finding: a late
         // start reopened a failed child).
@@ -538,8 +555,8 @@ export function foldSubagentActivities(
         const existed = agents.has(taskId);
         if (!existed && isBackgroundTaskActivity(payload)) break;
         const agent = getOrCreate(agents, taskId, payload, at);
+        if (!trackRun(agent, runs, payload, at)) break;
         fillMetadata(agent, payload);
-        reopenForNewRun(agent, runToolUseIds, payload, at);
         if (agent.activationCount === 0) agent.activationCount = 1;
         const explicitStatus = asRuntimeStatus(payload.status);
         if (explicitStatus) {
@@ -577,8 +594,8 @@ export function foldSubagentActivities(
         // first row's classification instead of being re-judged.
         if (!agents.has(taskId) && isBackgroundTaskActivity(payload)) break;
         const agent = getOrCreate(agents, taskId, payload, at);
+        if (!trackRun(agent, runs, payload, at)) break;
         fillMetadata(agent, payload);
-        reopenForNewRun(agent, runToolUseIds, payload, at);
         const detail = asString(payload.detail);
         if (detail) agent.progress = bounded(detail);
         // A task first seen via task.updated (start row aged out) has run at
@@ -608,8 +625,8 @@ export function foldSubagentActivities(
         // first row's classification instead of being re-judged.
         if (!agents.has(taskId) && isBackgroundTaskActivity(payload)) break;
         const agent = getOrCreate(agents, taskId, payload, at);
+        if (!trackRun(agent, runs, payload, at)) break;
         fillMetadata(agent, payload);
-        reopenForNewRun(agent, runToolUseIds, payload, at);
         if (agent.activationCount === 0) agent.activationCount = 1;
         // Already-terminal: status and timestamps are frozen (first write
         // wins, duplicates must not slide them) but the completion still

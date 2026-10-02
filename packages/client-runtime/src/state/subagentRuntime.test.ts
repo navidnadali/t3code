@@ -807,6 +807,52 @@ describe("terminal robustness", () => {
     });
   });
 
+  it("a subagent resumed after its Claude process restarted settles as the resumed run", () => {
+    // A restart (e.g. a model switch) stops the old process's live tasks, and
+    // the resumed CLI reports each orphan again without a toolUseId. The
+    // parent then continues the subagent with SendMessage.
+    const run1 = { taskId: "restarted", taskType: "local_agent", toolUseId: "agent-call" };
+    const run2 = { ...run1, toolUseId: "send-message-call" };
+    const restarted = [
+      activity("task.started", run1, "2026-08-01T10:00:00.000Z"),
+      activity("task.completed", { ...run1, status: "stopped" }, "2026-08-01T10:01:00.000Z"),
+      activity(
+        "task.completed",
+        {
+          taskId: run1.taskId,
+          status: "stopped",
+          summary: "Background agent didn't finish before the previous session ended",
+        },
+        "2026-08-01T10:01:02.000Z",
+      ),
+      activity("task.started", run2, "2026-08-01T10:01:40.000Z"),
+    ];
+    expect(fold(restarted)[0]).toMatchObject({
+      status: "running",
+      activationCount: 2,
+      result: null,
+      startedAt: "2026-08-01T10:01:40.000Z",
+      completedAt: null,
+    });
+    expect(
+      fold([
+        ...restarted,
+        activity(
+          "task.completed",
+          { ...run2, status: "completed", summary: "done" },
+          "2026-08-01T10:03:24.000Z",
+        ),
+        activity("task.updated", { ...run2, status: "completed" }, "2026-08-01T10:03:24.000Z"),
+      ])[0],
+    ).toMatchObject({
+      status: "completed",
+      activationCount: 2,
+      result: "done",
+      startedAt: "2026-08-01T10:01:40.000Z",
+      completedAt: "2026-08-01T10:03:24.000Z",
+    });
+  });
+
   it("a late duplicate start and an earlier run's replayed rows change nothing", () => {
     const run1 = { taskId: "replayed", taskType: "local_agent", toolUseId: "agent-call" };
     const run2 = { ...run1, toolUseId: "send-message-call" };

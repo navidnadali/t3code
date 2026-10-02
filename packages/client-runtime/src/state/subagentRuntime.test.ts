@@ -831,21 +831,34 @@ describe("terminal robustness", () => {
     ).toMatchObject({ status: "completed", activationCount: 2, result: "run 2 done" });
   });
 
-  it("a metadata row of a resumed run sorting ahead of its start still lets it reopen", () => {
-    // Equal timestamps order by activity id, so a run's metadata update (a
-    // model correction) can fold before the start it follows.
+  it("whichever row of a resumed run folds first reopens it", () => {
+    // Rows with equal timestamps order by activity id, so a resumed run's
+    // other rows can fold before its start.
     const run1 = { taskId: "tied", taskType: "local_agent", toolUseId: "agent-call" };
     const run2 = { ...run1, toolUseId: "send-message-call" };
     const resumedAt = "2026-08-01T10:20:00.000Z";
+    const failed = [
+      activity("task.started", run1),
+      activity("task.updated", { ...run1, status: "failed", error: "boom" }),
+    ];
+    // A metadata update (model correction) and a progress tick first.
     expect(
       fold([
-        activity("task.started", run1),
-        activity("task.updated", { ...run1, status: "failed", error: "boom" }),
+        ...failed,
         activity("task.updated", { ...run2, model: "claude-opus-5-5" }, resumedAt),
         activity("task.progress", { ...run2, lastToolName: "Read" }, resumedAt),
         activity("task.started", run2, resumedAt),
       ])[0],
     ).toMatchObject({ status: "running", activationCount: 2, error: null, startedAt: resumedAt });
+    // The run's terminal rows first: it settles as the new run.
+    expect(
+      fold([
+        ...failed,
+        activity("task.updated", { ...run2, status: "completed" }, resumedAt),
+        activity("task.completed", { ...run2, status: "completed", summary: "done" }, resumedAt),
+        activity("task.started", run2, resumedAt),
+      ])[0],
+    ).toMatchObject({ status: "completed", activationCount: 2, error: null, result: "done" });
   });
 
   it("a run whose start aged out is still known from its terminal rows", () => {

@@ -763,6 +763,103 @@ describe("terminal robustness", () => {
     expect(agents[0]!.completedAt).toBe("2026-08-01T09:59:59.000Z");
   });
 
+  it("a start under a new toolUseId reopens a settled run until that run settles", () => {
+    // Claude resumes a settled subagent (SendMessage) with another task.started
+    // for the same taskId under the resuming call's toolUseId, and no running
+    // status. Every task row repeats the toolUseId of the run it belongs to.
+    const run1 = { taskId: "resumed", taskType: "local_agent", toolUseId: "agent-call" };
+    const run2 = { ...run1, toolUseId: "send-message-call" };
+    const failedThenResumed = [
+      activity("task.started", run1, "2026-08-01T10:00:00.000Z"),
+      activity(
+        "task.updated",
+        { ...run1, status: "failed", error: "Agent terminated early due to an API error" },
+        "2026-08-01T10:10:00.000Z",
+      ),
+      activity("task.completed", { ...run1, status: "failed" }, "2026-08-01T10:10:00.000Z"),
+      activity("task.started", run2, "2026-08-01T10:20:00.000Z"),
+    ];
+    expect(fold(failedThenResumed)[0]).toMatchObject({
+      status: "running",
+      activationCount: 2,
+      error: null,
+      startedAt: "2026-08-01T10:20:00.000Z",
+      completedAt: null,
+    });
+
+    const settled = fold([
+      ...failedThenResumed,
+      activity("task.progress", { ...run2, lastToolName: "Bash" }, "2026-08-01T10:25:00.000Z"),
+      activity("task.updated", { ...run2, status: "completed" }, "2026-08-01T10:30:00.000Z"),
+      activity(
+        "task.completed",
+        { ...run2, status: "completed", summary: "run 2 done" },
+        "2026-08-01T10:30:00.000Z",
+      ),
+    ])[0];
+    expect(settled).toMatchObject({
+      status: "completed",
+      activationCount: 2,
+      result: "run 2 done",
+      error: null,
+      startedAt: "2026-08-01T10:20:00.000Z",
+      completedAt: "2026-08-01T10:30:00.000Z",
+    });
+  });
+
+  it("a start for a run already seen stays metadata-only", () => {
+    const run1 = { taskId: "replayed", taskType: "local_agent", toolUseId: "agent-call" };
+    const run2 = { ...run1, toolUseId: "send-message-call" };
+    const firstRun = [
+      activity("task.started", run1),
+      activity("task.completed", { ...run1, status: "completed", summary: "run 1 done" }),
+    ];
+    // A late duplicate of the current run's start.
+    expect(fold([...firstRun, activity("task.started", run1)])[0]).toMatchObject({
+      status: "completed",
+      activationCount: 1,
+      result: "run 1 done",
+    });
+    // A replay of an earlier run's start after a newer run.
+    expect(
+      fold([
+        ...firstRun,
+        activity("task.started", run2),
+        activity("task.completed", { ...run2, status: "completed", summary: "run 2 done" }),
+        activity("task.started", run1),
+      ])[0],
+    ).toMatchObject({ status: "completed", activationCount: 2, result: "run 2 done" });
+  });
+
+  it("a metadata row of a resumed run sorting ahead of its start still lets it reopen", () => {
+    // Equal timestamps order by activity id, so a run's metadata update (a
+    // model correction) can fold before the start it follows.
+    const run1 = { taskId: "tied", taskType: "local_agent", toolUseId: "agent-call" };
+    const run2 = { ...run1, toolUseId: "send-message-call" };
+    const resumedAt = "2026-08-01T10:20:00.000Z";
+    expect(
+      fold([
+        activity("task.started", run1),
+        activity("task.updated", { ...run1, status: "failed", error: "boom" }),
+        activity("task.updated", { ...run2, model: "claude-opus-5-5" }, resumedAt),
+        activity("task.progress", { ...run2, lastToolName: "Read" }, resumedAt),
+        activity("task.started", run2, resumedAt),
+      ])[0],
+    ).toMatchObject({ status: "running", activationCount: 2, error: null, startedAt: resumedAt });
+  });
+
+  it("a run whose start aged out is still known from its terminal rows", () => {
+    const run1 = { taskId: "aged-out", taskType: "local_agent", toolUseId: "agent-call" };
+    const failed = activity("task.updated", { ...run1, status: "failed", error: "boom" });
+    expect(fold([failed, activity("task.started", run1)])[0]).toMatchObject({
+      status: "failed",
+      error: "boom",
+    });
+    expect(
+      fold([failed, activity("task.started", { ...run1, toolUseId: "send-message-call" })])[0],
+    ).toMatchObject({ status: "running", activationCount: 2, error: null });
+  });
+
   it("workflow retries count each attempt once", () => {
     const agents = fold([
       activity("task.progress", {

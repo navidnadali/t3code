@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  providerOutputSince,
+  providerOutputDuring,
   Session,
   ShellWatcher,
   type RunContext,
@@ -93,44 +93,76 @@ describe("Session", () => {
   });
 });
 
-describe("providerOutputSince", () => {
+describe("providerOutputDuring", () => {
   const windowStart = Date.parse("2026-10-31T12:00:00.000Z");
+  const windowEnd = Date.parse("2026-10-31T12:05:00.000Z");
+  const during = (items: Parameters<typeof providerOutputDuring>[0]) =>
+    providerOutputDuring(items, windowStart, windowEnd);
 
-  it("sees an item that started before the window and streamed into it", () => {
+  it("sees an item that started before the window and was still streaming after it", () => {
     expect(
-      providerOutputSince(
-        [{ type: "assistant_message", updatedAt: "2026-10-31T12:03:10.000Z" }],
-        windowStart,
-      ),
+      during([
+        {
+          type: "assistant_message",
+          status: "running",
+          startedAt: "2026-10-31T11:59:00.000Z",
+          completedAt: null,
+          updatedAt: "2026-10-31T12:05:02.000Z",
+        },
+      ]),
     ).toBe(true);
   });
 
-  it("sees output that landed together with the run's completion", () => {
+  it("sees output that completed together with the run inside the window", () => {
     expect(
-      providerOutputSince(
-        [
-          { type: "user_message", updatedAt: "2026-10-31T11:59:58.000Z" },
-          { type: "command_execution", updatedAt: "2026-10-31T12:00:00.000Z" },
-          { type: "checkpoint", updatedAt: "2026-10-31T12:00:00.100Z" },
-        ],
-        windowStart,
-      ),
+      during([
+        {
+          type: "command_execution",
+          status: "completed",
+          startedAt: "2026-10-31T12:04:59.000Z",
+          completedAt: "2026-10-31T12:04:59.500Z",
+          updatedAt: "2026-10-31T12:04:59.500Z",
+        },
+      ]),
     ).toBe(true);
+  });
+
+  it("does not count output that first arrived after the window closed", () => {
+    expect(
+      during([
+        {
+          type: "assistant_message",
+          status: "running",
+          startedAt: "2026-10-31T12:05:01.000Z",
+          completedAt: null,
+          updatedAt: "2026-10-31T12:05:01.500Z",
+        },
+      ]),
+    ).toBe(false);
   });
 
   it("ignores the user's messages, checkpoints, run bookkeeping and older output", () => {
+    const inWindow = {
+      status: "completed",
+      startedAt: "2026-10-31T12:01:00.000Z",
+      completedAt: "2026-10-31T12:01:00.000Z",
+      updatedAt: "2026-10-31T12:01:00.000Z",
+    };
     expect(
-      providerOutputSince(
-        [
-          { type: "assistant_message", updatedAt: "2026-10-31T11:59:59.999Z" },
-          { type: "user_message", updatedAt: "2026-10-31T12:01:00.000Z" },
-          { type: "checkpoint", updatedAt: "2026-10-31T12:01:05.000Z" },
-          { type: "run_interrupt_request", updatedAt: "2026-10-31T12:02:00.000Z" },
-          { type: "run_interrupt_result", updatedAt: "2026-10-31T12:02:01.000Z" },
-          { type: "reasoning" },
-        ],
-        windowStart,
-      ),
+      during([
+        {
+          type: "assistant_message",
+          status: "completed",
+          startedAt: "2026-10-31T11:58:00.000Z",
+          completedAt: "2026-10-31T11:59:59.999Z",
+          updatedAt: "2026-10-31T11:59:59.999Z",
+        },
+        { type: "user_message", ...inWindow },
+        { type: "checkpoint", ...inWindow },
+        { type: "run_interrupt_request", ...inWindow },
+        { type: "run_interrupt_result", ...inWindow },
+        { type: "reasoning" },
+      ]),
     ).toBe(false);
   });
 });

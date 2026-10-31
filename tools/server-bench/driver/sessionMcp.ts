@@ -51,3 +51,76 @@ export function readCredentials(
   }
   return credentials;
 }
+
+export interface CredentialCaller {
+  readonly start: () => void;
+  readonly stop: (closeSession: boolean) => Promise<void>;
+}
+
+/**
+ * One caller per provider session, signed in with that session's credential. Sign-ins run in the
+ * background: a newer credential for the same session supersedes any older one still signing in,
+ * and the caller limit counts sign-ins in progress, so a rotation never leaves two callers running.
+ */
+export class CredentialCallers<C extends CredentialCaller> {
+  private readonly entries = new Map<
+    string,
+    { generation: number; authorization: string; caller: C | null }
+  >();
+  private readonly failed = new Set<string>();
+  private closed = false;
+  private readonly limit: number;
+  private readonly connect: (name: string, credential: McpCredential) => Promise<C>;
+
+  constructor(limit: number, connect: (name: string, credential: McpCredential) => Promise<C>) {
+    this.limit = limit;
+    this.connect = connect;
+  }
+
+  update(credentials: ReadonlyMap<string, McpCredential>): void {
+    for (const [name, credential] of credentials) {
+      if (this.closed) return;
+      const entry = this.entries.get(name);
+      const attempt = `${name}\0${credential.authorization}`;
+      if (entry?.authorization === credential.authorization || this.failed.has(attempt)) continue;
+      if (entry === undefined && this.entries.size >= this.limit) continue;
+      const generation = (entry?.generation ?? 0) + 1;
+      this.entries.set(name, {
+        generation,
+        authorization: credential.authorization,
+        caller: entry?.caller ?? null,
+      });
+      this.connect(name, credential).then(
+        (caller) => {
+          const current = this.entries.get(name);
+          if (this.closed || current?.generation !== generation) {
+            void caller.stop(true);
+            return;
+          }
+          void current.caller?.stop(false);
+          current.caller = caller;
+          caller.start();
+        },
+        () => {
+          this.failed.add(attempt);
+          const current = this.entries.get(name);
+          if (current?.generation === generation && current.caller === null) {
+            this.entries.delete(name);
+          }
+        },
+      );
+    }
+  }
+
+  /** Callers running now, one per provider session. */
+  callers(): Array<C> {
+    return [...this.entries.values()].flatMap((entry) =>
+      entry.caller === null ? [] : [entry.caller],
+    );
+  }
+
+  async close(closeSessions: boolean): Promise<void> {
+    this.closed = true;
+    await Promise.all(this.callers().map((caller) => caller.stop(closeSessions)));
+  }
+}

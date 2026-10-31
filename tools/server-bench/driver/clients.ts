@@ -49,18 +49,40 @@ const PROVIDER_ITEM_TYPES = new Set([
   "subagent",
 ]);
 
+const ITEM_ACTIVE_STATUSES = new Set(["pending", "running", "waiting"]);
+
+export interface TurnItemTimes {
+  readonly type?: string;
+  readonly status?: string;
+  readonly startedAt?: string | null;
+  readonly completedAt?: string | null;
+  readonly updatedAt?: string;
+}
+
 /**
- * Whether a provider item changed at or after `sinceEpochMs`. Streamed text updates its item, so
- * an item still streaming counts as well as one completed in the window.
+ * Whether a provider item was being written during the window: it started before the window
+ * ended and was still open, or completed, after it began. An item still streaming counts; one
+ * that only started after the window closed does not.
  */
-export function providerOutputSince(
-  turnItems: ReadonlyArray<{ readonly type?: string; readonly updatedAt?: string }>,
-  sinceEpochMs: number,
+export function providerOutputDuring(
+  turnItems: ReadonlyArray<TurnItemTimes>,
+  windowStartEpochMs: number,
+  windowEndEpochMs: number,
 ): boolean {
-  return turnItems.some(
-    (item) =>
-      PROVIDER_ITEM_TYPES.has(item.type ?? "") && Date.parse(item.updatedAt ?? "") >= sinceEpochMs,
-  );
+  const at = (value: string | null | undefined, fallback: number) => {
+    const parsed = Date.parse(value ?? "");
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  return turnItems.some((item) => {
+    if (!PROVIDER_ITEM_TYPES.has(item.type ?? "")) return false;
+    const updated = at(item.updatedAt, Number.NaN);
+    const began = at(item.startedAt, updated);
+    const ended = at(
+      item.completedAt,
+      ITEM_ACTIVE_STATUSES.has(item.status ?? "") ? Number.POSITIVE_INFINITY : updated,
+    );
+    return began <= windowEndEpochMs && ended >= windowStartEpochMs;
+  });
 }
 
 export interface ShellSnapshot {
@@ -352,16 +374,18 @@ export class Session {
   }
 
   /** Reads the thread back after the window: did the provider write into it during the window? */
-  async checkOutputSince(sinceEpochMs: number): Promise<void> {
+  async checkOutputDuring(windowStartEpochMs: number, windowEndEpochMs: number): Promise<void> {
     const snapshot = await httpJson<{
-      readonly projection: {
-        readonly turnItems: ReadonlyArray<{ type?: string; updatedAt?: string }>;
-      };
+      readonly projection: { readonly turnItems: ReadonlyArray<TurnItemTimes> };
     }>(
       this.context.http,
       `/api/orchestration/threads/${encodeURIComponent(this.threadId)}/bounded`,
     );
-    this.outputInWindow = providerOutputSince(snapshot.value.projection.turnItems, sinceEpochMs);
+    this.outputInWindow = providerOutputDuring(
+      snapshot.value.projection.turnItems,
+      windowStartEpochMs,
+      windowEndEpochMs,
+    );
   }
 
   get producedOutput(): boolean {

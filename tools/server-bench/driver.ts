@@ -32,7 +32,7 @@ import {
   shuffled,
   summarizeDistribution,
 } from "./driver/sampling.ts";
-import { readCredentials } from "./driver/sessionMcp.ts";
+import { CredentialCallers, readCredentials } from "./driver/sessionMcp.ts";
 import { Recorder } from "./driver/stats.ts";
 import { judgeWindow, type WindowEvidence } from "./driver/verdict.ts";
 import {
@@ -237,11 +237,11 @@ class BenchRun implements RunContext {
   private readonly sessions: Array<Session> = [];
   /** Setup work that may still be in flight when the run ends early. */
   private readonly pendingWork = new Set<Promise<void>>();
-  /** Each session's agent calling its MCP tools, by credential file or session. */
-  private readonly sessionCallers = new Map<
-    string,
-    { readonly authorization: string; readonly caller: Poller }
-  >();
+  /** Sessions' agents calling their MCP tools, each signed in as its own MCP client. */
+  private readonly clientCallers: Array<Poller> = [];
+  /** Sessions' agents calling their MCP tools with the credentials their providers publish. */
+  private credentialCallers: CredentialCallers<Poller> | null = null;
+  private sessionCallersCreated = 0;
   private sessionCallersAtWindowStart = 0;
   private readonly startedAtEpochMs = Date.now();
   private readonly timeline: Record<string, string> = {};
@@ -396,17 +396,16 @@ class BenchRun implements RunContext {
     return this.options.sessionMcpCredentials === null ? "client-oauth" : "provider-credentials";
   }
 
-  private addSessionCaller(
-    key: string,
-    authorization: string,
-    mcp: McpSession,
-    pool: ReadonlyArray<string>,
-  ): Poller {
-    const index = this.sessionCallers.size;
+  private sessionCallers(): Array<Poller> {
+    return [...this.clientCallers, ...(this.credentialCallers?.callers() ?? [])];
+  }
+
+  private makeSessionCaller(mcp: McpSession, pool: ReadonlyArray<string>): Poller {
+    const index = this.sessionCallersCreated++;
     const mix = this.options.pollMix.filter(
       ([call, weight]) => call.startsWith("mcp.") && weight > 0,
     );
-    const caller = new Poller({
+    return new Poller({
       index,
       context: this,
       mcp,
@@ -416,43 +415,33 @@ class BenchRun implements RunContext {
       ratePerSecond: this.options.sessionMcpRatePerMinute / 60,
       mix: mix.length > 0 ? mix : [["mcp.t3_thread_read", 1]],
     });
-    this.sessionCallers.set(key, { authorization, caller });
-    return caller;
   }
 
-  /**
-   * Follows the credentials providers write for their sessions and gives each its own caller,
-   * signed in with that session's token; a rotated token replaces the session's caller.
-   */
+  /** Gives each provider session that publishes a credential its own caller, signed in with it. */
   private followSessionCredentials(pool: ReadonlyArray<string>): ReturnType<typeof setInterval> {
     const directory = this.options.sessionMcpCredentials as string;
-    const tried = new Set<string>();
-    const tick = () => {
-      if (this.stopping) return;
-      for (const [name, credential] of readCredentials(directory, this.startedAtEpochMs)) {
-        const attempt = `${name}\0${credential.authorization}`;
-        if (tried.has(attempt)) continue;
-        const existing = this.sessionCallers.get(name);
-        if (existing === undefined && this.sessionCallers.size >= this.options.sessions) continue;
-        tried.add(attempt);
+    const callers = new CredentialCallers<Poller>(
+      this.options.sessions,
+      async (name, credential) => {
         const mcp = new McpSession(
           credential.url,
           credential.authorization,
           this.options.callTimeoutMs,
         );
-        void mcp.initialize(`bench-session-${name}`).then(
-          () => {
-            if (this.stopping) return;
-            void existing?.caller.stop(false);
-            this.sessionCallers.delete(name);
-            this.addSessionCaller(name, credential.authorization, mcp, pool).start();
-          },
-          (error: unknown) =>
-            log(
-              `session MCP sign-in for ${name} failed: ${error instanceof Error ? error.message : String(error)}`,
-            ),
-        );
-      }
+        try {
+          await mcp.initialize(`bench-session-${name}`);
+        } catch (error) {
+          log(
+            `session MCP sign-in for ${name} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          throw error;
+        }
+        return this.makeSessionCaller(mcp, pool);
+      },
+    );
+    this.credentialCallers = callers;
+    const tick = () => {
+      if (!this.stopping) callers.update(readCredentials(directory, this.startedAtEpochMs));
     };
     tick();
     return setInterval(tick, 1000);
@@ -726,7 +715,7 @@ class BenchRun implements RunContext {
               options.callTimeoutMs,
             );
             await mcp.initialize(`bench-session-${index}`);
-            this.addSessionCaller(`session-${index}`, "", mcp, workload.readPool);
+            this.clientCallers.push(this.makeSessionCaller(mcp, workload.readPool));
           }),
         );
       }
@@ -735,7 +724,7 @@ class BenchRun implements RunContext {
       if (options.mode === "history") for (const session of sessions) session.start();
       for (const subscriber of subscribers) subscriber.startSwitching();
       for (const poller of pollers) poller.start();
-      for (const { caller } of this.sessionCallers.values()) caller.start();
+      for (const caller of this.clientCallers) caller.start();
       credentialWatch =
         sessionMcpMode === "provider-credentials"
           ? this.followSessionCredentials(workload.readPool)
@@ -749,9 +738,10 @@ class BenchRun implements RunContext {
       const windowStartEpochMs = Date.now();
       recorder.setOpen(true);
       for (const subscriber of subscribers) subscriber.windowOpened();
-      this.sessionCallersAtWindowStart = this.sessionCallers.size;
+      this.sessionCallersAtWindowStart = this.sessionCallers().length;
       await this.race(delay(options.windowMs));
       recorder.setOpen(false);
+      const windowEndEpochMs = Date.now();
       const windowSeconds = (now() - windowStart) / 1000;
       const elu = NodePerfHooks.performance.eventLoopUtilization(eluStart);
       const cpu = process.cpuUsage(cpuStart);
@@ -759,7 +749,9 @@ class BenchRun implements RunContext {
       const summary = recorder.summarize(windowSeconds);
       await this.race(this.confirmServerAlive());
       await this.race(
-        this.parallel(sessions, (session) => session.checkOutputSince(windowStartEpochMs)),
+        this.parallel(sessions, (session) =>
+          session.checkOutputDuring(windowStartEpochMs, windowEndEpochMs),
+        ),
       );
       measured = {
         windowSeconds: Math.round(windowSeconds * 1000) / 1000,
@@ -777,7 +769,7 @@ class BenchRun implements RunContext {
         },
         distribution: this.distribution(workload, watcher, subscribers, [
           ...pollers,
-          ...[...this.sessionCallers.values()].map(({ caller }) => caller),
+          ...this.sessionCallers(),
         ]),
         driverHealth: {
           eventLoopUtilization: Math.round(elu.utilization * 1000) / 1000,
@@ -810,13 +802,17 @@ class BenchRun implements RunContext {
       clearInterval(watchdog);
       clearInterval(credentialWatch);
       this.mark("teardown");
-      if (!this.serverLost) {
+      if (this.serverLost) {
+        for (const caller of [...pollers, ...this.clientCallers]) void caller.stop(false);
+        void this.credentialCallers?.close(false);
+      } else {
         // A launch still in flight would start a run after the stop below.
         await Promise.race([Promise.all(this.pendingWork), delay(options.callTimeoutMs)]);
         await Promise.race([
           Promise.all([
             ...pollers.map((poller) => poller.stop(true)),
-            ...[...this.sessionCallers.values()].map(({ caller }) => caller.stop(true)),
+            ...this.clientCallers.map((caller) => caller.stop(true)),
+            this.credentialCallers?.close(true),
             ...sessions.map((session) => session.stop(options.stopSessions)),
           ]),
           delay(15_000),

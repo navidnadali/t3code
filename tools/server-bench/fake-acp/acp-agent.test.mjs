@@ -277,6 +277,31 @@ describe("fake acp agent", () => {
     expect(lines.join("\n")).not.toContain("Bearer secret");
   });
 
+  it("keeps per-session and process figures apart in its stats", async () => {
+    const stats = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-acp-stats-"));
+    using agent = startAgent({
+      BENCH_STATS_DIR: stats,
+      BENCH_STATE_DIR: NodePath.join(stats, "s"),
+    });
+    const sessionId = await openSession(agent);
+    agent.send({ id: 3, method: "session/prompt", params: { sessionId, prompt: [] } });
+    await agent.until(answerTo(3));
+    agent.end();
+    await agent.exited;
+    const [record] = NodeFS.readdirSync(stats)
+      .filter((file) => file.endsWith(".ndjson"))
+      .map((file) => JSON.parse(NodeFS.readFileSync(NodePath.join(stats, file), "utf8")));
+
+    expect(record).toMatchObject({
+      kind: "turn",
+      sessionId,
+      sessionRequests: { "session/new": 1, "session/prompt": 1 },
+      process: { requests: { initialize: 1, "session/new": 1, "session/prompt": 1 } },
+    });
+    expect(Object.keys(record)).not.toContain("requests");
+    expect(Object.keys(record)).not.toContain("rssBytes");
+  });
+
   it("stops a prompt cancelled with it and plays the next prompt after it", async () => {
     using agent = startAgent({});
     const sessionId = await openSession(agent);

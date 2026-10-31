@@ -396,6 +396,39 @@ describe("fake codex app-server", () => {
     expect([...started, ...resumed].join("\n")).not.toMatch(/Bearer (one|two)/);
   });
 
+  it("accounts for every frame it sends, with per-thread and process figures apart", async () => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-codex-stats-"));
+    const stats = NodePath.join(dir, "stats");
+    using fake = startFake({ BENCH_STATS_DIR: stats, BENCH_STATE_DIR: NodePath.join(dir, "s") });
+    fake.send(
+      { id: 1, method: "initialize", params: {} },
+      { method: "initialized" },
+      { id: 2, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } },
+    );
+    const opened = await fake.until(answerTo(2));
+    const threadId = frameOf(opened.at(-1)).result.thread.id;
+    fake.send({ id: 3, method: "turn/start", params: { threadId, input: [] } });
+    const played = await fake.until(isTurnCompleted);
+    fake.end();
+    await fake.exited;
+    const records = statsIn(stats);
+    const sent = [...opened, ...played].filter((line) => frameOf(line)?.id !== 1);
+
+    expect(records.map((record) => record.kind)).toEqual(["process-start", "thread-start", "turn"]);
+    expect(records.reduce((sum, record) => sum + record.bytes, 0)).toBe(
+      sent.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0),
+    );
+    expect(records[1]).toMatchObject({ sessionId: threadId, frames: { response: 1 } });
+    expect(records[2]).toMatchObject({
+      sessionId: threadId,
+      sessionRequests: { "thread/start": 1, "turn/start": 1 },
+      process: { requests: { initialize: 1, "thread/start": 1, "turn/start": 1 } },
+    });
+    expect(records[2].process.rssBytes).toBeGreaterThan(0);
+    expect(Object.keys(records[2])).not.toContain("requests");
+    expect(Object.keys(records[2])).not.toContain("rssBytes");
+  });
+
   it("reads the mix and rejects knobs out of range", () => {
     const read = (env) =>
       readConfig(env, {

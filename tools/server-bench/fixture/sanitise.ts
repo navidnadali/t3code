@@ -9,7 +9,7 @@ import { CREDENTIAL_COLUMN, MAYBE_SECRET, redact, scanFileBytes, secretHits } fr
 import {
   WATCHED_THREADS,
   database,
-  disableAutoSettle,
+  neutraliseThreads,
   failed,
   isRunnable,
   migrate,
@@ -381,7 +381,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
     } finally {
       db.close();
     }
-    const autoSettleDisabled = yield* disableAutoSettle.pipe(
+    const neutralisedThreads = yield* neutraliseThreads.pipe(
       Effect.provide(withEventSink(scratch)),
     );
     const redacting = openWritable(scratch);
@@ -414,7 +414,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
       removedRows: pruned.removed,
       clearedRows: neutralised.cleared,
       autoPullDisabled: neutralised.autoPull,
-      autoSettleDisabled,
+      ...neutralisedThreads,
       redactedRows: redacted,
       check,
     };

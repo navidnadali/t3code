@@ -3,11 +3,11 @@ import * as NodeFS from "node:fs";
 
 /** Credential shapes the sanitiser redacts and the self-check must find none of. */
 export const SECRET_PATTERNS: ReadonlyArray<{ readonly name: string; readonly pattern: RegExp }> = [
-  // The whole block: header, body (literal or JSON-escaped newlines) and footer.
+  // The whole block up to its footer; without one, everything up to the end of the JSON string.
   {
     name: "private-key",
     pattern:
-      /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:[A-Za-z0-9+/=\s:,]|-(?!----)|\\+[nrt])*(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----)?/g,
+      /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]{0,65536}?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|(?:[^"\\]|\\+[^"\\])*)/g,
   },
   { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}/g },
   { name: "github-pat", pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}/g },
@@ -30,7 +30,7 @@ export const SECRET_PATTERNS: ReadonlyArray<{ readonly name: string; readonly pa
   {
     name: "assignment",
     pattern:
-      /\b(?:api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|password|passwd)\b\\?["']?\s*[:=]\s*\\?["']?(?<secret>[A-Za-z0-9_\-+/=.]{12,})/gi,
+      /\b(?:api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|password|passwd)\b\\*["']?\s*[:=]\s*\\*["']?(?<secret>[A-Za-z0-9_\-+/=.]{12,})/gi,
   },
 ];
 

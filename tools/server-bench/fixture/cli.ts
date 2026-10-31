@@ -57,7 +57,7 @@ const sanitiseCommand = Command.make(
           `Sanitised fixture: ${result.destination} (${mib(result.sizeBytes)})`,
           `  live threads ${result.liveThreads}, dropped with their families ${result.droppedThreads}`,
           `  cleared ${JSON.stringify(result.clearedRows)}`,
-          `  auto-pull disabled on ${result.autoPullDisabled} projects, auto-settle on ${result.autoSettleDisabled} threads`,
+          `  auto-pull off on ${result.autoPullDisabled} projects, auto-settle off on ${result.autoSettleDisabled} threads, pull request links and branch cleared on ${result.pullRequestInputsCleared}`,
           `  rows redacted ${JSON.stringify(result.redactedRows)}`,
           `  self-check: 0 secret hits, 0 credential columns, nothing runnable`,
         ].join("\n"),

@@ -27,17 +27,18 @@ existing file, the source itself or its `-wal`/`-shm`/`-journal`, and a report p
    `orchestration_v2_thread_launch_workflows`, `orchestration_command_receipts`, `provider_session_runtime`,
    `auth_sessions`, `auth_pairing_links`, `peer_environment_links`) plus `scheduled_task_webhook_deliveries` and
    `scheduled_task_webhook_relay_deliveries`, and every table whose foreign keys reach one of them.
-4. Set `projection_projects.auto_pull = 0` (auto-pull fetches remotes on boot), and turn automatic settlement off
-   (`thread.auto-settle-set` through the server's event sink, `updatedAt` kept) on every thread the settle sweep
-   could pick, so a boot settles nothing and runs no settle hook.
+4. Set `projection_projects.auto_pull = 0` (auto-pull fetches remotes on boot). Through the server's event sink
+   (one `thread.metadata-updated` per thread, `updatedAt` kept): turn automatic settlement off on every thread the
+   settle sweep could pick (no settle event, no settle hook), and clear pull request links and the branch, which
+   the pull request sync and branch discovery read from the host and git.
 5. Redact credential-shaped text (`fixture/secrets.ts`) in every text column: letters and digits become `*`,
-   punctuation and escapes stay (JSON keeps parsing, sizes keep their shape); private keys go as whole blocks and
-   an assignment loses only its value.
+   punctuation and escapes stay (JSON keeps parsing at any nesting depth, sizes keep their shape); private keys go
+   as whole blocks (to the footer, else to the end of the string) and an assignment loses only its value.
 6. Rebuild the message search index, `VACUUM INTO` the destination (no free pages keep deleted text), `chmod 600`.
 7. Self-check, else delete the destination and fail: no pattern hit in any text column or in the raw file bytes, no
    non-null credential-named column, and nothing a server would run on boot (recovery threads, scheduled tasks,
    outbox, launch workflows, peer links, sessions, pairing links, provider runtime, auto-pull, `limitRecovery`,
-   pull request watches, settlement candidates).
+   pull request watches, pull request links or branches, settlement candidates).
 
 Settings and `secrets/` live outside the database; copy only `statev2.sqlite`. Never boot a sanitised copy on the
 machine its data came from: thread worktree paths still point at real folders.

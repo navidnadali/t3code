@@ -6,7 +6,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { EventId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import { EventId, type OrchestrationV2DomainEvent, ThreadId } from "@t3tools/contracts";
 
 import * as EventSink from "../../../apps/server/src/orchestration-v2/EventSink.ts";
 import * as EventStore from "../../../apps/server/src/orchestration-v2/EventStore.ts";
@@ -76,33 +76,55 @@ export const WATCHED_THREADS = `
     AND json_type(link.value, '$.watch') IS NOT NULL
     AND json_type(link.value, '$.watch') <> 'null'`;
 
+/** Threads whose pull request links or branch the PR sync and branch discovery read from the host. */
+export const PULL_REQUEST_THREADS = `
+  SELECT thread_id FROM orchestration_v2_projection_threads
+  WHERE deleted_at IS NULL AND json_valid(payload_json) AND (
+    COALESCE(json_array_length(payload_json, '$.pullRequests'), 0) > 0
+    OR json_type(payload_json, '$.linkedPullRequest') NOT IN ('null')
+    OR json_type(payload_json, '$.branchPullRequest') NOT IN ('null')
+    OR json_type(payload_json, '$.branch') NOT IN ('null'))`;
+
 /**
- * Turns automatic settlement off on every thread the settle sweep could pick, as
- * `thread.auto-settle.set` does (`updatedAt` kept), so a boot settles nothing and runs no settle hook.
+ * One `thread.metadata-updated` per thread a boot would act on, through the server's sink
+ * (`updatedAt` kept): automatic settlement off on every thread the settle sweep could pick (no
+ * settle event, no settle hook), and pull request links and branch cleared (no host or git reads).
  */
-export const disableAutoSettle = Effect.gen(function* () {
+export const neutraliseThreads = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const sql = yield* SqlClient.SqlClient;
   const sink = yield* EventSink.EventSinkV2;
   const now = yield* DateTime.now;
-  const candidates = yield* projections.getSettlementCandidates();
+  const settling = new Set<string>(
+    (yield* projections.getSettlementCandidates()).map((thread) => thread.id),
+  );
+  const linked = new Set(
+    (yield* sql.unsafe<{ thread_id: string }>(PULL_REQUEST_THREADS).unprepared).map(
+      (row) => row.thread_id,
+    ),
+  );
   const events: Array<OrchestrationV2DomainEvent> = [];
-  for (const candidate of candidates) {
-    const thread = yield* projections.getThread(candidate.id).pipe(Effect.option);
+  for (const id of new Set([...settling, ...linked])) {
+    const thread = yield* projections.getThread(ThreadId.make(id)).pipe(Effect.option);
     if (Option.isNone(thread)) continue;
     events.push({
-      id: EventId.make(
-        `event:thread:${encodeURIComponent(candidate.id)}:fixture-sanitise:auto-settle-off`,
-      ),
-      threadId: candidate.id,
-      type: "thread.auto-settle-set",
+      id: EventId.make(`event:thread:${encodeURIComponent(id)}:fixture-sanitise:neutralise`),
+      threadId: thread.value.id,
+      type: "thread.metadata-updated",
       occurredAt: now,
-      payload: { ...thread.value, autoSettleDisabledAt: now },
+      payload: {
+        ...thread.value,
+        ...(settling.has(id) ? { autoSettleDisabledAt: now } : {}),
+        ...(linked.has(id)
+          ? { pullRequests: [], linkedPullRequest: null, branchPullRequest: null, branch: null }
+          : {}),
+      },
     });
   }
   for (let start = 0; start < events.length; start += 500) {
     yield* sink.write({ events: events.slice(start, start + 500) });
   }
-  return events.length;
+  return { autoSettleDisabled: settling.size, pullRequestInputsCleared: linked.size };
 });
 
 /** The server's own migrations, as `migrate-dev-db` runs them on a copy. */

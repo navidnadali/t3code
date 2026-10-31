@@ -236,7 +236,8 @@ const seedPendingWork = (path: string) => {
      WHERE thread_id = ?`,
   ).run(idle);
   // Credentials pasted into a kept thread: a message, a turn item and an event payload.
-  // A v1 import: a root with no runs, so no seeded thread's family can take it along.
+  // A v1 import: a root with no runs, so no seeded thread's family can take it along. It also
+  // links a pull request (no watch) on a branch: the sync and branch discovery read the host.
   const kept = (
     db
       .prepare(
@@ -245,6 +246,11 @@ const seedPendingWork = (path: string) => {
       )
       .get() as { id: string }
   ).id;
+  db.prepare(
+    `UPDATE orchestration_v2_projection_threads
+     SET payload_json = json_set(payload_json, '$.pullRequests', json(?), '$.branch', 'feature/bench')
+     WHERE thread_id = ?`,
+  ).run(JSON.stringify([{ ...link, number: 8, watch: undefined }]), kept);
   db.prepare(
     `UPDATE orchestration_v2_projection_messages SET payload_json = json_set(payload_json, '$.text', ?)
      WHERE message_id = (SELECT message_id FROM orchestration_v2_projection_messages WHERE thread_id = ? LIMIT 1)`,
@@ -329,16 +335,27 @@ describe("secrets", () => {
     expect(secretHits(redacted)).toEqual([]);
   });
 
-  it("keeps JSON valid around a redacted credential and removes a whole private key block", () => {
+  it("keeps JSON valid at any nesting depth and removes whole private key blocks", () => {
     const pem = SAMPLES["private-key"] as string;
-    const inner = JSON.stringify({ password: "Ab12".repeat(5), key: pem });
-    const payload = JSON.stringify({ input: inner, note: `${SAMPLES.bearer} and ${pem}` });
+    const pgp = [
+      `-----BEGIN PGP ${"PRIVATE"} KEY BLOCK-----`,
+      "Version: GnuPG v1.4.23",
+      "",
+      `lQOYBF${"Ef56".repeat(15)}`,
+      `-----END PGP ${"PRIVATE"} KEY BLOCK-----`,
+    ].join("\n");
+    const deepest = JSON.stringify({ password: "Gh78".repeat(5) });
+    const inner = JSON.stringify({ password: "Ab12".repeat(5), key: pem, body: deepest });
+    const payload = JSON.stringify({ input: inner, note: `${SAMPLES.bearer} and ${pgp}` });
     const redacted = redact(payload);
     expect(redacted.length).toBe(payload.length);
     const parsed = JSON.parse(redacted) as { input: string; note: string };
-    expect(Object.keys(JSON.parse(parsed.input) as object)).toEqual(["password", "key"]);
+    const parsedInner = JSON.parse(parsed.input) as { body: string };
+    expect(Object.keys(parsedInner)).toEqual(["password", "key", "body"]);
+    expect(Object.keys(JSON.parse(parsedInner.body) as object)).toEqual(["password"]);
     expect(secretHits(redacted)).toEqual([]);
-    expect([redacted.includes("Ab12"), redacted.includes("Cd34")]).toEqual([false, false]);
+    const leftovers = ["Ab12", "Cd34", "Ef56", "Gh78"].filter((part) => redacted.includes(part));
+    expect(leftovers).toEqual([]);
   });
 
   it("finds a credential that straddles a chunk boundary of the raw file", () => {
@@ -514,6 +531,9 @@ describe("fixture CLI", () => {
     const autoSettleOff = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads
       WHERE thread_id = '${idle}' AND json_extract(payload_json, '$.autoSettleDisabledAt') IS NOT NULL`;
     expect(count(clean, autoSettleOff)).toBe(1);
+    const unlinked = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads WHERE thread_id = '${kept}'
+      AND json_array_length(payload_json, '$.pullRequests') = 0 AND json_extract(payload_json, '$.branch') IS NULL`;
+    expect(count(clean, unlinked)).toBe(1);
   });
 });
 

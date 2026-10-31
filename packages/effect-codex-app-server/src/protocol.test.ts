@@ -191,9 +191,18 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
         const { stdio, input } = yield* makeInMemoryStdio();
         const notifications: Array<CodexProtocol.CodexAppServerIncomingNotification> = [];
         const rawLines: Array<unknown> = [];
+        let framingBytes = 0;
+        const jsonFrames: Array<number> = [];
         const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
         yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
           stdio,
+          stageTiming: {
+            now: () => 0,
+            record: (stage, _elapsedMs, bytes) => {
+              if (stage === "framing") framingBytes += bytes;
+              if (stage === "json") jsonFrames.push(bytes);
+            },
+          },
           logIncoming: true,
           logger: (event) =>
             Effect.sync(() => {
@@ -227,6 +236,11 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
           { method: "x/final", params: { text: "最後" } },
         ]);
         assert.deepEqual(rawLines, [firstLine, secondLine, finalLine]);
+        assert.deepEqual(
+          jsonFrames,
+          [firstLine, secondLine, finalLine].map((line) => encoder.encode(line).byteLength),
+        );
+        assert.equal(framingBytes, bytes.byteLength);
       }),
   );
 

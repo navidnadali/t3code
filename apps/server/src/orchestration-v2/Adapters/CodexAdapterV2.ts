@@ -118,6 +118,10 @@ import {
   shouldPersistProviderEvent,
 } from "../../provider/EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import {
+  ProviderIoStageTiming,
+  timeProviderIoLogShape,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import { codexAppServerArgs, resolveCodexLaunchArgs } from "../../provider/codexLaunchArgs.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
@@ -1503,6 +1507,7 @@ export const layerAppServerClientFactory: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
+    const stageTiming = (yield* ProviderIoStageTiming)?.forProvider(CODEX_PROVIDER);
 
     return CodexAppServerClientFactory.of({
       open: Effect.fn("CodexAdapterV2.open")(function* (input) {
@@ -1535,14 +1540,16 @@ export const layerAppServerClientFactory: Layer.Layer<
           threadId: input.threadId,
           providerSessionId: input.providerSessionId,
         });
-        const clientOptions: CodexClient.CodexAppServerClientOptions =
-          protocolLogger === undefined
+        const clientOptions: CodexClient.CodexAppServerClientOptions = {
+          ...(protocolLogger === undefined
             ? {}
             : {
                 logIncoming: true,
                 logOutgoing: true,
-                logger: protocolLogger,
-              };
+                logger: timeProviderIoLogShape(stageTiming, protocolLogger),
+              }),
+          ...(stageTiming === undefined ? {} : { stageTiming }),
+        };
         const context = yield* Layer.build(CodexClient.layerChildProcess(handle, clientOptions));
         return yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
           Effect.provide(context),

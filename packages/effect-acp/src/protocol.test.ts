@@ -156,9 +156,18 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       const warnings: Array<unknown> = [];
       let terminated = false;
       let transformCalls = 0;
+      const stages: Record<string, { count: number; bytes: number }> = {};
       const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
         stdio,
         serverRequestMethods: new Set(),
+        stageTiming: {
+          now: () => 0,
+          record: (stage, _elapsedMs, bytes) => {
+            const totals = (stages[stage] ??= { count: 0, bytes: 0 });
+            totals.count += 1;
+            totals.bytes += bytes;
+          },
+        },
         logIncoming: true,
         logger: (event) =>
           Effect.sync(() => {
@@ -188,13 +197,14 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         Effect.forkScoped,
       );
 
-      const send = (params: unknown) =>
-        Queue.offer(
-          input,
-          encoder.encode(
-            `${encodeUnknownJsonString({ jsonrpc: "2.0", method: "session/update", params })}\n`,
-          ),
+      let sentBytes = 0;
+      const send = (params: unknown) => {
+        const frame = encoder.encode(
+          `${encodeUnknownJsonString({ jsonrpc: "2.0", method: "session/update", params })}\n`,
         );
+        sentBytes += frame.byteLength;
+        return Queue.offer(input, frame);
+      };
       const malformed = {
         sessionId: "session-1",
         update: { sessionUpdate: "usage_update", cost: { amount: 1, currency: secret } },
@@ -232,6 +242,12 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         issueSummary: expect.stringContaining("update.used missing"),
       });
       assert.notInclude(encodeUnknownJsonString({ decodeFailed, warnings }), secret);
+      assert.deepEqual(stages, {
+        logShape: { count: 6, bytes: 0 },
+        framing: { count: 3, bytes: sentBytes },
+        json: { count: 3, bytes: sentBytes - 3 },
+        decode: { count: 3, bytes: 0 },
+      });
     }),
   );
 

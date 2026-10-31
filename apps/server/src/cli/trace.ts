@@ -44,6 +44,7 @@ const decodeSpanSummaryLine = Schema.decodeUnknownOption(
       thresholdMs: Schema.Finite,
       count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
       maxDurationMs: Schema.Finite,
+      startTimeUnixNano: Schema.FiniteFromString,
       endTimeUnixNano: Schema.FiniteFromString,
     }),
   ),
@@ -69,7 +70,11 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
   let firstEndMs = Infinity;
   let lastEndMs = -Infinity;
 
-  const statsInWindow = (name: string, endTimeUnixNano: number) => {
+  const statsInWindow = (
+    name: string,
+    endTimeUnixNano: number,
+    startTimeUnixNano = endTimeUnixNano,
+  ) => {
     const endMs = endTimeUnixNano / 1_000_000;
     // The report prints end times as dates, so skip ones outside the Date range.
     if (Option.isNone(DateTime.make(endMs))) {
@@ -78,7 +83,9 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
     }
     if (endMs < sinceMs) return undefined;
 
-    firstEndMs = Math.min(firstEndMs, endMs);
+    // A summary's spans ended from its start on, so its start opens the rate window.
+    const startMs = Math.min(Math.max(startTimeUnixNano / 1_000_000, sinceMs), endMs);
+    firstEndMs = Math.min(firstEndMs, Option.isSome(DateTime.make(startMs)) ? startMs : endMs);
     lastEndMs = Math.max(lastEndMs, endMs);
     const stats = byName.get(name) ?? {
       durations: [],
@@ -101,7 +108,7 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
         skippedLineCount += 1;
         return;
       }
-      const stats = statsInWindow(summary.name, summary.endTimeUnixNano);
+      const stats = statsInWindow(summary.name, summary.endTimeUnixNano, summary.startTimeUnixNano);
       if (stats === undefined) return;
       spanCount += summary.count;
       stats.summarised += summary.count;

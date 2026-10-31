@@ -50,19 +50,33 @@ it("drops spans that ended before the window and counts unreadable lines", () =>
   );
 });
 
-it("counts summarised SQL spans and reports a percentile among them as under the threshold", () => {
+function sqlSummary(count: number, startMs: number, endMs: number) {
+  return JSON.stringify({
+    type: "span-summary",
+    name: "sqlite",
+    thresholdMs: 2,
+    count,
+    totalDurationMs: count * 0.5,
+    maxDurationMs: 1.5,
+    startTimeUnixNano: String(BigInt(startMs) * 1_000_000n),
+    endTimeUnixNano: String(BigInt(endMs) * 1_000_000n),
+  });
+}
+
+it("counts summarised SQL spans over their window and a percentile among them as under it", () => {
+  const rates = [
+    [sqlSummary(600, 0, MINUTE_MS)],
+    [sqlSummary(600, 0, MINUTE_MS), sqlSummary(600, MINUTE_MS, 2 * MINUTE_MS)],
+  ].map((lines) => {
+    const summarizer = makeTraceSpanSummary();
+    lines.forEach(summarizer.addLine);
+    return summarizer.finish().spans.map((entry) => entry.perMinute);
+  });
+  assert.deepStrictEqual(rates, [[600], [600]]);
+
   const summarizer = makeTraceSpanSummary();
   [
-    JSON.stringify({
-      type: "span-summary",
-      name: "sqlite",
-      thresholdMs: 2,
-      count: 8,
-      totalDurationMs: 6,
-      maxDurationMs: 1.5,
-      startTimeUnixNano: String(BigInt(MINUTE_MS) * 1_000_000n),
-      endTimeUnixNano: String(BigInt(2 * MINUTE_MS) * 1_000_000n),
-    }),
+    sqlSummary(8, MINUTE_MS, 2 * MINUTE_MS),
     span("sqlite", 5, 2 * MINUTE_MS),
     span("sqlite", 10, 3 * MINUTE_MS),
   ].forEach(summarizer.addLine);
@@ -77,7 +91,7 @@ it("counts summarised SQL spans and reports a percentile among them as under the
       entry.p90Ms,
       entry.maxMs,
     ]),
-    [[10, 10, { underMs: 2 }, 5, 10]],
+    [[10, 5, { underMs: 2 }, 5, 10]],
   );
 });
 

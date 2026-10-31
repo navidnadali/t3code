@@ -107,7 +107,8 @@ t3 trace summary --since 30m --limit 40
 It reads `T3CODE_TRACE_FILE` if set, else `<home>/userdata/logs/server.trace.ndjson` for
 `--base-dir` or `T3CODE_HOME`, plus the `T3CODE_TRACE_MAX_FILES` rotated backups. For a dev run or
 a copied file, set `T3CODE_TRACE_FILE`. `--since 30m` keeps spans that ended in the last 30
-minutes. The rate is per minute between the first and last span end.
+minutes. The rate is per minute between the first and last span end, where a `span-summary`
+record (see [Fast SQL spans](#fast-sql-spans)) counts from its start.
 
 ### Metrics
 

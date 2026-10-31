@@ -629,8 +629,8 @@ Local trace file:
 - `T3CODE_TRACE_MIN_LEVEL`: minimum trace level, default `Info`
 - `T3CODE_TRACE_TIMING_ENABLED`: enable timing metadata, default `true`
 - `T3CODE_TRACE_SQL_MIN_DURATION_MS`: count successful SQL spans shorter than this many
-  milliseconds instead of writing them, default `0` (write all). See
-  [Fast SQL spans](#fast-sql-spans).
+  milliseconds instead of writing them, default `0` (write all), at most `1000`, the Diagnostics
+  slow-span cutoff. See [Fast SQL spans](#fast-sql-spans).
 
 OTLP export:
 

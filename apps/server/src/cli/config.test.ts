@@ -214,7 +214,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
       }),
   );
 
-  it.effect("reads a non-negative SQL span threshold and rejects a malformed one", () =>
+  it.effect("reads a SQL span threshold up to the slow-span cutoff and rejects any other", () =>
     Effect.gen(function* () {
       const baseDir = yield* FileSystem.FileSystem.pipe(
         Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-trace-sql-" })),
@@ -230,7 +230,8 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
       expect(yield* resolveThreshold({})).toBeUndefined();
       expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "0" })).toBeUndefined();
       expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "2.5" })).toBe(2.5);
-      for (const value of ["-1", "2ms", "NaN", "Infinity"]) {
+      expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "1000" })).toBe(1_000);
+      for (const value of ["-1", "2ms", "NaN", "Infinity", "1000.5"]) {
         const error = yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: value }).pipe(
           Effect.flip,
         );

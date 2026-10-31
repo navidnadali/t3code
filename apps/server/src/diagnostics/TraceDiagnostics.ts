@@ -58,7 +58,7 @@ interface TraceDiagnosticsErrorSummary {
   readonly message: string;
 }
 
-const DEFAULT_SLOW_SPAN_THRESHOLD_MS = 1_000;
+export const DEFAULT_SLOW_SPAN_THRESHOLD_MS = 1_000;
 const TOP_LIMIT = 10;
 const RECENT_LIMIT = 20;
 

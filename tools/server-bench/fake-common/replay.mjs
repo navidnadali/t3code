@@ -155,12 +155,12 @@ export function freshId(original) {
   return id;
 }
 
-const TOKEN_OPEN = "";
-const TOKEN_CLOSE = "";
-const RAW_OPEN = "";
-const RAW_CLOSE = "";
-const RAW_TOKEN = /"(\d+)"/g;
-const TOKEN_SPLIT = /(r?)(\d+)/;
+const TOKEN_OPEN = "\uE000";
+const TOKEN_CLOSE = "\uE001";
+const RAW_OPEN = "\uE002";
+const RAW_CLOSE = "\uE003";
+const RAW_TOKEN = /"\uE002(\d+)\uE003"/g;
+const TOKEN_SPLIT = /\uE000(r?)(\d+)\uE001/;
 const token = (slot) => `${TOKEN_OPEN}${slot}${TOKEN_CLOSE}`;
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 export const jsonText = (value) => JSON.stringify(String(value)).slice(1, -1);
@@ -200,7 +200,7 @@ export function compileFrames(
   frames,
   { fixed, idPattern, firstId, keySlots = () => undefined, rawSlots = () => undefined },
 ) {
-  if (JSON.stringify(frames).match(/[-]/)) {
+  if (/[\uE000-\uE003]/.test(JSON.stringify(frames))) {
     throw new Error("A recorded frame contains a character the templates reserve.");
   }
   const slots = new Map([...fixed].filter(([key]) => typeof key === "string" && key.length > 0));

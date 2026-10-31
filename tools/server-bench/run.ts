@@ -57,7 +57,7 @@ Fixture (restored for every run with a reflink copy where the filesystem support
 Load
   --driver <path|stub>     [driver.ts beside this file when it exists, else driver-stub.ts]
   --warmup 60s --window 300s, --sessions/--subscribers/--pollers N (passed through when given),
-  --driver-arg <arg>       repeated, appended verbatim.
+  --driver-arg=<arg>       repeated, appended verbatim (e.g. --driver-arg=--mode --driver-arg=fresh).
   The driver (the P1-004 contract) is started as: node <driver> --url <origin> --out <run>/driver
   --server-pid <pid> --warmup <n>s --window <n>s [--sessions N] [--subscribers N] [--pollers N]
   [driver args], with T3_BENCH_TOKEN (a bearer token from the server's bootstrap grant) in its

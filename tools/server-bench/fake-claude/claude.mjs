@@ -277,6 +277,53 @@ function markLiveFields(frame) {
   if (typeof message?.model === "string") message.model = token(MODEL);
 }
 
+const DELTA_TEXT_FIELDS = {
+  input_json_delta: "partial_json",
+  text_delta: "text",
+  thinking_delta: "thinking",
+};
+
+/**
+ * Copies `frames` with each content block's delta boundaries moved off `pattern` matches, so a
+ * recorded id split across streamed chunks is rewritten whole, as in the final message.
+ */
+function alignDeltas(frames, pattern) {
+  const open = new Map();
+  const runs = [];
+  frames.forEach((frame, index) => {
+    const event = frame.type === "stream_event" ? frame.event : undefined;
+    const key = `${frame.parent_tool_use_id ?? ""}:${event?.index}`;
+    if (event?.type === "content_block_start") {
+      const run = [];
+      open.set(key, run);
+      runs.push(run);
+    }
+    const field = DELTA_TEXT_FIELDS[event?.delta?.type];
+    if (event?.type === "content_block_delta" && typeof event.delta[field] === "string") {
+      open.get(key)?.push({ index, field });
+    }
+  });
+  const aligned = [...frames];
+  for (const run of runs) {
+    const pieces = run.map(({ index, field }) => frames[index].event.delta[field]);
+    const text = pieces.join("");
+    let offset = 0;
+    const ends = pieces.map((piece) => (offset += piece.length));
+    for (const match of text.matchAll(pattern)) {
+      const end = match.index + match[0].length;
+      for (let at = 0; at < ends.length; at++) {
+        if (ends[at] > match.index && ends[at] < end) ends[at] = end;
+      }
+    }
+    run.forEach(({ index, field }, at) => {
+      const frame = structuredClone(frames[index]);
+      frame.event.delta[field] = text.slice(at === 0 ? 0 : ends[at - 1], ends[at]);
+      aligned[index] = frame;
+    });
+  }
+  return aligned;
+}
+
 /**
  * Compiles a prompted turn and its wake turns into line templates. Recorded ids become slots:
  * the session id, the prompt the result echoes and the recorded cwd take live values, ids seen
@@ -345,13 +392,14 @@ export function compileGroup(group) {
     for (let index = 1; index < parts.length; index += 2) parts[index] = Number(parts[index]);
     return { parts, pace: paceOf(frame, turnStreamed), stat: statKey(frame) };
   };
+  const align = (turn) => (pattern === undefined ? turn : alignDeltas(turn, pattern));
   const promptStreamed = streamed(frames);
-  const compiled = frames.map((frame, index) =>
+  const compiled = align(frames).map((frame, index) =>
     compile(frame, index >= bodyStart && index < resultIndex, promptStreamed),
   );
   const compiledWakes = wakes.flatMap((turn) => {
     const turnStreamed = streamed(turn);
-    return turn.map((frame) => compile(frame, false, turnStreamed));
+    return align(turn).map((frame) => compile(frame, false, turnStreamed));
   });
   const idSlots = ids.map((id) => slots.get(id)).filter((slot) => slot >= FIRST_ID);
   return {
@@ -414,7 +462,7 @@ export function* turnLines(compiled, live, loops) {
   for (const slot of compiled.playSlots) values[slot] = freshId(compiled.originals[slot]);
   for (const frame of compiled.prefix) yield { frame, line: render(frame, values) };
   const faultIndex = Math.floor(compiled.body.length / 2);
-  for (let loop = 0; loop < loops; loop++) {
+  for (let loop = 0; loop < (compiled.body.length === 0 ? 0 : loops); loop++) {
     refreshLive();
     for (const slot of compiled.loopSlots) values[slot] = freshId(compiled.originals[slot]);
     for (let index = 0; index < compiled.body.length; index++) {
@@ -608,12 +656,13 @@ async function runStream(flags, config) {
   };
 
   const play = async (message) => {
-    groups ??= await loadGroups();
-    const pick = groups[(hashOf(live.sessionId) + played++) % groups.length];
+    // Set before the first await, so an interrupt sent with the prompt still cancels it.
     const controller = new AbortController();
     active = controller;
     live.promptUuid = typeof message.uuid === "string" ? message.uuid : undefined;
     const startedAt = Date.now();
+    groups ??= await loadGroups();
+    const pick = groups[(hashOf(live.sessionId) + played++) % groups.length];
     const frames = {};
     let bytes = 0;
     let unpaced = 0;
@@ -630,7 +679,7 @@ async function runStream(flags, config) {
       if (faultPoint && faultPending) await injectFault(line);
       await write(line);
       frames[frame.stat] = (frames[frame.stat] ?? 0) + 1;
-      bytes += line.length + 1;
+      bytes += Buffer.byteLength(line) + 1;
     }
     const aborted = controller.signal.aborted;
     if (aborted) await write(JSON.stringify(abortedResult(live, startedAt)));

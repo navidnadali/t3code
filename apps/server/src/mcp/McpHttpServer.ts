@@ -1025,15 +1025,18 @@ const withToolSpans = Effect.fn("McpHttpServer.withToolSpans")(function* <A, E, 
       const name = options.tool.name;
       return server.addTool({
         ...options,
+        // Never the current span: Toolkit.handle annotates that one with the raw arguments.
         handle: (payload) =>
-          options.handle(payload).pipe(
-            Effect.withSpan(`mcp.tool.${name}`, {
+          Effect.useSpan(
+            `mcp.tool.${name}`,
+            {
               attributes: {
                 "rpc.system": "mcp",
                 "rpc.method": "tools/call",
                 "mcp.tool.name": name,
               },
-            }),
+            },
+            () => options.handle(payload),
           ),
       });
     }),

@@ -189,12 +189,14 @@ it.effect.each([
   ({ input, open, message, ...options }) =>
     Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
+      const traced = recordSpans();
       const result = yield* server.callTool({ name: "device_screenshot", arguments: input }).pipe(
         Effect.provideService(McpInvocationContext.McpInvocationContext, {
           ...invocation,
           capabilities: new Set(["device"] as const),
         }),
         Effect.provideService(McpSchema.McpServerClient, client),
+        Effect.withTracer(traced.tracer),
       );
       expect(result.isError).toBe(true);
       expect(result.content).toEqual([{ type: "text", text: message }]);
@@ -202,6 +204,14 @@ it.effect.each([
         error: { message, operation: "screenshot" },
       });
       expect(JSON.stringify(result)).not.toContain("private hub output");
+      // The tool's span names it, never its arguments.
+      expect(
+        traced.spans
+          .filter((span) => span.name.startsWith("mcp.tool."))
+          .map((span) => Object.fromEntries(span.attributes)),
+      ).toEqual([
+        { "rpc.system": "mcp", "rpc.method": "tools/call", "mcp.tool.name": "device_screenshot" },
+      ]);
     }).pipe(
       Effect.provide(
         McpHttpServer.layerDeviceToolkit.pipe(

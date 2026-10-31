@@ -261,9 +261,12 @@ export function failureCause(log: string, threadId: string): string | null {
   const names = [threadId, encodeURIComponent(threadId)];
   for (const entry of entries.toReversed()) {
     if (!names.some((name) => entry.includes(name))) continue;
+    // A logged `error:` or `cause:` property starts a cause too, nested `[cause]:` lines or not.
     const lines = entry.split("\n").flatMap((line) => {
-      const piece = /^\s*'(.*)'\s*\+?\s*$/u.exec(line)?.[1];
-      return piece === undefined ? [] : [piece.replaceAll("\\'", "'").replace(/\\n$/u, "").trim()];
+      const match = /^\s*(?:(error|cause): )?'(.*)'\s*\+?\s*$/u.exec(line);
+      if (match === null) return [];
+      const piece = match[2]!.replaceAll("\\'", "'").replace(/\\n$/u, "").trim();
+      return [match[1] === undefined ? piece : `[cause]: ${piece}`];
     });
     const at = lines.findLastIndex((line) => line.includes("[cause]: "));
     if (at < 0) continue;

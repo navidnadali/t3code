@@ -193,7 +193,8 @@ const LEADING_ROWS: ReadonlyArray<Row> = [
 ];
 
 const TRAILING_ROWS: ReadonlyArray<Row> = [
-  { label: "Events/s (client)", path: ["driver", "events_per_s"] },
+  { label: "Thread events/s (client)", path: ["driver", "thread_events_per_s"] },
+  { label: "Shell events/s (client)", path: ["driver", "shell_events_per_s"] },
   { label: "Peak RSS MiB", path: ["mem", "rss_peak_mib"] },
   { label: "Peak heap used MiB", path: ["otlp", "heap_used_peak_mib"] },
   { label: "Spans in window", path: ["trace", "spans"] },

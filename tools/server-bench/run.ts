@@ -58,13 +58,14 @@ Load
   --driver <path|stub>     [driver.ts beside this file when it exists, else driver-stub.ts]
   --warmup 60s --window 300s, --sessions/--subscribers/--pollers N (passed through when given),
   --driver-arg <arg>       repeated, appended verbatim.
-  The driver is started as: node <driver> --url <origin> --out <run>/driver.json --warmup <n>s
-  --window <n>s [--sessions N] [--subscribers N] [--pollers N] [driver args], with
-  T3_BENCH_BOOTSTRAP_TOKEN (exchange it at POST /oauth/token for a bearer token),
-  T3_BENCH_BASE_DIR and T3_BENCH_SERVER_PID in its environment. driver.json needs
-  { ok, error?, window: { start_unix_ms, end_unix_ms }, calls: { <type>: { count, errors,
-  p50_ms, p95_ms, p99_ms, max_ms } }, events_per_s, knobs }; ok=false or no file marks the run
-  invalid. Without a window, the run uses [driver start + warmup, + window].
+  The driver (the P1-004 contract) is started as: node <driver> --url <origin> --out <run>/driver
+  --server-pid <pid> --warmup <n>s --window <n>s [--sessions N] [--subscribers N] [--pollers N]
+  [driver args], with T3_BENCH_TOKEN (a bearer token from the server's bootstrap grant) in its
+  environment. It writes <out>/driver.json: { status: "ok"|"failed", failure?: { reason },
+  timeline: { window: <ISO> }, windowSeconds, calls: { <type>: { count, errors, p50, p95, p99,
+  max } }, counters: { "events.thread": { perSecond }, ... }, knobs }; status "failed", a
+  driver.failed marker or no file marks the run invalid. Without a window in it, the run uses
+  [driver start + warmup, + window].
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -113,6 +114,7 @@ const isPlumbing = (name: string) => name === "BENCH_NODE" || /_(DIR|PATH|FILE)$
 
 const FATAL = new Set([
   "server_start_failed",
+  "server_auth_failed",
   "server_exited",
   "driver_failed",
   "driver_timeout",
@@ -157,6 +159,29 @@ const resolveCommit = (cwd: string, ref: string) =>
 async function sha256File(path: string): Promise<string> {
   const hash = NodeCrypto.createHash("sha256");
   for await (const chunk of NodeFS.createReadStream(path)) hash.update(chunk as Buffer);
+  return hash.digest("hex");
+}
+
+export function benchEnvHash(env: Readonly<Record<string, string>>): string {
+  const entries = Object.entries(env)
+    .filter(([name]) => name.startsWith("BENCH_") && !isPlumbing(name))
+    .toSorted(([a], [b]) => a.localeCompare(b));
+  return NodeCrypto.createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
+
+/** The driver file and, when present, its module directory (driver.ts + driver/). */
+async function driverHash(path: string): Promise<string> {
+  const hash = NodeCrypto.createHash("sha256");
+  hash.update(`${NodePath.basename(path)}\0${await sha256File(path)}\n`);
+  const modules = path.replace(/\.[cm]?[jt]s$/, "");
+  if (modules !== path && NodeFS.existsSync(modules) && NodeFS.statSync(modules).isDirectory()) {
+    const files = (NodeFS.readdirSync(modules, { recursive: true }) as Array<string>)
+      .filter((relative) => NodeFS.statSync(NodePath.join(modules, relative)).isFile())
+      .toSorted();
+    for (const relative of files) {
+      hash.update(`${relative}\0${await sha256File(NodePath.join(modules, relative))}\n`);
+    }
+  }
   return hash.digest("hex");
 }
 
@@ -296,6 +321,7 @@ function prepareTarget(spec: string, workDir: string, buildCmd: string): Omit<Ta
 export interface CallStats {
   readonly count: number | null;
   readonly errors: number | null;
+  readonly per_s: number | null;
   readonly p50_ms: number | null;
   readonly p95_ms: number | null;
   readonly p99_ms: number | null;
@@ -306,7 +332,8 @@ export interface DriverSummary {
   readonly ok: boolean;
   readonly error: string | null;
   readonly window: WindowBounds | null;
-  readonly events_per_s: number | null;
+  readonly thread_events_per_s: number | null;
+  readonly shell_events_per_s: number | null;
   readonly calls: Readonly<Record<string, CallStats>> | null;
   readonly knobs: Readonly<Record<string, unknown>> | null;
 }
@@ -314,41 +341,70 @@ export interface DriverSummary {
 const finiteOrNull = (value: unknown) =>
   typeof value === "number" && Number.isFinite(value) ? value : null;
 
+const recordOf = (value: unknown): Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+
 /** driver.json (contract in HELP) to the fields the result keeps; missing fields are null. */
 export function readDriverResult(raw: unknown): DriverSummary {
-  const record = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-  const window = record.window as Record<string, unknown> | undefined;
-  const start = finiteOrNull(window?.start_unix_ms);
-  const end = finiteOrNull(window?.end_unix_ms);
-  const callsRaw = record.calls;
+  const record = recordOf(raw);
+  const timeline = recordOf(record.timeline);
+  const start = typeof timeline.window === "string" ? Date.parse(timeline.window) : Number.NaN;
+  const seconds = finiteOrNull(record.windowSeconds);
+  const end =
+    seconds !== null
+      ? start + seconds * 1000
+      : typeof timeline.measured === "string"
+        ? Date.parse(timeline.measured)
+        : Number.NaN;
   const calls: Record<string, CallStats> = {};
-  if (typeof callsRaw === "object" && callsRaw !== null) {
-    for (const [type, stats] of Object.entries(callsRaw as Record<string, unknown>)) {
-      const s = (typeof stats === "object" && stats !== null ? stats : {}) as Record<
-        string,
-        unknown
-      >;
-      calls[type] = {
-        count: finiteOrNull(s.count),
-        errors: finiteOrNull(s.errors),
-        p50_ms: finiteOrNull(s.p50_ms),
-        p95_ms: finiteOrNull(s.p95_ms),
-        p99_ms: finiteOrNull(s.p99_ms),
-        max_ms: finiteOrNull(s.max_ms),
-      };
-    }
+  for (const [type, stats] of Object.entries(recordOf(record.calls))) {
+    const entry = recordOf(stats);
+    calls[type] = {
+      count: finiteOrNull(entry.count),
+      errors: finiteOrNull(entry.errors),
+      per_s: finiteOrNull(entry.perSecond),
+      p50_ms: finiteOrNull(entry.p50),
+      p95_ms: finiteOrNull(entry.p95),
+      p99_ms: finiteOrNull(entry.p99),
+      max_ms: finiteOrNull(entry.max),
+    };
   }
+  const counters = recordOf(record.counters);
+  const failure = recordOf(record.failure);
   return {
-    ok: record.ok === true,
-    error: typeof record.error === "string" ? record.error : null,
-    window: start !== null && end !== null && end > start ? { startMs: start, endMs: end } : null,
-    events_per_s: finiteOrNull(record.events_per_s),
-    calls: Object.keys(calls).length === 0 ? null : calls,
-    knobs:
-      typeof record.knobs === "object" && record.knobs !== null
-        ? (record.knobs as Record<string, unknown>)
+    ok: record.status === "ok",
+    error: typeof failure.reason === "string" ? failure.reason : null,
+    window:
+      Number.isFinite(start) && Number.isFinite(end) && end > start
+        ? { startMs: start, endMs: end }
         : null,
+    thread_events_per_s: finiteOrNull(recordOf(counters["events.thread"]).perSecond),
+    shell_events_per_s: finiteOrNull(recordOf(counters["events.shell"]).perSecond),
+    calls: Object.keys(calls).length === 0 ? null : calls,
+    knobs: Object.keys(recordOf(record.knobs)).length === 0 ? null : recordOf(record.knobs),
   };
+}
+
+/** The bearer token the driver uses, from the unbounded bootstrap grant run.ts seeded. */
+async function exchangeBootstrap(origin: string, bootstrap: string): Promise<string | undefined> {
+  try {
+    const response = await fetch(`${origin}/oauth/token`, {
+      method: "POST",
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+        subject_token: bootstrap,
+        subject_token_type: "urn:t3:params:oauth:token-type:environment-bootstrap",
+        requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const body = recordOf(await response.json());
+    return response.ok && typeof body.access_token === "string" ? body.access_token : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 const freePort = () =>
@@ -507,12 +563,15 @@ async function runOnce(target: Target, attempt: number, options: RunOptions) {
   let window: WindowBounds | null = null;
   let driver: DriverSummary | null = null;
   let collector: Collector | undefined;
+  const token = startProblem === undefined ? await exchangeBootstrap(origin, bootstrap) : undefined;
   if (startProblem !== undefined) {
     problems.push(startProblem);
+  } else if (token === undefined) {
+    problems.push("server_auth_failed");
   } else {
     collector = new Collector(server.pid!);
     collector.start();
-    const driverOut = NodePath.join(runDir, "driver.json");
+    const driverOut = NodePath.join(runDir, "driver");
     const driverLog = NodeFS.openSync(NodePath.join(runDir, "driver.log"), "w");
     const [driverCommand, ...driverArgs] = pinned(options.driverCpus, [
       process.execPath,
@@ -521,6 +580,8 @@ async function runOnce(target: Target, attempt: number, options: RunOptions) {
       origin,
       "--out",
       driverOut,
+      "--server-pid",
+      String(server.pid),
       "--warmup",
       `${options.warmupS}s`,
       "--window",
@@ -530,18 +591,13 @@ async function runOnce(target: Target, attempt: number, options: RunOptions) {
     const driverStart = Date.now();
     const child = NodeChildProcess.spawn(driverCommand!, driverArgs, {
       cwd: runDir,
-      env: {
-        ...cleanEnv(),
-        T3_BENCH_BOOTSTRAP_TOKEN: bootstrap,
-        T3_BENCH_BASE_DIR: baseDir,
-        T3_BENCH_SERVER_PID: String(server.pid),
-      },
+      env: { ...cleanEnv(), T3_BENCH_TOKEN: token },
       detached: true,
       stdio: ["ignore", driverLog, driverLog],
     });
     live.add(child);
-    const budgetMs =
-      (options.warmupS + options.windowS + Math.max(120, options.windowS / 2)) * 1000;
+    // Setup (projects, sessions, subscribers) comes before the warm-up and is not bounded by it.
+    const budgetMs = (options.warmupS + options.windowS + Math.max(600, options.windowS)) * 1000;
     const outcome = await Promise.race([
       exited(child).then(() => "driver" as const),
       exited(server).then(() => "server" as const),
@@ -559,11 +615,19 @@ async function runOnce(target: Target, attempt: number, options: RunOptions) {
     collector.stop();
     if (collector.gone && !problems.includes("server_exited")) problems.push("pid_gone");
     try {
-      driver = readDriverResult(JSON.parse(NodeFS.readFileSync(driverOut, "utf8")));
+      driver = readDriverResult(
+        JSON.parse(NodeFS.readFileSync(NodePath.join(driverOut, "driver.json"), "utf8")),
+      );
     } catch {
       driver = null;
     }
-    if (driver === null || !driver.ok) problems.push("driver_failed");
+    if (
+      driver === null ||
+      !driver.ok ||
+      NodeFS.existsSync(NodePath.join(driverOut, "driver.failed"))
+    ) {
+      problems.push("driver_failed");
+    }
     window = driver?.window ?? {
       startMs: driverStart + options.warmupS * 1000,
       endMs: driverStart + (options.warmupS + options.windowS) * 1000,
@@ -601,7 +665,14 @@ async function runOnce(target: Target, attempt: number, options: RunOptions) {
       trace: spans === null ? null : { spans: spans.spans, errors: spans.errors },
       spans: spans?.by_name ?? null,
       sql: spans?.sql ?? null,
-      driver: driver === null ? null : { events_per_s: driver.events_per_s, calls: driver.calls },
+      driver:
+        driver === null
+          ? null
+          : {
+              thread_events_per_s: driver.thread_events_per_s,
+              shell_events_per_s: driver.shell_events_per_s,
+              calls: driver.calls,
+            },
     }),
   ) as MetricTree;
   const valid = !problems.some((problem) => FATAL.has(problem));
@@ -777,7 +848,7 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
     ),
     ...(values["driver-arg"] ?? []),
   ];
-  const driverSha = await sha256File(driverPath);
+  const driverSha = await driverHash(driverPath);
   const options: RunOptions = {
     fixture,
     workDir,
@@ -864,6 +935,8 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
               ([name]) => name.startsWith("BENCH_") && !isPlumbing(name),
             ),
           ),
+          // The values above may be redacted; this compares the raw load settings.
+          bench_env_sha256: benchEnvHash(target.env),
         },
         run: {
           runs,

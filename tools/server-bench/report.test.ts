@@ -79,7 +79,8 @@ const metrics = (scale: number): MetricTree => ({
     },
   },
   driver: {
-    events_per_s: 412.5,
+    thread_events_per_s: 412.5,
+    shell_events_per_s: 96,
     calls: {
       "http.environment": { count: 600, p50_ms: 520, p95_ms: 4400 },
       "mcp.t3_project_list": { count: 120, p50_ms: 950, p95_ms: 9800 * scale },

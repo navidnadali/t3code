@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off globalConsole:off globalDate:off globalTimers:off preferSchemaOverJson:off - standalone bench sampler outside the Effect runtime; it owns its 1 Hz timer.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeHttp from "node:http";
 import * as NodePath from "node:path";
@@ -20,7 +21,8 @@ Metric definitions (the same as tools/prod-sample.sh, so bench and production co
   I/O     syscr/syscw/rchar/wchar/read_bytes deltas of /proc/<pid>/task/<tid>/io, per second.
           "process" is /proc/<pid>/io, which also folds in the I/O of exited threads and reaped
           children (git, claude); "threads_sum" is the server's own live threads only. Per-thread
-          deltas are summed over the 1 s intervals, so a thread that starts mid-window counts.
+          deltas are summed over the 1 s intervals, so a thread that starts mid-window counts in
+          full; the last partial second of a thread that exits mid-window is lost.
   Memory  peak VmRSS of the 1 s samples; VmHWM at the end.
   Gauges  t3_server_* gauges posted by the server's OTLP exporter to a local receiver
           (T3CODE_OTLP_METRICS_URL=<receiver>/v1/metrics, T3CODE_OTLP_PROTOCOL=http/json). The server
@@ -33,7 +35,9 @@ Metric definitions (the same as tools/prod-sample.sh, so bench and production co
           re-read when a rotation happens during the read; spans whose end falls in the window,
           p50/p95/max (nearest rank) by name, and for "sqlite"/"sql.transaction" by name and
           db.connection with db.lock_wait_ms. Only names, durations, exit tags and the db.*
-          attributes are kept.
+          attributes are kept. A trace that does not reach back to the window start
+          (trace_coverage) or whose newest span ends 30 s or more before the window end
+          (trace_stale) yields no span statistics (n/a).
 
 Thread labels (every Node worker thread has comm "WorkerThread", so the SQLite workers are told
 apart by I/O pattern and start order, judged from each thread's lifetime counters):
@@ -435,6 +439,8 @@ interface IoDelta {
 
 const emptyIo = (): IoDelta => ({ syscr: 0, syscw: 0, rchar: 0, wchar: 0, read_bytes: 0 });
 
+const io0: IoCounters = { rchar: 0, wchar: 0, syscr: 0, syscw: 0, read_bytes: 0, write_bytes: 0 };
+
 const addIo = (into: IoDelta, a: IoCounters, b: IoCounters) => {
   into.syscr += b.syscr - a.syscr;
   into.syscw += b.syscw - a.syscw;
@@ -518,8 +524,13 @@ export function summariseWindow(
     const b = window[index]!;
     const intervalS = (b.mono - a.mono) / 1000;
     for (const [key, after] of b.threads ?? []) {
-      const before = a.threads?.get(key);
-      if (before === undefined) continue;
+      // A thread missing from the earlier sample started after it: everything it did counts.
+      const before = a.threads?.get(key) ?? {
+        ...after,
+        userS: 0,
+        sysS: 0,
+        io: after.io === null ? null : io0,
+      };
       const total = perThread.get(key) ?? { userS: 0, sysS: 0, io: emptyIo() };
       total.userS += after.userS - before.userS;
       total.sysS += after.sysS - before.sysS;
@@ -701,14 +712,20 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 /**
  * Spans ending inside the window from the trace and its rotated files (.1 newest .. .N),
  * read newest to oldest until a file starts before the window; re-read when the live file
- * rotates during the read.
+ * rotates during the read. Like prod-sample.sh, a trace whose newest span ends more than 30 s
+ * before the window end is stale (it stopped mid-window) and yields no spans.
  */
 export async function readTraceWindow(
   tracePath: string,
   bounds: WindowBounds,
-  options: { readonly attempts?: number; readonly maxRotated?: number } = {},
+  options: {
+    readonly attempts?: number;
+    readonly maxRotated?: number;
+    readonly staleMs?: number;
+  } = {},
 ): Promise<TraceWindowRead> {
   const attempts = options.attempts ?? 3;
+  const staleMs = options.staleMs ?? 30_000;
   const maxRotated = options.maxRotated ?? 1000;
   let result: TraceWindowRead | undefined;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -759,14 +776,17 @@ export async function readTraceWindow(
       if (oldest <= bounds.startMs) covered = true;
     }
     const rotated = before === undefined || fileIdentity(tracePath) !== before;
+    const stale = !(newest >= bounds.endMs - staleMs);
     const problems =
       files.length === 0
         ? ["trace_missing"]
         : rotated
           ? ["trace_rotated_during_read"]
-          : covered
-            ? []
-            : ["trace_coverage"];
+          : !covered
+            ? ["trace_coverage"]
+            : stale
+              ? ["trace_stale"]
+              : [];
     result = {
       valid: problems.length === 0,
       problems,
@@ -779,7 +799,7 @@ export async function readTraceWindow(
       spans: problems.length === 0 ? spans : [],
     };
     // A coverage gap can be a rename chain in flight, so it is read again like a rotation.
-    if (result.valid || problems[0] === "trace_missing") break;
+    if (result.valid || problems[0] === "trace_missing" || problems[0] === "trace_stale") break;
   }
   return result!;
 }
@@ -1092,7 +1112,14 @@ export async function startOtlpReceiver(port = 0): Promise<OtlpReceiver> {
 const SECRET_NAME = /TOKEN|SECRET|KEY|PASS|AUTH|CRED|COOKIE|SESSION|PRIVATE|URL|URI|DSN|HEADER/i;
 const SAFE_VALUE = /^[A-Za-z0-9._:,+-]{0,40}$/;
 
-/** Knob values from an environment, redacted as prod-sample.sh does. */
+const fingerprint = (value: string) =>
+  `<redacted sha256:${NodeCrypto.createHash("sha256").update(value).digest("hex").slice(0, 12)}>`;
+
+/**
+ * Knob values from an environment, redacted as prod-sample.sh does, except that a value
+ * redacted only for its shape (a path, a long list) keeps a short fingerprint so two
+ * different settings never read the same; secret-named knobs stay plain "<redacted>".
+ */
 export function knobsFromEnv(
   env: Readonly<Record<string, string | undefined>>,
   prefixes: ReadonlyArray<string> = ["T3CODE_", "T3_", "BENCH_"],
@@ -1101,7 +1128,11 @@ export function knobsFromEnv(
   for (const [name, value] of Object.entries(env)) {
     if (value === undefined) continue;
     if (prefixes.some((prefix) => name.startsWith(prefix))) {
-      knobs[name] = !SECRET_NAME.test(name) && SAFE_VALUE.test(value) ? value : "<redacted>";
+      knobs[name] = SECRET_NAME.test(name)
+        ? "<redacted>"
+        : SAFE_VALUE.test(value)
+          ? value
+          : fingerprint(value);
     } else if (name === "NODE_OPTIONS") {
       const tokens = value.split(/\s+/).filter((token) => token.length > 0);
       const kept = tokens.filter((token) =>

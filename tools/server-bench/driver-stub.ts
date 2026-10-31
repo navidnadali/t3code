@@ -1,23 +1,19 @@
 // @effect-diagnostics nodeBuiltinImport:off globalConsole:off globalDate:off globalTimers:off globalFetch:off preferSchemaOverJson:off - standalone bench load stub outside the Effect runtime; it owns its pacing timers.
 import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 import * as NodePerfHooks from "node:perf_hooks";
 import * as NodeUtil from "node:util";
 
 export const HELP = `Usage:
-  node tools/server-bench/driver-stub.ts --url <origin> --out <driver.json> --warmup <s> --window <s>
+  node tools/server-bench/driver-stub.ts --url <origin> --out <dir> --warmup <s> --window <s>
                                          [--pollers 4] [--rate 20]
 
-Stand-in for the P1-004 load driver with the same contract, so run.ts works before driver.ts
-exists. It exchanges T3_BENCH_BOOTSTRAP_TOKEN at /oauth/token once (when set), then <pollers>
-loops GET /.well-known/t3/environment at <rate> requests/s in total through the warm-up and the
-window. driver.json records the window (epoch ms), the latency of the requests that started in
-it (call type "http.environment") and ok=false with an error when the server stops answering.
---sessions and --subscribers are accepted and ignored.`;
-
-interface CallTotals {
-  readonly latencies: Array<number>;
-  errors: number;
-}
+A light stand-in for the P1-004 load driver (driver.ts) with the same command line and
+driver.json shape, for smoke runs of run.ts: <pollers> loops GET /.well-known/t3/environment at
+<rate> requests/s in total through the warm-up and the window, and <out>/driver.json records the
+window and the latency of the requests that started in it (call type "http.environment").
+A server that stops answering ends the run with status "failed" and a driver.failed marker.
+--sessions, --subscribers and --server-pid are accepted and ignored; T3_BENCH_TOKEN is not used.`;
 
 const percentile = (sorted: ReadonlyArray<number>, p: number) =>
   sorted.length === 0
@@ -32,23 +28,7 @@ const seconds = (value: string, flag: string) => {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
-async function exchangeBootstrap(origin: string, token: string): Promise<"ok" | "failed"> {
-  try {
-    const response = await fetch(`${origin}/oauth/token`, {
-      method: "POST",
-      body: new URLSearchParams({
-        grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
-        subject_token: token,
-        subject_token_type: "urn:t3:params:oauth:token-type:environment-bootstrap",
-        requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
-      }),
-    });
-    const body = (await response.json()) as { access_token?: unknown };
-    return response.ok && typeof body.access_token === "string" ? "ok" : "failed";
-  } catch {
-    return "failed";
-  }
-}
+const round = (value: number) => Math.round(value * 1000) / 1000;
 
 async function main(argv: ReadonlyArray<string>) {
   const { values } = NodeUtil.parseArgs({
@@ -62,6 +42,7 @@ async function main(argv: ReadonlyArray<string>) {
       rate: { type: "string", default: "20" },
       sessions: { type: "string" },
       subscribers: { type: "string" },
+      "server-pid": { type: "string" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -69,24 +50,28 @@ async function main(argv: ReadonlyArray<string>) {
     console.log(HELP);
     return 0;
   }
-  if (values.url === undefined || values.out === undefined)
+  if (values.url === undefined || values.out === undefined) {
     throw new Error("--url and --out are required");
+  }
   const origin = values.url.replace(/\/+$/, "");
   const warmupS = seconds(values.warmup, "--warmup");
   const windowS = seconds(values.window, "--window");
   const pollers = Number(values.pollers);
   const rate = Number(values.rate);
-  if (!Number.isInteger(pollers) || pollers < 1)
+  if (!Number.isInteger(pollers) || pollers < 1) {
     throw new Error("--pollers must be a positive integer");
+  }
   if (!Number.isFinite(rate) || rate <= 0) throw new Error("--rate must be positive");
+  NodeFS.mkdirSync(values.out, { recursive: true });
+  for (const file of ["driver.json", "driver.failed"]) {
+    NodeFS.rmSync(NodePath.join(values.out, file), { force: true });
+  }
 
-  const token = process.env.T3_BENCH_BOOTSTRAP_TOKEN;
-  const auth =
-    token === undefined || token === "" ? "skipped" : await exchangeBootstrap(origin, token);
   const startedAt = Date.now();
   const windowStart = startedAt + warmupS * 1000;
   const windowEnd = windowStart + windowS * 1000;
-  const totals: CallTotals = { latencies: [], errors: 0 };
+  const latencies: Array<number> = [];
+  let errors = 0;
   let consecutiveFailures = 0;
   let failure: string | undefined;
   const periodMs = (pollers / rate) * 1000;
@@ -110,43 +95,58 @@ async function main(argv: ReadonlyArray<string>) {
       }
       const elapsed = NodePerfHooks.performance.now() - begin;
       consecutiveFailures = ok ? 0 : consecutiveFailures + 1;
-      if (consecutiveFailures >= 3 * pollers) failure = "server stopped answering";
+      if (consecutiveFailures >= 3 * pollers) failure = "the server stopped answering";
       if (sentAt < windowStart || sentAt > windowEnd) continue;
-      if (ok) totals.latencies.push(elapsed);
-      else totals.errors++;
+      if (ok) latencies.push(elapsed);
+      else errors++;
     }
   };
   await Promise.all(Array.from({ length: pollers }, (_, index) => poller(index)));
 
-  const sorted = totals.latencies.toSorted((a, b) => a - b);
-  const ok = failure === undefined && auth !== "failed";
-  const output = {
-    schema: "t3-server-bench/driver/1",
-    driver: "stub",
-    ok,
-    error: failure ?? (auth === "failed" ? "bootstrap token exchange failed" : null),
-    window: { start_unix_ms: windowStart, end_unix_ms: windowEnd },
-    knobs: {
-      warmup_s: warmupS,
-      window_s: windowS,
-      pollers,
-      rate_per_s: rate,
-      auth,
-    },
-    calls: {
-      "http.environment": {
-        count: sorted.length,
-        errors: totals.errors,
-        p50_ms: percentile(sorted, 50),
-        p95_ms: percentile(sorted, 95),
-        p99_ms: percentile(sorted, 99),
-        max_ms: sorted.at(-1) ?? null,
-      },
-    },
-    events_per_s: null,
+  const sorted = latencies.toSorted((a, b) => a - b);
+  const percentileOrNull = (p: number) => {
+    const value = percentile(sorted, p);
+    return value === null ? null : round(value);
   };
-  NodeFS.writeFileSync(values.out, `${JSON.stringify(output, null, 2)}\n`);
-  return ok ? 0 : 1;
+  const base = {
+    schemaVersion: 1,
+    status: failure === undefined ? "ok" : "failed",
+    driver: { name: "stub", node: process.version },
+    knobs: { warmup_s: warmupS, window_s: windowS, pollers, rate_per_s: rate },
+    timeline: {
+      warmup: new Date(startedAt).toISOString(),
+      window: new Date(windowStart).toISOString(),
+      measured: new Date(windowEnd).toISOString(),
+    },
+  };
+  const failed = failure === undefined ? undefined : { phase: "window", reason: failure };
+  const result =
+    failed === undefined
+      ? {
+          ...base,
+          windowSeconds: windowS,
+          calls: {
+            "http.environment": {
+              count: sorted.length,
+              errors,
+              perSecond: round((sorted.length + errors) / windowS),
+              p50: percentileOrNull(50),
+              p95: percentileOrNull(95),
+              p99: percentileOrNull(99),
+              max: sorted.length === 0 ? null : round(sorted.at(-1)!),
+            },
+          },
+          counters: {},
+        }
+      : { ...base, failure: failed };
+  if (failed !== undefined) {
+    NodeFS.writeFileSync(NodePath.join(values.out, "driver.failed"), `${JSON.stringify(failed)}\n`);
+  }
+  NodeFS.writeFileSync(
+    NodePath.join(values.out, "driver.json"),
+    `${JSON.stringify(result, null, 2)}\n`,
+  );
+  return failure === undefined ? 0 : 1;
 }
 
 if (import.meta.main) {

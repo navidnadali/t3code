@@ -7,6 +7,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   classifyThreads,
+  knobsFromEnv,
   parseOtlpGauges,
   parseProcIo,
   parseProcStat,
@@ -190,6 +191,30 @@ describe("summariseWindow", () => {
     expect(summary.mem.rss_peak_mib).toBe(3000);
   });
 
+  it("counts a thread that starts mid-window from zero", () => {
+    const main = thread(PID, "node-MainThread", 10, io(0, 0), { userS: 1 });
+    const late = (userS: number, syscr: number) =>
+      thread(1001, "WorkerThread", 500, io(2 * MIB, 0, syscr, 0), { userS });
+    const snapshots = [
+      snapshot(0, io(0, 0), [main], 1024),
+      // Born between the first two samples: 0.8 s CPU and 10,000 reads before it was seen.
+      snapshot(1, io(0, 0, 10_000), [main, late(0.8, 10_000)], 1024),
+      snapshot(2, io(0, 0, 10_000), [main, late(0.8, 10_000)], 1024),
+    ];
+    const summary = summariseWindow(PID, snapshots, {
+      startMs: 1_793_000_000_000,
+      endMs: 1_793_000_002_000,
+    });
+
+    expect(summary.cpu.roles?.["sqlite-reader"]).toEqual({
+      user_pct: 40,
+      sys_pct: 0,
+      busy_pct: 40,
+      threads: 1,
+    });
+    expect(summary.io.threads_sum?.syscr_per_s).toBe(5000);
+  });
+
   it("leaves per-thread rows null when only ps data exists", () => {
     const ps = (second: number): Snapshot => ({
       mono: second * 1000,
@@ -295,6 +320,25 @@ describe("readTraceWindow", () => {
     });
   });
 
+  it("rejects a trace that stops before the window ends", async () => {
+    await withTraceDir(async (trace) => {
+      let lines = "";
+      // Spans from 10 s before the window to 60 s into a 120 s window, then nothing.
+      for (let second = -10; second <= 60; second++) {
+        lines += spanLine("sql.transaction", T0 + second * 1000, 5, { "db.connection": "writer" });
+      }
+      NodeFS.writeFileSync(trace, lines);
+      const partial = await readTraceWindow(trace, { startMs: T0, endMs: T0 + 120_000 });
+      const old = await readTraceWindow(trace, { startMs: T0 + 300_000, endMs: T0 + 400_000 });
+
+      expect(partial.valid).toBe(false);
+      expect(partial.problems).toEqual(["trace_stale"]);
+      expect(partial.spans).toEqual([]);
+      expect(old.problems).toEqual(["trace_stale"]);
+      expect(old.spans).toEqual([]);
+    });
+  });
+
   it("rejects a window that starts before the oldest file on disk", async () => {
     await withTraceDir(async (trace) => {
       NodeFS.writeFileSync(
@@ -306,6 +350,26 @@ describe("readTraceWindow", () => {
       expect(read.valid).toBe(false);
       expect(read.problems).toEqual(["trace_coverage"]);
       expect(read.spans).toEqual([]);
+    });
+  });
+});
+
+describe("knobsFromEnv", () => {
+  it("keeps different long values apart and never shows a secret", () => {
+    const a = knobsFromEnv({
+      BENCH_TRANSCRIPT: "/srv/bench/transcripts/large-tool-payload.ndjson",
+    });
+    const b = knobsFromEnv({
+      BENCH_TRANSCRIPT: "/srv/bench/transcripts/simple-turn-replay.ndjson",
+    });
+
+    expect(a.BENCH_TRANSCRIPT).toMatch(/^<redacted sha256:[0-9a-f]{12}>$/);
+    expect(a.BENCH_TRANSCRIPT).not.toBe(b.BENCH_TRANSCRIPT);
+    expect(
+      knobsFromEnv({ T3CODE_DEV_AUTH_TOKEN: "x".repeat(40), T3CODE_LOG_LEVEL: "Info" }),
+    ).toEqual({
+      T3CODE_DEV_AUTH_TOKEN: "<redacted>",
+      T3CODE_LOG_LEVEL: "Info",
     });
   });
 });

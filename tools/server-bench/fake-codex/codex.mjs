@@ -3,6 +3,7 @@
 // provider sends and replays recorded turns of the Codex replay fixtures with live ids, so the
 // real client, adapter and orchestration run with no model and no network. `--help` lists knobs.
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
@@ -16,7 +17,6 @@ import {
   delayMs,
   freshId,
   injectExitFault,
-  KNOBS_HELP,
   loadTranscriptEntries,
   makeStatsSink,
   makeWriter,
@@ -39,21 +39,7 @@ const MAX_GAP_MS = 3_000;
 // Unpaced replay still yields this often, so stdin requests such as turn/interrupt run.
 const FRAMES_PER_YIELD = 64;
 
-const HELP = `Fake Codex app-server for T3 Code server benchmarks: no model, no network.
-Point a codex provider instance's binaryPath at the \`codex\` launcher beside this file.
-
-Each turn/start replays the next recorded completed turn, with the live thread id, cwd, model
-and prompt and fresh item ids; a thread starts at a turn its id picks.
-
-  BENCH_CODEX_TRANSCRIPT    The mix: comma-separated name or name:weight (default ${DEFAULT_MIX[0].name}); a
-                            fixture under apps/server/src/orchestration-v2/testkit/fixtures/ with
-                            a ${TRANSCRIPT_FILE}, or an absolute .ndjson path.
-${KNOBS_HELP}
-
-One app-server serves every session of its provider instance, so BENCH_FAULT hits the first
-turn it plays. Recorded approval and question requests are sent and wait for the client's
-answer, so bench transcripts should not hold any. thread/read returns no turns.
-`;
+const README = new URL("./README.md", import.meta.url);
 
 const THREAD = 0;
 const TURN = 1;
@@ -816,7 +802,7 @@ async function main(argv, env) {
     return;
   }
   if (argv.includes("--help") || argv.includes("-h")) {
-    process.stdout.write(HELP);
+    process.stdout.write(NodeFS.readFileSync(README, "utf8"));
     return;
   }
   if (argv[0] !== "app-server") throw new Error(`unsupported invocation: ${argv.join(" ")}`);

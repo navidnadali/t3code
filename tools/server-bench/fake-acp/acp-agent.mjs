@@ -3,6 +3,7 @@
 // provider instance sends and replays recorded prompt turns of the ACP registry fixtures, parsed
 // by the dev replay agent, with live ids and bench pacing. `--help` lists its knobs.
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
@@ -16,7 +17,6 @@ import {
   compileFrames,
   delayMs,
   injectExitFault,
-  KNOBS_HELP,
   loadTranscriptEntries,
   makeStatsSink,
   makeWriter,
@@ -38,21 +38,7 @@ const FRAME_DELAY_MS = 250;
 const MAX_RECORDED_DELAY_MS = 2_000;
 const FRAMES_PER_YIELD = 64;
 
-const HELP = `Replaying ACP agent for T3 Code server benchmarks: no model, no network.
-Point an acpRegistry provider instance (source "local") at the \`acp-agent\` launcher beside this file.
-
-Each session/prompt replays the next recorded, uncancelled prompt turn (the frames the dev replay agent
-replays: message, thought, tool, plan and usage updates), with the live session id and cwd and
-fresh tool call ids; a session starts at a turn its id picks. Text streams in small chunks.
-
-  BENCH_ACP_TRANSCRIPT      The mix: comma-separated name or name:weight (default ${DEFAULT_MIX[0].name}); a
-                            fixture under apps/server/src/orchestration-v2/testkit/fixtures/ with
-                            a ${TRANSCRIPT_FILE}, or an absolute .ndjson path.
-${KNOBS_HELP}
-
-Recorded permission and elicitation requests are sent and wait for the client's answer, so bench
-transcripts should not hold any.
-`;
+const README = new URL("./README.md", import.meta.url);
 
 const SESSION = 0;
 const CWD = 1;
@@ -457,7 +443,7 @@ export const configFrom = (env) =>
 
 async function main(argv, env) {
   if (argv.includes("--help") || argv.includes("-h")) {
-    process.stdout.write(HELP);
+    process.stdout.write(NodeFS.readFileSync(README, "utf8"));
     return;
   }
   await runAgent(configFrom(env));

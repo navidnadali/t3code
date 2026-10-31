@@ -14,22 +14,6 @@ export const FAULTS = ["truncated-frame", "truncated-frame-exit", "bad-shape", "
 // The assignment cycle is materialised, so weights stay small.
 const MAX_MIX_WEIGHT = 10_000;
 
-export const KNOBS_HELP = `  BENCH_SPEED               Time scale for every wait (default 1). 0 never waits.
-  BENCH_DELTAS_PER_SEC      Streamed delta rate at speed 1 (default 40).
-  BENCH_TURN_LOOPS          Times a turn's body plays before the turn ends (default 1).
-  BENCH_TOOL_PAYLOAD_BYTES  Payload size of the large-tool-payload transcript (default 262144).
-  BENCH_SEED                Rotates where the transcript assignment cycle starts (default 0).
-  BENCH_STATE_DIR           Where sessions claim their ordinals; fresh for each run.
-  BENCH_STATS_DIR           Append a JSON line per played turn to <dir>/<fake>-<pid>.ndjson.
-  BENCH_MCP_CREDENTIALS_DIR Write each session's T3 MCP URL and authorization to
-                            <dir>/<session-id>.json (mode 0600) for the load driver.
-  BENCH_FAULT               Halfway through the first turn a process plays:
-                              truncated-frame       a cut-off JSON line, then the turn goes on
-                              truncated-frame-exit  a cut-off JSON line, then exit status 1
-                              bad-shape             a well-formed frame the schema rejects
-                              exit-mid-turn         exit status 1 with the turn unfinished
-  BENCH_NODE                The node binary the launcher runs (default: node on PATH).`;
-
 /** The knobs in `env`; `transcriptVar` names the fake's own transcript mix. */
 export function readConfig(env, { transcriptVar, defaultMix, defaultStateDir }) {
   const number = (name, fallback, valid, expected) => {
@@ -52,6 +36,12 @@ export function readConfig(env, { transcriptVar, defaultMix, defaultStateDir }) 
       40,
       (value) => value > 0 && value < Infinity,
       "a number > 0",
+    ),
+    maxGapMs: number(
+      "BENCH_MAX_GAP_MS",
+      undefined,
+      (value) => value >= 0 && value < Infinity,
+      "a number >= 0",
     ),
     turnLoops: number(
       "BENCH_TURN_LOOPS",
@@ -198,10 +188,14 @@ export const readNdjson = (file) =>
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line));
 
-/** Milliseconds to wait before a frame paced `pace`: `{ delta: true }`, `{ ms }` or null. */
+/**
+ * Milliseconds to wait before a frame paced `pace`: `{ delta: true }`, `{ ms }` or null. A
+ * recorded wait is capped at BENCH_MAX_GAP_MS when set; deltas keep their rate.
+ */
 export function delayMs(pace, config) {
   if (pace === null || config.speed === 0) return 0;
-  return (pace.delta ? 1_000 / config.deltasPerSec : pace.ms) / config.speed;
+  if (pace.delta) return 1_000 / config.deltasPerSec / config.speed;
+  return Math.min(pace.ms, config.maxGapMs ?? Infinity) / config.speed;
 }
 
 export const sleep = (ms, signal) =>

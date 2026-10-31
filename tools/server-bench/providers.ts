@@ -182,6 +182,7 @@ export interface BenchKnobs {
   readonly deltasPerSec?: string | undefined;
   readonly turnLoops?: string | undefined;
   readonly toolPayloadBytes?: string | undefined;
+  readonly maxGapMs?: string | undefined;
 }
 
 export interface BenchInstanceOptions {
@@ -248,6 +249,7 @@ export function benchProviderInstances(
         BENCH_DELTAS_PER_SEC: options.knobs?.deltasPerSec,
         BENCH_TURN_LOOPS: options.knobs?.turnLoops,
         BENCH_TOOL_PAYLOAD_BYTES: options.knobs?.toolPayloadBytes,
+        BENCH_MAX_GAP_MS: options.knobs?.maxGapMs,
         [provider.transcriptVar]: options.transcripts?.[kind],
         ...options.env?.[kind],
       }),
@@ -357,6 +359,7 @@ started with.
   --deltas-per-sec N        BENCH_DELTAS_PER_SEC for every fake
   --turn-loops N            BENCH_TURN_LOOPS for every fake
   --tool-payload-bytes N    BENCH_TOOL_PAYLOAD_BYTES for every fake: the large-tool-payload size
+  --max-gap-ms N            BENCH_MAX_GAP_MS for the Codex and ACP fakes: caps recorded waits
   --claude-transcripts L    BENCH_TRANSCRIPT; --codex-transcripts L, --acp-transcripts L likewise
   --env KIND:NAME=VALUE     extra environment for one kind, e.g. codex:BENCH_FAULT=exit-mid-turn
   --node PATH               BENCH_NODE (default: this node)
@@ -379,6 +382,7 @@ async function settingsCommand(argv: ReadonlyArray<string>): Promise<void> {
       "deltas-per-sec": { type: "string" },
       "turn-loops": { type: "string" },
       "tool-payload-bytes": { type: "string" },
+      "max-gap-ms": { type: "string" },
       "claude-transcripts": { type: "string" },
       "codex-transcripts": { type: "string" },
       "acp-transcripts": { type: "string" },
@@ -438,6 +442,7 @@ async function settingsCommand(argv: ReadonlyArray<string>): Promise<void> {
       deltasPerSec: values["deltas-per-sec"],
       turnLoops: values["turn-loops"],
       toolPayloadBytes: values["tool-payload-bytes"],
+      maxGapMs: values["max-gap-ms"],
     },
     transcripts: {
       ...(values["claude-transcripts"] ? { claude: values["claude-transcripts"] } : {}),

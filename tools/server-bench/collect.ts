@@ -597,10 +597,11 @@ export function summariseWindow(
 
   const startThreads = first.threads;
   const endThreads = last.threads;
-  const guesses = guessThreadRoles(pid, [
-    ...endThreads.values(),
-    ...[...startThreads].filter(([key]) => !endThreads.has(key)).map(([, thread]) => thread),
-  ]);
+  const latest = new Map<string, ThreadSample>();
+  for (const snapshot of window) {
+    for (const [key, thread] of snapshot.threads ?? []) latest.set(key, thread);
+  }
+  const guesses = guessThreadRoles(pid, [...latest.values()]);
   const roles = new Map<ThreadRole, Totals>();
   const byComm = new Map<string, Totals>();
   const workers = newTotals();
@@ -608,7 +609,15 @@ export function summariseWindow(
   const started = newTotals();
   let main: Totals | undefined;
   const rows: Array<ThreadRow> = [];
-  for (const [key, after] of endThreads) {
+  // Starters count from zero to their latest sighting, also when they end before the window does.
+  const starters = new Map<string, ThreadSample>();
+  for (const snapshot of window) {
+    for (const [key, thread] of snapshot.threads ?? []) {
+      if (!startThreads.has(key)) starters.set(key, thread);
+    }
+  }
+  const measured = [...[...endThreads].filter(([key]) => startThreads.has(key)), ...starters];
+  for (const [key, after] of measured) {
     const startedInWindow = !startThreads.has(key);
     const before = startThreads.get(key) ?? {
       ...after,

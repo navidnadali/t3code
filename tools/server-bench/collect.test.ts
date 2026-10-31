@@ -218,11 +218,13 @@ describe("summariseWindow", () => {
     const late = (userS: number, syscr: number) =>
       thread(1001, "WorkerThread", 500, io(2 * MIB, 0, syscr, 0), { userS });
     const gone = thread(1002, "WorkerThread", 15, io(MIB, 0, 700, 0));
+    // Starts and ends inside the window: seen only at t=1.
+    const brief = thread(1003, "WorkerThread", 600, io(MIB, 0, 600, 0), { userS: 0.2 });
     const snapshots = [
       snapshot(0, io(0, 0), [main, gone], 1024),
       // Born between the first two samples: 0.8 s CPU and 10,000 reads before it was seen.
-      snapshot(1, io(0, 0, 10_000), [main, late(0.8, 10_000)], 1024),
-      snapshot(2, io(0, 0, 10_000), [main, late(0.8, 10_000)], 1024),
+      snapshot(1, io(0, 0, 10_600), [main, late(0.8, 10_000), brief], 1024),
+      snapshot(2, io(0, 0, 10_600), [main, late(0.8, 10_000)], 1024),
     ];
     const summary = summariseWindow(PID, snapshots, {
       startMs: 1_793_000_000_000,
@@ -232,13 +234,13 @@ describe("summariseWindow", () => {
     expect(summary.io.threads_sum?.syscr_per_s).toBe(0);
     expect(summary.cpu.roles?.["sqlite-reader"]).toBeUndefined();
     expect(summary.cpu.started_in_window).toEqual({
-      user_pct: 40,
+      user_pct: 50,
       sys_pct: 0,
-      busy_pct: 40,
-      threads: 1,
+      busy_pct: 50,
+      threads: 2,
     });
-    expect(summary.io.started_in_window?.syscr_per_s).toBe(5000);
-    expect(summary.threads_started).toBe(1);
+    expect(summary.io.started_in_window?.syscr_per_s).toBe(5300);
+    expect(summary.threads_started).toBe(2);
     expect(summary.threads_exited).toBe(1);
     expect(summary.threads?.find((row) => row.tid === 1001)?.started_in_window).toBe(true);
   });

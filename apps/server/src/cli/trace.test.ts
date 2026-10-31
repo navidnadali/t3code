@@ -64,15 +64,18 @@ function sqlSummary(count: number, startMs: number, endMs: number) {
 }
 
 it("counts summarised SQL spans over their window and a percentile among them as under it", () => {
-  const rates = [
-    [sqlSummary(600, 0, MINUTE_MS)],
-    [sqlSummary(600, 0, MINUTE_MS), sqlSummary(600, MINUTE_MS, 2 * MINUTE_MS)],
-  ].map((lines) => {
-    const summarizer = makeTraceSpanSummary();
+  const rates = (
+    [
+      [-Infinity, [sqlSummary(600, 0, MINUTE_MS)]],
+      [-Infinity, [sqlSummary(600, 0, MINUTE_MS), sqlSummary(600, MINUTE_MS, 2 * MINUTE_MS)]],
+      [MINUTE_MS - 1_000, [sqlSummary(600, 0, MINUTE_MS)]],
+    ] as const
+  ).map(([sinceMs, lines]) => {
+    const summarizer = makeTraceSpanSummary(sinceMs);
     lines.forEach(summarizer.addLine);
     return summarizer.finish().spans.map((entry) => entry.perMinute);
   });
-  assert.deepStrictEqual(rates, [[600], [600]]);
+  assert.deepStrictEqual(rates, [[600], [600], [600]]);
 
   const summarizer = makeTraceSpanSummary();
   [

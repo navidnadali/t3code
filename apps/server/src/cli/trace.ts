@@ -83,8 +83,8 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
     }
     if (endMs < sinceMs) return undefined;
 
-    // A summary's spans ended from its start on, so its start opens the rate window.
-    const startMs = Math.min(Math.max(startTimeUnixNano / 1_000_000, sinceMs), endMs);
+    // A summary's spans ended from its start on; its whole count is kept, so is its whole interval.
+    const startMs = Math.min(startTimeUnixNano / 1_000_000, endMs);
     firstEndMs = Math.min(firstEndMs, Option.isSome(DateTime.make(startMs)) ? startMs : endMs);
     lastEndMs = Math.max(lastEndMs, endMs);
     const stats = byName.get(name) ?? {

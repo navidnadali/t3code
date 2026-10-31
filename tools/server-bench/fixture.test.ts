@@ -458,6 +458,35 @@ describe("secrets", () => {
   });
 });
 
+// Each credential the review found surviving: the text it sat in and the part that must go.
+const TOKENS: Record<string, string> = {
+  github: `gh${"p"}_${"A1b2".repeat(9)}`,
+  anthropic: `sk-${"ant"}-${"Ab12_".repeat(5)}`,
+  openai: `sk-${"proj"}-${"Ab12".repeat(9)}`,
+  aws: `AKIA${"ABCD1234".repeat(2)}`,
+  jwt: `eyJ${"hbGciOi"}J.eyJ${"zdWIiOi"}J.${"Ab12".repeat(3)}`,
+  slack: `xox${"b"}-${"1234-".repeat(3)}`,
+};
+describe("credential detection", () => {
+  it("finds and removes a token right after a newline, tab or ANSI escape, at any JSON depth", () => {
+    const cases = Object.entries(TOKENS).flatMap(([name, token]) =>
+      [
+        JSON.stringify({ output: `ok\n${token}\n` }),
+        JSON.stringify({ output: `\t${token}` }),
+        JSON.stringify({ output: `\u001b[32m${token}\u001b[0m` }),
+        JSON.stringify({ input: JSON.stringify({ result: `gh auth token\n${token}` }) }),
+      ].map((text, index) => ({ name: `${name}#${index}`, token, text })),
+    );
+    const missed = cases
+      .filter(({ text }) => secretHits(text).length === 0)
+      .map(({ name }) => name);
+    const kept = cases
+      .filter(({ text, token }) => redact(text).includes(token))
+      .map(({ name }) => name);
+    expect({ missed, kept }).toEqual({ missed: [], kept: [] });
+  });
+});
+
 describe("shape", () => {
   it("rejects malformed shapes by the field at fault", () => {
     expect(() => parseShape({ ...example, format: "other" })).toThrow(ShapeError);

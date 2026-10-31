@@ -108,6 +108,10 @@ const EnvServerConfig = Config.all({
   traceMaxBytes: Config.Int("T3CODE_TRACE_MAX_BYTES").pipe(Config.withDefault(10 * 1024 * 1024)),
   traceMaxFiles: traceMaxFilesConfig,
   traceBatchWindowMs: Config.Int("T3CODE_TRACE_BATCH_WINDOW_MS").pipe(Config.withDefault(1_000)),
+  traceSqlMinDurationMs: Config.schema(
+    Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+    "T3CODE_TRACE_SQL_MIN_DURATION_MS",
+  ).pipe(Config.withDefault(0)),
   otlpTracesUrl: Config.String("T3CODE_OTLP_TRACES_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -480,6 +484,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     traceBatchWindowMs: env.traceBatchWindowMs,
     traceMaxBytes: env.traceMaxBytes,
     traceMaxFiles: env.traceMaxFiles,
+    ...(env.traceSqlMinDurationMs > 0 ? { traceSqlMinDurationMs: env.traceSqlMinDurationMs } : {}),
     otlpTracesUrl: traces?.url,
     otlpMetricsUrl: metrics?.url,
     otlpLogsUrl: logs?.url,

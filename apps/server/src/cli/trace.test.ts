@@ -50,6 +50,37 @@ it("drops spans that ended before the window and counts unreadable lines", () =>
   );
 });
 
+it("counts summarised SQL spans and reports a percentile among them as under the threshold", () => {
+  const summarizer = makeTraceSpanSummary();
+  [
+    JSON.stringify({
+      type: "span-summary",
+      name: "sqlite",
+      thresholdMs: 2,
+      count: 8,
+      totalDurationMs: 6,
+      maxDurationMs: 1.5,
+      startTimeUnixNano: String(BigInt(MINUTE_MS) * 1_000_000n),
+      endTimeUnixNano: String(BigInt(2 * MINUTE_MS) * 1_000_000n),
+    }),
+    span("sqlite", 5, 2 * MINUTE_MS),
+    span("sqlite", 10, 3 * MINUTE_MS),
+  ].forEach(summarizer.addLine);
+  const summary = summarizer.finish();
+
+  assert.strictEqual(summary.skippedLineCount, 0);
+  assert.deepStrictEqual(
+    summary.spans.map((entry) => [
+      entry.count,
+      entry.perMinute,
+      entry.p50Ms,
+      entry.p90Ms,
+      entry.maxMs,
+    ]),
+    [[10, 10, { underMs: 2 }, 5, 10]],
+  );
+});
+
 it("reads failures and interrupts of browser spans from their OTLP status", () => {
   const summarizer = makeTraceSpanSummary();
   [

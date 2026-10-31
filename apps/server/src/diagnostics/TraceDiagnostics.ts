@@ -205,6 +205,48 @@ export function makeTraceDiagnosticsAggregator(
   const latestWarningAndErrorLogs: ServerTraceDiagnosticsLogEvent[] = [];
   const logLevelCounts: Record<string, number> = {};
 
+  const includeSpanTimes = (startedAt: DateTime.Utc | null, endedAt: DateTime.Utc) => {
+    firstSpanAt =
+      startedAt && (firstSpanAt === null || DateTime.isLessThan(startedAt, firstSpanAt))
+        ? startedAt
+        : firstSpanAt;
+    lastSpanAt =
+      lastSpanAt === null || DateTime.isGreaterThan(endedAt, lastSpanAt) ? endedAt : lastSpanAt;
+  };
+
+  const addSpanSummary = (parsed: Readonly<Record<string, unknown>>) => {
+    const name = toStringValue(parsed.name);
+    const count = toNumberValue(parsed.count);
+    const totalDurationMs = toNumberValue(parsed.totalDurationMs);
+    const maxDurationMs = toNumberValue(parsed.maxDurationMs);
+    const endedAt = unixNanoToDateTime(parsed.endTimeUnixNano);
+    if (
+      !name ||
+      count === null ||
+      !Number.isInteger(count) ||
+      count < 1 ||
+      totalDurationMs === null ||
+      maxDurationMs === null ||
+      !endedAt
+    ) {
+      parseErrorCount += 1;
+      return;
+    }
+
+    recordCount += count;
+    includeSpanTimes(unixNanoToDateTime(parsed.startTimeUnixNano), endedAt);
+    const spanSummary = spansByName.get(name) ?? {
+      count: 0,
+      failureCount: 0,
+      totalDurationMs: 0,
+      maxDurationMs: 0,
+    };
+    spanSummary.count += count;
+    spanSummary.totalDurationMs += totalDurationMs;
+    spanSummary.maxDurationMs = Math.max(spanSummary.maxDurationMs, maxDurationMs);
+    spansByName.set(name, spanSummary);
+  };
+
   const addLine = (line: string) => {
     if (line.trim().length === 0) return;
 
@@ -221,6 +263,11 @@ export function makeTraceDiagnosticsAggregator(
       return;
     }
 
+    if (parsed.type === "span-summary") {
+      addSpanSummary(parsed);
+      return;
+    }
+
     const name = toStringValue(parsed.name);
     const traceId = toStringValue(parsed.traceId);
     const spanId = toStringValue(parsed.spanId);
@@ -234,12 +281,7 @@ export function makeTraceDiagnosticsAggregator(
     }
 
     recordCount += 1;
-    firstSpanAt =
-      startedAt && (firstSpanAt === null || DateTime.isLessThan(startedAt, firstSpanAt))
-        ? startedAt
-        : firstSpanAt;
-    lastSpanAt =
-      lastSpanAt === null || DateTime.isGreaterThan(endedAt, lastSpanAt) ? endedAt : lastSpanAt;
+    includeSpanTimes(startedAt, endedAt);
 
     const exitTag = readExitTag(parsed.exit);
     const status = isRecordObject(parsed.status) ? parsed.status : {};

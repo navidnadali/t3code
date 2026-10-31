@@ -10,20 +10,23 @@ import * as NodeURL from "node:url";
 
 import { parseReplayTurns, streamChunks } from "../../../apps/server/scripts/dev-replay-agent.ts";
 import {
+  acpMcpCredentials,
   assign,
   claimOrdinal,
   compileFrames,
   delayMs,
   injectExitFault,
   KNOBS_HELP,
+  loadTranscriptEntries,
   makeStatsSink,
   makeWriter,
   mixRecord,
   nextTick,
+  prepareCredentialsDir,
   readConfig,
   render,
   sleep,
-  loadTranscriptEntries,
+  writeMcpCredentials,
 } from "../fake-common/replay.mjs";
 
 export const TRANSCRIPT_FILE = "registry_transcript.ndjson";
@@ -247,6 +250,7 @@ async function runAgent(config) {
   const write = makeWriter(process.stdout);
   const recordStats = makeStatsSink(config.statsDir, "fake-acp");
   const transcripts = await loadTranscripts(config);
+  prepareCredentialsDir(config.mcpCredentialsDir);
   const mix = mixRecord(config.mix);
   const requests = {};
   const sessions = new Map();
@@ -356,6 +360,14 @@ async function runAgent(config) {
       case "session/load": {
         const sessionId =
           message.method === "session/load" ? String(params.sessionId) : NodeCrypto.randomUUID();
+        const credentials = acpMcpCredentials(params.mcpServers);
+        if (config.mcpCredentialsDir !== undefined && credentials !== undefined) {
+          try {
+            writeMcpCredentials(config.mcpCredentialsDir, sessionId, credentials);
+          } catch (error) {
+            throw new Error(`cannot write MCP credentials: ${error.message}`, { cause: error });
+          }
+        }
         const cwd = typeof params.cwd === "string" ? params.cwd : process.cwd();
         sessions.set(sessionId, {
           sessionId,

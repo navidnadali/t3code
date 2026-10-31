@@ -11,19 +11,22 @@ import * as NodeURL from "node:url";
 import {
   assign,
   claimOrdinal,
+  codexMcpCredentials,
   compileFrames,
   delayMs,
   freshId,
   injectExitFault,
   KNOBS_HELP,
+  loadTranscriptEntries,
   makeStatsSink,
   makeWriter,
   mixRecord,
   nextTick,
+  prepareCredentialsDir,
   readConfig,
-  loadTranscriptEntries,
   render,
   sleep,
+  writeMcpCredentials,
 } from "../fake-common/replay.mjs";
 
 // Inside the range the bundled model manifest recommends for Codex.
@@ -439,6 +442,7 @@ async function runAppServer(config) {
   const write = makeWriter(process.stdout);
   const recordStats = makeStatsSink(config.statsDir, "fake-codex");
   const transcripts = await loadTranscripts(config);
+  prepareCredentialsDir(config.mcpCredentialsDir);
   const mix = mixRecord(config.mix);
   const fallback = transcripts.get(config.mix[0].name);
   const requests = {};
@@ -461,6 +465,14 @@ async function runAppServer(config) {
   };
 
   const openThread = (id, params, threadId) => {
+    const credentials = codexMcpCredentials(params.config);
+    if (config.mcpCredentialsDir !== undefined && credentials !== undefined) {
+      try {
+        writeMcpCredentials(config.mcpCredentialsDir, threadId, credentials);
+      } catch (error) {
+        return fail(id, -32603, `cannot write MCP credentials: ${error.message}`);
+      }
+    }
     const assignment = assign(config, claimOrdinal(config.stateDir, threadId));
     const compiled = transcripts.get(assignment.transcript);
     const thread = threads.get(threadId) ?? {

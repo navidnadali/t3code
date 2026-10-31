@@ -21,6 +21,8 @@ export const KNOBS_HELP = `  BENCH_SPEED               Time scale for every wait
   BENCH_SEED                Rotates where the transcript assignment cycle starts (default 0).
   BENCH_STATE_DIR           Where sessions claim their ordinals; fresh for each run.
   BENCH_STATS_DIR           Append a JSON line per played turn to <dir>/<fake>-<pid>.ndjson.
+  BENCH_MCP_CREDENTIALS_DIR Write each session's T3 MCP URL and authorization to
+                            <dir>/<session-id>.json (mode 0600) for the load driver.
   BENCH_FAULT               Halfway through the first turn a process plays:
                               truncated-frame       a cut-off JSON line, then the turn goes on
                               truncated-frame-exit  a cut-off JSON line, then exit status 1
@@ -72,6 +74,7 @@ export function readConfig(env, { transcriptVar, defaultMix, defaultStateDir }) 
     ),
     stateDir: env.BENCH_STATE_DIR?.trim() || defaultStateDir,
     statsDir: env.BENCH_STATS_DIR?.trim() || undefined,
+    mcpCredentialsDir: env.BENCH_MCP_CREDENTIALS_DIR?.trim() || undefined,
     fault,
   };
 }
@@ -227,6 +230,49 @@ export function makeStatsSink(statsDir, fake) {
   NodeFS.mkdirSync(statsDir, { recursive: true });
   const file = NodePath.join(statsDir, `${fake}-${process.pid}.ndjson`);
   return (record) => NodeFS.appendFileSync(file, `${JSON.stringify(record)}\n`);
+}
+
+/** Creates the credentials directory, readable by its owner only, before any session starts. */
+export function prepareCredentialsDir(dir) {
+  if (dir !== undefined) NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
+/**
+ * Replaces `<dir>/<session>.json` atomically, readable by its owner only: it holds a token. An
+ * error names the path and the errno, never the token.
+ */
+export function writeMcpCredentials(dir, sessionId, credentials) {
+  const name = `${sessionId.replace(/[^\w-]/g, "_")}.json`;
+  const temp = NodePath.join(dir, `.${name}.${process.pid}.tmp`);
+  NodeFS.writeFileSync(temp, `${JSON.stringify(credentials)}\n`, { mode: 0o600, flag: "w" });
+  NodeFS.chmodSync(temp, 0o600);
+  NodeFS.renameSync(temp, NodePath.join(dir, name));
+}
+
+const authorizationOf = (entries) =>
+  entries.find(([name]) => name.toLowerCase() === "authorization")?.[1] ?? null;
+
+/** The T3 MCP endpoint in a Codex thread's config (`mcp_servers.t3-code`), if any. */
+export function codexMcpCredentials(config) {
+  const server = config?.["mcp_servers.t3-code"] ?? config?.mcp_servers?.["t3-code"];
+  if (typeof server?.url !== "string") return undefined;
+  return {
+    url: server.url,
+    authorization: authorizationOf(Object.entries(server.http_headers ?? {})),
+  };
+}
+
+/** The T3 MCP endpoint in an ACP session's `mcpServers`: HTTP, or the stdio bridge's env. */
+export function acpMcpCredentials(servers) {
+  const server = (Array.isArray(servers) ? servers : []).find((entry) => entry?.name === "t3-code");
+  const pairs = (list) =>
+    Array.isArray(list) ? list.map((entry) => [entry?.name, entry?.value]) : [];
+  if (typeof server?.url === "string") {
+    return { url: server.url, authorization: authorizationOf(pairs(server.headers)) };
+  }
+  const env = Object.fromEntries(pairs(server?.env));
+  if (typeof env.T3_ACP_MCP_ENDPOINT !== "string") return undefined;
+  return { url: env.T3_ACP_MCP_ENDPOINT, authorization: env.T3_ACP_MCP_AUTHORIZATION ?? null };
 }
 
 /** Ends the process the way `fault` says, after `line` (the frame it would have written). */

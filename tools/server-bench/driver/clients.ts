@@ -1,4 +1,4 @@
-// @effect-diagnostics globalTimers:off globalDate:off preferSchemaOverJson:off cryptoRandomUUID:off - Wall-clock load generation outside Effect.
+// @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off preferSchemaOverJson:off cryptoRandomUUID:off - Wall-clock load generation outside Effect.
 import * as NodeCrypto from "node:crypto";
 
 import type { DriverOptions, PollCall } from "./options.ts";

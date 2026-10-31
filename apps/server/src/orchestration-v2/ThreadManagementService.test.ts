@@ -904,22 +904,37 @@ it.effect("a failed thread shell read is not shared with later callers", () =>
   }),
 );
 
-it.effect("shared thread shell reads keep only the most recent threads", () =>
+it.effect("shared thread shell reads keep only the most recent threads once reads settle", () =>
   Effect.gen(function* () {
     const threadIds = Array.from(
       { length: ThreadManagementService.SHARED_SHELL_READ_CAPACITY + 1 },
       (_, index) => ThreadId.make(`thread:shared-shell:capacity:${index}`),
     );
+    const oldestReleased = yield* Deferred.make<void>();
+    const othersReleased = yield* Deferred.make<void>();
     const reads: Array<ThreadId> = [];
     yield* sharedShellReadsTest(
-      (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shellRead(id, reads.length))),
+      (id) =>
+        Deferred.await(id === threadIds[0] ? oldestReleased : othersReleased).pipe(
+          Effect.andThen(Effect.sync(() => reads.push(id))),
+          Effect.as(shellRead(id, 1)),
+        ),
       (forEvent) =>
         Effect.gen(function* () {
-          yield* Effect.forEach(threadIds, (threadId) => forEvent(threadId, 1), { discard: true });
+          const callers = yield* Effect.forEach(threadIds, (threadId) =>
+            Effect.forkChild(forEvent(threadId, 1), { startImmediately: true }),
+          );
+          yield* Deferred.succeed(oldestReleased, undefined);
+          yield* Fiber.join(callers[0]!);
+          yield* Deferred.succeed(othersReleased, undefined);
+          yield* Fiber.joinAll(callers);
           yield* forEvent(threadIds.at(-1)!, 1);
           yield* forEvent(threadIds[0]!, 1);
+          yield* forEvent(threadIds[1]!, 1);
         }),
     );
-    expect(reads).toEqual([...threadIds, threadIds[0]]);
+    expect(reads).toHaveLength(threadIds.length + 2);
+    expect(new Set(reads.slice(0, threadIds.length))).toEqual(new Set(threadIds));
+    expect(reads.slice(threadIds.length)).toEqual([threadIds[0], threadIds[1]]);
   }),
 );

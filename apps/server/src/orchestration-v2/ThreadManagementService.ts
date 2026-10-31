@@ -844,7 +844,9 @@ const make = Effect.gen(function* () {
           Effect.onExit((exit) =>
             Effect.clockWith((settledClock) => {
               if (Exit.isSuccess(exit)) {
-                read.expiresAt = settledClock.currentTimeMillisUnsafe() + SHARED_SHELL_READ_TTL_MS;
+                const settledAt = settledClock.currentTimeMillisUnsafe();
+                read.expiresAt = settledAt + SHARED_SHELL_READ_TTL_MS;
+                trimSharedShellReads(settledAt);
               } else if (sharedShellReads.get(input.threadId) === read) {
                 sharedShellReads.delete(input.threadId);
               }

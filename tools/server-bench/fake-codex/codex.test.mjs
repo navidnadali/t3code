@@ -432,6 +432,56 @@ describe("fake codex app-server", () => {
     expect(Object.keys(records[2])).not.toContain("rssBytes");
   });
 
+  it("answers a method it does not serve with method not found", async () => {
+    using fake = startFake({});
+    fake.send({ id: 1, method: "fuzzyFileSearch", params: { query: "x", roots: [] } });
+
+    expect(frameOf((await fake.until(answerTo(1))).at(-1))).toMatchObject({
+      id: 1,
+      error: { code: -32601 },
+    });
+  });
+
+  it("interrupts only the turn the request names", async () => {
+    // The recorded approval request holds the turn open until the client answers it.
+    using fake = startFake({ BENCH_CODEX_TRANSCRIPT: "tool_call_read_only_on_request" });
+    fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
+    const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
+    fake.send({ id: 2, method: "turn/start", params: { threadId, input: [] } });
+    const turnId = frameOf((await fake.until(answerTo(2))).at(-1)).result.turn.id;
+    await fake.until((line) => frameOf(line)?.method === "item/commandExecution/requestApproval");
+    fake.send({ id: 3, method: "turn/interrupt", params: { threadId, turnId: "stale-turn" } });
+    const stale = frameOf((await fake.until(answerTo(3))).at(-1));
+    fake.send({ id: 4, method: "turn/interrupt", params: { threadId, turnId } });
+    const frames = (await fake.until(isTurnCompleted)).map(frameOf);
+
+    expect(stale).toMatchObject({ error: { code: -32600 } });
+    expect(frames.find((frame) => frame.id === 4)).toEqual({ id: 4, result: {} });
+    expect(frames.at(-1).params.turn).toMatchObject({ id: turnId, status: "interrupted" });
+  });
+
+  it("resumes a thread without starting it again", async () => {
+    using fake = startFake({});
+    fake.send(
+      { id: 1, method: "initialize", params: {} },
+      { method: "initialized" },
+      { id: 2, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } },
+    );
+    const threadId = frameOf((await fake.until(answerTo(2))).at(-1)).result.thread.id;
+    fake.send({ id: 3, method: "thread/goal/get", params: { threadId } });
+    await fake.until(answerTo(3));
+    fake.send(
+      { id: 4, method: "thread/resume", params: { threadId, cwd: LIVE.cwd } },
+      { id: 5, method: "thread/goal/get", params: { threadId } },
+    );
+    const resumed = (await fake.until(answerTo(5))).map(frameOf);
+
+    expect(resumed.find((frame) => frame.id === 4).result.thread.id).toBe(threadId);
+    expect(
+      new Set(resumed.filter((frame) => frame.method !== undefined).map((frame) => frame.method)),
+    ).toEqual(new Set(["mcpServer/startupStatus/updated"]));
+  });
+
   it("reads the mix and rejects knobs out of range", () => {
     const read = (env) =>
       readConfig(env, {

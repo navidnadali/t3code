@@ -4,6 +4,7 @@
 // model and no network. `claude.mjs --help` lists its knobs.
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeURL from "node:url";
@@ -15,7 +16,9 @@ const FIXTURES_DIR = NodeURL.fileURLToPath(
   new URL("../../../apps/server/src/orchestration-v2/testkit/fixtures/", import.meta.url),
 );
 const TRANSCRIPTS_DIR = NodeURL.fileURLToPath(new URL("./transcripts/", import.meta.url));
-const DEFAULT_TRANSCRIPTS = ["command_output_streaming"];
+const DEFAULT_MIX = [{ name: "command_output_streaming", weight: 1 }];
+// The assignment cycle is materialised, so weights stay small.
+const MAX_MIX_WEIGHT = 10_000;
 
 // Waits at BENCH_SPEED=1. Recorded time-to-first-token is kept up to the cap.
 const DEFAULT_FIRST_TOKEN_MS = 800;
@@ -27,30 +30,7 @@ const FRAMES_PER_YIELD = 64;
 
 export const FAULTS = ["truncated-frame", "truncated-frame-exit", "bad-shape"];
 
-const HELP = `Fake Claude Code CLI for T3 Code server benchmarks: no model, no network.
-Point a claudeAgent provider instance's binaryPath at the \`claude\` launcher beside this file.
-
-Each stdin user message replays the next recorded turn, then the wake turns recorded after it,
-with fresh ids. The session id comes from --session-id or --resume, as with the real CLI.
-
-  BENCH_TRANSCRIPT          Comma-separated transcripts (default ${DEFAULT_TRANSCRIPTS.join(",")}).
-                            Each is a name in transcripts/ (.ndjson, or a .mjs generator), a
-                            fixture under apps/server/src/orchestration-v2/testkit/fixtures/, or
-                            an absolute .ndjson path. A session starts at a turn its id picks.
-  BENCH_SPEED               Time scale for every wait (default 1). 0 never waits.
-  BENCH_DELTAS_PER_SEC      stream_event delta rate at speed 1 (default 40).
-  BENCH_TURN_LOOPS          Times a turn's body plays before its result (default 1).
-  BENCH_TOOL_PAYLOAD_BYTES  Payload size of the large-tool-payload transcript (default 262144).
-  BENCH_STATS_DIR           Append a JSON line per played turn to <dir>/fake-claude-<pid>.ndjson.
-  BENCH_FAULT               One malformed frame halfway through the first turn's body:
-                              truncated-frame       a cut-off JSON line, then the turn goes on
-                              truncated-frame-exit  a cut-off JSON line, then exit status 1
-                              bad-shape             a JSON assistant frame without a message
-  BENCH_NODE                The node binary the launcher runs (default: node on PATH).
-
-Not replayed: permission prompts (run bench threads in full access), hook callbacks, MCP calls.
--p with --json-schema prints a minimal schema-valid structured_output for text generation.
-`;
+const README = new URL("./README.md", import.meta.url);
 
 export function readConfig(env) {
   const number = (name, fallback, valid, expected) => {
@@ -67,10 +47,7 @@ export function readConfig(env) {
       `BENCH_FAULT must be one of ${FAULTS.join(", ")}, not ${JSON.stringify(fault)}.`,
     );
   }
-  const transcripts = (env.BENCH_TRANSCRIPT ?? "")
-    .split(",")
-    .map((name) => name.trim())
-    .filter((name) => name.length > 0);
+  const configDir = env.CLAUDE_CONFIG_DIR?.trim();
   return {
     speed: number("BENCH_SPEED", 1, (value) => value >= 0 && value < Infinity, "a number >= 0"),
     deltasPerSec: number(
@@ -81,10 +58,82 @@ export function readConfig(env) {
     ),
     turnLoops: number("BENCH_TURN_LOOPS", 1, count, "an integer >= 1"),
     payloadBytes: number("BENCH_TOOL_PAYLOAD_BYTES", 262_144, count, "an integer >= 1"),
-    transcripts: transcripts.length > 0 ? transcripts : DEFAULT_TRANSCRIPTS,
+    mix: parseMix(env.BENCH_TRANSCRIPT),
+    seed: number(
+      "BENCH_SEED",
+      0,
+      (value) => Number.isSafeInteger(value) && value >= 0,
+      "an integer >= 0",
+    ),
+    stateDir:
+      env.BENCH_STATE_DIR?.trim() ||
+      (configDir
+        ? NodePath.join(configDir, "fake-claude")
+        : NodePath.join(NodeOS.tmpdir(), "t3-fake-claude")),
     statsDir: env.BENCH_STATS_DIR?.trim() || undefined,
     fault,
   };
+}
+
+/** BENCH_TRANSCRIPT: comma-separated `name` or `name:weight` entries; a weight defaults to 1. */
+export function parseMix(value) {
+  const weights = new Map();
+  for (const entry of (value ?? "").split(",")) {
+    if (entry.trim() === "") continue;
+    const weighted = /^(.+):(\d+)$/.exec(entry.trim());
+    const name = (weighted?.[1] ?? entry).trim();
+    const weight = weighted === null ? 1 : Number(weighted[2]);
+    if (weight < 1) throw new Error(`BENCH_TRANSCRIPT weight of ${name} must be at least 1.`);
+    weights.set(name, (weights.get(name) ?? 0) + weight);
+  }
+  const mix = [...weights].map(([name, weight]) => ({ name, weight }));
+  if (mix.reduce((sum, { weight }) => sum + weight, 0) > MAX_MIX_WEIGHT) {
+    throw new Error(`BENCH_TRANSCRIPT weights must add up to at most ${MAX_MIX_WEIGHT}.`);
+  }
+  return mix.length > 0 ? mix : DEFAULT_MIX;
+}
+
+/**
+ * The mix as one assignment cycle, spread by smooth weighted round-robin: the cycle holds each
+ * transcript `weight` times, and each of its prefixes is within one of its weighted share.
+ */
+export function mixCycle(mix) {
+  const total = mix.reduce((sum, { weight }) => sum + weight, 0);
+  const current = mix.map(() => 0);
+  const cycle = [];
+  for (let step = 0; step < total; step++) {
+    let best = 0;
+    mix.forEach(({ weight }, index) => {
+      current[index] += weight;
+      if (current[index] > current[best]) best = index;
+    });
+    current[best] -= total;
+    cycle.push(mix[best].name);
+  }
+  return cycle;
+}
+
+/**
+ * The session's ordinal: the next free one in `stateDir`, claimed with an exclusive create so
+ * concurrent fakes never share one. A resumed session keeps the ordinal it claimed first.
+ */
+export function claimOrdinal(stateDir, sessionId) {
+  NodeFS.mkdirSync(stateDir, { recursive: true });
+  const sessionFile = NodePath.join(stateDir, `session-${sessionId.replace(/[^\w-]/g, "_")}`);
+  if (NodeFS.existsSync(sessionFile)) return Number(NodeFS.readFileSync(sessionFile, "utf8"));
+  const claimed = NodeFS.readdirSync(stateDir).filter((file) => file.startsWith("ordinal-"));
+  for (let ordinal = claimed.length; ; ordinal++) {
+    try {
+      NodeFS.writeFileSync(NodePath.join(stateDir, `ordinal-${ordinal}`), sessionId, {
+        flag: "wx",
+      });
+    } catch (error) {
+      if (error.code === "EEXIST") continue;
+      throw error;
+    }
+    NodeFS.writeFileSync(sessionFile, String(ordinal));
+    return ordinal;
+  }
 }
 
 // Flags the SDK passes with a separate value; any other flag reads as a boolean.
@@ -602,13 +651,39 @@ function makeStatsSink(statsDir) {
   return (record) => NodeFS.appendFileSync(file, `${JSON.stringify(record)}\n`);
 }
 
-const hashOf = (text) => {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < text.length; index++) {
-    hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
+/** Loads and compiles every transcript in the mix; a bad name or recording throws here. */
+export async function loadMix(config) {
+  const transcripts = new Map();
+  for (const { name } of config.mix) {
+    const groups = splitTurns(await loadTranscriptEntries(name, config));
+    if (groups.length === 0) throw new Error(`Transcript ${name} has no completed turn.`);
+    transcripts.set(name, groups.map(compileGroup));
   }
-  return hash;
-};
+  return transcripts;
+}
+
+/** An error result, then exit 1: the SDK reports the result's text instead of the exit code. */
+function failStream(sessionId, error) {
+  const message = `fake claude: ${error instanceof Error ? error.message : String(error)}`;
+  const result = {
+    type: "result",
+    subtype: "error_during_execution",
+    duration_ms: 0,
+    duration_api_ms: 0,
+    is_error: true,
+    num_turns: 0,
+    stop_reason: null,
+    session_id: sessionId,
+    total_cost_usd: 0,
+    usage: { input_tokens: 0, output_tokens: 0 },
+    modelUsage: {},
+    permission_denials: [],
+    uuid: NodeCrypto.randomUUID(),
+    errors: [message],
+  };
+  process.stderr.write(`${message}\n`);
+  process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(1));
+}
 
 async function runStream(flags, config) {
   const live = {
@@ -622,21 +697,13 @@ async function runStream(flags, config) {
   const recordStats = makeStatsSink(config.statsDir);
   const controlRequests = {};
   const prompts = [];
-  let groups;
+  const transcripts = await loadMix(config);
+  const mix = Object.fromEntries(config.mix.map(({ name, weight }) => [name, weight]));
+  let assignment;
   let played = 0;
   let active;
   let draining = false;
   let faultPending = config.fault !== undefined;
-
-  const loadGroups = async () => {
-    const loaded = [];
-    for (const name of config.transcripts) {
-      const turns = splitTurns(await loadTranscriptEntries(name, config));
-      if (turns.length === 0) throw new Error(`Transcript ${name} has no completed turn.`);
-      turns.forEach((group, turn) => loaded.push({ name, turn, compiled: compileGroup(group) }));
-    }
-    return loaded;
-  };
 
   const injectFault = async (line) => {
     faultPending = false;
@@ -661,12 +728,17 @@ async function runStream(flags, config) {
     active = controller;
     live.promptUuid = typeof message.uuid === "string" ? message.uuid : undefined;
     const startedAt = Date.now();
-    groups ??= await loadGroups();
-    const pick = groups[(hashOf(live.sessionId) + played++) % groups.length];
+    if (assignment === undefined) {
+      const ordinal = claimOrdinal(config.stateDir, live.sessionId);
+      const cycle = mixCycle(config.mix);
+      assignment = { ordinal, transcript: cycle[(ordinal + config.seed) % cycle.length] };
+    }
+    const groups = transcripts.get(assignment.transcript);
+    const turn = played++ % groups.length;
     const frames = {};
     let bytes = 0;
     let unpaced = 0;
-    for (const { frame, line, faultPoint } of turnLines(pick.compiled, live, config.turnLoops)) {
+    for (const { frame, line, faultPoint } of turnLines(groups[turn], live, config.turnLoops)) {
       const wait = delayMs(frame.pace, config);
       if (wait > 0) {
         unpaced = 0;
@@ -688,8 +760,11 @@ async function runStream(flags, config) {
       at: new Date().toISOString(),
       pid: process.pid,
       sessionId: live.sessionId,
-      transcript: pick.name,
-      turn: pick.turn,
+      transcript: assignment.transcript,
+      turn,
+      ordinal: assignment.ordinal,
+      seed: config.seed,
+      mix,
       loops: config.turnLoops,
       aborted,
       frames,
@@ -780,12 +855,7 @@ async function runStream(flags, config) {
     // A steer interrupts the running turn; other prompts wait for it, as the CLI queues them.
     if (message.priority === "now") active?.abort();
     prompts.push(message);
-    if (!draining) {
-      void drain().catch((error) => {
-        process.stderr.write(`fake claude: ${error.stack ?? error}\n`);
-        process.exit(1);
-      });
-    }
+    if (!draining) void drain().catch((error) => failStream(live.sessionId, error));
   });
   input.on("close", () => process.exit(0));
 }
@@ -796,12 +866,16 @@ async function main(argv, env) {
     return;
   }
   if (argv.includes("--help") || argv.includes("-h")) {
-    process.stdout.write(HELP);
+    process.stdout.write(NodeFS.readFileSync(README, "utf8"));
     return;
   }
-  const config = readConfig(env);
   const flags = parseArgs(argv);
-  if (stringFlag(flags, "--input-format") === "stream-json") return runStream(flags, config);
+  // Checked before the handshake, so a bad knob or transcript fails every session with its cause.
+  if (stringFlag(flags, "--input-format") === "stream-json") {
+    return Promise.resolve()
+      .then(() => runStream(flags, readConfig(env)))
+      .catch((error) => failStream(sessionIdFor(flags), error));
+  }
   if (flags.has("-p") || flags.has("--print")) return runPrint(flags);
   throw new Error(`unsupported invocation: ${argv.join(" ")}`);
 }

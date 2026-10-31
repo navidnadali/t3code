@@ -508,12 +508,19 @@ const makeReader = Effect.fnUntraced(function* (
               ),
             );
           }),
-        onFailure: (failure) => {
-          retire(failure.reader);
-          return failure.retry
-            ? recover(Duration.min(Duration.times(delay, 2), READER_RETRY_MAX_DELAY))
-            : Effect.void;
-        },
+        onFailure: (failure) =>
+          failure.retry
+            ? Effect.andThen(
+                Effect.sync(() => retire(failure.reader)),
+                recover(Duration.min(Duration.times(delay, 2), READER_RETRY_MAX_DELAY)),
+              )
+            : Effect.andThen(
+                Effect.logInfo(
+                  "SQLite reader worker retries stopped permanently; reads use the main connection",
+                  { reason: failure.reason },
+                ),
+                Effect.sync(() => retire(failure.reader)),
+              ),
       }),
     );
 

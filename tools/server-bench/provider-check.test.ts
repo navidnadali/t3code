@@ -62,6 +62,14 @@ const SERVER_LOG = `[22:31:00.726] WARN (#8057): Orchestration effect execution 
       '            at file:///dist/binCli.mjs:171134:40\\n' +
       '}'
   }
+[23:17:23.740] WARN (#10770): orchestration V2 failed to interrupt turn after ingestion failure
+  {
+    runId: 'run:thread:mcp%3A93e55143-694f-4a6e-b0d4-81e40737b0fb:ordinal:1',
+    cause: 'ProviderAdapterRequestError: \\n' +
+      '  [cause]: CodexAppServerProcessExitedError: Codex App Server process exited with code 1\\n' +
+      '      at file:///dist/binCli.mjs:227435:10\\n' +
+      '}'
+  }
 `;
 
 const turn = (items: TurnExpectation["items"], todoLists = 0): TurnExpectation => ({
@@ -125,6 +133,10 @@ describe("provider check runs", () => {
     );
     expect(failureCause(SERVER_LOG, "mcp:b133373f-358e-408b-9e4e-43ad18bfe451")).toBe(
       'AcpProcessExitedError: ACP process exited with code 2; fake acp agent: BENCH_TURN_LOOPS must be an integer >= 1, not "0".',
+    );
+    // A turn that failed mid-stream is logged by its run id, with the thread id URL-encoded.
+    expect(failureCause(SERVER_LOG, "mcp:93e55143-694f-4a6e-b0d4-81e40737b0fb")).toBe(
+      "CodexAppServerProcessExitedError: Codex App Server process exited with code 1",
     );
     expect(failureCause(SERVER_LOG, "mcp:00000000-0000-4000-8000-000000000000")).toBeNull();
   });

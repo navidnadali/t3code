@@ -120,6 +120,11 @@ function runCli(
       timedOut = true;
       child.kill("SIGKILL");
     }, timeoutMs);
+    // A CLI that cannot start is that turn's failure, not the run's crash.
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      resolve({ code: null, stdout, stderr: `${stderr}${error.message}`, timedOut });
+    });
     child.on("close", (code) => {
       clearTimeout(timer);
       resolve({ code, stdout, stderr, timedOut });
@@ -333,6 +338,12 @@ async function check(
   if (plan.length === 0)
     throw new Error("No sessions: pass --sessions, --codex-sessions or --acp-sessions");
 
+  for (const [flag, path] of [
+    ["--project", project],
+    ["--t3", values.t3],
+  ]) {
+    if (!NodeFS.existsSync(path)) throw new Error(`${flag} ${path} does not exist`);
+  }
   const settingsPath = NodePath.join(baseDir, "userdata", "settings.json");
   const knobs = readBenchKnobs(settingsPath);
   const statsDirs = new Set(

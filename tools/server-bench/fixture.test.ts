@@ -914,6 +914,32 @@ describe("sanitise content", () => {
   });
 });
 
+describe("v1 imports", () => {
+  it("scan counts pending v1 shell and transcript imports, and sanitise leaves none", () => {
+    const directory = scratch("legacy");
+    const seeded = NodePath.join(directory, "seeded.sqlite");
+    synth(seeded, "0.25");
+    const db = new NodeSqlite.DatabaseSync(seeded);
+    const at = "2026-01-01T00:00:00.000Z";
+    db.exec(`UPDATE orchestration_v2_legacy_imports SET transcript_imported_at = NULL
+      WHERE thread_id = (SELECT MIN(thread_id) FROM orchestration_v2_legacy_imports)`);
+    db.prepare(
+      `INSERT INTO projection_threads (thread_id, project_id, title, created_at, updated_at)
+       VALUES ('v1-only-thread', (SELECT MIN(project_id) FROM projection_projects), 'Old', ?, ?)`,
+    ).run(at, at);
+    db.close();
+    const before = run(["scan", seeded]);
+    const found = (JSON.parse(before.stdout) as { runnable: Record<string, number> }).runnable;
+    expect([found.legacyShellImports, found.legacyTranscriptImports]).toEqual([1, 1]);
+    const clean = NodePath.join(directory, "clean.sqlite");
+    expect(run(["sanitise", seeded, clean]).status).toBe(0);
+    const after = JSON.parse(run(["scan", clean]).stdout) as { runnable: Record<string, number> };
+    expect([after.runnable.legacyShellImports, after.runnable.legacyTranscriptImports]).toEqual([
+      0, 0,
+    ]);
+  });
+});
+
 describe("server on a fixture", () => {
   it("a perf/base server boots on a synthetic database and runs nothing", async () => {
     const database = NodePath.join(scratch("boot"), "synthetic.sqlite");

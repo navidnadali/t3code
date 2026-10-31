@@ -467,6 +467,40 @@ const TOKENS: Record<string, string> = {
   jwt: `eyJ${"hbGciOi"}J.eyJ${"zdWIiOi"}J.${"Ab12".repeat(3)}`,
   slack: `xox${"b"}-${"1234-".repeat(3)}`,
 };
+const FORMS: Record<string, { readonly text: string; readonly secret: string }> = {
+  dbPassword: { text: `DB_PASSWORD=${"Zx9q".repeat(4)}`, secret: "Zx9q".repeat(4) },
+  cfApiToken: { text: `export CF_API_TOKEN=${"Qw3rTy".repeat(7)}`, secret: "Qw3rTy".repeat(7) },
+  awsSecret: {
+    text: `AWS_SECRET_ACCESS_KEY="${"wJalrXUtnFEMI".repeat(3)}"`,
+    secret: "wJalrXUtnFEMI".repeat(3),
+  },
+  anthropicAuth: { text: `ANTHROPIC_AUTH_TOKEN=${"Mn8v".repeat(8)}`, secret: "Mn8v".repeat(8) },
+  refreshToken: {
+    text: JSON.stringify({ refresh_token: `1//0g${"Ab3".repeat(10)}` }),
+    secret: `1//0g${"Ab3".repeat(10)}`,
+  },
+  sessionToken: { text: `session_token: ${"Kp7w".repeat(8)}`, secret: "Kp7w".repeat(8) },
+  accessKey: { text: `access_key=${"Hj5r".repeat(6)}`, secret: "Hj5r".repeat(6) },
+  hexPassword: {
+    text: `PASSWORD=${"0123456789abcdef".repeat(2)}`,
+    secret: "0123456789abcdef".repeat(2),
+  },
+  googleOauth: { text: `ya${"29"}.${"A0b1C2".repeat(8)}`, secret: "A0b1C2".repeat(8) },
+  slackXoxc: { text: `xox${"c"}-${"1234-".repeat(4)}abcd`, secret: `${"1234-".repeat(4)}abcd` },
+  slackXoxd: { text: `xox${"d"}-${"Ab12".repeat(8)}`, secret: "Ab12".repeat(8) },
+  slackApp: { text: `xap${"p"}-1-${"A1B2".repeat(6)}`, secret: "A1B2".repeat(6) },
+  atlassian: { text: `ATA${"TT"}${"xFfGF0".repeat(8)}`, secret: "xFfGF0".repeat(8) },
+  basicAuth: {
+    text: `Authorization: Basic ${Buffer.from("bench:hunter2hunter2").toString("base64")}`,
+    secret: Buffer.from("bench:hunter2hunter2").toString("base64"),
+  },
+  emptyUserUrl: { text: "redis://:s3cr3tPw0rd@cache.invalid:6379/0", secret: "s3cr3tPw0rd" },
+  base64Anthropic: {
+    text: `blob ${Buffer.from(`sk-${"ant"}-${"Ab12_".repeat(5)}`).toString("base64")} end`,
+    secret: Buffer.from(`sk-${"ant"}-${"Ab12_".repeat(5)}`).toString("base64"),
+  },
+};
+
 describe("credential detection", () => {
   it("finds and removes a token right after a newline, tab or ANSI escape, at any JSON depth", () => {
     const cases = Object.entries(TOKENS).flatMap(([name, token]) =>
@@ -482,6 +516,20 @@ describe("credential detection", () => {
       .map(({ name }) => name);
     const kept = cases
       .filter(({ text, token }) => redact(text).includes(token))
+      .map(({ name }) => name);
+    expect({ missed, kept }).toEqual({ missed: [], kept: [] });
+  });
+
+  it("finds and removes every credential form, in plain text and inside JSON", () => {
+    const cases = Object.entries(FORMS).flatMap(([name, { text, secret }]) => [
+      { name, secret, text },
+      { name: `${name}#json`, secret, text: JSON.stringify({ output: `x\n${text}\n` }) },
+    ]);
+    const missed = cases
+      .filter(({ text }) => secretHits(text).length === 0)
+      .map(({ name }) => name);
+    const kept = cases
+      .filter(({ text, secret }) => redact(text).includes(secret))
       .map(({ name }) => name);
     expect({ missed, kept }).toEqual({ missed: [], kept: [] });
   });

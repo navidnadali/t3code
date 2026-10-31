@@ -20,6 +20,7 @@ import { vi } from "vite-plus/test";
 import * as SqliteClient from "./nodeSqliteClient.ts";
 
 const startedWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
+const workerExits = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, Promise<void>>());
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
 
@@ -35,6 +36,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
             : args) as ConstructorParameters<typeof actual.Worker>),
       );
       startedWorkers.push(this);
+      workerExits.set(this, new Promise((resolve) => this.once("exit", () => resolve())));
     }
     override terminate() {
       // A "ready" already queued when termination starts reaches the parent before "exit".
@@ -458,6 +460,7 @@ it.effect.each([
     withLogLines((lines) =>
       withReaderClient((sql) =>
         Effect.gen(function* () {
+          // The failed read's own metric attributes must not label the pool's gauge.
           const failed = yield* withWorkers(
             workers,
             Effect.gen(function* () {
@@ -466,7 +469,7 @@ it.effect.each([
               });
               yield* TestClock.adjust(startup);
               return yield* Fiber.join(read);
-            }),
+            }).pipe(Effect.provideService(Metric.CurrentMetricAttributes, { read: "failed" })),
           );
           assert.deepEqual(failed, { count: 1, connection: ["writer"] });
           const startedBefore = startedWorkers.length;
@@ -510,25 +513,45 @@ it.effect("backs off a reader that never starts without logging each retry", () 
   ),
 );
 
-it.effect("keeps readers off without retrying when the database is not in WAL mode", () =>
-  withLogLines((lines) =>
-    withFileClient((sql) =>
-      Effect.gen(function* () {
-        yield* sql`CREATE TABLE entries(name TEXT NOT NULL)`;
-        yield* sql`INSERT INTO entries VALUES ('kept')`;
-        const startedBefore = startedWorkers.length;
+it.effect.each([
+  {
+    when: "the database is not in WAL mode",
+    journalMode: "DELETE",
+    workers: {},
+    starts: 1,
+    reason: "database uses journal_mode delete, not wal",
+  },
+  {
+    when: "a retry finds the database out of WAL mode",
+    journalMode: "WAL",
+    workers: { failWith: "reader start failed" },
+    starts: 2,
+    reason: "Database reader failed: reader start failed",
+  },
+])(
+  "keeps readers off with one warning and no more retries when $when",
+  ({ journalMode, workers, starts, reason }) =>
+    withLogLines((lines) =>
+      withFileClient((sql) =>
+        Effect.gen(function* () {
+          yield* sql.unsafe(`PRAGMA journal_mode = ${journalMode}`);
+          yield* sql`CREATE TABLE entries(name TEXT NOT NULL)`;
+          yield* sql`INSERT INTO entries VALUES ('kept')`;
+          const startedBefore = startedWorkers.length;
 
-        assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["writer"] });
-        yield* TestClock.adjust("1 hour");
-        assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["writer"] });
-        assert.equal(startedWorkers.length, startedBefore + 1);
-        assert.deepEqual(yield* Queue.clear(lines), [
-          ["Warn", unavailableWarning, { reason: "database uses journal_mode delete, not wal" }],
-        ]);
-        assert.deepEqual(yield* readerPoolAvailable, [0]);
-      }),
-    ),
-  ).pipe(Effect.provideService(Metric.MetricRegistry, new Map())),
+          const failed = yield* withWorkers(workers, readConnection(sql));
+          assert.deepEqual(failed, { count: 1, connection: ["writer"] });
+          yield* sql`PRAGMA journal_mode = DELETE`;
+          yield* TestClock.adjust("1 second");
+          yield* Effect.promise(() => workerExits.get(startedWorkers.at(-1)!)!);
+          yield* TestClock.adjust("1 hour");
+          assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["writer"] });
+          assert.equal(startedWorkers.length, startedBefore + starts);
+          assert.deepEqual(yield* Queue.clear(lines), [["Warn", unavailableWarning, { reason }]]);
+          assert.deepEqual(yield* readerPoolAvailable, [0]);
+        }),
+      ),
+    ).pipe(Effect.provideService(Metric.MetricRegistry, new Map())),
 );
 
 it.effect("finishes masked database cleanup after its caller is interrupted", () =>

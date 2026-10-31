@@ -305,11 +305,6 @@ const readerPoolAvailable = Metric.gauge("t3_sqlite_reader_pool_available", {
   description: "1 while SQLite reads can use reader workers, 0 while they use the main connection.",
 });
 
-const warnUnavailable = (reason: string) =>
-  Effect.logWarning("SQLite reader worker unavailable; reads use the main connection", {
-    reason,
-  });
-
 // Bind transactions to one worker; fail after its exit instead of resuming outside the transaction on a replacement.
 const makeReader = Effect.fnUntraced(function* (
   options: SqliteClientConfig,
@@ -517,7 +512,7 @@ const makeReader = Effect.fnUntraced(function* (
           retire(failure.reader);
           return failure.retry
             ? recover(Duration.min(Duration.times(delay, 2), READER_RETRY_MAX_DELAY))
-            : warnUnavailable(failure.reason);
+            : Effect.void;
         },
       }),
     );
@@ -527,13 +522,15 @@ const makeReader = Effect.fnUntraced(function* (
       // @effect-diagnostics-next-line effectSucceedWithVoid:off - The connection result distinguishes undefined from void.
       if (!retire(failure.reader) || pool.unavailable) return Effect.succeed(undefined);
       pool.unavailable = true;
-      // Retries run in the client's scope and context, not the read that failed.
-      const retry = failure.retry
-        ? Effect.forkIn(Effect.provideContext(recover(READER_RETRY_DELAY), context), scope)
-        : Effect.void;
-      return warnUnavailable(failure.reason).pipe(
+      // Pool state belongs to the client: never log, meter or retry with the failed read's services.
+      return Effect.logWarning("SQLite reader worker unavailable; reads use the main connection", {
+        reason: failure.reason,
+      }).pipe(
         Effect.andThen(Metric.update(readerPoolAvailable, 0)),
-        Effect.andThen(retry),
+        Effect.andThen(
+          failure.retry ? Effect.forkIn(recover(READER_RETRY_DELAY), scope) : Effect.void,
+        ),
+        Effect.updateContext((_: Context.Context<never>) => context),
         Effect.as(undefined),
       );
     });

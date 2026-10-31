@@ -226,9 +226,11 @@ export function makeStatsSink(statsDir, fake) {
   return (record) => NodeFS.appendFileSync(file, `${JSON.stringify(record)}\n`);
 }
 
-/** Creates the credentials directory, readable by its owner only, before any session starts. */
+/** Creates or locks the credentials directory to its owner before any session starts. */
 export function prepareCredentialsDir(dir) {
-  if (dir !== undefined) NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (dir === undefined) return;
+  NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  NodeFS.chmodSync(dir, 0o700);
 }
 
 /**

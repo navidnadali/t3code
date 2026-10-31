@@ -13,7 +13,7 @@ import { describe, expect, it, onTestFinished } from "vite-plus/test";
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { SECRET_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
-import { ShapeError, parseShape, quantile, shapeRows } from "./fixture/shape.ts";
+import { ShapeError, measureShape, parseShape, quantile, shapeRows } from "./fixture/shape.ts";
 
 const ROOT = NodePath.resolve(import.meta.dirname, "..", "..");
 const FIXTURE = NodePath.join(import.meta.dirname, "fixture.ts");
@@ -686,6 +686,16 @@ describe("shape", () => {
     expect(() =>
       parseShape({ ...example, distributions: { turnItemsPerThread: [[0.5, 10]] } }),
     ).toThrow(/q = 1/);
+  });
+
+  it("measures tables whose names need quoting", () => {
+    const path = NodePath.join(scratch("quoted"), "odd.sqlite");
+    const db = new NodeSqlite.DatabaseSync(path);
+    db.exec(`CREATE TABLE "odd""name" (payload_json TEXT); CREATE TABLE "order" (text TEXT);`);
+    db.exec(`INSERT INTO "odd""name" VALUES ('{}'); INSERT INTO "order" VALUES ('x');`);
+    const measured = measureShape(db);
+    db.close();
+    expect([measured.tables['odd"name']?.rows, measured.tables.order?.rows]).toEqual([1, 1]);
   });
 
   it("interpolates quantiles between recorded points", () => {

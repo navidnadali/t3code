@@ -4,17 +4,20 @@
 // real client, adapter and orchestration run with no model and no network. `--help` lists knobs.
 import * as NodeCrypto from "node:crypto";
 import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 
 import {
+  assign,
+  claimOrdinal,
   compileFrames,
   delayMs,
   freshId,
-  hashOf,
   injectExitFault,
   KNOBS_HELP,
   makeStatsSink,
   makeWriter,
+  mixRecord,
   nextTick,
   readConfig,
   readNdjson,
@@ -26,7 +29,7 @@ import {
 // Inside the range the bundled model manifest recommends for Codex.
 export const FAKE_CODEX_VERSION = "0.159.0";
 export const TRANSCRIPT_FILE = "codex_transcript.ndjson";
-const DEFAULT_TRANSCRIPTS = ["command_output_streaming"];
+const DEFAULT_MIX = [{ name: "command_output_streaming", weight: 1 }];
 // Recorded gaps between frames are kept up to this cap at BENCH_SPEED=1.
 const MAX_GAP_MS = 3_000;
 // Unpaced replay still yields this often, so stdin requests such as turn/interrupt run.
@@ -38,7 +41,7 @@ Point a codex provider instance's binaryPath at the \`codex\` launcher beside th
 Each turn/start replays the next recorded completed turn, with the live thread id, cwd, model
 and prompt and fresh item ids; a thread starts at a turn its id picks.
 
-  BENCH_CODEX_TRANSCRIPT    Comma-separated transcripts (default ${DEFAULT_TRANSCRIPTS.join(",")}): a
+  BENCH_CODEX_TRANSCRIPT    The mix: comma-separated name or name:weight (default ${DEFAULT_MIX[0].name}); a
                             fixture under apps/server/src/orchestration-v2/testkit/fixtures/ with
                             a ${TRANSCRIPT_FILE}, or an absolute .ndjson path.
 ${KNOBS_HELP}
@@ -321,13 +324,13 @@ function threadLines(compiled, live) {
   };
 }
 
+/** Loads and compiles every transcript in the mix; a bad name or recording throws here. */
 export function loadTranscripts(config) {
-  const loaded = [];
-  for (const name of config.transcripts) {
+  const loaded = new Map();
+  for (const { name } of config.mix) {
     const parsed = parseTranscript(readNdjson(transcriptPath(name, TRANSCRIPT_FILE)));
     if (parsed.turns.length === 0) throw new Error(`Transcript ${name} has no completed turn.`);
-    const compiled = compileTranscript(parsed);
-    loaded.push({ name, compiled });
+    loaded.set(name, compileTranscript(parsed));
   }
   return loaded;
 }
@@ -425,7 +428,8 @@ async function runAppServer(config) {
   const write = makeWriter(process.stdout);
   const recordStats = makeStatsSink(config.statsDir, "fake-codex");
   const transcripts = loadTranscripts(config);
-  const turnCount = transcripts.reduce((sum, entry) => sum + entry.compiled.turns.length, 0);
+  const mix = mixRecord(config.mix);
+  const fallback = transcripts.get(config.mix[0].name);
   const requests = {};
   const threads = new Map();
   const pendingServerRequests = new Map();
@@ -437,29 +441,29 @@ async function runAppServer(config) {
   const respond = (id, result) => send({ id, result });
   const fail = (id, code, message) => send({ id, error: { code, message } });
 
+  // A thread plays the transcript its ordinal picks, turn after turn; one app-server serves
+  // every thread of its instance, and the state directory keeps ordinals across its restarts.
   const pickTurn = (thread) => {
-    let index = (hashOf(thread.threadId) + thread.played++) % turnCount;
-    for (const { name, compiled } of transcripts) {
-      if (index < compiled.turns.length)
-        return { name, turn: index, compiled: compiled.turns[index] };
-      index -= compiled.turns.length;
-    }
-    throw new Error("unreachable");
+    const turns = transcripts.get(thread.assignment.transcript).turns;
+    const turn = thread.played++ % turns.length;
+    return { name: thread.assignment.transcript, turn, compiled: turns[turn] };
   };
 
   const openThread = (id, params, threadId) => {
+    const assignment = assign(config, claimOrdinal(config.stateDir, threadId));
+    const compiled = transcripts.get(assignment.transcript);
     const thread = threads.get(threadId) ?? {
       threadId,
+      assignment,
       cwd: typeof params.cwd === "string" ? params.cwd : process.cwd(),
-      model:
-        typeof params.model === "string" ? params.model : transcripts[0].compiled.recordedModel,
+      model: typeof params.model === "string" ? params.model : compiled.recordedModel,
       played: 0,
       queue: [],
       active: undefined,
       draining: false,
     };
     threads.set(threadId, thread);
-    const lines = threadLines(transcripts[0].compiled, thread);
+    const lines = threadLines(compiled, thread);
     send({ id, result: JSON.parse(lines.answer) });
     for (const line of lines.setup) write(line);
   };
@@ -550,9 +554,13 @@ async function runAppServer(config) {
     thread.active = undefined;
     recordStats({
       at: new Date().toISOString(),
+      kind: "turn",
       pid: process.pid,
       fake: "codex",
       sessionId: thread.threadId,
+      ordinal: thread.assignment.ordinal,
+      seed: config.seed,
+      mix,
       transcript: pick.name,
       turn: pick.turn,
       loops,
@@ -606,9 +614,9 @@ async function runAppServer(config) {
         const live = threads.get(String(params.threadId)) ?? {
           threadId: String(params.threadId),
           cwd: process.cwd(),
-          model: transcripts[0].compiled.recordedModel,
+          model: fallback.recordedModel,
         };
-        const answer = JSON.parse(threadLines(transcripts[0].compiled, live).answer);
+        const answer = JSON.parse(threadLines(fallback, live).answer);
         return respond(id, { thread: answer.thread });
       }
       case "turn/start": {
@@ -681,7 +689,10 @@ async function main(argv, env) {
   await runAppServer(
     readConfig(env, {
       transcriptVar: "BENCH_CODEX_TRANSCRIPT",
-      defaultTranscripts: DEFAULT_TRANSCRIPTS,
+      defaultMix: DEFAULT_MIX,
+      defaultStateDir: env.CODEX_HOME?.trim()
+        ? NodePath.join(env.CODEX_HOME.trim(), "fake-codex")
+        : NodePath.join(NodeOS.tmpdir(), "t3-fake-codex"),
     }),
   );
 }

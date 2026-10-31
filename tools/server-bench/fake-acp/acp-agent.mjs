@@ -4,17 +4,21 @@
 // by the dev replay agent, with live ids and bench pacing. `--help` lists its knobs.
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 
 import { parseReplayTurns, streamChunks } from "../../../apps/server/scripts/dev-replay-agent.ts";
 import {
+  assign,
+  claimOrdinal,
   compileFrames,
   delayMs,
-  hashOf,
   injectExitFault,
   KNOBS_HELP,
   makeStatsSink,
   makeWriter,
+  mixRecord,
   nextTick,
   readConfig,
   render,
@@ -24,7 +28,7 @@ import {
 
 export const TRANSCRIPT_FILE = "registry_transcript.ndjson";
 export const BENCH_MODEL = "bench-replay";
-const DEFAULT_TRANSCRIPTS = ["todo_list"];
+const DEFAULT_MIX = [{ name: "todo_list", weight: 1 }];
 // As the dev replay agent: frames without recorded timing wait this long, recorded waits are cut.
 const FRAME_DELAY_MS = 250;
 const MAX_RECORDED_DELAY_MS = 2_000;
@@ -37,7 +41,7 @@ Each session/prompt replays the next recorded, uncancelled prompt turn (the fram
 replays: message, thought, tool, plan and usage updates), with the live session id and cwd and
 fresh tool call ids; a session starts at a turn its id picks. Text streams in small chunks.
 
-  BENCH_ACP_TRANSCRIPT      Comma-separated transcripts (default ${DEFAULT_TRANSCRIPTS.join(",")}): a
+  BENCH_ACP_TRANSCRIPT      The mix: comma-separated name or name:weight (default ${DEFAULT_MIX[0].name}); a
                             fixture under apps/server/src/orchestration-v2/testkit/fixtures/ with
                             a ${TRANSCRIPT_FILE}, or an absolute .ndjson path.
 ${KNOBS_HELP}
@@ -156,14 +160,17 @@ export function* turnLines(compiled, live, loops) {
   }
 }
 
+/** Loads and compiles every transcript in the mix; a bad name or recording throws here. */
 export function loadTranscripts(config) {
-  return config.transcripts.map((name) => {
+  const loaded = new Map();
+  for (const { name } of config.mix) {
     const turns = compileTranscript(
       NodeFS.readFileSync(transcriptPath(name, TRANSCRIPT_FILE), "utf8"),
     );
     if (turns.length === 0) throw new Error(`Transcript ${name} has no prompt turn with frames.`);
-    return { name, turns };
-  });
+    loaded.set(name, turns);
+  }
+  return loaded;
 }
 
 const ITEM_UPDATES = { agent_message_chunk: "assistant_message", agent_thought_chunk: "reasoning" };
@@ -234,7 +241,7 @@ async function runAgent(config) {
   const write = makeWriter(process.stdout);
   const recordStats = makeStatsSink(config.statsDir, "fake-acp");
   const transcripts = loadTranscripts(config);
-  const turnCount = transcripts.reduce((sum, entry) => sum + entry.turns.length, 0);
+  const mix = mixRecord(config.mix);
   const requests = {};
   const sessions = new Map();
   const pendingAgentRequests = new Map();
@@ -243,13 +250,13 @@ async function runAgent(config) {
 
   const send = (message) => write(JSON.stringify({ jsonrpc: "2.0", ...message }));
 
+  // A session claims its ordinal at its first prompt (a probe's session never prompts) and
+  // plays the transcript that ordinal picks, turn after turn.
   const pickTurn = (session) => {
-    let index = (hashOf(session.sessionId) + session.played++) % turnCount;
-    for (const { name, turns } of transcripts) {
-      if (index < turns.length) return { name, turn: index, compiled: turns[index] };
-      index -= turns.length;
-    }
-    throw new Error("unreachable");
+    session.assignment ??= assign(config, claimOrdinal(config.stateDir, session.sessionId));
+    const turns = transcripts.get(session.assignment.transcript);
+    const turn = session.played++ % turns.length;
+    return { name: session.assignment.transcript, turn, compiled: turns[turn] };
   };
 
   const play = async (session, controller) => {
@@ -295,9 +302,13 @@ async function runAgent(config) {
     const aborted = controller.signal.aborted;
     recordStats({
       at: new Date().toISOString(),
+      kind: "turn",
       pid: process.pid,
       fake: "acp",
       sessionId: session.sessionId,
+      ordinal: session.assignment.ordinal,
+      seed: config.seed,
+      mix,
       transcript: pick.name,
       turn: pick.turn,
       loops: config.turnLoops,
@@ -419,7 +430,8 @@ async function main(argv, env) {
   await runAgent(
     readConfig(env, {
       transcriptVar: "BENCH_ACP_TRANSCRIPT",
-      defaultTranscripts: DEFAULT_TRANSCRIPTS,
+      defaultMix: DEFAULT_MIX,
+      defaultStateDir: NodePath.join(NodeOS.tmpdir(), "t3-fake-acp"),
     }),
   );
 }

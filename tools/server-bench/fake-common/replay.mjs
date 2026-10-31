@@ -11,10 +11,14 @@ export const FIXTURES_DIR = NodeURL.fileURLToPath(
 );
 
 export const FAULTS = ["truncated-frame", "truncated-frame-exit", "bad-shape", "exit-mid-turn"];
+// The assignment cycle is materialised, so weights stay small.
+const MAX_MIX_WEIGHT = 10_000;
 
 export const KNOBS_HELP = `  BENCH_SPEED               Time scale for every wait (default 1). 0 never waits.
   BENCH_DELTAS_PER_SEC      Streamed delta rate at speed 1 (default 40).
   BENCH_TURN_LOOPS          Times a turn's body plays before the turn ends (default 1).
+  BENCH_SEED                Rotates where the transcript assignment cycle starts (default 0).
+  BENCH_STATE_DIR           Where sessions claim their ordinals; fresh for each run.
   BENCH_STATS_DIR           Append a JSON line per played turn to <dir>/<fake>-<pid>.ndjson.
   BENCH_FAULT               Halfway through the first turn a process plays:
                               truncated-frame       a cut-off JSON line, then the turn goes on
@@ -23,8 +27,8 @@ export const KNOBS_HELP = `  BENCH_SPEED               Time scale for every wait
                               exit-mid-turn         exit status 1 with the turn unfinished
   BENCH_NODE                The node binary the launcher runs (default: node on PATH).`;
 
-/** The knobs in `env`; `transcriptVar` names the fake's own transcript list. */
-export function readConfig(env, { transcriptVar, defaultTranscripts }) {
+/** The knobs in `env`; `transcriptVar` names the fake's own transcript mix. */
+export function readConfig(env, { transcriptVar, defaultMix, defaultStateDir }) {
   const number = (name, fallback, valid, expected) => {
     const raw = env[name]?.trim();
     if (raw === undefined || raw === "") return fallback;
@@ -38,10 +42,6 @@ export function readConfig(env, { transcriptVar, defaultTranscripts }) {
       `BENCH_FAULT must be one of ${FAULTS.join(", ")}, not ${JSON.stringify(fault)}.`,
     );
   }
-  const transcripts = (env[transcriptVar] ?? "")
-    .split(",")
-    .map((name) => name.trim())
-    .filter((name) => name.length > 0);
   return {
     speed: number("BENCH_SPEED", 1, (value) => value >= 0 && value < Infinity, "a number >= 0"),
     deltasPerSec: number(
@@ -56,11 +56,88 @@ export function readConfig(env, { transcriptVar, defaultTranscripts }) {
       (value) => Number.isSafeInteger(value) && value >= 1,
       "an integer >= 1",
     ),
-    transcripts: transcripts.length > 0 ? transcripts : defaultTranscripts,
+    mix: parseMix(env[transcriptVar], transcriptVar, defaultMix),
+    seed: number(
+      "BENCH_SEED",
+      0,
+      (value) => Number.isSafeInteger(value) && value >= 0,
+      "an integer >= 0",
+    ),
+    stateDir: env.BENCH_STATE_DIR?.trim() || defaultStateDir,
     statsDir: env.BENCH_STATS_DIR?.trim() || undefined,
     fault,
   };
 }
+
+/** Comma-separated `name` or `name:weight` entries; a weight defaults to 1. */
+export function parseMix(value, variable, fallback) {
+  const weights = new Map();
+  for (const entry of (value ?? "").split(",")) {
+    if (entry.trim() === "") continue;
+    const weighted = /^(.+):(\d+)$/.exec(entry.trim());
+    const name = (weighted?.[1] ?? entry).trim();
+    const weight = weighted === null ? 1 : Number(weighted[2]);
+    if (weight < 1) throw new Error(`${variable} weight of ${name} must be at least 1.`);
+    weights.set(name, (weights.get(name) ?? 0) + weight);
+  }
+  const mix = [...weights].map(([name, weight]) => ({ name, weight }));
+  if (mix.reduce((sum, { weight }) => sum + weight, 0) > MAX_MIX_WEIGHT) {
+    throw new Error(`${variable} weights must add up to at most ${MAX_MIX_WEIGHT}.`);
+  }
+  return mix.length > 0 ? mix : fallback;
+}
+
+/**
+ * The mix as one assignment cycle, spread by smooth weighted round-robin: the cycle holds each
+ * transcript `weight` times, and each of its prefixes is within one of its weighted share.
+ */
+export function mixCycle(mix) {
+  const total = mix.reduce((sum, { weight }) => sum + weight, 0);
+  const current = mix.map(() => 0);
+  const cycle = [];
+  for (let step = 0; step < total; step++) {
+    let best = 0;
+    mix.forEach(({ weight }, index) => {
+      current[index] += weight;
+      if (current[index] > current[best]) best = index;
+    });
+    current[best] -= total;
+    cycle.push(mix[best].name);
+  }
+  return cycle;
+}
+
+/**
+ * The session's ordinal: the next free one in `stateDir`, claimed with an exclusive create so
+ * concurrent fakes never share one. A session claims once and keeps its ordinal.
+ */
+export function claimOrdinal(stateDir, sessionId) {
+  NodeFS.mkdirSync(stateDir, { recursive: true });
+  const sessionFile = NodePath.join(stateDir, `session-${sessionId.replace(/[^\w-]/g, "_")}`);
+  if (NodeFS.existsSync(sessionFile)) return Number(NodeFS.readFileSync(sessionFile, "utf8"));
+  const claimed = NodeFS.readdirSync(stateDir).filter((file) => file.startsWith("ordinal-"));
+  for (let ordinal = claimed.length; ; ordinal++) {
+    try {
+      NodeFS.writeFileSync(NodePath.join(stateDir, `ordinal-${ordinal}`), sessionId, {
+        flag: "wx",
+      });
+    } catch (error) {
+      if (error.code === "EEXIST") continue;
+      throw error;
+    }
+    NodeFS.writeFileSync(sessionFile, String(ordinal));
+    return ordinal;
+  }
+}
+
+/** The transcript an ordinal plays: its place in the mix's cycle, rotated by the seed. */
+export function assign(config, ordinal) {
+  const cycle = mixCycle(config.mix);
+  return { ordinal, transcript: cycle[(ordinal + config.seed) % cycle.length] };
+}
+
+/** The mix as `{ name: weight }`, for stats lines. */
+export const mixRecord = (mix) => Object.fromEntries(mix.map(({ name, weight }) => [name, weight]));
 
 /** A fixture name (its `fileName` under the replay fixtures) or an absolute .ndjson path. */
 export function transcriptPath(name, fileName) {
@@ -121,14 +198,6 @@ export async function injectExitFault(fault, line, write) {
   process.stdout.end(() => process.exit(1));
   await new Promise(() => {});
 }
-
-export const hashOf = (text) => {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < text.length; index++) {
-    hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
-  }
-  return hash;
-};
 
 const EXACT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const randomOf = (alphabet) => alphabet[NodeCrypto.randomInt(alphabet.length)];

@@ -176,6 +176,7 @@ export function sessionsByInstance(
 }
 
 export interface BenchKnobs {
+  readonly seed?: string | undefined;
   readonly speed?: string | undefined;
   readonly deltasPerSec?: string | undefined;
   readonly turnLoops?: string | undefined;
@@ -188,6 +189,8 @@ export interface BenchInstanceOptions {
   readonly node: string;
   /** Each fake appends a JSON line per played turn here (BENCH_STATS_DIR). */
   readonly statsDir: string;
+  /** Each kind claims session ordinals in `<stateDir>/<kind>` (BENCH_STATE_DIR); fresh per run. */
+  readonly stateDir?: string;
   readonly kinds: ReadonlyArray<ProviderKind>;
   readonly knobs?: BenchKnobs;
   readonly transcripts?: Partial<Record<ProviderKind, string>>;
@@ -236,6 +239,9 @@ export function benchProviderInstances(
       environment: environment({
         BENCH_NODE: options.node,
         BENCH_STATS_DIR: options.statsDir,
+        BENCH_STATE_DIR:
+          options.stateDir === undefined ? undefined : NodePath.join(options.stateDir, kind),
+        BENCH_SEED: options.knobs?.seed,
         BENCH_SPEED: options.knobs?.speed,
         BENCH_DELTAS_PER_SEC: options.knobs?.deltasPerSec,
         BENCH_TURN_LOOPS: options.knobs?.turnLoops,
@@ -304,6 +310,9 @@ a running Codex app-server is shared by its instance's sessions and keeps the en
 started with.
 
   --kinds LIST              claude,codex,acp (default codex,acp; claude needs fake-claude/claude)
+  --seed N                  BENCH_SEED for every fake: where the transcript mix's cycle starts
+  --state-dir DIR           ordinals are claimed in DIR/<kind> (default <stats-dir>/../fake-state);
+                            use a fresh one for every run, so the same counts play the same plan
   --speed X                 BENCH_SPEED for every fake (time scale; 0 never waits)
   --deltas-per-sec N        BENCH_DELTAS_PER_SEC for every fake
   --turn-loops N            BENCH_TURN_LOOPS for every fake
@@ -323,6 +332,8 @@ function settingsCommand(argv: ReadonlyArray<string>): void {
       out: { type: "string" },
       "stats-dir": { type: "string" },
       kinds: { type: "string", default: "codex,acp" },
+      seed: { type: "string" },
+      "state-dir": { type: "string" },
       speed: { type: "string" },
       "deltas-per-sec": { type: "string" },
       "turn-loops": { type: "string" },
@@ -378,8 +389,12 @@ function settingsCommand(argv: ReadonlyArray<string>): void {
     benchDir,
     node: values.node,
     statsDir: NodePath.resolve(values["stats-dir"]),
+    stateDir: NodePath.resolve(
+      values["state-dir"] ?? NodePath.join(values["stats-dir"], "..", "fake-state"),
+    ),
     kinds: kinds as ReadonlyArray<ProviderKind>,
     knobs: {
+      seed: values.seed,
       speed: values.speed,
       deltasPerSec: values["deltas-per-sec"],
       turnLoops: values["turn-loops"],

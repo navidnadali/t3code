@@ -340,13 +340,20 @@ describe("fake codex app-server", () => {
     expect(first[0]).toMatchObject({ seed: 3, mix: { multi_turn: 2, simple: 1, web_search: 1 } });
   });
 
-  it("rejects knobs out of range", () => {
+  it("reads the mix and rejects knobs out of range", () => {
     const read = (env) =>
-      readConfig(env, { transcriptVar: "BENCH_CODEX_TRANSCRIPT", defaultTranscripts: ["simple"] });
-    expect(read({ BENCH_CODEX_TRANSCRIPT: " web_search, simple " }).transcripts).toEqual([
-      "web_search",
-      "simple",
+      readConfig(env, {
+        transcriptVar: "BENCH_CODEX_TRANSCRIPT",
+        defaultMix: [{ name: "simple", weight: 1 }],
+        defaultStateDir: "/state",
+      });
+    expect(read({ BENCH_CODEX_TRANSCRIPT: " web_search:3, simple,web_search " }).mix).toEqual([
+      { name: "web_search", weight: 4 },
+      { name: "simple", weight: 1 },
     ]);
+    expect(read({}).mix).toEqual([{ name: "simple", weight: 1 }]);
+    expect(() => read({ BENCH_CODEX_TRANSCRIPT: "simple:0" })).toThrow(/weight of simple/);
+    expect(() => read({ BENCH_SEED: "-1" })).toThrow(/BENCH_SEED/);
     expect(() => read({ BENCH_TURN_LOOPS: "0" })).toThrow(/BENCH_TURN_LOOPS/);
     expect(() => read({ BENCH_SPEED: "-1" })).toThrow(/BENCH_SPEED/);
     expect(() => read({ BENCH_FAULT: "explode" })).toThrow(/BENCH_FAULT/);

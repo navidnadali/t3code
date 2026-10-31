@@ -21,6 +21,7 @@ import * as SqliteClient from "./nodeSqliteClient.ts";
 
 const startedWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
 const workerExits = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, Promise<void>>());
+const workerParams = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, Array<unknown>>());
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
 
@@ -37,6 +38,14 @@ vi.mock("node:worker_threads", async (importOriginal) => {
       );
       startedWorkers.push(this);
       workerExits.set(this, new Promise((resolve) => this.once("exit", () => resolve())));
+      workerParams.set(this, []);
+    }
+    override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      const [request] = args;
+      if (typeof request === "object" && request !== null && "params" in request) {
+        workerParams.get(this)!.push(...(request.params as ReadonlyArray<unknown>));
+      }
+      super.postMessage(...args);
     }
     override terminate() {
       // A "ready" already queued when termination starts reaches the parent before "exit".
@@ -262,6 +271,52 @@ it.effect("serves another read while a read-only transaction is open", () =>
           }),
         )
         .pipe(SqliteClient.readOnly);
+    }),
+  ),
+);
+
+// oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary that lets the worker's queued messages land, not a wait for time
+const eventLoopTurn = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
+
+const holdReader = (sql: SqlClient.SqlClient, name: string) =>
+  Effect.gen(function* () {
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const fiber = yield* sql
+      .withTransaction(
+        sql`SELECT ${name} AS name`.pipe(
+          Effect.andThen(Deferred.succeed(held, undefined)),
+          Effect.andThen(Deferred.await(release)),
+        ),
+      )
+      .pipe(SqliteClient.readOnly, Effect.forkChild);
+    yield* Deferred.await(held);
+    return Deferred.succeed(release, undefined).pipe(Effect.andThen(Fiber.join(fiber)));
+  });
+
+const workerThatRan = (since: number, name: string) =>
+  startedWorkers.slice(since).findIndex((worker) => workerParams.get(worker)?.includes(name));
+
+it.effect("runs a waiting read on the first reader that frees up", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const startedBefore = startedWorkers.length;
+      const [first, second, ...rest] = yield* Effect.forEach(["a", "b", "c", "d"], (name) =>
+        holdReader(sql, name),
+      );
+      const waiting = yield* sql`SELECT ${"waiting"} AS name`.pipe(
+        SqliteClient.readOnly,
+        (effect) => Effect.forkChild(effect, { startImmediately: true }),
+      );
+      yield* second!;
+      // Wake-ups run on setImmediate, so one turn lets the waiting read claim the freed slot first.
+      yield* eventLoopTurn;
+      yield* first!;
+      yield* Effect.all(rest);
+      assert.deepEqual(yield* Fiber.join(waiting), [{ name: "waiting" }]);
+
+      assert.equal(startedWorkers.length - startedBefore, 4);
+      assert.equal(workerThatRan(startedBefore, "waiting"), workerThatRan(startedBefore, "b"));
     }),
   ),
 );
@@ -588,9 +643,6 @@ it.effect("finishes masked database cleanup after its caller is interrupted", ()
     ]);
   }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:" }))),
 );
-
-// oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary that lets the worker's queued messages land, not a wait for time
-const eventLoopTurn = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
 
 it.effect.each([
   { reservation: false, masked: false },

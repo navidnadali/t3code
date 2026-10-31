@@ -7,6 +7,7 @@ import * as NodePath from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  historyAssignments,
   parseProviderLoad,
   planSessions,
   readBenchKnobs,
@@ -59,6 +60,40 @@ describe("bench session plan", () => {
       /--codex-sessions/,
     );
     expect(() => parseProviderLoad({ "acp-sessions": "1.5" }, PRIMARY)).toThrow(/--acp-sessions/);
+  });
+});
+
+describe("history mode", () => {
+  it("keeps every session on its planned instance and counts the threads each takes over", () => {
+    const plan = planSessions(
+      parseProviderLoad(
+        { "codex-sessions": "2", "acp-sessions": "1" },
+        { ...PRIMARY, sessions: 1 },
+      ),
+    );
+    const thread = (instanceId: string) => ({ id: instanceId, modelSelection: { instanceId } });
+    const { assignments, switches } = historyAssignments(plan, [
+      thread("codex"),
+      thread("claudeBench"),
+      thread("acpBench"),
+      thread("claudeAgent"),
+      thread("spare"),
+    ]);
+
+    expect(
+      assignments.map(({ session, thread: seeded, switchProvider }) => [
+        session.instanceId,
+        seeded.id,
+        switchProvider,
+      ]),
+    ).toEqual([
+      ["codexBench", "codex", true],
+      ["claudeBench", "claudeBench", false],
+      ["acpBench", "acpBench", false],
+      ["codexBench", "claudeAgent", true],
+    ]);
+    expect(switches).toEqual({ codexBench: 2 });
+    expect(() => historyAssignments(plan, [thread("codex")])).toThrow(/4 sessions/);
   });
 });
 

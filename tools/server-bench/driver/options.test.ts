@@ -58,7 +58,40 @@ describe("parseDriverOptions", () => {
     });
   });
 
+  it("plans Codex and ACP sessions next to --sessions on the bench instances", () => {
+    const options = parseDriverOptions([
+      ...required,
+      "--sessions",
+      "2",
+      "--codex-sessions",
+      "3",
+      "--acp-sessions",
+      "1",
+    ]);
+
+    expect(options).toMatchObject({
+      provider: "claudeBench",
+      sessions: 2,
+      codexSessions: 3,
+      acpSessions: 1,
+      subscribers: 6,
+    });
+    expect(options.sessionPlan.map((session) => [session.instanceId, session.model])).toEqual([
+      ["codexBench", "gpt-6-luna"],
+      ["claudeBench", "claude-sonnet-4-6"],
+      ["codexBench", "gpt-6-luna"],
+      ["acpBench", "bench-replay"],
+      ["claudeBench", "claude-sonnet-4-6"],
+      ["codexBench", "gpt-6-luna"],
+    ]);
+    expect(
+      parseDriverOptions([...required, "--mode", "fresh", "--sessions", "0", "--acp-sessions", "2"])
+        .sessionPlan.length,
+    ).toBe(2);
+  });
+
   it.each([
+    [[...required, "--codex-sessions=-1"], "--codex-sessions must be an integer"],
     [["--out", "/tmp/bench"], "--url is required"],
     [[...required, "--mode", "replay"], "--mode must be fresh or history"],
     [[...required, "--sessions", "1.5"], "--sessions must be an integer"],
@@ -67,7 +100,7 @@ describe("parseDriverOptions", () => {
     [[...required, "--taskset", "all"], "--taskset takes a CPU list"],
     [[...required, "--max-driver-elu", "2"], "--max-driver-elu must be between 0 and 1"],
     [[...required, "--sessions-per-socket", "0"], "--sessions-per-socket must be an integer"],
-    [[...required, "--mode", "fresh", "--sessions", "0"], "--sessions must be > 0"],
+    [[...required, "--mode", "fresh", "--sessions", "0"], "start at least one session"],
   ])("rejects %j", (argv, message) => {
     expect(() => parseDriverOptions(argv)).toThrow(UsageError);
     expect(() => parseDriverOptions(argv)).toThrow(message);

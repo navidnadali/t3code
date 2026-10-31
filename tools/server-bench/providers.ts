@@ -167,6 +167,39 @@ export function planSessions(groups: ReadonlyArray<SessionGroup>): ReadonlyArray
   }));
 }
 
+/**
+ * History mode: session i continues seeded thread i on the instance the plan gives it, whatever
+ * that thread last ran on; such a thread switches with the session's first turn. `switches`
+ * counts, per instance, the threads it takes over that way.
+ */
+export function historyAssignments<
+  T extends { readonly modelSelection: { readonly instanceId: string } },
+>(
+  plan: ReadonlyArray<PlannedSession>,
+  threads: ReadonlyArray<T>,
+): {
+  readonly assignments: ReadonlyArray<{
+    readonly session: PlannedSession;
+    readonly thread: T;
+    readonly switchProvider: boolean;
+  }>;
+  readonly switches: Readonly<Record<string, number>>;
+} {
+  if (threads.length < plan.length) {
+    throw new ProviderLoadError(
+      `${plan.length} sessions need as many threads, not ${threads.length}`,
+    );
+  }
+  const switches: Record<string, number> = {};
+  const assignments = plan.map((session, index) => {
+    const thread = threads[index]!;
+    const switchProvider = thread.modelSelection.instanceId !== session.instanceId;
+    if (switchProvider) switches[session.instanceId] = (switches[session.instanceId] ?? 0) + 1;
+    return { session, thread, switchProvider };
+  });
+  return { assignments, switches };
+}
+
 /** Sessions per provider instance, the way a run's result names them. */
 export function sessionsByInstance(
   plan: ReadonlyArray<PlannedSession>,

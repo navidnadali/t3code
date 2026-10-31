@@ -227,6 +227,7 @@ export class Session {
 
   readonly index: number;
   readonly threadId: string;
+  readonly selection: { readonly instanceId: string; readonly model: string };
   private readonly context: RunContext;
   private readonly socket: RpcSocket;
   private readonly watcher: ShellWatcher;
@@ -239,6 +240,9 @@ export class Session {
     readonly socket: RpcSocket;
     readonly watcher: ShellWatcher;
     readonly rng: Rng;
+    /** The provider instance and model this session's turns run on. */
+    readonly selection: { readonly instanceId: string; readonly model: string };
+    /** History mode: the seeded thread ran elsewhere, so the first turn switches it. */
     readonly switchProvider: boolean;
   }) {
     this.index = input.index;
@@ -247,13 +251,9 @@ export class Session {
     this.socket = input.socket;
     this.watcher = input.watcher;
     this.rng = input.rng;
-    const { context, watcher, threadId } = input;
-    if (input.switchProvider) {
-      this.pendingModelSelection = {
-        instanceId: context.options.provider,
-        model: context.options.model,
-      };
-    }
+    this.selection = input.selection;
+    const { watcher, threadId } = input;
+    if (input.switchProvider) this.pendingModelSelection = { ...input.selection };
     watcher.listen(threadId, (shell) => this.onShell(shell));
   }
 
@@ -278,7 +278,7 @@ export class Session {
             projectId,
             title,
             generateTitle: false,
-            modelSelection: { instanceId: options.provider, model: options.model },
+            modelSelection: { ...this.selection },
             runtimeMode: options.runtimeMode,
             interactionMode: "default",
             workspaceStrategy: { type: "root" },

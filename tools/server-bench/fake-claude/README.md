@@ -34,8 +34,9 @@ Not generated: the per-session MCP traffic a real agent sends to the server's `/
 driver, P1-004, models it), permission prompts (run bench threads in full access), hook callbacks
 and SDK MCP calls. For the driver, `BENCH_MCP_CREDENTIALS_DIR` hands over what the server sends in
 `mcp_set_servers`: the session's T3 MCP URL and `Authorization` header, as
-`{"url", "authorization"}` in `<dir>/<session-id>.json` (replaced atomically, mode 0600, never
-logged; a later `mcp_set_servers` for the session replaces the file, and files are not removed).
+`{"url", "authorization"}` in `<dir>/<session-id>.json` (replaced atomically, mode 0600 in a
+directory locked to 0700 at start, never logged; a later `mcp_set_servers` for the session replaces
+the file, and files are not removed).
 
 ## Knobs
 

@@ -371,6 +371,36 @@ describe("secrets", () => {
     expect(leftovers).toEqual([]);
   });
 
+  it("never carries a private key match across JSON fields", () => {
+    const pem = SAMPLES["private-key"] as string;
+    const item = {
+      type: "command_execution",
+      input: `grep -l "-----BEGIN RSA ${"PRIVATE"} KEY-----" keys/`,
+      output: pem,
+      exitCode: 0,
+    };
+    const once = JSON.stringify(item);
+    const twice = JSON.stringify({ input: once });
+    const decoded = JSON.parse(redact(once)) as typeof item;
+    const nested = JSON.parse(
+      (JSON.parse(redact(twice)) as { input: string }).input,
+    ) as typeof item;
+    expect([Object.keys(decoded), Object.keys(nested)]).toEqual([
+      Object.keys(item),
+      Object.keys(item),
+    ]);
+    expect([decoded.type, decoded.exitCode, nested.type]).toEqual([
+      "command_execution",
+      0,
+      "command_execution",
+    ]);
+    expect([secretHits(redact(once)), secretHits(redact(twice))]).toEqual([[], []]);
+    expect([decoded.output.includes("Ab12"), nested.output.includes("Cd34")]).toEqual([
+      false,
+      false,
+    ]);
+  });
+
   it("finds a credential that straddles a chunk boundary of the raw file", () => {
     const path = NodePath.join(scratch("raw"), "file.bin");
     const token = SAMPLES["github-token"] as string;

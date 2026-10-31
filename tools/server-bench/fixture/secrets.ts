@@ -3,11 +3,12 @@ import * as NodeFS from "node:fs";
 
 /** Credential shapes the sanitiser redacts and the self-check must find none of. */
 export const SECRET_PATTERNS: ReadonlyArray<{ readonly name: string; readonly pattern: RegExp }> = [
-  // The whole block up to its footer; without one, everything up to the end of the JSON string.
+  // The whole block up to its footer, else to the end of its string; a key holds no quote, so the
+  // match never crosses into another JSON field, at any encoding depth.
   {
     name: "private-key",
     pattern:
-      /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]{0,65536}?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|(?:[^"\\]|\\+[^"\\])*)/g,
+      /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:[^"]{0,65536}?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|[^"]*)/g,
   },
   { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}/g },
   { name: "github-pat", pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}/g },

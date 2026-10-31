@@ -306,6 +306,17 @@ describe("assertSafeDestination", () => {
     ).toBe(NodePath.join(NodeFS.realpathSync(root), "copy.sqlite"));
   });
 
+  it("resolves `symlink/..` the way the OS does before checking a destination", () => {
+    const root = scratch("dotdot");
+    const home = NodePath.join(root, ".t3");
+    NodeFS.mkdirSync(NodePath.join(home, "userdata"), { recursive: true });
+    NodeFS.symlinkSync(NodePath.join(home, "userdata"), NodePath.join(root, "link"));
+    const physical = NodePath.join(root, "link", "..", "fixture.sqlite");
+    expect(() => assertSafeDestination({ destination: physical, homes: [home] })).toThrow(
+      /inside the T3 home/,
+    );
+  });
+
   it("refuses to overwrite its source, the source's WAL, or any existing file", () => {
     const root = scratch("source");
     const source = NodePath.join(root, "state.sqlite");
@@ -560,6 +571,27 @@ describe("fixture CLI", () => {
     expect(NodeCrypto.createHash("sha256").update(NodeFS.readFileSync(source)).digest("hex")).toBe(
       before,
     );
+  });
+
+  it("sanitise refuses a --report that reaches the live database through `symlink/..`", () => {
+    const home = scratch("cli-dotdot");
+    const userdata = NodePath.join(home, ".t3", "userdata");
+    NodeFS.mkdirSync(userdata, { recursive: true });
+    const live = NodePath.join(userdata, "statev2.sqlite");
+    new NodeSqlite.DatabaseSync(live).close();
+    const before = NodeFS.readFileSync(live);
+    const work = scratch("cli-dotdot-work");
+    NodeFS.symlinkSync(userdata, NodePath.join(work, "link"));
+    const source = NodePath.join(work, "source.sqlite");
+    new NodeSqlite.DatabaseSync(source).close();
+    const report = NodePath.join(work, "link", "..", "userdata", "statev2.sqlite");
+    const refused = run(
+      ["sanitise", "--report", report, source, NodePath.join(work, "out.sqlite")],
+      { HOME: home },
+    );
+    expect(refused.status).toBe(2);
+    expect(NodeFS.readFileSync(live).equals(before)).toBe(true);
+    expect(NodeFS.existsSync(NodePath.join(work, "out.sqlite"))).toBe(false);
   });
 
   it("synth builds the example within 10 % of its size and every table's rows at scale 1", () => {

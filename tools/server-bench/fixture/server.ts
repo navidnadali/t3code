@@ -183,6 +183,10 @@ const RUNNABLE_QUERIES: ReadonlyArray<readonly [string, string]> = [
     `SELECT COUNT(*) AS n FROM (${WATCHED_THREADS})`,
   ],
   [
+    "orchestration_v2_projection_threads.pullRequestOrBranch",
+    `SELECT COUNT(*) AS n FROM (${PULL_REQUEST_THREADS})`,
+  ],
+  [
     "orchestration_v2_projection_threads.limitRecovery",
     `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads
      WHERE json_extract(payload_json, '$.limitRecovery') IS NOT NULL`,

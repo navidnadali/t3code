@@ -188,6 +188,15 @@ const seedPendingWork = (path: string) => {
        ?, ?, ?, 'never', 0, ?, ?)`,
   ).run(projectId, at, at, at, SAMPLES["github-token"] as string, "webhook-secret-value");
   db.prepare(
+    `INSERT INTO scheduled_task_webhook_pending
+       (delivery_id, task_id, coalesce_key, due_at, task_json, request_json, delivery_ids_json)
+     VALUES ('delivery-1', 'task-1', 'key-1', 0, '{}', '{}', '["delivery-1"]')`,
+  ).run();
+  db.prepare(
+    `INSERT INTO provider_session_runtime (thread_id, provider_name, adapter_key, status, last_seen_at)
+     VALUES (?, 'claudeAgent', 'claudeAgent', 'running', ?)`,
+  ).run(running, at);
+  db.prepare(
     `INSERT INTO orchestration_v2_thread_launch_workflows
        (command_id, thread_id, project_id, status, title, created_at, updated_at)
      VALUES ('launch-1', 'thread-launching', ?, 'pending', 'Launching', ?, ?)`,
@@ -501,6 +510,11 @@ describe("fixture CLI", () => {
     const seeded = NodePath.join(directory, "seeded.sqlite");
     synth(seeded, "0.25");
     const { dropped, kept, idle } = seedPendingWork(seeded);
+    const before = run(["scan", seeded]);
+    expect(before.status).toBe(1);
+    const found = (JSON.parse(before.stdout) as { runnable: Record<string, number> }).runnable;
+    const missed = Object.entries(found).filter(([, value]) => value === 0);
+    expect(missed).toEqual([]);
     const report = NodePath.join(directory, "report.json");
     const clean = NodePath.join(directory, "clean.sqlite");
     const result = run(["sanitise", "--report", report, seeded, clean]);

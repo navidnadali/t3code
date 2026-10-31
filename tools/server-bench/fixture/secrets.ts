@@ -3,13 +3,8 @@ import * as NodeFS from "node:fs";
 
 /** Credential shapes the sanitiser redacts and the self-check must find none of. */
 export const SECRET_PATTERNS: ReadonlyArray<{ readonly name: string; readonly pattern: RegExp }> = [
-  // The whole block up to its footer, else to the end of its string; a key holds no quote, so the
-  // match never crosses into another JSON field, at any encoding depth.
-  {
-    name: "private-key",
-    pattern:
-      /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:[^"]{0,65536}?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|[^"]*)/g,
-  },
+  // Found by its header; `redact` masks the whole block inside its decoded string (redactKeys).
+  { name: "private-key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g },
   { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}/g },
   { name: "github-pat", pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}/g },
   { name: "gitlab-token", pattern: /\bglpat-[A-Za-z0-9_-]{20,}/g },
@@ -63,10 +58,42 @@ export const MAYBE_SECRET = new RegExp(
   "i",
 );
 
+const KEY_BLOCK =
+  /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|[\s\S]*)/g;
+const STRING_TOKEN = /"(?:[^"\\]|\\.)*"/g;
+
+const parsesAsJson = (text: string) => {
+  const start = text.trimStart()[0];
+  if (start !== "{" && start !== "[") return false;
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Masks whole private key blocks (header to footer, else to the end of the string) inside the
+ * decoded string value that holds them, recursing into JSON-encoded strings, so armor headers
+ * with quotes stay covered and no match crosses into another field.
+ */
+const redactKeys = (text: string): string => {
+  if (!text.includes("PRIVATE KEY")) return text;
+  if (!parsesAsJson(text)) return text.replace(KEY_BLOCK, mask);
+  return text.replace(STRING_TOKEN, (token) => {
+    if (!token.includes("PRIVATE KEY")) return token;
+    const decoded = JSON.parse(token) as string;
+    const redacted = redactKeys(decoded);
+    return redacted === decoded ? token : JSON.stringify(redacted);
+  });
+};
+
 /** Masks each match; a pattern with a `secret` group masks only that part (an assignment's value). */
 export const redact = (text: string): string => {
-  let out = text;
-  for (const { pattern } of SECRET_PATTERNS) {
+  let out = redactKeys(text);
+  for (const { name, pattern } of SECRET_PATTERNS) {
+    if (name === "private-key") continue;
     out = out.replace(pattern, (match: string, ...rest: Array<unknown>) => {
       const groups = rest.at(-1) as { secret?: string } | string;
       const secret = typeof groups === "object" ? groups.secret : undefined;

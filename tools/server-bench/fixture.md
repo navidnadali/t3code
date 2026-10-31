@@ -33,7 +33,8 @@ existing file, the source itself or its `-wal`/`-shm`/`-journal`, and a report p
    the pull request sync and branch discovery read from the host and git.
 5. Redact credential-shaped text (`fixture/secrets.ts`) in every text column: letters and digits become `*`,
    punctuation and escapes stay (JSON keeps parsing at any nesting depth, sizes keep their shape); private keys go
-   as whole blocks (to the footer, else to the end of the string) and an assignment loses only its value.
+   as whole blocks inside the decoded string that holds them (to the footer, else to the end of that string, JSON
+   encodings unwrapped) and an assignment loses only its value.
 6. Rebuild the message search index, `VACUUM INTO` the destination (no free pages keep deleted text), `chmod 600`.
 7. Self-check, else delete the destination and fail: no pattern hit in any text column or in the raw file bytes, no
    non-null credential-named column, and nothing a server would run on boot (recovery threads, scheduled tasks,

@@ -371,6 +371,28 @@ describe("secrets", () => {
     expect(leftovers).toEqual([]);
   });
 
+  it("masks a PGP block whose armor header quotes text, in plain text and nested JSON", () => {
+    const pgp = [
+      `-----BEGIN PGP ${"PRIVATE"} KEY BLOCK-----`,
+      'Comment: "benchmark"',
+      "",
+      `lQOYBF${"Ij90".repeat(15)}`,
+      `-----END PGP ${"PRIVATE"} KEY BLOCK-----`,
+    ].join("\n");
+    const nested = JSON.stringify({ input: JSON.stringify({ output: pgp, after: "kept" }) });
+    const plain = redact(pgp);
+    const decoded = JSON.parse((JSON.parse(redact(nested)) as { input: string }).input) as {
+      output: string;
+      after: string;
+    };
+    expect([plain.includes("Ij90"), decoded.output.includes("Ij90"), decoded.after]).toEqual([
+      false,
+      false,
+      "kept",
+    ]);
+    expect([secretHits(plain), secretHits(redact(nested))]).toEqual([[], []]);
+  });
+
   it("never carries a private key match across JSON fields", () => {
     const pem = SAMPLES["private-key"] as string;
     const item = {

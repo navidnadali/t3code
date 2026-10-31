@@ -91,6 +91,44 @@ const frameOf = (line) => {
   }
 };
 const isTurnCompleted = (line) => frameOf(line)?.method === "turn/completed";
+const statsIn = (dir) =>
+  NodeFS.readdirSync(dir).flatMap((file) =>
+    NodeFS.readFileSync(NodePath.join(dir, file), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line)),
+  );
+
+/** Plays `threads` threads of `turns` turns, one after the other; returns each turn's plan. */
+async function offeredPlan(env, threads, turns) {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-codex-plan-"));
+  using fake = startFake({
+    ...env,
+    BENCH_STATS_DIR: NodePath.join(dir, "stats"),
+    BENCH_STATE_DIR: NodePath.join(dir, "state"),
+  });
+  let id = 1;
+  for (let thread = 0; thread < threads; thread++) {
+    fake.send({ id, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
+    const threadId = frameOf((await fake.until(answerTo(id++))).at(-1)).result.thread.id;
+    for (let turn = 0; turn < turns; turn++) {
+      fake.send({ id: id++, method: "turn/start", params: { threadId, input: [] } });
+      await fake.until(isTurnCompleted);
+    }
+  }
+  fake.end();
+  await fake.exited;
+  return statsIn(NodePath.join(dir, "stats"))
+    .filter((record) => record.kind === "turn")
+    .map(({ ordinal, transcript, turn, seed, mix, frames }) => ({
+      ordinal,
+      transcript,
+      turn,
+      seed,
+      mix,
+      frames,
+    }));
+}
 const answerTo = (id) => (line) => frameOf(line)?.id === id && frameOf(line)?.method === undefined;
 
 describe("fake codex transcripts", () => {
@@ -279,6 +317,27 @@ describe("fake codex app-server", () => {
     expect(frames.find((frame) => frame.id === 3)).toMatchObject({ error: { code: -32600 } });
     expect(frames.at(-1).result).toEqual({ turnId });
     expect(() => decodeSteerResponse(frames.at(-1).result)).not.toThrow();
+  });
+
+  it("offers the same seeded, weighted plan on every run, whatever the thread ids", async () => {
+    const env = { BENCH_SEED: "3", BENCH_CODEX_TRANSCRIPT: "multi_turn:2,simple,web_search:1" };
+    const first = await offeredPlan(env, 5, 2);
+
+    expect(await offeredPlan(env, 5, 2)).toEqual(first);
+    // The weighted cycle is multi_turn, simple, web_search, multi_turn; seed 3 starts at its end.
+    expect(first.map(({ ordinal, transcript, turn }) => [ordinal, transcript, turn])).toEqual([
+      [0, "multi_turn", 0],
+      [0, "multi_turn", 1],
+      [1, "multi_turn", 0],
+      [1, "multi_turn", 1],
+      [2, "simple", 0],
+      [2, "simple", 0],
+      [3, "web_search", 0],
+      [3, "web_search", 0],
+      [4, "multi_turn", 0],
+      [4, "multi_turn", 1],
+    ]);
+    expect(first[0]).toMatchObject({ seed: 3, mix: { multi_turn: 2, simple: 1, web_search: 1 } });
   });
 
   it("rejects knobs out of range", () => {

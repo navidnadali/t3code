@@ -1,6 +1,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeURL from "node:url";
@@ -61,6 +62,7 @@ function startAgent(env) {
         if (match(next.value)) return read;
       }
     },
+    end: () => child.stdin.end(),
     [Symbol.dispose]: () => child.kill(),
   };
 }
@@ -73,6 +75,42 @@ const frameOf = (line) => {
   }
 };
 const answerTo = (id) => (line) => frameOf(line)?.id === id && frameOf(line)?.method === undefined;
+
+/** Plays `sessions` sessions (one agent each) of `turns` prompts; returns each turn's plan. */
+async function offeredPlan(env, sessions, turns) {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-acp-plan-"));
+  const stats = NodePath.join(dir, "stats");
+  for (let session = 0; session < sessions; session++) {
+    using agent = startAgent({
+      ...env,
+      BENCH_STATS_DIR: stats,
+      BENCH_STATE_DIR: NodePath.join(dir, "state"),
+    });
+    const sessionId = await openSession(agent);
+    for (let turn = 0; turn < turns; turn++) {
+      agent.send({ id: 10 + turn, method: "session/prompt", params: { sessionId, prompt: [] } });
+      await agent.until(answerTo(10 + turn));
+    }
+    agent.end();
+    await agent.exited;
+  }
+  return NodeFS.readdirSync(stats)
+    .flatMap((file) =>
+      NodeFS.readFileSync(NodePath.join(stats, file), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line)),
+    )
+    .toSorted((left, right) => left.ordinal - right.ordinal || left.at.localeCompare(right.at))
+    .map(({ ordinal, transcript, turn, seed, mix, frames }) => ({
+      ordinal,
+      transcript,
+      turn,
+      seed,
+      mix,
+      frames,
+    }));
+}
 
 async function openSession(agent) {
   agent.send(
@@ -186,6 +224,27 @@ describe("fake acp agent", () => {
     expect(first).toEqual([{ jsonrpc: "2.0", id: 3, result: { stopReason: "cancelled" } }]);
     expect(second.length).toBeGreaterThan(1);
     expect(second.at(-1).result).toEqual({ stopReason: "end_turn" });
+  });
+
+  it("offers the same seeded, weighted plan on every run, whatever the session ids", async () => {
+    const env = { BENCH_SEED: "3", BENCH_ACP_TRANSCRIPT: "multi_turn:2,simple,todo_list:1" };
+    const first = await offeredPlan(env, 5, 2);
+
+    expect(await offeredPlan(env, 5, 2)).toEqual(first);
+    // The weighted cycle is multi_turn, simple, todo_list, multi_turn; seed 3 starts at its end.
+    expect(first.map(({ ordinal, transcript, turn }) => [ordinal, transcript, turn])).toEqual([
+      [0, "multi_turn", 0],
+      [0, "multi_turn", 1],
+      [1, "multi_turn", 0],
+      [1, "multi_turn", 1],
+      [2, "simple", 0],
+      [2, "simple", 0],
+      [3, "todo_list", 0],
+      [3, "todo_list", 0],
+      [4, "multi_turn", 0],
+      [4, "multi_turn", 1],
+    ]);
+    expect(first[0]).toMatchObject({ seed: 3, mix: { multi_turn: 2, simple: 1, todo_list: 1 } });
   });
 
   it.each([

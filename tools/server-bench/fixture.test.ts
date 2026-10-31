@@ -280,6 +280,123 @@ const seedPendingWork = (path: string) => {
   return { dropped: [running, queued, limited, watched], kept, idle };
 };
 
+/** Plants the review's credential cases where real data held them; returns what must not survive. */
+const seedCredentials = (path: string) => {
+  const db = new NodeSqlite.DatabaseSync(path);
+  const at = "2026-01-01T00:00:00.000Z";
+  const item = (type: string) =>
+    (
+      db
+        .prepare(
+          `SELECT turn_item_id AS id FROM orchestration_v2_projection_turn_items
+           WHERE type = ? ORDER BY turn_item_id LIMIT 1`,
+        )
+        .get(type) as { id: string }
+    ).id;
+  const setItem = (id: string, path: string, value: unknown) =>
+    db
+      .prepare(
+        `UPDATE orchestration_v2_projection_turn_items SET payload_json = json_set(payload_json, ?, json(?))
+         WHERE turn_item_id = ?`,
+      )
+      .run(path, JSON.stringify(value), id);
+  const command = item("command_execution");
+  setItem(command, "$.output", `gh auth token\n${TOKENS.github}\n`);
+  setItem(command, "$.input", FORMS.cfApiToken?.text);
+  const tool = item("dynamic_tool");
+  setItem(
+    tool,
+    "$.output",
+    JSON.stringify({ stdout: `token:\n${TOKENS.github}`, aws: `\t${TOKENS.aws}` }),
+  );
+  const reasoning = item("reasoning");
+  setItem(reasoning, "$.text", `\u001b[31m${TOKENS.openai}\u001b[0m then ${TOKENS.slack}`);
+  const change = item("file_change");
+  const pem = [
+    `-----BEGIN RSA ${"PRIVATE"} KEY-----`,
+    ...KEY_LINES,
+    `-----END RSA ${"PRIVATE"} KEY-----`,
+  ];
+  setItem(
+    change,
+    "$.changes",
+    pem.map((line) => `+${line}`),
+  );
+  setItem(
+    change,
+    "$.diffStr",
+    [
+      FORMS.anthropicAuth,
+      FORMS.base64Anthropic,
+      FORMS.hexPassword,
+      FORMS.accessKey,
+      FORMS.sessionToken,
+    ]
+      .map((form) => form?.text)
+      .join("\n"),
+  );
+  db.prepare(
+    `UPDATE orchestration_events SET payload_json = json_set(payload_json, '$.output', ?)
+     WHERE sequence = (SELECT MIN(sequence) FROM orchestration_events WHERE event_type = 'turn-item.updated')`,
+  ).run(`result\n${TOKENS.jwt}`);
+  db.prepare(
+    `UPDATE orchestration_events SET metadata_json = json_set(metadata_json, '$.note', ?)
+     WHERE sequence = (SELECT MAX(sequence) FROM orchestration_events WHERE event_type = 'run.created')`,
+  ).run(FORMS.basicAuth?.text ?? "");
+  db.prepare(
+    `UPDATE orchestration_v2_projection_messages SET payload_json = json_set(payload_json, '$.text', ?)
+     WHERE message_id = (SELECT message_id FROM orchestration_v2_projection_messages ORDER BY message_id LIMIT 1)`,
+  ).run(`${FORMS.googleOauth?.text} and ${FORMS.emptyUserUrl?.text}`);
+  db.prepare(
+    `UPDATE projection_thread_messages SET text = ? WHERE message_id = (SELECT MIN(message_id) FROM projection_thread_messages)`,
+  ).run(`slack says\n${FORMS.slackXoxc?.text}`);
+  const thread = (
+    db
+      .prepare(
+        `SELECT thread_id AS id FROM orchestration_v2_projection_threads ORDER BY thread_id LIMIT 1`,
+      )
+      .get() as {
+      id: string;
+    }
+  ).id;
+  db.prepare(
+    `INSERT INTO mcp_app_model_context (thread_id, item_id, server, tool, text, updated_at)
+     VALUES (?, 'item-1', 'drive', 'oauth', ?, ?)`,
+  ).run(thread, FORMS.refreshToken?.text ?? "", at);
+  db.prepare(`UPDATE projection_projects SET scripts_json = ?`).run(
+    JSON.stringify([
+      {
+        id: "migrate",
+        name: "Migrate",
+        command: `${FORMS.dbPassword?.text} vp run migrate`,
+        icon: "play",
+        runOnWorktreeCreate: false,
+      },
+    ]),
+  );
+  db.prepare(
+    `UPDATE orchestration_v2_projection_provider_sessions SET payload_json = json_set(payload_json, '$.lastError', ?)`,
+  ).run(FORMS.sessionToken?.text ?? "");
+  db.prepare(
+    `UPDATE orchestration_v2_projection_threads
+     SET title = ?, payload_json = json_set(payload_json, '$.title', ?) WHERE thread_id = ?`,
+  ).run(FORMS.awsSecret?.text ?? "", FORMS.awsSecret?.text ?? "", thread);
+  db.prepare(
+    `UPDATE orchestration_v2_projection_subagents SET payload_json = json_set(payload_json, '$.prompt', ?)
+     WHERE subagent_id = (SELECT MIN(subagent_id) FROM orchestration_v2_projection_subagents)`,
+  ).run(`${FORMS.slackXoxd?.text}\n${FORMS.slackApp?.text}`);
+  db.prepare(
+    `UPDATE orchestration_v2_projection_runs SET payload_json = json_set(payload_json, '$.note', ?)
+     WHERE run_id = (SELECT MIN(run_id) FROM orchestration_v2_projection_runs)`,
+  ).run(FORMS.atlassian?.text ?? "");
+  db.close();
+  return [
+    ...Object.values(TOKENS),
+    ...Object.values(FORMS).map((form) => form.secret),
+    ...KEY_LINES,
+  ];
+};
+
 describe("assertSafeDestination", () => {
   it("refuses a destination inside a T3 home, directly or through a symlink", () => {
     const root = scratch("guard");
@@ -743,6 +860,47 @@ describe("fixture CLI", () => {
     const unlinked = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads WHERE thread_id = '${kept}'
       AND json_array_length(payload_json, '$.pullRequests') = 0 AND json_extract(payload_json, '$.branch') IS NULL`;
     expect(count(clean, unlinked)).toBe(1);
+  });
+});
+
+describe("sanitise content", () => {
+  it("leaves none of the review's planted credentials, and scan fails on any planted afterwards", () => {
+    const directory = scratch("credentials");
+    const seeded = NodePath.join(directory, "seeded.sqlite");
+    synth(seeded, "0.25");
+    const secrets = seedCredentials(seeded);
+    const clean = NodePath.join(directory, "clean.sqlite");
+    const result = run(["sanitise", seeded, clean]);
+    expect(result.status).toBe(0);
+    const raw = NodeFS.readFileSync(clean).toString("latin1");
+    const survivors = secrets.filter(
+      (secret) => raw.includes(secret) || raw.includes(JSON.stringify(secret).slice(1, -1)),
+    );
+    expect(survivors).toEqual([]);
+    expect(run(["scan", clean]).status).toBe(0);
+
+    const plant = (name: string, sql: string, value: string) => {
+      const copy = NodePath.join(directory, `${name}.sqlite`);
+      NodeFS.copyFileSync(clean, copy);
+      const db = new NodeSqlite.DatabaseSync(copy);
+      db.prepare(sql).run(value);
+      db.close();
+      return run(["scan", copy]).status;
+    };
+    const inId = plant(
+      "token-in-id",
+      `UPDATE orchestration_v2_projection_turn_items
+       SET payload_json = json_set(payload_json, '$.nativeItemRef', json_object('driver', 'claudeAgent', 'nativeId', ?, 'strength', 'strong'))
+       WHERE turn_item_id = (SELECT MIN(turn_item_id) FROM orchestration_v2_projection_turn_items)`,
+      TOKENS.github as string,
+    );
+    const prose = plant(
+      "prose",
+      `UPDATE orchestration_v2_projection_messages SET payload_json = json_set(payload_json, '$.text', ?)
+       WHERE message_id = (SELECT MIN(message_id) FROM orchestration_v2_projection_messages)`,
+      "the staging db password is hunter two, keep it quiet",
+    );
+    expect([inId, prose]).toEqual([1, 1]);
   });
 });
 

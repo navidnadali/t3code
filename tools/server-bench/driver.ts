@@ -657,6 +657,7 @@ class BenchRun implements RunContext {
           ? this.prepareHistory(snapshot.value, control, watcher)
           : this.prepareFresh(control, watcher),
       );
+      for (const session of sessions) session.watch();
       log(`sessions ready: ${sessions.length}`);
 
       const subscriberRng = this.rng.fork("subscribers");
@@ -735,29 +736,23 @@ class BenchRun implements RunContext {
       const eluStart = NodePerfHooks.performance.eventLoopUtilization();
       const cpuStart = process.cpuUsage();
       const windowStart = now();
-      const windowStartEpochMs = Date.now();
       recorder.setOpen(true);
-      for (const subscriber of subscribers) subscriber.windowOpened();
+      for (const client of [...sessions, ...subscribers]) client.windowOpened();
       this.sessionCallersAtWindowStart = this.sessionCallers().length;
       await this.race(delay(options.windowMs));
       recorder.setOpen(false);
-      const windowEndEpochMs = Date.now();
       const windowSeconds = (now() - windowStart) / 1000;
       const elu = NodePerfHooks.performance.eventLoopUtilization(eluStart);
       const cpu = process.cpuUsage(cpuStart);
       this.mark("measured");
       const summary = recorder.summarize(windowSeconds);
       await this.race(this.confirmServerAlive());
-      await this.race(
-        this.parallel(sessions, (session) =>
-          session.checkOutputDuring(windowStartEpochMs, windowEndEpochMs),
-        ),
-      );
       measured = {
         windowSeconds: Math.round(windowSeconds * 1000) / 1000,
         ...summary,
         sessions: {
           count: sessions.length,
+          ownerStreams: sessions.length,
           withOutputInWindow: sessions.filter((session) => session.producedOutput).length,
           inFlightAtWindowEnd: sessions.filter((session) => session.inFlight).length,
         },

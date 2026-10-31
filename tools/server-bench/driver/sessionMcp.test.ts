@@ -92,6 +92,23 @@ describe("CredentialCallers", () => {
     expect(callers.callers()).toHaveLength(1);
   });
 
+  it("never lets an older sign-in replace a newer one after a failed one in between", async () => {
+    const { callers, started, stopped, signIns, settle } = harness(1);
+    callers.update(new Map([["a.json", as("Bearer old")]]));
+    callers.update(new Map([["a.json", as("Bearer middle")]]));
+    signIns[1]?.fail();
+    await settle();
+    await settle();
+    callers.update(new Map([["a.json", as("Bearer new")]]));
+    signIns[2]?.finish();
+    await settle();
+    signIns[0]?.finish();
+    await settle();
+    expect(started).toEqual(["Bearer new"]);
+    expect(stopped).toEqual(["Bearer old"]);
+    expect(callers.callers()).toHaveLength(1);
+  });
+
   it("replaces a running caller when its session's token rotates", async () => {
     const { callers, started, stopped, signIns, settle } = harness(1);
     callers.update(new Map([["a.json", as("Bearer one")]]));

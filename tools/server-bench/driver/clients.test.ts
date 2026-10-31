@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  providerOutputDuring,
+  isProviderOutputEvent,
   Session,
   ShellWatcher,
   type RunContext,
@@ -29,12 +29,16 @@ const shell = (overrides: Partial<ThreadShell>): ThreadShell => ({
   ...overrides,
 });
 
-/** A shell stream fed by the test and a socket that accepts every command. */
+/** Shell and thread streams fed by the test, and a socket that accepts every command. */
 const harness = () => {
-  let push: (values: ReadonlyArray<unknown>) => void = () => undefined;
+  const streams = new Map<string, (values: ReadonlyArray<unknown>) => void>();
   const socket = {
-    stream: (_tag: string, _payload: unknown, handlers: { onValues: typeof push }) => {
-      push = (values) => handlers.onValues(values);
+    stream: (
+      tag: string,
+      _payload: unknown,
+      handlers: { onValues: (values: ReadonlyArray<unknown>) => void },
+    ) => {
+      streams.set(tag, (values) => handlers.onValues(values));
       return () => undefined;
     },
     call: async () => ({ sequence: 1 }),
@@ -60,8 +64,15 @@ const harness = () => {
     rng: createRng("test"),
     switchProvider: false,
   });
-  const update = (thread: ThreadShell) => push([{ kind: "thread.updated", sequence: 1, thread }]);
-  return { session, recorder, update };
+  const update = (thread: ThreadShell) =>
+    streams.get("orchestration.subscribeShell")?.([
+      { kind: "thread.updated", sequence: 1, thread },
+    ]);
+  const emit = (type: string, payload: Record<string, unknown>) =>
+    streams.get("orchestration.subscribeThread")?.([
+      { kind: "event", sequence: 2, event: { type, payload, occurredAt: "2026-10-31T12:00:00Z" } },
+    ]);
+  return { session, recorder, update, emit };
 };
 
 describe("Session", () => {
@@ -93,76 +104,44 @@ describe("Session", () => {
   });
 });
 
-describe("providerOutputDuring", () => {
-  const windowStart = Date.parse("2026-10-31T12:00:00.000Z");
-  const windowEnd = Date.parse("2026-10-31T12:05:00.000Z");
-  const during = (items: Parameters<typeof providerOutputDuring>[0]) =>
-    providerOutputDuring(items, windowStart, windowEnd);
-
-  it("sees an item that started before the window and was still streaming after it", () => {
-    expect(
-      during([
-        {
-          type: "assistant_message",
-          status: "running",
-          startedAt: "2026-10-31T11:59:00.000Z",
-          completedAt: null,
-          updatedAt: "2026-10-31T12:05:02.000Z",
-        },
-      ]),
-    ).toBe(true);
+describe("Session output check", () => {
+  it("counts provider output that streams while the window is open", async () => {
+    const { session, recorder, emit } = harness();
+    session.watch();
+    recorder.setOpen(true);
+    session.windowOpened();
+    emit("turn-item.updated", { type: "assistant_message", status: "running" });
+    expect(session.producedOutput).toBe(true);
+    expect(recorder.summarize(1).counters["sessions.providerEvents"]?.count).toBe(1);
+    await session.stop(false);
   });
 
-  it("sees output that completed together with the run inside the window", () => {
-    expect(
-      during([
-        {
-          type: "command_execution",
-          status: "completed",
-          startedAt: "2026-10-31T12:04:59.000Z",
-          completedAt: "2026-10-31T12:04:59.500Z",
-          updatedAt: "2026-10-31T12:04:59.500Z",
-        },
-      ]),
-    ).toBe(true);
+  it("does not count output written before the window or first arriving after it", async () => {
+    const { session, recorder, emit } = harness();
+    session.watch();
+    emit("turn-item.updated", { type: "assistant_message", status: "completed" });
+    recorder.setOpen(true);
+    session.windowOpened();
+    emit("turn-item.updated", { type: "user_message", status: "completed" });
+    emit("turn-item.updated", { type: "checkpoint", status: "completed" });
+    emit("run.updated", { status: "completed" });
+    recorder.setOpen(false);
+    emit("turn-item.updated", { type: "assistant_message", status: "running" });
+    expect(session.producedOutput).toBe(false);
+    await session.stop(false);
   });
+});
 
-  it("does not count output that first arrived after the window closed", () => {
-    expect(
-      during([
-        {
-          type: "assistant_message",
-          status: "running",
-          startedAt: "2026-10-31T12:05:01.000Z",
-          completedAt: null,
-          updatedAt: "2026-10-31T12:05:01.500Z",
-        },
-      ]),
-    ).toBe(false);
-  });
-
-  it("ignores the user's messages, checkpoints, run bookkeeping and older output", () => {
-    const inWindow = {
-      status: "completed",
-      startedAt: "2026-10-31T12:01:00.000Z",
-      completedAt: "2026-10-31T12:01:00.000Z",
-      updatedAt: "2026-10-31T12:01:00.000Z",
-    };
-    expect(
-      during([
-        {
-          type: "assistant_message",
-          status: "completed",
-          startedAt: "2026-10-31T11:58:00.000Z",
-          completedAt: "2026-10-31T11:59:59.999Z",
-          updatedAt: "2026-10-31T11:59:59.999Z",
-        },
-        { type: "user_message", ...inWindow },
-        { type: "checkpoint", ...inWindow },
-        { type: "run_interrupt_request", ...inWindow },
-        { type: "run_interrupt_result", ...inWindow },
-        { type: "reasoning" },
-      ]),
-    ).toBe(false);
+describe("isProviderOutputEvent", () => {
+  it.each([
+    [{ type: "turn-item.updated", payload: { type: "reasoning" } }, true],
+    [{ type: "turn-item.updated", payload: { type: "command_execution" } }, true],
+    [{ type: "message.updated", payload: { role: "assistant" } }, true],
+    [{ type: "message.updated", payload: { role: "user" } }, false],
+    [{ type: "turn-item.updated", payload: { type: "user_message" } }, false],
+    [{ type: "turn-item.updated", payload: { type: "run_interrupt_result" } }, false],
+    [{ type: "run.updated", payload: {} }, false],
+  ])("%j is provider output: %s", (event, expected) => {
+    expect(isProviderOutputEvent(event)).toBe(expected);
   });
 });

@@ -68,6 +68,8 @@ export class CredentialCallers<C extends CredentialCaller> {
     { generation: number; authorization: string; caller: C | null }
   >();
   private readonly failed = new Set<string>();
+  /** Never reused, so a sign-in that outlives its entry can never pass for a newer one. */
+  private attempts = 0;
   private closed = false;
   private readonly limit: number;
   private readonly connect: (name: string, credential: McpCredential) => Promise<C>;
@@ -84,7 +86,7 @@ export class CredentialCallers<C extends CredentialCaller> {
       const attempt = `${name}\0${credential.authorization}`;
       if (entry?.authorization === credential.authorization || this.failed.has(attempt)) continue;
       if (entry === undefined && this.entries.size >= this.limit) continue;
-      const generation = (entry?.generation ?? 0) + 1;
+      const generation = ++this.attempts;
       this.entries.set(name, {
         generation,
         authorization: credential.authorization,

@@ -49,40 +49,17 @@ const PROVIDER_ITEM_TYPES = new Set([
   "subagent",
 ]);
 
-const ITEM_ACTIVE_STATUSES = new Set(["pending", "running", "waiting"]);
-
-export interface TurnItemTimes {
+interface DomainEvent {
   readonly type?: string;
-  readonly status?: string;
-  readonly startedAt?: string | null;
-  readonly completedAt?: string | null;
-  readonly updatedAt?: string;
+  readonly occurredAt?: string;
+  readonly payload?: { readonly type?: string; readonly role?: string };
 }
 
-/**
- * Whether a provider item was being written during the window: it started before the window
- * ended and was still open, or completed, after it began. An item still streaming counts; one
- * that only started after the window closed does not.
- */
-export function providerOutputDuring(
-  turnItems: ReadonlyArray<TurnItemTimes>,
-  windowStartEpochMs: number,
-  windowEndEpochMs: number,
-): boolean {
-  const at = (value: string | null | undefined, fallback: number) => {
-    const parsed = Date.parse(value ?? "");
-    return Number.isFinite(parsed) ? parsed : fallback;
-  };
-  return turnItems.some((item) => {
-    if (!PROVIDER_ITEM_TYPES.has(item.type ?? "")) return false;
-    const updated = at(item.updatedAt, Number.NaN);
-    const began = at(item.startedAt, updated);
-    const ended = at(
-      item.completedAt,
-      ITEM_ACTIVE_STATUSES.has(item.status ?? "") ? Number.POSITIVE_INFINITY : updated,
-    );
-    return began <= windowEndEpochMs && ended >= windowStartEpochMs;
-  });
+/** A thread event carrying what the provider wrote: one of its turn items, or assistant text. */
+export function isProviderOutputEvent(event: DomainEvent | undefined): boolean {
+  if (event?.type === "turn-item.updated")
+    return PROVIDER_ITEM_TYPES.has(event.payload?.type ?? "");
+  return event?.type === "message.updated" && event.payload?.role === "assistant";
 }
 
 export interface ShellSnapshot {
@@ -95,8 +72,9 @@ export interface ShellSnapshot {
 interface StreamItem {
   readonly kind?: string;
   readonly sequence?: number;
+  readonly snapshotSequence?: number;
   readonly thread?: ThreadShell;
-  readonly event?: { readonly occurredAt?: string };
+  readonly event?: DomainEvent;
   readonly snapshot?: ShellSnapshot;
 }
 
@@ -236,6 +214,8 @@ export class Session {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private pendingModelSelection: { instanceId: string; model: string } | undefined;
   private outputInWindow = false;
+  private stopWatching: (() => void) | undefined;
+  private watchTimer: ReturnType<typeof setTimeout> | undefined;
 
   readonly index: number;
   readonly threadId: string;
@@ -373,19 +353,48 @@ export class Session {
     return this.waiting !== null;
   }
 
-  /** Reads the thread back after the window: did the provider write into it during the window? */
-  async checkOutputDuring(windowStartEpochMs: number, windowEndEpochMs: number): Promise<void> {
-    const snapshot = await httpJson<{
-      readonly projection: { readonly turnItems: ReadonlyArray<TurnItemTimes> };
-    }>(
-      this.context.http,
-      `/api/orchestration/threads/${encodeURIComponent(this.threadId)}/bounded`,
-    );
-    this.outputInWindow = providerOutputDuring(
-      snapshot.value.projection.turnItems,
-      windowStartEpochMs,
-      windowEndEpochMs,
-    );
+  /**
+   * Follows the session's own thread, as the user who started it does. Provider output counts
+   * only when it reaches this stream while the window is open, so nothing written before or
+   * after the window can vouch for it.
+   */
+  watch(): void {
+    const follow = (afterSequence: number | undefined) => {
+      let last = afterSequence;
+      this.stopWatching = this.socket.stream(
+        "orchestration.subscribeThread",
+        {
+          threadId: this.threadId,
+          ...(last === undefined ? {} : { afterSequence: last }),
+          requestCompletionMarker: true,
+          acceptBoundedSnapshot: true,
+          acceptDeferredWork: true,
+        },
+        {
+          onValues: (values) => {
+            for (const value of values as ReadonlyArray<StreamItem>) {
+              if (value.kind === "snapshot") last = value.snapshotSequence ?? last;
+              if (value.kind !== "event") continue;
+              last = value.sequence ?? last;
+              if (this.context.recorder.isOpen && isProviderOutputEvent(value.event)) {
+                this.outputInWindow = true;
+                this.context.recorder.count("sessions.providerEvents");
+              }
+            }
+          },
+          onEnd: (error) => {
+            if (this.context.isStopping()) return;
+            this.context.recorder.error("session.watch", error?.message ?? "stream ended");
+            this.watchTimer = setTimeout(() => follow(last), 250);
+          },
+        },
+      );
+    };
+    follow(undefined);
+  }
+
+  windowOpened(): void {
+    this.outputInWindow = false;
   }
 
   get producedOutput(): boolean {
@@ -395,6 +404,8 @@ export class Session {
   /** Stops sending turns; with `stopThread`, also stops whatever the server is running there. */
   async stop(stopThread: boolean): Promise<void> {
     clearTimeout(this.timer);
+    clearTimeout(this.watchTimer);
+    this.stopWatching?.();
     if (!stopThread) return;
     await this.socket
       .call(

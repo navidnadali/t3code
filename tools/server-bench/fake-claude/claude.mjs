@@ -71,6 +71,7 @@ export function readConfig(env) {
         ? NodePath.join(configDir, "fake-claude")
         : NodePath.join(NodeOS.tmpdir(), "t3-fake-claude")),
     statsDir: env.BENCH_STATS_DIR?.trim() || undefined,
+    mcpCredentialsDir: env.BENCH_MCP_CREDENTIALS_DIR?.trim() || undefined,
     fault,
   };
 }
@@ -676,6 +677,30 @@ function frameProblem(frame) {
   }
 }
 
+/**
+ * The session's T3 MCP endpoint from an `mcp_set_servers` request, or undefined when it names
+ * none: the `t3-code` server the adapter registers, else the first server with a URL.
+ */
+export function mcpCredentials(servers) {
+  const entries = Object.entries(servers ?? {});
+  const server =
+    servers?.["t3-code"] ?? entries.find(([, config]) => typeof config?.url === "string")?.[1];
+  if (typeof server?.url !== "string") return undefined;
+  const header = Object.entries(server.headers ?? {}).find(
+    ([name]) => name.toLowerCase() === "authorization",
+  );
+  return { url: server.url, authorization: typeof header?.[1] === "string" ? header[1] : null };
+}
+
+/** Replaces `<dir>/<session>.json` atomically, readable by its owner only; it holds a token. */
+export function writeMcpCredentials(dir, sessionId, credentials) {
+  const name = `${sessionId.replace(/[^\w-]/g, "_")}.json`;
+  const temp = NodePath.join(dir, `.${name}.${process.pid}.tmp`);
+  NodeFS.writeFileSync(temp, `${JSON.stringify(credentials)}\n`, { mode: 0o600, flag: "w" });
+  NodeFS.chmodSync(temp, 0o600);
+  NodeFS.renameSync(temp, NodePath.join(dir, name));
+}
+
 /** Loads and compiles every transcript in the mix; a bad name or recording throws here. */
 export async function loadMix(config) {
   const transcripts = new Map();
@@ -731,6 +756,9 @@ async function runStream(flags, config) {
   const controlRequests = {};
   const prompts = [];
   const transcripts = await loadMix(config);
+  if (config.mcpCredentialsDir !== undefined) {
+    NodeFS.mkdirSync(config.mcpCredentialsDir, { recursive: true, mode: 0o700 });
+  }
   const mix = Object.fromEntries(config.mix.map(({ name, weight }) => [name, weight]));
   let assignment;
   let played = 0;
@@ -846,12 +874,22 @@ async function runStream(flags, config) {
           rate_limits_available: true,
           rate_limits: { five_hour: { utilization: 0, resets_at: null } },
         });
-      case "mcp_set_servers":
+      case "mcp_set_servers": {
+        const credentials = mcpCredentials(request.servers);
+        if (config.mcpCredentialsDir !== undefined && credentials !== undefined) {
+          try {
+            writeMcpCredentials(config.mcpCredentialsDir, live.sessionId, credentials);
+          } catch (error) {
+            // The message names the path and the errno only, never the token.
+            return failStream(live.sessionId, `cannot write MCP credentials: ${error.message}`);
+          }
+        }
         return respond(requestId, {
           added: Object.keys(request.servers ?? {}),
           removed: [],
           errors: {},
         });
+      }
       case "mcp_status":
         return respond(requestId, { mcpServers: [] });
       case "background_tasks":

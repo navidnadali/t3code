@@ -1,0 +1,182 @@
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
+import * as NodePath from "node:path";
+import * as NodeReadline from "node:readline";
+import * as NodeURL from "node:url";
+
+import { describe, expect, it } from "vite-plus/test";
+
+import * as AcpSchema from "../../../packages/effect-acp/src/_generated/schema-v1.gen.ts";
+import { FIXTURES_DIR, transcriptPath } from "../fake-common/replay.mjs";
+import { compileTranscript, expectedTurn, TRANSCRIPT_FILE, turnLines } from "./acp-agent.mjs";
+
+// effect resolves from the packages that depend on it, not from the repo root.
+const Schema = await import(
+  NodeModule.createRequire(
+    new URL("../../../packages/effect-acp/package.json", import.meta.url),
+  ).resolve("effect/Schema")
+);
+
+const AGENT = NodeURL.fileURLToPath(new URL("./acp-agent.mjs", import.meta.url));
+const LIVE = { sessionId: "11111111-2222-4333-8444-555555555555", cwd: "/live/project" };
+const FIXTURES = NodeFS.readdirSync(FIXTURES_DIR).filter((name) =>
+  NodeFS.existsSync(NodePath.join(FIXTURES_DIR, name, TRANSCRIPT_FILE)),
+);
+const transcriptOf = (name) => NodeFS.readFileSync(transcriptPath(name, TRANSCRIPT_FILE), "utf8");
+const decodes = (schema, value) => {
+  try {
+    Schema.decodeUnknownSync(schema)(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+function startAgent(env) {
+  const child = NodeChildProcess.spawn(process.execPath, [AGENT], {
+    env: { ...process.env, BENCH_SPEED: "0", ...env },
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  const lines = NodeReadline.createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  return {
+    exited: new Promise((resolve) => child.once("exit", (code) => resolve(code))),
+    send: (...messages) =>
+      child.stdin.write(
+        messages.map((message) => `${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`).join(""),
+      ),
+    /** Reads stdout lines up to and including the first one `match` accepts. */
+    until: async (match) => {
+      const read = [];
+      for (;;) {
+        const next = await lines.next();
+        if (next.done) return read;
+        read.push(next.value);
+        if (match(next.value)) return read;
+      }
+    },
+    [Symbol.dispose]: () => child.kill(),
+  };
+}
+
+const frameOf = (line) => {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+};
+const answerTo = (id) => (line) => frameOf(line)?.id === id && frameOf(line)?.method === undefined;
+
+async function openSession(agent) {
+  agent.send(
+    { id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: {} } },
+    { id: 2, method: "session/new", params: { cwd: LIVE.cwd, mcpServers: [] } },
+  );
+  const frames = (await agent.until(answerTo(2))).map(frameOf);
+  expect(decodes(AcpSchema.InitializeResponse, frames.find((frame) => frame.id === 1).result)).toBe(
+    true,
+  );
+  expect(decodes(AcpSchema.NewSessionResponse, frames.at(-1).result)).toBe(true);
+  return frames.at(-1).result.sessionId;
+}
+
+describe("fake acp transcripts", () => {
+  // malformed_session_update records frames the schema rejects, on purpose.
+  it.each(FIXTURES.filter((name) => name !== "malformed_session_update"))(
+    "replays %s as session updates the ACP schema accepts",
+    (name) => {
+      const text = transcriptOf(name);
+      for (const turn of compileTranscript(text)) {
+        const lines = [...turnLines(turn, LIVE, 2)].map(({ line }) => line);
+        const updates = lines
+          .map((line) => JSON.parse(line))
+          .filter((frame) => frame.id === undefined);
+
+        expect(
+          updates.filter((frame) => !decodes(AcpSchema.SessionNotification, frame.params)),
+        ).toEqual([]);
+        expect(new Set(updates.map((frame) => frame.params.sessionId))).toEqual(
+          new Set(updates.length === 0 ? [] : [LIVE.sessionId]),
+        );
+        expect(lines.join("\n")).not.toContain("<workspace>");
+        const started = updates
+          .filter((frame) => frame.params.update.sessionUpdate === "tool_call")
+          .map((frame) => frame.params.update.toolCallId);
+        expect(new Set(started).size).toBe(started.length);
+      }
+    },
+  );
+
+  it("streams text in chunks and counts a run of chunks as one message", () => {
+    const [turn] = compileTranscript(transcriptOf("todo_list"));
+    const kinds = turn.frames.map((frame) => frame.stat);
+
+    expect(kinds.filter((kind) => kind.endsWith("agent_message_chunk")).length).toBeGreaterThan(2);
+    expect(expectedTurn("todo_list", 0, 2)).toEqual({
+      frames: Object.fromEntries(
+        Object.entries(Object.groupBy(kinds, (kind) => kind)).map(([kind, list]) => [
+          kind,
+          list.length * 2,
+        ]),
+      ),
+      // The last chunk of one loop and the first of the next stream as one message.
+      items: { assistant_message: 3, reasoning: 0, tool: 4 },
+      todoLists: 1,
+      reply: "todo list fixture complete",
+    });
+  });
+});
+
+describe("fake acp agent", () => {
+  it("answers a prompt with the replayed turn and a stop reason the client decodes", async () => {
+    using agent = startAgent({ BENCH_ACP_TRANSCRIPT: "simple" });
+    const sessionId = await openSession(agent);
+    agent.send({ id: 3, method: "session/prompt", params: { sessionId, prompt: [] } });
+    const frames = (await agent.until(answerTo(3))).map(frameOf);
+
+    const kinds = frames
+      .slice(0, -1)
+      .map((frame) => `session/update:${frame.params.update.sessionUpdate}`);
+    expect(
+      Object.fromEntries(
+        Object.entries(Object.groupBy(kinds, (kind) => kind)).map(([kind, list]) => [
+          kind,
+          list.length,
+        ]),
+      ),
+    ).toEqual(expectedTurn("simple", 0, 1).frames);
+    expect(frames.at(-1).result).toEqual({ stopReason: "end_turn" });
+    expect(decodes(AcpSchema.PromptResponse, frames.at(-1).result)).toBe(true);
+  });
+
+  it("stops a prompt cancelled with it and plays the next prompt after it", async () => {
+    using agent = startAgent({});
+    const sessionId = await openSession(agent);
+    agent.send(
+      { id: 3, method: "session/prompt", params: { sessionId, prompt: [] } },
+      { method: "session/cancel", params: { sessionId } },
+      { id: 4, method: "session/prompt", params: { sessionId, prompt: [] } },
+    );
+    const first = (await agent.until(answerTo(3))).map(frameOf);
+    const second = (await agent.until(answerTo(4))).map(frameOf);
+
+    expect(first).toEqual([{ jsonrpc: "2.0", id: 3, result: { stopReason: "cancelled" } }]);
+    expect(second.length).toBeGreaterThan(1);
+    expect(second.at(-1).result).toEqual({ stopReason: "end_turn" });
+  });
+
+  it.each([
+    ["exit-mid-turn", 0],
+    ["truncated-frame-exit", 1],
+  ])("with BENCH_FAULT=%s exits 1 mid-turn after %i cut-off lines", async (fault, cut) => {
+    using agent = startAgent({ BENCH_FAULT: fault });
+    const sessionId = await openSession(agent);
+    agent.send({ id: 3, method: "session/prompt", params: { sessionId, prompt: [] } });
+    const lines = await agent.until(answerTo(3));
+
+    expect(lines.filter((line) => frameOf(line) === undefined)).toHaveLength(cut);
+    expect(lines.some(answerTo(3))).toBe(false);
+    expect(await agent.exited).toBe(1);
+  });
+});

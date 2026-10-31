@@ -265,6 +265,8 @@ describe("fake acp agent", () => {
       NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-acp-mcp-")),
       "credentials",
     );
+    // A directory made beforehand, as the driver's --session-mcp-credentials may be, is locked too.
+    NodeFS.mkdirSync(dir, { mode: 0o755 });
     using agent = startAgent({ BENCH_MCP_CREDENTIALS_DIR: dir });
     agent.send(
       { id: 1, method: "initialize", params: { protocolVersion: 1 } },

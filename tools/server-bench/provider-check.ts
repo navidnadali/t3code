@@ -50,6 +50,7 @@ const CODEX_ITEM_TYPES: Readonly<Record<string, string>> = {
   fileChange: "file_change",
   webSearch: "web_search",
   plan: "proposed_plan",
+  mcpToolCall: "dynamic_tool",
 };
 const NON_TOOL_ITEMS = new Set([
   "user_message",
@@ -67,7 +68,12 @@ export interface TurnExpectation {
 }
 
 interface FakeModule {
-  readonly expectedTurn: (name: string, index: number, loops: number) => TurnExpectation;
+  readonly expectedTurn: (
+    name: string,
+    index: number,
+    loops: number,
+    payloadBytes: number | undefined,
+  ) => Promise<TurnExpectation>;
 }
 
 interface StatsRecord {
@@ -81,6 +87,7 @@ interface StatsRecord {
   readonly frames: Readonly<Record<string, number>>;
   readonly bytes: number;
   readonly ms: number;
+  readonly payloadBytes?: number;
   /** The final answer the fake sent, after live substitutions. */
   readonly reply?: string | null;
 }
@@ -412,79 +419,85 @@ async function check(
     }
   }
 
-  const sessionResults = runs.map((run) => {
-    const { session } = run;
-    const completed = run.turns.filter((turn) => turn.status === "completed").length;
-    const rows = run.threadId === null ? null : readThread(db, run.threadId);
-    const played =
-      rows?.nativeId == null ? [] : records.filter((record) => record.sessionId === rows.nativeId);
-    const checks: Record<string, boolean> = {
-      "every turn completed": run.turns.length === turns && completed === turns,
-      "server runs completed":
-        rows !== null &&
-        rows.runs.length === turns &&
-        rows.runs.every((status) => status === "completed"),
-    };
-    const fake = fakes[session.kind];
-    let detail: Record<string, unknown> = {};
-    if (fake !== undefined && rows !== null) {
-      const expectations = played.map((record) =>
-        fake.expectedTurn(record.transcript, record.turn, record.loops),
-      );
-      const items = compareItems(session.kind, expectations, rows.items);
-      checks["fake played one turn per completed turn"] =
-        played.length === completed && played.every((record) => !record.aborted);
-      checks["fake frames == transcript frames"] = played.every((record, index) =>
-        sameCounts(record.frames, expectations[index]?.frames ?? {}),
-      );
-      checks["server items == transcript items"] = items.match;
-      // The Codex adapter never completes a todo_list item; its steps carry the state.
-      checks["every message and tool item completed"] = providerItems(rows.items).every(
-        (item) => item.type === "todo_list" || item.status === "completed",
-      );
-      checks["replies == the final answers the fake sent"] = run.turns.every(
-        (turn, index) =>
-          turn.status !== "completed" || turn.reply === (played[index]?.reply ?? null),
-      );
-      detail = {
-        played: played.map(({ transcript, turn, loops, bytes, ms, frames }) => ({
-          transcript,
-          turn,
-          loops,
-          bytes,
-          ms,
-          frames,
-        })),
-        expectedItems: items.expected,
-        serverItems: items.actual,
-        unmappedTranscriptItems: items.unmapped,
+  const sessionResults = await Promise.all(
+    runs.map(async (run) => {
+      const { session } = run;
+      const completed = run.turns.filter((turn) => turn.status === "completed").length;
+      const rows = run.threadId === null ? null : readThread(db, run.threadId);
+      const played =
+        rows?.nativeId == null
+          ? []
+          : records.filter((record) => record.sessionId === rows.nativeId);
+      const checks: Record<string, boolean> = {
+        "every turn completed": run.turns.length === turns && completed === turns,
+        "server runs completed":
+          rows !== null &&
+          rows.runs.length === turns &&
+          rows.runs.every((status) => status === "completed"),
       };
-    } else if (rows !== null) {
-      checks["fake played one turn per completed turn"] = played.length === completed;
-      detail = {
-        played: played.map(({ transcript, turn, loops, bytes, ms }) => ({
-          transcript,
-          turn,
-          loops,
-          bytes,
-          ms,
-        })),
+      const fake = fakes[session.kind];
+      let detail: Record<string, unknown> = {};
+      if (fake !== undefined && rows !== null) {
+        const expectations = await Promise.all(
+          played.map((record) =>
+            fake.expectedTurn(record.transcript, record.turn, record.loops, record.payloadBytes),
+          ),
+        );
+        const items = compareItems(session.kind, expectations, rows.items);
+        checks["fake played one turn per completed turn"] =
+          played.length === completed && played.every((record) => !record.aborted);
+        checks["fake frames == transcript frames"] = played.every((record, index) =>
+          sameCounts(record.frames, expectations[index]?.frames ?? {}),
+        );
+        checks["server items == transcript items"] = items.match;
+        // The Codex adapter never completes a todo_list item; its steps carry the state.
+        checks["every message and tool item completed"] = providerItems(rows.items).every(
+          (item) => item.type === "todo_list" || item.status === "completed",
+        );
+        checks["replies == the final answers the fake sent"] = run.turns.every(
+          (turn, index) =>
+            turn.status !== "completed" || turn.reply === (played[index]?.reply ?? null),
+        );
+        detail = {
+          played: played.map(({ transcript, turn, loops, bytes, ms, frames }) => ({
+            transcript,
+            turn,
+            loops,
+            bytes,
+            ms,
+            frames,
+          })),
+          expectedItems: items.expected,
+          serverItems: items.actual,
+          unmappedTranscriptItems: items.unmapped,
+        };
+      } else if (rows !== null) {
+        checks["fake played one turn per completed turn"] = played.length === completed;
+        detail = {
+          played: played.map(({ transcript, turn, loops, bytes, ms }) => ({
+            transcript,
+            turn,
+            loops,
+            bytes,
+            ms,
+          })),
+        };
+      }
+      return {
+        index: session.index,
+        kind: session.kind,
+        instanceId: session.instanceId,
+        model: session.model,
+        threadId: run.threadId,
+        nativeSessionId: rows?.nativeId ?? null,
+        turns: run.turns,
+        serverRuns: rows?.runs ?? [],
+        ...detail,
+        checks,
+        verdict: Object.values(checks).every(Boolean) ? "MATCH" : "MISMATCH",
       };
-    }
-    return {
-      index: session.index,
-      kind: session.kind,
-      instanceId: session.instanceId,
-      model: session.model,
-      threadId: run.threadId,
-      nativeSessionId: rows?.nativeId ?? null,
-      turns: run.turns,
-      serverRuns: rows?.runs ?? [],
-      ...detail,
-      checks,
-      verdict: Object.values(checks).every(Boolean) ? "MATCH" : "MISMATCH",
-    };
-  });
+    }),
+  );
   db.close();
 
   const turnsByProvider: Record<string, Record<string, number>> = {};

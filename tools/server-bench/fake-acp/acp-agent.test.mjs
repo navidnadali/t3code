@@ -158,12 +158,12 @@ describe("fake acp transcripts", () => {
     ).toEqual(["end_turn"]);
   });
 
-  it("streams text in chunks and counts a run of chunks as one message", () => {
+  it("streams text in chunks and counts a run of chunks as one message", async () => {
     const [turn] = compileTranscript(transcriptOf("todo_list"));
     const kinds = turn.frames.map((frame) => frame.stat);
 
     expect(kinds.filter((kind) => kind.endsWith("agent_message_chunk")).length).toBeGreaterThan(2);
-    expect(expectedTurn("todo_list", 0, 2)).toEqual({
+    expect(await expectedTurn("todo_list", 0, 2)).toEqual({
       frames: Object.fromEntries(
         Object.entries(Object.groupBy(kinds, (kind) => kind)).map(([kind, list]) => [
           kind,
@@ -195,7 +195,7 @@ describe("fake acp agent", () => {
           list.length,
         ]),
       ),
-    ).toEqual(expectedTurn("simple", 0, 1).frames);
+    ).toEqual((await expectedTurn("simple", 0, 1)).frames);
     expect(frames.at(-1).result).toEqual({ stopReason: "end_turn" });
     expect(decodes(AcpSchema.PromptResponse, frames.at(-1).result)).toBe(true);
   });

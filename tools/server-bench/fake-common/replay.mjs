@@ -17,6 +17,7 @@ const MAX_MIX_WEIGHT = 10_000;
 export const KNOBS_HELP = `  BENCH_SPEED               Time scale for every wait (default 1). 0 never waits.
   BENCH_DELTAS_PER_SEC      Streamed delta rate at speed 1 (default 40).
   BENCH_TURN_LOOPS          Times a turn's body plays before the turn ends (default 1).
+  BENCH_TOOL_PAYLOAD_BYTES  Payload size of the large-tool-payload transcript (default 262144).
   BENCH_SEED                Rotates where the transcript assignment cycle starts (default 0).
   BENCH_STATE_DIR           Where sessions claim their ordinals; fresh for each run.
   BENCH_STATS_DIR           Append a JSON line per played turn to <dir>/<fake>-<pid>.ndjson.
@@ -53,6 +54,12 @@ export function readConfig(env, { transcriptVar, defaultMix, defaultStateDir }) 
     turnLoops: number(
       "BENCH_TURN_LOOPS",
       1,
+      (value) => Number.isSafeInteger(value) && value >= 1,
+      "an integer >= 1",
+    ),
+    payloadBytes: number(
+      "BENCH_TOOL_PAYLOAD_BYTES",
+      262_144,
       (value) => Number.isSafeInteger(value) && value >= 1,
       "an integer >= 1",
     ),
@@ -138,6 +145,38 @@ export function assign(config, ordinal) {
 
 /** The mix as `{ name: weight }`, for stats lines. */
 export const mixRecord = (mix) => Object.fromEntries(mix.map(({ name, weight }) => [name, weight]));
+
+/**
+ * A transcript's recorded entries: a generator (`<transcriptsDir>/<name>.mjs`, given the knobs),
+ * a file in `transcriptsDir`, a fixture with `fileName`, or an absolute .ndjson path.
+ */
+export async function loadTranscriptEntries(name, { fileName, transcriptsDir, config }) {
+  if (!NodePath.isAbsolute(name)) {
+    if (!/^[\w.-]+$/.test(name) || name.startsWith(".")) {
+      throw new Error(`Transcript ${JSON.stringify(name)} is neither a plain name nor absolute.`);
+    }
+    const generator = NodePath.join(transcriptsDir, `${name}.mjs`);
+    if (NodeFS.existsSync(generator)) {
+      const module = await import(NodeURL.pathToFileURL(generator).href);
+      return module.makeTranscript(config);
+    }
+    const file = NodePath.join(transcriptsDir, `${name}.ndjson`);
+    if (NodeFS.existsSync(file)) return readNdjson(file);
+  }
+  return readNdjson(transcriptPath(name, fileName));
+}
+
+/** Text of at least `bytes` UTF-8 bytes in generated source lines, with multi-byte characters. */
+export function syntheticText(bytes, label) {
+  const lines = [];
+  let size = 0;
+  for (let line = 1; size < bytes; line++) {
+    const text = `export const ${label}${line} = compute("${label}-${line}", ${(line * 37) % 101}, { note: "naïve → résumé ✓\\t#${line}" });`;
+    lines.push(text);
+    size += Buffer.byteLength(text) + 1;
+  }
+  return lines.join("\n");
+}
 
 /** A fixture name (its `fileName` under the replay fixtures) or an absolute .ndjson path. */
 export function transcriptPath(name, fileName) {

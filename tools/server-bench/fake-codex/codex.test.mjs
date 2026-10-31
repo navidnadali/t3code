@@ -154,7 +154,7 @@ describe("fake codex transcripts", () => {
     }
   });
 
-  it("loops a turn's work with fresh item ids and answers once, with the live prompt", () => {
+  it("loops a turn's work with fresh item ids and answers once, with the live prompt", async () => {
     const [turn] = compileTranscript(parsedFixture("command_output_streaming")).turns;
     const frames = [...turnLines(turn, LIVE, 3)].map(({ line }) => JSON.parse(line));
     const completed = frames.filter((frame) => frame.method === "item/completed");
@@ -173,7 +173,7 @@ describe("fake codex transcripts", () => {
     expect(frames.at(-1).params.turn.items.map((item) => item.id)).toEqual([
       byType("agentMessage").at(-1).params.item.id,
     ]);
-    expect(expectedTurn("command_output_streaming", 0, 3)).toMatchObject({
+    expect(await expectedTurn("command_output_streaming", 0, 3)).toMatchObject({
       items: { userMessage: 1, agentMessage: 4, commandExecution: 3 },
       reply: "command output fixture complete",
     });

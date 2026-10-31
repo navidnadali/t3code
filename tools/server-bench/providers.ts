@@ -180,6 +180,7 @@ export interface BenchKnobs {
   readonly speed?: string | undefined;
   readonly deltasPerSec?: string | undefined;
   readonly turnLoops?: string | undefined;
+  readonly toolPayloadBytes?: string | undefined;
 }
 
 export interface BenchInstanceOptions {
@@ -245,6 +246,7 @@ export function benchProviderInstances(
         BENCH_SPEED: options.knobs?.speed,
         BENCH_DELTAS_PER_SEC: options.knobs?.deltasPerSec,
         BENCH_TURN_LOOPS: options.knobs?.turnLoops,
+        BENCH_TOOL_PAYLOAD_BYTES: options.knobs?.toolPayloadBytes,
         [provider.transcriptVar]: options.transcripts?.[kind],
         ...options.env?.[kind],
       }),
@@ -316,6 +318,7 @@ started with.
   --speed X                 BENCH_SPEED for every fake (time scale; 0 never waits)
   --deltas-per-sec N        BENCH_DELTAS_PER_SEC for every fake
   --turn-loops N            BENCH_TURN_LOOPS for every fake
+  --tool-payload-bytes N    BENCH_TOOL_PAYLOAD_BYTES for every fake: the large-tool-payload size
   --claude-transcripts L    BENCH_TRANSCRIPT; --codex-transcripts L, --acp-transcripts L likewise
   --env KIND:NAME=VALUE     extra environment for one kind, e.g. codex:BENCH_FAULT=exit-mid-turn
   --node PATH               BENCH_NODE (default: this node)
@@ -337,6 +340,7 @@ function settingsCommand(argv: ReadonlyArray<string>): void {
       speed: { type: "string" },
       "deltas-per-sec": { type: "string" },
       "turn-loops": { type: "string" },
+      "tool-payload-bytes": { type: "string" },
       "claude-transcripts": { type: "string" },
       "codex-transcripts": { type: "string" },
       "acp-transcripts": { type: "string" },
@@ -398,6 +402,7 @@ function settingsCommand(argv: ReadonlyArray<string>): void {
       speed: values.speed,
       deltasPerSec: values["deltas-per-sec"],
       turnLoops: values["turn-loops"],
+      toolPayloadBytes: values["tool-payload-bytes"],
     },
     transcripts: {
       ...(values["claude-transcripts"] ? { claude: values["claude-transcripts"] } : {}),

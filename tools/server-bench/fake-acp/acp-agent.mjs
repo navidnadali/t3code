@@ -3,10 +3,10 @@
 // provider instance sends and replays recorded prompt turns of the ACP registry fixtures, parsed
 // by the dev replay agent, with live ids and bench pacing. `--help` lists its knobs.
 import * as NodeCrypto from "node:crypto";
-import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
+import * as NodeURL from "node:url";
 
 import { parseReplayTurns, streamChunks } from "../../../apps/server/scripts/dev-replay-agent.ts";
 import {
@@ -23,10 +23,11 @@ import {
   readConfig,
   render,
   sleep,
-  transcriptPath,
+  loadTranscriptEntries,
 } from "../fake-common/replay.mjs";
 
 export const TRANSCRIPT_FILE = "registry_transcript.ndjson";
+const TRANSCRIPTS_DIR = NodeURL.fileURLToPath(new URL("./transcripts/", import.meta.url));
 export const BENCH_MODEL = "bench-replay";
 const DEFAULT_MIX = [{ name: "todo_list", weight: 1 }];
 // As the dev replay agent: frames without recorded timing wait this long, recorded waits are cut.
@@ -160,16 +161,22 @@ export function* turnLines(compiled, live, loops) {
   }
 }
 
+/** A transcript of the mix as compiled turns: generated (`transcripts/<name>.mjs`) or recorded. */
+export async function loadTurns(name, config) {
+  const entries = await loadTranscriptEntries(name, {
+    fileName: TRANSCRIPT_FILE,
+    transcriptsDir: TRANSCRIPTS_DIR,
+    config,
+  });
+  const turns = compileTranscript(entries.map((entry) => JSON.stringify(entry)).join("\n"));
+  if (turns.length === 0) throw new Error(`Transcript ${name} has no prompt turn with frames.`);
+  return turns;
+}
+
 /** Loads and compiles every transcript in the mix; a bad name or recording throws here. */
-export function loadTranscripts(config) {
+export async function loadTranscripts(config) {
   const loaded = new Map();
-  for (const { name } of config.mix) {
-    const turns = compileTranscript(
-      NodeFS.readFileSync(transcriptPath(name, TRANSCRIPT_FILE), "utf8"),
-    );
-    if (turns.length === 0) throw new Error(`Transcript ${name} has no prompt turn with frames.`);
-    loaded.set(name, turns);
-  }
+  for (const { name } of config.mix) loaded.set(name, await loadTurns(name, config));
   return loaded;
 }
 
@@ -179,9 +186,8 @@ const ITEM_UPDATES = { agent_message_chunk: "assistant_message", agent_thought_c
  * What one played prompt sends and leaves behind: frames by kind, then message and thought items
  * (a run of chunks is one item), tool calls and turns with a plan, and the final answer.
  */
-export function expectedTurn(name, index, loops) {
-  const text = NodeFS.readFileSync(transcriptPath(name, TRANSCRIPT_FILE), "utf8");
-  const compiled = compileTranscript(text)[index];
+export async function expectedTurn(name, index, loops, payloadBytes) {
+  const compiled = (await loadTurns(name, { payloadBytes }))[index];
   if (compiled === undefined) throw new Error(`Transcript ${name} has no prompt turn ${index}.`);
   const frames = {};
   for (const frame of compiled.frames) frames[frame.stat] = (frames[frame.stat] ?? 0) + loops;
@@ -240,7 +246,7 @@ const BAD_SHAPE = (sessionId) =>
 async function runAgent(config) {
   const write = makeWriter(process.stdout);
   const recordStats = makeStatsSink(config.statsDir, "fake-acp");
-  const transcripts = loadTranscripts(config);
+  const transcripts = await loadTranscripts(config);
   const mix = mixRecord(config.mix);
   const requests = {};
   const sessions = new Map();
@@ -312,6 +318,7 @@ async function runAgent(config) {
       transcript: pick.name,
       turn: pick.turn,
       loops: config.turnLoops,
+      payloadBytes: config.payloadBytes,
       aborted,
       frames,
       bytes,

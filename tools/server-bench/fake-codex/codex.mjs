@@ -6,6 +6,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
+import * as NodeURL from "node:url";
 
 import {
   assign,
@@ -20,15 +21,15 @@ import {
   mixRecord,
   nextTick,
   readConfig,
-  readNdjson,
+  loadTranscriptEntries,
   render,
   sleep,
-  transcriptPath,
 } from "../fake-common/replay.mjs";
 
 // Inside the range the bundled model manifest recommends for Codex.
 export const FAKE_CODEX_VERSION = "0.159.0";
 export const TRANSCRIPT_FILE = "codex_transcript.ndjson";
+const TRANSCRIPTS_DIR = NodeURL.fileURLToPath(new URL("./transcripts/", import.meta.url));
 const DEFAULT_MIX = [{ name: "command_output_streaming", weight: 1 }];
 // Recorded gaps between frames are kept up to this cap at BENCH_SPEED=1.
 const MAX_GAP_MS = 3_000;
@@ -324,13 +325,23 @@ function threadLines(compiled, live) {
   };
 }
 
+/** A transcript of the mix, parsed: generated (`transcripts/<name>.mjs`) or recorded. */
+export async function loadParsed(name, config) {
+  const entries = await loadTranscriptEntries(name, {
+    fileName: TRANSCRIPT_FILE,
+    transcriptsDir: TRANSCRIPTS_DIR,
+    config,
+  });
+  const parsed = parseTranscript(entries);
+  if (parsed.turns.length === 0) throw new Error(`Transcript ${name} has no completed turn.`);
+  return parsed;
+}
+
 /** Loads and compiles every transcript in the mix; a bad name or recording throws here. */
-export function loadTranscripts(config) {
+export async function loadTranscripts(config) {
   const loaded = new Map();
   for (const { name } of config.mix) {
-    const parsed = parseTranscript(readNdjson(transcriptPath(name, TRANSCRIPT_FILE)));
-    if (parsed.turns.length === 0) throw new Error(`Transcript ${name} has no completed turn.`);
-    loaded.set(name, compileTranscript(parsed));
+    loaded.set(name, compileTranscript(await loadParsed(name, config)));
   }
   return loaded;
 }
@@ -377,8 +388,8 @@ function textedPlans(frames) {
  * thread by Codex item type (reasoning by part, plans with text), turns with a todo plan, and
  * the final answer.
  */
-export function expectedTurn(name, index, requestedLoops) {
-  const parsed = parseTranscript(readNdjson(transcriptPath(name, TRANSCRIPT_FILE)));
+export async function expectedTurn(name, index, requestedLoops, payloadBytes) {
+  const parsed = await loadParsed(name, { payloadBytes });
   const compiled = compileTranscript(parsed).turns[index];
   const turn = parsed.turns[index];
   if (compiled === undefined) throw new Error(`Transcript ${name} has no turn ${index}.`);
@@ -427,7 +438,7 @@ const BAD_SHAPE = (threadId, turnId) =>
 async function runAppServer(config) {
   const write = makeWriter(process.stdout);
   const recordStats = makeStatsSink(config.statsDir, "fake-codex");
-  const transcripts = loadTranscripts(config);
+  const transcripts = await loadTranscripts(config);
   const mix = mixRecord(config.mix);
   const fallback = transcripts.get(config.mix[0].name);
   const requests = {};
@@ -564,6 +575,7 @@ async function runAppServer(config) {
       transcript: pick.name,
       turn: pick.turn,
       loops,
+      payloadBytes: config.payloadBytes,
       aborted,
       frames,
       bytes,

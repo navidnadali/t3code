@@ -9,7 +9,13 @@ import * as NodeURL from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 
 import * as CodexRpc from "../../../packages/effect-codex-app-server/src/rpc.ts";
-import { FIXTURES_DIR, readConfig, readNdjson, transcriptPath } from "../fake-common/replay.mjs";
+import {
+  delayMs,
+  FIXTURES_DIR,
+  readConfig,
+  readNdjson,
+  transcriptPath,
+} from "../fake-common/replay.mjs";
 import {
   answerOf,
   compileTranscript,
@@ -467,6 +473,22 @@ describe("fake codex app-server", () => {
     expect(
       new Set(resumed.filter((frame) => frame.method !== undefined).map((frame) => frame.method)),
     ).toEqual(new Set(["mcpServer/startupStatus/updated"]));
+  });
+
+  it("caps every recorded wait at BENCH_MAX_GAP_MS and leaves deltas to their rate", () => {
+    const read = (env) =>
+      readConfig(env, {
+        transcriptVar: "BENCH_CODEX_TRANSCRIPT",
+        defaultMix: [{ name: "simple", weight: 1 }],
+        defaultStateDir: "/state",
+      });
+    const capped = read({ BENCH_MAX_GAP_MS: "100", BENCH_SPEED: "2" });
+
+    expect(
+      [{ ms: 2_500 }, { ms: 40 }, { delta: true }].map((pace) => delayMs(pace, capped)),
+    ).toEqual([50, 20, 12.5]);
+    expect(delayMs({ ms: 2_500 }, read({}))).toBe(2_500);
+    expect(() => read({ BENCH_MAX_GAP_MS: "-5" })).toThrow(/BENCH_MAX_GAP_MS/);
   });
 
   it("reads the mix and rejects knobs out of range", () => {

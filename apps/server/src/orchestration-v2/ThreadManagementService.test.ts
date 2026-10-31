@@ -774,6 +774,14 @@ it.effect("Force stop refuses once a newer run has started, before killing anyth
 
 type GetThreadShell = Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
 
+const layerSharedShellReadsTest = (getThreadShell: GetThreadShell) =>
+  ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({ getThreadShell })),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+
 const sharedShellReadsTest = (
   getThreadShell: GetThreadShell,
   test: (
@@ -785,16 +793,7 @@ const sharedShellReadsTest = (
     return yield* test((threadId, sequence) =>
       threads.getThreadShellForEvent({ threadId, sequence }),
     );
-  }).pipe(
-    Effect.provide(
-      ThreadManagementService.layer.pipe(
-        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-        Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({ getThreadShell })),
-        Layer.provide(ServerSettings.layerTest()),
-        Layer.provide(layerReceiptsTest),
-      ),
-    ),
-  );
+  }).pipe(Effect.provide(layerSharedShellReadsTest(getThreadShell)));
 
 const shellRead = (threadId: ThreadId, read: number) =>
   ({ id: threadId, title: `read ${read}` }) as unknown as OrchestrationV2ThreadShell;
@@ -881,6 +880,21 @@ it.effect("a thread shell read serves its event and older ones until a newer eve
           expect(yield* forEvent(threadId, 6)).toEqual(shellRead(threadId, 3));
         }),
     );
+  }),
+);
+
+it.effect("a thread shell read requested after the service closed fails instead of waiting", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:closed");
+    let reads = 0;
+    const threads = yield* ThreadManagementService.ThreadManagementService.pipe(
+      Effect.provide(layerSharedShellReadsTest((id) => Effect.sync(() => shellRead(id, ++reads)))),
+    );
+    for (const sequence of [1, 1]) {
+      const exit = yield* Effect.exit(threads.getThreadShellForEvent({ threadId, sequence }));
+      expect(Exit.hasInterrupts(exit)).toBe(true);
+    }
+    expect(reads).toBe(0);
   }),
 );
 

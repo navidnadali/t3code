@@ -41,6 +41,7 @@ import * as AntigravityInstallation from "./provider/AntigravityInstallation.ts"
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
+import * as CommandReceiptStore from "./orchestration-v2/CommandReceiptStore.ts";
 import * as CodexInstallation from "./provider/CodexInstallation.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
@@ -474,6 +475,82 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
     assert.deepEqual(withoutOld?.olderSettled?.counts, [
       { projectId: ProjectId.make("project"), count: 1 },
     ]);
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("shell subscribers share one thread shell read per event", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shared-shell-read");
+    const now = "2026-10-31T00:00:00.000Z";
+    const [event] = yield* sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        'shared-shell-read:0', 'thread', ${threadId}, 0, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:shared", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+    const reads: Array<ThreadId> = [];
+    const shell = { id: threadId, archivedAt: null } as unknown as OrchestrationV2ThreadShell;
+    const subscriber = subscribeOrchestrationV2Shell({
+      afterSequence: 0,
+      requestCompletionMarker: true,
+    }).pipe(
+      Effect.flatMap((stream) =>
+        stream.pipe(
+          Stream.takeUntil((item) => item.kind === "synchronized"),
+          Stream.runCollect,
+        ),
+      ),
+    );
+
+    const [first, second] = yield* Effect.all([subscriber, subscriber], {
+      concurrency: "unbounded",
+    }).pipe(
+      Effect.provide(
+        ThreadManagement.layer.pipe(
+          Layer.provide(
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              listActiveSubagentThreadIds: () => Effect.succeed([]),
+              getThreadShell: (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
+            }),
+          ),
+          Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(CommandReceiptStore.layer),
+        ),
+      ),
+      Effect.provideService(ProjectStore.ProjectStoreV2, {
+        listShells: () => Effect.succeed([]),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+      Effect.provideService(ProjectService.ProjectService, {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"]),
+      Effect.provideServiceEffect(
+        ProjectEnrichment.ProjectEnrichmentService,
+        PubSub.unbounded().pipe(
+          Effect.map(
+            (changes) =>
+              ({
+                subscribeChanges: PubSub.subscribe(changes),
+              }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+          ),
+        ),
+      ),
+    );
+
+    for (const items of [first, second]) {
+      assert.deepEqual(
+        items.flatMap((item) =>
+          item.kind === "thread.updated" ? [[item.sequence, item.thread.id]] : [],
+        ),
+        [[event!.sequence, threadId]],
+      );
+    }
+    assert.deepEqual(reads, [threadId]);
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 

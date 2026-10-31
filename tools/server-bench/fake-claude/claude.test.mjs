@@ -230,17 +230,30 @@ describe("fake claude transcripts", () => {
 describe("fake claude process", () => {
   it("answers the SDK's control requests and plays a turn per user message", async () => {
     using stats = tempDir("fake-claude-stats-");
+    using credentials = tempDir("fake-claude-mcp-");
+    const mcpDir = NodePath.join(credentials.path, "sessions");
     using fake = startFake(STREAM_ARGS, {
       BENCH_SPEED: "0",
       BENCH_TRANSCRIPT: "large-tool-payload",
       BENCH_TOOL_PAYLOAD_BYTES: "2048",
       BENCH_STATS_DIR: stats.path,
+      BENCH_MCP_CREDENTIALS_DIR: mcpDir,
     });
     const control = (id, request) =>
       fake.send({ type: "control_request", request_id: id, request });
     control("init", { subtype: "initialize", hooks: {} });
     control("usage", { subtype: "get_usage", skip_behaviors: true });
-    control("mcp", { subtype: "mcp_set_servers", servers: { "t3-code": { type: "http" } } });
+    control("mcp", {
+      subtype: "mcp_set_servers",
+      servers: {
+        other: { type: "http", url: "http://127.0.0.1:2/other" },
+        "t3-code": {
+          type: "http",
+          url: "http://127.0.0.1:1/mcp",
+          headers: { Authorization: "Bearer mcp-secret" },
+        },
+      },
+    });
     control("model", { subtype: "set_model", model: "claude-opus-5" });
     const responses = parseAll(await fake.until((line) => line.includes('"request_id":"model"')));
     fake.send({ type: "user", message: { role: "user", content: "hi" }, uuid: PROMPT });
@@ -249,6 +262,7 @@ describe("fake claude process", () => {
     fake.end();
     await fake.exited;
     const [record] = readStats(stats.path);
+    const credentialFile = NodePath.join(mcpDir, `${SESSION}.json`);
 
     expect(responses.map(({ response }) => [response.request_id, response.subtype])).toEqual([
       ["init", "success"],
@@ -258,7 +272,15 @@ describe("fake claude process", () => {
     ]);
     expect(responses[0].response.response.account.email).toBeDefined();
     expect(responses[1].response.response.rate_limits_available).toBe(true);
-    expect(responses[2].response.response.added).toEqual(["t3-code"]);
+    expect(responses[2].response.response.added).toEqual(["other", "t3-code"]);
+    expect(JSON.parse(NodeFS.readFileSync(credentialFile, "utf8"))).toEqual({
+      url: "http://127.0.0.1:1/mcp",
+      authorization: "Bearer mcp-secret",
+    });
+    expect(NodeFS.statSync(credentialFile).mode & 0o777).toBe(0o600);
+    expect(NodeFS.readdirSync(mcpDir)).toEqual([`${SESSION}.json`]);
+    expect(lines.some((line) => line.includes("mcp-secret"))).toBe(false);
+    expect(JSON.stringify(responses)).not.toContain("mcp-secret");
     expect(turn.find((frame) => frame.subtype === "init")).toMatchObject({
       session_id: SESSION,
       model: "claude-opus-5",

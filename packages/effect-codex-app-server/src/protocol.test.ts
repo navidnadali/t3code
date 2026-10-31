@@ -208,7 +208,8 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
           clock += 7;
           return decode.call(this, input, options);
         });
-        const framing = { count: 0, elapsedMs: 0, bytes: 0 };
+        const framingMs: Array<number> = [];
+        let framingBytes = 0;
         const jsonFrames: Array<{ readonly elapsedMs: number; readonly bytes: number }> = [];
         const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
         yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
@@ -218,9 +219,8 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
             record: (stage, elapsedMs, bytes) => {
               if (stage === "json") jsonFrames.push({ elapsedMs, bytes });
               if (stage !== "framing") return;
-              framing.count += 1;
-              framing.elapsedMs += elapsedMs;
-              framing.bytes += bytes;
+              framingMs.push(elapsedMs);
+              framingBytes += bytes;
             },
           },
           logIncoming: true,
@@ -263,11 +263,11 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
             bytes: encoder.encode(line).byteLength,
           })),
         );
-        assert.deepEqual(framing, {
-          count: Math.ceil(bytes.byteLength / chunkSize),
-          elapsedMs: 7 * Math.ceil(bytes.byteLength / chunkSize),
-          bytes: bytes.byteLength,
-        });
+        assert.deepEqual(
+          framingMs,
+          Array.from({ length: Math.ceil(bytes.byteLength / chunkSize) }, () => 7),
+        );
+        assert.equal(framingBytes, bytes.byteLength);
       }),
   );
 

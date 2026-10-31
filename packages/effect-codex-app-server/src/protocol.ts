@@ -183,7 +183,8 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const nextRequestId = yield* Ref.make(1);
     const maxIncomingMessageBytes = options.maxIncomingMessageBytes ?? MAX_INCOMING_MESSAGE_BYTES;
     const timing = options.stageTiming;
-    let textDecodeMs = 0;
+    // A stream batch is decoded before its chunks are framed; queue each chunk's decode time.
+    const textDecodeMs: Array<number> = [];
     const decodeText =
       timing === undefined
         ? Stream.decodeText()
@@ -193,7 +194,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
               return Stream.map(bytes, (chunk) => {
                 const startedAt = timing.now();
                 const text = decoder.decode(chunk, { stream: true });
-                textDecodeMs += timing.now() - startedAt;
+                textDecodeMs.push(timing.now() - startedAt);
                 return text;
               });
             });
@@ -484,10 +485,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           if (timing !== undefined) {
             timing.record(
               "framing",
-              textDecodeMs + framingMs + timing.now() - segmentStartedAt,
+              (textDecodeMs.shift() ?? 0) + framingMs + timing.now() - segmentStartedAt,
               chunkBytes,
             );
-            textDecodeMs = 0;
           }
         }),
       ),

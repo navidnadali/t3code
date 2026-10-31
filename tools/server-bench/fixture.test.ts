@@ -8,7 +8,7 @@ import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeSqlite from "node:sqlite";
 
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, onTestFinished } from "vite-plus/test";
 
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
@@ -21,8 +21,12 @@ const SERVER = NodePath.join(ROOT, "apps", "server", "src", "bin.ts");
 const EXAMPLE = NodePath.join(import.meta.dirname, "fixture", "example-shape.json");
 const example = parseShape(JSON.parse(NodeFS.readFileSync(EXAMPLE, "utf8")));
 
-const scratch = (name: string) =>
-  NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), `fixture-${name}-`));
+/** A temp directory removed when the current test finishes. */
+const scratch = (name: string) => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), `fixture-${name}-`));
+  onTestFinished(() => NodeFS.rmSync(directory, { recursive: true, force: true }));
+  return directory;
+};
 
 // Credential-shaped samples, assembled at run time so no literal token sits in the source.
 const SAMPLES: Record<string, string> = {

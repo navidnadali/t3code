@@ -32,16 +32,24 @@ export const HELP = `Usage:
                                  --out <dir> [options]
 
 Per ref: restore the pristine fixture into a fresh base dir, start the server, sample it at 1 Hz
-(collect.ts), run the load driver, stop the server, read the trace; repeat --runs times, rounds
-interleaved across refs (A B A B ...), then write <out>/<label>.result.json (median of the valid
-runs, min/max spread, every run's detail) and, with two or more refs, <out>/compare.md (the first
-ref against each other one, via report.ts; a refused comparison exits 2).
+(collect.ts), run the load driver, stop the server, read the trace. --runs rounds, counterbalanced
+(A B, B A, A B ...). An attempt is invalid when the server fails or exits, the driver fails, or,
+unless T3CODE_TRACE_MIN_LEVEL is Warn or above, the trace does not cover the window
+(trace_missing / trace_coverage / trace_stale / trace_rotated_during_read); it is retried in its
+own slot up to --retries times, so the order holds. Then <out>/<label>.result.json (median of the
+valid runs, min/max spread, the attempt order, every attempt's detail) and, with two or more refs,
+<out>/compare.md (the first ref against each other one, via report.ts; a refused comparison
+exits 2).
 
 Refs
   --ref <git-ref>          worktree at <work>/trees/<sha>, built once with --build-cmd; runs
                            apps/server/dist/bin.mjs.
-  --ref <dir>              an existing checkout as it is (HEAD SHA and a dirty flag recorded); runs
-                           dist/bin.mjs when built, else src/bin.ts (smoke only).
+  --ref <dir>              an existing checkout (HEAD SHA, dirty flag and a hash of its changes
+                           recorded). It runs dist/bin.mjs only when the stamp run.ts writes after
+                           a build (apps/server/dist/.server-bench-build.json) matches the tree as
+                           it is now and the bundle on disk; otherwise it rebuilds with --build-cmd
+                           first. Without dist/ it runs src/bin.ts (smoke only; compare refuses
+                           dist against source).
   label=...                names the result (default: the ref with / as -).
   --base <ref>             the base every result records; compare refuses different bases
                            [perf/base].
@@ -77,7 +85,7 @@ Server
   --otlp-interval-ms N     server gauge export interval to the local receiver; 0 = off [1000].
   --server-cpus / --driver-cpus <list>   taskset CPU lists (Linux); the harness itself joins the
                            driver CPUs.
-  --startup-timeout 300s, --runs 3, --max-attempts <runs + 2>, --work <out>/work, --keep-runs
+  --startup-timeout 300s, --runs 3, --retries 2 (per run slot), --work <out>/work, --keep-runs
   (keep each run's base dir with its database and trace; deleted by default).
 
 <work>/trees/<sha> are git worktrees of this repository, kept so a SHA is built once; remove them
@@ -122,6 +130,24 @@ const FATAL = new Set([
   "window_too_short",
   "main_thread_missing",
 ]);
+const TRACE_PROBLEMS = new Set([
+  "trace_missing",
+  "trace_coverage",
+  "trace_stale",
+  "trace_rotated_during_read",
+]);
+/** Below Warn the server writes spans continuously, so a trace problem voids the attempt. */
+export const traceRequired = (env: Readonly<Record<string, string>>) =>
+  !["warn", "error", "fatal", "none"].includes(
+    (env.T3CODE_TRACE_MIN_LEVEL ?? "Info").trim().toLowerCase(),
+  );
+
+/** Rounds alternate direction (A B, B A, A B ...), so drift over time hits every ref alike. */
+export function runOrder(labels: ReadonlyArray<string>, runs: number): Array<string> {
+  return Array.from({ length: runs }, (_, round) =>
+    round % 2 === 0 ? [...labels] : labels.toReversed(),
+  ).flat();
+}
 
 export function parseDuration(value: string, flag: string): number {
   const match = /^(\d+(?:\.\d+)?)(s|m)?$/.exec(value.trim());
@@ -167,6 +193,14 @@ export function benchEnvHash(env: Readonly<Record<string, string>>): string {
     .filter(([name]) => name.startsWith("BENCH_") && !isPlumbing(name))
     .toSorted(([a], [b]) => a.localeCompare(b));
   return NodeCrypto.createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
+
+const HARNESS_FILES = ["collect.ts", "report.ts", "run.ts", "driver-stub.ts"];
+
+async function filesHash(paths: ReadonlyArray<string>): Promise<string> {
+  const hash = NodeCrypto.createHash("sha256");
+  for (const path of paths) hash.update(`${NodePath.basename(path)}\0${await sha256File(path)}\n`);
+  return hash.digest("hex");
 }
 
 /** The driver file and, when present, its module directory (driver.ts + driver/). */
@@ -257,6 +291,8 @@ interface Target {
   readonly dir: string;
   readonly sha: string;
   readonly dirty: boolean;
+  /** HEAD, plus a hash of uncommitted changes for a dirty tree. */
+  readonly tree: string;
   readonly entry: string;
   readonly entryKind: "dist" | "source";
   readonly version: string | null;
@@ -266,40 +302,92 @@ interface Target {
 const sanitiseLabel = (text: string) =>
   text.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 
+/** HEAD and, for a tree with changes (tracked or untracked), a hash of them. */
+function treeState(dir: string) {
+  const sha = git(dir, ["rev-parse", "HEAD"]);
+  const dirty = git(dir, ["status", "--porcelain"]).length > 0;
+  if (!dirty) return { sha, dirty, tree: sha };
+  const hash = NodeCrypto.createHash("sha256");
+  hash.update(
+    NodeChildProcess.spawnSync("git", ["-C", dir, "diff", "HEAD", "--binary"], {
+      maxBuffer: 1024 * MIB,
+    }).stdout,
+  );
+  const untracked = git(dir, ["ls-files", "--others", "--exclude-standard", "-z"])
+    .split("\0")
+    .filter((file) => file.length > 0)
+    .toSorted();
+  for (const file of untracked) {
+    hash.update(`\0${file}\0`);
+    hash.update(NodeFS.readFileSync(NodePath.join(dir, file)));
+  }
+  return { sha, dirty, tree: `${sha}+${hash.digest("hex").slice(0, 16)}` };
+}
+
+const DIST_ENTRY = "apps/server/dist/bin.mjs";
+const BUILD_STAMP = "apps/server/dist/.server-bench-build.json";
+
+/** The stamp a build leaves: the tree it was built from and the bundle it produced. */
+const distStamp = (dir: string, tree: string) => {
+  const stat = NodeFS.statSync(NodePath.join(dir, DIST_ENTRY));
+  return { tree, size: stat.size, mtimeMs: stat.mtimeMs };
+};
+
+function builtFrom(dir: string, tree: string): boolean {
+  try {
+    const stamp = JSON.parse(
+      NodeFS.readFileSync(NodePath.join(dir, BUILD_STAMP), "utf8"),
+    ) as unknown;
+    return JSON.stringify(stamp) === JSON.stringify(distStamp(dir, tree));
+  } catch {
+    return false;
+  }
+}
+
+function build(dir: string, tree: string, buildCmd: string, log: string, what: string) {
+  console.error(`building ${what} (${tree.slice(0, 12)}): ${buildCmd} > ${log}`);
+  const fd = NodeFS.openSync(log, "w");
+  const result = NodeChildProcess.spawnSync("sh", ["-c", buildCmd], {
+    cwd: dir,
+    stdio: ["ignore", fd, fd],
+  });
+  NodeFS.closeSync(fd);
+  if (result.status !== 0) throw new Error(`build of ${what} failed; see ${log}`);
+  if (NodeFS.existsSync(NodePath.join(dir, DIST_ENTRY))) {
+    NodeFS.writeFileSync(NodePath.join(dir, BUILD_STAMP), JSON.stringify(distStamp(dir, tree)));
+  }
+}
+
+/**
+ * A git ref gets its own worktree, built once per SHA. A checkout directory runs its built
+ * bundle only when the stamp says it was built from the tree as it is now (HEAD plus any
+ * changes), and is rebuilt otherwise; without a bundle it runs from source.
+ */
 function prepareTarget(spec: string, workDir: string, buildCmd: string): Omit<Target, "env"> {
   const eq = spec.indexOf("=");
   const explicitLabel =
     eq > 0 && /^[A-Za-z0-9._-]+$/.test(spec.slice(0, eq)) ? spec.slice(0, eq) : undefined;
   const value = explicitLabel === undefined ? spec : spec.slice(eq + 1);
+  const isCheckout = NodeFS.existsSync(value) && NodeFS.statSync(value).isDirectory();
   let dir: string;
-  let sha: string;
-  let dirty = false;
-  if (NodeFS.existsSync(value) && NodeFS.statSync(value).isDirectory()) {
+  if (isCheckout) {
     dir = NodeFS.realpathSync(value);
-    sha = git(dir, ["rev-parse", "HEAD"]);
-    dirty = git(dir, ["status", "--porcelain", "--untracked-files=no"]).length > 0;
   } else {
-    sha = resolveCommit(repoRoot, value);
+    const sha = resolveCommit(repoRoot, value);
     dir = NodePath.join(workDir, "trees", sha.slice(0, 12));
     if (!NodeFS.existsSync(dir)) git(repoRoot, ["worktree", "add", "--detach", dir, sha]);
-    const marker = NodePath.join(dir, ".server-bench-built");
-    const built = NodeFS.existsSync(marker) && NodeFS.readFileSync(marker, "utf8").trim() === sha;
-    if (!built) {
-      const log = NodePath.join(workDir, "trees", `${sha.slice(0, 12)}.build.log`);
-      console.error(`building ${value} (${sha.slice(0, 12)}): ${buildCmd} > ${log}`);
-      const fd = NodeFS.openSync(log, "w");
-      const result = NodeChildProcess.spawnSync("sh", ["-c", buildCmd], {
-        cwd: dir,
-        stdio: ["ignore", fd, fd],
-      });
-      NodeFS.closeSync(fd);
-      if (result.status !== 0) throw new Error(`build of ${value} failed; see ${log}`);
-      NodeFS.writeFileSync(marker, `${sha}\n`);
-    }
   }
-  const dist = NodePath.join(dir, "apps/server/dist/bin.mjs");
-  const entryKind = NodeFS.existsSync(dist) ? "dist" : "source";
-  const entry = entryKind === "dist" ? dist : NodePath.join(dir, "apps/server/src/bin.ts");
+  const state = treeState(dir);
+  const hasDist = NodeFS.existsSync(NodePath.join(dir, DIST_ENTRY));
+  if ((!isCheckout || hasDist) && !(hasDist && builtFrom(dir, state.tree))) {
+    const log = NodePath.join(workDir, `build-${state.sha.slice(0, 12)}.log`);
+    build(dir, state.tree, buildCmd, log, value);
+  }
+  const entryKind = NodeFS.existsSync(NodePath.join(dir, DIST_ENTRY)) ? "dist" : "source";
+  if (entryKind === "dist" && !builtFrom(dir, state.tree)) {
+    throw new Error(`${value}: ${DIST_ENTRY} was not built from ${state.tree}`);
+  }
+  const entry = NodePath.join(dir, entryKind === "dist" ? DIST_ENTRY : "apps/server/src/bin.ts");
   if (!NodeFS.existsSync(entry)) throw new Error(`${value}: no server entry at ${entry}`);
   const version = NodeChildProcess.spawnSync(process.execPath, [entry, "--version"], {
     cwd: dir,
@@ -307,11 +395,12 @@ function prepareTarget(spec: string, workDir: string, buildCmd: string): Omit<Ta
     timeout: 120_000,
   });
   return {
-    label: explicitLabel ?? sanitiseLabel(value === dir ? NodePath.basename(dir) : value),
+    label: explicitLabel ?? sanitiseLabel(isCheckout ? NodePath.basename(dir) : value),
     ref: value,
     dir,
-    sha,
-    dirty,
+    sha: state.sha,
+    dirty: state.dirty,
+    tree: state.tree,
     entry,
     entryKind,
     version: version.status === 0 ? (version.stdout.split("\n")[0]?.trim() ?? null) : null,
@@ -675,7 +764,10 @@ async function runOnce(target: Target, attempt: number, options: RunOptions) {
             },
     }),
   ) as MetricTree;
-  const valid = !problems.some((problem) => FATAL.has(problem));
+  const required = traceRequired(target.env);
+  const valid = !problems.some(
+    (problem) => FATAL.has(problem) || (required && TRACE_PROBLEMS.has(problem)),
+  );
   const record = {
     schema: "t3-server-bench/run/1",
     label: target.label,
@@ -724,6 +816,8 @@ async function runOnce(target: Target, attempt: number, options: RunOptions) {
 }
 
 const hostInfo = () => ({
+  // A fingerprint, so results can be matched to a machine without publishing its name.
+  host_id: NodeCrypto.createHash("sha256").update(NodeOS.hostname()).digest("hex").slice(0, 16),
   os: `${NodeOS.type()} ${NodeOS.release()}`,
   machine: NodeOS.machine(),
   cpu_model: NodeOS.cpus()[0]?.model ?? null,
@@ -741,7 +835,7 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
       base: { type: "string", default: "perf/base" },
       fixture: { type: "string" },
       runs: { type: "string", default: "3" },
-      "max-attempts": { type: "string" },
+      retries: { type: "string", default: "2" },
       warmup: { type: "string", default: "60s" },
       window: { type: "string", default: "300s" },
       driver: { type: "string" },
@@ -771,11 +865,10 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
   if (values.fixture === undefined) throw new Error("--fixture <file|dir|none> is required");
   if (values.out === undefined) throw new Error("--out <dir> is required");
   const runs = positiveInt(values.runs, "--runs");
-  const maxAttempts =
-    values["max-attempts"] === undefined
-      ? runs + 2
-      : positiveInt(values["max-attempts"], "--max-attempts");
-  if (maxAttempts < runs) throw new Error("--max-attempts must be at least --runs");
+  const retries = Number(values.retries);
+  if (!Number.isSafeInteger(retries) || retries < 0) {
+    throw new Error("--retries must be a whole number");
+  }
   const warmupS = parseDuration(values.warmup, "--warmup");
   const windowS = parseDuration(values.window, "--window");
   if (windowS < 2) throw new Error("--window must be at least 2 s");
@@ -815,6 +908,9 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
   }
   const baseSha = resolveCommit(repoRoot, values.base);
   const harnessSha = git(repoRoot, ["rev-parse", "HEAD"]);
+  const harnessFilesSha = await filesHash(
+    HARNESS_FILES.map((file) => NodePath.join(harnessDir, file)),
+  );
   const fixture = await fixtureInfo(values.fixture, workDir);
   const prepared = refs.map((spec) => prepareTarget(spec, workDir, values["build-cmd"]));
   const labels = new Set(prepared.map((target) => target.label));
@@ -873,15 +969,19 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
   const records = new Map<string, Array<Awaited<ReturnType<typeof runOnce>>>>(
     targets.map((target) => [target.label, []]),
   );
-  for (let round = 0; round < maxAttempts; round++) {
-    const pending = targets.filter((target) => {
-      const done = records.get(target.label)!;
-      return done.filter((record) => record.valid).length < runs && done.length < maxAttempts;
-    });
-    if (pending.length === 0) break;
-    for (const target of pending) {
-      const done = records.get(target.label)!;
-      done.push(await runOnce(target, done.length + 1, options));
+  const order: Array<string> = [];
+  // A failed attempt is retried in its own slot, so the counterbalanced order holds.
+  for (const [slot, label] of runOrder(
+    targets.map((target) => target.label),
+    runs,
+  ).entries()) {
+    const target = targets.find((candidate) => candidate.label === label)!;
+    const done = records.get(label)!;
+    for (let retry = 0; retry <= retries; retry++) {
+      const record = { ...(await runOnce(target, done.length + 1, options)), slot };
+      done.push(record);
+      order.push(`${label}#${record.attempt}${record.valid ? "" : " (invalid)"}`);
+      if (record.valid) break;
     }
   }
 
@@ -909,10 +1009,12 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
         server_sha: target.sha,
         server_ref: target.ref,
         server_dirty: target.dirty,
+        server_tree: target.tree,
         server_version: target.version,
         base_sha: baseSha,
         base_ref: values.base,
         harness_sha: harnessSha,
+        harness_files_sha256: harnessFilesSha,
         fixture: { kind: fixture.kind, sha256: fixture.sha256, bytes: fixture.bytes },
       },
       sampling: {
@@ -940,7 +1042,7 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
         },
         run: {
           runs,
-          max_attempts: maxAttempts,
+          retries,
           server_entry: target.entryKind,
           server_cpus: values["server-cpus"] ?? null,
           driver_cpus: values["driver-cpus"] ?? null,
@@ -948,7 +1050,7 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
         },
       },
       host: hostInfo(),
-      runs: { requested: runs, attempted: all.length, valid: valid.length },
+      runs: { requested: runs, attempted: all.length, valid: valid.length, order },
       metrics,
       spread,
       run_details: all,

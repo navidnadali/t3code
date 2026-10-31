@@ -20,6 +20,7 @@ const metrics = (scale: number): MetricTree => ({
     main: { user_pct: 21.25 * scale, sys_pct: 39.5 * scale, busy_pct: 60.75 * scale },
     process: { user_pct: 30, sys_pct: 45, busy_pct: 75 },
     roles: { "sqlite-reader": { user_pct: 2.7, sys_pct: 3.6, busy_pct: 6.3, threads: 4 } },
+    worker_threads: { user_pct: 3.4, sys_pct: 4.3, busy_pct: 7.7, threads: 5 },
   },
   io: {
     main: {
@@ -44,6 +45,13 @@ const metrics = (scale: number): MetricTree => ({
       read_bytes_mb_s: 0.18,
     },
     roles: null,
+    worker_threads: {
+      syscr_per_s: 4533.3,
+      syscw_per_s: 3.7,
+      rchar_mb_s: 18.4,
+      wchar_mb_s: 0.1,
+      read_bytes_mb_s: 0.1,
+    },
   },
   mem: { rss_peak_mib: 2150.4, hwm_mib: 2200 },
   otlp: {
@@ -67,15 +75,17 @@ const metrics = (scale: number): MetricTree => ({
       count: 5000,
       p50_ms: 66.5 * scale,
       p95_ms: 274,
-      lock_wait_p50_ms: 60.1,
-      lock_wait_p95_ms: 254,
+      avg_ms: 75,
+      avg_lock_wait_ms: 66,
+      p95_lock_wait_ms: 254,
     },
     "sql.transaction|reader": {
       count: 2460,
       p50_ms: 441,
       p95_ms: 2900,
-      lock_wait_p50_ms: 225,
-      lock_wait_p95_ms: 2300,
+      avg_ms: 837,
+      avg_lock_wait_ms: 441 * scale,
+      p95_lock_wait_ms: 2300,
     },
   },
   driver: {
@@ -104,6 +114,7 @@ const result = (
     base_sha: BASE_SHA,
     base_ref: "perf/base",
     harness_sha: "aaaaaaaa",
+    harness_files_sha256: "12".repeat(32),
     fixture: { kind: "file", sha256: "ab".repeat(32), bytes: 1024 },
   },
   sampling: {
@@ -122,9 +133,9 @@ const result = (
       window_s: 300,
       driver_args: ["--sessions", "80"],
     },
-    run: { runs: 3 },
+    run: { runs: 3, server_entry: "dist", server_cpus: "0-3", driver_cpus: "4-7" },
   },
-  host: {},
+  host: { host_id: "f00dfeedf00dfeed", cpu_model: "AMD EPYC 7B13", node: "v26.12.1", cpus: 8 },
   runs: { requested: 3, attempted: 3, valid: 3 },
   metrics: metrics(scale),
   spread: { min: metrics(scale), max: metrics(scale) },
@@ -156,6 +167,12 @@ describe("renderComparison", () => {
     expect(line(markdown, "Client `mcp.t3_project_list` p95 ms")).toBe(
       "| Client `mcp.t3_project_list` p95 ms | 9,800 | 4,900 | -4,900 (-50%) |",
     );
+    expect(line(markdown, "`sql.transaction` reader avg lock wait ms")).toBe(
+      "| `sql.transaction` reader avg lock wait ms | 441 | 221 | -221 (-50%) |",
+    );
+    expect(line(markdown, "WorkerThread CPU % (SQLite readers + checkpoint)")).toBe(
+      "| WorkerThread CPU % (SQLite readers + checkpoint) | 7.70 | 7.70 | 0 (0.0%) |",
+    );
     expect(line(markdown, "Process read syscalls/s (incl. reaped children)")).toBe(
       "| Process read syscalls/s (incl. reaped children) | 7,793 | 7,793 | 0 (0.0%) |",
     );
@@ -178,7 +195,8 @@ describe("renderComparison", () => {
 
     for (const label of [
       "`sql.transaction` writer p50 ms",
-      "`sql.transaction` reader lock wait p95 ms",
+      "`sql.transaction` reader p95 lock wait ms",
+      "`sql.transaction` writer avg lock wait ms",
       "`OrchestratorV2.getThreadShell` p95 ms",
       "`McpHttpServer.authenticateRequest` p95 ms",
       "ELU (server gauge, mean)",
@@ -245,6 +263,45 @@ describe("comparabilityProblems", () => {
       "base SHA not recorded",
       "fixture hash not recorded",
       "trace sampling not recorded",
+    ]);
+  });
+
+  it("refuses another host, Node, harness, server entry or CPU pinning", () => {
+    const elsewhere = result("elsewhere", 0.5, {
+      host: { ...after.host, host_id: "0123456789abcdef", cpu_model: "Apple M4 Max" },
+    });
+    const otherNode = result("node", 0.5, { host: { ...after.host, node: "v26.9.0" } });
+    const otherHarness = result("harness", 0.5, {
+      identity: { ...after.identity, harness_files_sha256: "34".repeat(32) },
+    });
+    const fromSource = result("source", 0.5, {
+      knobs: { ...after.knobs, run: { ...after.knobs.run, server_entry: "source" } },
+    });
+    const unpinned = result("unpinned", 0.5, {
+      knobs: { ...after.knobs, run: { ...after.knobs.run, server_cpus: null } },
+    });
+    const legacy = result("legacy", 0.5, { host: {} });
+
+    expect(comparabilityProblems(before, elsewhere)).toEqual([
+      'host differs: cpu_model "AMD EPYC 7B13" vs "Apple M4 Max"',
+      'host differs: host_id "f00dfeedf00dfeed" vs "0123456789abcdef"',
+    ]);
+    expect(comparabilityProblems(before, otherNode)).toEqual([
+      'host differs: node "v26.12.1" vs "v26.9.0"',
+    ]);
+    expect(comparabilityProblems(before, otherHarness)).toEqual([
+      `harness differs: harness_files_sha256 "${"12".repeat(32)}" vs "${"34".repeat(32)}"`,
+    ]);
+    expect(comparabilityProblems(before, fromSource)).toEqual([
+      'run setup differs: server_entry "dist" vs "source"',
+    ]);
+    expect(comparabilityProblems(before, unpinned)).toEqual([
+      'run setup differs: server_cpus "0-3" vs null',
+    ]);
+    expect(comparabilityProblems(before, legacy)).toEqual([
+      "host not recorded: cpu_model",
+      "host not recorded: host_id",
+      "host not recorded: node",
     ]);
   });
 

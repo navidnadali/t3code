@@ -16,13 +16,15 @@ export const HELP = `Usage:
 Samples one running T3 Code server at 1 Hz and writes one JSON summary of the window
 [start, start + duration]. run.ts uses the same functions for every bench run.
 
-Metric definitions (the same as tools/prod-sample.sh, so bench and production compare):
-  CPU     utime/stime deltas of /proc/<pid>/task/<tid>/stat over the window, % of one core.
+Metric definitions (those of tools/prod-sample.sh, so bench and production compare):
+  CPU     utime/stime deltas of /proc/<pid>/task/<tid>/stat between the window's first and last
+          snapshot, % of one core; "process" from /proc/<pid>/stat.
   I/O     syscr/syscw/rchar/wchar/read_bytes deltas of /proc/<pid>/task/<tid>/io, per second.
           "process" is /proc/<pid>/io, which also folds in the I/O of exited threads and reaped
-          children (git, claude); "threads_sum" is the server's own live threads only. Per-thread
-          deltas are summed over the 1 s intervals, so a thread that starts mid-window counts in
-          full; the last partial second of a thread that exits mid-window is lost.
+          children (git, claude); "threads_sum", the roles and the per-thread rows cover the
+          server's threads present at both window ends, as in production. Threads that start
+          inside the window are summed apart ("started_in_window", counted from zero);
+          "threads_exited" counts those that end inside it.
   Memory  peak VmRSS of the 1 s samples; VmHWM at the end.
   Gauges  t3_server_* gauges posted by the server's OTLP exporter to a local receiver
           (T3CODE_OTLP_METRICS_URL=<receiver>/v1/metrics, T3CODE_OTLP_PROTOCOL=http/json). The server
@@ -32,24 +34,36 @@ Metric definitions (the same as tools/prod-sample.sh, so bench and production co
           event-loop delay their maximum; RSS and heap peaks use every sample seen in the window.
           ELU therefore needs warm-up + window of 90 s or more.
   Spans   server.trace.ndjson plus its rotated files (.1 newest .. .N), de-duplicated by inode and
-          re-read when a rotation happens during the read; spans whose end falls in the window,
-          p50/p95/max (nearest rank) by name, and for "sqlite"/"sql.transaction" by name and
-          db.connection with db.lock_wait_ms. Only names, durations, exit tags and the db.*
-          attributes are kept. A trace that does not reach back to the window start
-          (trace_coverage) or whose newest span ends 30 s or more before the window end
-          (trace_stale) yields no span statistics (n/a).
+          re-read when a rotation happens during the read; spans whose end falls in the window.
+          By name: count, total, avg, p50, p95, max (nearest rank); for "sqlite" and
+          "sql.transaction" by "<name>|<db.connection>" with lock_wait_n, avg_lock_wait_ms and
+          p95_lock_wait_ms (prod-sample.sh's keys) plus p50/max. Only names, durations, exit tags
+          and the db.* attributes are kept. A trace that does not reach back to the window start
+          (trace_coverage), rotated during every read (trace_rotated_during_read) or whose newest
+          span ends 30 s or more before the window end (trace_stale) yields no span statistics.
 
-Thread labels (every Node worker thread has comm "WorkerThread", so the SQLite workers are told
-apart by I/O pattern and start order, judged from each thread's lifetime counters):
+Thread labels ("role", prod-sample.sh's rule; every Node worker thread has comm "WorkerThread"):
   main           tid == pid.
-  checkpoint     the WorkerThread whose lifetime writes look like a WAL checkpoint (wchar >= 1 MiB
-                 and 0.5 <= wchar/rchar <= 2: it copies WAL frames into the database); if none has
-                 checkpointed yet, the earliest-started WorkerThread that is not reading like a
-                 reader (the checkpoint worker starts with the writer connection, the reader workers
-                 only on their first read).
-  sqlite-reader  every other WorkerThread that writes at most max(64 KiB, 1 % of its reads).
-  other          everything else (V8 platform, libuv pool, inspector, threads of native modules).
-Each thread's label and its basis ("io-pattern", "start-order", "default") are in the output.
+  checkpoint     a WorkerThread whose lifetime rchar is over 100 MB with wchar/rchar in 0.8-1.25:
+                 the WAL checkpoint worker copies WAL frames into the database. Production calls
+                 it "checkpoint?"; until it has copied 100 MB it counts as a reader.
+  sqlite-reader  every other WorkerThread (production's "worker").
+  other          everything else (V8 platform, libuv pool, inspector, native modules); by comm
+                 under cpu.by_comm.
+  "worker_threads" sums all WorkerThreads (production's "WorkerThread CPU %" rows). Each thread
+  row also carries this harness's finer guess ("role_guess", "role_guess_basis"): the checkpoint
+  is the WorkerThread whose lifetime writes are 1 MiB or more and 0.5-2x its reads, else the
+  earliest-started WorkerThread not reading like a reader (the checkpoint worker starts with the
+  writer, readers on first read); other WorkerThreads writing at most max(64 KiB, 1 % of reads)
+  are readers.
+
+Differences from prod-sample.sh that remain (by design):
+  - one fixed window (the driver's measured window) for CPU, I/O and spans; production uses a
+    20 s CPU/I/O window and the last 120 s of spans per sample;
+  - no 50 ms main-thread scheduler-state sampling, no child-process (claude) counts, no host PSI;
+  - the environment GET latency comes from the load driver, not from curl;
+  - ELU, event-loop delay and heap come from the server's own gauges (production has none);
+  - an unreadable per-thread io file makes the I/O sums null (n/a), where production counts it 0.
 
 macOS has no /proc: process user/sys CPU and RSS come from ps(1); per-thread CPU and all I/O
 rows are null (rendered n/a).`;
@@ -112,8 +126,12 @@ export interface IoRates {
 export interface ThreadRow {
   readonly tid: number;
   readonly comm: string;
+  /** prod-sample.sh's label, so bench and production group threads alike. */
   readonly role: ThreadRole;
-  readonly basis: RoleBasis;
+  /** This harness's finer guess from I/O pattern and start order, and what it rests on. */
+  readonly role_guess: ThreadRole;
+  readonly role_guess_basis: RoleBasis;
+  readonly started_in_window: boolean;
   readonly starttime: number;
   readonly user_pct: number;
   readonly sys_pct: number;
@@ -126,6 +144,8 @@ export interface ThreadRow {
   readonly lifetime_wchar_mb: number | null;
 }
 
+export type CpuGroup = CpuStats & { readonly threads: number };
+
 export interface ProcWindowSummary {
   readonly source: "proc" | "ps" | null;
   readonly samples: number;
@@ -134,7 +154,13 @@ export interface ProcWindowSummary {
   readonly cpu: {
     readonly main: CpuStats | null;
     readonly process: CpuStats | null;
-    readonly roles: Partial<Record<ThreadRole, CpuStats & { readonly threads: number }>> | null;
+    /** Threads present at both window ends, by prod-sample.sh's label. */
+    readonly roles: Partial<Record<ThreadRole, CpuGroup>> | null;
+    /** Every WorkerThread present at both ends: production's "worker" + "checkpoint?". */
+    readonly worker_threads: CpuGroup | null;
+    readonly by_comm: Readonly<Record<string, CpuGroup>> | null;
+    /** Threads that started inside the window, counted from zero; not in the rows above. */
+    readonly started_in_window: CpuGroup | null;
     readonly main_busy_1s: {
       readonly p50_pct: number;
       readonly p95_pct: number;
@@ -143,10 +169,15 @@ export interface ProcWindowSummary {
   };
   readonly io: {
     readonly main: IoRates | null;
+    /** Live threads present at both window ends, as production's threads_sum. */
     readonly threads_sum: IoRates | null;
     readonly process: IoRates | null;
     readonly roles: Partial<Record<ThreadRole, IoRates>> | null;
+    readonly worker_threads: IoRates | null;
+    readonly started_in_window: IoRates | null;
   };
+  readonly threads_started: number | null;
+  readonly threads_exited: number | null;
   readonly mem: { readonly rss_peak_mib: number | null; readonly hwm_mib: number | null };
   readonly threads: ReadonlyArray<ThreadRow> | null;
 }
@@ -368,8 +399,22 @@ export class Collector {
 
 const isWorkerThread = (comm: string) => comm === "WorkerThread";
 
-/** Labels threads by the rules in HELP; `threads` holds each thread's latest sample. */
-export function classifyThreads(
+/**
+ * prod-sample.sh's label: comm cannot tell the SQLite workers apart; the WAL checkpoint worker
+ * copies WAL pages into the database, so its lifetime wchar is close to its rchar.
+ */
+export function productionRole(pid: number, thread: ThreadSample): ThreadRole {
+  if (thread.tid === pid) return "main";
+  if (!isWorkerThread(thread.comm)) return "other";
+  const reads = thread.io?.rchar ?? 0;
+  const writes = thread.io?.wchar ?? 0;
+  return reads > 100e6 && writes / reads >= 0.8 && writes / reads <= 1.25
+    ? "checkpoint"
+    : "sqlite-reader";
+}
+
+/** The finer guess described in HELP; `threads` holds each thread's latest sample. */
+export function guessThreadRoles(
   pid: number,
   threads: ReadonlyArray<ThreadSample>,
 ): Map<string, { readonly role: ThreadRole; readonly basis: RoleBasis }> {
@@ -466,13 +511,53 @@ const emptyProcSummary = (
   samples,
   elapsed_s: null,
   problems: [problem],
-  cpu: { main: null, process: null, roles: null, main_busy_1s: null },
-  io: { main: null, threads_sum: null, process: null, roles: null },
+  cpu: {
+    main: null,
+    process: null,
+    roles: null,
+    worker_threads: null,
+    by_comm: null,
+    started_in_window: null,
+    main_busy_1s: null,
+  },
+  io: {
+    main: null,
+    threads_sum: null,
+    process: null,
+    roles: null,
+    worker_threads: null,
+    started_in_window: null,
+  },
+  threads_started: null,
+  threads_exited: null,
   mem: { rss_peak_mib: null, hwm_mib: null },
   threads: null,
 });
 
-/** CPU, I/O and memory of the window from the 1 s snapshots. */
+interface Totals {
+  userS: number;
+  sysS: number;
+  threads: number;
+  io: IoDelta | null;
+}
+
+const newTotals = (): Totals => ({ userS: 0, sysS: 0, threads: 0, io: emptyIo() });
+
+const addThread = (into: Totals, before: ThreadSample, after: ThreadSample) => {
+  into.userS += after.userS - before.userS;
+  into.sysS += after.sysS - before.sysS;
+  into.threads += 1;
+  if (into.io !== null && before.io !== null && after.io !== null)
+    addIo(into.io, before.io, after.io);
+  else into.io = null;
+};
+
+/**
+ * CPU, I/O and memory of the window, as prod-sample.sh computes them: deltas between the first
+ * and the last snapshot of the window for the threads present at both ends. Threads that start
+ * inside the window are summed apart (from zero); the 1 s snapshots add the main thread's
+ * per-second busy distribution and the RSS peak.
+ */
 export function summariseWindow(
   pid: number,
   snapshots: ReadonlyArray<Snapshot>,
@@ -499,121 +584,115 @@ export function summariseWindow(
     addIo(delta, first.io, last.io);
     return ioRates(delta, elapsedS);
   })();
-  if (window.some((snapshot) => snapshot.threads === null)) {
+  if (first.threads === null || last.threads === null) {
+    const empty = emptyProcSummary(first.source, window.length, "per_thread_unavailable");
     return {
-      source: first.source,
-      samples: window.length,
+      ...empty,
       elapsed_s: round3(elapsedS),
-      problems: ["per_thread_unavailable"],
-      cpu: { main: null, process: processCpu, roles: null, main_busy_1s: null },
-      io: { main: null, threads_sum: null, process: processIo, roles: null },
+      cpu: { ...empty.cpu, process: processCpu },
+      io: { ...empty.io, process: processIo },
       mem,
-      threads: null,
     };
   }
 
-  const latest = new Map<string, ThreadSample>();
-  for (const snapshot of window) {
-    for (const [key, thread] of snapshot.threads ?? []) latest.set(key, thread);
-  }
-  const labels = classifyThreads(pid, [...latest.values()]);
-  const perThread = new Map<string, { userS: number; sysS: number; io: IoDelta | null }>();
-  const mainSeries: Array<number> = [];
-  for (let index = 1; index < window.length; index++) {
-    const a = window[index - 1]!;
-    const b = window[index]!;
-    const intervalS = (b.mono - a.mono) / 1000;
-    for (const [key, after] of b.threads ?? []) {
-      // A thread missing from the earlier sample started after it: everything it did counts.
-      const before = a.threads?.get(key) ?? {
-        ...after,
-        userS: 0,
-        sysS: 0,
-        io: after.io === null ? null : io0,
-      };
-      const total = perThread.get(key) ?? { userS: 0, sysS: 0, io: emptyIo() };
-      total.userS += after.userS - before.userS;
-      total.sysS += after.sysS - before.sysS;
-      if (before.io !== null && after.io !== null && total.io !== null) {
-        addIo(total.io, before.io, after.io);
-      } else {
-        total.io = null;
-      }
-      perThread.set(key, total);
-      if (after.tid === pid && intervalS > 0) {
-        mainSeries.push(
-          ((after.userS - before.userS + after.sysS - before.sysS) / intervalS) * 100,
-        );
-      }
-    }
-  }
-
-  const roleCpu = new Map<ThreadRole, { userS: number; sysS: number; threads: number }>();
-  const roleIo = new Map<ThreadRole, IoDelta | null>();
-  let threadsIo: IoDelta | null = emptyIo();
+  const startThreads = first.threads;
+  const endThreads = last.threads;
+  const guesses = guessThreadRoles(pid, [
+    ...endThreads.values(),
+    ...[...startThreads].filter(([key]) => !endThreads.has(key)).map(([, thread]) => thread),
+  ]);
+  const roles = new Map<ThreadRole, Totals>();
+  const byComm = new Map<string, Totals>();
+  const workers = newTotals();
+  const common = newTotals();
+  const started = newTotals();
+  let main: Totals | undefined;
   const rows: Array<ThreadRow> = [];
-  for (const [key, total] of perThread) {
-    const thread = latest.get(key)!;
-    const label = labels.get(key) ?? { role: "other" as const, basis: "default" as const };
-    const cpu = roleCpu.get(label.role) ?? { userS: 0, sysS: 0, threads: 0 };
-    cpu.userS += total.userS;
-    cpu.sysS += total.sysS;
-    cpu.threads += 1;
-    roleCpu.set(label.role, cpu);
-    const previousIo = roleIo.has(label.role) ? roleIo.get(label.role)! : emptyIo();
-    if (previousIo === null || total.io === null) {
-      roleIo.set(label.role, null);
+  for (const [key, after] of endThreads) {
+    const startedInWindow = !startThreads.has(key);
+    const before = startThreads.get(key) ?? {
+      ...after,
+      userS: 0,
+      sysS: 0,
+      io: after.io === null ? null : io0,
+    };
+    const own = newTotals();
+    addThread(own, before, after);
+    const role = productionRole(pid, after);
+    const guess = guesses.get(key) ?? { role: "other" as const, basis: "default" as const };
+    if (startedInWindow) {
+      addThread(started, before, after);
     } else {
-      for (const field of ["syscr", "syscw", "rchar", "wchar", "read_bytes"] as const) {
-        previousIo[field] += total.io[field];
-      }
-      roleIo.set(label.role, previousIo);
+      addThread(common, before, after);
+      const roleTotals = roles.get(role) ?? newTotals();
+      addThread(roleTotals, before, after);
+      roles.set(role, roleTotals);
+      const commTotals = byComm.get(after.comm) ?? newTotals();
+      addThread(commTotals, before, after);
+      byComm.set(after.comm, commTotals);
+      if (isWorkerThread(after.comm)) addThread(workers, before, after);
+      if (after.tid === pid) main = own;
     }
-    if (threadsIo !== null && total.io !== null) {
-      for (const field of ["syscr", "syscw", "rchar", "wchar", "read_bytes"] as const) {
-        threadsIo[field] += total.io[field];
-      }
-    } else {
-      threadsIo = null;
-    }
-    const rates = total.io === null ? null : ioRates(total.io, elapsedS);
+    const rates = own.io === null ? null : ioRates(own.io, elapsedS);
     rows.push({
-      tid: thread.tid,
-      comm: thread.comm,
-      role: label.role,
-      basis: label.basis,
-      starttime: thread.starttime,
-      ...cpuStats(total.userS, total.sysS, elapsedS),
+      tid: after.tid,
+      comm: after.comm,
+      role,
+      role_guess: guess.role,
+      role_guess_basis: guess.basis,
+      started_in_window: startedInWindow,
+      starttime: after.starttime,
+      ...cpuStats(own.userS, own.sysS, elapsedS),
       syscr_per_s: rates?.syscr_per_s ?? null,
       syscw_per_s: rates?.syscw_per_s ?? null,
       rchar_mb_s: rates?.rchar_mb_s ?? null,
       wchar_mb_s: rates?.wchar_mb_s ?? null,
-      lifetime_rchar_mb: thread.io === null ? null : round3(thread.io.rchar / 1e6),
-      lifetime_wchar_mb: thread.io === null ? null : round3(thread.io.wchar / 1e6),
+      lifetime_rchar_mb: after.io === null ? null : round3(after.io.rchar / 1e6),
+      lifetime_wchar_mb: after.io === null ? null : round3(after.io.wchar / 1e6),
     });
   }
-  const roles: Partial<Record<ThreadRole, CpuStats & { threads: number }>> = {};
-  for (const [role, cpu] of roleCpu) {
-    roles[role] = { ...cpuStats(cpu.userS, cpu.sysS, elapsedS), threads: cpu.threads };
+
+  const group = (totals: Totals): CpuGroup => ({
+    ...cpuStats(totals.userS, totals.sysS, elapsedS),
+    threads: totals.threads,
+  });
+  const rate = (totals: Totals) => (totals.io === null ? null : ioRates(totals.io, elapsedS));
+  const roleCpu: Partial<Record<ThreadRole, CpuGroup>> = {};
+  const roleIo: Partial<Record<ThreadRole, IoRates>> = {};
+  let roleIoComplete = true;
+  for (const [role, totals] of roles) {
+    roleCpu[role] = group(totals);
+    const io = rate(totals);
+    if (io === null) roleIoComplete = false;
+    else roleIo[role] = io;
   }
-  const ioRoles: Partial<Record<ThreadRole, IoRates>> = {};
-  let ioRolesComplete = true;
-  for (const [role, io] of roleIo) {
-    if (io === null) ioRolesComplete = false;
-    else ioRoles[role] = ioRates(io, elapsedS);
+  const mainSeries: Array<number> = [];
+  for (let index = 1; index < window.length; index++) {
+    const a = window[index - 1]!;
+    const b = window[index]!;
+    const before = [...(a.threads ?? [])].find(([, thread]) => thread.tid === pid)?.[1];
+    const after = [...(b.threads ?? [])].find(([, thread]) => thread.tid === pid)?.[1];
+    const intervalS = (b.mono - a.mono) / 1000;
+    if (before === undefined || after === undefined || intervalS <= 0) continue;
+    mainSeries.push(((after.userS - before.userS + after.sysS - before.sysS) / intervalS) * 100);
   }
-  const mainKey = [...perThread.keys()].find((key) => latest.get(key)?.tid === pid);
-  const mainTotal = mainKey === undefined ? undefined : perThread.get(mainKey);
   const series = mainSeries.toSorted((a, b) => a - b);
   return {
     source: first.source,
     samples: window.length,
     elapsed_s: round3(elapsedS),
-    problems: mainTotal === undefined ? ["main_thread_missing"] : [],
+    problems: main === undefined ? ["main_thread_missing"] : [],
     cpu: {
-      main: mainTotal === undefined ? null : cpuStats(mainTotal.userS, mainTotal.sysS, elapsedS),
+      main: main === undefined ? null : cpuStats(main.userS, main.sysS, elapsedS),
       process: processCpu,
-      roles,
+      roles: roleCpu,
+      worker_threads: workers.threads === 0 ? null : group(workers),
+      by_comm: Object.fromEntries(
+        [...byComm]
+          .toSorted(([a], [b]) => a.localeCompare(b))
+          .map(([comm, totals]) => [comm, group(totals)]),
+      ),
+      started_in_window: started.threads === 0 ? null : group(started),
       main_busy_1s:
         series.length === 0
           ? null
@@ -624,11 +703,15 @@ export function summariseWindow(
             },
     },
     io: {
-      main: mainTotal?.io ? ioRates(mainTotal.io, elapsedS) : null,
-      threads_sum: threadsIo === null ? null : ioRates(threadsIo, elapsedS),
+      main: main === undefined ? null : rate(main),
+      threads_sum: rate(common),
       process: processIo,
-      roles: ioRolesComplete ? ioRoles : null,
+      roles: roleIoComplete ? roleIo : null,
+      worker_threads: workers.threads === 0 ? null : rate(workers),
+      started_in_window: started.threads === 0 ? null : rate(started),
     },
+    threads_started: started.threads,
+    threads_exited: [...startThreads.keys()].filter((key) => !endThreads.has(key)).length,
     mem,
     threads: rows.toSorted((a, b) => b.busy_pct - a.busy_pct),
   };
@@ -816,10 +899,10 @@ export interface SpanStats {
 
 export interface SqlStats extends SpanStats {
   readonly lock_wait_n: number;
-  readonly lock_wait_avg_ms: number | null;
-  readonly lock_wait_p50_ms: number | null;
-  readonly lock_wait_p95_ms: number | null;
-  readonly lock_wait_max_ms: number | null;
+  readonly avg_lock_wait_ms: number | null;
+  readonly p50_lock_wait_ms: number | null;
+  readonly p95_lock_wait_ms: number | null;
+  readonly max_lock_wait_ms: number | null;
 }
 
 export interface SpanSummary {
@@ -901,10 +984,10 @@ export function summariseSpans(spans: ReadonlyArray<SpanRecord>, ownerLimit = 20
     sqlOut[key] = {
       ...spanStats(entry.durations, entry.errors),
       lock_wait_n: waits.length,
-      lock_wait_avg_ms: waits.length === 0 ? null : round3(waitTotal / waits.length),
-      lock_wait_p50_ms: roundOrNull(percentile(waits, 50)),
-      lock_wait_p95_ms: roundOrNull(percentile(waits, 95)),
-      lock_wait_max_ms: roundOrNull(waits.at(-1)),
+      avg_lock_wait_ms: waits.length === 0 ? null : round3(waitTotal / waits.length),
+      p50_lock_wait_ms: roundOrNull(percentile(waits, 50)),
+      p95_lock_wait_ms: roundOrNull(percentile(waits, 95)),
+      max_lock_wait_ms: roundOrNull(waits.at(-1)),
     };
   }
   return {

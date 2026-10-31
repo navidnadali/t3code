@@ -6,11 +6,14 @@ export const HELP = `Usage:
   node tools/server-bench/report.ts show <result.json>
 
 compare  Prints one markdown table: the median of the valid runs per metric, its min–max across
-         runs, and after − before. It refuses (exit 2) results whose base SHA, fixture hash, trace
-         sampling settings (T3CODE_TRACE_MIN_LEVEL, T3CODE_TRACE_SQL_MIN_DURATION_MS,
-         T3CODE_TRACE_TIMING_ENABLED, OTLP export interval) or workload (driver, its knobs and the
-         BENCH_* load knobs) differ, or that lack any of them. Server knobs may differ (that is what
-         a knob A/B measures); the ones that do are listed under the table.
+         runs, and after − before. It refuses (exit 2) results that differ in, or lack, any of:
+         base SHA; fixture hash; trace sampling (T3CODE_TRACE_MIN_LEVEL,
+         T3CODE_TRACE_SQL_MIN_DURATION_MS, T3CODE_TRACE_TIMING_ENABLED, OTLP export interval);
+         workload (driver files, its arguments, the BENCH_* load knobs); host (hostname
+         fingerprint, CPU model); Node version; harness (git SHA and the harness files' hash);
+         server entry (built dist vs source) and the server/driver CPU pinning. Server knobs may
+         differ (that is what a knob A/B measures); the ones that do, and any other run setting
+         that differs, are listed under the table.
 show     The same table for one result.
 
 A metric without data (no spans of that kind, no per-thread data on macOS, a trace that does not
@@ -28,10 +31,13 @@ export interface BenchResult {
     readonly server_sha: string | null;
     readonly server_ref: string | null;
     readonly server_dirty: boolean | null;
+    readonly server_tree?: string | null;
     readonly server_version: string | null;
     readonly base_sha: string | null;
     readonly base_ref: string | null;
     readonly harness_sha: string | null;
+    /** sha256 of the harness files themselves, which also catches uncommitted edits. */
+    readonly harness_files_sha256: string | null;
     readonly fixture: {
       readonly kind: "file" | "dir" | "empty";
       readonly sha256: string | null;
@@ -46,7 +52,13 @@ export interface BenchResult {
     readonly run: Readonly<Record<string, unknown>>;
   };
   readonly host: Readonly<Record<string, unknown>>;
-  readonly runs: { readonly requested: number; readonly attempted: number; readonly valid: number };
+  readonly runs: {
+    readonly requested: number;
+    readonly attempted: number;
+    readonly valid: number;
+    /** `<label>#<attempt>` in the order the attempts ran, all refs interleaved. */
+    readonly order?: ReadonlyArray<string>;
+  };
   readonly metrics: MetricTree;
   readonly spread: { readonly min: MetricTree; readonly max: MetricTree };
   readonly run_details: ReadonlyArray<unknown>;
@@ -117,10 +129,25 @@ const sameMaps = (
 ): Array<string> => {
   if (!isTree(before) || !isTree(after)) return [`${what} not recorded`];
   const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].toSorted();
-  return keys
-    .filter((key) => stable(before[key]) !== stable(after[key]))
-    .map((key) => `${what} differs: ${key} ${stable(before[key])} vs ${stable(after[key])}`);
+  return keys.flatMap((key) =>
+    before[key] === undefined || after[key] === undefined
+      ? [`${what} not recorded: ${key}`]
+      : stable(before[key]) !== stable(after[key])
+        ? [`${what} differs: ${key} ${stable(before[key])} vs ${stable(after[key])}`]
+        : [],
+  );
 };
+
+const HOST_KEYS = ["host_id", "cpu_model", "node"] as const;
+const HARNESS_KEYS = ["harness_sha", "harness_files_sha256"] as const;
+const RUN_KEYS = ["server_entry", "server_cpus", "driver_cpus"] as const;
+
+/** The listed keys of a record; a key it lacks maps to undefined, which reads "not recorded". */
+const pick = (
+  record: Readonly<Record<string, unknown>> | null | undefined,
+  keys: ReadonlyArray<string>,
+): Record<string, unknown> | null =>
+  isTree(record) ? Object.fromEntries(keys.map((key) => [key, record[key]])) : null;
 
 /** Why two results must not be compared; empty when they may. */
 export function comparabilityProblems(before: BenchResult, after: BenchResult): Array<string> {
@@ -143,6 +170,13 @@ export function comparabilityProblems(before: BenchResult, after: BenchResult): 
   }
   problems.push(...sameMaps("trace sampling", before.sampling, after.sampling));
   problems.push(...sameMaps("workload", before.knobs?.workload, after.knobs?.workload));
+  problems.push(...sameMaps("host", pick(before.host, HOST_KEYS), pick(after.host, HOST_KEYS)));
+  problems.push(
+    ...sameMaps("harness", pick(before.identity, HARNESS_KEYS), pick(after.identity, HARNESS_KEYS)),
+  );
+  problems.push(
+    ...sameMaps("run setup", pick(before.knobs?.run, RUN_KEYS), pick(after.knobs?.run, RUN_KEYS)),
+  );
   return problems;
 }
 
@@ -153,17 +187,16 @@ interface Row {
 
 const SQL_ROWS: ReadonlyArray<Row> = (["writer", "reader"] as const).flatMap((connection) => {
   const key = `sql.transaction|${connection}`;
+  const row = (what: string, field: string) => ({
+    label: `\`sql.transaction\` ${connection} ${what} ms`,
+    path: ["sql", key, field],
+  });
   return [
-    { label: `\`sql.transaction\` ${connection} p50 ms`, path: ["sql", key, "p50_ms"] },
-    { label: `\`sql.transaction\` ${connection} p95 ms`, path: ["sql", key, "p95_ms"] },
-    {
-      label: `\`sql.transaction\` ${connection} lock wait p50 ms`,
-      path: ["sql", key, "lock_wait_p50_ms"],
-    },
-    {
-      label: `\`sql.transaction\` ${connection} lock wait p95 ms`,
-      path: ["sql", key, "lock_wait_p95_ms"],
-    },
+    row("p50", "p50_ms"),
+    row("p95", "p95_ms"),
+    row("avg", "avg_ms"),
+    row("avg lock wait", "avg_lock_wait_ms"),
+    row("p95 lock wait", "p95_lock_wait_ms"),
   ];
 });
 
@@ -177,7 +210,11 @@ const LEADING_ROWS: ReadonlyArray<Row> = [
     label: "Process read syscalls/s (incl. reaped children)",
     path: ["io", "process", "syscr_per_s"],
   },
-  { label: "SQLite reader workers CPU %", path: ["cpu", "roles", "sqlite-reader", "busy_pct"] },
+  {
+    label: "WorkerThread CPU % (SQLite readers + checkpoint)",
+    path: ["cpu", "worker_threads", "busy_pct"],
+  },
+  { label: "WorkerThread read syscalls/s", path: ["io", "worker_threads", "syscr_per_s"] },
   { label: "Process CPU % (all threads)", path: ["cpu", "process", "busy_pct"] },
   { label: "ELU (server gauge, mean)", path: ["otlp", "elu_mean"] },
   { label: "Event loop delay max ms", path: ["otlp", "event_loop_delay_max_ms"] },
@@ -314,7 +351,9 @@ export function renderComparison(before: BenchResult, after: BenchResult): strin
   );
   const knobs = differences(before.knobs?.server, after.knobs?.server);
   if (knobs.length > 0) lines.push(`Server knobs that differ: ${knobs.join(", ")}.`);
-  const settings = differences(before.knobs?.run, after.knobs?.run);
+  const settings = differences(before.knobs?.run, after.knobs?.run).filter(
+    (line) => !RUN_KEYS.some((key) => line.startsWith(`\`${key}\``)),
+  );
   if (settings.length > 0) lines.push(`Run settings that differ: ${settings.join(", ")}.`);
   return `${lines.join("\n")}\n`;
 }

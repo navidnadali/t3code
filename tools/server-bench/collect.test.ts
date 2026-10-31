@@ -6,12 +6,13 @@ import * as NodePath from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  classifyThreads,
+  guessThreadRoles,
   knobsFromEnv,
   parseOtlpGauges,
   parseProcIo,
   parseProcStat,
   parsePsTime,
+  productionRole,
   readTraceWindow,
   summariseGauges,
   summariseSpans,
@@ -51,7 +52,7 @@ const thread = (
 
 const roles = (threads: ReadonlyArray<ThreadSample>) =>
   Object.fromEntries(
-    [...classifyThreads(PID, threads)].map(([key, label]) => [key.split(":")[0], label]),
+    [...guessThreadRoles(PID, threads)].map(([key, label]) => [key.split(":")[0], label]),
   );
 
 describe("parseProcStat", () => {
@@ -86,7 +87,21 @@ describe("parseProcStat", () => {
   });
 });
 
-describe("classifyThreads", () => {
+describe("productionRole", () => {
+  it("uses prod-sample.sh's checkpoint rule: over 100 MB read, writes 0.8-1.25x reads", () => {
+    const role = (comm: string, rchar: number, wchar: number, tid = 1001) =>
+      productionRole(PID, thread(tid, comm, 20, io(rchar, wchar)));
+
+    expect(role("node-MainThread", 0, 0, PID)).toBe("main");
+    expect(role("WorkerThread", 200e6, 190e6)).toBe("checkpoint");
+    expect(role("WorkerThread", 80e6, 80e6)).toBe("sqlite-reader");
+    expect(role("WorkerThread", 200e6, 260e6)).toBe("sqlite-reader");
+    expect(role("WorkerThread", 900e6, 0)).toBe("sqlite-reader");
+    expect(role("node-V8Worker", 200e6, 200e6)).toBe("other");
+  });
+});
+
+describe("guessThreadRoles", () => {
   it("finds the checkpoint worker by its copy pattern and labels the readers", () => {
     expect(
       roles([
@@ -188,15 +203,23 @@ describe("summariseWindow", () => {
     expect(summary.io.threads_sum?.syscr_per_s).toBe(4300);
     expect(summary.io.process?.syscr_per_s).toBe(5300);
     expect(summary.io.roles?.["sqlite-reader"]?.syscr_per_s).toBe(4000);
+    expect(summary.cpu.worker_threads).toEqual({
+      user_pct: 2,
+      sys_pct: 3,
+      busy_pct: 5,
+      threads: 1,
+    });
+    expect(summary.io.worker_threads?.syscr_per_s).toBe(4000);
     expect(summary.mem.rss_peak_mib).toBe(3000);
   });
 
-  it("counts a thread that starts mid-window from zero", () => {
-    const main = thread(PID, "node-MainThread", 10, io(0, 0), { userS: 1 });
+  it("sums only threads present at both ends and reports starters apart", () => {
+    const main = thread(PID, "node-MainThread", 10, io(0, 0, 0, 0), { userS: 1 });
     const late = (userS: number, syscr: number) =>
       thread(1001, "WorkerThread", 500, io(2 * MIB, 0, syscr, 0), { userS });
+    const gone = thread(1002, "WorkerThread", 15, io(MIB, 0, 700, 0));
     const snapshots = [
-      snapshot(0, io(0, 0), [main], 1024),
+      snapshot(0, io(0, 0), [main, gone], 1024),
       // Born between the first two samples: 0.8 s CPU and 10,000 reads before it was seen.
       snapshot(1, io(0, 0, 10_000), [main, late(0.8, 10_000)], 1024),
       snapshot(2, io(0, 0, 10_000), [main, late(0.8, 10_000)], 1024),
@@ -206,13 +229,18 @@ describe("summariseWindow", () => {
       endMs: 1_793_000_002_000,
     });
 
-    expect(summary.cpu.roles?.["sqlite-reader"]).toEqual({
+    expect(summary.io.threads_sum?.syscr_per_s).toBe(0);
+    expect(summary.cpu.roles?.["sqlite-reader"]).toBeUndefined();
+    expect(summary.cpu.started_in_window).toEqual({
       user_pct: 40,
       sys_pct: 0,
       busy_pct: 40,
       threads: 1,
     });
-    expect(summary.io.threads_sum?.syscr_per_s).toBe(5000);
+    expect(summary.io.started_in_window?.syscr_per_s).toBe(5000);
+    expect(summary.threads_started).toBe(1);
+    expect(summary.threads_exited).toBe(1);
+    expect(summary.threads?.find((row) => row.tid === 1001)?.started_in_window).toBe(true);
   });
 
   it("leaves per-thread rows null when only ps data exists", () => {
@@ -304,10 +332,10 @@ describe("readTraceWindow", () => {
         p95_ms: 95,
         max_ms: 100,
         lock_wait_n: 100,
-        lock_wait_avg_ms: 25.25,
-        lock_wait_p50_ms: 25,
-        lock_wait_p95_ms: 47.5,
-        lock_wait_max_ms: 50,
+        avg_lock_wait_ms: 25.25,
+        p50_lock_wait_ms: 25,
+        p95_lock_wait_ms: 47.5,
+        max_lock_wait_ms: 50,
       });
       expect(summary.by_name["McpHttpServer.authenticateRequest"]?.p95_ms).toBe(1000);
       expect(summary.lock_owners[0]).toEqual({

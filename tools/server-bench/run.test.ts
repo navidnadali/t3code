@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { benchEnvHash, readDriverResult } from "./run.ts";
+import { benchEnvHash, readDriverResult, runOrder, traceRequired } from "./run.ts";
 
 describe("readDriverResult", () => {
   it("reads the P1-004 driver.json: window, per-call latencies and event rates", () => {
@@ -78,5 +78,22 @@ describe("benchEnvHash", () => {
       benchEnvHash({ ...base, BENCH_TRANSCRIPT: "/srv/b.ndjson" }),
     );
     expect(benchEnvHash(base)).toBe(benchEnvHash({ ...base, T3CODE_LOG_LEVEL: "Debug" }));
+  });
+});
+
+describe("runOrder", () => {
+  it("counterbalances the refs round by round (A B B A ...)", () => {
+    expect(runOrder(["a", "b"], 4)).toEqual(["a", "b", "b", "a", "a", "b", "b", "a"]);
+    expect(runOrder(["a", "b", "c"], 3)).toEqual(["a", "b", "c", "c", "b", "a", "a", "b", "c"]);
+    expect(runOrder(["a"], 3)).toEqual(["a", "a", "a"]);
+  });
+});
+
+describe("traceRequired", () => {
+  it("expects spans unless the trace level drops them", () => {
+    expect(traceRequired({})).toBe(true);
+    expect(traceRequired({ T3CODE_TRACE_MIN_LEVEL: "Debug" })).toBe(true);
+    expect(traceRequired({ T3CODE_TRACE_MIN_LEVEL: "Warn" })).toBe(false);
+    expect(traceRequired({ T3CODE_TRACE_MIN_LEVEL: "none" })).toBe(false);
   });
 });

@@ -651,11 +651,44 @@ function makeStatsSink(statsDir) {
   return (record) => NodeFS.appendFileSync(file, `${JSON.stringify(record)}\n`);
 }
 
+/** What a recorded CLI frame lacks for replay, if anything. */
+function frameProblem(frame) {
+  switch (frame.type) {
+    case "assistant":
+      return Array.isArray(frame.message?.content)
+        ? undefined
+        : "an assistant frame without content";
+    case "user": {
+      const content = frame.message?.content;
+      return typeof content === "string" || Array.isArray(content)
+        ? undefined
+        : "a user frame without content";
+    }
+    case "stream_event":
+      return typeof frame.event?.type === "string" ? undefined : "a stream_event without an event";
+    case "system":
+    case "result":
+      return typeof frame.subtype === "string"
+        ? undefined
+        : `a ${frame.type} frame without a subtype`;
+    default:
+      return undefined;
+  }
+}
+
 /** Loads and compiles every transcript in the mix; a bad name or recording throws here. */
 export async function loadMix(config) {
   const transcripts = new Map();
   for (const { name } of config.mix) {
-    const groups = splitTurns(await loadTranscriptEntries(name, config));
+    const entries = await loadTranscriptEntries(name, config);
+    entries.forEach((entry, index) => {
+      const frame = entry.frame;
+      if (entry.type !== "emit_inbound" || typeof frame?.type !== "string") return;
+      const problem = frame.type.includes(".") ? undefined : frameProblem(frame);
+      if (problem !== undefined)
+        throw new Error(`Transcript ${name} has ${problem} on line ${index + 1}.`);
+    });
+    const groups = splitTurns(entries);
     if (groups.length === 0) throw new Error(`Transcript ${name} has no completed turn.`);
     transcripts.set(name, groups.map(compileGroup));
   }

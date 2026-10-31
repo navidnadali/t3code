@@ -341,7 +341,7 @@ async function check(
   for (const [flag, path] of [
     ["--project", project],
     ["--t3", values.t3],
-  ]) {
+  ] as const) {
     if (!NodeFS.existsSync(path)) throw new Error(`${flag} ${path} does not exist`);
   }
   const settingsPath = NodePath.join(baseDir, "userdata", "settings.json");

@@ -42,7 +42,7 @@ export interface SqliteClientConfig {
   readonly cacheSizeMb?: number | undefined;
   /** Page cache in MiB for each reader worker; unset or 0 keeps SQLite's default. */
   readonly readerCacheSizeMb?: number | undefined;
-  /** Memory map in MiB for the main connection and reader workers; unset or 0 keeps it off. */
+  /** Experimental: memory map in MiB for the writer and reader workers; unset or 0 keeps it off. */
   readonly mmapSizeMb?: number | undefined;
 }
 

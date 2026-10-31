@@ -107,7 +107,10 @@ export const traceMaxFilesConfig = Config.Int("T3CODE_TRACE_MAX_FILES").pipe(
 const sqliteMebibytesConfig = (name: string, maximum: number) =>
   Config.schema(
     Schema.Int.check(
-      Schema.isBetween({ minimum: 0, maximum }, { message: `${name} must be 0 to ${maximum} MiB` }),
+      Schema.isBetween(
+        { minimum: 0, maximum },
+        { message: `${name} must be 0 (SQLite default) to ${maximum} MiB` },
+      ),
     ),
     name,
   ).pipe(Config.option, Config.map(Option.getOrUndefined));

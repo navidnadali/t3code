@@ -963,11 +963,23 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         sqliteMmapSizeMb: 2047,
       });
       for (const [name, value, message] of [
-        ["T3CODE_SQLITE_CACHE_MB", "-1", "T3CODE_SQLITE_CACHE_MB must be 0 to 2097152 MiB"],
-        ["T3CODE_SQLITE_CACHE_MB", "2097153", "T3CODE_SQLITE_CACHE_MB must be 0 to 2097152 MiB"],
+        [
+          "T3CODE_SQLITE_CACHE_MB",
+          "-1",
+          "T3CODE_SQLITE_CACHE_MB must be 0 (SQLite default) to 2097152 MiB",
+        ],
+        [
+          "T3CODE_SQLITE_CACHE_MB",
+          "2097153",
+          "T3CODE_SQLITE_CACHE_MB must be 0 (SQLite default) to 2097152 MiB",
+        ],
         ["T3CODE_SQLITE_READER_CACHE_MB", "1.5", "Expected an integer"],
         ["T3CODE_SQLITE_READER_CACHE_MB", "64MB", "Expected a string representing a finite number"],
-        ["T3CODE_SQLITE_MMAP_MB", "2048", "T3CODE_SQLITE_MMAP_MB must be 0 to 2047 MiB"],
+        [
+          "T3CODE_SQLITE_MMAP_MB",
+          "2048",
+          "T3CODE_SQLITE_MMAP_MB must be 0 (SQLite default) to 2047 MiB",
+        ],
       ] as const) {
         const error = String(yield* resolve({ [name]: value }).pipe(Effect.flip));
         expect(error).toContain(message);

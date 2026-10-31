@@ -655,6 +655,21 @@ per page load for the UI, and the Expo session on mobile. A `service.instance.id
 If the OTLP URLs are unset, local tracing still works, metrics stay in-process only, and logs stay
 on stdout only.
 
+SQLite memory, in MiB. Unset or `0` keeps SQLite's default: a 2000 KiB page cache per connection and
+no memory map.
+
+- `T3CODE_SQLITE_CACHE_MB`: page cache of the main connection, which does every write
+- `T3CODE_SQLITE_READER_CACHE_MB`: page cache of each reader worker
+- `T3CODE_SQLITE_MMAP_MB`: experimental memory map for the main connection and each reader worker, at
+  most `2047` with Node's bundled SQLite
+
+Each connection allocates its cache as it reads pages, up to the limit, so the cost is the main
+connection's plus each reader worker's. Readers drop their cache and memory map whenever another
+connection commits, so the main connection gains most. While the database is mapped, an I/O error or
+a truncation from outside SQLite raises SIGBUS and terminates the process. CLI commands that open the
+database, such as `t3 project`, `t3 auth`, `t3 environment`, and `t3 thread`, use the same settings,
+and an invalid value stops them as well as the server.
+
 ### The Kill Switch
 
 `T3CODE_OTEL_SDK_DISABLED` and `OTEL_SDK_DISABLED` turn off every OTLP export in both the server and

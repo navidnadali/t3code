@@ -42,13 +42,14 @@ ${PROVIDER_LOAD_USAGE}
   --t3 PATH                 the server CLI (default apps/server/dist/bin.mjs)
 `;
 
-// Codex item types the Codex adapter turns into these turn items.
+// Codex item types the Codex adapter turns into these turn items; others leave a session unverified.
 const CODEX_ITEM_TYPES: Readonly<Record<string, string>> = {
   agentMessage: "assistant_message",
   reasoning: "reasoning",
   commandExecution: "command_execution",
   fileChange: "file_change",
   webSearch: "web_search",
+  plan: "proposed_plan",
 };
 const NON_TOOL_ITEMS = new Set([
   "user_message",
@@ -58,7 +59,7 @@ const NON_TOOL_ITEMS = new Set([
   "todo_list",
 ]);
 
-interface TurnExpectation {
+export interface TurnExpectation {
   readonly frames: Readonly<Record<string, number>>;
   readonly items: Readonly<Record<string, number>>;
   readonly todoLists: number;
@@ -189,14 +190,16 @@ function readStats(statsDirs: ReadonlySet<string>): ReadonlyArray<StatsRecord> {
   return records.toSorted((left, right) => left.at.localeCompare(right.at));
 }
 
+export interface ServerItem {
+  readonly type: string;
+  readonly status: string;
+  readonly id: string;
+}
+
 interface ThreadRows {
   readonly nativeId: string | null;
   readonly runs: ReadonlyArray<string>;
-  readonly items: ReadonlyArray<{
-    readonly type: string;
-    readonly status: string;
-    readonly id: string;
-  }>;
+  readonly items: ReadonlyArray<ServerItem>;
 }
 
 function readThread(db: NodeSqlite.DatabaseSync, threadId: string): ThreadRows {
@@ -219,45 +222,48 @@ function readThread(db: NodeSqlite.DatabaseSync, threadId: string): ThreadRows {
 }
 
 /** Items the provider produced: no checkpoints, no workspace preparation step. */
-const providerItems = (rows: ThreadRows) =>
-  rows.items.filter(
-    (item) => item.type !== "checkpoint" && !item.id.includes("workspace-preparation"),
-  );
+const providerItems = (items: ReadonlyArray<ServerItem>) =>
+  items.filter((item) => item.type !== "checkpoint" && !item.id.includes("workspace-preparation"));
 
-function expectedItems(
+const add = (counts: Record<string, number>, key: string, count: number) => {
+  if (count > 0) counts[key] = (counts[key] ?? 0) + count;
+};
+
+/**
+ * The provider items a session's turns should leave, against the items the server holds. A
+ * transcript item with no known turn item, or any server item nobody expected, is no match.
+ */
+export function compareItems(
   kind: ProviderKind,
   expectations: ReadonlyArray<TurnExpectation>,
-): { readonly counts: Record<string, number>; readonly unchecked: ReadonlyArray<string> } {
-  const counts: Record<string, number> = { user_message: expectations.length, todo_list: 0 };
-  const unchecked = new Set<string>();
+  items: ReadonlyArray<ServerItem>,
+) {
+  const expected: Record<string, number> = {};
+  const unmapped = new Set<string>();
+  add(expected, "user_message", expectations.length);
   for (const expectation of expectations) {
-    counts.todo_list = (counts.todo_list ?? 0) + expectation.todoLists;
+    add(expected, "todo_list", expectation.todoLists);
     for (const [type, count] of Object.entries(expectation.items)) {
-      const itemType = kind === "codex" ? CODEX_ITEM_TYPES[type] : type === "tool" ? "tool" : type;
       if (kind === "codex" && type === "userMessage") continue;
-      if (itemType === undefined) {
-        unchecked.add(type);
-        continue;
-      }
-      counts[itemType] = (counts[itemType] ?? 0) + count;
+      const itemType = kind === "codex" ? CODEX_ITEM_TYPES[type] : type;
+      if (itemType === undefined) unmapped.add(type);
+      else add(expected, itemType, count);
     }
   }
-  return { counts, unchecked: [...unchecked] };
-}
-
-function actualItems(kind: ProviderKind, rows: ThreadRows, checked: ReadonlySet<string>) {
-  const counts: Record<string, number> = {};
-  const other: Record<string, number> = {};
-  for (const item of providerItems(rows)) {
-    const type = kind === "acp" && !NON_TOOL_ITEMS.has(item.type) ? "tool" : item.type;
-    const target = checked.has(type) ? counts : other;
-    target[type] = (target[type] ?? 0) + 1;
+  const actual: Record<string, number> = {};
+  for (const item of providerItems(items)) {
+    add(actual, kind === "acp" && !NON_TOOL_ITEMS.has(item.type) ? "tool" : item.type, 1);
   }
-  return { counts, other };
+  return {
+    expected,
+    actual,
+    unmapped: [...unmapped],
+    match: unmapped.size === 0 && sameCounts(expected, actual),
+  };
 }
 
-async function main(argv: ReadonlyArray<string>): Promise<number> {
-  const { values } = NodeUtil.parseArgs({
+const parseFlags = (argv: ReadonlyArray<string>) =>
+  NodeUtil.parseArgs({
     args: [...argv],
     options: {
       "base-dir": { type: "string" },
@@ -273,7 +279,10 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
       t3: { type: "string", default: NodePath.join(repoRoot, "apps/server/dist/bin.mjs") },
       help: { type: "boolean", default: false },
     },
-  });
+  }).values;
+
+async function main(argv: ReadonlyArray<string>): Promise<number> {
+  const values = parseFlags(argv);
   if (values.help) {
     process.stdout.write(USAGE);
     return 0;
@@ -285,6 +294,28 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
     process.stderr.write(USAGE);
     return 2;
   }
+  NodeFS.mkdirSync(out, { recursive: true });
+  for (const file of [RESULT_FILE, FAILED_MARKER]) {
+    NodeFS.rmSync(NodePath.join(out, file), { force: true });
+  }
+  try {
+    return await check(values, baseDir, project, out);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const result = { schema: 1, ok: false, verdict: "ERROR", error: message };
+    NodeFS.writeFileSync(NodePath.join(out, RESULT_FILE), `${JSON.stringify(result, null, 2)}\n`);
+    NodeFS.writeFileSync(NodePath.join(out, FAILED_MARKER), `${message}\n`);
+    process.stderr.write(`[provider-check] ERROR: ${message}\n`);
+    return 2;
+  }
+}
+
+async function check(
+  values: ReturnType<typeof parseFlags>,
+  baseDir: string,
+  project: string,
+  out: string,
+): Promise<number> {
   const turns = Number(values.turns);
   const concurrency = Number(values.concurrency);
   const callTimeoutMs = Number(values["call-timeout"]) * 1000;
@@ -310,8 +341,6 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
       return dir === undefined ? [] : [dir];
     }),
   );
-  NodeFS.mkdirSync(out, { recursive: true });
-  NodeFS.rmSync(NodePath.join(out, FAILED_MARKER), { force: true });
   const startedAt = new Date();
   process.stderr.write(
     `[provider-check] ${plan.length} sessions × ${turns} turns: ${JSON.stringify(sessionsByInstance(plan))}\n`,
@@ -389,16 +418,15 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
       const expectations = played.map((record) =>
         fake.expectedTurn(record.transcript, record.turn, record.loops),
       );
-      const expected = expectedItems(session.kind, expectations);
-      const actual = actualItems(session.kind, rows, new Set(Object.keys(expected.counts)));
+      const items = compareItems(session.kind, expectations, rows.items);
       checks["fake played one turn per completed turn"] =
         played.length === completed && played.every((record) => !record.aborted);
       checks["fake frames == transcript frames"] = played.every((record, index) =>
         sameCounts(record.frames, expectations[index]?.frames ?? {}),
       );
-      checks["server items == transcript items"] = sameCounts(actual.counts, expected.counts);
+      checks["server items == transcript items"] = items.match;
       // The Codex adapter never completes a todo_list item; its steps carry the state.
-      checks["every message and tool item completed"] = providerItems(rows).every(
+      checks["every message and tool item completed"] = providerItems(rows.items).every(
         (item) => item.type === "todo_list" || item.status === "completed",
       );
       checks["replies == recorded final answers"] = run.turns.every(
@@ -413,10 +441,9 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
           ms,
           frames,
         })),
-        expectedItems: expected.counts,
-        serverItems: actual.counts,
-        otherServerItems: actual.other,
-        uncheckedTranscriptItems: expected.unchecked,
+        expectedItems: items.expected,
+        serverItems: items.actual,
+        unmappedTranscriptItems: items.unmapped,
       };
     } else if (rows !== null) {
       checks["fake played one turn per completed turn"] = played.length === completed;

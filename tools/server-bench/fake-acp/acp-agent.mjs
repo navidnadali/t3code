@@ -33,7 +33,7 @@ const FRAMES_PER_YIELD = 64;
 const HELP = `Replaying ACP agent for T3 Code server benchmarks: no model, no network.
 Point an acpRegistry provider instance (source "local") at the \`acp-agent\` launcher beside this file.
 
-Each session/prompt replays the next recorded prompt turn (the frames the dev replay agent
+Each session/prompt replays the next recorded, uncancelled prompt turn (the frames the dev replay agent
 replays: message, thought, tool, plan and usage updates), with the live session id and cwd and
 fresh tool call ids; a session starts at a turn its id picks. Text streams in small chunks.
 
@@ -106,7 +106,10 @@ export function expandTurn(turn) {
 /** Compiles one transcript's prompt turns; tool call ids become slots fresh on every loop. */
 export function compileTranscript(text) {
   const sessionId = recordedSessionId(text);
-  const turns = parseReplayTurns(text).filter((turn) => turn.frames.length > 0);
+  // A cancelled turn ended on the client's cancel, which a bench run does not send.
+  const turns = parseReplayTurns(text).filter(
+    (turn) => turn.frames.length > 0 && turn.stopReason !== "cancelled",
+  );
   return turns.map((turn) => {
     const expanded = expandTurn(turn);
     const toolSlots = new Map();

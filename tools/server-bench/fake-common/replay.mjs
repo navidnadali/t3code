@@ -16,7 +16,7 @@ export const KNOBS_HELP = `  BENCH_SPEED               Time scale for every wait
   BENCH_DELTAS_PER_SEC      Streamed delta rate at speed 1 (default 40).
   BENCH_TURN_LOOPS          Times a turn's body plays before the turn ends (default 1).
   BENCH_STATS_DIR           Append a JSON line per played turn to <dir>/<fake>-<pid>.ndjson.
-  BENCH_FAULT               Halfway through the first turn's body:
+  BENCH_FAULT               Halfway through the first turn a process plays:
                               truncated-frame       a cut-off JSON line, then the turn goes on
                               truncated-frame-exit  a cut-off JSON line, then exit status 1
                               bad-shape             a well-formed frame the schema rejects

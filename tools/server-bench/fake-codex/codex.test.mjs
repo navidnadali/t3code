@@ -25,6 +25,9 @@ const Schema = await import(
   ).resolve("effect/Schema")
 );
 
+const decodeSteerResponse = Schema.decodeUnknownSync(
+  CodexRpc.CLIENT_REQUEST_RESPONSES["turn/steer"],
+);
 const FAKE = NodeURL.fileURLToPath(new URL("./codex.mjs", import.meta.url));
 const LIVE = {
   threadId: "11111111-2222-4333-8444-555555555555",
@@ -216,20 +219,25 @@ describe("fake codex app-server", () => {
   });
 
   it.each([
-    ["exit-mid-turn", 1, 0],
-    ["truncated-frame-exit", 1, 1],
-    ["truncated-frame", null, 1],
-  ])("with BENCH_FAULT=%s exits %s after %i cut-off lines", async (fault, code, cut) => {
-    using fake = startFake({ BENCH_FAULT: fault });
-    fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
-    const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
-    fake.send({ id: 2, method: "turn/start", params: { threadId, input: [] } });
-    const lines = await fake.until(isTurnCompleted);
+    ["exit-mid-turn", "command_output_streaming", 1, 0],
+    // Its turns hold only the answer: no work to loop, still a mid-turn fault.
+    ["exit-mid-turn", "multi_turn", 1, 0],
+    ["truncated-frame-exit", "command_output_streaming", 1, 1],
+    ["truncated-frame", "command_output_streaming", null, 1],
+  ])(
+    "with BENCH_FAULT=%s on %s exits %s after %i cut-off lines",
+    async (fault, name, code, cut) => {
+      using fake = startFake({ BENCH_FAULT: fault, BENCH_CODEX_TRANSCRIPT: name });
+      fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
+      const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
+      fake.send({ id: 2, method: "turn/start", params: { threadId, input: [] } });
+      const lines = await fake.until(isTurnCompleted);
 
-    expect(lines.filter((line) => frameOf(line) === undefined)).toHaveLength(cut);
-    expect(lines.some(isTurnCompleted)).toBe(code === null);
-    if (code !== null) expect(await fake.exited).toBe(code);
-  });
+      expect(lines.filter((line) => frameOf(line) === undefined)).toHaveLength(cut);
+      expect(lines.some(isTurnCompleted)).toBe(code === null);
+      if (code !== null) expect(await fake.exited).toBe(code);
+    },
+  );
 
   it("with BENCH_FAULT=bad-shape sends one frame the schema rejects and completes the turn", async () => {
     using fake = startFake({ BENCH_FAULT: "bad-shape" });
@@ -240,6 +248,25 @@ describe("fake codex app-server", () => {
 
     expect(frames.map(schemaIssue).filter(Boolean)).toHaveLength(1);
     expect(frames.at(-1).params.turn.status).toBe("completed");
+  });
+
+  it("steers only the turn the request expects", async () => {
+    using fake = startFake({ BENCH_SPEED: "1" });
+    fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
+    const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
+    fake.send({ id: 2, method: "turn/start", params: { threadId, input: [] } });
+    const turnId = frameOf((await fake.until(answerTo(2))).at(-1)).result.turn.id;
+    const steer = (id, expectedTurnId) => ({
+      id,
+      method: "turn/steer",
+      params: { threadId, expectedTurnId, input: [{ type: "text", text: "Steer." }] },
+    });
+    fake.send(steer(3, "stale-turn"), steer(4, turnId));
+    const frames = (await fake.until(answerTo(4))).map(frameOf);
+
+    expect(frames.find((frame) => frame.id === 3)).toMatchObject({ error: { code: -32600 } });
+    expect(frames.at(-1).result).toEqual({ turnId });
+    expect(() => decodeSteerResponse(frames.at(-1).result)).not.toThrow();
   });
 
   it("rejects knobs out of range", () => {

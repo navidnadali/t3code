@@ -108,6 +108,12 @@ describe("fake acp transcripts", () => {
     },
   );
 
+  it("drops prompt turns the recording ended with a cancel", () => {
+    expect(
+      compileTranscript(transcriptOf("message_steering")).map((turn) => turn.stopReason),
+    ).toEqual(["end_turn"]);
+  });
+
   it("streams text in chunks and counts a run of chunks as one message", () => {
     const [turn] = compileTranscript(transcriptOf("todo_list"));
     const kinds = turn.frames.map((frame) => frame.stat);

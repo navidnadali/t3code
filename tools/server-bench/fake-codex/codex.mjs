@@ -291,16 +291,22 @@ export function* turnLines(compiled, live, loops) {
     values[NOW_S] = Math.floor(now / 1000);
     return render(frame, values);
   };
-  for (const frame of [...compiled.before, ...compiled.prefix]) yield { frame, line: line(frame) };
-  const faultIndex = Math.floor(compiled.body.length / 2);
   const plays = compiled.body.length === 0 ? 0 : Math.min(loops, compiled.maxLoops);
+  const head = [...compiled.before, ...compiled.prefix];
+  // The fault point is the middle frame of the turn's first play, before turn/completed.
+  const faultAt = Math.floor((head.length + compiled.body.length + compiled.suffix.length) / 2);
+  let position = 0;
+  const next = (frame, counted) => ({
+    frame,
+    line: line(frame),
+    faultPoint: counted && position++ === faultAt,
+  });
+  for (const frame of head) yield next(frame, true);
   for (let loop = 0; loop < plays; loop++) {
     for (const slot of compiled.loopSlots) values[slot] = freshId(compiled.originals[slot]);
-    for (const [index, frame] of compiled.body.entries()) {
-      yield { frame, line: line(frame), faultPoint: loop === 0 && index === faultIndex };
-    }
+    for (const frame of compiled.body) yield next(frame, loop === 0);
   }
-  for (const frame of compiled.suffix) yield { frame, line: line(frame) };
+  for (const frame of compiled.suffix) yield next(frame, true);
 }
 
 function threadLines(compiled, live) {
@@ -350,9 +356,23 @@ function reasoningParts(frames) {
   return parts.size;
 }
 
+/** The plan items in `frames` with text: an empty plan leaves no proposed plan. */
+function textedPlans(frames) {
+  const plans = new Set();
+  for (const frame of frames) {
+    if (frame.method === "item/plan/delta" && frame.params.delta.length > 0) {
+      plans.add(frame.params.itemId);
+    }
+    const item = frame.method === "item/completed" ? frame.params.item : undefined;
+    if (item?.type === "plan" && item.text.length > 0) plans.add(item.id);
+  }
+  return plans.size;
+}
+
 /**
  * What one played turn sends and leaves behind: frames by kind, completed items of the root
- * thread by Codex item type (reasoning by part), turns with a todo plan, and the final answer.
+ * thread by Codex item type (reasoning by part, plans with text), turns with a todo plan, and
+ * the final answer.
  */
 export function expectedTurn(name, index, requestedLoops) {
   const parsed = parseTranscript(readNdjson(transcriptPath(name, TRANSCRIPT_FILE)));
@@ -373,12 +393,16 @@ export function expectedTurn(name, index, requestedLoops) {
   let reply = null;
   for (const [part, list] of [["before", turn.before], ...Object.entries(split)]) {
     const own = list.filter((frame) => (frame.params?.threadId ?? root) === root);
-    const reasoning = reasoningParts(own) * times(part);
-    if (reasoning > 0) items.reasoning = (items.reasoning ?? 0) + reasoning;
+    for (const [type, count] of [
+      ["reasoning", reasoningParts(own)],
+      ["plan", textedPlans(own)],
+    ]) {
+      if (count > 0) items[type] = (items[type] ?? 0) + count * times(part);
+    }
     for (const frame of own) {
       if (frame.method === "turn/plan/updated") plans = 1;
-      if (frame.method !== "item/completed" || frame.params.item.type === "reasoning") continue;
-      const type = frame.params.item.type;
+      const type = frame.method === "item/completed" ? frame.params.item.type : undefined;
+      if (type === undefined || type === "reasoning" || type === "plan") continue;
       items[type] = (items[type] ?? 0) + times(part);
       if (type === "agentMessage") reply = frame.params.item.text;
     }
@@ -592,6 +616,13 @@ async function runAppServer(config) {
       case "turn/steer": {
         const active = threads.get(String(params.threadId))?.active;
         if (active === undefined) return fail(id, -32600, "No active turn to steer");
+        if (params.expectedTurnId !== active.turnId) {
+          return fail(
+            id,
+            -32600,
+            `Expected turn ${params.expectedTurnId}, active ${active.turnId}`,
+          );
+        }
         return respond(id, { turnId: active.turnId });
       }
       case "turn/interrupt":

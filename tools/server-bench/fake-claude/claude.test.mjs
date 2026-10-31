@@ -10,6 +10,8 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   compileGroup,
   loadTranscriptEntries,
+  mixCycle,
+  parseMix,
   readConfig,
   sampleJsonSchema,
   splitTurns,
@@ -19,18 +21,19 @@ import {
 const FAKE = NodeURL.fileURLToPath(new URL("./claude.mjs", import.meta.url));
 const SESSION = "11111111-2222-4333-8444-555555555555";
 const PROMPT = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-const STREAM_ARGS = [
+const streamArgs = (session = `--session-id=${SESSION}`) => [
   "--output-format",
   "stream-json",
   "--verbose",
   "--input-format",
   "stream-json",
-  `--session-id=${SESSION}`,
+  session,
   "--model",
   "claude-sonnet-4-6",
   "--permission-mode",
   "bypassPermissions",
 ];
+const STREAM_ARGS = streamArgs();
 
 const groupsOf = async (name, env = {}) =>
   splitTurns(await loadTranscriptEntries(name, readConfig(env)));
@@ -50,11 +53,20 @@ const render = (group, loops) =>
     ),
   ].map(({ line }) => line);
 
-/** Runs the fake over stdio; `until` reads its stdout lines up to and including a match. */
+const tempDir = (prefix) => {
+  const path = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), prefix));
+  return { path, [Symbol.dispose]: () => NodeFS.rmSync(path, { recursive: true, force: true }) };
+};
+
+/**
+ * Runs the fake over stdio, with its own ordinal state unless `env` names one; `until` reads
+ * its stdout lines up to and including a match.
+ */
 function startFake(args, env) {
+  const state = tempDir("fake-claude-state-");
   const child = NodeChildProcess.spawn(process.execPath, [FAKE, ...args], {
-    env: { ...process.env, ...env },
-    stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, BENCH_STATE_DIR: state.path, ...env },
+    stdio: ["pipe", "pipe", "ignore"],
   });
   const lines = NodeReadline.createInterface({ input: child.stdout })[Symbol.asyncIterator]();
   const exited = new Promise((resolve) => child.once("exit", (code) => resolve(code)));
@@ -72,7 +84,10 @@ function startFake(args, env) {
         if (match(next.value)) return read;
       }
     },
-    [Symbol.dispose]: () => child.kill(),
+    [Symbol.dispose]: () => {
+      child.kill();
+      state[Symbol.dispose]();
+    },
   };
 }
 
@@ -89,6 +104,10 @@ const isMalformed = (line) => {
   return frame === undefined || (frame.type === "assistant" && frame.message === undefined);
 };
 const parseAll = (lines) => lines.map((line) => JSON.parse(line));
+const readStats = (dir) =>
+  NodeFS.readdirSync(dir).flatMap((file) =>
+    parseAll(NodeFS.readFileSync(NodePath.join(dir, file), "utf8").trim().split("\n")),
+  );
 
 describe("fake claude transcripts", () => {
   it.each([
@@ -210,13 +229,12 @@ describe("fake claude transcripts", () => {
 
 describe("fake claude process", () => {
   it("answers the SDK's control requests and plays a turn per user message", async () => {
-    const statsDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-claude-stats-"));
-    using _stats = { [Symbol.dispose]: () => NodeFS.rmSync(statsDir, { recursive: true }) };
+    using stats = tempDir("fake-claude-stats-");
     using fake = startFake(STREAM_ARGS, {
       BENCH_SPEED: "0",
       BENCH_TRANSCRIPT: "large-tool-payload",
       BENCH_TOOL_PAYLOAD_BYTES: "2048",
-      BENCH_STATS_DIR: statsDir,
+      BENCH_STATS_DIR: stats.path,
     });
     const control = (id, request) =>
       fake.send({ type: "control_request", request_id: id, request });
@@ -230,9 +248,7 @@ describe("fake claude process", () => {
     const turn = parseAll(lines);
     fake.end();
     await fake.exited;
-    const [stats] = NodeFS.readdirSync(statsDir).map((file) =>
-      JSON.parse(NodeFS.readFileSync(NodePath.join(statsDir, file), "utf8")),
-    );
+    const [record] = readStats(stats.path);
 
     expect(responses.map(({ response }) => [response.request_id, response.subtype])).toEqual([
       ["init", "success"],
@@ -248,8 +264,8 @@ describe("fake claude process", () => {
       model: "claude-opus-5",
     });
     expect(turn.at(-1)).toMatchObject({ subtype: "success", session_id: SESSION });
-    expect(stats).toMatchObject({ sessionId: SESSION, transcript: "large-tool-payload" });
-    expect(stats.bytes).toBe(lines.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0));
+    expect(record).toMatchObject({ sessionId: SESSION, transcript: "large-tool-payload" });
+    expect(record.bytes).toBe(lines.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0));
   });
 
   it.each([
@@ -308,6 +324,67 @@ describe("fake claude process", () => {
     }).toEqual(expected);
   });
 
+  it("assigns transcripts by claimed ordinal, keeps a resumed session's, and records it", async () => {
+    using state = tempDir("fake-claude-mix-");
+    using stats = tempDir("fake-claude-mix-stats-");
+    const env = {
+      BENCH_SPEED: "0",
+      BENCH_TRANSCRIPT: "simple:2,multi_turn",
+      BENCH_STATE_DIR: state.path,
+      BENCH_STATS_DIR: stats.path,
+    };
+    const sessions = [
+      "00000000-0000-4000-8000-00000000000a",
+      "00000000-0000-4000-8000-00000000000b",
+      "00000000-0000-4000-8000-00000000000c",
+    ];
+    for (const session of [
+      ...sessions.map((id) => `--session-id=${id}`),
+      `--resume=${sessions[1]}`,
+    ]) {
+      using fake = startFake(streamArgs(session), env);
+      fake.send({ type: "user", message: { role: "user", content: "hi" }, uuid: PROMPT });
+      await fake.until(isResult);
+      fake.end();
+      await fake.exited;
+    }
+
+    expect(
+      readStats(stats.path)
+        .toSorted((left, right) => left.at.localeCompare(right.at))
+        .map(({ sessionId, ordinal, transcript, seed, mix }) => [
+          sessionId,
+          ordinal,
+          transcript,
+          seed,
+          mix,
+        ]),
+    ).toEqual([
+      [sessions[0], 0, "simple", 0, { simple: 2, multi_turn: 1 }],
+      [sessions[1], 1, "multi_turn", 0, { simple: 2, multi_turn: 1 }],
+      [sessions[2], 2, "simple", 0, { simple: 2, multi_turn: 1 }],
+      [sessions[1], 1, "multi_turn", 0, { simple: 2, multi_turn: 1 }],
+    ]);
+  });
+
+  it.each([
+    [{ BENCH_TRANSCRIPT: "simple,no_such_transcript" }, "Unknown transcript no_such_transcript"],
+    [{ BENCH_SPEED: "fast" }, "BENCH_SPEED must be a number >= 0"],
+  ])("fails a session started with %o through an error result", async (env, cause) => {
+    using fake = startFake(STREAM_ARGS, env);
+    const lines = await fake.until(() => false);
+
+    expect(await fake.exited).toBe(1);
+    expect(parseAll(lines)).toEqual([
+      expect.objectContaining({
+        type: "result",
+        is_error: true,
+        session_id: SESSION,
+        errors: [expect.stringContaining(cause)],
+      }),
+    ]);
+  });
+
   it("answers -p with structured output that fits the requested schema", async () => {
     const schema = {
       type: "object",
@@ -334,8 +411,20 @@ describe("fake claude configuration", () => {
     [{ BENCH_TURN_LOOPS: "1.5" }, "BENCH_TURN_LOOPS"],
     [{ BENCH_TOOL_PAYLOAD_BYTES: "lots" }, "BENCH_TOOL_PAYLOAD_BYTES"],
     [{ BENCH_FAULT: "explode" }, "BENCH_FAULT"],
+    [{ BENCH_SEED: "-1" }, "BENCH_SEED"],
+    [{ BENCH_TRANSCRIPT: "simple:0" }, "BENCH_TRANSCRIPT"],
   ])("rejects %o", (env, name) => {
     expect(() => readConfig(env)).toThrow(name);
+  });
+
+  it("reads BENCH_TRANSCRIPT as a weighted mix spread evenly over its cycle", () => {
+    expect(parseMix(" simple:2, multi_turn ,simple")).toEqual([
+      { name: "simple", weight: 3 },
+      { name: "multi_turn", weight: 1 },
+    ]);
+    expect(parseMix("")).toEqual([{ name: "command_output_streaming", weight: 1 }]);
+    expect(mixCycle(parseMix("a:3,b:1"))).toEqual(["a", "a", "b", "a"]);
+    expect(mixCycle(parseMix("a:2,b:2,c:1"))).toEqual(["a", "b", "c", "a", "b"]);
   });
 
   it("samples JSON schemas the way text generation declares them", () => {

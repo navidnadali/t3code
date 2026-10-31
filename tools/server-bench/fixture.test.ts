@@ -467,6 +467,11 @@ const TOKENS: Record<string, string> = {
   jwt: `eyJ${"hbGciOi"}J.eyJ${"zdWIiOi"}J.${"Ab12".repeat(3)}`,
   slack: `xox${"b"}-${"1234-".repeat(3)}`,
 };
+const KEY_LINES = [
+  `MIIEowIBAAKCAQEA${"q8Zr3Vt9Lp2Xw7Ms".repeat(3)}`,
+  `${"Hn4Kd8Yb1Rc6Gf0Tj".repeat(3)}a+b/`.slice(0, 64),
+  `${"wE5uI7oP2aS9dF3gH".repeat(3)}Zx==`.slice(0, 64),
+];
 const FORMS: Record<string, { readonly text: string; readonly secret: string }> = {
   dbPassword: { text: `DB_PASSWORD=${"Zx9q".repeat(4)}`, secret: "Zx9q".repeat(4) },
   cfApiToken: { text: `export CF_API_TOKEN=${"Qw3rTy".repeat(7)}`, secret: "Qw3rTy".repeat(7) },
@@ -532,6 +537,17 @@ describe("credential detection", () => {
       .filter(({ text, secret }) => redact(text).includes(secret))
       .map(({ name }) => name);
     expect({ missed, kept }).toEqual({ missed: [], kept: [] });
+  });
+
+  it("removes a private key whose lines sit in separate JSON strings", () => {
+    const pem = [
+      `-----BEGIN RSA ${"PRIVATE"} KEY-----`,
+      ...KEY_LINES,
+      `-----END RSA ${"PRIVATE"} KEY-----`,
+    ];
+    const diff = JSON.stringify({ type: "file_change", lines: pem.map((line) => `+${line}`) });
+    const redacted = redact(diff);
+    expect(KEY_LINES.filter((line) => redacted.includes(line))).toEqual([]);
   });
 });
 

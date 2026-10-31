@@ -248,29 +248,6 @@ describe("fake codex app-server", () => {
     }
   });
 
-  it("ends a turn interrupted with its turn/start as an interrupted turn", async () => {
-    const stats = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-codex-"));
-    using fake = startFake({ BENCH_SPEED: "1", BENCH_STATS_DIR: stats });
-    fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
-    const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
-    fake.send(
-      { id: 2, method: "turn/start", params: { threadId, input: [] } },
-      { id: 3, method: "turn/interrupt", params: { threadId, turnId: "any" } },
-    );
-    const frames = (await fake.until(isTurnCompleted)).map(frameOf);
-
-    expect(frames.find((frame) => frame.id === 3)).toMatchObject({ result: {} });
-    expect(frames.at(-1).params.turn).toMatchObject({
-      id: frames.find((frame) => frame.id === 2).result.turn.id,
-      status: "interrupted",
-    });
-    expect(frames.some((frame) => frame.method === "item/started")).toBe(false);
-    fake.end();
-    expect(await fake.exited).toBe(0);
-    const record = statsIn(stats).find((line) => line.kind === "turn");
-    expect(record).toMatchObject({ fake: "codex", sessionId: threadId, aborted: true });
-  });
-
   it.each([
     ["exit-mid-turn", "command_output_streaming", 1, 0],
     // Its turns hold only the answer: no work to loop, still a mid-turn fault.
@@ -444,7 +421,11 @@ describe("fake codex app-server", () => {
 
   it("interrupts only the turn the request names", async () => {
     // The recorded approval request holds the turn open until the client answers it.
-    using fake = startFake({ BENCH_CODEX_TRANSCRIPT: "tool_call_read_only_on_request" });
+    const stats = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-codex-"));
+    using fake = startFake({
+      BENCH_CODEX_TRANSCRIPT: "tool_call_read_only_on_request",
+      BENCH_STATS_DIR: stats,
+    });
     fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
     const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
     fake.send({ id: 2, method: "turn/start", params: { threadId, input: [] } });
@@ -458,6 +439,12 @@ describe("fake codex app-server", () => {
     expect(stale).toMatchObject({ error: { code: -32600 } });
     expect(frames.find((frame) => frame.id === 4)).toEqual({ id: 4, result: {} });
     expect(frames.at(-1).params.turn).toMatchObject({ id: turnId, status: "interrupted" });
+    fake.end();
+    expect(await fake.exited).toBe(0);
+    expect(statsIn(stats).find((line) => line.kind === "turn")).toMatchObject({
+      sessionId: threadId,
+      aborted: true,
+    });
   });
 
   it("resumes a thread without starting it again", async () => {

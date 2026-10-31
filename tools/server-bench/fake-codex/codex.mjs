@@ -756,17 +756,25 @@ async function runAppServer(config) {
         }
         return respond(id, { turnId: active.turnId });
       }
-      case "turn/interrupt":
-        threads.get(String(params.threadId))?.active?.controller.abort();
+      case "turn/interrupt": {
+        const active = threads.get(String(params.threadId))?.active;
+        if (active === undefined) return fail(id, -32600, "No active turn to interrupt");
+        if (params.turnId !== active.turnId) {
+          return fail(id, -32600, `Expected turn ${params.turnId}, active ${active.turnId}`);
+        }
+        active.controller.abort();
         return respond(id, {});
+      }
       case "thread/unsubscribe":
         return respond(id, { status: "unsubscribed" });
       case "thread/goal/get":
         return respond(id, { goal: null });
       case "thread/goal/clear":
         return respond(id, { cleared: false });
-      default:
+      case "thread/inject_items":
         return respond(id, {});
+      default:
+        return fail(id, -32601, `Method not found: ${method}`);
     }
   };
 

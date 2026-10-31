@@ -415,6 +415,19 @@ describe("fake codex app-server", () => {
     expect(Object.keys(records[2])).not.toContain("rssBytes");
   });
 
+  it("records each turn's frames as expectedTurn predicts them", async () => {
+    const plan = await offeredPlan(
+      { BENCH_CODEX_TRANSCRIPT: "command_output_streaming,multi_turn,large-tool-payload" },
+      3,
+      2,
+    );
+
+    expect(plan).toHaveLength(6);
+    for (const { transcript, turn, frames } of plan) {
+      expect(frames).toEqual((await expectedTurn(transcript, turn, 1, 262_144)).frames);
+    }
+  });
+
   it("answers a method it does not serve with method not found", async () => {
     using fake = startFake({});
     fake.send({ id: 1, method: "fuzzyFileSearch", params: { query: "x", roots: [] } });

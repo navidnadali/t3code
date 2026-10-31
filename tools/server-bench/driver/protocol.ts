@@ -137,25 +137,26 @@ interface JsonRpcEnvelope {
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
-/** One initialized MCP session on the server's `/mcp` endpoint. */
+/** One initialized MCP session on the server's MCP endpoint. */
 export class McpSession {
   private sessionId: string | null = null;
   private protocolVersion: string | null = null;
   private nextId = 0;
-  private readonly origin: string;
-  private readonly token: string;
+  private readonly endpoint: string;
+  private readonly authorization: string;
   private readonly timeoutMs: number;
 
-  constructor(origin: string, token: string, timeoutMs: number) {
-    this.origin = origin;
-    this.token = token;
+  /** `authorization` is the whole header value, e.g. `Bearer <token>`. */
+  constructor(endpoint: string, authorization: string, timeoutMs: number) {
+    this.endpoint = endpoint;
+    this.authorization = authorization;
     this.timeoutMs = timeoutMs;
   }
 
   private headers(): Record<string, string> {
     return {
       accept: "application/json, text/event-stream",
-      authorization: `Bearer ${this.token}`,
+      authorization: this.authorization,
       "content-type": "application/json",
       ...(this.sessionId === null ? {} : { "mcp-session-id": this.sessionId }),
       ...(this.protocolVersion === null ? {} : { "mcp-protocol-version": this.protocolVersion }),
@@ -166,7 +167,7 @@ export class McpSession {
     let response: Response;
     let text: string;
     try {
-      response = await fetch(`${this.origin}/mcp`, {
+      response = await fetch(this.endpoint, {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify(message),
@@ -222,7 +223,7 @@ export class McpSession {
 
   async close(): Promise<void> {
     if (this.sessionId === null) return;
-    await fetch(`${this.origin}/mcp`, {
+    await fetch(this.endpoint, {
       method: "DELETE",
       headers: this.headers(),
       signal: AbortSignal.timeout(this.timeoutMs),

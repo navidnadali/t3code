@@ -13,6 +13,13 @@ const POLL_MIX_KEYS: Record<string, PollCall> = {
   http_bounded: "http.threadBounded",
 };
 
+/**
+ * MCP tool calls per minute per live Claude session in production: ws4-navid's trace showed a
+ * median of 12.5 `McpHttpServer.authenticateRequest` spans per 120 s with 166 live sessions
+ * (P1-009 first samples, 2026-10-31), about 0.04.
+ */
+export const PRODUCTION_SESSION_MCP_RATE = 0.04;
+
 export interface DriverOptions {
   readonly url: string;
   readonly out: string;
@@ -30,6 +37,8 @@ export interface DriverOptions {
   readonly runtimeMode: string;
   readonly pollRate: number;
   readonly pollMix: ReadonlyArray<readonly [PollCall, number]>;
+  readonly sessionMcpRatePerMinute: number;
+  readonly sessionMcpCredentials: string | null;
   readonly switchIntervalMs: number;
   readonly turnGapMs: number;
   readonly messageChars: number;
@@ -79,6 +88,12 @@ function parseFraction(text: string, flag: string): number {
   if (!Number.isFinite(value) || value < 0 || value > 1) {
     throw new UsageError(`--${flag} must be between 0 and 1`);
   }
+  return value;
+}
+
+function parseNonNegative(text: string, flag: string): number {
+  const value = Number(text);
+  if (!Number.isFinite(value) || value < 0) throw new UsageError(`--${flag} must be 0 or more`);
   return value;
 }
 
@@ -133,6 +148,13 @@ orchestration:read, orchestration:operate and access:write, e.g.
   --runtime-mode MODE       runtime mode sessions run in (default full-access)
   --poll-rate N             calls per second per poller (default 1)
   --poll-mix SPEC           project_list=W,thread_read=W,http_bounded=W (default 1 each)
+  --session-mcp-rate N      MCP tool calls per minute per session, as an agent makes them
+                            (default ${PRODUCTION_SESSION_MCP_RATE}, production's rate; 0 turns it off). The calls
+                            follow --poll-mix's MCP weights
+  --session-mcp-credentials DIR
+                            use the credentials providers write here (one JSON file per session:
+                            {"url": …, "authorization": …}); without it each session signs in
+                            as its own MCP client
   --switch-interval DUR     subscribers move to another thread this often; 0 holds (default 30s)
   --turn-gap DUR            pause between a session's turns (default 1s)
   --message-chars N         size of each user message (default 400)
@@ -173,6 +195,8 @@ const parseFlags = (argv: ReadonlyArray<string>) =>
       "runtime-mode": { type: "string", default: "full-access" },
       "poll-rate": { type: "string", default: "1" },
       "poll-mix": { type: "string", default: "project_list=1,thread_read=1,http_bounded=1" },
+      "session-mcp-rate": { type: "string", default: String(PRODUCTION_SESSION_MCP_RATE) },
+      "session-mcp-credentials": { type: "string" },
       "switch-interval": { type: "string", default: "30s" },
       "turn-gap": { type: "string", default: "1s" },
       "message-chars": { type: "string", default: "400" },
@@ -237,6 +261,8 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
     runtimeMode: values["runtime-mode"],
     pollRate: parsePositive(values["poll-rate"], "poll-rate"),
     pollMix: parsePollMix(values["poll-mix"]),
+    sessionMcpRatePerMinute: parseNonNegative(values["session-mcp-rate"], "session-mcp-rate"),
+    sessionMcpCredentials: values["session-mcp-credentials"] ?? null,
     switchIntervalMs: parseDuration(values["switch-interval"], "switch-interval"),
     turnGapMs: parseDuration(values["turn-gap"], "turn-gap"),
     messageChars: parseCount(values["message-chars"], "message-chars", 1),

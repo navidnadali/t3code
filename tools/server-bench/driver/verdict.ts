@@ -8,6 +8,10 @@ export interface WindowEvidence {
   readonly sessionsWithOutput: number;
   /** History mode only: the exercised threads against the fixture. */
   readonly distribution: DistributionMatch | null;
+  /** Sessions that must call their MCP tools (0 when that load is off). */
+  readonly sessionMcpRequired: number;
+  /** Sessions with a signed-in MCP caller when the window opened. */
+  readonly sessionMcpCallers: number;
 }
 
 /**
@@ -21,6 +25,9 @@ export function judgeWindow(evidence: WindowEvidence): string | null {
   }
   if (evidence.sessionsWithOutput < evidence.sessions) {
     return `only ${evidence.sessionsWithOutput} of ${evidence.sessions} sessions produced provider output during the window`;
+  }
+  if (evidence.sessionMcpCallers < evidence.sessionMcpRequired) {
+    return `only ${evidence.sessionMcpCallers} of ${evidence.sessionMcpRequired} sessions had an MCP client when the window opened`;
   }
   const distribution = evidence.distribution;
   if (distribution !== null && !distribution.withinTolerance) {

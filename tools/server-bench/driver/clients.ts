@@ -35,19 +35,31 @@ export interface ThreadShell {
   readonly archivedAt: string | null;
 }
 
-const PROVIDER_ACTIVE_STATUSES = new Set(["running", "waiting"]);
+/** Turn items a provider writes; the user's message, checkpoints and run bookkeeping are not. */
+const PROVIDER_ITEM_TYPES = new Set([
+  "assistant_message",
+  "reasoning",
+  "command_execution",
+  "dynamic_tool",
+  "file_change",
+  "file_search",
+  "web_search",
+  "todo_list",
+  "proposed_plan",
+  "subagent",
+]);
 
 /**
- * The run gained turn items while the provider was working on it, so the provider produced
- * output. The user's message and the run's start and end land outside this, so they never count.
+ * Whether a provider item changed at or after `sinceEpochMs`. Streamed text updates its item, so
+ * an item still streaming counts as well as one completed in the window.
  */
-export function providerProgressed(previous: ThreadShell | undefined, next: ThreadShell): boolean {
-  return (
-    previous !== undefined &&
-    previous.latestRunId === next.latestRunId &&
-    PROVIDER_ACTIVE_STATUSES.has(previous.status) &&
-    PROVIDER_ACTIVE_STATUSES.has(next.status) &&
-    next.itemCount > previous.itemCount
+export function providerOutputSince(
+  turnItems: ReadonlyArray<{ readonly type?: string; readonly updatedAt?: string }>,
+  sinceEpochMs: number,
+): boolean {
+  return turnItems.some(
+    (item) =>
+      PROVIDER_ITEM_TYPES.has(item.type ?? "") && Date.parse(item.updatedAt ?? "") >= sinceEpochMs,
   );
 }
 
@@ -152,10 +164,7 @@ export function messageText(rng: Rng, chars: number, label: string): string {
  */
 export class ShellWatcher {
   private readonly threads = new Map<string, ThreadShell>();
-  private readonly listeners = new Map<
-    string,
-    (shell: ThreadShell, previous: ThreadShell | undefined) => void
-  >();
+  private readonly listeners = new Map<string, (shell: ThreadShell) => void>();
 
   seed(snapshot: ShellSnapshot): void {
     for (const thread of snapshot.threads) this.threads.set(thread.id, thread);
@@ -165,10 +174,7 @@ export class ShellWatcher {
     return this.threads.get(threadId);
   }
 
-  listen(
-    threadId: string,
-    listener: (shell: ThreadShell, previous: ThreadShell | undefined) => void,
-  ): void {
+  listen(threadId: string, listener: (shell: ThreadShell) => void): void {
     this.listeners.set(threadId, listener);
   }
 
@@ -186,9 +192,8 @@ export class ShellWatcher {
                   ? [value.thread]
                   : [];
             for (const thread of threads) {
-              const previous = this.threads.get(thread.id);
               this.threads.set(thread.id, thread);
-              this.listeners.get(thread.id)?.(thread, previous);
+              this.listeners.get(thread.id)?.(thread);
             }
           }
         },
@@ -239,7 +244,7 @@ export class Session {
         model: context.options.model,
       };
     }
-    watcher.listen(threadId, (shell, previous) => this.onShell(shell, previous));
+    watcher.listen(threadId, (shell) => this.onShell(shell));
   }
 
   /** Fresh mode: the launch is the first turn. */
@@ -321,14 +326,7 @@ export class Session {
     this.pendingModelSelection = undefined;
   }
 
-  private onShell(shell: ThreadShell, previous: ThreadShell | undefined): void {
-    if (providerProgressed(previous, shell) && this.context.recorder.isOpen) {
-      this.outputInWindow = true;
-      this.context.recorder.count(
-        "sessions.providerItems",
-        shell.itemCount - (previous?.itemCount ?? shell.itemCount),
-      );
-    }
+  private onShell(shell: ThreadShell): void {
     const waiting = this.waiting;
     if (waiting === null) return;
     if (shell.latestRunId === waiting.previousRunId || !TERMINAL_RUN_STATUSES.has(shell.status)) {
@@ -353,11 +351,19 @@ export class Session {
     return this.waiting !== null;
   }
 
-  windowOpened(): void {
-    this.outputInWindow = false;
+  /** Reads the thread back after the window: did the provider write into it during the window? */
+  async checkOutputSince(sinceEpochMs: number): Promise<void> {
+    const snapshot = await httpJson<{
+      readonly projection: {
+        readonly turnItems: ReadonlyArray<{ type?: string; updatedAt?: string }>;
+      };
+    }>(
+      this.context.http,
+      `/api/orchestration/threads/${encodeURIComponent(this.threadId)}/bounded`,
+    );
+    this.outputInWindow = providerOutputSince(snapshot.value.projection.turnItems, sinceEpochMs);
   }
 
-  /** Whether the provider streamed into this thread while the window was open. */
   get producedOutput(): boolean {
     return this.outputInWindow;
   }
@@ -550,9 +556,10 @@ export class Subscriber {
 const MAX_POLLS_IN_FLIGHT = 32;
 
 /**
- * An agent polling the server at a fixed rate. Calls start on schedule even while earlier ones
- * are still out, so a slow server shows up as latency, not as fewer calls; a call that cannot
- * start because too many are out counts as a failed call.
+ * A client calling the server at a fixed rate: a poller, or a session's agent using its MCP
+ * tools. Calls start on schedule even while earlier ones are still out, so a slow server shows up
+ * as latency, not as fewer calls; a call that cannot start because too many are out counts as a
+ * failed call. Call types are recorded as `<prefix>.<call>`.
  */
 export class Poller {
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -564,6 +571,9 @@ export class Poller {
   private readonly mcp: McpSession | null;
   private readonly pool: ReadonlyArray<string>;
   private readonly rng: Rng;
+  private readonly prefix: string;
+  private readonly ratePerSecond: number;
+  private readonly mix: ReadonlyArray<readonly [PollCall, number]>;
 
   constructor(input: {
     readonly index: number;
@@ -571,16 +581,22 @@ export class Poller {
     readonly mcp: McpSession | null;
     readonly pool: ReadonlyArray<string>;
     readonly rng: Rng;
+    readonly prefix: string;
+    readonly ratePerSecond: number;
+    readonly mix: ReadonlyArray<readonly [PollCall, number]>;
   }) {
     this.index = input.index;
     this.context = input.context;
     this.mcp = input.mcp;
     this.pool = input.pool;
     this.rng = input.rng;
+    this.prefix = input.prefix;
+    this.ratePerSecond = input.ratePerSecond;
+    this.mix = input.mix;
   }
 
   start(): void {
-    const interval = 1000 / this.context.options.pollRate;
+    const interval = 1000 / this.ratePerSecond;
     const startedAt = now() + this.rng.next() * interval;
     let tick = 0;
     const next = () => {
@@ -593,11 +609,11 @@ export class Poller {
   }
 
   private fire(): void {
-    const call: PollCall = weightedChoice(this.rng, this.context.options.pollMix);
+    const call: PollCall = weightedChoice(this.rng, this.mix);
     const threadId = this.pool[pickIndex(this.rng, this.pool.length)] as string;
     if (this.inFlight >= MAX_POLLS_IN_FLIGHT) {
       this.context.recorder.error(
-        `poll.${call}`,
+        `${this.prefix}.${call}`,
         `not sent: ${MAX_POLLS_IN_FLIGHT} calls in flight`,
       );
       return;
@@ -610,7 +626,7 @@ export class Poller {
 
   private async run(call: PollCall, threadId: string): Promise<void> {
     const { recorder, http } = this.context;
-    const type = `poll.${call}`;
+    const type = `${this.prefix}.${call}`;
     if (call !== "mcp.t3_project_list" && recorder.isOpen) this.touched.add(threadId);
     const bytes = await timed(this.context, type, async () => {
       if (call === "http.threadBounded") {

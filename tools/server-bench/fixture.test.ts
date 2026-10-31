@@ -393,6 +393,20 @@ describe("secrets", () => {
     expect([secretHits(plain), secretHits(redact(nested))]).toEqual([[], []]);
   });
 
+  it("redacts a key block beside a multi-megabyte string without exhausting the stack", () => {
+    const payload = JSON.stringify({
+      output: "x".repeat(5_000_000),
+      key: SAMPLES["private-key"],
+      quoted: 'say "hi" \\ done',
+    });
+    const decoded = JSON.parse(redact(payload)) as { output: string; key: string; quoted: string };
+    expect([decoded.output.length, decoded.key.includes("Ab12"), decoded.quoted]).toEqual([
+      5_000_000,
+      false,
+      'say "hi" \\ done',
+    ]);
+  });
+
   it("never carries a private key match across JSON fields", () => {
     const pem = SAMPLES["private-key"] as string;
     const item = {

@@ -58,9 +58,34 @@ export const MAYBE_SECRET = new RegExp(
   "i",
 );
 
-const KEY_BLOCK =
-  /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|[\s\S]*)/g;
-const STRING_TOKEN = /"(?:[^"\\]|\\.)*"/g;
+const KEY_HEADER = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
+const KEY_FOOTER = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
+
+/** Header to footer, else to the end of the text; plain index scans, no backtracking on big text. */
+const maskKeyBlocks = (text: string): string => {
+  let out = "";
+  let copied = 0;
+  KEY_HEADER.lastIndex = 0;
+  for (let header = KEY_HEADER.exec(text); header !== null; header = KEY_HEADER.exec(text)) {
+    KEY_FOOTER.lastIndex = header.index + header[0].length;
+    const footer = KEY_FOOTER.exec(text);
+    const end = footer === null ? text.length : footer.index + footer[0].length;
+    out += text.slice(copied, header.index) + mask(text.slice(header.index, end));
+    copied = end;
+    KEY_HEADER.lastIndex = end;
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+};
+
+/** The index of the quote closing a JSON string that starts before `from`: one after an even backslash run. */
+const closingQuote = (text: string, from: number) => {
+  for (let at = text.indexOf('"', from); at !== -1; at = text.indexOf('"', at + 1)) {
+    let slashes = 0;
+    while (at - slashes - 1 >= from && text[at - slashes - 1] === "\\") slashes++;
+    if (slashes % 2 === 0) return at;
+  }
+  return -1;
+};
 
 const parsesAsJson = (text: string) => {
   const start = text.trimStart()[0];
@@ -74,19 +99,29 @@ const parsesAsJson = (text: string) => {
 };
 
 /**
- * Masks whole private key blocks (header to footer, else to the end of the string) inside the
- * decoded string value that holds them, recursing into JSON-encoded strings, so armor headers
- * with quotes stay covered and no match crosses into another field.
+ * Masks whole private key blocks inside the decoded string value that holds them, recursing into
+ * JSON-encoded strings, so armor headers with quotes stay covered and no match crosses a field.
  */
 const redactKeys = (text: string): string => {
   if (!text.includes("PRIVATE KEY")) return text;
-  if (!parsesAsJson(text)) return text.replace(KEY_BLOCK, mask);
-  return text.replace(STRING_TOKEN, (token) => {
-    if (!token.includes("PRIVATE KEY")) return token;
-    const decoded = JSON.parse(token) as string;
-    const redacted = redactKeys(decoded);
-    return redacted === decoded ? token : JSON.stringify(redacted);
-  });
+  if (!parsesAsJson(text)) return maskKeyBlocks(text);
+  let out = "";
+  let copied = 0;
+  for (let open = text.indexOf('"'); open !== -1;) {
+    const close = closingQuote(text, open + 1);
+    if (close === -1) break;
+    const token = text.slice(open, close + 1);
+    if (token.includes("PRIVATE KEY")) {
+      const decoded = JSON.parse(token) as string;
+      const redacted = redactKeys(decoded);
+      if (redacted !== decoded) {
+        out += text.slice(copied, open) + JSON.stringify(redacted);
+        copied = close + 1;
+      }
+    }
+    open = text.indexOf('"', close + 1);
+  }
+  return copied === 0 ? text : out + text.slice(copied);
 };
 
 /** Masks each match; a pattern with a `secret` group masks only that part (an assignment's value). */

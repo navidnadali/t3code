@@ -24,6 +24,7 @@ import * as Sqlite from "../../../apps/server/src/persistence/Sqlite.ts";
 import { Builder, type LegacyRows } from "./entities.ts";
 import { type SynthPlan, planSynth } from "./plan.ts";
 import { checkFixture, compactInto, isClean } from "./sanitise.ts";
+import { withSidecars } from "./guards.ts";
 import { failed, safeDestination } from "./server.ts";
 import { type Shape, measureShape, parseShape, shapeRows } from "./shape.ts";
 
@@ -41,6 +42,7 @@ export interface SynthInput {
   readonly model: string;
   readonly workspaceRoot: string;
   readonly now: string | undefined;
+  readonly report?: string | undefined;
 }
 
 export interface TableComparison {
@@ -131,9 +133,10 @@ const writeDatabase = Effect.fn("fixture.synth.write")(function* (
     ),
   );
 
-  // Parents first: a child thread names the node that spawned it.
+  // Parents first: a fork names its source run, a child the node that spawned it.
   const order = [
-    ...plan.threads.filter((thread) => thread.parent === null),
+    ...plan.threads.filter((thread) => thread.parent === null && thread.fork === null),
+    ...plan.threads.filter((thread) => thread.fork !== null),
     ...plan.threads.filter((thread) => thread.parent !== null),
   ];
   let written = 0;
@@ -163,8 +166,16 @@ export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput)
   const scratch = `${input.destination}.synth-tmp`;
   const destination = yield* safeDestination({
     destination: input.destination,
-    scratch: [scratch, `${scratch}-wal`, `${scratch}-shm`, `${scratch}-journal`],
+    scratch: withSidecars(scratch),
+    ...(input.report === undefined ? {} : { distinctFrom: [input.report] }),
   });
+  if (input.report !== undefined) {
+    yield* safeDestination({
+      destination: input.report,
+      source: input.shapePath,
+      distinctFrom: [...withSidecars(input.destination), ...withSidecars(scratch)],
+    });
+  }
   const shape = yield* Effect.try({
     try: () => parseShape(JSON.parse(NodeFS.readFileSync(input.shapePath, "utf8"))),
     catch: (cause) => failed(`--like ${input.shapePath}`, cause),

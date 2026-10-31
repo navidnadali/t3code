@@ -10,27 +10,34 @@ Server code runs in-process: the server's own migrations, event sink, projection
 | `shape <database>`                                    | Prints a database's shape as JSON (counts and sizes only, no row content).                                    |
 | `scan <database>`                                     | The self-check on its own: exits 1 unless the database is clean.                                              |
 
-Both writers refuse a destination inside `~/.t3` or `$T3CODE_HOME` (symlinks resolved), an existing file, and
-the source itself or its `-wal`/`-shm`/`-journal` (exit 2). A failed run leaves no destination behind.
+Both writers refuse a destination (or `--report` file) inside `~/.t3` or `$T3CODE_HOME` (symlinks resolved), an
+existing file, the source itself or its `-wal`/`-shm`/`-journal`, and a report path the run writes as a database
+(exit 2). A failed run leaves no destination behind.
 
 ## sanitise
 
 1. `VACUUM INTO` a scratch file beside the destination; run the server's migrations on it.
 2. Find live threads with the server's own queries (`getRecoveryThreadIds` for queued runs, runtime, subagent
    results and delegated completions; `getLimitRecoveryCandidates`) plus, as `migrate-dev-db` does, threads whose
-   latest run failed or that carry `limitRecovery`. Drop their whole families (lineage root) from every table with
+   latest run failed, that carry `limitRecovery`, or that keep a pull request watch (resumed on boot). Drop their
+   whole families (lineage root) from every table with
    a `thread_id`, their provider sessions, context transfers, subagent rows and `orchestration_events`, and keep
    `orchestration_v2_projection_metadata` at the remaining high-water mark.
 3. Clear the `migrate-dev-db` tables (`scheduled_tasks`, `orchestration_v2_effect_outbox`,
    `orchestration_v2_thread_launch_workflows`, `orchestration_command_receipts`, `provider_session_runtime`,
    `auth_sessions`, `auth_pairing_links`, `peer_environment_links`) plus `scheduled_task_webhook_deliveries` and
    `scheduled_task_webhook_relay_deliveries`, and every table whose foreign keys reach one of them.
-4. Set `projection_projects.auto_pull = 0` (auto-pull fetches remotes on boot).
-5. Redact credential-shaped text (`fixture/secrets.ts`) in every text column, same length, JSON-safe.
+4. Set `projection_projects.auto_pull = 0` (auto-pull fetches remotes on boot), and turn automatic settlement off
+   (`thread.auto-settle-set` through the server's event sink, `updatedAt` kept) on every thread the settle sweep
+   could pick, so a boot settles nothing and runs no settle hook.
+5. Redact credential-shaped text (`fixture/secrets.ts`) in every text column: letters and digits become `*`,
+   punctuation and escapes stay (JSON keeps parsing, sizes keep their shape); private keys go as whole blocks and
+   an assignment loses only its value.
 6. Rebuild the message search index, `VACUUM INTO` the destination (no free pages keep deleted text), `chmod 600`.
 7. Self-check, else delete the destination and fail: no pattern hit in any text column or in the raw file bytes, no
    non-null credential-named column, and nothing a server would run on boot (recovery threads, scheduled tasks,
-   outbox, launch workflows, peer links, sessions, pairing links, provider runtime, auto-pull, `limitRecovery`).
+   outbox, launch workflows, peer links, sessions, pairing links, provider runtime, auto-pull, `limitRecovery`,
+   pull request watches, settlement candidates).
 
 Settings and `secrets/` live outside the database; copy only `statev2.sqlite`. Never boot a sanitised copy on the
 machine its data came from: thread worktree paths still point at real folders.
@@ -44,7 +51,7 @@ if any table differs from its own plan or the result is not clean (as `scan`).
 
 - `--scale` multiplies projects, threads and every row count; each thread keeps the shape's turn-items-per-thread
   distribution (stratified draws), so long-history threads stay long at any scale.
-- Threads: roots, subagent children (spawned by a `subagent` item of a larger root, sharing its project, closed by
+- Threads: roots, forks (branched from a run of a root, with a consumed `fork` transfer), subagent children (spawned by a `subagent` item of a larger root, sharing its project, closed by
   a consumed `subagent_result` transfer), v1 imports (run-less history with the importer's ids, its
   `orchestration_v2_legacy_imports` row and the v1 `projection_threads` / `projection_thread_messages` rows) and
   run-less children. Every thread is settled the way the server's sweep settles it, so a boot writes nothing.

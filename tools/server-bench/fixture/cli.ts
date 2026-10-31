@@ -29,7 +29,9 @@ const writeReport = (path: Option.Option<string>, report: unknown) =>
 
 const reportFlag = Flag.String("report").pipe(
   Flag.optional,
-  Flag.withDescription("Also write the full result as JSON to this file."),
+  Flag.withDescription(
+    "Also write the full result as JSON to this new file (checked like the destination).",
+  ),
 );
 
 const sanitiseCommand = Command.make(
@@ -45,13 +47,18 @@ const sanitiseCommand = Command.make(
   },
   ({ source, destination, report }) =>
     Effect.gen(function* () {
-      const result = yield* runSanitise({ source, destination });
+      const result = yield* runSanitise({
+        source,
+        destination,
+        report: Option.getOrUndefined(report),
+      });
       yield* Console.log(
         [
           `Sanitised fixture: ${result.destination} (${mib(result.sizeBytes)})`,
           `  live threads ${result.liveThreads}, dropped with their families ${result.droppedThreads}`,
           `  cleared ${JSON.stringify(result.clearedRows)}`,
-          `  auto-pull disabled on ${result.autoPullDisabled} projects; rows redacted ${JSON.stringify(result.redactedRows)}`,
+          `  auto-pull disabled on ${result.autoPullDisabled} projects, auto-settle on ${result.autoSettleDisabled} threads`,
+          `  rows redacted ${JSON.stringify(result.redactedRows)}`,
           `  self-check: 0 secret hits, 0 credential columns, nothing runnable`,
         ].join("\n"),
       );
@@ -59,7 +66,7 @@ const sanitiseCommand = Command.make(
     }),
 ).pipe(
   Command.withDescription(
-    "Copy a T3 database with VACUUM INTO, run the server's migrations, drop thread families with live work, clear credentials and queued work (scheduled tasks, outbox, launch workflows, peer links, sessions, pairing, provider runtime), disable auto-pull, redact credential-shaped text, compact, and self-check.",
+    "Copy a T3 database with VACUUM INTO, run the server's migrations, drop thread families with live work or a pull request watch, clear credentials and queued work (scheduled tasks, outbox, launch workflows, peer links, sessions, pairing, provider runtime), turn off auto-pull and auto-settle, redact credential-shaped text, compact, and self-check.",
   ),
 );
 
@@ -112,6 +119,7 @@ const synthCommand = Command.make(
         model: input.model,
         workspaceRoot: input.workspaceRoot,
         now: Option.getOrUndefined(input.now),
+        report: Option.getOrUndefined(input.report),
       });
       const lines = result.tables
         .filter((row) => row.target > 0 || row.actual > 0)

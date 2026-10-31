@@ -3,7 +3,12 @@ import * as NodeFS from "node:fs";
 
 /** Credential shapes the sanitiser redacts and the self-check must find none of. */
 export const SECRET_PATTERNS: ReadonlyArray<{ readonly name: string; readonly pattern: RegExp }> = [
-  { name: "private-key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g },
+  // The whole block: header, body (literal or JSON-escaped newlines) and footer.
+  {
+    name: "private-key",
+    pattern:
+      /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:[A-Za-z0-9+/=\s:,]|-(?!----)|\\+[nrt])*(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----)?/g,
+  },
   { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}/g },
   { name: "github-pat", pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}/g },
   { name: "gitlab-token", pattern: /\bglpat-[A-Za-z0-9_-]{20,}/g },
@@ -25,12 +30,31 @@ export const SECRET_PATTERNS: ReadonlyArray<{ readonly name: string; readonly pa
   {
     name: "assignment",
     pattern:
-      /\b(?:api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|password|passwd)\b\\?["']?\s*[:=]\s*\\?["']?[A-Za-z0-9_\-+/=.]{12,}/gi,
+      /\b(?:api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|password|passwd)\b\\?["']?\s*[:=]\s*\\?["']?(?<secret>[A-Za-z0-9_\-+/=.]{12,})/gi,
   },
 ];
 
-/** Same length, so payload sizes keep their shape; JSON-safe characters only. */
-const mask = (match: string) => "x".repeat(match.length);
+/**
+ * Same length, so payload sizes keep their shape: letters and digits become `*`. Punctuation and
+ * every escape (a backslash run and the character or `uXXXX` after it, at any JSON nesting depth)
+ * stay, so the JSON around a match still parses.
+ */
+const mask = (match: string) => {
+  let out = "";
+  for (let index = 0; index < match.length; index++) {
+    const char = match[index] as string;
+    if (char !== "\\") {
+      out += /[A-Za-z0-9]/.test(char) ? "*" : char;
+      continue;
+    }
+    let end = index;
+    while (match[end] === "\\") end++;
+    const keep = match[end] === "u" ? 5 : end < match.length ? 1 : 0;
+    out += match.slice(index, end + keep);
+    index = end + keep - 1;
+  }
+  return out;
+};
 
 /** One case-insensitive pass that every precise pattern implies; rows without a match skip redaction. */
 export const MAYBE_SECRET = new RegExp(
@@ -38,9 +62,18 @@ export const MAYBE_SECRET = new RegExp(
   "i",
 );
 
+/** Masks each match; a pattern with a `secret` group masks only that part (an assignment's value). */
 export const redact = (text: string): string => {
   let out = text;
-  for (const { pattern } of SECRET_PATTERNS) out = out.replace(pattern, mask);
+  for (const { pattern } of SECRET_PATTERNS) {
+    out = out.replace(pattern, (match: string, ...rest: Array<unknown>) => {
+      const groups = rest.at(-1) as { secret?: string } | string;
+      const secret = typeof groups === "object" ? groups.secret : undefined;
+      if (secret === undefined) return mask(match);
+      const start = match.length - secret.length;
+      return match.slice(0, start) + mask(secret);
+    });
+  }
   return out;
 };
 

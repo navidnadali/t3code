@@ -2,9 +2,14 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import { EventId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
+
+import * as EventSink from "../../../apps/server/src/orchestration-v2/EventSink.ts";
+import * as EventStore from "../../../apps/server/src/orchestration-v2/EventStore.ts";
 import * as ProjectionStore from "../../../apps/server/src/orchestration-v2/ProjectionStore.ts";
 import { rebuildMessageSearch } from "../../../apps/server/src/orchestration-v2/messageSearchIndex.ts";
 import { runMigrations } from "../../../apps/server/src/persistence/Migrations.ts";
@@ -55,6 +60,50 @@ export const database = (filename: string) => NodeSqliteClient.layer({ filename 
 
 export const withProjections = (filename: string) =>
   ProjectionStore.layer.pipe(Layer.provideMerge(database(filename)));
+
+/** The server's write path on a plain connection: events, projections, positions, metadata. */
+export const withEventSink = (filename: string) =>
+  EventSink.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(EventStore.layer, ProjectionStore.layer)),
+    Layer.provideMerge(database(filename)),
+  );
+
+/** Threads whose pull request watch the server resumes on boot (it reads the host, may wake the agent). */
+export const WATCHED_THREADS = `
+  SELECT DISTINCT thread.thread_id FROM orchestration_v2_projection_threads AS thread,
+    json_each(thread.payload_json, '$.pullRequests') AS link
+  WHERE json_valid(thread.payload_json)
+    AND json_type(link.value, '$.watch') IS NOT NULL
+    AND json_type(link.value, '$.watch') <> 'null'`;
+
+/**
+ * Turns automatic settlement off on every thread the settle sweep could pick, as
+ * `thread.auto-settle.set` does (`updatedAt` kept), so a boot settles nothing and runs no settle hook.
+ */
+export const disableAutoSettle = Effect.gen(function* () {
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const sink = yield* EventSink.EventSinkV2;
+  const now = yield* DateTime.now;
+  const candidates = yield* projections.getSettlementCandidates();
+  const events: Array<OrchestrationV2DomainEvent> = [];
+  for (const candidate of candidates) {
+    const thread = yield* projections.getThread(candidate.id).pipe(Effect.option);
+    if (Option.isNone(thread)) continue;
+    events.push({
+      id: EventId.make(
+        `event:thread:${encodeURIComponent(candidate.id)}:fixture-sanitise:auto-settle-off`,
+      ),
+      threadId: candidate.id,
+      type: "thread.auto-settle-set",
+      occurredAt: now,
+      payload: { ...thread.value, autoSettleDisabledAt: now },
+    });
+  }
+  for (let start = 0; start < events.length; start += 500) {
+    yield* sink.write({ events: events.slice(start, start + 500) });
+  }
+  return events.length;
+});
 
 /** The server's own migrations, as `migrate-dev-db` runs them on a copy. */
 export const migrate = Effect.gen(function* () {
@@ -108,6 +157,10 @@ const RUNNABLE_QUERIES: ReadonlyArray<readonly [string, string]> = [
     "SELECT COUNT(*) AS n FROM projection_projects WHERE auto_pull <> 0",
   ],
   [
+    "orchestration_v2_projection_threads.pullRequestWatch",
+    `SELECT COUNT(*) AS n FROM (${WATCHED_THREADS})`,
+  ],
+  [
     "orchestration_v2_projection_threads.limitRecovery",
     `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads
      WHERE json_extract(payload_json, '$.limitRecovery') IS NOT NULL`,
@@ -122,8 +175,10 @@ export const runnableWork = Effect.gen(function* () {
       (row) => row.name,
     ),
   );
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
   const counts: Record<string, number> = {
     recoveryThreads: (yield* recoveryThreadIds).size,
+    settlementCandidates: (yield* projections.getSettlementCandidates()).length,
   };
   for (const [name, query] of RUNNABLE_QUERIES) {
     if (!tables.has(name.split(".")[0] as string)) continue;

@@ -55,6 +55,7 @@ export interface LegacyRows {
 /** Spawn details a parent records for its child, read when the child is written. */
 interface SpawnLink {
   readonly parentThreadId: string;
+  readonly rootThreadId: string;
   readonly parentRunId: string;
   readonly subagentNodeId: string;
 }
@@ -139,6 +140,8 @@ export class Builder {
   >;
   private readonly childBySlot = new Map<string, number>();
   private readonly spawns = new Map<number, SpawnLink>();
+  /** Lineage root of each thread already built; parents are always built first. */
+  private readonly roots = new Map<number, string>();
   readonly threadIds: ReadonlyArray<string>;
   readonly projectIds: ReadonlyArray<string>;
 
@@ -288,6 +291,18 @@ export class Builder {
       events.push({ id, threadId, type, payload, occurredAt: this.iso(at), ...scope });
     };
     const spawn = thread.parent === null ? undefined : this.spawns.get(thread.index);
+    const fork =
+      thread.fork === null
+        ? undefined
+        : {
+            threadId: this.threadIds[thread.fork.thread] as string,
+            rootThreadId: this.roots.get(thread.fork.thread) as string,
+            runId: derive.run({
+              threadId: ThreadId.make(this.threadIds[thread.fork.thread] as string),
+              ordinal: thread.fork.run + 1,
+            }),
+          };
+    this.roots.set(thread.index, spawn?.rootThreadId ?? fork?.rootThreadId ?? threadId);
     const span = thread.runs.reduce((acc, run) => acc + 720_000 + 5_000 * run.items.length, 0);
     const createdAt = options.now - span - Math.floor(this.random() * 360 * 86_400_000);
     const providerThreadId =
@@ -317,10 +332,20 @@ export class Builder {
         ? {
             parentThreadId: spawn.parentThreadId,
             relationshipToParent: "subagent",
-            rootThreadId: spawn.parentThreadId,
+            rootThreadId: spawn.rootThreadId,
           }
-        : { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-      forkedFrom: spawn ? { type: "node", nodeId: spawn.subagentNodeId } : null,
+        : fork
+          ? {
+              parentThreadId: fork.threadId,
+              relationshipToParent: "fork",
+              rootThreadId: fork.rootThreadId,
+            }
+          : { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: spawn
+        ? { type: "node", nodeId: spawn.subagentNodeId }
+        : fork
+          ? { type: "run", threadId: fork.threadId, runId: fork.runId }
+          : null,
       createdAt: this.iso(createdAt),
       updatedAt: this.iso(createdAt),
       archivedAt: null,
@@ -454,6 +479,40 @@ export class Builder {
         },
         clock.now,
       );
+    }
+    if (fork !== undefined) {
+      const firstRun =
+        thread.runs.length > 0 && !thread.runless
+          ? derive.run({ threadId: ThreadId.make(threadId), ordinal: 1 })
+          : null;
+      const transfer: Json = {
+        id: joinId(
+          "context-transfer",
+          "type",
+          "fork",
+          "source-thread",
+          fork.threadId,
+          "target-thread",
+          threadId,
+          this.uuid(),
+        ),
+        type: "fork",
+        sourceThreadId: fork.threadId,
+        targetThreadId: threadId,
+        sourcePoint: { threadId: fork.threadId, runId: fork.runId },
+        basePoint: null,
+        sourceProviderInstanceId: instance,
+        targetProviderInstanceId: instance,
+        targetRunId: firstRun,
+        status: "consumed",
+        resolution: null,
+        createdBy: "user",
+        error: null,
+        createdAt: this.iso(createdAt),
+        updatedAt: this.iso(createdAt),
+        consumedAt: this.iso(createdAt),
+      };
+      emit("context-transfer.created", transfer, createdAt);
     }
     if (this.plan.events.threadFinal) {
       const settled = clock.now + 60_000;
@@ -943,6 +1002,7 @@ export class Builder {
           if (child !== undefined) {
             this.spawns.set(child, {
               parentThreadId: threadId,
+              rootThreadId: this.roots.get(thread.index) as string,
               parentRunId: runId,
               subagentNodeId: subagentId,
             });

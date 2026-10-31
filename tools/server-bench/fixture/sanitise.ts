@@ -7,7 +7,9 @@ import * as Effect from "effect/Effect";
 
 import { CREDENTIAL_COLUMN, MAYBE_SECRET, redact, scanFileBytes, secretHits } from "./secrets.ts";
 import {
+  WATCHED_THREADS,
   database,
+  disableAutoSettle,
   failed,
   isRunnable,
   migrate,
@@ -15,8 +17,10 @@ import {
   recoveryThreadIds,
   runnableWork,
   safeDestination,
+  withEventSink,
   withProjections,
 } from "./server.ts";
+import { withSidecars } from "./guards.ts";
 
 /** Deleted outright: credentials, sessions, pairing, links to other machines, and queued work. */
 export const CLEARED_TABLES: ReadonlyArray<string> = [
@@ -131,7 +135,8 @@ const dropLiveFamilies = (db: NodeSqlite.DatabaseSync, live: ReadonlySet<string>
         WHERE latest.thread_id = r.thread_id)
       UNION
       SELECT thread_id FROM orchestration_v2_projection_threads
-      WHERE json_extract(payload_json, '$.limitRecovery') IS NOT NULL;
+      WHERE json_extract(payload_json, '$.limitRecovery') IS NOT NULL
+      UNION ${WATCHED_THREADS};
     CREATE TEMP TABLE thread_families AS
       SELECT thread_id, COALESCE(json_extract(payload_json, '$.lineage.rootThreadId'), thread_id) AS root_id
       FROM orchestration_v2_projection_threads;
@@ -330,13 +335,22 @@ export const isClean = (check: FixtureCheck) =>
 export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
   readonly source: string;
   readonly destination: string;
+  readonly report?: string | undefined;
 }) {
   const scratch = `${input.destination}.sanitise-tmp`;
   const destination = yield* safeDestination({
     destination: input.destination,
     source: input.source,
-    scratch: [scratch, `${scratch}-wal`, `${scratch}-shm`, `${scratch}-journal`],
+    scratch: withSidecars(scratch),
+    ...(input.report === undefined ? {} : { distinctFrom: [input.report] }),
   });
+  if (input.report !== undefined) {
+    yield* safeDestination({
+      destination: input.report,
+      source: input.source,
+      distinctFrom: [...withSidecars(input.destination), ...withSidecars(scratch)],
+    });
+  }
   if (!NodeFS.statSync(input.source, { throwIfNoEntry: false })?.isFile()) {
     return yield* failed(`Source database ${input.source} does not exist.`);
   }
@@ -359,15 +373,25 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
     const db = openWritable(scratch);
     let pruned: ReturnType<typeof dropLiveFamilies>;
     let neutralised: ReturnType<typeof clearAndNeutralise>;
-    let redacted: Record<string, number>;
     try {
       db.exec("BEGIN");
       pruned = dropLiveFamilies(db, live);
       neutralised = clearAndNeutralise(db);
-      redacted = redactTables(db);
       db.exec("COMMIT");
     } finally {
       db.close();
+    }
+    const autoSettleDisabled = yield* disableAutoSettle.pipe(
+      Effect.provide(withEventSink(scratch)),
+    );
+    const redacting = openWritable(scratch);
+    let redacted: Record<string, number>;
+    try {
+      redacting.exec("BEGIN");
+      redacted = redactTables(redacting);
+      redacting.exec("COMMIT");
+    } finally {
+      redacting.close();
     }
     yield* rebuildSearch.pipe(Effect.provide(database(scratch)));
 
@@ -390,6 +414,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
       removedRows: pruned.removed,
       clearedRows: neutralised.cleared,
       autoPullDisabled: neutralised.autoPull,
+      autoSettleDisabled,
       redactedRows: redacted,
       check,
     };

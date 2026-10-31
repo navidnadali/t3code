@@ -10,7 +10,7 @@ import * as NodeSqlite from "node:sqlite";
 
 import { describe, expect, it } from "vite-plus/test";
 
-import { UnsafePathError, assertSafeDestination } from "./fixture/guards.ts";
+import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { SECRET_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
 import { ShapeError, parseShape, quantile, shapeRows } from "./fixture/shape.ts";
@@ -26,7 +26,12 @@ const scratch = (name: string) =>
 
 // Credential-shaped samples, assembled at run time so no literal token sits in the source.
 const SAMPLES: Record<string, string> = {
-  "private-key": `-----BEGIN RSA ${"PRIVATE"} KEY-----`,
+  "private-key": [
+    `-----BEGIN RSA ${"PRIVATE"} KEY-----`,
+    `MIIEow${"Ab12".repeat(15)}`,
+    `${"Cd34".repeat(16)}==`,
+    `-----END RSA ${"PRIVATE"} KEY-----`,
+  ].join("\n"),
   "github-token": `gh${"p"}_${"A1b2".repeat(9)}`,
   "github-pat": `github_${"pat"}_${"A1b2_".repeat(5)}`,
   "gitlab-token": `glpat-${"Ab12-".repeat(5)}`,
@@ -145,10 +150,15 @@ const seedPendingWork = (path: string) => {
       `SELECT DISTINCT r.thread_id AS id FROM orchestration_v2_projection_runs r
        JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
        WHERE json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NULL
-       ORDER BY r.thread_id LIMIT 3`,
+       ORDER BY r.thread_id LIMIT 4`,
     )
     .all() as Array<{ id: string }>;
-  const [running, queued, limited] = native.map((row) => row.id) as [string, string, string];
+  const [running, queued, limited, watched] = native.map((row) => row.id) as [
+    string,
+    string,
+    string,
+    string,
+  ];
   const projectId = (
     db.prepare(`SELECT project_id AS id FROM projection_projects LIMIT 1`).get() as { id: string }
   ).id;
@@ -195,6 +205,36 @@ const seedPendingWork = (path: string) => {
      VALUES ('pair-1', 'pairing-credential', 'pairing', '[]', 'owner', ?, '2099-01-01T00:00:00.000Z')`,
   ).run(at);
   db.exec(`UPDATE projection_projects SET auto_pull = 1`);
+  const watch = { startedAt: at, headSha: null, failedChecks: [], passed: false, passedChecks: [] };
+  const link = {
+    host: "github.com",
+    repository: "bench/fixture",
+    number: 7,
+    url: "https://github.com/bench/fixture/pull/7",
+    source: "agent",
+    linkedAt: at,
+    snapshot: null,
+    stack: null,
+    watch: { ...watch, remarksThrough: at, remarkIds: [], conflicting: false, wakes: 0 },
+  };
+  db.prepare(
+    `UPDATE orchestration_v2_projection_threads
+     SET payload_json = json_set(payload_json, '$.pullRequests', json(?)) WHERE thread_id = ?`,
+  ).run(JSON.stringify([link]), watched);
+  // An idle thread the settle sweep would pick: unsettled, last active long ago.
+  const idle = (
+    db
+      .prepare(
+        `SELECT thread_id AS id FROM orchestration_v2_projection_threads
+         WHERE thread_id LIKE 'import:%' ORDER BY thread_id DESC LIMIT 1`,
+      )
+      .get() as { id: string }
+  ).id;
+  db.prepare(
+    `UPDATE orchestration_v2_projection_threads
+     SET payload_json = json_set(payload_json, '$.settledOverride', NULL, '$.settledAt', NULL)
+     WHERE thread_id = ?`,
+  ).run(idle);
   // Credentials pasted into a kept thread: a message, a turn item and an event payload.
   // A v1 import: a root with no runs, so no seeded thread's family can take it along.
   const kept = (
@@ -218,7 +258,7 @@ const seedPendingWork = (path: string) => {
      WHERE sequence = (SELECT MAX(sequence) FROM orchestration_events WHERE stream_id = ?)`,
   ).run(SAMPLES["private-key"] as string, kept);
   db.close();
-  return { dropped: [running, queued, limited], kept };
+  return { dropped: [running, queued, limited, watched], kept, idle };
 };
 
 describe("assertSafeDestination", () => {
@@ -230,6 +270,7 @@ describe("assertSafeDestination", () => {
     const destinations = [
       NodePath.join(home, "userdata", "statev2.sqlite"),
       NodePath.join(root, "link", "copy.sqlite"),
+      NodePath.join(home, "..fixture.sqlite"),
       home,
     ];
     const refused = destinations.filter((destination) => {
@@ -267,6 +308,14 @@ describe("assertSafeDestination", () => {
     expect(() => assertSafeDestination({ destination: source, homes: [] })).toThrow(
       /already exists/,
     );
+    const database = NodePath.join(root, "fixture.sqlite");
+    expect(() =>
+      assertSafeDestination({
+        destination: `${database}-wal`,
+        distinctFrom: withSidecars(database),
+        homes: [],
+      }),
+    ).toThrow(/something else/);
   });
 });
 
@@ -278,6 +327,18 @@ describe("secrets", () => {
     const redacted = redact(text);
     expect(redacted.length).toBe(text.length);
     expect(secretHits(redacted)).toEqual([]);
+  });
+
+  it("keeps JSON valid around a redacted credential and removes a whole private key block", () => {
+    const pem = SAMPLES["private-key"] as string;
+    const inner = JSON.stringify({ password: "Ab12".repeat(5), key: pem });
+    const payload = JSON.stringify({ input: inner, note: `${SAMPLES.bearer} and ${pem}` });
+    const redacted = redact(payload);
+    expect(redacted.length).toBe(payload.length);
+    const parsed = JSON.parse(redacted) as { input: string; note: string };
+    expect(Object.keys(JSON.parse(parsed.input) as object)).toEqual(["password", "key"]);
+    expect(secretHits(redacted)).toEqual([]);
+    expect([redacted.includes("Ab12"), redacted.includes("Cd34")]).toEqual([false, false]);
   });
 
   it("finds a credential that straddles a chunk boundary of the raw file", () => {
@@ -348,6 +409,23 @@ describe("planSynth", () => {
     );
   });
 
+  it("branches each fork from a run of a native root", () => {
+    const plan = planSynth(example, 1, 3);
+    const forks = plan.threads.filter((thread) => thread.fork !== null);
+    expect(forks.length).toBe(example.lineage?.fork);
+    const sources = forks.map((thread) => plan.threads[thread.fork?.thread ?? -1]);
+    expect(
+      sources.every(
+        (source, index) =>
+          source !== undefined &&
+          !source.runless &&
+          source.parent === null &&
+          source.fork === null &&
+          source.runs.length > (forks[index]?.fork?.run ?? Infinity),
+      ),
+    ).toBe(true);
+  });
+
   it("is deterministic for a seed", () => {
     expect(JSON.stringify(planSynth(example, 0.2, 7))).toBe(
       JSON.stringify(planSynth(example, 0.2, 7)),
@@ -376,7 +454,10 @@ describe("fixture CLI", () => {
     const intoHome = NodePath.join(home, ".t3", "userdata", "statev2.sqlite");
     const refusedHome = run(["sanitise", source, intoHome], { HOME: home });
     const refusedSource = run(["sanitise", source, source], { HOME: home });
-    expect([refusedHome.status, refusedSource.status]).toEqual([2, 2]);
+    const fresh = NodePath.join(scratch("cli-out"), "fixture.sqlite");
+    const refusedReport = run(["sanitise", "--report", source, source, fresh], { HOME: home });
+    expect([refusedHome.status, refusedSource.status, refusedReport.status]).toEqual([2, 2, 2]);
+    expect(NodeFS.existsSync(fresh)).toBe(false);
     expect(refusedHome.stderr).toMatch(/inside the T3 home/);
     expect(refusedSource.stderr).toMatch(/overwrite the source database/);
     expect(NodeFS.existsSync(intoHome)).toBe(false);
@@ -402,7 +483,7 @@ describe("fixture CLI", () => {
     const directory = scratch("sanitise");
     const seeded = NodePath.join(directory, "seeded.sqlite");
     synth(seeded, "0.25");
-    const { dropped, kept } = seedPendingWork(seeded);
+    const { dropped, kept, idle } = seedPendingWork(seeded);
     const report = NodePath.join(directory, "report.json");
     const clean = NodePath.join(directory, "clean.sqlite");
     const result = run(["sanitise", "--report", report, seeded, clean]);
@@ -430,6 +511,9 @@ describe("fixture CLI", () => {
         `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads WHERE thread_id = '${kept}'`,
       ),
     ).toBe(1);
+    const autoSettleOff = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads
+      WHERE thread_id = '${idle}' AND json_extract(payload_json, '$.autoSettleDisabledAt') IS NOT NULL`;
+    expect(count(clean, autoSettleOff)).toBe(1);
   });
 });
 

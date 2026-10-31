@@ -21,8 +21,13 @@ export const canonicalPath = (path: string): string => {
 
 const isWithin = (path: string, directory: string) => {
   const relative = NodePath.relative(directory, path);
-  return relative === "" || (!relative.startsWith("..") && !NodePath.isAbsolute(relative));
+  const escapes = relative === ".." || relative.startsWith(`..${NodePath.sep}`);
+  return !escapes && !NodePath.isAbsolute(relative);
 };
+
+/** A database path and the side files SQLite may create beside it. */
+export const withSidecars = (path: string) =>
+  [path, `${path}-wal`, `${path}-shm`, `${path}-journal`] as const;
 
 /** The real T3 homes a fixture must never be written into: `~/.t3` and `$T3CODE_HOME`. */
 export const protectedHomes = (
@@ -36,35 +41,43 @@ export const protectedHomes = (
 };
 
 /**
- * Refuses a destination inside a protected home, an existing destination, and one that is
- * (or whose scratch copies are) the source. `scratch` lists the side files the command writes.
+ * Refuses to write inside a protected home, over an existing file, over the source (or its side
+ * files), or onto a path the command writes for something else. `scratch` lists its side files.
  */
 export const assertSafeDestination = (input: {
   readonly destination: string;
   readonly source?: string;
   readonly scratch?: ReadonlyArray<string>;
+  readonly distinctFrom?: ReadonlyArray<string>;
   readonly homes?: ReadonlyArray<string>;
 }): string => {
   const destination = canonicalPath(input.destination);
-  for (const home of input.homes ?? protectedHomes()) {
-    const variants = new Set([NodePath.resolve(home), canonicalPath(home)]);
-    for (const variant of variants) {
-      if (isWithin(destination, variant)) {
-        throw new UnsafePathError(
-          `Refusing to write ${destination}: it is inside the T3 home ${variant}. Pick a path outside it.`,
-        );
-      }
+  const written = [destination, ...(input.scratch ?? []).map(canonicalPath)];
+  const homes = (input.homes ?? protectedHomes()).flatMap((home) => [
+    NodePath.resolve(home),
+    canonicalPath(home),
+  ]);
+  for (const path of written) {
+    const home = homes.find((candidate) => isWithin(path, candidate));
+    if (home !== undefined) {
+      throw new UnsafePathError(
+        `Refusing to write ${path}: it is inside the T3 home ${home}. Pick a path outside it.`,
+      );
     }
   }
-  const written = [destination, ...(input.scratch ?? []).map(canonicalPath)];
   if (input.source !== undefined) {
     const source = canonicalPath(input.source);
-    const sourceFiles = new Set([source, `${source}-wal`, `${source}-shm`, `${source}-journal`]);
-    for (const path of written) {
-      if (sourceFiles.has(path)) {
-        throw new UnsafePathError(`Refusing to overwrite the source database ${source}.`);
-      }
+    const sourceFiles = new Set(withSidecars(source));
+    if (written.some((path) => sourceFiles.has(path))) {
+      throw new UnsafePathError(`Refusing to overwrite the source database ${source}.`);
     }
+  }
+  const taken = new Set((input.distinctFrom ?? []).map(canonicalPath));
+  const clash = written.find((path) => taken.has(path));
+  if (clash !== undefined) {
+    throw new UnsafePathError(
+      `Refusing to write ${clash}: this command writes it for something else.`,
+    );
   }
   for (const path of written) {
     if (NodeFS.existsSync(path)) {

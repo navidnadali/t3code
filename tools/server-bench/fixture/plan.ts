@@ -149,6 +149,8 @@ export interface ThreadPlan {
   readonly project: number;
   /** Set on a subagent child: the parent thread and the position of its `subagent` item. */
   readonly parent: { readonly thread: number; readonly run: number; readonly item: number } | null;
+  /** Set on a fork: the root it forked from and the run (index) it forked at. */
+  readonly fork: { readonly thread: number; readonly run: number } | null;
   /** Turns; on a run-less thread they are history groups with no run, node or provider turn. */
   readonly runs: ReadonlyArray<RunPlan>;
   readonly runless: boolean;
@@ -316,6 +318,13 @@ export const planSynth = (shape: Shape, scale: number, seed: number): SynthPlan 
     ofThreads(lineage?.runless ?? lineage?.v1Import) - importedCount,
   );
   for (const index of children.slice(0, runlessChildren)) runless[index] = 1;
+  const forkStart = importedCount + Math.max(0, childCount);
+  const forks = order.slice(
+    forkStart,
+    forkStart + Math.max(0, Math.min(order.length - forkStart - 1, ofThreads(lineage?.fork))),
+  );
+  const isFork = new Uint8Array(threadCount);
+  for (const index of forks) isFork[index] = 1;
 
   const nativeItems = itemsPerThread.map((items, index) => (runless[index] === 1 ? 0 : items));
   const runsPerThread = fitRuns(nativeItems, target("orchestration_v2_projection_runs"));
@@ -451,6 +460,31 @@ export const planSynth = (shape: Shape, scale: number, seed: number): SynthPlan 
     if (slot === undefined) isChild[child] = 0;
     else parents[child] = slot;
   }
+  // A fork branches from a run of a native root, so its inherited history is a real run.
+  const roots = runItems.flatMap((runs, thread) =>
+    isChild[thread] === 0 && isFork[thread] === 0 && runless[thread] === 0 && runs.length > 0
+      ? [thread]
+      : [],
+  );
+  const forkOf: Array<ThreadPlan["fork"]> = Array.from({ length: threadCount }, () => null);
+  for (const fork of forks) {
+    if (roots.length === 0) continue;
+    const thread = roots[Math.floor(random() * roots.length)] as number;
+    forkOf[fork] = {
+      thread,
+      run: Math.floor(random() * (runItems[thread] as Array<unknown>).length),
+    };
+  }
+  // Forks and children work in their parent's project.
+  const projectFor = (index: number): number => {
+    const fork = forkOf[index];
+    const parent = parents[index];
+    return fork
+      ? projectFor(fork.thread)
+      : parent
+        ? projectFor(parent.thread)
+        : (projectOf[index] as number);
+  };
 
   const allRuns = runItems.flat();
   const isNative = runItems.flatMap((runs, thread) => runs.map(() => runless[thread] === 0));
@@ -511,9 +545,10 @@ export const planSynth = (shape: Shape, scale: number, seed: number): SynthPlan 
   );
 
   const spawned = children.filter((child) => parents[child] !== null);
+  const forked = forkOf.filter((fork) => fork !== null).length;
   const transferTarget = Math.max(
     spawned.filter((child) => runless[child] === 0).length,
-    Math.min(spawned.length, target("orchestration_v2_projection_context_transfers")),
+    Math.min(spawned.length, target("orchestration_v2_projection_context_transfers") - forked),
   );
   const withTransfer = new Uint8Array(threadCount);
   for (const child of [
@@ -527,9 +562,9 @@ export const planSynth = (shape: Shape, scale: number, seed: number): SynthPlan 
     const parent = parents[index] ?? null;
     return {
       index,
-      // A spawned subagent works in its parent's project.
-      project: projectOf[parent === null ? index : parent.thread] as number,
+      project: projectFor(index),
       parent,
+      fork: forkOf[index] ?? null,
       runless: runless[index] === 1,
       imported: imported[index] === 1,
       scopes: (rootScopes[index] as number) + (extraScopes[index] as number),
@@ -563,7 +598,7 @@ export const planSynth = (shape: Shape, scale: number, seed: number): SynthPlan 
   const checkpointRows = sum(checkpoints);
   const scopes = sum(rootScopes) + sum(extraScopes);
   const plans = count("todo_list");
-  const transfers = sum(withTransfer);
+  const transfers = sum(withTransfer) + forked;
 
   // Extra events where the shape records more than one per entity; first/latest pairs stay at two.
   const eventMix = shape.mix?.eventTypes ?? {};

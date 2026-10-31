@@ -38,7 +38,36 @@ export interface SqliteClientConfig {
   readonly readerWorker?: boolean | undefined;
   /** Ignored for in-memory databases. */
   readonly checkpointWorker?: boolean | undefined;
+  /** Main connection page cache in MiB; unset or 0 keeps SQLite's default. */
+  readonly cacheSizeMb?: number | undefined;
+  /** Page cache in MiB for each reader worker; unset or 0 keeps SQLite's default. */
+  readonly readerCacheSizeMb?: number | undefined;
+  /** Memory map in MiB for the main connection and reader workers; unset or 0 keeps it off. */
+  readonly mmapSizeMb?: number | undefined;
 }
+
+// A negative cache_size is a 32-bit KiB count; larger values silently become 0.
+export const SQLITE_MAX_CACHE_SIZE_MB = 2 ** 21;
+// Node's bundled SQLite is built with SQLITE_MAX_MMAP_SIZE=0x7fff0000 and silently clamps larger maps.
+export const SQLITE_MAX_MMAP_SIZE_MB = 2047;
+
+const mebibytes = (
+  options: SqliteClientConfig,
+  name: "cacheSizeMb" | "readerCacheSizeMb" | "mmapSizeMb",
+  maximum: number,
+) => {
+  const value = options[name] ?? 0;
+  if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
+    throw new RangeError(`SQLite ${name} must be an integer from 0 to ${maximum}, got ${value}`);
+  }
+  return value;
+};
+
+const tuningPragmas = (cacheSizeMb: number, mmapSizeMb: number) =>
+  [
+    ...(cacheSizeMb > 0 ? [`PRAGMA cache_size = ${-cacheSizeMb * 1024};`] : []),
+    ...(mmapSizeMb > 0 ? [`PRAGMA mmap_size = ${mmapSizeMb * 1024 * 1024};`] : []),
+  ].join(" ");
 
 // SqlClient masks transaction acquisition, so readOnly carries the caller's interruption policy.
 const ReadOnly = Context.Reference<typeof Effect.interruptible | undefined>(
@@ -207,6 +236,7 @@ try {
     allowExtension: workerData.allowExtension,
   });
   next.exec("PRAGMA busy_timeout = 5000;");
+  if (workerData.pragmas) next.exec(workerData.pragmas);
   // Without WAL a reader's shared lock blocks the writer's commits, so refuse.
   const mode = String(next.prepare("PRAGMA journal_mode").get().journal_mode).toLowerCase();
   permanent = mode !== "wal";
@@ -309,6 +339,7 @@ const readerPoolAvailable = Metric.gauge("t3_sqlite_reader_pool_available", {
 const makeReader = Effect.fnUntraced(function* (
   options: SqliteClientConfig,
   pool: { unavailable: boolean },
+  pragmas: string,
 ) {
   type Reader = {
     readonly worker: NodeWorkerThreads.Worker;
@@ -330,6 +361,7 @@ const makeReader = Effect.fnUntraced(function* (
         filename: options.filename,
         allowExtension: false,
         prepareCacheSize: 200,
+        pragmas,
       },
     });
     let announce: (startup: ReaderStartup) => void = () => {};
@@ -928,6 +960,15 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
   const compiler = Statement.makeCompilerSqlite();
   const isFileDatabase = options.filename !== ":memory:" && options.filename !== "";
+  const mmapSizeMb = mebibytes(options, "mmapSizeMb", SQLITE_MAX_MMAP_SIZE_MB);
+  const writerPragmas = tuningPragmas(
+    mebibytes(options, "cacheSizeMb", SQLITE_MAX_CACHE_SIZE_MB),
+    mmapSizeMb,
+  );
+  const readerPragmas = tuningPragmas(
+    mebibytes(options, "readerCacheSizeMb", SQLITE_MAX_CACHE_SIZE_MB),
+    mmapSizeMb,
+  );
 
   const makeConnection = Effect.gen(function* () {
     const scope = yield* Effect.scope;
@@ -952,6 +993,15 @@ const make = Effect.fn("makeWithDatabase")(function* (
           }),
       }).pipe(Effect.orDie),
     );
+    if (writerPragmas !== "") {
+      yield* Effect.try({
+        try: () => db.exec(writerPragmas),
+        catch: (cause) =>
+          new SqlError({
+            reason: classifyError(cause, "Failed to configure database", "configure"),
+          }),
+      });
+    }
     // Started after the close finalizer, so the worker stops before the writer closes.
     const checkpoint =
       options.checkpointWorker && isFileDatabase
@@ -1155,7 +1205,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
     options.readerWorker && isFileDatabase
       ? yield* Effect.forEach(Array.from({ length: READER_POOL_SIZE }), () =>
           Effect.map(
-            Effect.all([makeReader(options, readerPool), Semaphore.make(1)]),
+            Effect.all([makeReader(options, readerPool, readerPragmas), Semaphore.make(1)]),
             ([acquire, lock]) => ({
               acquire,
               lock,

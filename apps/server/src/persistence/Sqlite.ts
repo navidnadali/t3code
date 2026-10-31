@@ -44,7 +44,10 @@ const layerSetup = Layer.effectDiscard(
   }),
 );
 
-export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (dbPath: string) {
+export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (
+  dbPath: string,
+  tuning?: { readonly readerPoolSize?: number | undefined },
+) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });
@@ -54,6 +57,7 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
     NodeSqliteClient.layer({
       filename: dbPath,
       readerWorker: true,
+      readerPoolSize: tuning?.readerPoolSize,
       // Run checkpoint fsyncs off the event loop so slow disk flushes cannot stall clients.
       checkpointWorker: true,
       spanAttributes: {
@@ -71,8 +75,8 @@ export const layerMemory = Layer.provideMerge(
 
 export const layerConfig = Layer.unwrap(
   Effect.gen(function* () {
-    const { dbPath } = yield* ServerConfig.ServerConfig;
+    const { dbPath, sqliteReaderPoolSize } = yield* ServerConfig.ServerConfig;
     yield* initializeV2Database(dbPath);
-    return layerFromPath(dbPath);
+    return layerFromPath(dbPath, { readerPoolSize: sqliteReaderPoolSize });
   }),
 );

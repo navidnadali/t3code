@@ -252,14 +252,15 @@ export function parseDuration(text: string): number | null {
 }
 
 /**
- * The innermost cause the server logged for a failed effect of `threadId`: its pretty log prints
- * the error as quoted string pieces, and the last `[cause]:` with the lines up to its stack is
- * the provider's own message (a fake's stderr, say).
+ * The innermost cause the server last logged for `threadId` (named as is, or URL-encoded in a run
+ * id): its pretty log prints errors as quoted string pieces, and the last `[cause]:` with the
+ * lines up to its stack is the provider's own message (a fake's stderr, say).
  */
 export function failureCause(log: string, threadId: string): string | null {
   const entries = log.split(/\n(?=\[\d\d:\d\d:\d\d\.\d{3}\] )/u);
+  const names = [threadId, encodeURIComponent(threadId)];
   for (const entry of entries.toReversed()) {
-    if (!entry.includes(threadId)) continue;
+    if (!names.some((name) => entry.includes(name))) continue;
     const lines = entry.split("\n").flatMap((line) => {
       const piece = /^\s*'(.*)'\s*\+?\s*$/u.exec(line)?.[1];
       return piece === undefined ? [] : [piece.replaceAll("\\'", "'").replace(/\\n$/u, "").trim()];

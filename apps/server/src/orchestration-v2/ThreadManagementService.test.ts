@@ -11,6 +11,7 @@ import {
   ProviderSessionId,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderInstanceId,
   RunId,
@@ -21,6 +22,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Option from "effect/Option";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -767,5 +769,118 @@ it.effect("Force stop refuses once a newer run has started, before killing anyth
     }).pipe(Effect.provide(layerTest));
     expect(error.reason).toBe("superseded");
     expect(killed).toBe(false);
+  }),
+);
+
+type GetThreadShell = Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
+
+const sharedShellReadsTest = (
+  getThreadShell: GetThreadShell,
+  test: (
+    forEvent: (threadId: ThreadId, sequence: number) => ReturnType<GetThreadShell>,
+  ) => Effect.Effect<void, Orchestrator.OrchestratorV2Error>,
+) =>
+  Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    return yield* test((threadId, sequence) =>
+      threads.getThreadShellForEvent({ threadId, sequence }),
+    );
+  }).pipe(
+    Effect.provide(
+      ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({ getThreadShell })),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      ),
+    ),
+  );
+
+const shellRead = (threadId: ThreadId, read: number) =>
+  ({ id: threadId, title: `read ${read}` }) as unknown as OrchestrationV2ThreadShell;
+
+it.effect("callers share an in-flight thread shell read, even after one leaves", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:in-flight");
+    const release = yield* Deferred.make<void>();
+    let reads = 0;
+    yield* sharedShellReadsTest(
+      (id) => Deferred.await(release).pipe(Effect.map(() => shellRead(id, ++reads))),
+      (forEvent) =>
+        Effect.gen(function* () {
+          const leaving = yield* Effect.forkChild(forEvent(threadId, 5), {
+            startImmediately: true,
+          });
+          const staying = yield* Effect.forkChild(forEvent(threadId, 5), {
+            startImmediately: true,
+          });
+          yield* Fiber.interrupt(leaving);
+          yield* Deferred.succeed(release, undefined);
+          expect(yield* Fiber.join(staying)).toEqual(shellRead(threadId, 1));
+          expect(reads).toBe(1);
+        }),
+    );
+  }),
+);
+
+it.effect("a thread shell read serves its event and older ones until a newer event or expiry", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:sequence");
+    let reads = 0;
+    yield* sharedShellReadsTest(
+      (id) => Effect.sync(() => shellRead(id, ++reads)),
+      (forEvent) =>
+        Effect.gen(function* () {
+          expect(yield* forEvent(threadId, 5)).toEqual(shellRead(threadId, 1));
+          expect(yield* forEvent(threadId, 5)).toEqual(shellRead(threadId, 1));
+          expect(yield* forEvent(threadId, 3)).toEqual(shellRead(threadId, 1));
+          expect(yield* forEvent(threadId, 6)).toEqual(shellRead(threadId, 2));
+          expect(yield* forEvent(threadId, 5)).toEqual(shellRead(threadId, 2));
+          yield* TestClock.adjust(
+            Duration.millis(ThreadManagementService.SHARED_SHELL_READ_TTL_MS),
+          );
+          expect(yield* forEvent(threadId, 6)).toEqual(shellRead(threadId, 3));
+        }),
+    );
+  }),
+);
+
+it.effect("a failed thread shell read is not shared with later callers", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:failure");
+    let reads = 0;
+    yield* sharedShellReadsTest(
+      (id) =>
+        Effect.suspend(() =>
+          ++reads === 1
+            ? Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId: id }))
+            : Effect.succeed(shellRead(id, reads)),
+        ),
+      (forEvent) =>
+        Effect.gen(function* () {
+          expect(Exit.isFailure(yield* Effect.exit(forEvent(threadId, 5)))).toBe(true);
+          expect(yield* forEvent(threadId, 5)).toEqual(shellRead(threadId, 2));
+        }),
+    );
+  }),
+);
+
+it.effect("shared thread shell reads keep only the most recent threads", () =>
+  Effect.gen(function* () {
+    const threadIds = Array.from(
+      { length: ThreadManagementService.SHARED_SHELL_READ_CAPACITY + 1 },
+      (_, index) => ThreadId.make(`thread:shared-shell:capacity:${index}`),
+    );
+    const reads: Array<ThreadId> = [];
+    yield* sharedShellReadsTest(
+      (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shellRead(id, reads.length))),
+      (forEvent) =>
+        Effect.gen(function* () {
+          yield* Effect.forEach(threadIds, (threadId) => forEvent(threadId, 1), { discard: true });
+          yield* forEvent(threadIds.at(-1)!, 1);
+          yield* forEvent(threadIds[0]!, 1);
+        }),
+    );
+    expect(reads).toEqual([...threadIds, threadIds[0]]);
   }),
 );

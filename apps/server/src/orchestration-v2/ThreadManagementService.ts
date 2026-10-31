@@ -47,8 +47,10 @@ import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -419,6 +421,11 @@ export interface ThreadManagementServiceShape {
     Orchestrator.OrchestratorV2Error
   >;
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
+  /** The thread shell as of event `sequence` or later, shared with callers the thread's latest read covers. */
+  readonly getThreadShellForEvent: (input: {
+    readonly threadId: ThreadId;
+    readonly sequence: number;
+  }) => ReturnType<Orchestrator.OrchestratorV2["Service"]["getThreadShell"]>;
   /** Omit `projectId` to list every project's threads. Side chats are never listed. */
   readonly listProjectThreads: (input: {
     readonly projectId?: ProjectId | undefined;
@@ -565,6 +572,17 @@ const SETTLE_AFTER_RUN_WAIT_MS = 24 * 60 * 60 * 1_000;
 const FORCE_STOP_REASON = "Force stopped by user";
 const FORCE_STOP_RELEASE_WAIT = "10 seconds";
 const isForceStopThreadError = Schema.is(OrchestrationV2ForceStopThreadError);
+export const SHARED_SHELL_READ_CAPACITY = 512;
+export const SHARED_SHELL_READ_TTL_MS = 5_000;
+
+interface SharedShellRead {
+  readonly sequence: number;
+  readonly result: Deferred.Deferred<
+    OrchestrationV2ThreadShell | null,
+    Orchestrator.OrchestratorV2Error
+  >;
+  expiresAt: number;
+}
 
 const make = Effect.gen(function* () {
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
@@ -776,6 +794,52 @@ const make = Effect.gen(function* () {
             threadId: input.threadId,
           }),
       ),
+    );
+
+  const sharedShellReads = new Map<ThreadId, SharedShellRead>();
+  const trimSharedShellReads = (now: number) => {
+    for (const [threadId, read] of sharedShellReads) {
+      if (sharedShellReads.size <= SHARED_SHELL_READ_CAPACITY && now < read.expiresAt) return;
+      sharedShellReads.delete(threadId);
+    }
+  };
+  // Callers ask after their event commits, so a read started for one sequence also serves earlier ones.
+  // The read runs in the layer scope, so a caller that disconnects mid-read cannot cancel it for others.
+  const getThreadShellForEvent: ThreadManagementServiceShape["getThreadShellForEvent"] = (input) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.clockWith((clock) => {
+        const now = clock.currentTimeMillisUnsafe();
+        const current = sharedShellReads.get(input.threadId);
+        if (
+          current !== undefined &&
+          current.sequence >= input.sequence &&
+          now < current.expiresAt
+        ) {
+          return restore(Deferred.await(current.result));
+        }
+        const read: SharedShellRead = {
+          sequence: Math.max(input.sequence, current?.sequence ?? 0),
+          result: Deferred.makeUnsafe(),
+          expiresAt: Number.POSITIVE_INFINITY,
+        };
+        sharedShellReads.delete(input.threadId);
+        sharedShellReads.set(input.threadId, read);
+        trimSharedShellReads(now);
+        return orchestrator.getThreadShell(input.threadId).pipe(
+          Effect.onExit((exit) =>
+            Effect.clockWith((settledClock) => {
+              if (Exit.isSuccess(exit)) {
+                read.expiresAt = settledClock.currentTimeMillisUnsafe() + SHARED_SHELL_READ_TTL_MS;
+              } else if (sharedShellReads.get(input.threadId) === read) {
+                sharedShellReads.delete(input.threadId);
+              }
+              return Effect.asVoid(Deferred.done(read.result, exit));
+            }),
+          ),
+          Effect.forkIn(layerScope),
+          Effect.andThen(restore(Deferred.await(read.result))),
+        );
+      }),
     );
 
   const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = (input) =>
@@ -1526,6 +1590,7 @@ const make = Effect.gen(function* () {
     listOlderSettledThreads: orchestrator.listOlderSettledThreads,
     readShellSnapshot: orchestrator.readShellSnapshot,
     getThreadShell: orchestrator.getThreadShell,
+    getThreadShellForEvent,
     listProjectThreads,
     sendToThread,
     assertProviderInstanceEnabled,

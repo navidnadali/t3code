@@ -841,20 +841,21 @@ const make = Effect.gen(function* () {
             }),
           ),
           Effect.andThen(orchestrator.getThreadShell(input.threadId)),
-          Effect.onExit((exit) =>
-            Effect.clockWith((settledClock) => {
+          Effect.forkIn(layerScope),
+          Effect.flatMap((fiber) => {
+            // An observer also sees a read interrupted before it starts, e.g. forked into a closed scope.
+            fiber.addObserver((exit) => {
               if (Exit.isSuccess(exit)) {
-                const settledAt = settledClock.currentTimeMillisUnsafe();
+                const settledAt = clock.currentTimeMillisUnsafe();
                 read.expiresAt = settledAt + SHARED_SHELL_READ_TTL_MS;
                 trimSharedShellReads(settledAt);
               } else if (sharedShellReads.get(input.threadId) === read) {
                 sharedShellReads.delete(input.threadId);
               }
-              return Effect.asVoid(Deferred.done(read.result, exit));
-            }),
-          ),
-          Effect.forkIn(layerScope),
-          Effect.andThen(restore(Deferred.await(read.result))),
+              Deferred.doneUnsafe(read.result, exit);
+            });
+            return restore(Deferred.await(read.result));
+          }),
         );
       }),
     );

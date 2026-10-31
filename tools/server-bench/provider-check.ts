@@ -78,6 +78,8 @@ interface FakeModule {
 
 interface StatsRecord {
   readonly at: string;
+  /** "turn", or the Codex fake's "thread-start" and "process-start"; the fake Claude CLI has none. */
+  readonly kind?: string;
   readonly fake: string;
   readonly sessionId: string;
   readonly transcript: string;
@@ -427,7 +429,9 @@ async function check(
       const played =
         rows?.nativeId == null
           ? []
-          : records.filter((record) => record.sessionId === rows.nativeId);
+          : records.filter(
+              (record) => record.sessionId === rows.nativeId && (record.kind ?? "turn") === "turn",
+            );
       const checks: Record<string, boolean> = {
         "every turn completed": run.turns.length === turns && completed === turns,
         "server runs completed":

@@ -60,7 +60,12 @@ function schemaIssue(frame) {
 
 function startFake(env) {
   const child = NodeChildProcess.spawn(process.execPath, [FAKE, "app-server"], {
-    env: { ...process.env, BENCH_SPEED: "0", ...env },
+    env: {
+      ...process.env,
+      BENCH_SPEED: "0",
+      BENCH_STATE_DIR: NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-state-")),
+      ...env,
+    },
     stdio: ["pipe", "pipe", "inherit"],
   });
   const lines = NodeReadline.createInterface({ input: child.stdout })[Symbol.asyncIterator]();
@@ -262,9 +267,7 @@ describe("fake codex app-server", () => {
     expect(frames.some((frame) => frame.method === "item/started")).toBe(false);
     fake.end();
     expect(await fake.exited).toBe(0);
-    const [record] = NodeFS.readdirSync(stats).map((file) =>
-      JSON.parse(NodeFS.readFileSync(NodePath.join(stats, file), "utf8")),
-    );
+    const record = statsIn(stats).find((line) => line.kind === "turn");
     expect(record).toMatchObject({ fake: "codex", sessionId: threadId, aborted: true });
   });
 

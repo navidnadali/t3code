@@ -71,6 +71,19 @@ const S_KEYS = new Set(["startedAt", "completedAt", "createdAt", "updatedAt", "r
 const timeSlot = (key, value) =>
   MS_KEYS.has(key) && value > 1e12 ? NOW_MS : S_KEYS.has(key) && value > 1e9 ? NOW_S : undefined;
 
+// Sent once per app-server after `initialized`, not per thread: the recordings show them while
+// the first thread/start is pending.
+const PROCESS_METHODS = new Set([
+  "configWarning",
+  "remoteControl/status/changed",
+  "account/updated",
+  "deprecationNotice",
+  "warning",
+]);
+// What thread/resume sends besides its answer (provider_thread_resume).
+const RESUME_METHODS = new Set(["mcpServer/startupStatus/updated"]);
+const OPENING_METHODS = new Set(["thread/start", "thread/fork", "thread/resume"]);
+
 const isDelta = (method) => method.endsWith("/delta") || method.endsWith("Delta");
 const promptText = (input) =>
   (Array.isArray(input) ? input : [])
@@ -216,12 +229,16 @@ export function compileTranscript(parsed) {
     [parsed.thread.thread.cwd ?? parsed.thread.cwd, CWD],
     [parsed.thread.model, MODEL],
   ]);
-  const setup = compileFrames([parsed.thread, ...parsed.setup], {
+  const processFrames = parsed.setup.filter((frame) => PROCESS_METHODS.has(frame.method));
+  const threadFrames = parsed.setup.filter((frame) => !PROCESS_METHODS.has(frame.method));
+  const setup = compileFrames([parsed.thread, ...threadFrames, ...processFrames], {
     fixed,
     idPattern: ID_PATTERN,
     firstId: FIRST_ID,
     rawSlots: timeSlot,
   });
+  const withStats = (templates, frames) =>
+    templates.map((template, index) => ({ ...template, stat: statKey(frames[index]) }));
   const turns = parsed.turns.map((turn) => {
     const parts = splitTurn(turn, turn.threadId);
     const turnFixed = new Map([...fixed, [turn.threadId, THREAD], [turn.turnId, TURN]]);
@@ -277,7 +294,8 @@ export function compileTranscript(parsed) {
   return {
     recordedModel: parsed.thread.model,
     threadAnswer: setup.templates[0],
-    setup: setup.templates.slice(1),
+    threadSetup: withStats(setup.templates.slice(1, 1 + threadFrames.length), threadFrames),
+    processSetup: withStats(setup.templates.slice(1 + threadFrames.length), processFrames),
     setupIds: setup.ids,
     turns,
   };
@@ -316,15 +334,41 @@ export function* turnLines(compiled, live, loops) {
   for (const frame of compiled.suffix) yield next(frame, true);
 }
 
-function threadLines(compiled, live) {
+/** The answer to thread/start (or resume, fork) and the frames that follow it, with live values. */
+function threadLines(compiled, live, resumed = false) {
   const values = [live.threadId, "", live.cwd, live.model, "", 0, 0];
   for (const id of compiled.setupIds) values.push(freshId(id));
   const now = Date.now();
   values[NOW_MS] = now;
   values[NOW_S] = Math.floor(now / 1000);
+  const setup = resumed
+    ? compiled.threadSetup.filter((frame) => RESUME_METHODS.has(frame.stat))
+    : compiled.threadSetup;
   return {
     answer: render(compiled.threadAnswer, values),
-    setup: compiled.setup.map((frame) => render(frame, values)),
+    setup: setup.map((frame) => ({ stat: frame.stat, line: render(frame, values) })),
+    process: compiled.processSetup.map((frame) => ({
+      stat: frame.stat,
+      line: render(frame, values),
+    })),
+  };
+}
+
+/** Frames and bytes sent, by stat key. */
+function makeTally() {
+  const frames = {};
+  let bytes = 0;
+  return {
+    add: (stat, line) => {
+      frames[stat] = (frames[stat] ?? 0) + 1;
+      bytes += Buffer.byteLength(line) + 1;
+    },
+    get frames() {
+      return frames;
+    },
+    get bytes() {
+      return bytes;
+    },
   };
 }
 
@@ -449,10 +493,28 @@ async function runAppServer(config) {
   const threads = new Map();
   const pendingServerRequests = new Map();
   let initialized = false;
+  let processSetupSent = false;
   let nextServerRequestId = 0;
   let faultPending = config.fault !== undefined;
 
   const send = (message) => write(JSON.stringify(message));
+  // Request counts and RSS cover every thread this app-server serves.
+  const processFigures = () => ({ rssBytes: process.memoryUsage.rss(), requests: { ...requests } });
+  const recordOutsideTurn = (kind, sessionId, tally) =>
+    recordStats({
+      at: new Date().toISOString(),
+      kind,
+      pid: process.pid,
+      fake: "codex",
+      sessionId,
+      frames: tally.frames,
+      bytes: tally.bytes,
+      process: processFigures(),
+    });
+  const sendCounted = (tally, stat, line) => {
+    tally.add(stat, line);
+    return write(line);
+  };
   const respond = (id, result) => send({ id, result });
   const fail = (id, code, message) => send({ id, error: { code, message } });
 
@@ -464,7 +526,7 @@ async function runAppServer(config) {
     return { name: thread.assignment.transcript, turn, compiled: turns[turn] };
   };
 
-  const openThread = (id, params, threadId) => {
+  const openThread = (id, method, params, threadId) => {
     const credentials = codexMcpCredentials(params.config);
     if (config.mcpCredentialsDir !== undefined && credentials !== undefined) {
       try {
@@ -478,6 +540,7 @@ async function runAppServer(config) {
     const thread = threads.get(threadId) ?? {
       threadId,
       assignment,
+      requests: {},
       cwd: typeof params.cwd === "string" ? params.cwd : process.cwd(),
       model: typeof params.model === "string" ? params.model : compiled.recordedModel,
       played: 0,
@@ -486,9 +549,25 @@ async function runAppServer(config) {
       draining: false,
     };
     threads.set(threadId, thread);
-    const lines = threadLines(compiled, thread);
-    send({ id, result: JSON.parse(lines.answer) });
-    for (const line of lines.setup) write(line);
+    countThreadRequest(thread, method);
+    const lines = threadLines(compiled, thread, method === "thread/resume");
+    const tally = makeTally();
+    sendCounted(tally, "response", JSON.stringify({ id, result: JSON.parse(lines.answer) }));
+    for (const { stat, line } of lines.setup) sendCounted(tally, stat, line);
+    recordOutsideTurn("thread-start", threadId, tally);
+  };
+
+  const countThreadRequest = (thread, method) => {
+    if (thread !== undefined) thread.requests[method] = (thread.requests[method] ?? 0) + 1;
+  };
+
+  const sendProcessSetup = () => {
+    const tally = makeTally();
+    for (const { stat, line } of threadLines(fallback, { threadId: "", cwd: "", model: "" })
+      .process) {
+      sendCounted(tally, stat, line);
+    }
+    recordOutsideTurn("process-start", null, tally);
   };
 
   const play = async (thread, request) => {
@@ -496,22 +575,24 @@ async function runAppServer(config) {
     const turnId = NodeCrypto.randomUUID();
     thread.active = { controller, turnId };
     const startedAt = Date.now();
-    await respond(request.id, {
-      turn: {
-        id: turnId,
-        items: [],
-        itemsView: "notLoaded",
-        status: "inProgress",
-        error: null,
-        startedAt: null,
-        completedAt: null,
-        durationMs: null,
-      },
-    });
+    const tally = makeTally();
+    const started = {
+      id: turnId,
+      items: [],
+      itemsView: "notLoaded",
+      status: "inProgress",
+      error: null,
+      startedAt: null,
+      completedAt: null,
+      durationMs: null,
+    };
+    await sendCounted(
+      tally,
+      "response",
+      JSON.stringify({ id: request.id, result: { turn: started } }),
+    );
     const pick = pickTurn(thread);
     const live = { ...thread, turnId, prompt: promptText(request.params?.input) };
-    const frames = {};
-    let bytes = 0;
     let unpaced = 0;
     let reply = null;
     const loops = Math.min(config.turnLoops, pick.compiled.maxLoops);
@@ -527,36 +608,40 @@ async function runAppServer(config) {
       if (controller.signal.aborted) break;
       if (faultPoint && faultPending) {
         faultPending = false;
-        if (config.fault === "bad-shape") await write(BAD_SHAPE(thread.threadId, turnId));
-        else if (config.fault === "truncated-frame") {
-          await write(line.slice(0, Math.max(1, Math.floor(line.length / 2))));
+        if (config.fault === "bad-shape") {
+          await sendCounted(tally, "fault", BAD_SHAPE(thread.threadId, turnId));
+        } else if (config.fault === "truncated-frame") {
+          await sendCounted(
+            tally,
+            "fault",
+            line.slice(0, Math.max(1, Math.floor(line.length / 2))),
+          );
         } else await injectExitFault(config.fault, line, write);
       }
       if (frame.request) {
         const id = nextServerRequestId++;
         const answered = new Promise((resolve) => pendingServerRequests.set(id, resolve));
-        await send({ ...JSON.parse(line), id });
+        await sendCounted(tally, frame.stat, JSON.stringify({ ...JSON.parse(line), id }));
         await Promise.race([
           answered,
           new Promise((resolve) => controller.signal.addEventListener("abort", resolve)),
         ]);
         pendingServerRequests.delete(id);
       } else {
-        await write(line);
+        await sendCounted(tally, frame.stat, line);
       }
-      frames[frame.stat] = (frames[frame.stat] ?? 0) + 1;
       if (frame.stat === "item/completed") reply = answerOf(line, thread.threadId) ?? reply;
-      bytes += Buffer.byteLength(line) + 1;
     }
     const aborted = controller.signal.aborted;
     if (aborted) {
       const now = Date.now();
-      await send({
+      const idle = {
         method: "thread/status/changed",
         params: { threadId: thread.threadId, status: { type: "idle" } },
         emittedAtMs: now,
-      });
-      await send({
+      };
+      await sendCounted(tally, idle.method, JSON.stringify(idle));
+      const completed = {
         method: "turn/completed",
         params: {
           threadId: thread.threadId,
@@ -572,7 +657,8 @@ async function runAppServer(config) {
           },
         },
         emittedAtMs: now,
-      });
+      };
+      await sendCounted(tally, completed.method, JSON.stringify(completed));
     }
     thread.active = undefined;
     recordStats({
@@ -589,12 +675,12 @@ async function runAppServer(config) {
       loops,
       payloadBytes: config.payloadBytes,
       aborted,
-      frames,
-      bytes,
+      frames: tally.frames,
+      bytes: tally.bytes,
       reply,
       ms: Date.now() - startedAt,
-      rssBytes: process.memoryUsage.rss(),
-      requests,
+      sessionRequests: { ...thread.requests },
+      process: processFigures(),
     });
   };
 
@@ -608,6 +694,8 @@ async function runAppServer(config) {
     const { id, method } = message;
     const params = message.params ?? {};
     requests[method] = (requests[method] ?? 0) + 1;
+    if (!OPENING_METHODS.has(method))
+      countThreadRequest(threads.get(String(params.threadId)), method);
     switch (method) {
       case "initialize":
         if (initialized) return fail(id, -32600, "Already initialized");
@@ -631,9 +719,9 @@ async function runAppServer(config) {
         return respond(id, { config: {}, origins: {} });
       case "thread/start":
       case "thread/fork":
-        return openThread(id, params, NodeCrypto.randomUUID());
+        return openThread(id, method, params, NodeCrypto.randomUUID());
       case "thread/resume":
-        return openThread(id, params, String(params.threadId));
+        return openThread(id, method, params, String(params.threadId));
       case "thread/read": {
         const live = threads.get(String(params.threadId)) ?? {
           threadId: String(params.threadId),
@@ -693,6 +781,10 @@ async function runAppServer(config) {
     }
     if (typeof message.method === "string") {
       if (message.id !== undefined && message.id !== null) void handleRequest(message);
+      else if (message.method === "initialized" && !processSetupSent) {
+        processSetupSent = true;
+        sendProcessSetup();
+      }
       return;
     }
     pendingServerRequests.get(message.id)?.(message);

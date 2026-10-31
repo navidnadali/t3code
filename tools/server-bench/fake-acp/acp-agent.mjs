@@ -328,8 +328,9 @@ async function runAgent(config) {
       bytes,
       reply: answer.text,
       ms: Date.now() - startedAt,
-      rssBytes: process.memoryUsage.rss(),
-      requests,
+      sessionRequests: { ...session.requests },
+      // One process per session, but its request counts include the client's probes.
+      process: { rssBytes: process.memoryUsage.rss(), requests: { ...requests } },
     });
     return { stopReason: aborted ? "cancelled" : pick.compiled.stopReason };
   };
@@ -375,6 +376,7 @@ async function runAgent(config) {
           model: BENCH_MODEL,
           played: 0,
           prompts: new Set(),
+          requests: { [message.method]: 1 },
         });
         return {
           ...(message.method === "session/new" ? { sessionId } : {}),
@@ -415,6 +417,10 @@ async function runAgent(config) {
       return;
     }
     requests[message.method] = (requests[message.method] ?? 0) + 1;
+    const owner = sessions.get(String(message.params?.sessionId));
+    if (owner !== undefined && message.method !== "session/load") {
+      owner.requests[message.method] = (owner.requests[message.method] ?? 0) + 1;
+    }
     if (message.id === undefined || message.id === null) {
       if (message.method === "session/cancel") cancel(String(message.params?.sessionId));
       return;

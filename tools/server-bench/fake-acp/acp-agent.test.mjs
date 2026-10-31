@@ -42,7 +42,12 @@ const decodes = (schema, value) => {
 
 function startAgent(env) {
   const child = NodeChildProcess.spawn(process.execPath, [AGENT], {
-    env: { ...process.env, BENCH_SPEED: "0", ...env },
+    env: {
+      ...process.env,
+      BENCH_SPEED: "0",
+      BENCH_STATE_DIR: NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-state-")),
+      ...env,
+    },
     stdio: ["pipe", "pipe", "inherit"],
   });
   const lines = NodeReadline.createInterface({ input: child.stdout })[Symbol.asyncIterator]();

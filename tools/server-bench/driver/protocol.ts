@@ -324,10 +324,18 @@ export class RpcSocket {
   private receive(data: unknown): void {
     this.unansweredPingAt = null;
     const text = typeof data === "string" ? data : Buffer.from(data as ArrayBuffer).toString();
-    const parsed = JSON.parse(text) as ServerMessage | ReadonlyArray<ServerMessage>;
-    const messages = Array.isArray(parsed) ? parsed : [parsed as ServerMessage];
-    const bytes = Buffer.byteLength(text);
-    for (const message of messages) this.dispatch(message, bytes / messages.length);
+    try {
+      const parsed = JSON.parse(text) as ServerMessage | ReadonlyArray<ServerMessage>;
+      const messages = Array.isArray(parsed) ? parsed : [parsed as ServerMessage];
+      const bytes = Buffer.byteLength(text);
+      for (const message of messages) this.dispatch(message, bytes / messages.length);
+    } catch (error) {
+      this.fail(
+        new FatalError(
+          `Could not handle a server frame: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+    }
   }
 
   private dispatch(message: ServerMessage, bytes: number): void {

@@ -129,9 +129,17 @@ function expandCpuList(list: string): Set<number> {
 function applyAffinity(options: DriverOptions) {
   if (options.taskset !== null) {
     if (NodeOS.type() !== "Linux") throw new UsageError("--taskset needs Linux");
-    NodeChildProcess.execFileSync("taskset", ["-a", "-cp", options.taskset, String(process.pid)], {
-      stdio: "ignore",
-    });
+    try {
+      NodeChildProcess.execFileSync(
+        "taskset",
+        ["-a", "-cp", options.taskset, String(process.pid)],
+        { stdio: "ignore" },
+      );
+    } catch (error) {
+      throw new UsageError(
+        `taskset -a -cp ${options.taskset} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   const driver = cpusAllowed("self");
   const server = options.serverPid === null ? null : cpusAllowed(options.serverPid);
@@ -802,6 +810,15 @@ async function main(): Promise<number> {
   const interrupt = (signal: string) => run.abort(new FatalError(`interrupted by ${signal}`));
   process.once("SIGINT", () => interrupt("SIGINT"));
   process.once("SIGTERM", () => interrupt("SIGTERM"));
+  // A driver bug must still end in a failed run, never in a crash that leaves no marker.
+  const crashed = (error: unknown) =>
+    run.abort(
+      new FatalError(
+        `driver error: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+      ),
+    );
+  process.on("uncaughtException", crashed);
+  process.on("unhandledRejection", crashed);
   const result = await run.execute({ ...server, cpuAffinity: affinity });
   writeResult(options.out, result);
   log(

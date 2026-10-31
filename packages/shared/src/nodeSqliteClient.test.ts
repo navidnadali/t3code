@@ -3,12 +3,16 @@ import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
+import * as TestClock from "effect/testing/TestClock";
 import type * as Tracer from "effect/Tracer";
 import { vi } from "vite-plus/test";
 
@@ -375,6 +379,143 @@ it.effect("uses the writer when the reader cannot open the database", () =>
       assert.equal(yield* Fiber.join(other), 1);
       assert.equal(startedWorkers.length, startedBefore + 1);
     }),
+  ),
+);
+
+const withLogLines = <A, E, R>(
+  use: (lines: Queue.Queue<ReadonlyArray<unknown>>) => Effect.Effect<A, E, R>,
+) =>
+  Effect.gen(function* () {
+    const lines = yield* Queue.unbounded<ReadonlyArray<unknown>>();
+    const logger = Logger.make(({ logLevel, message }) => {
+      Queue.offerUnsafe(lines, [logLevel, ...(message as ReadonlyArray<unknown>)]);
+    });
+    return yield* use(lines).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+  });
+
+const readConnection = (sql: SqlClient.SqlClient) =>
+  Effect.gen(function* () {
+    const spans: Array<Tracer.Span> = [];
+    const observe: Statement.Transformer = (statement, _sql, _fiber, span) =>
+      Effect.sync(() => {
+        spans.push(span);
+        return statement;
+      });
+    const count = yield* countEntries(sql).pipe(
+      SqliteClient.readOnly,
+      Effect.provideService(Statement.CurrentTransformer, observe),
+      Effect.provideService(Statement.SpanPropagationEnabled, true),
+    );
+    return { count, connection: spans.map((span) => span.attributes.get("db.connection")) };
+  });
+
+const withWorkers = <A, E, R>(
+  mode: { readonly failWith?: string; readonly silent?: boolean },
+  effect: Effect.Effect<A, E, R>,
+) =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      failingWorkers.message = mode.failWith;
+      silentWorkers.on = mode.silent ?? false;
+    }),
+    () => effect,
+    () =>
+      Effect.sync(() => {
+        failingWorkers.message = undefined;
+        silentWorkers.on = false;
+      }),
+  );
+
+const unavailableWarning = "SQLite reader worker unavailable; reads use the main connection";
+
+it.effect.each([
+  {
+    failure: "a crash",
+    workers: { failWith: "reader start failed" },
+    startup: Duration.zero,
+    reason: "Database reader failed: reader start failed",
+  },
+  {
+    failure: "a startup timeout",
+    workers: { silent: true },
+    startup: Duration.seconds(10),
+    reason: "worker did not open the database within 10000 ms",
+  },
+])(
+  "reads on the writer after $failure until a retry starts the reader again",
+  ({ workers, startup, reason }) =>
+    withLogLines((lines) =>
+      withReaderClient((sql) =>
+        Effect.gen(function* () {
+          const failed = yield* withWorkers(
+            workers,
+            Effect.gen(function* () {
+              const read = yield* Effect.forkChild(readConnection(sql), {
+                startImmediately: true,
+              });
+              yield* TestClock.adjust(startup);
+              return yield* Fiber.join(read);
+            }),
+          );
+          assert.deepEqual(failed, { count: 1, connection: ["writer"] });
+          const startedBefore = startedWorkers.length;
+          assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["writer"] });
+          assert.equal(startedWorkers.length, startedBefore);
+          assert.deepEqual(yield* Queue.take(lines), ["Warn", unavailableWarning, { reason }]);
+
+          yield* TestClock.adjust("1 second");
+          assert.equal(startedWorkers.length, startedBefore + 1);
+          assert.deepEqual(yield* Queue.take(lines), [
+            "Info",
+            "SQLite reader worker available again; reads use the reader workers",
+          ]);
+          assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["reader"] });
+          assert.equal(Queue.sizeUnsafe(lines), 0);
+        }),
+      ),
+    ),
+);
+
+it.effect("backs off a reader that never starts without logging each retry", () =>
+  withLogLines((lines) =>
+    withReaderClient((sql) =>
+      withWorkers(
+        { silent: true },
+        Effect.gen(function* () {
+          const read = yield* Effect.forkChild(readConnection(sql), { startImmediately: true });
+          yield* TestClock.adjust("10 seconds");
+          assert.deepEqual(yield* Fiber.join(read), { count: 1, connection: ["writer"] });
+
+          const startedBefore = startedWorkers.length;
+          // Each retry waits 10 s for startup; the gaps between them double from 1 s up to a minute.
+          yield* TestClock.adjust("10 minutes");
+          assert.equal(startedWorkers.length - startedBefore, 12);
+          assert.equal(Queue.sizeUnsafe(lines), 1);
+        }),
+      ),
+    ),
+  ),
+);
+
+it.effect("keeps readers off without retrying when the database is not in WAL mode", () =>
+  withLogLines((lines) =>
+    withFileClient((sql) =>
+      Effect.gen(function* () {
+        yield* sql`CREATE TABLE entries(name TEXT NOT NULL)`;
+        yield* sql`INSERT INTO entries VALUES ('kept')`;
+        const startedBefore = startedWorkers.length;
+
+        assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["writer"] });
+        yield* TestClock.adjust("1 hour");
+        assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["writer"] });
+        assert.equal(startedWorkers.length, startedBefore + 1);
+        assert.deepEqual(yield* Queue.clear(lines), [
+          ["Warn", unavailableWarning, { reason: "database uses journal_mode delete, not wal" }],
+        ]);
+      }),
+    ),
   ),
 );
 

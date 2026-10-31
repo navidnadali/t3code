@@ -36,7 +36,7 @@ export interface SqliteClientConfig {
   readonly spanAttributes?: Record<string, unknown> | undefined;
   /** Ignored for in-memory databases, which cannot share a second connection. */
   readonly readerWorker?: boolean | undefined;
-  /** Most reader workers to run at once, each started on demand; defaults to 4. */
+  /** Most reader workers to run at once (1 to 32), each started on demand; defaults to 4. */
   readonly readerPoolSize?: number | undefined;
   /** Ignored for in-memory databases. */
   readonly checkpointWorker?: boolean | undefined;
@@ -300,6 +300,8 @@ const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test
 
 // WAL readers run concurrently; one worker serialized every read behind the slowest transaction.
 const DEFAULT_READER_POOL_SIZE = 4;
+// Each reader is a worker thread with its own connection and page cache.
+export const SQLITE_MAX_READER_POOL_SIZE = 32;
 const READER_RETRY_DELAY = Duration.seconds(1);
 const READER_RETRY_MAX_DELAY = Duration.minutes(1);
 
@@ -930,6 +932,16 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
   const compiler = Statement.makeCompilerSqlite();
   const isFileDatabase = options.filename !== ":memory:" && options.filename !== "";
+  const readerPoolSize = options.readerPoolSize ?? DEFAULT_READER_POOL_SIZE;
+  if (
+    !Number.isSafeInteger(readerPoolSize) ||
+    readerPoolSize < 1 ||
+    readerPoolSize > SQLITE_MAX_READER_POOL_SIZE
+  ) {
+    throw new RangeError(
+      `SQLite readerPoolSize must be an integer from 1 to ${SQLITE_MAX_READER_POOL_SIZE}, got ${readerPoolSize}`,
+    );
+  }
 
   const makeConnection = Effect.gen(function* () {
     const scope = yield* Effect.scope;
@@ -1155,10 +1167,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const readerPool = { unavailable: false };
   const readers =
     options.readerWorker && isFileDatabase
-      ? yield* Effect.forEach(
-          Array.from({ length: options.readerPoolSize ?? DEFAULT_READER_POOL_SIZE }),
-          () =>
-            Effect.map(makeReader(options, readerPool), (acquire) => ({ acquire, busy: false })),
+      ? yield* Effect.forEach(Array.from({ length: readerPoolSize }), () =>
+          Effect.map(makeReader(options, readerPool), (acquire) => ({ acquire, busy: false })),
         )
       : [];
   // Counts idle reader slots, so a read waits for whichever slot frees first.

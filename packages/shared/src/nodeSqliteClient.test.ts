@@ -2,9 +2,11 @@ import * as NodeSqlite from "node:sqlite";
 import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
@@ -351,6 +353,29 @@ it.effect.each([
       }),
     { readerPoolSize: size },
   ),
+);
+
+it.effect.each([{ size: 0 }, { size: 33 }, { size: 1.5 }, { size: Number.NaN }])(
+  "refuses a reader pool size of $size before opening the database",
+  ({ size }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-pool-size-" });
+      const filename = path.join(directory, "state.sqlite");
+      const exit = yield* Effect.exit(
+        Effect.provide(
+          Effect.void,
+          SqliteClient.layer({ filename, readerWorker: true, readerPoolSize: size }),
+        ),
+      );
+      assert(Exit.isFailure(exit));
+      assert.include(
+        String(Cause.squash(exit.cause)),
+        `SQLite readerPoolSize must be an integer from 1 to 32, got ${size}`,
+      );
+      assert.isFalse(yield* fs.exists(filename));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 // regression: #19226 read-only transactions run on the separate reader connection

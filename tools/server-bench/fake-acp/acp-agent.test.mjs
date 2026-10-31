@@ -210,6 +210,29 @@ describe("fake acp agent", () => {
     expect(answer.text).toBe(`done in ${LIVE.cwd}`);
   });
 
+  it("replays large-tool-payload with megabyte tool output the ACP schema accepts", async () => {
+    using agent = startAgent({
+      BENCH_ACP_TRANSCRIPT: "large-tool-payload",
+      BENCH_TOOL_PAYLOAD_BYTES: "1048576",
+    });
+    const sessionId = await openSession(agent);
+    agent.send({ id: 3, method: "session/prompt", params: { sessionId, prompt: [] } });
+    const lines = await agent.until(answerTo(3));
+    const updates = lines
+      .map(frameOf)
+      .filter((frame) => frame.method === "session/update")
+      .map((frame) => frame.params);
+
+    expect(updates.filter((params) => !decodes(AcpSchema.SessionNotification, params))).toEqual([]);
+    expect(lines.filter((line) => Buffer.byteLength(line) > 1_048_576)).toHaveLength(2);
+    expect(
+      updates
+        .filter((params) => params.update.sessionUpdate === "tool_call_update")
+        .map((params) => params.update.status),
+    ).toEqual(["completed", "completed"]);
+    expect(frameOf(lines.at(-1)).result).toEqual({ stopReason: "end_turn" });
+  });
+
   it("stops a prompt cancelled with it and plays the next prompt after it", async () => {
     using agent = startAgent({});
     const sessionId = await openSession(agent);

@@ -340,6 +340,33 @@ describe("fake codex app-server", () => {
     expect(first[0]).toMatchObject({ seed: 3, mix: { multi_turn: 2, simple: 1, web_search: 1 } });
   });
 
+  it("replays large-tool-payload with megabyte lines the Codex schema accepts", async () => {
+    using fake = startFake({
+      BENCH_CODEX_TRANSCRIPT: "large-tool-payload",
+      BENCH_TOOL_PAYLOAD_BYTES: "1048576",
+    });
+    fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
+    const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
+    fake.send({ id: 2, method: "turn/start", params: { threadId, input: [] } });
+    const lines = await fake.until(isTurnCompleted);
+    const frames = lines.map(frameOf);
+    const completed = frames
+      .filter((frame) => frame.method === "item/completed")
+      .map((frame) => frame.params.item);
+
+    expect(frames.map(schemaIssue).filter(Boolean)).toEqual([]);
+    expect(lines.filter((line) => Buffer.byteLength(line) > 1_048_576)).toHaveLength(2);
+    expect(completed.map((item) => item.type)).toEqual([
+      "userMessage",
+      "agentMessage",
+      "commandExecution",
+      "mcpToolCall",
+      "agentMessage",
+    ]);
+    expect(Buffer.byteLength(completed[2].aggregatedOutput)).toBeGreaterThanOrEqual(1_048_576);
+    expect(frames.at(-1).params.turn.status).toBe("completed");
+  });
+
   it("reads the mix and rejects knobs out of range", () => {
     const read = (env) =>
       readConfig(env, {

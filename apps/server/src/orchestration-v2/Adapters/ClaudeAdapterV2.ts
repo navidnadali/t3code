@@ -10352,10 +10352,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   ) {
                     context.permissionMode = message.permissionMode;
                   }
-                  return timeProviderIoStage(
-                    stageTiming,
-                    "adapter",
-                    0,
+                  return timeProviderIoStage(stageTiming, "adapter", 0, () =>
                     handleSdkMessage({ query: querySession, message }),
                   );
                 }),

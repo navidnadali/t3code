@@ -49,24 +49,29 @@ describe("ProviderIoStageTiming", () => {
     ]);
   });
 
-  it.effect("times an effect on success and failure, and leaves it untouched when off", () =>
+  it.effect("times building and running an effect, and leaves it untouched when off", () =>
     Effect.gen(function* () {
       const clock = makeClock();
       const recorder = makeProviderIoStageRecorder(clock.now);
       const timer = recorder.forProvider("acp");
       const work = Effect.sync(() => clock.advance(4));
+      // Like a schema decoder, which validates when called rather than when run.
+      const eagerWork = () => {
+        clock.advance(2);
+        return work;
+      };
 
-      assert.strictEqual(timeProviderIoStage(undefined, "decode", 10, work), work);
-      yield* timeProviderIoStage(timer, "decode", 10, work);
-      yield* timeProviderIoStage(
-        timer,
-        "decode",
-        6,
+      assert.strictEqual(
+        timeProviderIoStage(undefined, "decode", 10, () => work),
+        work,
+      );
+      yield* timeProviderIoStage(timer, "decode", 10, eagerWork);
+      yield* timeProviderIoStage(timer, "decode", 6, () =>
         work.pipe(Effect.andThen(Effect.fail("bad payload"))),
       ).pipe(Effect.ignore);
 
       assert.deepStrictEqual(recorder.drain(), [
-        { provider: "acp", stage: "decode", count: 2, totalMs: 8, maxMs: 4, bytes: 16 },
+        { provider: "acp", stage: "decode", count: 2, totalMs: 10, maxMs: 6, bytes: 16 },
       ]);
     }),
   );

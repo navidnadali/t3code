@@ -128,18 +128,33 @@ export const encodeJsonl = <A, I>(schema: Schema.Codec<A, I>, value: A) =>
     encoder.encode(`${encoded}\n`),
   );
 
-/** Wall time, which is main-thread busy time while the effect does not suspend. */
+/**
+ * Wall time, which is main-thread busy time while the effect does not suspend. Schema decoders
+ * validate when called, so the effect is built inside the timed window.
+ */
 export const timeStage = <A, E, R>(
   timing: AcpStageTiming | undefined,
   stage: Parameters<AcpStageTiming["record"]>[0],
   bytes: number,
-  effect: Effect.Effect<A, E, R>,
+  makeEffect: () => Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> =>
   timing === undefined
-    ? effect
+    ? makeEffect()
     : Effect.suspend(() => {
         const startedAt = timing.now();
-        return Effect.onExit(effect, () =>
+        return Effect.onExit(makeEffect(), () =>
           Effect.sync(() => timing.record(stage, timing.now() - startedAt, bytes)),
         );
       });
+
+/** Times synchronous work, such as shaping a log event and building its write effect. */
+export const timeSync = <A>(
+  timing: AcpStageTiming,
+  stage: Parameters<AcpStageTiming["record"]>[0],
+  work: () => A,
+): A => {
+  const startedAt = timing.now();
+  const result = work();
+  timing.record(stage, timing.now() - startedAt, 0);
+  return result;
+};

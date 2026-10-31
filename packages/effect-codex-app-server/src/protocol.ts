@@ -183,6 +183,20 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const nextRequestId = yield* Ref.make(1);
     const maxIncomingMessageBytes = options.maxIncomingMessageBytes ?? MAX_INCOMING_MESSAGE_BYTES;
     const timing = options.stageTiming;
+    let textDecodeMs = 0;
+    const decodeText =
+      timing === undefined
+        ? Stream.decodeText()
+        : <E, R>(bytes: Stream.Stream<Uint8Array, E, R>) =>
+            Stream.suspend(() => {
+              const decoder = new TextDecoder();
+              return Stream.map(bytes, (chunk) => {
+                const startedAt = timing.now();
+                const text = decoder.decode(chunk, { stream: true });
+                textDecodeMs += timing.now() - startedAt;
+                return text;
+              });
+            });
     const remainder: Array<string> = [];
     let remainderBytes = 0;
     const terminationHandled = yield* Ref.make(false);
@@ -403,7 +417,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         Effect.flatMap(() =>
           timing === undefined
             ? decodeWireMessage(line)
-            : timeStage(timing, "json", Buffer.byteLength(line, "utf8"), decodeWireMessage(line)),
+            : timeStage(timing, "json", Buffer.byteLength(line, "utf8"), () =>
+                decodeWireMessage(line),
+              ),
         ),
         Effect.tap((decoded) =>
           logProtocol({
@@ -434,7 +450,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
 
     yield* options.stdio.stdin.pipe(
       Stream.interruptWhen(Deferred.await(terminationSignal)),
-      Stream.decodeText(),
+      decodeText,
       Stream.runForEach(
         Effect.fnUntraced(function* (chunk) {
           let start = 0;
@@ -465,7 +481,14 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             if (timing !== undefined) segmentStartedAt = timing.now();
             start = newline + 1;
           }
-          timing?.record("framing", framingMs + timing.now() - segmentStartedAt, chunkBytes);
+          if (timing !== undefined) {
+            timing.record(
+              "framing",
+              textDecodeMs + framingMs + timing.now() - segmentStartedAt,
+              chunkBytes,
+            );
+            textDecodeMs = 0;
+          }
         }),
       ),
       Effect.matchEffect({

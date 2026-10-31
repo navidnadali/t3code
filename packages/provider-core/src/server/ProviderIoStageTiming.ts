@@ -99,18 +99,21 @@ export const ProviderIoStageTiming = Context.Reference<ProviderIoStageRecorder |
   { defaultValue: () => providerIoStageRecorderFromEnv(process.env) },
 );
 
-/** Records wall time, which is main-thread busy time only while the effect does not suspend. */
+/**
+ * Records wall time, which is main-thread busy time only while the effect does not suspend.
+ * The effect is built inside the window because some constructors do their work eagerly.
+ */
 export const timeProviderIoStage = <A, E, R>(
   timer: ProviderIoStageTimer | undefined,
   stage: ProviderIoStage,
   bytes: number,
-  effect: Effect.Effect<A, E, R>,
+  makeEffect: () => Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> =>
   timer === undefined
-    ? effect
+    ? makeEffect()
     : Effect.suspend(() => {
         const startedAt = timer.now();
-        return Effect.onExit(effect, () =>
+        return Effect.onExit(makeEffect(), () =>
           Effect.sync(() => timer.record(stage, timer.now() - startedAt, bytes)),
         );
       });

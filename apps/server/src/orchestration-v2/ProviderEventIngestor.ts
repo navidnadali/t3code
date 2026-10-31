@@ -913,7 +913,12 @@ export const layer: Layer.Layer<
                   : effect,
             ),
           (effect, input) =>
-            timeProviderIoStage(stageTiming?.forProvider(input.event.driver), "ingest", 0, effect),
+            timeProviderIoStage(
+              stageTiming?.forProvider(input.event.driver),
+              "ingest",
+              0,
+              () => effect,
+            ),
         ),
     });
   }),

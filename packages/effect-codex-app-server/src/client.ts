@@ -189,18 +189,12 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     const handlers = notificationHandlers.get(notification.method) ?? [];
 
     if (schema) {
-      return timeStage(
-        options.stageTiming,
-        "decode",
-        0,
+      return timeStage(options.stageTiming, "decode", 0, () =>
         decodeNotificationPayload(notification.method, schema, notification.params),
       ).pipe(
         Effect.tapError(warnUndecodableNotification),
         Effect.flatMap((decoded) =>
-          timeStage(
-            options.stageTiming,
-            "adapter",
-            0,
+          timeStage(options.stageTiming, "adapter", 0, () =>
             Effect.forEach(handlers, (handler) => handler(decoded), { discard: true }),
           ),
         ),

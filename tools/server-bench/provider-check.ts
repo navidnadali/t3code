@@ -38,8 +38,11 @@ come from \`providers.ts settings\` (each fake needs BENCH_STATS_DIR).
 ${PROVIDER_LOAD_USAGE}
   --turns N                 turns per session (default 2)
   --concurrency N           sessions in flight at once (default 8)
-  --call-timeout SECONDS    a CLI call still waiting this long is killed; its turn is hung (default 300)
+  --call-timeout DUR        a CLI call still waiting this long is killed; its turn is hung
+                            (300s, 5m, 1500ms; a bare number is seconds; default 300s)
   --t3 PATH                 the server CLI (default apps/server/dist/bin.mjs)
+  --server-log PATH         the server's log, read for the cause of a failed turn
+                            (default <base-dir>/../server.log when it exists)
 `;
 
 // Codex item types the Codex adapter turns into these turn items; others leave a session unverified.
@@ -237,6 +240,43 @@ function readThread(db: NodeSqlite.DatabaseSync, threadId: string): ThreadRows {
   return { nativeId: provider?.nativeId ?? null, runs: runs.map((run) => run.status), items };
 }
 
+/** `300s`, `5m`, `1500ms`, `1h`; a bare number is seconds, as the load driver reads them. */
+export function parseDuration(text: string): number | null {
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/u.exec(text.trim());
+  if (match === null) return null;
+  const unit = match[2] ?? "s";
+  return (
+    Number(match[1]) *
+    (unit === "ms" ? 1 : unit === "s" ? 1_000 : unit === "m" ? 60_000 : 3_600_000)
+  );
+}
+
+/**
+ * The innermost cause the server logged for a failed effect of `threadId`: its pretty log prints
+ * the error as quoted string pieces, and the last `[cause]:` with the lines up to its stack is
+ * the provider's own message (a fake's stderr, say).
+ */
+export function failureCause(log: string, threadId: string): string | null {
+  const entries = log.split(/\n(?=\[\d\d:\d\d:\d\d\.\d{3}\] )/u);
+  for (const entry of entries.toReversed()) {
+    if (!entry.includes(threadId)) continue;
+    const lines = entry.split("\n").flatMap((line) => {
+      const piece = /^\s*'(.*)'\s*\+?\s*$/u.exec(line)?.[1];
+      return piece === undefined ? [] : [piece.replaceAll("\\'", "'").replace(/\\n$/u, "").trim()];
+    });
+    const at = lines.findLastIndex((line) => line.includes("[cause]: "));
+    if (at < 0) continue;
+    const head = lines[at]!;
+    const cause = [head.slice(head.indexOf("[cause]: ") + "[cause]: ".length)];
+    for (const line of lines.slice(at + 1)) {
+      if (line.length === 0 || line.startsWith("at ") || line.startsWith("}")) break;
+      cause.push(line);
+    }
+    return cause.join("; ").replace(/\s*\{$/u, "");
+  }
+  return null;
+}
+
 /** Items the provider produced: no checkpoints, no workspace preparation step. */
 const providerItems = (items: ReadonlyArray<ServerItem>) =>
   items.filter((item) => item.type !== "checkpoint" && !item.id.includes("workspace-preparation"));
@@ -291,7 +331,8 @@ const parseFlags = (argv: ReadonlyArray<string>) =>
       ...PROVIDER_LOAD_FLAGS,
       turns: { type: "string", default: "2" },
       concurrency: { type: "string", default: "8" },
-      "call-timeout": { type: "string", default: "300" },
+      "call-timeout": { type: "string", default: "300s" },
+      "server-log": { type: "string" },
       t3: { type: "string", default: NodePath.join(repoRoot, "apps/server/dist/bin.mjs") },
       help: { type: "boolean", default: false },
     },
@@ -334,12 +375,12 @@ async function check(
 ): Promise<number> {
   const turns = Number(values.turns);
   const concurrency = Number(values.concurrency);
-  const callTimeoutMs = Number(values["call-timeout"]) * 1000;
+  const callTimeoutMs = parseDuration(values["call-timeout"]);
   if (![turns, concurrency].every((value) => Number.isSafeInteger(value) && value >= 1)) {
     throw new Error("--turns and --concurrency must be integers of at least 1");
   }
-  if (!Number.isFinite(callTimeoutMs) || callTimeoutMs <= 0) {
-    throw new Error("--call-timeout must be a positive number of seconds");
+  if (callTimeoutMs === null || callTimeoutMs <= 0) {
+    throw new Error("--call-timeout must be a positive duration such as 300s, 5m or 1500ms");
   }
   const sessions = Number(values.sessions);
   if (!Number.isSafeInteger(sessions) || sessions < 0) throw new Error("--sessions must be >= 0");
@@ -399,7 +440,7 @@ async function check(
       run.turns.push({
         status: result.timedOut ? "hung" : (answer?.status ?? "cli-error"),
         error: result.timedOut
-          ? `no answer after ${values["call-timeout"]} s`
+          ? `no answer after ${callTimeoutMs / 1000} s`
           : (answer?.error ??
             (answer === null ? result.stderr.trim().slice(-500) || `exit ${result.code}` : null)),
         reply: answer?.reply ?? null,
@@ -512,6 +553,12 @@ async function check(
       counts[status] = (counts[status] ?? 0) + count;
     }
   }
+  const serverLog = values["server-log"] ?? NodePath.join(baseDir, "..", "server.log");
+  const failed = sessionResults.some((result) =>
+    result.turns.some((turn) => turn.status !== "completed"),
+  );
+  const log =
+    failed && NodeFS.existsSync(serverLog) ? NodeFS.readFileSync(serverLog, "utf8") : null;
   const providerErrors = sessionResults.flatMap((result) =>
     result.turns.flatMap((turn, index) =>
       turn.status === "completed"
@@ -523,6 +570,10 @@ async function check(
               turn: index + 1,
               status: turn.status,
               error: turn.error,
+              cause:
+                log === null || result.threadId === null
+                  ? null
+                  : failureCause(log, result.threadId),
             },
           ],
     ),
@@ -548,7 +599,7 @@ async function check(
     startedAt: startedAt.toISOString(),
     finishedAt: finishedAt.toISOString(),
     durationMs: finishedAt.getTime() - startedAt.getTime(),
-    options: { turns, concurrency, callTimeoutS: Number(values["call-timeout"]), t3: values.t3 },
+    options: { turns, concurrency, callTimeoutMs, t3: values.t3, serverLog },
     knobs,
     sessionsByProvider: sessionsByInstance(plan),
     turnsByProvider,

@@ -800,6 +800,16 @@ async function runAppServer(config) {
   input.on("close", () => process.exit(0));
 }
 
+/** The knobs in `env`; a bad value or mix throws. */
+export const configFrom = (env) =>
+  readConfig(env, {
+    transcriptVar: "BENCH_CODEX_TRANSCRIPT",
+    defaultMix: DEFAULT_MIX,
+    defaultStateDir: env.CODEX_HOME?.trim()
+      ? NodePath.join(env.CODEX_HOME.trim(), "fake-codex")
+      : NodePath.join(NodeOS.tmpdir(), "t3-fake-codex"),
+  });
+
 async function main(argv, env) {
   if (argv.includes("--version") || argv.includes("-V")) {
     process.stdout.write(`codex-cli ${FAKE_CODEX_VERSION}\n`);
@@ -810,15 +820,7 @@ async function main(argv, env) {
     return;
   }
   if (argv[0] !== "app-server") throw new Error(`unsupported invocation: ${argv.join(" ")}`);
-  await runAppServer(
-    readConfig(env, {
-      transcriptVar: "BENCH_CODEX_TRANSCRIPT",
-      defaultMix: DEFAULT_MIX,
-      defaultStateDir: env.CODEX_HOME?.trim()
-        ? NodePath.join(env.CODEX_HOME.trim(), "fake-codex")
-        : NodePath.join(NodeOS.tmpdir(), "t3-fake-codex"),
-    }),
-  );
+  await runAppServer(configFrom(env));
 }
 
 if (import.meta.main) {

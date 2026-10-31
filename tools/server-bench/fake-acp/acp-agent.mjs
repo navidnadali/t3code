@@ -447,18 +447,20 @@ async function runAgent(config) {
   input.on("close", () => process.exit(0));
 }
 
+/** The knobs in `env`; a bad value or mix throws. */
+export const configFrom = (env) =>
+  readConfig(env, {
+    transcriptVar: "BENCH_ACP_TRANSCRIPT",
+    defaultMix: DEFAULT_MIX,
+    defaultStateDir: NodePath.join(NodeOS.tmpdir(), "t3-fake-acp"),
+  });
+
 async function main(argv, env) {
   if (argv.includes("--help") || argv.includes("-h")) {
     process.stdout.write(HELP);
     return;
   }
-  await runAgent(
-    readConfig(env, {
-      transcriptVar: "BENCH_ACP_TRANSCRIPT",
-      defaultMix: DEFAULT_MIX,
-      defaultStateDir: NodePath.join(NodeOS.tmpdir(), "t3-fake-acp"),
-    }),
-  );
+  await runAgent(configFrom(env));
 }
 
 if (import.meta.main) {

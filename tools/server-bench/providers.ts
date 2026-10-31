@@ -7,6 +7,7 @@
  */
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 
 export const PROVIDER_KINDS = ["claude", "codex", "acp"] as const;
@@ -304,6 +305,43 @@ export function readBenchKnobs(
   return knobs;
 }
 
+interface FakeModule {
+  readonly configFrom?: (env: Readonly<Record<string, string>>) => unknown;
+  readonly loadTranscripts?: (config: unknown) => Promise<unknown>;
+  readonly readConfig?: (env: Readonly<Record<string, string>>) => unknown;
+  readonly loadMix?: (config: unknown) => Promise<unknown>;
+}
+
+/**
+ * Reads a bench instance's knobs and loads its transcript mix the way its fake will at start, so
+ * a bad value fails here instead of in every session. A Claude launcher without the fake beside it
+ * is not checked.
+ */
+export async function validateBenchInstance(
+  kind: ProviderKind,
+  launcher: string,
+  environment: ReadonlyArray<{ readonly name: string; readonly value: string }>,
+): Promise<void> {
+  const file = NodePath.join(
+    NodePath.dirname(launcher),
+    `${NodePath.basename(BENCH_PROVIDERS[kind].launcher)}.mjs`,
+  );
+  if (!NodeFS.existsSync(file)) return;
+  const fake = (await import(NodeURL.pathToFileURL(file).href)) as FakeModule;
+  const env = Object.fromEntries(environment.map((entry) => [entry.name, entry.value]));
+  try {
+    if (fake.configFrom !== undefined && fake.loadTranscripts !== undefined) {
+      await fake.loadTranscripts(fake.configFrom(env));
+    } else if (fake.readConfig !== undefined && fake.loadMix !== undefined) {
+      await fake.loadMix(fake.readConfig(env));
+    }
+  } catch (error) {
+    throw new ProviderLoadError(
+      `${BENCH_PROVIDERS[kind].instanceId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 const SETTINGS_USAGE = `Usage: node tools/server-bench/providers.ts settings --out <settings.json> --stats-dir <dir> [options]
 
 Adds the replaying bench provider instances to a scratch server's settings.json (created when
@@ -328,7 +366,7 @@ started with.
   --keep-built-ins          leave the built-in provider instances as they are
 `;
 
-function settingsCommand(argv: ReadonlyArray<string>): void {
+async function settingsCommand(argv: ReadonlyArray<string>): Promise<void> {
   const { values } = NodeUtil.parseArgs({
     args: [...argv],
     options: {
@@ -383,9 +421,6 @@ function settingsCommand(argv: ReadonlyArray<string>): void {
       throw new ProviderLoadError(`No ${kind} fake at ${launcher}`);
     }
   }
-  for (const dir of [values["stats-dir"], values["codex-home"], values["claude-home"]]) {
-    if (dir !== undefined) NodeFS.mkdirSync(dir, { recursive: true });
-  }
   const current = NodeFS.existsSync(values.out)
     ? (JSON.parse(NodeFS.readFileSync(values.out, "utf8")) as Record<string, unknown>)
     : {};
@@ -415,18 +450,32 @@ function settingsCommand(argv: ReadonlyArray<string>): void {
     ...(values["claude-home"] ? { claudeHome: NodePath.resolve(values["claude-home"]) } : {}),
     keepBuiltIns: values["keep-built-ins"],
   });
+  const instances = settings.providerInstances as Readonly<
+    Record<string, { readonly environment: ReadonlyArray<{ name: string; value: string }> }>
+  >;
+  for (const kind of kinds as ReadonlyArray<ProviderKind>) {
+    const launcher = launchers[kind] ?? NodePath.join(benchDir, BENCH_PROVIDERS[kind].launcher);
+    await validateBenchInstance(
+      kind,
+      launcher,
+      instances[BENCH_PROVIDERS[kind].instanceId]?.environment ?? [],
+    );
+  }
+  for (const dir of [values["stats-dir"], values["codex-home"], values["claude-home"]]) {
+    if (dir !== undefined) NodeFS.mkdirSync(dir, { recursive: true });
+  }
   NodeFS.mkdirSync(NodePath.dirname(values.out), { recursive: true });
   NodeFS.writeFileSync(values.out, `${JSON.stringify(settings, null, 2)}\n`);
   process.stdout.write(`${JSON.stringify(readBenchKnobs(values.out))}\n`);
 }
 
 if (import.meta.main) {
-  try {
-    const [command, ...rest] = process.argv.slice(2);
-    if (command !== "settings") throw new ProviderLoadError(SETTINGS_USAGE);
-    settingsCommand(rest);
-  } catch (error) {
+  const [command, ...rest] = process.argv.slice(2);
+  (command === "settings"
+    ? settingsCommand(rest)
+    : Promise.reject(new ProviderLoadError(SETTINGS_USAGE))
+  ).catch((error: unknown) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(2);
-  }
+  });
 }

@@ -440,7 +440,13 @@ export async function expectedTurn(name, index, requestedLoops, payloadBytes) {
   let plans = 0;
   let reply = null;
   for (const [part, list] of [["before", turn.before], ...Object.entries(split)]) {
-    const own = list.filter((frame) => (frame.params?.threadId ?? root) === root);
+    // A frame of another turn (a late item of an interrupted one) replays under an id no live
+    // turn has, and the server drops it.
+    const own = list.filter(
+      (frame) =>
+        (frame.params?.threadId ?? root) === root &&
+        (frame.params?.turnId ?? turn.turnId) === turn.turnId,
+    );
     for (const [type, count] of [
       ["reasoning", reasoningParts(own)],
       ["plan", textedPlans(own)],

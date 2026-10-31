@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Bench tooling tests outside the Effect runtime.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -117,5 +118,34 @@ describe("bench provider settings", () => {
         BENCH_ACP_TRANSCRIPT: "simple,todo_list",
       },
     });
+  });
+});
+
+describe("bench provider settings command", () => {
+  it.each([
+    [["--speed=-1"], /BENCH_SPEED/],
+    [["--turn-loops=0"], /BENCH_TURN_LOOPS/],
+    [["--codex-transcripts", "no_such_fixture"], /no_such_fixture/],
+    [["--env", "acp:BENCH_FAULT=explode"], /BENCH_FAULT/],
+  ])("refuses %j before writing anything", (args, problem) => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bench-settings-"));
+    const out = NodePath.join(dir, "settings.json");
+    const run = NodeChildProcess.spawnSync(
+      process.execPath,
+      [
+        NodePath.join(import.meta.dirname, "providers.ts"),
+        "settings",
+        "--out",
+        out,
+        "--stats-dir",
+        NodePath.join(dir, "stats"),
+        ...args,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(run.status).toBe(2);
+    expect(run.stderr).toMatch(problem);
+    expect(NodeFS.existsSync(out)).toBe(false);
   });
 });

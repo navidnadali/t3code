@@ -823,6 +823,45 @@ it.effect("callers share an in-flight thread shell read, even after one leaves",
   }),
 );
 
+it.effect("a thread's shell reads run in order, and a queued read covers newer events", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:order");
+    const firstStarted = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const log: Array<string> = [];
+    let reads = 0;
+    yield* sharedShellReadsTest(
+      (id) =>
+        Effect.gen(function* () {
+          const read = ++reads;
+          log.push(`start ${read}`);
+          if (read === 1) {
+            yield* Deferred.succeed(firstStarted, undefined);
+            yield* Deferred.await(release);
+          }
+          log.push(`end ${read}`);
+          return shellRead(id, read);
+        }),
+      (forEvent) =>
+        Effect.gen(function* () {
+          const first = yield* Effect.forkChild(forEvent(threadId, 1));
+          yield* Deferred.await(firstStarted);
+          const second = yield* Effect.forkChild(forEvent(threadId, 2), {
+            startImmediately: true,
+          });
+          const third = yield* Effect.forkChild(forEvent(threadId, 3), {
+            startImmediately: true,
+          });
+          yield* Deferred.succeed(release, undefined);
+          expect(yield* Fiber.join(first)).toEqual(shellRead(threadId, 1));
+          expect(yield* Fiber.join(second)).toEqual(shellRead(threadId, 2));
+          expect(yield* Fiber.join(third)).toEqual(shellRead(threadId, 2));
+          expect(log).toEqual(["start 1", "end 1", "start 2", "end 2"]);
+        }),
+    );
+  }),
+);
+
 it.effect("a thread shell read serves its event and older ones until a newer event or expiry", () =>
   Effect.gen(function* () {
     const threadId = ThreadId.make("thread:shared-shell:sequence");

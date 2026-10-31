@@ -576,12 +576,13 @@ export const SHARED_SHELL_READ_CAPACITY = 512;
 export const SHARED_SHELL_READ_TTL_MS = 5_000;
 
 interface SharedShellRead {
-  readonly sequence: number;
+  sequence: number;
+  started: boolean;
+  expiresAt: number;
   readonly result: Deferred.Deferred<
     OrchestrationV2ThreadShell | null,
     Orchestrator.OrchestratorV2Error
   >;
-  expiresAt: number;
 }
 
 const make = Effect.gen(function* () {
@@ -800,11 +801,13 @@ const make = Effect.gen(function* () {
   const trimSharedShellReads = (now: number) => {
     for (const [threadId, read] of sharedShellReads) {
       if (sharedShellReads.size <= SHARED_SHELL_READ_CAPACITY && now < read.expiresAt) return;
-      sharedShellReads.delete(threadId);
+      // A pending read stays, so the thread's next read still waits for it.
+      if (read.expiresAt !== Number.POSITIVE_INFINITY) sharedShellReads.delete(threadId);
     }
   };
-  // Callers ask after their event commits, so a read started for one sequence also serves earlier ones.
-  // The read runs in the layer scope, so a caller that disconnects mid-read cannot cancel it for others.
+  // Callers ask after their event commits, so a read that has not started covers every sequence asked
+  // so far. A thread's reads run one after another, so a newer read never sees older state, and in the
+  // layer scope, so a caller that disconnects cannot cancel a read other callers await.
   const getThreadShellForEvent: ThreadManagementServiceShape["getThreadShellForEvent"] = (input) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.clockWith((clock) => {
@@ -812,20 +815,32 @@ const make = Effect.gen(function* () {
         const current = sharedShellReads.get(input.threadId);
         if (
           current !== undefined &&
-          current.sequence >= input.sequence &&
-          now < current.expiresAt
+          now < current.expiresAt &&
+          (current.sequence >= input.sequence || !current.started)
         ) {
+          current.sequence = Math.max(current.sequence, input.sequence);
           return restore(Deferred.await(current.result));
         }
         const read: SharedShellRead = {
           sequence: Math.max(input.sequence, current?.sequence ?? 0),
-          result: Deferred.makeUnsafe(),
+          started: false,
           expiresAt: Number.POSITIVE_INFINITY,
+          result: Deferred.makeUnsafe(),
         };
         sharedShellReads.delete(input.threadId);
         sharedShellReads.set(input.threadId, read);
         trimSharedShellReads(now);
-        return orchestrator.getThreadShell(input.threadId).pipe(
+        const previous =
+          current !== undefined && current.expiresAt === Number.POSITIVE_INFINITY
+            ? Effect.exit(Deferred.await(current.result))
+            : Effect.void;
+        return previous.pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              read.started = true;
+            }),
+          ),
+          Effect.andThen(orchestrator.getThreadShell(input.threadId)),
           Effect.onExit((exit) =>
             Effect.clockWith((settledClock) => {
               if (Exit.isSuccess(exit)) {

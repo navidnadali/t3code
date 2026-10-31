@@ -9,7 +9,13 @@ import { describe, expect, it } from "vite-plus/test";
 
 import * as AcpSchema from "../../../packages/effect-acp/src/_generated/schema-v1.gen.ts";
 import { FIXTURES_DIR, transcriptPath } from "../fake-common/replay.mjs";
-import { compileTranscript, expectedTurn, TRANSCRIPT_FILE, turnLines } from "./acp-agent.mjs";
+import {
+  compileTranscript,
+  expectedTurn,
+  makeAnswer,
+  TRANSCRIPT_FILE,
+  turnLines,
+} from "./acp-agent.mjs";
 
 // effect resolves from the packages that depend on it, not from the repo root.
 const Schema = await import(
@@ -154,6 +160,16 @@ describe("fake acp agent", () => {
     ).toEqual(expectedTurn("simple", 0, 1).frames);
     expect(frames.at(-1).result).toEqual({ stopReason: "end_turn" });
     expect(decodes(AcpSchema.PromptResponse, frames.at(-1).result)).toBe(true);
+  });
+
+  it("follows the streamed answer with the live cwd in place of the recorded workspace", () => {
+    const [turn] = compileTranscript(
+      transcriptOf("todo_list").replaceAll("todo list fixture complete", "done in <workspace>"),
+    );
+    const answer = makeAnswer();
+    for (const { frame, line } of turnLines(turn, LIVE, 1)) answer.add(frame, line);
+
+    expect(answer.text).toBe(`done in ${LIVE.cwd}`);
   });
 
   it("stops a prompt cancelled with it and plays the next prompt after it", async () => {

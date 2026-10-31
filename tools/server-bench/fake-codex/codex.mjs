@@ -410,6 +410,14 @@ export function expectedTurn(name, index, requestedLoops) {
   return { frames, items, todoLists: plans, reply };
 }
 
+/** The text of a sent line that completes an answer of `threadId`: what the server shows as the reply. */
+export function answerOf(line, threadId) {
+  const params = JSON.parse(line).params;
+  return params?.threadId === threadId && params.item?.type === "agentMessage"
+    ? params.item.text
+    : undefined;
+}
+
 const BAD_SHAPE = (threadId, turnId) =>
   JSON.stringify({ method: "item/completed", params: { threadId, turnId, item: { type: 7 } } });
 
@@ -478,6 +486,7 @@ async function runAppServer(config) {
     const frames = {};
     let bytes = 0;
     let unpaced = 0;
+    let reply = null;
     const loops = Math.min(config.turnLoops, pick.compiled.maxLoops);
     for (const { frame, line, faultPoint } of turnLines(pick.compiled, live, loops)) {
       const wait = delayMs(frame.pace, config);
@@ -509,6 +518,7 @@ async function runAppServer(config) {
         await write(line);
       }
       frames[frame.stat] = (frames[frame.stat] ?? 0) + 1;
+      if (frame.stat === "item/completed") reply = answerOf(line, thread.threadId) ?? reply;
       bytes += Buffer.byteLength(line) + 1;
     }
     const aborted = controller.signal.aborted;
@@ -549,6 +559,7 @@ async function runAppServer(config) {
       aborted,
       frames,
       bytes,
+      reply,
       ms: Date.now() - startedAt,
       rssBytes: process.memoryUsage.rss(),
       requests,

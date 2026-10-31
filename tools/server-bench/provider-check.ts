@@ -81,6 +81,8 @@ interface StatsRecord {
   readonly frames: Readonly<Record<string, number>>;
   readonly bytes: number;
   readonly ms: number;
+  /** The final answer the fake sent, after live substitutions. */
+  readonly reply?: string | null;
 }
 
 interface TurnOutcome {
@@ -440,8 +442,9 @@ async function check(
       checks["every message and tool item completed"] = providerItems(rows.items).every(
         (item) => item.type === "todo_list" || item.status === "completed",
       );
-      checks["replies == recorded final answers"] = run.turns.every(
-        (turn, index) => turn.status !== "completed" || turn.reply === expectations[index]?.reply,
+      checks["replies == the final answers the fake sent"] = run.turns.every(
+        (turn, index) =>
+          turn.status !== "completed" || turn.reply === (played[index]?.reply ?? null),
       );
       detail = {
         played: played.map(({ transcript, turn, loops, bytes, ms, frames }) => ({

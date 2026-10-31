@@ -11,6 +11,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as CodexRpc from "../../../packages/effect-codex-app-server/src/rpc.ts";
 import { FIXTURES_DIR, readConfig, readNdjson, transcriptPath } from "../fake-common/replay.mjs";
 import {
+  answerOf,
   compileTranscript,
   expectedTurn,
   parseTranscript,
@@ -138,6 +139,17 @@ describe("fake codex transcripts", () => {
       items: { userMessage: 1, agentMessage: 4, commandExecution: 3 },
       reply: "command output fixture complete",
     });
+  });
+
+  it("answers with the live prompt where the recorded answer quotes the recorded one", () => {
+    const parsed = parsedFixture("thread_rollback");
+    const turn = compileTranscript(parsed).turns[2];
+    const answers = [...turnLines(turn, LIVE, 1)]
+      .map(({ line }) => answerOf(line, LIVE.threadId))
+      .filter((answer) => answer !== undefined);
+
+    expect(parsed.turns[2].prompt).toBe("Repeat the conversation verbatim.");
+    expect(answers.at(-1)).toMatch(/\nUser: Live prompt\.$/);
   });
 
   it("keeps completed turns and drops interrupted ones", () => {

@@ -205,6 +205,24 @@ export function expectedTurn(name, index, loops) {
   };
 }
 
+/** Follows the answer a prompt streams: a run of message chunks, unbroken by other updates. */
+export function makeAnswer() {
+  let text = null;
+  let open = false;
+  return {
+    add: (frame, line) => {
+      if (frame.stat === "session/update:agent_message_chunk") {
+        const chunk = JSON.parse(line).params.update.content.text;
+        text = open ? text + chunk : chunk;
+        open = true;
+      } else if (frame.stat !== "session/update:usage_update") open = false;
+    },
+    get text() {
+      return text;
+    },
+  };
+}
+
 const BAD_SHAPE = (sessionId) =>
   JSON.stringify({
     jsonrpc: "2.0",
@@ -240,6 +258,7 @@ async function runAgent(config) {
     const frames = {};
     let bytes = 0;
     let unpaced = 0;
+    const answer = makeAnswer();
     for (const { frame, line, faultPoint } of turnLines(pick.compiled, session, config.turnLoops)) {
       const wait = delayMs(frame.pace, config);
       if (wait > 0) {
@@ -270,6 +289,7 @@ async function runAgent(config) {
         await write(line);
       }
       frames[frame.stat] = (frames[frame.stat] ?? 0) + 1;
+      answer.add(frame, line);
       bytes += Buffer.byteLength(line) + 1;
     }
     const aborted = controller.signal.aborted;
@@ -284,6 +304,7 @@ async function runAgent(config) {
       aborted,
       frames,
       bytes,
+      reply: answer.text,
       ms: Date.now() - startedAt,
       rssBytes: process.memoryUsage.rss(),
       requests,

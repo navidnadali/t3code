@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
+import * as Metric from "effect/Metric";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -430,6 +431,14 @@ const withWorkers = <A, E, R>(
 
 const unavailableWarning = "SQLite reader worker unavailable; reads use the main connection";
 
+const readerPoolAvailable = Effect.map(Metric.snapshot, (snapshots) =>
+  snapshots.flatMap((snapshot) =>
+    snapshot.id === "t3_sqlite_reader_pool_available" && snapshot.type === "Gauge"
+      ? [snapshot.state.value]
+      : [],
+  ),
+);
+
 it.effect.each([
   {
     failure: "a crash",
@@ -464,6 +473,7 @@ it.effect.each([
           assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["writer"] });
           assert.equal(startedWorkers.length, startedBefore);
           assert.deepEqual(yield* Queue.take(lines), ["Warn", unavailableWarning, { reason }]);
+          assert.deepEqual(yield* readerPoolAvailable, [0]);
 
           yield* TestClock.adjust("1 second");
           assert.equal(startedWorkers.length, startedBefore + 1);
@@ -471,11 +481,12 @@ it.effect.each([
             "Info",
             "SQLite reader worker available again; reads use the reader workers",
           ]);
+          assert.deepEqual(yield* readerPoolAvailable, [1]);
           assert.deepEqual(yield* readConnection(sql), { count: 1, connection: ["reader"] });
           assert.equal(Queue.sizeUnsafe(lines), 0);
         }),
       ),
-    ),
+    ).pipe(Effect.provideService(Metric.MetricRegistry, new Map())),
 );
 
 it.effect("backs off a reader that never starts without logging each retry", () =>
@@ -514,9 +525,10 @@ it.effect("keeps readers off without retrying when the database is not in WAL mo
         assert.deepEqual(yield* Queue.clear(lines), [
           ["Warn", unavailableWarning, { reason: "database uses journal_mode delete, not wal" }],
         ]);
+        assert.deepEqual(yield* readerPoolAvailable, [0]);
       }),
     ),
-  ),
+  ).pipe(Effect.provideService(Metric.MetricRegistry, new Map())),
 );
 
 it.effect("finishes masked database cleanup after its caller is interrupted", () =>

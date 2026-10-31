@@ -367,6 +367,35 @@ describe("fake codex app-server", () => {
     expect(frames.at(-1).params.turn.status).toBe("completed");
   });
 
+  it("hands each thread's T3 MCP credentials to the load driver, readable by its owner only", async () => {
+    const dir = NodePath.join(
+      NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-codex-mcp-")),
+      "credentials",
+    );
+    using fake = startFake({ BENCH_MCP_CREDENTIALS_DIR: dir });
+    const config = (token) => ({
+      "tools.update_plan.enabled": true,
+      "mcp_servers.t3-code": {
+        url: "http://127.0.0.1:3773/mcp",
+        tool_timeout_sec: 120,
+        http_headers: { Authorization: `Bearer ${token}` },
+      },
+    });
+    fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, config: config("one") } });
+    const started = await fake.until(answerTo(1));
+    const threadId = frameOf(started.at(-1)).result.thread.id;
+    const file = NodePath.join(dir, `${threadId}.json`);
+    const first = JSON.parse(NodeFS.readFileSync(file, "utf8"));
+    fake.send({ id: 2, method: "thread/resume", params: { threadId, config: config("two") } });
+    const resumed = await fake.until(answerTo(2));
+
+    expect(first).toEqual({ url: "http://127.0.0.1:3773/mcp", authorization: "Bearer one" });
+    expect(JSON.parse(NodeFS.readFileSync(file, "utf8")).authorization).toBe("Bearer two");
+    expect(NodeFS.statSync(file).mode & 0o777).toBe(0o600);
+    expect(NodeFS.statSync(dir).mode & 0o777).toBe(0o700);
+    expect([...started, ...resumed].join("\n")).not.toMatch(/Bearer (one|two)/);
+  });
+
   it("reads the mix and rejects knobs out of range", () => {
     const read = (env) =>
       readConfig(env, {

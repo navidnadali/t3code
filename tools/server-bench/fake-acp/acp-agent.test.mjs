@@ -233,6 +233,50 @@ describe("fake acp agent", () => {
     expect(frameOf(lines.at(-1)).result).toEqual({ stopReason: "end_turn" });
   });
 
+  it.each([
+    [
+      "a stdio bridge",
+      {
+        name: "t3-code",
+        command: "/usr/bin/node",
+        args: ["acp-mcp-bridge"],
+        env: [
+          { name: "T3_ACP_MCP_ENDPOINT", value: "http://127.0.0.1:3773/mcp" },
+          { name: "T3_ACP_MCP_AUTHORIZATION", value: "Bearer secret" },
+        ],
+      },
+    ],
+    [
+      "HTTP",
+      {
+        type: "http",
+        name: "t3-code",
+        url: "http://127.0.0.1:3773/mcp",
+        headers: [{ name: "Authorization", value: "Bearer secret" }],
+      },
+    ],
+  ])("hands the session's T3 MCP credentials over %s to the load driver", async (_, server) => {
+    const dir = NodePath.join(
+      NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-acp-mcp-")),
+      "credentials",
+    );
+    using agent = startAgent({ BENCH_MCP_CREDENTIALS_DIR: dir });
+    agent.send(
+      { id: 1, method: "initialize", params: { protocolVersion: 1 } },
+      { id: 2, method: "session/new", params: { cwd: LIVE.cwd, mcpServers: [server] } },
+    );
+    const lines = await agent.until(answerTo(2));
+    const file = NodePath.join(dir, `${frameOf(lines.at(-1)).result.sessionId}.json`);
+
+    expect(JSON.parse(NodeFS.readFileSync(file, "utf8"))).toEqual({
+      url: "http://127.0.0.1:3773/mcp",
+      authorization: "Bearer secret",
+    });
+    expect(NodeFS.statSync(file).mode & 0o777).toBe(0o600);
+    expect(NodeFS.statSync(dir).mode & 0o777).toBe(0o700);
+    expect(lines.join("\n")).not.toContain("Bearer secret");
+  });
+
   it("stops a prompt cancelled with it and plays the next prompt after it", async () => {
     using agent = startAgent({});
     const sessionId = await openSession(agent);

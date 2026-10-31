@@ -1,4 +1,7 @@
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeURL from "node:url";
 
@@ -57,7 +60,8 @@ function startFake(args, env) {
   const exited = new Promise((resolve) => child.once("exit", (code) => resolve(code)));
   return {
     exited,
-    send: (message) => child.stdin.write(`${JSON.stringify(message)}\n`),
+    send: (...messages) =>
+      child.stdin.write(messages.map((message) => `${JSON.stringify(message)}\n`).join("")),
     end: () => child.stdin.end(),
     until: async (match) => {
       const read = [];
@@ -153,6 +157,36 @@ describe("fake claude transcripts", () => {
     for (const id of [...messageIds, ...toolResults]) expect(recorded).not.toContain(id);
   });
 
+  it("rewrites ids split across streamed tool input like the final tool input", async () => {
+    const groups = await groupsOf("claude_background_subagent_lifecycle");
+    const streamed = new Map();
+    const open = new Map();
+    const finals = [];
+    for (const frame of parseAll(groups.flatMap((group) => render(group, 2)))) {
+      const event = frame.event;
+      const key = `${frame.parent_tool_use_id}:${event?.index}`;
+      if (event?.type === "content_block_start" && event.content_block.type === "tool_use") {
+        open.set(key, event.content_block.id);
+        streamed.set(event.content_block.id, "");
+      }
+      if (event?.delta?.type === "input_json_delta") {
+        const id = open.get(key);
+        streamed.set(id, streamed.get(id) + event.delta.partial_json);
+      }
+      if (frame.type === "assistant") {
+        finals.push(...frame.message.content.filter((block) => block.type === "tool_use"));
+      }
+    }
+    const checked = finals.filter((block) => streamed.has(block.id));
+
+    expect(checked.length).toBeGreaterThan(0);
+    // The CLI adds fields to some final inputs, so the streamed input is a subset.
+    for (const block of checked) {
+      const json = streamed.get(block.id);
+      expect(block.input).toMatchObject(json === "" ? {} : JSON.parse(json));
+    }
+  });
+
   it("generates large tool payloads of the configured size", async () => {
     const [group] = await groupsOf("large-tool-payload", { BENCH_TOOL_PAYLOAD_BYTES: "4096" });
     const frames = parseAll(render(group, 1));
@@ -176,7 +210,14 @@ describe("fake claude transcripts", () => {
 
 describe("fake claude process", () => {
   it("answers the SDK's control requests and plays a turn per user message", async () => {
-    using fake = startFake(STREAM_ARGS, { BENCH_SPEED: "0", BENCH_TRANSCRIPT: "simple" });
+    const statsDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-claude-stats-"));
+    using _stats = { [Symbol.dispose]: () => NodeFS.rmSync(statsDir, { recursive: true }) };
+    using fake = startFake(STREAM_ARGS, {
+      BENCH_SPEED: "0",
+      BENCH_TRANSCRIPT: "large-tool-payload",
+      BENCH_TOOL_PAYLOAD_BYTES: "2048",
+      BENCH_STATS_DIR: statsDir,
+    });
     const control = (id, request) =>
       fake.send({ type: "control_request", request_id: id, request });
     control("init", { subtype: "initialize", hooks: {} });
@@ -185,7 +226,13 @@ describe("fake claude process", () => {
     control("model", { subtype: "set_model", model: "claude-opus-5" });
     const responses = parseAll(await fake.until((line) => line.includes('"request_id":"model"')));
     fake.send({ type: "user", message: { role: "user", content: "hi" }, uuid: PROMPT });
-    const turn = parseAll(await fake.until(isResult));
+    const lines = await fake.until(isResult);
+    const turn = parseAll(lines);
+    fake.end();
+    await fake.exited;
+    const [stats] = NodeFS.readdirSync(statsDir).map((file) =>
+      JSON.parse(NodeFS.readFileSync(NodePath.join(statsDir, file), "utf8")),
+    );
 
     expect(responses.map(({ response }) => [response.request_id, response.subtype])).toEqual([
       ["init", "success"],
@@ -201,22 +248,39 @@ describe("fake claude process", () => {
       model: "claude-opus-5",
     });
     expect(turn.at(-1)).toMatchObject({ subtype: "success", session_id: SESSION });
+    expect(stats).toMatchObject({ sessionId: SESSION, transcript: "large-tool-payload" });
+    expect(stats.bytes).toBe(lines.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0));
   });
 
-  it("ends an interrupted turn with an aborted result", async () => {
-    // The turn waits at its first delta until the interrupt arrives.
+  it.each([
+    ["while it streams", false],
+    ["in the same write as its prompt", true],
+  ])("ends a turn interrupted %s with an aborted result", async (_when, together) => {
+    // Paced so the turn waits at its first delta until the interrupt arrives.
     using fake = startFake(STREAM_ARGS, {
       BENCH_SPEED: "1000",
       BENCH_DELTAS_PER_SEC: "0.000001",
       BENCH_TRANSCRIPT: "command_output_streaming",
     });
-    fake.send({ type: "user", message: { role: "user", content: "hi" }, uuid: PROMPT });
-    await fake.until((line) => line.includes('"type":"content_block_start"'));
-    fake.send({ type: "control_request", request_id: "stop", request: { subtype: "interrupt" } });
-    const tail = parseAll(await fake.until(isResult));
+    const prompt = { type: "user", message: { role: "user", content: "hi" }, uuid: PROMPT };
+    const interrupt = {
+      type: "control_request",
+      request_id: "stop",
+      request: { subtype: "interrupt" },
+    };
+    if (together) {
+      fake.send(prompt, interrupt);
+    } else {
+      fake.send(prompt);
+      await fake.until((line) => line.includes('"type":"content_block_start"'));
+      fake.send(interrupt);
+    }
+    const lines = await fake.until(isResult);
+    const frames = parseAll(lines);
 
-    expect(tail.some((frame) => frame.response?.request_id === "stop")).toBe(true);
-    expect(tail.at(-1)).toMatchObject({
+    expect(frames.some((frame) => frame.response?.request_id === "stop")).toBe(true);
+    expect(frames.filter((frame) => frame.event?.type === "content_block_delta")).toEqual([]);
+    expect(frames.at(-1)).toMatchObject({
       subtype: "error_during_execution",
       is_error: true,
       user_message_uuids: [PROMPT],

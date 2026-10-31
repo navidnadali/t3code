@@ -368,10 +368,32 @@ describe("fake claude process", () => {
   });
 
   it.each([
-    [{ BENCH_TRANSCRIPT: "simple,no_such_transcript" }, "Unknown transcript no_such_transcript"],
-    [{ BENCH_SPEED: "fast" }, "BENCH_SPEED must be a number >= 0"],
-  ])("fails a session started with %o through an error result", async (env, cause) => {
-    using fake = startFake(STREAM_ARGS, env);
+    [
+      "an unknown transcript",
+      () => ({ BENCH_TRANSCRIPT: "simple,no_such_transcript" }),
+      "Unknown transcript no_such_transcript",
+    ],
+    ["a bad knob", () => ({ BENCH_SPEED: "fast" }), "BENCH_SPEED must be a number >= 0"],
+    [
+      "a malformed recorded frame",
+      (dir) => {
+        const file = NodePath.join(dir, "malformed.ndjson");
+        const frames = [
+          { type: "system", subtype: "init", session_id: SESSION },
+          { type: "assistant", session_id: SESSION },
+          { type: "result", subtype: "success", session_id: SESSION },
+        ];
+        NodeFS.writeFileSync(
+          file,
+          frames.map((frame) => `${JSON.stringify({ type: "emit_inbound", frame })}\n`).join(""),
+        );
+        return { BENCH_TRANSCRIPT: file };
+      },
+      "malformed.ndjson has an assistant frame without content on line 2",
+    ],
+  ])("fails a session started with %s through an error result", async (_what, envIn, cause) => {
+    using dir = tempDir("fake-claude-bad-");
+    using fake = startFake(STREAM_ARGS, envIn(dir.path));
     const lines = await fake.until(() => false);
 
     expect(await fake.exited).toBe(1);

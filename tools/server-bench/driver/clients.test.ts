@@ -238,4 +238,43 @@ describe("Subscriber", () => {
     });
     subscriber.stop();
   });
+
+  it("gives up on a load that never synchronizes, so switching goes on", async () => {
+    using _fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(
+        async () =>
+          new Response(JSON.stringify({ snapshotSequence: 1, threads: [], projects: [] })),
+      );
+    const { recorder, context, streams, opened } = harness();
+    const subscriber = new Subscriber(0, context, ["thread-1", "thread-2"], createRng("test"));
+    const threadStreams = () => opened.filter((tag) => tag === "orchestration.subscribeThread");
+    // The load's own timeout starts with it, so fake time must be in place before it opens.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const opening = subscriber.open();
+      await vi.waitFor(() =>
+        expect(opened.filter((tag) => tag === "orchestration.subscribeShell")).toHaveLength(2),
+      );
+      streams.get("orchestration.subscribeShell")?.([{ kind: "synchronized" }]);
+      await opening;
+      // The warm-up load never synchronizes; a measured switch must still happen.
+      recorder.openWindow();
+      subscriber.requestSwitch();
+      expect(threadStreams()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(context.options.callTimeoutMs);
+      await vi.waitFor(() => expect(threadStreams()).toHaveLength(2));
+      // That replacement times out too, and inside the window it counts as a failed load.
+      await vi.advanceTimersByTimeAsync(context.options.callTimeoutMs);
+      await vi.waitFor(() => expect(threadStreams()).toHaveLength(3));
+      expect(recorder.summarize(1).calls["subscribe.threadSync"]).toMatchObject({
+        count: 0,
+        errors: 1,
+        errorSamples: ["did not synchronize within the call timeout"],
+      });
+    } finally {
+      subscriber.stop();
+      vi.useRealTimers();
+    }
+  });
 });

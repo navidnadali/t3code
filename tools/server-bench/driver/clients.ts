@@ -452,6 +452,7 @@ export class Subscriber {
   private loading = false;
   private switchWhenSynchronized = false;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private syncTimer: ReturnType<typeof setTimeout> | undefined;
   readonly touched = new Set<string>();
 
   readonly index: number;
@@ -541,6 +542,7 @@ export class Subscriber {
     const generation = ++this.generation;
     this.stopThread?.();
     this.stopThread = undefined;
+    clearTimeout(this.syncTimer);
     this.context.recorder.fail(this.syncHandle, "left before the thread synchronized");
     this.loading = true;
     this.current = threadId;
@@ -585,6 +587,7 @@ export class Subscriber {
               recorder.count("events.threadSnapshot", 1);
             } else if (value.kind === "synchronized" && !synchronized) {
               synchronized = true;
+              clearTimeout(this.syncTimer);
               recorder.succeed(handle, now() - started);
               this.loading = false;
               if (this.switchWhenSynchronized) {
@@ -600,10 +603,19 @@ export class Subscriber {
           const reason = error?.message ?? "stream ended";
           if (synchronized) recorder.error("subscribe.threadStream", reason);
           else recorder.fail(handle, reason);
+          clearTimeout(this.syncTimer);
           this.retryTimer = setTimeout(() => void this.show(this.nextThread()), 250);
         },
       },
     );
+    // A load that never synchronizes must not hold the client (and its switches) forever.
+    this.syncTimer = setTimeout(() => {
+      if (generation !== this.generation || synchronized || this.context.isStopping()) return;
+      recorder.fail(handle, "did not synchronize within the call timeout");
+      this.syncHandle = null;
+      this.switchWhenSynchronized = false;
+      void this.show(this.nextThread());
+    }, this.context.options.callTimeoutMs);
   }
 
   /** Moves to another thread; a load still in progress is measured to its end first. */
@@ -624,6 +636,7 @@ export class Subscriber {
   stop(): void {
     clearTimeout(this.timer);
     clearTimeout(this.retryTimer);
+    clearTimeout(this.syncTimer);
     this.stopThread?.();
     this.socket?.close();
   }

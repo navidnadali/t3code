@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   isProviderOutputEvent,
   Session,
-  timed,
   ShellWatcher,
+  Subscriber,
+  timed,
   type RunContext,
   type ThreadShell,
 } from "./clients.ts";
@@ -31,18 +32,21 @@ const shell = (overrides: Partial<ThreadShell>): ThreadShell => ({
 });
 
 /** Shell and thread streams fed by the test, and a socket that accepts every command. */
-const harness = () => {
+const harness = (call: () => Promise<unknown> = async () => ({ sequence: 1 })) => {
   const streams = new Map<string, (values: ReadonlyArray<unknown>) => void>();
+  const opened: Array<string> = [];
   const socket = {
     stream: (
       tag: string,
       _payload: unknown,
       handlers: { onValues: (values: ReadonlyArray<unknown>) => void },
     ) => {
+      opened.push(tag);
       streams.set(tag, (values) => handlers.onValues(values));
       return () => undefined;
     },
-    call: async () => ({ sequence: 1 }),
+    call,
+    close: () => undefined,
   } as unknown as RpcSocket;
   const recorder = new Recorder();
   const context: RunContext = {
@@ -73,7 +77,7 @@ const harness = () => {
     streams.get("orchestration.subscribeThread")?.([
       { kind: "event", sequence: 2, event: { type, payload, occurredAt: "2026-10-31T12:00:00Z" } },
     ]);
-  return { session, recorder, update, emit, context };
+  return { session, recorder, update, emit, context, streams, opened };
 };
 
 describe("Session", () => {
@@ -98,6 +102,22 @@ describe("Session", () => {
     update(shell({ latestRunId: "run-2", status: "completed", itemCount: 19 }));
     expect(session.inFlight).toBe(false);
     expect(recorder.summarize(1).calls["session.turn"]).toBeUndefined();
+    await session.stop(false);
+  });
+
+  it("survives a dispatch that fails after the shell already settled its turn", async () => {
+    const reply = Promise.withResolvers<unknown>();
+    const { session, recorder, update } = harness(() => reply.promise);
+    recorder.openWindow();
+    session.start();
+    update(shell({ latestRunId: "run-2", status: "completed", itemCount: 19 }));
+    reply.reject(new CallError("orchestration.dispatchCommand: timed out"));
+    await reply.promise.catch(() => undefined);
+    await Promise.resolve();
+    expect(recorder.summarize(1).calls).toMatchObject({
+      "session.turn": { count: 1, errors: 0 },
+      "session.dispatch": { count: 0, errors: 1 },
+    });
     await session.stop(false);
   });
 
@@ -178,5 +198,44 @@ describe("timed", () => {
       errorSamples: ["MCP answered 500"],
     });
     expect(recorder.inFlight).toBe(0);
+  });
+});
+
+describe("Subscriber", () => {
+  it("lets a thread load finish before switching, and counts one cut short as failed", async () => {
+    using _fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(
+        async () =>
+          new Response(JSON.stringify({ snapshotSequence: 1, threads: [], projects: [] })),
+      );
+    const { recorder, context, streams, opened } = harness();
+    const subscriber = new Subscriber(0, context, ["thread-1", "thread-2"], createRng("test"));
+    const opening = subscriber.open();
+    // The harness's own shell watcher holds the first shell stream; the subscriber opens the second.
+    await vi.waitFor(() =>
+      expect(opened.filter((tag) => tag === "orchestration.subscribeShell")).toHaveLength(2),
+    );
+    streams.get("orchestration.subscribeShell")?.([{ kind: "synchronized" }]);
+    await opening;
+    recorder.openWindow();
+    const threadStreams = () => opened.filter((tag) => tag === "orchestration.subscribeThread");
+    expect(threadStreams()).toHaveLength(1);
+
+    // Still loading: the switch waits for the load to synchronize, then happens.
+    subscriber.requestSwitch();
+    expect(threadStreams()).toHaveLength(1);
+    streams.get("orchestration.subscribeThread")?.([{ kind: "synchronized" }]);
+    await vi.waitFor(() => expect(threadStreams()).toHaveLength(2));
+
+    // Leaving a thread before it synchronizes is a failed load, not a vanished one.
+    await subscriber.show("thread-1");
+    streams.get("orchestration.subscribeThread")?.([{ kind: "synchronized" }]);
+    expect(recorder.summarize(1).calls["subscribe.threadSync"]).toMatchObject({
+      count: 1,
+      errors: 1,
+      errorSamples: ["left before the thread synchronized"],
+    });
+    subscriber.stop();
   });
 });

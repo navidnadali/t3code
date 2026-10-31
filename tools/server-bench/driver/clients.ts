@@ -307,11 +307,12 @@ export class Session {
     if (this.context.isStopping()) return;
     const { options } = this.context;
     this.turn++;
-    this.waiting = {
+    const turn = {
       previousRunId: this.watcher.get(this.threadId)?.latestRunId ?? null,
       startedAt: now(),
       handle: this.context.recorder.begin("session.turn"),
     };
+    this.waiting = turn;
     const messageId = newId();
     const sent = await timed(this.context, "session.dispatch", () =>
       this.socket.call(
@@ -333,8 +334,9 @@ export class Session {
         options.callTimeoutMs,
       ),
     );
-    if (sent === undefined) {
-      this.context.recorder.discard(this.waiting.handle);
+    // A late failure (a timeout, say) can arrive after the shell already settled this turn.
+    if (sent === undefined && this.waiting === turn) {
+      this.context.recorder.discard(turn.handle);
       this.waiting = null;
       this.schedule(Math.max(options.turnGapMs, 1000));
       return;
@@ -446,6 +448,10 @@ export class Subscriber {
   private generation = 0;
   private current: string | undefined;
   private syncHandle: CallHandle = null;
+  /** Between asking for a thread and its stream synchronizing. */
+  private loading = false;
+  private switchWhenSynchronized = false;
+  private retryTimer: ReturnType<typeof setTimeout> | undefined;
   readonly touched = new Set<string>();
 
   readonly index: number;
@@ -473,7 +479,7 @@ export class Subscriber {
     if (interval <= 0 || this.pool.length < 2) return;
     const tick = () => {
       if (this.context.isStopping()) return;
-      void this.show(this.pool[pickIndex(this.rng, this.pool.length)] as string);
+      this.requestSwitch();
       this.timer = setTimeout(tick, interval);
     };
     this.timer = setTimeout(tick, this.rng.next() * interval);
@@ -535,7 +541,8 @@ export class Subscriber {
     const generation = ++this.generation;
     this.stopThread?.();
     this.stopThread = undefined;
-    this.context.recorder.discard(this.syncHandle);
+    this.context.recorder.fail(this.syncHandle, "left before the thread synchronized");
+    this.loading = true;
     this.current = threadId;
     const { recorder, http } = this.context;
     if (recorder.isOpen) this.touched.add(threadId);
@@ -579,21 +586,34 @@ export class Subscriber {
             } else if (value.kind === "synchronized" && !synchronized) {
               synchronized = true;
               recorder.succeed(handle, now() - started);
+              this.loading = false;
+              if (this.switchWhenSynchronized) {
+                this.switchWhenSynchronized = false;
+                void this.show(this.nextThread());
+              }
             }
           }
           recorder.count("events.thread", events, bytes);
         },
         onEnd: (error) => {
           if (generation !== this.generation || this.context.isStopping()) return;
-          recorder.discard(handle);
-          recorder.error("subscribe.threadStream", error?.message ?? "stream ended");
-          this.timer = setTimeout(
-            () => void this.show(this.pool[pickIndex(this.rng, this.pool.length)] as string),
-            250,
-          );
+          const reason = error?.message ?? "stream ended";
+          if (synchronized) recorder.error("subscribe.threadStream", reason);
+          else recorder.fail(handle, reason);
+          this.retryTimer = setTimeout(() => void this.show(this.nextThread()), 250);
         },
       },
     );
+  }
+
+  /** Moves to another thread; a load still in progress is measured to its end first. */
+  requestSwitch(): void {
+    if (this.loading) this.switchWhenSynchronized = true;
+    else void this.show(this.nextThread());
+  }
+
+  private nextThread(): string {
+    return this.pool[pickIndex(this.rng, this.pool.length)] as string;
   }
 
   /** Counts the thread already open when the window begins as shown in it. */
@@ -603,6 +623,7 @@ export class Subscriber {
 
   stop(): void {
     clearTimeout(this.timer);
+    clearTimeout(this.retryTimer);
     this.stopThread?.();
     this.socket?.close();
   }

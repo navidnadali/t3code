@@ -924,22 +924,28 @@ it.effect("shared thread shell reads keep only the most recent threads once read
       { length: ThreadManagementService.SHARED_SHELL_READ_CAPACITY + 1 },
       (_, index) => ThreadId.make(`thread:shared-shell:capacity:${index}`),
     );
-    const oldestReleased = yield* Deferred.make<void>();
+    const firstReleased = yield* Deferred.make<void>();
+    const secondReleased = yield* Deferred.make<void>();
     const othersReleased = yield* Deferred.make<void>();
     const reads: Array<ThreadId> = [];
     yield* sharedShellReadsTest(
       (id) =>
-        Deferred.await(id === threadIds[0] ? oldestReleased : othersReleased).pipe(
-          Effect.andThen(Effect.sync(() => reads.push(id))),
-          Effect.as(shellRead(id, 1)),
-        ),
+        Deferred.await(
+          id === threadIds[0]
+            ? firstReleased
+            : id === threadIds[1]
+              ? secondReleased
+              : othersReleased,
+        ).pipe(Effect.andThen(Effect.sync(() => reads.push(id))), Effect.as(shellRead(id, 1))),
       (forEvent) =>
         Effect.gen(function* () {
           const callers = yield* Effect.forEach(threadIds, (threadId) =>
             Effect.forkChild(forEvent(threadId, 1), { startImmediately: true }),
           );
-          yield* Deferred.succeed(oldestReleased, undefined);
+          yield* Deferred.succeed(firstReleased, undefined);
           yield* Fiber.join(callers[0]!);
+          yield* Deferred.succeed(secondReleased, undefined);
+          yield* Fiber.join(callers[1]!);
           yield* Deferred.succeed(othersReleased, undefined);
           yield* Fiber.joinAll(callers);
           yield* forEvent(threadIds.at(-1)!, 1);

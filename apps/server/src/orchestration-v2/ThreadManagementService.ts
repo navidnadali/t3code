@@ -798,11 +798,13 @@ const make = Effect.gen(function* () {
     );
 
   const sharedShellReads = new Map<ThreadId, SharedShellRead>();
+  // Settled reads move to the end when they settle, so they expire in map order. A pending read
+  // stays, so the thread's next read still waits for it.
   const trimSharedShellReads = (now: number) => {
     for (const [threadId, read] of sharedShellReads) {
+      if (read.expiresAt === Number.POSITIVE_INFINITY) continue;
       if (sharedShellReads.size <= SHARED_SHELL_READ_CAPACITY && now < read.expiresAt) return;
-      // A pending read stays, so the thread's next read still waits for it.
-      if (read.expiresAt !== Number.POSITIVE_INFINITY) sharedShellReads.delete(threadId);
+      sharedShellReads.delete(threadId);
     }
   };
   // Callers ask after their event commits, so a read that has not started covers every sequence asked
@@ -845,12 +847,13 @@ const make = Effect.gen(function* () {
           Effect.flatMap((fiber) => {
             // An observer also sees a read interrupted before it starts, e.g. forked into a closed scope.
             fiber.addObserver((exit) => {
+              const isCurrent = sharedShellReads.get(input.threadId) === read;
+              if (isCurrent) sharedShellReads.delete(input.threadId);
               if (Exit.isSuccess(exit)) {
                 const settledAt = clock.currentTimeMillisUnsafe();
                 read.expiresAt = settledAt + SHARED_SHELL_READ_TTL_MS;
+                if (isCurrent) sharedShellReads.set(input.threadId, read);
                 trimSharedShellReads(settledAt);
-              } else if (sharedShellReads.get(input.threadId) === read) {
-                sharedShellReads.delete(input.threadId);
               }
               Deferred.doneUnsafe(read.result, exit);
             });

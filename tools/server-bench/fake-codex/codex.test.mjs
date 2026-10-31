@@ -201,6 +201,14 @@ describe("fake codex transcripts", () => {
     expect(answers.at(-1)).toMatch(/\nUser: Live prompt\.$/);
   });
 
+  it("expects only the items a turn itself completes", async () => {
+    // Turn 1 is sent while the interrupted turn before it still completes its command.
+    expect((await expectedTurn("thread_rollback_to_stopped_turn", 1, 1)).items).toEqual({
+      userMessage: 1,
+      agentMessage: 1,
+    });
+  });
+
   it("keeps completed turns and drops interrupted ones", () => {
     expect(
       ["multi_turn", "turn_interrupt", "thread_rollback_to_stopped_turn"].map(

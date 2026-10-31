@@ -24,13 +24,16 @@ import {
   RpcSocket,
 } from "./driver/protocol.ts";
 import {
+  compareDistributions,
   createRng,
+  type DistributionMatch,
   pickMatching,
   type Rng,
   shuffled,
   summarizeDistribution,
 } from "./driver/sampling.ts";
 import { Recorder } from "./driver/stats.ts";
+import { judgeWindow, type WindowEvidence } from "./driver/verdict.ts";
 import {
   newId,
   now,
@@ -46,7 +49,6 @@ import {
 const RESULT_FILE = "driver.json";
 const FAILED_MARKER = "driver.failed";
 const SCHEMA_VERSION = 1;
-const DISTRIBUTION_TOLERANCE = 0.2;
 const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate", "access:write"];
 
 const log = (message: string) =>
@@ -54,21 +56,6 @@ const log = (message: string) =>
 
 const delay = (milliseconds: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
-
-async function forEachLimited<T>(
-  items: ReadonlyArray<T>,
-  limit: number,
-  run: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  let next = 0;
-  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next++;
-      await run(items[index] as T, index);
-    }
-  });
-  await Promise.all(lanes);
-}
 
 function git(args: ReadonlyArray<string>, cwd: string): string {
   return NodeChildProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -221,7 +208,6 @@ async function mintMcpToken(http: HttpTarget): Promise<string> {
 }
 
 interface Workload {
-  readonly sessions: ReadonlyArray<Session>;
   readonly subscriberPool: ReadonlyArray<string>;
   readonly readPool: ReadonlyArray<string>;
   readonly details: Record<string, unknown>;
@@ -246,6 +232,10 @@ class BenchRun implements RunContext {
   private serverLost = false;
   private readonly fatal = Promise.withResolvers<never>();
   private readonly sockets: Array<RpcSocket> = [];
+  /** Every session, registered before it sends anything, so teardown can stop it. */
+  private readonly sessions: Array<Session> = [];
+  /** Setup work that may still be in flight when the run ends early. */
+  private readonly pendingWork = new Set<Promise<void>>();
   private readonly timeline: Record<string, string> = {};
   /** Keeps each fresh run's workspaces apart; a folder can back only one project. */
   private readonly runId = NodeCrypto.randomBytes(4).toString("hex");
@@ -276,6 +266,36 @@ class BenchRun implements RunContext {
 
   private race<T>(promise: Promise<T>): Promise<T> {
     return Promise.race([promise, this.fatal.promise]);
+  }
+
+  /**
+   * Runs setup steps `--setup-concurrency` at a time. After the first failure (or once the run
+   * is stopping) no new step starts; the promise settles only when every started step has.
+   */
+  private parallel<T>(
+    items: ReadonlyArray<T>,
+    run: (item: T, index: number) => Promise<void>,
+  ): Promise<void> {
+    let next = 0;
+    let failure: { readonly error: unknown } | null = null;
+    const lanes = Array.from(
+      { length: Math.min(this.options.setupConcurrency, items.length) },
+      async () => {
+        while (next < items.length && failure === null && !this.stopping) {
+          const index = next++;
+          try {
+            await run(items[index] as T, index);
+          } catch (error) {
+            failure ??= { error };
+          }
+        }
+      },
+    );
+    const settled = Promise.all(lanes).then(() => {
+      if (failure !== null) throw failure.error;
+    });
+    this.pendingWork.add(settled.catch(() => undefined));
+    return settled;
   }
 
   private mark(phase: string): void {
@@ -380,9 +400,8 @@ class BenchRun implements RunContext {
       projectIds.push(projectId);
     }
     const sessionRng = this.rng.fork("sessions");
-    const sessions = Array.from(
-      { length: options.sessions },
-      (_, index) =>
+    for (let index = 0; index < options.sessions; index++) {
+      this.sessions.push(
         new Session({
           index,
           threadId: newId(),
@@ -392,13 +411,13 @@ class BenchRun implements RunContext {
           rng: sessionRng.fork(String(index)),
           switchProvider: false,
         }),
-    );
-    await forEachLimited(sessions, options.setupConcurrency, (session, index) =>
+      );
+    }
+    await this.parallel(this.sessions, (session, index) =>
       session.launch(projectIds[index % projectIds.length] as string, `Bench session ${index}`),
     );
-    const threadIds = sessions.map((session) => session.threadId);
+    const threadIds = this.sessions.map((session) => session.threadId);
     return {
-      sessions,
       subscriberPool: threadIds,
       readPool: threadIds,
       details: { projects: projectIds.length },
@@ -446,16 +465,31 @@ class BenchRun implements RunContext {
       target,
       Math.min(options.readPool, population.length),
     ).map((entry) => entry.id);
+    const itemCounts = new Map(all.map((thread) => [thread.id, thread.itemCount]));
+    const planned = compareDistributions(
+      summarizeDistribution(target),
+      summarizeDistribution(
+        [...new Set([...chosen.map((thread) => thread.id), ...readPool])].map(
+          (id) => itemCounts.get(id) ?? 0,
+        ),
+      ),
+      options.distributionTolerance,
+    );
+    if (!planned.withinTolerance) {
+      throw new FatalError(
+        `the fixture's eligible threads cannot match its turn-item distribution (p50 ratio ${planned.p50Ratio}, p95 ratio ${planned.p95Ratio}); raise --read-pool or --distribution-tolerance`,
+      );
+    }
 
     // Turns check out and checkpoint in the project root: point each at a scratch repository.
     const rerooted = [...new Set(chosen.map((thread) => thread.projectId))];
-    await forEachLimited(rerooted, options.setupConcurrency, async (projectId) => {
+    await this.parallel(rerooted, async (projectId) => {
       const directory = NodePath.join(this.workspaceDir(), projectId.replaceAll(/[^\w-]/gu, "_"));
       createWorkspace(directory);
       await this.mutateProject({ type: "project.update", projectId, workspaceRoot: directory });
     });
     let modeChanges = 0;
-    await forEachLimited(chosen, options.setupConcurrency, async (thread) => {
+    await this.parallel(chosen, async (thread) => {
       const commands: Array<Record<string, unknown>> = [];
       if (thread.runtimeMode !== options.runtimeMode) {
         commands.push({ type: "thread.runtime-mode.set", runtimeMode: options.runtimeMode });
@@ -473,8 +507,8 @@ class BenchRun implements RunContext {
       }
     });
     const sessionRng = this.rng.fork("session-text");
-    const sessions = chosen.map(
-      (thread, index) =>
+    for (const [index, thread] of chosen.entries()) {
+      this.sessions.push(
         new Session({
           index,
           threadId: thread.id,
@@ -484,10 +518,10 @@ class BenchRun implements RunContext {
           rng: sessionRng.fork(String(index)),
           switchProvider: thread.modelSelection.instanceId !== options.provider,
         }),
-    );
+      );
+    }
     return {
-      sessions,
-      subscriberPool: sessions.length > 0 ? sessions.map((session) => session.threadId) : readPool,
+      subscriberPool: chosen.length > 0 ? chosen.map((thread) => thread.id) : readPool,
       readPool,
       details: {
         populationThreads: population.length,
@@ -500,7 +534,7 @@ class BenchRun implements RunContext {
         ).length,
         sessionThreadIds: chosen.map((thread) => thread.id),
       },
-      itemCounts: new Map(all.map((thread) => [thread.id, thread.itemCount])),
+      itemCounts,
     };
   }
 
@@ -510,12 +544,13 @@ class BenchRun implements RunContext {
     subscribers: ReadonlyArray<Subscriber>,
     pollers: ReadonlyArray<Poller>,
   ) {
-    const sessionIds = workload.sessions.map((session) => session.threadId);
+    const sessionIds = this.sessions.map((session) => session.threadId);
     if (workload.itemCounts === null) {
       return {
         sessionsAtWindowEnd: summarizeDistribution(
           sessionIds.map((id) => watcher.get(id)?.itemCount ?? 0),
         ),
+        match: null,
       };
     }
     const counts = workload.itemCounts;
@@ -525,14 +560,6 @@ class BenchRun implements RunContext {
     const subscribed = new Set(subscribers.flatMap((subscriber) => [...subscriber.touched]));
     const fixture = summarizeDistribution([...counts.values()].filter((count) => count >= 1));
     const exercised = of(new Set([...sessionIds, ...polled, ...subscribed]));
-    const ratio = (value: number | null, base: number | null) =>
-      value === null || base === null || base === 0
-        ? null
-        : Math.round((value / base) * 1000) / 1000;
-    const p50Ratio = ratio(exercised.p50, fixture.p50);
-    const p95Ratio = ratio(exercised.p95, fixture.p95);
-    const within = (value: number | null) =>
-      value !== null && Math.abs(value - 1) <= DISTRIBUTION_TOLERANCE;
     return {
       fixture,
       exercised,
@@ -540,18 +567,12 @@ class BenchRun implements RunContext {
       readPool: of(workload.readPool),
       polled: of(polled),
       subscribed: of(subscribed),
-      match: {
-        p50Ratio,
-        p95Ratio,
-        tolerance: DISTRIBUTION_TOLERANCE,
-        withinTolerance: within(p50Ratio) && within(p95Ratio),
-      },
+      match: compareDistributions(fixture, exercised, this.options.distributionTolerance),
     };
   }
 
   async execute(server: Record<string, unknown>) {
-    const { options, recorder } = this;
-    const sessions: Array<Session> = [];
+    const { options, recorder, sessions } = this;
     const subscribers: Array<Subscriber> = [];
     const pollers: Array<Poller> = [];
     const watchdog = this.watchServer();
@@ -571,7 +592,6 @@ class BenchRun implements RunContext {
           ? this.prepareHistory(snapshot.value, control, watcher)
           : this.prepareFresh(control, watcher),
       );
-      sessions.push(...workload.sessions);
       log(`sessions ready: ${sessions.length}`);
 
       const subscriberRng = this.rng.fork("subscribers");
@@ -582,9 +602,7 @@ class BenchRun implements RunContext {
             new Subscriber(index, this, workload.subscriberPool, subscriberRng.fork(String(index))),
         ),
       );
-      await this.race(
-        forEachLimited(subscribers, options.setupConcurrency, (subscriber) => subscriber.open()),
-      );
+      await this.race(this.parallel(subscribers, (subscriber) => subscriber.open()));
       log(`subscribers ready: ${subscribers.length}`);
 
       const usesMcp = options.pollMix.some(
@@ -597,7 +615,7 @@ class BenchRun implements RunContext {
         mcpToken === null ? null : new McpSession(options.url, mcpToken, options.callTimeoutMs),
       );
       await this.race(
-        forEachLimited(mcpSessions, options.setupConcurrency, async (session, index) => {
+        this.parallel(mcpSessions, async (session, index) => {
           await session?.initialize(`bench-poller-${index}`);
         }),
       );
@@ -626,7 +644,7 @@ class BenchRun implements RunContext {
       const cpuStart = process.cpuUsage();
       const windowStart = now();
       recorder.setOpen(true);
-      for (const subscriber of subscribers) subscriber.windowOpened();
+      for (const client of [...sessions, ...subscribers]) client.windowOpened();
       await this.race(delay(options.windowMs));
       recorder.setOpen(false);
       const windowSeconds = (now() - windowStart) / 1000;
@@ -638,6 +656,7 @@ class BenchRun implements RunContext {
         ...recorder.summarize(windowSeconds),
         sessions: {
           count: sessions.length,
+          withOutputInWindow: sessions.filter((session) => session.producedOutput).length,
           inFlightAtWindowEnd: sessions.filter((session) => session.inFlight).length,
         },
         workload: workload.details,
@@ -654,7 +673,13 @@ class BenchRun implements RunContext {
           "warning: the driver's event loop was saturated; client latencies include driver delay",
         );
       }
-      this.validate(measured);
+      this.validate(measured, {
+        worstErrorRate: recorder.worstErrorRate(),
+        maxErrorRate: options.maxErrorRate,
+        sessions: sessions.length,
+        sessionsWithOutput: sessions.filter((session) => session.producedOutput).length,
+        distribution: (measured.distribution as { match: DistributionMatch | null }).match,
+      });
     } catch (error) {
       if (this.failure === null) {
         const reason = error instanceof Error ? error.message : String(error);
@@ -665,53 +690,40 @@ class BenchRun implements RunContext {
       this.stopping = true;
       clearInterval(watchdog);
       this.mark("teardown");
-      await Promise.race([
-        Promise.all([
-          ...pollers.map((poller) => poller.stop(!this.serverLost)),
-          ...sessions.map((session) => session.stop(options.stopSessions && !this.serverLost)),
-        ]),
-        delay(15_000),
-      ]);
+      if (!this.serverLost) {
+        // A launch still in flight would start a run after the stop below.
+        await Promise.race([Promise.all(this.pendingWork), delay(options.callTimeoutMs)]);
+        await Promise.race([
+          Promise.all([
+            ...pollers.map((poller) => poller.stop(true)),
+            ...sessions.map((session) => session.stop(options.stopSessions)),
+          ]),
+          delay(15_000),
+        ]);
+      }
       for (const subscriber of subscribers) subscriber.stop();
       for (const socket of this.sockets) socket.close();
     }
     return this.result(server, measured);
   }
 
-  /** A complete window can still be unusable: too many failed calls or no streaming at all. */
-  private validate(measured: Record<string, unknown>): void {
-    const worst = this.recorder.worstErrorRate();
-    if (worst !== null && worst.rate > this.options.maxErrorRate) {
-      const calls = measured.calls as Record<
-        string,
-        { errors: number; count: number; errorSamples: unknown }
-      >;
-      const errors = Object.fromEntries(
-        Object.entries(calls)
-          .filter(([, summary]) => summary.errors > 0)
-          .map(([type, summary]) => [
-            type,
-            { errors: summary.errors, succeeded: summary.count, samples: summary.errorSamples },
-          ]),
-      );
-      this.failure = {
-        phase: "window",
-        reason: `${worst.type} failed ${(worst.rate * 100).toFixed(2)}% of calls (limit ${this.options.maxErrorRate * 100}%)`,
-        errors,
-      };
-      return;
-    }
-    const counters = measured.counters as Record<string, { count: number }>;
-    if (
-      this.options.sessions > 0 &&
-      this.options.subscribers > 0 &&
-      (counters["events.thread"]?.count ?? 0) === 0
-    ) {
-      this.failure = {
-        phase: "window",
-        reason: "no thread events reached the subscribers: the sessions are not streaming",
-      };
-    }
+  /** A complete window is published only if `judgeWindow` accepts it. */
+  private validate(measured: Record<string, unknown>, evidence: WindowEvidence): void {
+    const reason = judgeWindow(evidence);
+    if (reason === null) return;
+    const calls = measured.calls as Record<
+      string,
+      { errors: number; count: number; errorSamples: unknown }
+    >;
+    const errors = Object.fromEntries(
+      Object.entries(calls)
+        .filter(([, summary]) => summary.errors > 0)
+        .map(([type, summary]) => [
+          type,
+          { errors: summary.errors, succeeded: summary.count, samples: summary.errorSamples },
+        ]),
+    );
+    this.failure = { phase: "window", reason, errors };
   }
 
   private result(server: Record<string, unknown>, measured: Record<string, unknown> | null) {

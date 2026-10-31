@@ -34,6 +34,7 @@ export interface DriverOptions {
   readonly turnGapMs: number;
   readonly messageChars: number;
   readonly readPool: number;
+  readonly distributionTolerance: number;
   readonly workspaceDir: string | null;
   readonly callTimeoutMs: number;
   readonly stallTimeoutMs: number;
@@ -69,6 +70,14 @@ function parseCount(text: string, flag: string, minimum: number): number {
   const value = Number(text);
   if (!Number.isSafeInteger(value) || value < minimum) {
     throw new UsageError(`--${flag} must be an integer of at least ${minimum}`);
+  }
+  return value;
+}
+
+function parseFraction(text: string, flag: string): number {
+  const value = Number(text);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new UsageError(`--${flag} must be between 0 and 1`);
   }
   return value;
 }
@@ -128,6 +137,9 @@ orchestration:read, orchestration:operate and access:write, e.g.
   --turn-gap DUR            pause between a session's turns (default 1s)
   --message-chars N         size of each user message (default 400)
   --read-pool N             history mode: threads pollers read (default 200)
+  --distribution-tolerance F
+                            history mode: fail unless the exercised threads' p50 and p95 turn
+                            items are within this fraction of the fixture's (default 0.2)
   --workspace-dir DIR       git workspaces the sessions run in (default <out>/workspaces)
   --call-timeout DUR        per call (default 60s)
   --stall-timeout DUR       fail the run when the server leaves a ping unanswered this long
@@ -165,6 +177,7 @@ const parseFlags = (argv: ReadonlyArray<string>) =>
       "turn-gap": { type: "string", default: "1s" },
       "message-chars": { type: "string", default: "400" },
       "read-pool": { type: "string", default: "200" },
+      "distribution-tolerance": { type: "string", default: "0.2" },
       "workspace-dir": { type: "string" },
       "call-timeout": { type: "string", default: "60s" },
       "stall-timeout": { type: "string", default: "30s" },
@@ -201,10 +214,7 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
     throw new UsageError("--mode must be fresh or history");
   }
   const sessions = parseCount(values.sessions, "sessions", 0);
-  const maxErrorRate = Number(values["max-error-rate"]);
-  if (!Number.isFinite(maxErrorRate) || maxErrorRate < 0 || maxErrorRate > 1) {
-    throw new UsageError("--max-error-rate must be between 0 and 1");
-  }
+  const maxErrorRate = parseFraction(values["max-error-rate"], "max-error-rate");
   const windowMs = parseDuration(values.window, "window");
   if (windowMs <= 0) throw new UsageError("--window must be positive");
   if (values.taskset !== undefined && !/^[\d,-]+$/u.test(values.taskset)) {
@@ -231,6 +241,10 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
     turnGapMs: parseDuration(values["turn-gap"], "turn-gap"),
     messageChars: parseCount(values["message-chars"], "message-chars", 1),
     readPool: parseCount(values["read-pool"], "read-pool", 1),
+    distributionTolerance: parseFraction(
+      values["distribution-tolerance"],
+      "distribution-tolerance",
+    ),
     workspaceDir: values["workspace-dir"] ?? null,
     callTimeoutMs: parseDuration(values["call-timeout"], "call-timeout"),
     stallTimeoutMs: parseDuration(values["stall-timeout"], "stall-timeout"),

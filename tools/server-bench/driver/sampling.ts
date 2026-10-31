@@ -132,3 +132,24 @@ export function pickMatching<T extends Weighted>(
   }
   return picked;
 }
+
+export interface DistributionMatch {
+  readonly p50Ratio: number | null;
+  readonly p95Ratio: number | null;
+  readonly tolerance: number;
+  readonly withinTolerance: boolean;
+}
+
+/** Whether `sample`'s p50 and p95 sit within `tolerance` (a fraction) of `population`'s. */
+export function compareDistributions(
+  population: DistributionSummary,
+  sample: DistributionSummary,
+  tolerance: number,
+): DistributionMatch {
+  const ratio = (value: number | null, base: number | null) =>
+    value === null || base === null || base === 0 ? null : Math.round((value / base) * 1000) / 1000;
+  const p50Ratio = ratio(sample.p50, population.p50);
+  const p95Ratio = ratio(sample.p95, population.p95);
+  const within = (value: number | null) => value !== null && Math.abs(value - 1) <= tolerance;
+  return { p50Ratio, p95Ratio, tolerance, withinTolerance: within(p50Ratio) && within(p95Ratio) };
+}

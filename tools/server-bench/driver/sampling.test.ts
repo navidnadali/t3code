@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { createRng, percentile, pickMatching, summarizeDistribution } from "./sampling.ts";
+import {
+  compareDistributions,
+  createRng,
+  percentile,
+  pickMatching,
+  summarizeDistribution,
+} from "./sampling.ts";
 
 const draws = (seed: string, count: number) => {
   const rng = createRng(seed);
@@ -89,5 +95,20 @@ describe("pickMatching", () => {
     expect(() => pickMatching(createRng("x"), [{ id: "a", value: 1 }], [1], 2)).toThrow(
       "only 1 qualify",
     );
+  });
+});
+
+describe("compareDistributions", () => {
+  it("fails a sample that cannot reach the population's long tail", () => {
+    const population = summarizeDistribution([1, 1000, 1000]);
+    expect(compareDistributions(population, summarizeDistribution([1]), 0.2)).toEqual({
+      p50Ratio: 0.001,
+      p95Ratio: 0.001,
+      tolerance: 0.2,
+      withinTolerance: false,
+    });
+    expect(
+      compareDistributions(population, summarizeDistribution([1, 900, 1100]), 0.2).withinTolerance,
+    ).toBe(true);
   });
 });

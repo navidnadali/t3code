@@ -35,6 +35,22 @@ export interface ThreadShell {
   readonly archivedAt: string | null;
 }
 
+const PROVIDER_ACTIVE_STATUSES = new Set(["running", "waiting"]);
+
+/**
+ * The run gained turn items while the provider was working on it, so the provider produced
+ * output. The user's message and the run's start and end land outside this, so they never count.
+ */
+export function providerProgressed(previous: ThreadShell | undefined, next: ThreadShell): boolean {
+  return (
+    previous !== undefined &&
+    previous.latestRunId === next.latestRunId &&
+    PROVIDER_ACTIVE_STATUSES.has(previous.status) &&
+    PROVIDER_ACTIVE_STATUSES.has(next.status) &&
+    next.itemCount > previous.itemCount
+  );
+}
+
 export interface ShellSnapshot {
   readonly snapshotSequence: number;
   readonly threads: ReadonlyArray<ThreadShell>;
@@ -136,7 +152,10 @@ export function messageText(rng: Rng, chars: number, label: string): string {
  */
 export class ShellWatcher {
   private readonly threads = new Map<string, ThreadShell>();
-  private readonly listeners = new Map<string, (shell: ThreadShell) => void>();
+  private readonly listeners = new Map<
+    string,
+    (shell: ThreadShell, previous: ThreadShell | undefined) => void
+  >();
 
   seed(snapshot: ShellSnapshot): void {
     for (const thread of snapshot.threads) this.threads.set(thread.id, thread);
@@ -146,7 +165,10 @@ export class ShellWatcher {
     return this.threads.get(threadId);
   }
 
-  listen(threadId: string, listener: (shell: ThreadShell) => void): void {
+  listen(
+    threadId: string,
+    listener: (shell: ThreadShell, previous: ThreadShell | undefined) => void,
+  ): void {
     this.listeners.set(threadId, listener);
   }
 
@@ -157,12 +179,16 @@ export class ShellWatcher {
       {
         onValues: (values) => {
           for (const value of values as ReadonlyArray<StreamItem>) {
-            if (value.kind === "snapshot" && value.snapshot !== undefined) {
-              this.seed(value.snapshot);
-              for (const thread of value.snapshot.threads) this.listeners.get(thread.id)?.(thread);
-            } else if (value.kind === "thread.updated" && value.thread !== undefined) {
-              this.threads.set(value.thread.id, value.thread);
-              this.listeners.get(value.thread.id)?.(value.thread);
+            const threads =
+              value.kind === "snapshot"
+                ? (value.snapshot?.threads ?? [])
+                : value.kind === "thread.updated" && value.thread !== undefined
+                  ? [value.thread]
+                  : [];
+            for (const thread of threads) {
+              const previous = this.threads.get(thread.id);
+              this.threads.set(thread.id, thread);
+              this.listeners.get(thread.id)?.(thread, previous);
             }
           }
         },
@@ -182,6 +208,7 @@ export class Session {
     null;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private pendingModelSelection: { instanceId: string; model: string } | undefined;
+  private outputInWindow = false;
 
   readonly index: number;
   readonly threadId: string;
@@ -212,7 +239,7 @@ export class Session {
         model: context.options.model,
       };
     }
-    watcher.listen(threadId, (shell) => this.onShell(shell));
+    watcher.listen(threadId, (shell, previous) => this.onShell(shell, previous));
   }
 
   /** Fresh mode: the launch is the first turn. */
@@ -294,7 +321,14 @@ export class Session {
     this.pendingModelSelection = undefined;
   }
 
-  private onShell(shell: ThreadShell): void {
+  private onShell(shell: ThreadShell, previous: ThreadShell | undefined): void {
+    if (providerProgressed(previous, shell) && this.context.recorder.isOpen) {
+      this.outputInWindow = true;
+      this.context.recorder.count(
+        "sessions.providerItems",
+        shell.itemCount - (previous?.itemCount ?? shell.itemCount),
+      );
+    }
     const waiting = this.waiting;
     if (waiting === null) return;
     if (shell.latestRunId === waiting.previousRunId || !TERMINAL_RUN_STATUSES.has(shell.status)) {
@@ -319,14 +353,23 @@ export class Session {
     return this.waiting !== null;
   }
 
-  async stop(interrupt: boolean): Promise<void> {
+  windowOpened(): void {
+    this.outputInWindow = false;
+  }
+
+  /** Whether the provider streamed into this thread while the window was open. */
+  get producedOutput(): boolean {
+    return this.outputInWindow;
+  }
+
+  /** Stops sending turns; with `stopThread`, also stops whatever the server is running there. */
+  async stop(stopThread: boolean): Promise<void> {
     clearTimeout(this.timer);
-    const runId = this.watcher.get(this.threadId)?.activeRunId;
-    if (!interrupt || runId === null || runId === undefined) return;
+    if (!stopThread) return;
     await this.socket
       .call(
         "orchestration.dispatchCommand",
-        { type: "run.interrupt", commandId: newId(), threadId: this.threadId, runId },
+        { type: "thread.stop", commandId: newId(), threadId: this.threadId, reason: "bench end" },
         5_000,
       )
       .catch(() => undefined);
@@ -504,9 +547,12 @@ export class Subscriber {
   }
 }
 
+const MAX_POLLS_IN_FLIGHT = 32;
+
 /**
  * An agent polling the server at a fixed rate. Calls start on schedule even while earlier ones
- * are still out (up to four), so a slow server shows up as latency, not as fewer calls.
+ * are still out, so a slow server shows up as latency, not as fewer calls; a call that cannot
+ * start because too many are out counts as a failed call.
  */
 export class Poller {
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -547,13 +593,15 @@ export class Poller {
   }
 
   private fire(): void {
-    const { recorder } = this.context;
-    if (this.inFlight >= 4) {
-      recorder.count("poll.skipped");
-      return;
-    }
     const call: PollCall = weightedChoice(this.rng, this.context.options.pollMix);
     const threadId = this.pool[pickIndex(this.rng, this.pool.length)] as string;
+    if (this.inFlight >= MAX_POLLS_IN_FLIGHT) {
+      this.context.recorder.error(
+        `poll.${call}`,
+        `not sent: ${MAX_POLLS_IN_FLIGHT} calls in flight`,
+      );
+      return;
+    }
     this.inFlight++;
     void this.run(call, threadId).finally(() => {
       this.inFlight--;

@@ -77,7 +77,8 @@ counted: `name`, `count`, `totalDurationMs`, `maxDurationMs`, the `thresholdMs`,
 `startTimeUnixNano` and `endTimeUnixNano` from the first counted start to the last counted end. It
 has no `durationMs`, `traceId`, or `spanId`. `t3 trace summary` and Settings > Diagnostics add
 these counts to the span counts; a percentile that falls among them prints as `<2ms` for a 2 ms
-threshold.
+threshold. A crash or kill loses up to a minute of these counts; slow, failed, and lock-waited
+spans are still written as they end.
 
 With the filter on:
 

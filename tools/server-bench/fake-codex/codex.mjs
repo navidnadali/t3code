@@ -428,7 +428,8 @@ export async function expectedTurn(name, index, requestedLoops, payloadBytes) {
   if (compiled === undefined) throw new Error(`Transcript ${name} has no turn ${index}.`);
   const loops = Math.min(requestedLoops, compiled.maxLoops);
   const times = (part) => (part === "body" ? (compiled.body.length === 0 ? 0 : loops) : 1);
-  const frames = {};
+  // The turn/start answer, then every frame of the turn.
+  const frames = { response: 1 };
   for (const part of ["before", "prefix", "body", "suffix"]) {
     for (const frame of compiled[part])
       frames[frame.stat] = (frames[frame.stat] ?? 0) + times(part);

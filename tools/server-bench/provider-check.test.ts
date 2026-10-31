@@ -62,6 +62,14 @@ const SERVER_LOG = `[22:31:00.726] WARN (#8057): Orchestration effect execution 
       '            at file:///dist/binCli.mjs:171134:40\\n' +
       '}'
   }
+[23:30:47.119] WARN (#11299): orchestration-v2.acp-prompt-failed
+  {
+    driver: 'acpRegistry',
+    providerSessionId: 'provider-session:provider-instance:acpBench:thread:mcp%3A479ac855-1ca4-4148-95fd-3e98e1c7cbe4:210d0df9-eea5-4c80-a301-7f80b42fbcb8',
+    cause: 'AcpProcessExitedError: ACP process exited with code 1\\n' +
+      '    at Object.onSuccess (file:///dist/binCli.mjs:169851:23)\\n' +
+      '    at AcpAdapterV2.startTurn (file:///dist/binCli.mjs:178315:54)'
+  }
 [23:17:23.740] WARN (#10770): orchestration V2 failed to interrupt turn after ingestion failure
   {
     runId: 'run:thread:mcp%3A93e55143-694f-4a6e-b0d4-81e40737b0fb:ordinal:1',
@@ -137,6 +145,10 @@ describe("provider check runs", () => {
     // A turn that failed mid-stream is logged by its run id, with the thread id URL-encoded.
     expect(failureCause(SERVER_LOG, "mcp:93e55143-694f-4a6e-b0d4-81e40737b0fb")).toBe(
       "CodexAppServerProcessExitedError: Codex App Server process exited with code 1",
+    );
+    // An ACP prompt failure logs its cause as a property of its own.
+    expect(failureCause(SERVER_LOG, "mcp:479ac855-1ca4-4148-95fd-3e98e1c7cbe4")).toBe(
+      "AcpProcessExitedError: ACP process exited with code 1",
     );
     expect(failureCause(SERVER_LOG, "mcp:00000000-0000-4000-8000-000000000000")).toBeNull();
   });

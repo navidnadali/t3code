@@ -46,6 +46,10 @@ export interface DriverOptions {
   readonly distributionTolerance: number;
   readonly workspaceDir: string | null;
   readonly callTimeoutMs: number;
+  readonly graceMs: number;
+  readonly sessionsPerSocket: number;
+  readonly maxDriverElu: number;
+  readonly maxDriverDelayMs: number;
   readonly stallTimeoutMs: number;
   readonly setupConcurrency: number;
   readonly maxErrorRate: number;
@@ -153,8 +157,10 @@ orchestration:read, orchestration:operate and access:write, e.g.
                             follow --poll-mix's MCP weights
   --session-mcp-credentials DIR
                             use the credentials providers write here (one JSON file per session:
-                            {"url": …, "authorization": …}); without it each session signs in
-                            as its own MCP client
+                            {"url": …, "authorization": …}); the driver sets the provider
+                            instance's BENCH_MCP_CREDENTIALS_DIR to DIR (the token then also
+                            needs settings:write and providers:manage). Without it each session
+                            signs in as its own MCP client
   --switch-interval DUR     subscribers move to another thread this often; 0 holds (default 30s)
   --turn-gap DUR            pause between a session's turns (default 1s)
   --message-chars N         size of each user message (default 400)
@@ -164,6 +170,13 @@ orchestration:read, orchestration:operate and access:write, e.g.
                             items are within this fraction of the fixture's (default 0.2)
   --workspace-dir DIR       git workspaces the sessions run in (default <out>/workspaces)
   --call-timeout DUR        per call (default 60s)
+  --grace DUR               calls started in the window may finish this long after it; later
+                            ones are reported as unfinished (default 60s)
+  --sessions-per-socket N   sessions sharing one WebSocket for their commands and own thread
+                            streams (default 10)
+  --max-driver-elu F        fail the run when the driver's event loop was busier (default 0.7)
+  --max-driver-delay DUR    fail the run when the driver's event-loop delay p99 was longer
+                            (default 50ms): its own lag would show up as server latency
   --stall-timeout DUR       fail the run when the server leaves a ping unanswered this long
                             (default 30s)
   --setup-concurrency N     parallel setup requests (default 8)
@@ -204,6 +217,10 @@ const parseFlags = (argv: ReadonlyArray<string>) =>
       "distribution-tolerance": { type: "string", default: "0.2" },
       "workspace-dir": { type: "string" },
       "call-timeout": { type: "string", default: "60s" },
+      grace: { type: "string", default: "60s" },
+      "sessions-per-socket": { type: "string", default: "10" },
+      "max-driver-elu": { type: "string", default: "0.7" },
+      "max-driver-delay": { type: "string", default: "50ms" },
       "stall-timeout": { type: "string", default: "30s" },
       "setup-concurrency": { type: "string", default: "8" },
       "max-error-rate": { type: "string", default: "0.01" },
@@ -273,6 +290,10 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
     ),
     workspaceDir: values["workspace-dir"] ?? null,
     callTimeoutMs: parseDuration(values["call-timeout"], "call-timeout"),
+    graceMs: parseDuration(values.grace, "grace"),
+    sessionsPerSocket: parseCount(values["sessions-per-socket"], "sessions-per-socket", 1),
+    maxDriverElu: parseFraction(values["max-driver-elu"], "max-driver-elu"),
+    maxDriverDelayMs: parseDuration(values["max-driver-delay"], "max-driver-delay"),
     stallTimeoutMs: parseDuration(values["stall-timeout"], "stall-timeout"),
     setupConcurrency: parseCount(values["setup-concurrency"], "setup-concurrency", 1),
     maxErrorRate,

@@ -10,12 +10,29 @@ const healthy: WindowEvidence = {
   distribution: { p50Ratio: 1.05, p95Ratio: 0.9, tolerance: 0.2, withinTolerance: true },
   sessionMcpRequired: 80,
   sessionMcpCallers: 80,
+  driver: {
+    eventLoopUtilization: 0.2,
+    eventLoopDelayP99Ms: 12,
+    maxEventLoopUtilization: 0.7,
+    maxEventLoopDelayP99Ms: 50,
+  },
 };
 
 describe("judgeWindow", () => {
   it("publishes a window that streamed, rarely failed and matched the fixture", () => {
     expect(judgeWindow(healthy)).toBeNull();
     expect(judgeWindow({ ...healthy, distribution: null })).toBeNull();
+  });
+
+  it("rejects a window measured by a saturated driver", () => {
+    expect(
+      judgeWindow({ ...healthy, driver: { ...healthy.driver, eventLoopUtilization: 0.75 } }),
+    ).toBe(
+      "the driver itself was saturated (event loop 75% busy, delay p99 12 ms; limits 70% and 50 ms), so its latencies are not the server's",
+    );
+    expect(
+      judgeWindow({ ...healthy, driver: { ...healthy.driver, eventLoopDelayP99Ms: 80 } }),
+    ).toContain("the driver itself was saturated");
   });
 
   it("rejects a window with too many failed calls", () => {

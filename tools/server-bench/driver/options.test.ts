@@ -33,6 +33,12 @@ describe("parseDriverOptions", () => {
       "--poll-mix",
       "thread_read=3,http_bounded=1",
       "--no-stop-sessions",
+      "--grace",
+      "90s",
+      "--sessions-per-socket",
+      "8",
+      "--max-driver-delay",
+      "20ms",
     ]);
     expect(options).toMatchObject({
       mode: "fresh",
@@ -45,6 +51,10 @@ describe("parseDriverOptions", () => {
         ["http.threadBounded", 1],
       ],
       stopSessions: false,
+      graceMs: 90_000,
+      sessionsPerSocket: 8,
+      maxDriverDelayMs: 20,
+      maxDriverElu: 0.7,
     });
   });
 
@@ -55,6 +65,8 @@ describe("parseDriverOptions", () => {
     [[...required, "--window", "0s"], "--window must be positive"],
     [[...required, "--bogus"], "Unknown option '--bogus'"],
     [[...required, "--taskset", "all"], "--taskset takes a CPU list"],
+    [[...required, "--max-driver-elu", "2"], "--max-driver-elu must be between 0 and 1"],
+    [[...required, "--sessions-per-socket", "0"], "--sessions-per-socket must be an integer"],
     [[...required, "--mode", "fresh", "--sessions", "0"], "--sessions must be > 0"],
   ])("rejects %j", (argv, message) => {
     expect(() => parseDriverOptions(argv)).toThrow(UsageError);

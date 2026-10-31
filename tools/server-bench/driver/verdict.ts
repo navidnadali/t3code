@@ -12,13 +12,27 @@ export interface WindowEvidence {
   readonly sessionMcpRequired: number;
   /** Sessions with a signed-in MCP caller when the window opened. */
   readonly sessionMcpCallers: number;
+  /** The driver's own load over the window, with the limits it must stay under. */
+  readonly driver: {
+    readonly eventLoopUtilization: number;
+    readonly eventLoopDelayP99Ms: number;
+    readonly maxEventLoopUtilization: number;
+    readonly maxEventLoopDelayP99Ms: number;
+  };
 }
 
 /**
- * Why a complete window still cannot be published, or null when it can: too many failed calls,
- * sessions that did not stream, or threads that do not look like the fixture.
+ * Why a complete window still cannot be published, or null when it can: a saturated driver, too
+ * many failed calls, sessions that did not stream or call MCP, or threads unlike the fixture.
  */
 export function judgeWindow(evidence: WindowEvidence): string | null {
+  const driver = evidence.driver;
+  if (
+    driver.eventLoopUtilization > driver.maxEventLoopUtilization ||
+    driver.eventLoopDelayP99Ms > driver.maxEventLoopDelayP99Ms
+  ) {
+    return `the driver itself was saturated (event loop ${Math.round(driver.eventLoopUtilization * 100)}% busy, delay p99 ${driver.eventLoopDelayP99Ms} ms; limits ${driver.maxEventLoopUtilization * 100}% and ${driver.maxEventLoopDelayP99Ms} ms), so its latencies are not the server's`;
+  }
   const worst = evidence.worstErrorRate;
   if (worst !== null && worst.rate > evidence.maxErrorRate) {
     return `${worst.type} failed ${(worst.rate * 100).toFixed(2)}% of calls (limit ${evidence.maxErrorRate * 100}%)`;

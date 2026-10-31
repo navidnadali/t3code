@@ -51,6 +51,9 @@ const RESULT_FILE = "driver.json";
 const FAILED_MARKER = "driver.failed";
 const SCHEMA_VERSION = 1;
 const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate", "access:write"];
+const LOOP_DELAY_RESOLUTION_MS = 10;
+/** P1-003's fake Claude CLI writes each session's MCP credential into this directory. */
+const CREDENTIALS_ENV = "BENCH_MCP_CREDENTIALS_DIR";
 
 const log = (message: string) =>
   process.stderr.write(`[driver ${new Date().toISOString()}] ${message}\n`);
@@ -243,6 +246,9 @@ class BenchRun implements RunContext {
   private credentialCallers: CredentialCallers<Poller> | null = null;
   private sessionCallersCreated = 0;
   private sessionCallersAtWindowStart = 0;
+  private providerSetup: { readonly credentialsEnvironment?: string } = {};
+  /** The sockets sessions send commands and follow their threads on, a few sessions each. */
+  private readonly sessionSockets: Array<RpcSocket> = [];
   private readonly startedAtEpochMs = Date.now();
   private readonly timeline: Record<string, string> = {};
   /** Keeps each fresh run's workspaces apart; a folder can back only one project. */
@@ -267,7 +273,7 @@ class BenchRun implements RunContext {
     this.failure = { phase: this.phase, reason: error.message };
     this.serverLost = error.serverLost;
     this.stopping = true;
-    this.recorder.setOpen(false);
+    this.recorder.closeWindow();
     log(`run failed during ${this.phase}: ${error.message}`);
     this.fatal.reject(error);
   };
@@ -366,12 +372,100 @@ class BenchRun implements RunContext {
     }
   }
 
-  private async checkScopes(): Promise<void> {
-    const session = await httpJson<{ authenticated: boolean; scopes?: ReadonlyArray<string> }>(
-      this.http,
-      "/api/auth/session",
+  /** Waits, up to `--grace`, for the calls started in the window to finish. */
+  private async drain(): Promise<void> {
+    const started = now();
+    while (this.recorder.inFlight > 0 && now() - started < this.options.graceMs) {
+      await delay(Math.min(100, this.options.graceMs));
+    }
+  }
+
+  /**
+   * Fails fast on a provider instance the server does not have ready, and points the instance's
+   * environment at `--session-mcp-credentials` so the fake CLI writes its sessions' credentials.
+   */
+  private async checkProvider(socket: RpcSocket): Promise<void> {
+    const { options } = this;
+    const config = (await socket.call("server.getConfig", {}, options.callTimeoutMs)) as {
+      readonly providers: ReadonlyArray<{
+        readonly instanceId: string;
+        readonly enabled: boolean;
+        readonly installed: boolean;
+        readonly availability?: string;
+        readonly unavailableReason?: string;
+        readonly message?: string;
+      }>;
+      readonly settings: {
+        readonly providerInstances?: Record<
+          string,
+          {
+            readonly environment?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
+          }
+        >;
+      };
+    };
+    const provider = config.providers.find((entry) => entry.instanceId === options.provider);
+    const problem =
+      provider === undefined
+        ? `is not configured (configured: ${config.providers.map((entry) => entry.instanceId).join(", ") || "none"})`
+        : !provider.enabled
+          ? "is disabled"
+          : !provider.installed || provider.availability === "unavailable"
+            ? `is unavailable: ${provider.unavailableReason ?? provider.message ?? "not installed"}`
+            : null;
+    if (problem !== null) {
+      throw new FatalError(`provider instance "${options.provider}" ${problem}`);
+    }
+    const directory = options.sessionMcpCredentials;
+    if (directory === null || this.sessionMcpMode() === "off") return;
+    const instance = config.settings.providerInstances?.[options.provider];
+    if (instance === undefined) {
+      throw new FatalError(
+        `provider instance "${options.provider}" is built in; give it a settings entry to set ${CREDENTIALS_ENV}`,
+      );
+    }
+    const environment = instance.environment ?? [];
+    if (environment.some((entry) => entry.name === CREDENTIALS_ENV && entry.value === directory)) {
+      this.providerSetup = { credentialsEnvironment: "already set" };
+      return;
+    }
+    // Entries round-trip as the server sent them; redacted secrets keep their stored values.
+    await socket.call(
+      "server.updateSettings",
+      {
+        patch: {},
+        providerInstanceMutation: {
+          operation: "upsert",
+          instanceId: options.provider,
+          instance: {
+            ...instance,
+            environment: [
+              ...environment.filter((entry) => entry.name !== CREDENTIALS_ENV),
+              { name: CREDENTIALS_ENV, value: directory, sensitive: false },
+            ],
+          },
+        },
+      },
+      options.callTimeoutMs,
     );
-    const missing = REQUIRED_SCOPES.filter((scope) => !session.value.scopes?.includes(scope));
+    this.providerSetup = { credentialsEnvironment: "set by the driver" };
+  }
+
+  private async checkScopes(): Promise<void> {
+    const session = await httpJson<{
+      authenticated: boolean;
+      scopes?: ReadonlyArray<string>;
+      permissions?: ReadonlyArray<string>;
+    }>(this.http, "/api/auth/session");
+    const required = [
+      ...REQUIRED_SCOPES,
+      ...(this.options.sessionMcpCredentials === null
+        ? []
+        : ["settings:write", "providers:manage"]),
+    ];
+    // `permissions` lists every grant; `scopes` folds some of them into their parents.
+    const granted = session.value.permissions ?? session.value.scopes ?? [];
+    const missing = required.filter((scope) => !granted.includes(scope));
     if (!session.value.authenticated || missing.length > 0) {
       throw new FatalError(
         `The bench token is not accepted or lacks scopes: ${missing.join(", ") || "unauthenticated"}`,
@@ -400,7 +494,11 @@ class BenchRun implements RunContext {
     return [...this.clientCallers, ...(this.credentialCallers?.callers() ?? [])];
   }
 
-  private makeSessionCaller(mcp: McpSession, pool: ReadonlyArray<string>): Poller {
+  private makeSessionCaller(
+    mcp: McpSession,
+    pool: ReadonlyArray<string>,
+    ownCredential: boolean,
+  ): Poller {
     const index = this.sessionCallersCreated++;
     const mix = this.options.pollMix.filter(
       ([call, weight]) => call.startsWith("mcp.") && weight > 0,
@@ -414,6 +512,7 @@ class BenchRun implements RunContext {
       prefix: "session",
       ratePerSecond: this.options.sessionMcpRatePerMinute / 60,
       mix: mix.length > 0 ? mix : [["mcp.t3_thread_read", 1]],
+      endsOnUnauthorized: ownCredential,
     });
   }
 
@@ -436,7 +535,7 @@ class BenchRun implements RunContext {
           );
           throw error;
         }
-        return this.makeSessionCaller(mcp, pool);
+        return this.makeSessionCaller(mcp, pool, true);
       },
     );
     this.credentialCallers = callers;
@@ -447,7 +546,11 @@ class BenchRun implements RunContext {
     return setInterval(tick, 1000);
   }
 
-  private async prepareFresh(socket: RpcSocket, watcher: ShellWatcher): Promise<Workload> {
+  private socketFor(index: number): RpcSocket {
+    return this.sessionSockets[Math.floor(index / this.options.sessionsPerSocket)] as RpcSocket;
+  }
+
+  private async prepareFresh(watcher: ShellWatcher): Promise<Workload> {
     const { options } = this;
     const projectCount = Math.max(1, Math.min(options.projects, options.sessions));
     const projectIds: Array<string> = [];
@@ -470,7 +573,7 @@ class BenchRun implements RunContext {
           index,
           threadId: newId(),
           context: this,
-          socket,
+          socket: this.socketFor(index),
           watcher,
           rng: sessionRng.fork(String(index)),
           switchProvider: false,
@@ -489,11 +592,7 @@ class BenchRun implements RunContext {
     };
   }
 
-  private async prepareHistory(
-    snapshot: ShellSnapshot,
-    socket: RpcSocket,
-    watcher: ShellWatcher,
-  ): Promise<Workload> {
+  private async prepareHistory(snapshot: ShellSnapshot, watcher: ShellWatcher): Promise<Workload> {
     const { options } = this;
     const projects = new Set(snapshot.projects.map((project) => project.id));
     const all = [...snapshot.threads, ...(snapshot.archivedThreads ?? [])];
@@ -553,7 +652,7 @@ class BenchRun implements RunContext {
       await this.mutateProject({ type: "project.update", projectId, workspaceRoot: directory });
     });
     let modeChanges = 0;
-    await this.parallel(chosen, async (thread) => {
+    await this.parallel(chosen, async (thread, index) => {
       const commands: Array<Record<string, unknown>> = [];
       if (thread.runtimeMode !== options.runtimeMode) {
         commands.push({ type: "thread.runtime-mode.set", runtimeMode: options.runtimeMode });
@@ -562,7 +661,7 @@ class BenchRun implements RunContext {
         commands.push({ type: "thread.interaction-mode.set", interactionMode: "default" });
       }
       for (const command of commands) {
-        await socket.call(
+        await this.socketFor(index).call(
           "orchestration.dispatchCommand",
           { ...command, commandId: newId(), threadId: thread.id },
           options.callTimeoutMs,
@@ -577,7 +676,7 @@ class BenchRun implements RunContext {
           index,
           threadId: thread.id,
           context: this,
-          socket,
+          socket: this.socketFor(index),
           watcher,
           rng: sessionRng.fork(String(index)),
           switchProvider: thread.modelSelection.instanceId !== options.provider,
@@ -649,13 +748,23 @@ class BenchRun implements RunContext {
         httpJson<ShellSnapshot>(this.http, "/api/orchestration/shell"),
       );
       const control = await this.race(this.openSocket());
+      await this.race(this.checkProvider(control));
+      this.sessionSockets.push(
+        ...(await this.race(
+          Promise.all(
+            Array.from({ length: Math.ceil(options.sessions / options.sessionsPerSocket) }, () =>
+              this.openSocket(),
+            ),
+          ),
+        )),
+      );
       const watcher = new ShellWatcher();
       watcher.seed(snapshot.value);
       watcher.follow(this, control, snapshot.value.snapshotSequence);
       const workload = await this.race(
         options.mode === "history"
-          ? this.prepareHistory(snapshot.value, control, watcher)
-          : this.prepareFresh(control, watcher),
+          ? this.prepareHistory(snapshot.value, watcher)
+          : this.prepareFresh(watcher),
       );
       for (const session of sessions) session.watch();
       log(`sessions ready: ${sessions.length}`);
@@ -716,7 +825,7 @@ class BenchRun implements RunContext {
               options.callTimeoutMs,
             );
             await mcp.initialize(`bench-session-${index}`);
-            this.clientCallers.push(this.makeSessionCaller(mcp, workload.readPool));
+            this.clientCallers.push(this.makeSessionCaller(mcp, workload.readPool, false));
           }),
         );
       }
@@ -735,24 +844,52 @@ class BenchRun implements RunContext {
       this.mark("window");
       const eluStart = NodePerfHooks.performance.eventLoopUtilization();
       const cpuStart = process.cpuUsage();
+      const loopDelay = NodePerfHooks.monitorEventLoopDelay({
+        resolution: LOOP_DELAY_RESOLUTION_MS,
+      });
+      loopDelay.enable();
       const windowStart = now();
-      recorder.setOpen(true);
+      recorder.openWindow();
       for (const client of [...sessions, ...subscribers]) client.windowOpened();
-      this.sessionCallersAtWindowStart = this.sessionCallers().length;
+      this.sessionCallersAtWindowStart = this.sessionCallers().filter(
+        (caller) => !caller.ended,
+      ).length;
       await this.race(delay(options.windowMs));
-      recorder.setOpen(false);
+      recorder.closeWindow();
+      loopDelay.disable();
       const windowSeconds = (now() - windowStart) / 1000;
       const elu = NodePerfHooks.performance.eventLoopUtilization(eluStart);
       const cpu = process.cpuUsage(cpuStart);
+      // The histogram holds whole sampling intervals; the delay is what exceeds the interval.
+      const delayMs = (nanoseconds: number) =>
+        Math.round(Math.max(0, nanoseconds / 1e6 - LOOP_DELAY_RESOLUTION_MS) * 10) / 10;
+      const driverHealth = {
+        eventLoopUtilization: Math.round(elu.utilization * 1000) / 1000,
+        eventLoopDelayP99Ms: delayMs(loopDelay.percentile(99)),
+        eventLoopDelayMaxMs: delayMs(loopDelay.max),
+        cpuPercent: Math.round((cpu.user + cpu.system) / windowSeconds / 1000) / 10,
+      };
+      this.mark("drain");
+      const inFlightAtWindowClose = recorder.inFlight;
+      const drainStart = now();
+      await this.race(this.drain());
+      recorder.seal();
+      const drained = {
+        graceMs: options.graceMs,
+        inFlightAtWindowClose,
+        waitedMs: Math.round(now() - drainStart),
+      };
       this.mark("measured");
       const summary = recorder.summarize(windowSeconds);
       await this.race(this.confirmServerAlive());
       measured = {
         windowSeconds: Math.round(windowSeconds * 1000) / 1000,
+        drain: drained,
         ...summary,
         sessions: {
           count: sessions.length,
           ownerStreams: sessions.length,
+          controlSockets: this.sessionSockets.length,
           withOutputInWindow: sessions.filter((session) => session.producedOutput).length,
           inFlightAtWindowEnd: sessions.filter((session) => session.inFlight).length,
         },
@@ -761,22 +898,14 @@ class BenchRun implements RunContext {
           mode: sessionMcpMode,
           ratePerMinute: options.sessionMcpRatePerMinute,
           callersAtWindowStart: this.sessionCallersAtWindowStart,
+          ...this.providerSetup,
         },
         distribution: this.distribution(workload, watcher, subscribers, [
           ...pollers,
           ...this.sessionCallers(),
         ]),
-        driverHealth: {
-          eventLoopUtilization: Math.round(elu.utilization * 1000) / 1000,
-          cpuPercent: Math.round((cpu.user + cpu.system) / windowSeconds / 1000) / 10,
-          saturated: elu.utilization > 0.9,
-        },
+        driverHealth,
       };
-      if (elu.utilization > 0.9) {
-        log(
-          "warning: the driver's event loop was saturated; client latencies include driver delay",
-        );
-      }
       this.validate(measured, {
         worstErrorRate: recorder.worstErrorRate(),
         maxErrorRate: options.maxErrorRate,
@@ -785,6 +914,12 @@ class BenchRun implements RunContext {
         distribution: (measured.distribution as { match: DistributionMatch | null }).match,
         sessionMcpRequired: sessionMcpMode === "off" ? 0 : sessions.length,
         sessionMcpCallers: this.sessionCallersAtWindowStart,
+        driver: {
+          eventLoopUtilization: driverHealth.eventLoopUtilization,
+          eventLoopDelayP99Ms: driverHealth.eventLoopDelayP99Ms,
+          maxEventLoopUtilization: options.maxDriverElu,
+          maxEventLoopDelayP99Ms: options.maxDriverDelayMs,
+        },
       });
     } catch (error) {
       if (this.failure === null) {

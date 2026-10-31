@@ -21,6 +21,13 @@ const serverLost = { serverLost: true } as const;
 /** One call failed; it counts against the error budget but the run continues. */
 export class CallError extends Error {
   override readonly name = "CallError";
+  /** The HTTP status that failed the call, when there was one. */
+  readonly status: number | undefined;
+
+  constructor(message: string, options: { readonly status?: number } = {}) {
+    super(message);
+    this.status = options.status;
+  }
 }
 
 const FATAL_NETWORK_CODES = new Set([
@@ -179,7 +186,9 @@ export class McpSession {
     }
     this.sessionId = response.headers.get("mcp-session-id") ?? this.sessionId;
     if (!response.ok) {
-      throw new CallError(`MCP answered ${response.status}: ${text.slice(0, 300)}`);
+      throw new CallError(`MCP answered ${response.status}: ${text.slice(0, 300)}`, {
+        status: response.status,
+      });
     }
     return {
       payloads: parseMcpPayloads(response.headers.get("content-type") ?? "", text),

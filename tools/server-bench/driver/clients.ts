@@ -12,7 +12,7 @@ import {
   RpcSocket,
 } from "./protocol.ts";
 import { pickIndex, type Rng, weightedChoice } from "./sampling.ts";
-import type { Recorder } from "./stats.ts";
+import type { CallHandle, Recorder } from "./stats.ts";
 
 /** The subset of `OrchestrationV2ThreadShell` the driver reads. */
 export interface ThreadShell {
@@ -93,25 +93,30 @@ export const now = () => performance.now();
 export const newId = () => NodeCrypto.randomUUID();
 
 /**
- * Times one call into `type`. A fatal error aborts the run; any other failure is counted and
- * yields undefined, or is rethrown when the caller cannot go on without the result.
+ * Times one call into `type`, attributed to the window it starts in. A fatal error aborts the
+ * run; `ignore` marks failures that are not the server's (they are dropped); any other failure
+ * is counted and yields undefined, or is rethrown when the caller cannot go on without it.
  */
 export async function timed<T>(
   context: RunContext,
   type: string,
   call: () => Promise<T>,
-  options: { readonly required?: boolean } = {},
+  options: { readonly required?: boolean; readonly ignore?: (error: unknown) => boolean } = {},
 ): Promise<T | undefined> {
+  const handle = context.recorder.begin(type);
   const started = now();
   try {
     const value = await call();
-    context.recorder.latency(type, now() - started);
+    context.recorder.succeed(handle, now() - started);
     return value;
   } catch (error) {
     if (error instanceof FatalError) {
+      context.recorder.discard(handle);
       context.abort(error);
-    } else if (!context.isStopping()) {
-      context.recorder.error(type, error instanceof Error ? error.message : String(error));
+    } else if (context.isStopping() || options.ignore?.(error) === true) {
+      context.recorder.discard(handle);
+    } else {
+      context.recorder.fail(handle, error instanceof Error ? error.message : String(error));
     }
     if (options.required === true) throw error;
     return undefined;
@@ -209,8 +214,11 @@ export class ShellWatcher {
 /** One agent session: sends a turn, waits for its run to settle, pauses, sends the next. */
 export class Session {
   private turn = 0;
-  private waiting: { readonly previousRunId: string | null; readonly startedAt: number } | null =
-    null;
+  private waiting: {
+    readonly previousRunId: string | null;
+    readonly startedAt: number;
+    readonly handle: CallHandle;
+  } | null = null;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private pendingModelSelection: { instanceId: string; model: string } | undefined;
   private outputInWindow = false;
@@ -252,7 +260,11 @@ export class Session {
   /** Fresh mode: the launch is the first turn. */
   async launch(projectId: string, title: string): Promise<void> {
     const { options } = this.context;
-    this.waiting = { previousRunId: null, startedAt: now() };
+    this.waiting = {
+      previousRunId: null,
+      startedAt: now(),
+      handle: this.context.recorder.begin("session.turn"),
+    };
     this.turn = 1;
     await timed(
       this.context,
@@ -298,6 +310,7 @@ export class Session {
     this.waiting = {
       previousRunId: this.watcher.get(this.threadId)?.latestRunId ?? null,
       startedAt: now(),
+      handle: this.context.recorder.begin("session.turn"),
     };
     const messageId = newId();
     const sent = await timed(this.context, "session.dispatch", () =>
@@ -321,6 +334,7 @@ export class Session {
       ),
     );
     if (sent === undefined) {
+      this.context.recorder.discard(this.waiting.handle);
       this.waiting = null;
       this.schedule(Math.max(options.turnGapMs, 1000));
       return;
@@ -337,9 +351,9 @@ export class Session {
     this.waiting = null;
     const { recorder } = this.context;
     if (shell.status === "completed") {
-      recorder.latency("session.turn", now() - waiting.startedAt);
+      recorder.succeed(waiting.handle, now() - waiting.startedAt);
     } else {
-      recorder.error("session.turn", `run ${shell.status}: ${shell.lastError ?? "no error text"}`);
+      recorder.fail(waiting.handle, `run ${shell.status}: ${shell.lastError ?? "no error text"}`);
     }
     this.schedule(this.context.options.turnGapMs);
   }
@@ -431,6 +445,7 @@ export class Subscriber {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private generation = 0;
   private current: string | undefined;
+  private syncHandle: CallHandle = null;
   readonly touched = new Set<string>();
 
   readonly index: number;
@@ -478,6 +493,7 @@ export class Subscriber {
     )) as { readonly value: ShellSnapshot; readonly bytes: number };
     recorder.count("bytes.httpShell", 1, snapshot.bytes);
     const synced = Promise.withResolvers<void>();
+    const handle = recorder.begin("subscribe.shellSync");
     const started = now();
     let synchronized = false;
     socket.stream(
@@ -496,7 +512,7 @@ export class Subscriber {
             (values as ReadonlyArray<StreamItem>).some((v) => v.kind === "synchronized")
           ) {
             synchronized = true;
-            recorder.latency("subscribe.shellSync", now() - started);
+            recorder.succeed(handle, now() - started);
             synced.resolve();
           }
         },
@@ -519,6 +535,7 @@ export class Subscriber {
     const generation = ++this.generation;
     this.stopThread?.();
     this.stopThread = undefined;
+    this.context.recorder.discard(this.syncHandle);
     this.current = threadId;
     const { recorder, http } = this.context;
     if (recorder.isOpen) this.touched.add(threadId);
@@ -530,6 +547,8 @@ export class Subscriber {
     );
     if (generation !== this.generation || this.context.isStopping()) return;
     if (bounded !== undefined) recorder.count("bytes.httpThreadBounded", 1, bounded.bytes);
+    const handle = recorder.begin("subscribe.threadSync");
+    this.syncHandle = handle;
     const started = now();
     let synchronized = false;
     this.stopThread = socket.stream(
@@ -553,19 +572,20 @@ export class Subscriber {
               events++;
               const occurredAt = Date.parse(value.event?.occurredAt ?? "");
               if (Number.isFinite(occurredAt)) {
-                recorder.latency("push.threadEvent", Math.max(0, received - occurredAt));
+                recorder.sample("push.threadEvent", Math.max(0, received - occurredAt));
               }
             } else if (value.kind === "snapshot") {
               recorder.count("events.threadSnapshot", 1);
             } else if (value.kind === "synchronized" && !synchronized) {
               synchronized = true;
-              recorder.latency("subscribe.threadSync", now() - started);
+              recorder.succeed(handle, now() - started);
             }
           }
           recorder.count("events.thread", events, bytes);
         },
         onEnd: (error) => {
           if (generation !== this.generation || this.context.isStopping()) return;
+          recorder.discard(handle);
           recorder.error("subscribe.threadStream", error?.message ?? "stream ended");
           this.timer = setTimeout(
             () => void this.show(this.pool[pickIndex(this.rng, this.pool.length)] as string),
@@ -609,6 +629,8 @@ export class Poller {
   private readonly prefix: string;
   private readonly ratePerSecond: number;
   private readonly mix: ReadonlyArray<readonly [PollCall, number]>;
+  private readonly endsOnUnauthorized: boolean;
+  private stoppedForGood = false;
 
   constructor(input: {
     readonly index: number;
@@ -619,6 +641,8 @@ export class Poller {
     readonly prefix: string;
     readonly ratePerSecond: number;
     readonly mix: ReadonlyArray<readonly [PollCall, number]>;
+    /** A session's own credential: a 401 means its session ended, so the caller stops quietly. */
+    readonly endsOnUnauthorized?: boolean;
   }) {
     this.index = input.index;
     this.context = input.context;
@@ -628,6 +652,12 @@ export class Poller {
     this.prefix = input.prefix;
     this.ratePerSecond = input.ratePerSecond;
     this.mix = input.mix;
+    this.endsOnUnauthorized = input.endsOnUnauthorized === true;
+  }
+
+  /** The caller's session ended (its credential was refused); it makes no more calls. */
+  get ended(): boolean {
+    return this.stoppedForGood;
   }
 
   start(): void {
@@ -635,7 +665,7 @@ export class Poller {
     const startedAt = now() + this.rng.next() * interval;
     let tick = 0;
     const next = () => {
-      if (this.context.isStopping()) return;
+      if (this.context.isStopping() || this.stoppedForGood) return;
       this.fire();
       tick++;
       this.timer = setTimeout(next, Math.max(0, startedAt + tick * interval - now()));
@@ -663,25 +693,40 @@ export class Poller {
     const { recorder, http } = this.context;
     const type = `${this.prefix}.${call}`;
     if (call !== "mcp.t3_project_list" && recorder.isOpen) this.touched.add(threadId);
-    const bytes = await timed(this.context, type, async () => {
-      if (call === "http.threadBounded") {
-        const result = await httpRequest(
-          http,
-          `/api/orchestration/threads/${encodeURIComponent(threadId)}/bounded?compactTurnItems=1&dedupeBodies=1&compactIds=1&deferWork=1`,
-        );
-        if (result.status !== 200) {
-          throw new CallError(
-            `bounded read answered ${result.status}: ${result.text.slice(0, 200)}`,
+    const bytes = await timed(
+      this.context,
+      type,
+      async () => {
+        if (call === "http.threadBounded") {
+          const result = await httpRequest(
+            http,
+            `/api/orchestration/threads/${encodeURIComponent(threadId)}/bounded?compactTurnItems=1&dedupeBodies=1&compactIds=1&deferWork=1`,
           );
+          if (result.status !== 200) {
+            throw new CallError(
+              `bounded read answered ${result.status}: ${result.text.slice(0, 200)}`,
+            );
+          }
+          return result.bytes;
         }
-        return result.bytes;
-      }
-      const mcp = this.mcp;
-      if (mcp === null) throw new CallError("no MCP session");
-      return call === "mcp.t3_project_list"
-        ? mcp.callTool("t3_project_list", {})
-        : mcp.callTool("t3_thread_read", { threadId });
-    });
+        const mcp = this.mcp;
+        if (mcp === null) throw new CallError("no MCP session");
+        return call === "mcp.t3_project_list"
+          ? mcp.callTool("t3_project_list", {})
+          : mcp.callTool("t3_thread_read", { threadId });
+      },
+      {
+        ignore: (error) => {
+          const ended =
+            this.endsOnUnauthorized && error instanceof CallError && error.status === 401;
+          if (ended) {
+            this.stoppedForGood = true;
+            clearTimeout(this.timer);
+          }
+          return ended;
+        },
+      },
+    );
     if (bytes !== undefined) recorder.count(`bytes.${type}`, 1, bytes);
   }
 

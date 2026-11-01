@@ -24,6 +24,7 @@ import type * as ResourceAttribution from "../resourceTelemetry/ResourceAttribut
 import {
   type EventNdjsonStream,
   formatEventNdjsonLine,
+  serializedRecordProblem,
   serializeEventNdjsonRecord,
 } from "./EventNdjsonRecord.ts";
 
@@ -552,8 +553,15 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
       }
     });
 
-    const writeSerialized = (payload: string, threadId: ThreadId | null) =>
-      appendRecord(payload, threadId, undefined);
+    const writeSerialized = (
+      record: ProviderEventLoggers.SerializedProviderEventRecord,
+      threadId: ThreadId | null,
+    ) => {
+      const problem = serializedRecordProblem(stream, record);
+      return problem === undefined
+        ? appendRecord(record.payload, threadId, undefined)
+        : logWarning("rejected a serialized provider event log record", { stream, problem });
+    };
 
     const write = Effect.fnUntraced(function* (event: unknown, threadId: ThreadId | null) {
       const startedAt = stageTiming?.now() ?? 0;

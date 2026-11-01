@@ -28,7 +28,7 @@ import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../../config.ts";
 import { makeCodexAppServerProtocolLogger } from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
-import { serializeEventNdjsonRecord } from "../EventNdjsonRecord.ts";
+import { serializedRecordProblem, serializeEventNdjsonRecord } from "../EventNdjsonRecord.ts";
 import * as ProviderIoOffloads from "./ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
 
@@ -176,9 +176,11 @@ const nativeLogger = (payloads: Array<string>): ProviderEventLoggers.EventNdjson
       const record = serializeEventNdjsonRecord("native", event);
       if (record._tag === "Serialized") payloads.push(record.payload);
     }),
-  writeSerialized: (payload) =>
+  // As the real view: a record serialized for another stream, or one write never builds, is refused.
+  writeSerialized: (record) =>
     Effect.sync(() => {
-      payloads.push(payload);
+      const problem = serializedRecordProblem("native", record);
+      payloads.push(problem === undefined ? record.payload : `refused: ${problem}`);
     }),
   close: () => Effect.void,
 });
@@ -201,7 +203,7 @@ const runCodex = (
               kill: Effect.void,
               log: {
                 providerSessionId,
-                writeSerialized: (payload) => native.writeSerialized!(payload, threadId),
+                writeSerialized: (record) => native.writeSerialized!(record, threadId),
               },
             }),
           );
@@ -503,7 +505,7 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
                 kill: Effect.void,
                 log: {
                   providerSessionId,
-                  writeSerialized: (payload) => native.writeSerialized!(payload, threadId),
+                  writeSerialized: (record) => native.writeSerialized!(record, threadId),
                 },
               }),
             );

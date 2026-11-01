@@ -22,7 +22,7 @@ const logEntry = (
     case "Skipped":
       return "skip";
     case "Serialized":
-      return { payload: serialized.payload };
+      return { stream: serialized.stream, payload: serialized.payload };
     case "Failed":
       // Main logs it, so the logger reports the failure as it does today.
       return "in-thread";

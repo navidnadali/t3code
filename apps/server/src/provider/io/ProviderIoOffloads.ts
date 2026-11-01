@@ -8,6 +8,7 @@ import * as Stream from "effect/Stream";
 import { AcpTransportError } from "effect-acp/errors";
 import { CodexAppServerTransportError } from "effect-codex-app-server/errors";
 import type { AcpLineOffload } from "effect-acp/protocol";
+import type { SerializedLogRecord } from "effect-codex-app-server/offload";
 import type { CodexAppServerLineOffload } from "effect-codex-app-server/protocol";
 import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime";
 
@@ -31,7 +32,7 @@ export interface CodexLineOffloadInput {
   /** Set when incoming protocol events go to the native log. */
   readonly log?: {
     readonly providerSessionId: string;
-    readonly writeSerialized: (payload: string) => Effect.Effect<void>;
+    readonly writeSerialized: (record: SerializedLogRecord) => Effect.Effect<void>;
   };
 }
 
@@ -60,10 +61,10 @@ const openLineSession = Effect.fnUntraced(function* <Options, Reply, E>(
 ) {
   const failed = yield* Deferred.make<never, E>();
   const watched = yield* Deferred.make<void>();
-  const session = yield* pool.open({
-    ...input,
-    kill: Deferred.await(watched).pipe(Effect.andThen(input.kill)),
-  });
+  // Opening fails only on options a worker cannot receive; the session then stays in-thread.
+  const session = yield* pool
+    .open({ ...input, kill: Deferred.await(watched).pipe(Effect.andThen(input.kill)) })
+    .pipe(Effect.catch(() => Effect.succeedNone));
   if (Option.isNone(session)) return Option.none();
   // Also on close: the scope can close before the watch below has started.
   yield* Effect.addFinalizer(() => Deferred.succeed(watched, undefined));

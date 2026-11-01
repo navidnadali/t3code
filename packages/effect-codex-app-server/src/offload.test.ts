@@ -8,13 +8,15 @@ it("parses an offloaded line and builds its log entries as the protocol does in-
   const stages: Array<string> = [];
   const logEntry = (event: { readonly stage: string; readonly payload: unknown }) => {
     stages.push(event.stage);
-    return event.stage === "raw" ? ("skip" as const) : { payload: JSON.stringify(event.payload) };
+    return event.stage === "raw"
+      ? ("skip" as const)
+      : { stream: "native", payload: JSON.stringify(event.payload) };
   };
 
   assert.deepEqual(CodexOffload.decodeOffloadedLine(line, logEntry), {
     _tag: "Decoded",
     message: { method: "item/agentMessage/delta", params: delta },
-    logs: [line],
+    logs: [{ stream: "native", payload: line }],
   });
   assert.deepEqual(stages, ["raw", "decoded"]);
   assert.deepEqual(CodexOffload.decodeOffloadedLine('{"id":3,"result":{"ok":true}}'), {

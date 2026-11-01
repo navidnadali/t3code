@@ -12,10 +12,10 @@ import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
 
 import * as CodexError from "./errors.ts";
-import { JsonRpcId, JsonRpcResponseEnvelope, timeStage } from "./_internal/shared.ts";
+import { isJsonRpcId, isObject, JsonRpcResponseEnvelope, timeStage } from "./_internal/shared.ts";
 import type * as CodexOffload from "./offload.ts";
 import * as CodexWire from "./wire.ts";
-const isJsonRpcId = Schema.is(JsonRpcId);
+const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
 const MAX_BUFFERED_RAW_MESSAGES = 32;
 const EXIT_STATUS_GRACE = "250 millis";
@@ -57,8 +57,8 @@ export interface CodexAppServerLineOffload {
   readonly decode: (
     line: string,
   ) => Effect.Effect<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
-  /** Appends an incoming log entry built off-thread. */
-  readonly writeLog: (payload: string) => Effect.Effect<void>;
+  /** Appends an incoming log record serialized off-thread. */
+  readonly writeLog: (record: CodexOffload.SerializedLogRecord) => Effect.Effect<void>;
   /** Fails when the offload stops working (its worker died); that error then ends the protocol. */
   readonly failure: Effect.Effect<never, CodexError.CodexAppServerError>;
 }
@@ -108,8 +108,8 @@ interface CodexAppServerPendingRequest {
   readonly method: string;
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+function isIncomingResponse(value: unknown): value is typeof JsonRpcResponseEnvelope.Type {
+  return isJsonRpcResponseEnvelope(value);
 }
 
 const encodeJsonString = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
@@ -394,7 +394,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       if (Option.isSome(yield* Ref.get(terminationFailure))) return;
       if (CodexWire.isIncomingRequest(message)) return yield* handleRequest(message);
       if (CodexWire.isIncomingNotification(message)) return yield* handleNotification(message);
-      if (CodexWire.isIncomingResponse(message)) return yield* handleResponse(message);
+      if (isIncomingResponse(message)) return yield* handleResponse(message);
       return yield* CodexError.CodexAppServerProtocolParseError.fromUnroutableMessage(message);
     });
 
@@ -459,7 +459,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       Stream.interruptWhen(Deferred.await(terminationSignal)),
       Stream.runForEach(
         Effect.fnUntraced(function* (chunk) {
-          const startedAt = timing?.now() ?? 0;
+          const startedAt = timing === undefined ? 0 : timing.now();
           const framed = framer.push(chunk);
           const framingMs = timing === undefined ? 0 : timing.now() - startedAt;
           for (const line of framed.lines) {

@@ -3,14 +3,12 @@ import * as Schema from "effect/Schema";
 
 import * as CodexRpc from "./_generated/meta.gen.ts";
 import * as CodexError from "./errors.ts";
-import { JsonRpcId, JsonRpcResponseEnvelope } from "./_internal/shared.ts";
+import { isJsonRpcId, isObject } from "./_internal/shared.ts";
 import type {
   CodexAppServerIncomingNotification,
   CodexAppServerIncomingRequest,
 } from "./protocol.ts";
 
-const isJsonRpcId = Schema.is(JsonRpcId);
-const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 // Bound JSONL lines before joining and parsing; the LF delimiter is excluded.
 export const MAX_INCOMING_MESSAGE_BYTES = 128 * 1024 * 1024;
 
@@ -69,10 +67,17 @@ const decodeJsonString = Schema.decodeUnknownResult(Schema.fromJsonString(Schema
 
 export const decodeWireLine = (
   line: string,
-): Result.Result<unknown, CodexError.CodexAppServerProtocolParseError> =>
-  Result.mapError(decodeJsonString(line), (cause) =>
-    CodexError.CodexAppServerProtocolParseError.fromSchemaError("decode-wire-message", cause),
-  );
+): Result.Result<unknown, CodexError.CodexAppServerProtocolParseError> => {
+  // The schema runs this same JSON.parse; it is only needed to build the error.
+  try {
+    const message: unknown = JSON.parse(line);
+    return Result.succeed(message);
+  } catch {
+    return Result.mapError(decodeJsonString(line), (cause) =>
+      CodexError.CodexAppServerProtocolParseError.fromSchemaError("decode-wire-message", cause),
+    );
+  }
+};
 
 export const decodeFailedLogPayload = (error: CodexError.CodexAppServerProtocolParseError) => ({
   operation: error.operation,
@@ -82,10 +87,6 @@ export const decodeFailedLogPayload = (error: CodexError.CodexAppServerProtocolP
   ...(error.issueKinds === undefined ? {} : { issueKinds: error.issueKinds }),
   ...(error.maximumPathDepth === undefined ? {} : { maximumPathDepth: error.maximumPathDepth }),
 });
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
 
 export function isIncomingRequest(value: unknown): value is CodexAppServerIncomingRequest {
   if (!isObject(value) || typeof value.method !== "string") {
@@ -98,10 +99,6 @@ export function isIncomingNotification(
   value: unknown,
 ): value is CodexAppServerIncomingNotification {
   return isObject(value) && typeof value.method === "string" && !("id" in value);
-}
-
-export function isIncomingResponse(value: unknown): value is typeof JsonRpcResponseEnvelope.Type {
-  return isJsonRpcResponseEnvelope(value);
 }
 
 export const decodeNotificationPayload = <A, I>(

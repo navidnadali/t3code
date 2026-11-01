@@ -33,6 +33,7 @@ import * as SqlError from "effect/sql/SqlError";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 import { getModelSelectionStringOptionValue, modelSelectionsEqual } from "@t3tools/shared/model";
+import { errorTag } from "@t3tools/shared/observability";
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
@@ -854,10 +855,16 @@ export const layer: Layer.Layer<
             .pipe(Effect.result),
       );
       if (Result.isFailure(written)) {
-        // Nothing committed; one by one, each event commits or fails as it would alone.
+        // Nothing committed; one by one, each event commits or fails as it would alone, and a real
+        // failure is reported there. The cause can render provider data, so Warn names only its tag.
+        const providerSessionId = inputs[0]?.providerSessionId;
         yield* Effect.logWarning("orchestration-v2.provider-event-batch-write-failed", {
-          providerSessionId: inputs[0]?.providerSessionId,
+          providerSessionId,
           eventCount: inputs.length,
+          errorTag: errorTag(written.failure),
+        });
+        yield* Effect.logDebug("orchestration-v2.provider-event-batch-write-failed", {
+          providerSessionId,
           cause: written.failure,
         });
         return yield* Effect.forEach(inputs, (input) => ingestor.ingestNormalized(input));

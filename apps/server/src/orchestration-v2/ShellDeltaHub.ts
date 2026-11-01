@@ -1,4 +1,5 @@
-import type { ApplicationStoredEvent, ThreadId } from "@t3tools/contracts";
+import type { ApplicationStoredEvent } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -137,6 +138,8 @@ const make = Effect.gen(function* () {
     yield* run({ committed, output }).pipe(
       Effect.catchCause((cause) =>
         Effect.suspend(() => {
+          // Stopping with the last subscriber interrupts the fibers; only a failure is reported.
+          if (Cause.hasInterruptsOnly(cause)) return Effect.void;
           instance.failure = new ShellDeltaHubError({
             message: "The shell delta hub stopped",
             cause,

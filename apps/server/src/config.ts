@@ -68,6 +68,7 @@ export class ServerConfig extends Context.Service<
     readonly traceBatchWindowMs: number;
     readonly traceMaxBytes: number;
     readonly traceMaxFiles: number;
+    readonly traceSqlMinDurationMs?: number | undefined;
     readonly otlpTracesUrl: string | undefined;
     readonly otlpMetricsUrl: string | undefined;
     readonly otlpLogsUrl: string | undefined;
@@ -106,6 +107,10 @@ export class ServerConfig extends Context.Service<
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;
     readonly tailscaleServePort: number;
+    readonly sqliteReaderPoolSize?: number | undefined;
+    readonly sqliteCacheSizeMb?: number | undefined;
+    readonly sqliteReaderCacheSizeMb?: number | undefined;
+    readonly sqliteMmapSizeMb?: number | undefined;
     readonly providerIoWorkers?: number | undefined;
   }
 >()("t3/config/ServerConfig") {

@@ -58,7 +58,8 @@ Refs
 Fixture (restored for every run with a reflink copy where the filesystem supports it)
   --fixture <file>         a checkpointed statev2.sqlite (VACUUM INTO output; a non-empty -wal next
                            to it is refused), copied to <base>/userdata/statev2.sqlite.
-  --fixture <dir>          a whole base-dir template (userdata/statev2.sqlite, settings.json ...).
+  --fixture <dir>          a whole base-dir template (userdata/statev2.sqlite, settings.json ...);
+                           regular files and directories only (a symlink is refused).
   --fixture none           an empty database (smoke only).
   The fixture's sha256 (cached by path, size and mtime in <work>/fixture-hashes.json) is recorded.
 
@@ -226,7 +227,7 @@ interface FixtureInfo {
   readonly bytes: number | null;
 }
 
-async function fixtureInfo(spec: string, workDir: string): Promise<FixtureInfo> {
+export async function fixtureInfo(spec: string, workDir: string): Promise<FixtureInfo> {
   if (spec === "none") return { kind: "empty", path: null, sha256: "empty", bytes: 0 };
   const path = NodeFS.realpathSync(spec);
   const cachePath = NodePath.join(workDir, "fixture-hashes.json");
@@ -246,9 +247,20 @@ async function fixtureInfo(spec: string, workDir: string): Promise<FixtureInfo> 
   };
   let info: FixtureInfo;
   if (NodeFS.statSync(path).isDirectory()) {
-    const files = (NodeFS.readdirSync(path, { recursive: true }) as Array<string>)
-      .filter((relative) => NodeFS.statSync(NodePath.join(path, relative)).isFile())
-      .toSorted();
+    const files: Array<string> = [];
+    for (const relative of (
+      NodeFS.readdirSync(path, { recursive: true }) as Array<string>
+    ).toSorted()) {
+      const stat = NodeFS.lstatSync(NodePath.join(path, relative));
+      if (stat.isDirectory()) continue;
+      // A copied link would let the server write into its target, outside the run's base dir.
+      if (!stat.isFile()) {
+        throw new Error(
+          `fixture ${path} has a ${stat.isSymbolicLink() ? "symlink" : "special file"} at ${relative}; a template holds only regular files and directories`,
+        );
+      }
+      files.push(relative);
+    }
     const hash = NodeCrypto.createHash("sha256");
     let bytes = 0;
     for (const relative of files) {

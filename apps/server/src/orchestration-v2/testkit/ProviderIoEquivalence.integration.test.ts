@@ -161,22 +161,26 @@ const normalize = (
   tmpRoot: string,
   freshIds: boolean,
 ): Capture => {
+  // Either separator (Windows), repeated where a path sits inside an escaped JSON string.
+  const separator = String.raw`[\\/]+`;
   const tmpDirectory = new RegExp(
-    `(?:/private)?${tmpRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/[^/\\\\\\s"']+`,
+    `(?:${separator}private)?${tmpRoot
+      .split(/[\\/]+/u)
+      .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
+      .join(separator)}${separator}([^\\\\/\\s"']+)`,
     "gu",
   );
   const tmpNames = new Map<string, string>();
-  const tmpName = (match: string) => {
-    const directory = match.slice(match.lastIndexOf("/") + 1);
+  const tmpName = (_match: string, directory: string) => {
     // mkdtemp appends six random characters to the prefix.
     const known = tmpNames.get(directory) ?? `<tmp ${directory.slice(0, -6)}#${tmpNames.size + 1}>`;
     tmpNames.set(directory, known);
     return known;
   };
   const scrub = (value: unknown) => {
-    const text = JSON.stringify(value)
-      .replace(tmpDirectory, tmpName)
-      .replace(ISO_TIMESTAMP, "<timestamp>");
+    const text = JSON.stringify(value, (_key, field: unknown) =>
+      typeof field === "string" ? field.replace(tmpDirectory, tmpName) : field,
+    ).replace(ISO_TIMESTAMP, "<timestamp>");
     return freshIds ? text.replace(DURATION_MS, (_match, key: string) => `${key}0`) : text;
   };
   const texts = [

@@ -2,6 +2,7 @@
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
+import * as NodeZlib from "node:zlib";
 import { Rolldown } from "vite-plus/pack";
 
 // The build sees only what Rolldown resolved, so the worker guards its loaders itself: any
@@ -86,7 +87,9 @@ const bundleProviderIoWorker = async (entry: string) => {
   });
   // String contents are never scanned: bundled code may carry loader text as data (ajv).
   const chunk = output[0];
-  const imports = [...new Set([...chunk.imports, ...chunk.dynamicImports])];
+  // A dynamic import Rolldown inlined (the lazily loaded Claude Agent SDK) names this chunk.
+  const dynamicImports = chunk.dynamicImports.filter((specifier) => specifier !== chunk.fileName);
+  const imports = [...new Set([...chunk.imports, ...dynamicImports])];
   const problems = [
     ...unresolved,
     ...imports
@@ -112,7 +115,7 @@ const realpathOrSelf = (path: string) => {
 /**
  * Replaces the `placeholder` module with `loadEmbeddedProviderIoWorkerSource`, returning `entry`
  * bundled as one CommonJS string for a worker run with `eval`: executables resolve only
- * built-ins and have no module files. The function keeps the string out of memory until used.
+ * built-ins and have no module files. The function inflates the string only when a worker starts.
  */
 export const providerIoWorkerBundle = (options: {
   readonly entry: string;
@@ -130,7 +133,13 @@ export const providerIoWorkerBundle = (options: {
       if (!id.endsWith(placeholderName) || realpathOrSelf(id) !== placeholder) return null;
       const code = await bundleProviderIoWorker(options.entry);
       embedded = true;
-      return `export const loadEmbeddedProviderIoWorkerSource = () => ${JSON.stringify(code)};`;
+      // Compressed, a 2 MB bundle that is partly two-byte text costs a server with the pool off a
+      // short ASCII string.
+      const compressed = NodeZlib.brotliCompressSync(code, {
+        params: { [NodeZlib.constants.BROTLI_PARAM_QUALITY]: 11 },
+      }).toString("base64");
+      // zlib loads only when a worker starts, not with every server.
+      return `export const loadEmbeddedProviderIoWorkerSource = () => process.getBuiltinModule("node:zlib").brotliDecompressSync(Buffer.from(${JSON.stringify(compressed)}, "base64")).toString("utf8");`;
     },
     // A placeholder path that never matches would otherwise ship a server with no worker.
     buildEnd(error?: Error) {

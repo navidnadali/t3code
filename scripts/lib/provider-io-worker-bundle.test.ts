@@ -47,11 +47,12 @@ const rejection = (worker: string) =>
 
 it.effect("embeds a worker that loads only built-ins", () =>
   Effect.gen(function* () {
-    const code = yield* buildHost(
+    const source = yield* embeddedSource(
       'import * as NodeWorkerThreads from "node:worker_threads";\n' +
         'NodeWorkerThreads.parentPort?.postMessage("worker-marker");\n',
     );
-    assert.include(code, "worker-marker");
+    assert.include(source, "worker-marker");
+    assert.equal(yield* runEmbedded(source), "worker-marker");
   }),
 );
 
@@ -76,13 +77,13 @@ it.effect("rejects a worker whose static import does not resolve", () =>
 // ajv (in the Claude Agent SDK) carries loader text as data and compiles validators at run time.
 it.effect("builds a worker whose code holds loader text as data and compiles code", () =>
   Effect.gen(function* () {
-    const code = yield* buildHost(
+    const source = yield* embeddedSource(
       'import * as NodeWorkerThreads from "node:worker_threads";\n' +
         'const generated = "require(\\"ajv/dist/runtime/uri\\").default";\n' +
         'const compile = new Function("x", "return x");\n' +
         "NodeWorkerThreads.parentPort?.postMessage([generated, compile(1)]);\n",
     );
-    assert.include(code, "ajv/dist/runtime/uri");
+    assert.include(source, "ajv/dist/runtime/uri");
   }),
 );
 

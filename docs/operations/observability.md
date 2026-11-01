@@ -176,8 +176,8 @@ flush its TLB, and leaves copy-on-write faults for the event loop, so measure be
 `T3CODE_PROCESS_SPAWNER=child` (also `1` or `true`, any case; it takes precedence over the worker)
 starts the same commands from a small spawner process instead, started once while the server is
 small, so the server never forks for them: each fork copies only the spawner's page tables.
-`worker` selects the worker thread, `default` (`0`, `false`) or unset neither; any other value is
-logged as an error and keeps the default. A spawner that stops is restarted, which forks the server
+`worker` selects the worker thread and `default` (`0`, `false`) neither; only when it is unset does
+`T3CODE_VCS_SPAWN_WORKER` apply. Any other value is logged as an error and keeps the default. A spawner that stops is restarted, which forks the server
 once. If it stops again before starting a command, or more than 3 times in 10 minutes, those
 commands fail with "The process spawner stopped" and an error is logged until the server restarts.
 Each command's unread output waits in the server, up to 1 MiB per stream, where it would otherwise

@@ -1452,8 +1452,10 @@ export function makeCodexAppServerProtocolLogger(input: {
 function redactCodexProtocolValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     const redacted = value.map(redactCodexProtocolValue);
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index) || redacted[index] !== value[index]) return redacted;
+    }
     return Object.getPrototypeOf(value) === Array.prototype &&
-      redacted.every((item, index) => item === value[index]) &&
       Object.keys(value).length === value.length
       ? value
       : redacted;

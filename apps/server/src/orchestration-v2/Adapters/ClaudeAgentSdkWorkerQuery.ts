@@ -221,6 +221,8 @@ const CLOSE_GRACE = Duration.seconds(2);
 const CLOSE_KILL_AFTER = Duration.seconds(5);
 // The SDK's own error for a call once its transport has closed.
 const QUERY_ENDED = "ProcessTransport is not ready for writing";
+// The signals the SDK sends its CLI; `kill` throws on an unknown name.
+const CLI_SIGNALS: ReadonlySet<string> = new Set(["SIGTERM", "SIGKILL", "SIGINT"]);
 
 /**
  * Runs `query()` on a provider I/O worker (none when the pool is off); main spawns and owns the CLI.
@@ -436,13 +438,20 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       case "spawn":
         spawnChild(event);
         return;
+      // A worker bug fails only this session: the pool turns a throw here into its failure.
       case "stdin":
+        if (typeof event.data !== "string" && !(event.data instanceof Uint8Array)) {
+          throw new TypeError("The provider I/O worker sent CLI input that is not text or bytes.");
+        }
         child?.stdin.write(event.data);
         return;
       case "stdinEnd":
         child?.stdin.end();
         return;
       case "kill":
+        if (event.signal !== undefined && !CLI_SIGNALS.has(event.signal)) {
+          throw new TypeError("The provider I/O worker sent an unknown signal for the CLI.");
+        }
         child?.kill(event.signal);
         return;
       case "abort":

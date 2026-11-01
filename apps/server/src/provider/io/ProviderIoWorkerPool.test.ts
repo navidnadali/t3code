@@ -11,6 +11,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as Scheduler from "effect/Scheduler";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { AcpTransportError } from "effect-acp/errors";
@@ -20,12 +21,13 @@ import { vi } from "vite-plus/test";
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
 import { echoStage, linesStage } from "./testFixtures/providerIoTestStages.ts";
 
-type WorkerMode = "fixture" | "production" | "silent" | "throws";
+type WorkerMode = "fixture" | "production" | "silent" | "throws" | "inert";
 
 const workers = vi.hoisted(() => ({
   mode: "fixture" as WorkerMode,
   started: new Array<NodeWorkerThreads.Worker>(),
   exits: new WeakMap<NodeWorkerThreads.Worker, Promise<number>>(),
+  opened: new Array<number>(),
 }));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
@@ -37,10 +39,22 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         production: args,
         silent: ["setInterval(() => {}, 1 << 30);", { eval: true }],
         throws: ['throw new Error("worker start failed");', { eval: true }],
+        // Ready, then never answers: the test injects the worker's replies itself.
+        inert: [
+          'require("node:worker_threads").parentPort.postMessage({ type: "ready" }); setInterval(() => {}, 1 << 30);',
+          { eval: true },
+        ],
       };
       super(...replacements[workers.mode]);
       workers.started.push(this);
       workers.exits.set(this, new Promise((resolve) => this.once("exit", resolve)));
+    }
+    override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      const [message] = args as [{ readonly type?: unknown; readonly session?: unknown }];
+      if (message.type === "open" && typeof message.session === "number") {
+        workers.opened.push(message.session);
+      }
+      super.postMessage(...args);
     }
   }
   return { ...actual, Worker: RecordedWorker };
@@ -369,5 +383,80 @@ it.effect("rejects and logs worker messages of an unknown or malformed shape and
         ]);
       }),
     ),
+  ),
+);
+
+// Parks the forked fiber after `ops` operations, so the caller acts at that exact point; a budget
+// under 3 never lets a resumed fiber make progress.
+const forkParkedAfter = <A, E, R>(ops: number, effect: Effect.Effect<A, E, R>) =>
+  Effect.forkChild(Effect.provideService(effect, Scheduler.MaxOpsBeforeYield, ops), {
+    startImmediately: true,
+  });
+
+const OP_BOUNDARIES = 40;
+
+it.effect("admits a waiting write whenever its credit returns during admission", () =>
+  withPool({ workers: 1, mode: "inert" }, (pool) =>
+    Effect.gen(function* () {
+      const worker = workers.started.at(-1)!;
+      for (let ops = 3; ops <= OP_BOUNDARIES; ops++) {
+        yield* Effect.gen(function* () {
+          const session = yield* openEcho(pool, "t", { highWaterMark: 4 });
+          yield* session.write(bytes("full"));
+          const write = yield* forkParkedAfter(ops, session.write(bytes("next")));
+          worker.emit("message", {
+            type: "output",
+            session: workers.opened.at(-1),
+            outputs: [],
+            bytes: 4,
+          });
+          yield* Fiber.join(write);
+        }).pipe(Effect.scoped);
+      }
+    }),
+  ),
+);
+
+it.effect("starts one replacement for a stopped worker however many sessions open at once", () =>
+  withPool({ workers: 1 }, (pool, started) =>
+    Effect.gen(function* () {
+      // Stopping a worker before its handshake would turn the pool off instead.
+      yield* openEcho(pool, "ready").pipe(Effect.scoped);
+      for (let ops = 3; ops <= OP_BOUNDARIES; ops++) {
+        const current = workers.started.at(-1)!;
+        yield* Effect.promise(() => current.terminate());
+        yield* Effect.promise(() => workers.exits.get(current)!);
+        const startedBefore = started();
+        yield* Effect.gen(function* () {
+          const first = yield* forkParkedAfter(ops, openEchoOption(pool));
+          const second = yield* Effect.forkChild(openEchoOption(pool), { startImmediately: true });
+          assert.isTrue(Option.isSome(yield* Fiber.join(first)));
+          assert.isTrue(Option.isSome(yield* Fiber.join(second)));
+        }).pipe(Effect.scoped);
+        assert.equal(started() - startedBefore, 1);
+      }
+    }),
+  ),
+);
+
+it.effect("never hands out a session on a worker that stopped while it was opening", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      yield* openEcho(pool, "ready").pipe(Effect.scoped);
+      for (let ops = 3; ops <= OP_BOUNDARIES; ops++) {
+        const current = workers.started.at(-1)!;
+        yield* Effect.gen(function* () {
+          const opening = yield* forkParkedAfter(ops, openEchoOption(pool));
+          current.emit("exit", 1);
+          const session = yield* Fiber.join(opening);
+          if (Option.isNone(session)) return;
+          // A session that registered in time fails with the worker; a later one is on a replacement.
+          yield* Effect.exit(session.value.end);
+          yield* Effect.exit(Stream.runDrain(session.value.output));
+        }).pipe(Effect.scoped);
+        yield* Effect.promise(() => current.terminate());
+      }
+      assert.isTrue(Option.isSome(yield* openEchoOption(pool)));
+    }),
   ),
 );

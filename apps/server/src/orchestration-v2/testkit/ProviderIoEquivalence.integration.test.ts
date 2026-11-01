@@ -59,8 +59,8 @@ interface Capture {
 
 interface PoolUse {
   readonly sessions: number;
-  /** Requests sent to the workers (offloaded lines). */
-  readonly calls: number;
+  /** Lines the workers decoded (not handed back to main). */
+  readonly decoded: number;
 }
 
 interface CaptureRun {
@@ -333,7 +333,7 @@ const adapterRow = <
         close: () => Effect.void,
       };
       const pool = yield* ProviderIoWorkerPool.make({ workers: mode.workers });
-      const use: Record<string, { sessions: number; calls: number }> = {};
+      const use: Record<string, { sessions: number; decoded: number }> = {};
       const layerPool = Layer.succeed(
         ProviderIoWorkerPool.ProviderIoWorkerPool,
         ProviderIoWorkerPool.ProviderIoWorkerPool.of({
@@ -341,14 +341,21 @@ const adapterRow = <
             pool.open(openInput).pipe(
               Effect.map(
                 Option.map((session) => {
-                  const stage = (use[openInput.stage.name] ??= { sessions: 0, calls: 0 });
+                  const stage = (use[openInput.stage.name] ??= { sessions: 0, decoded: 0 });
                   stage.sessions += 1;
+                  // Only lines the worker decoded count: it may hand a line back to main.
                   return {
                     ...session,
-                    call: (request) => {
-                      stage.calls += 1;
-                      return session.call(request);
-                    },
+                    call: (request) =>
+                      session.call(request).pipe(
+                        Effect.tap((reply) =>
+                          Effect.sync(() => {
+                            if ((reply as { readonly _tag?: unknown })._tag === "Decoded") {
+                              stage.decoded += 1;
+                            }
+                          }),
+                        ),
+                      ),
                   };
                 }),
               ),
@@ -576,7 +583,7 @@ describe("provider I/O at 0 and 2 workers", () => {
             const use = onWorkers.pool[row.stage];
             assert.isAbove(use?.sessions ?? 0, 0, `${mode.name}: workers took the sessions`);
             if (mode.offloadMinChars === 0) {
-              assert.isAbove(use?.calls ?? 0, 0, `${mode.name}: workers took the lines`);
+              assert.isAbove(use?.decoded ?? 0, 0, `${mode.name}: workers decoded the lines`);
             }
           }
           for (const channel of [

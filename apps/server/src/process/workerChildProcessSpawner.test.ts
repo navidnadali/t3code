@@ -632,6 +632,65 @@ describe("WorkerChildProcessSpawner", () => {
   );
 
   it.live.skipIf(!workerPlatform)(
+    "rejects a malformed message from the spawner process as a failed spawner, without crashing the server",
+    () =>
+      Effect.gen(function* () {
+        const script = `
+          import * as NodeServices from "@effect/platform-node/NodeServices";
+          import * as Effect from "effect/Effect";
+          import * as Layer from "effect/Layer";
+          import * as Logger from "effect/Logger";
+          import * as ChildProcess from "effect/process/ChildProcess";
+          import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
+          const loading = new MessageChannel();
+          loading.port1.on("message", () => {});
+          const W = await import(process.argv[1]);
+          loading.port1.close();
+          const malformed = {
+            stream: 'post({ t: "end", id, s: "length" });',
+            pid: 'post({ t: "spawn", id, pid: 1 });',
+          };
+          const results = {};
+          await Effect.runPromise(
+            Effect.gen(function* () {
+              for (const [name, message] of Object.entries(malformed)) {
+                const source = W.spawnerProcessSource.replace(
+                  "  children.set(id, entry);",
+                  "  children.set(id, entry); " + message,
+                );
+                if (source === W.spawnerProcessSource) process.exit(2);
+                const spawner = yield* W.makeProcessSpawner(yield* ChildProcessSpawner, { source });
+                const exit = yield* Effect.exit(
+                  spawner.string(ChildProcess.make(process.execPath, ["-e", "setTimeout(() => {}, 0)"])),
+                );
+                results[name] = exit._tag;
+              }
+            }).pipe(
+              Effect.scoped,
+              Effect.provide(Layer.merge(NodeServices.layer, Logger.layer([], { mergeWithExisting: false }))),
+            ),
+          );
+          process.stdout.write(Object.entries(results).map(([name, tag]) => name + ":" + tag).join(" "));`;
+        const server = NodeChildProcess.spawn(
+          process.execPath,
+          [
+            "--input-type=module",
+            "-e",
+            script,
+            `${import.meta.dirname}/workerChildProcessSpawner.ts`,
+          ],
+          { cwd: `${import.meta.dirname}/../..`, stdio: ["ignore", "pipe", "ignore"] },
+        );
+        let stdout = "";
+        server.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+        const code = yield* Effect.callback<number | null>((resume) => {
+          server.on("close", (code) => resume(Effect.succeed(code)));
+        });
+        expect({ code, stdout }).toEqual({ code: 0, stdout: "stream:Failure pid:Failure" });
+      }),
+  );
+
+  it.live.skipIf(!workerPlatform)(
     "a kill whose answer arrives after its child closed keeps the server alive until it settles",
     () =>
       Effect.gen(function* () {

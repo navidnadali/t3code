@@ -19,7 +19,7 @@ import {
   keptAs,
   rewriteContent,
 } from "./fixture/content.ts";
-import { extendedFindings } from "./fixture/extended.ts";
+import { extendedFindings, extendedMayMatch } from "./fixture/extended.ts";
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { TOKEN_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
@@ -109,6 +109,23 @@ const synthCopy = (destination: string) => {
   }
   NodeFS.copyFileSync(sharedDatabase, destination);
 };
+
+/**
+ * Migration 77's turn item counts against `COUNT(*)` of the items, both ways: rows whose count is
+ * off, plus (thread, run) pairs with items but no row.
+ */
+const turnItemCountsMismatch = (path: string) => ({
+  rows: count(path, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts`),
+  wrong: count(
+    path,
+    `SELECT COUNT(*) AS n FROM (
+       SELECT thread_id, COALESCE(run_id, '') AS run_id, COUNT(*) AS items
+       FROM orchestration_v2_projection_turn_items GROUP BY thread_id, COALESCE(run_id, '')) AS i
+     FULL OUTER JOIN orchestration_v2_projection_turn_item_counts AS c
+       ON c.thread_id = i.thread_id AND c.run_id = i.run_id
+     WHERE c.item_count IS NOT i.items`,
+  ),
+});
 
 const count = (path: string, sql: string) => {
   const db = new NodeSqlite.DatabaseSync(path, { readOnly: true });
@@ -431,13 +448,6 @@ const seedPendingWork = (path: string) => {
     `DELETE FROM orchestration_v2_projection_context_transfers
      WHERE source_thread_id = ? AND type = 'subagent_result'`,
   ).run(child.id);
-  // P1-014's migration 77: turn items per thread and run, kept by triggers. Sanitise must keep it.
-  db.exec(`CREATE TABLE IF NOT EXISTS orchestration_v2_projection_turn_item_counts (
-      thread_id TEXT NOT NULL, run_id TEXT NOT NULL, item_count INTEGER NOT NULL,
-      PRIMARY KEY (thread_id, run_id)) WITHOUT ROWID;
-    INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
-      SELECT thread_id, COALESCE(run_id, ''), COUNT(*) FROM orchestration_v2_projection_turn_items
-      GROUP BY thread_id, COALESCE(run_id, '');`);
   // A task delegated to another machine, still without its result: its follower resumes on start.
   db.prepare(
     `UPDATE orchestration_v2_projection_subagents
@@ -1012,6 +1022,11 @@ describe("fixture CLI", () => {
     expect(Math.abs(result.sizeDeviation)).toBeLessThan(0.1);
     const off = result.tables.filter((row) => row.target > 0 && Math.abs(row.deviation ?? 1) > 0.1);
     expect(off).toEqual([]);
+    // Migration 77's turn item counts, kept by its triggers while synth writes: exact.
+    expect(turnItemCountsMismatch(NodePath.join(directory, "example.sqlite"))).toEqual({
+      rows: expect.any(Number),
+      wrong: 0,
+    });
   });
 
   it("sanitise leaves a seeded fixture with nothing runnable and no credentials", () => {
@@ -1066,16 +1081,9 @@ describe("fixture CLI", () => {
         `SELECT COUNT(*) AS n FROM orchestration_v2_projection_runtime_requests WHERE status = 'pending'`,
       ),
     ).toBe(0);
-    // Turn item counts stay, exact for the items the fixture holds.
-    const counts = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts AS c
-      WHERE c.item_count = (SELECT COUNT(*) FROM orchestration_v2_projection_turn_items AS i
-        WHERE i.thread_id = c.thread_id AND COALESCE(i.run_id, '') = c.run_id)`;
-    expect(count(clean, counts)).toBe(
-      count(clean, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts`),
-    );
-    expect(
-      count(clean, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts`),
-    ).toBeGreaterThan(0);
+    // Migration 77's turn item counts stay, exact for the items the fixture holds.
+    const counted = turnItemCountsMismatch(clean);
+    expect([counted.rows > 0, counted.wrong]).toEqual([true, 0]);
     const settled = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_subagents
       WHERE subagent_id = '${task}' AND status = 'completed' AND json_extract(payload_json, '$.result') IS NOT NULL`;
     expect(count(clean, settled)).toBe(1);
@@ -1393,6 +1401,104 @@ describe("allowlist limits", () => {
       extendedFindings(deepObject, () => undefined);
       rewriteContent(deepObject, null, "blank", emptyCounts());
     }).not.toThrow();
+  });
+});
+
+describe("allowlisted ids", () => {
+  // Production: 20 Claude reasoning ids whose random part ended in `pwd` (any case), kept as ids, read
+  // by P1-002's extended check as `pwd:<8 letters>` assignments; the self-check failed, nothing written.
+  const NATIVE_ID = "abc_123XXXXXXXXXXXXXXXXXXXpWd:abcdefgh:1";
+
+  it("blanks a kept id that an extended rule reads as a credential", () => {
+    const payload = JSON.stringify({
+      type: "reasoning",
+      nativeItemRef: { driver: "claudeAgent", nativeId: NATIVE_ID, strength: "strong" },
+      providerThreadId: `provider-thread:${NATIVE_ID}`,
+    });
+    const out = JSON.parse(rewriteContent(payload, "payload_json", "blank", emptyCounts())) as {
+      nativeItemRef: { nativeId: string };
+      providerThreadId: string;
+    };
+    expect([isFiller(out.nativeItemRef.nativeId), isFiller(out.providerThreadId)]).toEqual([
+      true,
+      true,
+    ]);
+    const kinds: Array<string> = [];
+    contentFindings(payload, "payload_json", "blank", (kind) => kinds.push(kind));
+    expect(kinds.filter((kind) => kind.startsWith("raw|keyword assignment"))).toEqual([
+      "raw|keyword assignment (loose)",
+      "raw|keyword assignment (loose)",
+    ]);
+  });
+
+  it("skips the extended rules only on values none of them can match", () => {
+    // Id-like strings built from id characters and fragments of every rule's literals.
+    const parts = [
+      ..."abcXYZ019_-:.%/+=@ ",
+      "pWd",
+      "PASS",
+      "Key",
+      "tok",
+      "en",
+      "DSN",
+      "AKIA",
+      "sk-",
+      "eyJ",
+      "-----",
+      "://",
+      "\n",
+      "0123456789abcdef",
+      "A".repeat(64),
+    ];
+    let state = 7;
+    const random = () => {
+      state = (state * 48271) % 2147483647;
+      return state / 2147483647;
+    };
+    const missed: Array<string> = [];
+    for (let index = 0; index < 50_000; index++) {
+      let text = "";
+      for (let length = 1 + Math.floor(random() * 30); length > 0; length--) {
+        text += parts[Math.floor(random() * parts.length)];
+      }
+      if (extendedMayMatch(text)) continue;
+      extendedFindings(text, () => missed.push(text));
+    }
+    expect(missed).toEqual([]);
+  });
+
+  it("sanitises a turn item and its event whose native id reads as an assignment", () => {
+    const directory = scratch("native-id");
+    const seeded = NodePath.join(directory, "seeded.sqlite");
+    synthCopy(seeded);
+    const db = new NodeSqlite.DatabaseSync(seeded);
+    const item = (
+      db
+        .prepare(
+          `SELECT turn_item_id AS id FROM orchestration_v2_projection_turn_items
+           WHERE type = 'reasoning' ORDER BY turn_item_id LIMIT 1`,
+        )
+        .get() as { id: string }
+    ).id;
+    const reference = `json_object('driver', 'claudeAgent', 'nativeId', ?, 'strength', 'strong')`;
+    db.prepare(
+      `UPDATE orchestration_v2_projection_turn_items
+       SET payload_json = json_set(payload_json, '$.nativeItemRef', ${reference}) WHERE turn_item_id = ?`,
+    ).run(NATIVE_ID, item);
+    const events = db
+      .prepare(
+        `UPDATE orchestration_events
+         SET payload_json = json_set(payload_json, '$.nativeItemRef', ${reference})
+         WHERE event_type = 'turn-item.updated' AND json_extract(payload_json, '$.id') = ?`,
+      )
+      .run(NATIVE_ID, item).changes;
+    db.close();
+    expect(Number(events)).toBeGreaterThan(0);
+    const clean = NodePath.join(directory, "clean.sqlite");
+    const result = run(["sanitise", seeded, clean]);
+    expect([result.status, result.stderr]).toEqual([0, ""]);
+    const raw = NodeFS.readFileSync(clean).toString("latin1");
+    expect(raw.includes(NATIVE_ID)).toBe(false);
   });
 });
 

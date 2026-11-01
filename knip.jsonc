@@ -43,9 +43,12 @@
     },
     "apps/server": {
       // Vite+ pack entries and the launcher used by installed background services.
+      // Provider I/O workers load by URL (and vite.config.ts bundles the production one).
       "entry": [
         "src/bin.ts!",
         "src/claude-history-worker.ts!",
+        "src/provider/io/providerIoWorker.ts!",
+        "src/provider/io/testFixtures/providerIoTestWorker.ts",
         "scripts/cli.ts",
         "scripts/fetch-expo-schema.ts",
         "scripts/probe-claude-fork-local-rollback-replay.ts",

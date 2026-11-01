@@ -197,13 +197,15 @@ function* elementsParts(elements: ReadonlyArray<Json>): Generator<string> {
   yield "]";
 }
 
+// Parts are sized before escaping, which can make one six times longer: cut the written text.
 function* chunks(parts: Iterable<string>): Generator<Uint8Array> {
   let pending = "";
   for (const part of parts) {
     pending += part;
-    if (pending.length >= CHUNK_CHARS) {
-      yield Buffer.from(pending, "utf8");
-      pending = "";
+    while (pending.length >= CHUNK_CHARS) {
+      const end = sliceEnd(pending, 0);
+      yield Buffer.from(pending.slice(0, end), "utf8");
+      pending = pending.slice(end);
     }
   }
   if (pending.length > 0) yield Buffer.from(pending, "utf8");

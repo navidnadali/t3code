@@ -214,6 +214,32 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
       }),
   );
 
+  it.effect("reads a SQL span threshold up to the slow-span cutoff and rejects any other", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-trace-sql-" })),
+      );
+      const resolveThreshold = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.traceSqlMinDurationMs),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveThreshold({})).toBeUndefined();
+      expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "0" })).toBeUndefined();
+      expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "2.5" })).toBe(2.5);
+      expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "1000" })).toBe(1_000);
+      for (const value of ["-1", "2ms", "NaN", "Infinity", "1000.5"]) {
+        const error = yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: value }).pipe(
+          Effect.flip,
+        );
+        expect(String(error)).toMatch(/at \["T3CODE_TRACE_SQL_MIN_DURATION_MS"\]/);
+      }
+    }),
+  );
+
   it.effect("enables a trimmed reusable auth token only for web dev mode", () =>
     Effect.gen(function* () {
       const baseDir = yield* FileSystem.FileSystem.pipe(
@@ -928,5 +954,154 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         privateNetworkOnly: undefined,
       });
     }),
+  );
+
+  it.effect("accepts a SQLite reader pool of 1 to 32 workers and rejects any other size", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-reader-pool-" })),
+      );
+      const resolvePoolSize = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.sqliteReaderPoolSize),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolvePoolSize({})).toBeUndefined();
+      expect(yield* resolvePoolSize({ T3CODE_SQLITE_READER_POOL: "1" })).toBe(1);
+      expect(yield* resolvePoolSize({ T3CODE_SQLITE_READER_POOL: "32" })).toBe(32);
+      for (const size of ["0", "33"]) {
+        const error = yield* resolvePoolSize({ T3CODE_SQLITE_READER_POOL: size }).pipe(Effect.flip);
+        expect(String(error)).toMatch(/between 1 and 32\s+at \["T3CODE_SQLITE_READER_POOL"\]/);
+      }
+    }),
+  );
+
+  it.effect("reads SQLite page cache and memory map sizes and refuses ones SQLite cannot use", () =>
+    Effect.gen(function* () {
+      const { join } = yield* Path.Path;
+      const baseDir = join(NodeOS.tmpdir(), "t3-cli-config-sqlite-tuning");
+      const resolve = (env: Record<string, string>) =>
+        resolveServerConfig(minimalWebFlags(baseDir), Option.none()).pipe(
+          Effect.map(({ sqliteCacheSizeMb, sqliteReaderCacheSizeMb, sqliteMmapSizeMb }) => ({
+            sqliteCacheSizeMb,
+            sqliteReaderCacheSizeMb,
+            sqliteMmapSizeMb,
+          })),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolve({})).toStrictEqual({
+        sqliteCacheSizeMb: undefined,
+        sqliteReaderCacheSizeMb: undefined,
+        sqliteMmapSizeMb: undefined,
+      });
+      expect(
+        yield* resolve({
+          T3CODE_SQLITE_CACHE_MB: "512",
+          T3CODE_SQLITE_READER_CACHE_MB: "0",
+          T3CODE_SQLITE_MMAP_MB: "2047",
+        }),
+      ).toStrictEqual({
+        sqliteCacheSizeMb: 512,
+        sqliteReaderCacheSizeMb: 0,
+        sqliteMmapSizeMb: 2047,
+      });
+      for (const [name, value, message] of [
+        [
+          "T3CODE_SQLITE_CACHE_MB",
+          "-1",
+          "T3CODE_SQLITE_CACHE_MB must be 0 (SQLite default) to 2097152 MiB",
+        ],
+        [
+          "T3CODE_SQLITE_CACHE_MB",
+          "2097153",
+          "T3CODE_SQLITE_CACHE_MB must be 0 (SQLite default) to 2097152 MiB",
+        ],
+        ["T3CODE_SQLITE_READER_CACHE_MB", "1.5", "Expected an integer"],
+        ["T3CODE_SQLITE_READER_CACHE_MB", "64MB", "Expected a string representing a finite number"],
+        [
+          "T3CODE_SQLITE_MMAP_MB",
+          "2048",
+          "T3CODE_SQLITE_MMAP_MB must be 0 (SQLite default) to 2047 MiB",
+        ],
+      ] as const) {
+        const error = String(yield* resolve({ [name]: value }).pipe(Effect.flip));
+        expect(error).toContain(message);
+        expect(error).toContain(name);
+      }
+    }),
+  );
+
+  it.effect("leaves provider I/O workers off unless 0 to 32 workers are configured", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-provider-io-" })),
+      );
+      const resolveWorkers = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.providerIoWorkers),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveWorkers({})).toBeUndefined();
+      expect(yield* resolveWorkers({ T3CODE_PROVIDER_IO_WORKERS: "0" })).toBe(0);
+      expect(yield* resolveWorkers({ T3CODE_PROVIDER_IO_WORKERS: "32" })).toBe(32);
+      for (const [workers, problem] of [
+        ["-1", "between 0 and 32"],
+        ["33", "between 0 and 32"],
+        ["two", "finite number"],
+      ] as const) {
+        const error = yield* resolveWorkers({ T3CODE_PROVIDER_IO_WORKERS: workers }).pipe(
+          Effect.flip,
+        );
+        expect(String(error)).toContain(problem);
+        expect(String(error)).toContain('at ["T3CODE_PROVIDER_IO_WORKERS"]');
+      }
+    }),
+  );
+
+  it.effect(
+    "reads the line lengths provider I/O workers parse from and refuses negative ones",
+    () =>
+      Effect.gen(function* () {
+        const baseDir = yield* FileSystem.FileSystem.pipe(
+          Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-provider-io-" })),
+        );
+        const resolve = (env: Record<string, string>) =>
+          resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+            Effect.map((config) => [
+              config.providerIoCodexOffloadMinChars,
+              config.providerIoAcpOffloadMinChars,
+            ]),
+            Effect.provide(
+              Layer.mergeAll(
+                ConfigProvider.layer(ConfigProvider.fromEnv({ env })),
+                NetService.layer,
+              ),
+            ),
+          );
+
+        expect(yield* resolve({})).toEqual([undefined, undefined]);
+        expect(
+          yield* resolve({
+            T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS: "0",
+            T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS: "65536",
+          }),
+        ).toEqual([0, 65536]);
+        for (const name of [
+          "T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS",
+          "T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS",
+        ]) {
+          const error = String(yield* resolve({ [name]: "-1" }).pipe(Effect.flip));
+          expect(error).toContain(`at ["${name}"]`);
+        }
+      }),
   );
 });

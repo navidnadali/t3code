@@ -6,6 +6,11 @@ import {
 } from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
+import {
+  SQLITE_MAX_CACHE_SIZE_MB,
+  SQLITE_MAX_MMAP_SIZE_MB,
+  SQLITE_MAX_READER_POOL_SIZE,
+} from "@t3tools/shared/nodeSqliteClient";
 import { DesktopBackendBootstrap, PortSchema } from "@t3tools/contracts";
 import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
@@ -25,7 +30,9 @@ import * as CliError from "effect/cli/CliError";
 import { readBootstrapEnvelope } from "../bootstrap.ts";
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
+import { DEFAULT_SLOW_SPAN_THRESHOLD_MS } from "../diagnostics/TraceDiagnostics.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
+import { PROVIDER_IO_MAX_WORKERS } from "../provider/io/ProviderIoWorkerPool.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 
 const modeFlag = Flag.Literals("mode", ServerConfig.RuntimeMode.literals).pipe(
@@ -100,6 +107,17 @@ export const traceMaxFilesConfig = Config.Int("T3CODE_TRACE_MAX_FILES").pipe(
   Config.withDefault(10),
 );
 
+const sqliteMebibytesConfig = (name: string, maximum: number) =>
+  Config.schema(
+    Schema.Int.check(
+      Schema.isBetween(
+        { minimum: 0, maximum },
+        { message: `${name} must be 0 (SQLite default) to ${maximum} MiB` },
+      ),
+    ),
+    name,
+  ).pipe(Config.option, Config.map(Option.getOrUndefined));
+
 const EnvServerConfig = Config.all({
   logLevel: Config.LogLevel("T3CODE_LOG_LEVEL").pipe(Config.withDefault("Info")),
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
@@ -108,6 +126,11 @@ const EnvServerConfig = Config.all({
   traceMaxBytes: Config.Int("T3CODE_TRACE_MAX_BYTES").pipe(Config.withDefault(10 * 1024 * 1024)),
   traceMaxFiles: traceMaxFilesConfig,
   traceBatchWindowMs: Config.Int("T3CODE_TRACE_BATCH_WINDOW_MS").pipe(Config.withDefault(1_000)),
+  // Capped at the Diagnostics slow-span cutoff, so a counted span is never a slow one.
+  traceSqlMinDurationMs: Config.schema(
+    Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: DEFAULT_SLOW_SPAN_THRESHOLD_MS })),
+    "T3CODE_TRACE_SQL_MIN_DURATION_MS",
+  ).pipe(Config.withDefault(0)),
   otlpTracesUrl: Config.String("T3CODE_OTLP_TRACES_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -172,6 +195,28 @@ const EnvServerConfig = Config.all({
     Config.map(Option.getOrUndefined),
   ),
   lan: Config.Boolean("T3CODE_LAN").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  sqliteReaderPoolSize: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: SQLITE_MAX_READER_POOL_SIZE })),
+    "T3CODE_SQLITE_READER_POOL",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  sqliteCacheSizeMb: sqliteMebibytesConfig("T3CODE_SQLITE_CACHE_MB", SQLITE_MAX_CACHE_SIZE_MB),
+  sqliteReaderCacheSizeMb: sqliteMebibytesConfig(
+    "T3CODE_SQLITE_READER_CACHE_MB",
+    SQLITE_MAX_CACHE_SIZE_MB,
+  ),
+  sqliteMmapSizeMb: sqliteMebibytesConfig("T3CODE_SQLITE_MMAP_MB", SQLITE_MAX_MMAP_SIZE_MB),
+  providerIoWorkers: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: PROVIDER_IO_MAX_WORKERS })),
+    "T3CODE_PROVIDER_IO_WORKERS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  providerIoCodexOffloadMinChars: Config.schema(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    "T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  providerIoAcpOffloadMinChars: Config.schema(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    "T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -480,6 +525,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     traceBatchWindowMs: env.traceBatchWindowMs,
     traceMaxBytes: env.traceMaxBytes,
     traceMaxFiles: env.traceMaxFiles,
+    ...(env.traceSqlMinDurationMs > 0 ? { traceSqlMinDurationMs: env.traceSqlMinDurationMs } : {}),
     otlpTracesUrl: traces?.url,
     otlpMetricsUrl: metrics?.url,
     otlpLogsUrl: logs?.url,
@@ -519,6 +565,19 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logWebSocketEvents,
     tailscaleServeEnabled,
     tailscaleServePort,
+    ...(env.sqliteReaderPoolSize === undefined
+      ? {}
+      : { sqliteReaderPoolSize: env.sqliteReaderPoolSize }),
+    sqliteCacheSizeMb: env.sqliteCacheSizeMb,
+    sqliteReaderCacheSizeMb: env.sqliteReaderCacheSizeMb,
+    sqliteMmapSizeMb: env.sqliteMmapSizeMb,
+    ...(env.providerIoWorkers === undefined ? {} : { providerIoWorkers: env.providerIoWorkers }),
+    ...(env.providerIoCodexOffloadMinChars === undefined
+      ? {}
+      : { providerIoCodexOffloadMinChars: env.providerIoCodexOffloadMinChars }),
+    ...(env.providerIoAcpOffloadMinChars === undefined
+      ? {}
+      : { providerIoAcpOffloadMinChars: env.providerIoAcpOffloadMinChars }),
   };
 
   return config;

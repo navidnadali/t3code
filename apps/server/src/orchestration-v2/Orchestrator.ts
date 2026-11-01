@@ -427,6 +427,7 @@ export interface OrchestratorV2Shape {
     threadId: ThreadId,
   ) => Effect.Effect<number, OrchestratorV2Error>;
   readonly streamStoredEvents: Stream.Stream<OrchestrationV2StoredEvent, OrchestratorV2Error>;
+  /** Events arrive projected for the wire and shared by every subscriber; never mutate them. */
   readonly streamStoredEventsFrom: (input?: {
     readonly threadId?: ThreadId;
     readonly afterSequence?: number;
@@ -12498,10 +12499,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     )
       return;
     const progress = delegatedTaskProgress(childControls);
-    const parent = yield* projectionStore.getThreadRecords(parentThreadId, [
-      "subagents",
-      "contextTransfers",
-    ]);
+    // Only this child's tasks and result transfers matter; a parent can hold thousands.
+    const parent = yield* projectionStore.getThreadRecords(
+      parentThreadId,
+      ["subagents", "contextTransfers"],
+      { subagentChildThreadIds: [childThreadId], contextTransferSourceThreadIds: [childThreadId] },
+    );
     for (const task of parent.subagents) {
       if (
         task.origin !== "app_owned" ||

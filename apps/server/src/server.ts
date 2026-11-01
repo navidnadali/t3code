@@ -51,7 +51,10 @@ import * as ProviderEventIngestor from "./orchestration-v2/ProviderEventIngestor
 import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as ResetCreditCoordinator from "./provider/resetCreditCoordinator.ts";
 import * as EventNdjsonLogger from "./provider/EventNdjsonLogger.ts";
+import * as ProviderIoOffloads from "./provider/io/ProviderIoOffloads.ts";
+import * as ProviderIoWorkerPool from "./provider/io/ProviderIoWorkerPool.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
+import * as ProviderIoStageTiming from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as OpenCodeRuntime from "@t3tools/provider-opencode/server/OpenCodeRuntime";
 import * as OpenCodeServerLedger from "@t3tools/provider-opencode/server/OpenCodeServerLedger";
@@ -658,6 +661,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       layerProviderEventLoggers,
+      ProviderIoOffloads.layer.pipe(Layer.provideMerge(ProviderIoWorkerPool.layer)),
       ModelManifest.layerModelCatalog.pipe(Layer.provideMerge(ModelManifest.layer)),
       ResetCreditCoordinator.layer,
       ProviderLatestVersions.layer,
@@ -1093,6 +1097,8 @@ const layerMakeServer = Layer.unwrap(
     return layerServerApplication.pipe(
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
       Layer.provideMerge(layerRuntimeServices),
+      // Built before the runtime, so its final report runs after provider sessions close.
+      Layer.provideMerge(ProviderIoStageTiming.layerReporter),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
           Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),

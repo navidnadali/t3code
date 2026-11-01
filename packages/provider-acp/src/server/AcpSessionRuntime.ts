@@ -32,6 +32,10 @@ import { AgentScope, AgentScopeThreadId, RAISE_OOM_SCORE_LINE } from "@t3tools/s
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
+import {
+  ProviderIoStageDriver,
+  ProviderIoStageTiming,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import { appendAcpStderrTail, sanitizeAcpStderrExcerpt } from "./stderr.ts";
 import {
   collectSessionConfigOptionValues,
@@ -1088,6 +1092,17 @@ export interface AcpSessionActivationOptions {
   readonly httpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
 }
 
+/** Decodes long ACP stdout lines on a provider I/O worker; absent, or `open` none: in-thread. */
+export class AcpLineOffloads extends Context.Service<
+  AcpLineOffloads,
+  {
+    readonly open: (input: {
+      /** Stops the agent when its worker dies. */
+      readonly kill: Effect.Effect<void>;
+    }) => Effect.Effect<Option.Option<EffectAcpProtocol.AcpLineOffload>, never, Scope.Scope>;
+  }
+>()("@t3tools/provider-acp/server/AcpSessionRuntime/AcpLineOffloads") {}
+
 export class AcpSessionRuntime extends Context.Service<
   AcpSessionRuntime,
   {
@@ -1647,9 +1662,18 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
     Effect.forkIn(runtimeScope),
   );
 
+  const stageRecorder = yield* ProviderIoStageTiming;
+  const stageTiming = stageRecorder?.forProvider(yield* ProviderIoStageDriver);
+  const offloads = yield* Effect.serviceOption(AcpLineOffloads);
+  const lineOffload = Option.isNone(offloads)
+    ? undefined
+    : yield* offloads.value
+        .open({ kill: child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore) })
+        .pipe(Effect.map(Option.getOrUndefined), Effect.provideService(Scope.Scope, runtimeScope));
   const acpContext = yield* Layer.build(
     EffectAcpClient.layerChildProcess(child, {
       ...(options.transformStdout ? { transformStdout: options.transformStdout } : {}),
+      ...(lineOffload === undefined ? {} : { lineOffload }),
       ...(options.transformSessionUpdate
         ? { transformSessionUpdate: options.transformSessionUpdate }
         : {}),
@@ -1660,6 +1684,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         ? { logOutgoing: options.protocolLogging.logOutgoing }
         : {}),
       ...(options.protocolLogging?.logger ? { logger: options.protocolLogging.logger } : {}),
+      ...(stageTiming === undefined ? {} : { stageTiming }),
       ...(options.onIncomingRequest ? { onIncomingRequest: options.onIncomingRequest } : {}),
       onTermination: (error) =>
         recordTermination(error).pipe(

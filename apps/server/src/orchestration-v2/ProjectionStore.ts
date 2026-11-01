@@ -338,6 +338,8 @@ export interface ProjectionRecordFilter {
   readonly runIds?: ReadonlyArray<RunId>;
   readonly subagentIds?: ReadonlyArray<NodeId>;
   readonly subagentRunIds?: ReadonlyArray<RunId>;
+  readonly subagentChildThreadIds?: ReadonlyArray<ThreadId>;
+  readonly contextTransferSourceThreadIds?: ReadonlyArray<ThreadId>;
   readonly nodeIds?: ReadonlyArray<NodeId>;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
@@ -3289,15 +3291,26 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ),
           (fields !== undefined && !fields.includes("subagents")) ||
           (window === undefined &&
-            (matchesNothing(filter?.subagentIds) || matchesNothing(filter?.subagentRunIds)))
+            matchesNothing(
+              filter?.subagentIds,
+              filter?.subagentRunIds,
+              filter?.subagentChildThreadIds,
+            ))
             ? Effect.succeed([])
             : window === undefined
               ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_subagents AS subagent
+              ${
+                // Seek the named children's tasks, not every task in this thread.
+                filter?.subagentChildThreadIds === undefined
+                  ? sql``
+                  : sql`INDEXED BY orchestration_v2_projection_subagents_child_thread_idx`
+              }
             WHERE thread_id = ${threadId}
               ${filter?.subagentIds === undefined ? sql`` : sql`AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentIds)}))`}
               ${filter?.subagentRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentRunIds)}))`}
+              ${filter?.subagentChildThreadIds === undefined ? sql`` : sql`AND child_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentChildThreadIds)}))`}
               ${
                 filter?.omitSettledSubagents !== undefined
                   ? sql`AND (${
@@ -3515,13 +3528,24 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   )
                 ORDER BY rowid ASC
               `,
-          fields !== undefined && !fields.includes("contextTransfers")
+          (fields !== undefined && !fields.includes("contextTransfers")) ||
+          (window === undefined && matchesNothing(filter?.contextTransferSourceThreadIds))
             ? Effect.succeed([])
             : window === undefined
-              ? sql<PayloadRow>`
+              ? filter?.contextTransferSourceThreadIds === undefined
+                ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_context_transfers
             WHERE source_thread_id = ${threadId} OR target_thread_id = ${threadId}
+            ORDER BY rowid ASC
+          `
+                : sql<PayloadRow>`
+            -- Seek the named sources' transfers, not every transfer of this thread.
+            SELECT payload_json
+            FROM orchestration_v2_projection_context_transfers
+              INDEXED BY orchestration_v2_projection_context_transfers_source_thread_idx
+            WHERE source_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.contextTransferSourceThreadIds)}))
+              AND (source_thread_id = ${threadId} OR target_thread_id = ${threadId})
             ORDER BY rowid ASC
           `
               : sql<PayloadRow>`
@@ -6094,29 +6118,24 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             WHERE thread_id IN (SELECT value FROM json_each(${encodeIdList(threadIds)}))
           `;
 
+    // Maintained counts (migration 77) hold one row per thread and run; '' is run-less.
     const selectShellRunItemCounts = (threadIds: ReadonlyArray<ThreadId>) =>
       sql<ShellRunItemCountRow>`
-        SELECT thread_id, run_id, COUNT(*) AS item_count
-        FROM orchestration_v2_projection_turn_items
-        WHERE run_id IS NOT NULL AND thread_id IN (SELECT value FROM json_each(${encodeIdList(threadIds)}))
-        GROUP BY thread_id, run_id
+        SELECT thread_id, run_id, item_count
+        FROM orchestration_v2_projection_turn_item_counts
+        WHERE run_id <> '' AND thread_id IN (SELECT value FROM json_each(${encodeIdList(threadIds)}))
       `;
 
-    // Count all selected threads in one index walk; fork sources still need per-run counts.
     const selectShellItemCounts = (threadIds: ReadonlyArray<ThreadId>) =>
       sql<ShellItemCountRow>`
         SELECT counts.thread_id,
-          SUM(CASE WHEN counts.run_id IS NULL OR r.status <> 'rolled_back'
+          SUM(CASE WHEN counts.run_id = '' OR r.status <> 'rolled_back'
             THEN counts.item_count ELSE 0 END) AS item_count,
-          SUM(CASE WHEN counts.run_id IS NULL THEN counts.item_count ELSE 0 END)
+          SUM(CASE WHEN counts.run_id = '' THEN counts.item_count ELSE 0 END)
             AS runless_item_count
-        FROM (
-          SELECT thread_id, run_id, COUNT(*) AS item_count
-          FROM orchestration_v2_projection_turn_items
-          WHERE thread_id IN (SELECT value FROM json_each(${encodeIdList(threadIds)}))
-          GROUP BY thread_id, run_id
-        ) counts
+        FROM orchestration_v2_projection_turn_item_counts counts
         LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = counts.run_id
+        WHERE counts.thread_id IN (SELECT value FROM json_each(${encodeIdList(threadIds)}))
         GROUP BY counts.thread_id
       `;
 
@@ -7013,7 +7032,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
       getOpenRemoteDelegatedTasks: getOpenRemoteDelegatedTasks.pipe(NodeSqliteClient.readOnly),
-      getThreadProjection,
+      getThreadProjection: (threadId) =>
+        sql.withTransaction(getThreadProjection(threadId)).pipe(
+          Effect.mapError((cause) =>
+            isProjectionStoreThreadNotFoundError(cause) || isProjectionStoreReadError(cause)
+              ? cause
+              : new ProjectionStoreReadError({ threadId, cause }),
+          ),
+          NodeSqliteClient.readOnly,
+        ),
       getTurnStartContext: readOnReader(getTurnStartContext),
       getTurnStartHistory: readOnReader(getTurnStartHistory),
       getRuntimeRecoveryProjection: readOnReader(getRuntimeRecoveryProjection),

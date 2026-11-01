@@ -710,7 +710,10 @@ class BenchRun implements RunContext {
       }
     });
     const sessionRng = this.rng.fork("session-text");
-    const { assignments, switches } = historyAssignments(options.sessionPlan, chosen);
+    const { assignments, switches, modelSwitches } = historyAssignments(
+      options.sessionPlan,
+      chosen,
+    );
     for (const { session: planned, thread, switchProvider } of assignments) {
       this.sessions.push(
         new Session({
@@ -735,6 +738,7 @@ class BenchRun implements RunContext {
         rerootedProjects: rerooted.length,
         modeChanges,
         providerSwitches: switches,
+        modelSwitches,
         sessionThreadIds: chosen.map((thread) => thread.id),
       },
       itemCounts,

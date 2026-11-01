@@ -264,7 +264,7 @@ export class Session {
     readonly rng: Rng;
     /** The provider instance and model this session's turns run on. */
     readonly selection: { readonly instanceId: string; readonly model: string };
-    /** History mode: the seeded thread ran elsewhere, so the first turn switches it. */
+    /** History mode: the seeded thread ran on another instance or model; turn 1 switches it. */
     readonly switchProvider: boolean;
   }) {
     this.index = input.index;

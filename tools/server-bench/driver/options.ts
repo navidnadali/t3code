@@ -164,9 +164,11 @@ export const USAGE = `Usage: node tools/server-bench/driver.ts --url <origin> --
 
 Drives load against a running scratch T3 server and writes <out>/driver.json. Its knobs echo
 every option but the session plan; sessionsByProvider gives the sessions per provider instance;
-in history mode workload.providerSwitches maps each instance to the seeded threads it took over;
-and with --session-mcp-credentials sessionMcp.credentialsEnvironment maps each planned instance
-to "set by the driver" or "already set". --provider defaults to claudeBench, not claudeAgent.
+in history mode workload.providerSwitches maps each instance to the seeded threads it took over
+from another instance, and workload.modelSwitches to those already on it that their first turn
+moved to the planned model; and with --session-mcp-credentials
+sessionMcp.credentialsEnvironment maps each planned instance to "set by the driver" or "already
+set". --provider defaults to claudeBench, not claudeAgent.
 Before any session opens it sets each planned bench instance's BENCH_STATE_DIR to a fresh,
 owner-only <out>/fake-state/<instance> (and fails when that is not empty), so runs restoring the
 same settings replay the same plan; fakeStateDirectories names them.

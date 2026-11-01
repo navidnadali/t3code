@@ -329,6 +329,24 @@ describe("workload fingerprint", () => {
     });
   });
 
+  it("refuses a script launcher outside fake-* dirs, whose code it cannot fingerprint", async () => {
+    await withTempDir(async (root) => {
+      const harness = NodePath.join(root, "harness", "tools", "server-bench");
+      const wrapper = NodePath.join(root, "wrappers", "claude");
+      write(wrapper, '#!/bin/sh\nexec node "$(dirname "$0")/claude.mjs" "$@"\n');
+      write(NodePath.join(root, "wrappers", "claude.mjs"), "export {};\n");
+      const template = NodePath.join(root, "template");
+      write(
+        NodePath.join(template, "userdata", "settings.json"),
+        JSON.stringify({ providerInstances: { claudeBench: { config: { binaryPath: wrapper } } } }),
+      );
+      const work = NodePath.join(root, "work");
+      NodeFS.mkdirSync(work);
+      const fixture = await fixtureInfo(template, work);
+      await expect(launchersHash(fixture, harness)).rejects.toThrow(/script outside a fake-\*/);
+    });
+  });
+
   it("covers the recorded transcripts and the absolute ones the settings name", async () => {
     await withTempDir(async (root) => {
       const fixtures = NodePath.join(root, "replay-fixtures");

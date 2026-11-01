@@ -25,7 +25,10 @@ import {
   LiveStreamBufferError,
 } from "../orchestration-v2/LiveStreamBudget.ts";
 import { PersistenceDecodeError } from "./Errors.ts";
-import { toShellApplicationEvent } from "../orchestration-v2/ShellStream.ts";
+import {
+  shellApplicationEventKey,
+  toShellApplicationEvent,
+} from "../orchestration-v2/ShellStream.ts";
 import * as OrchestrationEventStore from "./OrchestrationEventStore.ts";
 import * as SqlitePersistence from "./Sqlite.ts";
 const isPersistenceDecodeError = Schema.is(PersistenceDecodeError);
@@ -626,6 +629,116 @@ it.effect.each(["high-water", "replay"] as const)(
         if (result._tag === "Failure") {
           assert.equal(result.failure._tag, "PersistenceSqlError");
           assert.isTrue(isLiveStreamBufferError(result.failure.cause));
+        }
+      }),
+    ).pipe(Effect.provide(Layer.fresh(layerTest))),
+);
+
+it.effect.each(["coalesced", "distinct"] as const)(
+  "keeps the newest live event per key for a reader blocked on the high-water query (%s keys)",
+  (keys) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+        const now = "2026-11-01T00:00:00.000Z";
+        const projectIds = Array.from({ length: 3 }, (_, index) =>
+          ProjectId.make(`project:keyed-${keys}-${index}`),
+        );
+        const projectEvent = yield* store.appendProjectEvent({
+          type: "project.created",
+          eventId: EventId.make(`event:keyed-${keys}:created`),
+          aggregateKind: "project",
+          aggregateId: projectIds[0]!,
+          occurredAt: now,
+          commandId: CommandId.make(`command:keyed-${keys}`),
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          payload: {
+            projectId: projectIds[0]!,
+            title: "Keyed stream",
+            workspaceRoot: "/tmp/keyed-stream",
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+        if (projectEvent.type !== "project.created")
+          return yield* Effect.die("Expected project.created");
+        // Three aggregates updated over and over: the buffer only needs their newest events.
+        // Distinct aggregates are each a key, so the cap still ends the stream for them.
+        const burst = keys === "coalesced" ? 3 * LIVE_STREAM_MAX_ITEMS + 3 : LIVE_STREAM_MAX_ITEMS + 1;
+        const events = Array.from({ length: burst }, (_, index) => ({
+          ...projectEvent,
+          eventId: EventId.make(`event:keyed-${keys}:${index}`),
+          aggregateId:
+            keys === "coalesced"
+              ? projectIds[index % projectIds.length]!
+              : ProjectId.make(`project:keyed-distinct-${index}`),
+          sequence: projectEvent.sequence + index + 1,
+        }));
+        const lastSequence = events.at(-1)!.sequence;
+        const readStarted = yield* Deferred.make<void>();
+        const releaseRead = yield* Deferred.make<void>();
+        const readClosed = yield* Deferred.make<void>();
+        const allRetained = yield* Deferred.make<void>();
+        const blockHighWater: Statement.Transformer = (statement) => {
+          const [query] = statement.compile();
+          if (query.includes("FROM orchestration_events") && query.includes("MAX(sequence)")) {
+            return Deferred.succeed(readStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseRead)),
+              Effect.ensuring(Deferred.succeed(readClosed, undefined)),
+              Effect.as(statement),
+            );
+          }
+          return Effect.succeed(statement);
+        };
+        const reader = yield* store
+          .streamProjectedApplicationEvents({
+            afterSequence: projectEvent.sequence,
+            project: (event) => {
+              // Called by the subscriber's fiber right before it retains the event.
+              if (event.sequence === lastSequence) Deferred.doneUnsafe(allRetained, Effect.void);
+              return toShellApplicationEvent(event);
+            },
+            coalesceKey: shellApplicationEventKey,
+          })
+          .pipe(
+            Stream.provideService(Statement.CurrentTransformer, blockHighWater),
+            Stream.take(3),
+            Stream.runCollect,
+            Effect.result,
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(readStarted);
+        yield* store.publishCommitted(events);
+        if (keys === "distinct") {
+          yield* Deferred.await(readClosed);
+          const result = yield* Fiber.join(reader);
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            assert.equal(result.failure._tag, "PersistenceSqlError");
+            assert.isTrue(isLiveStreamBufferError(result.failure.cause));
+          }
+          return;
+        }
+        // A stream that overflowed never projects the last event; do not wait for it.
+        yield* Effect.raceFirst(Deferred.await(allRetained), Effect.asVoid(Fiber.await(reader)));
+        yield* Deferred.succeed(releaseRead, undefined);
+        const result = yield* Fiber.join(reader);
+        assert.equal(result._tag, "Success");
+        if (result._tag === "Success") {
+          assert.deepEqual(
+            result.success.map((item) =>
+              "aggregateKind" in item ? [item.aggregateId, item.sequence] : [],
+            ),
+            [
+              [projectIds[0], lastSequence - 2],
+              [projectIds[1], lastSequence - 1],
+              [projectIds[2], lastSequence],
+            ],
+          );
         }
       }),
     ).pipe(Effect.provide(Layer.fresh(layerTest))),

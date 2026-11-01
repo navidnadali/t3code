@@ -26,6 +26,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -33,6 +34,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
 import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import { vi } from "vite-plus/test";
 
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
@@ -118,6 +120,7 @@ import * as Keybindings from "./keybindings.ts";
 import * as ServerSettings from "./serverSettings.ts";
 
 import * as EventStore from "./orchestration-v2/EventStore.ts";
+import { LIVE_STREAM_MAX_ITEMS } from "./orchestration-v2/LiveStreamBudget.ts";
 import * as ProjectionMaintenance from "./orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
@@ -699,6 +702,143 @@ it.effect("shell subscribers share one thread shell read per event", () =>
       );
     }
     assert.deepEqual(reads, [threadId]);
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live("a shell subscriber outlives a live burst larger than its buffer while its shell reads wait", () =>
+  Effect.gen(function* () {
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const now = "2026-11-01T00:00:00.000Z";
+    const threadIds = Array.from({ length: 3 }, (_, index) =>
+      ThreadId.make(`thread:live-burst-${index}`),
+    );
+    const [row] = yield* sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        'live-burst:0', 'thread', ${threadIds[0]!}, 0, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:live-burst", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+    const [stored] = yield* store
+      .readApplicationEvents({ afterSequence: row!.sequence - 1, throughSequence: row!.sequence })
+      .pipe(Stream.runCollect);
+    if (stored === undefined || !("event" in stored)) return yield* Effect.die("Expected a thread event");
+    // More events than the live buffer holds, spread over three threads whose shell reads
+    // wait until every event has been retained: the stream must stay up and end with the
+    // newest shell of each thread.
+    const burst = 3 * LIVE_STREAM_MAX_ITEMS + 3;
+    const lastSequence = row!.sequence + burst;
+    const events = Array.from({ length: burst }, (_, index) => ({
+      ...stored,
+      sequence: row!.sequence + index + 1,
+      event: { ...stored.event, threadId: threadIds[index % threadIds.length]! },
+    }));
+    const allRetained = yield* Deferred.make<void>();
+    // A buffer that gives up logs it; its failure only reaches the stream once the shell
+    // projection pulls again, so the reads must also stop waiting then.
+    const overflowLogged = yield* Deferred.make<void>();
+    const overflowLogger = Logger.make(({ message }) => {
+      if (String(message).includes("live event buffer is full")) {
+        Deferred.doneUnsafe(overflowLogged, Effect.void);
+      }
+    });
+    const shellReadsReleased = Effect.raceFirst(
+      Deferred.await(allRetained),
+      Deferred.await(overflowLogged),
+    );
+    const observingStore: OrchestrationEventStore.OrchestrationEventStore["Service"] = {
+      ...store,
+      streamProjectedApplicationEvents: (input) =>
+        store.streamProjectedApplicationEvents({
+          ...input,
+          project: (event) => {
+            if (event.sequence === lastSequence) Deferred.doneUnsafe(allRetained, Effect.void);
+            return input.project(event);
+          },
+        }),
+    };
+    // The snapshot reads the high-water mark first; the live tail reads it again right after
+    // subscribing. Publishing there puts the whole burst behind a subscription nothing pulls yet.
+    let highWaterReads = 0;
+    const publishOnLiveSubscription: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      if (!query.includes("FROM orchestration_events") || !query.includes("MAX(sequence)")) {
+        return Effect.succeed(statement);
+      }
+      highWaterReads += 1;
+      return highWaterReads === 2
+        ? store.publishCommitted(events).pipe(Effect.as(statement))
+        : Effect.succeed(statement);
+    };
+    const shell = (threadId: ThreadId, sequence: number) =>
+      ({
+        id: threadId,
+        projectId: "project",
+        archivedAt: null,
+        title: `Shell at ${sequence}`,
+        status: "completed",
+        activityRunStatus: null,
+        pendingRuntimeRequest: null,
+        pendingBackgroundTasks: [],
+        settledOverride: null,
+        settledAt: null,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      }) as unknown as OrchestrationV2ThreadShell;
+    const items = yield* subscribeOrchestrationV2Shell({ requestCompletionMarker: true }).pipe(
+      Effect.flatMap((stream) =>
+        stream.pipe(
+          Stream.takeUntil(
+            (item) => item.kind === "thread.updated" && item.sequence === lastSequence,
+          ),
+          Stream.runCollect,
+        ),
+      ),
+      Effect.provideService(Statement.CurrentTransformer, publishOnLiveSubscription),
+      Effect.provideService(OrchestrationEventStore.OrchestrationEventStore, observingStore),
+      Effect.provide(Logger.layer([overflowLogger], { mergeWithExisting: true })),
+      Effect.provideService(ThreadManagement.ThreadManagementService, {
+        listActiveShellIndex: () => Effect.succeed([]),
+        readShellSnapshot: () =>
+          Effect.succeed(
+            Effect.succeed({ schemaVersion: 1, snapshotSequence: 0, threads: [], archivedThreads: [] }),
+          ),
+        listActiveSubagentThreadIds: () => Effect.succeed([]),
+        getThreadShellForEvent: (input: { readonly threadId: ThreadId; readonly sequence: number }) =>
+          shellReadsReleased.pipe(Effect.as(shell(input.threadId, input.sequence))),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+      Effect.provideService(ProjectStore.ProjectStoreV2, {
+        listShells: () => Effect.succeed([]),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+      Effect.provideService(ProjectService.ProjectService, {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"]),
+      Effect.provideServiceEffect(
+        ProjectEnrichment.ProjectEnrichmentService,
+        PubSub.unbounded().pipe(
+          Effect.map(
+            (changes) =>
+              ({
+                subscribeChanges: PubSub.subscribe(changes),
+              }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+          ),
+        ),
+      ),
+    );
+    const updates = items.flatMap((item) =>
+      item.kind === "thread.updated" ? [[item.thread.id, item.sequence] as const] : [],
+    );
+    const newestByThread = new Map(updates);
+    assert.deepEqual(
+      threadIds.map((threadId) => newestByThread.get(threadId)),
+      [lastSequence - 2, lastSequence - 1, lastSequence],
+    );
+    // Coalesced before the shell reads, not one shell per event.
+    assert.isBelow(updates.length, 3 * 4);
+    assert.isTrue(updates.every(([, sequence], index) => index === 0 || sequence > updates[index - 1]![1]));
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 

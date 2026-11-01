@@ -904,7 +904,7 @@ describe("WorkerChildProcessSpawner", () => {
           const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner);
           // Without its own group, the child's descendant stays in the spawner's group after it exits.
           const leaver = node(
-            `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(watch.connectScript())}], { stdio: "ignore" })`,
+            `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(watch.connectScript())}], { stdio: "ignore" }).unref()`,
             { detached: false },
           );
           expect((yield* collect(remoteSpawner, leaver)).exit).toEqual({ code: 0 });

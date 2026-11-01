@@ -71,7 +71,8 @@ const isOutgoingPrompt = (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
 
 // Prompts, cancels as soon as the prompt is dispatched, and returns what the agent received in order.
 // holdPrompt slows the prompt on its way out: its outgoing protocol log record waits until the agent
-// has answered a later request, or its fiber yields every few operations.
+// has answered a later request, or its fiber yields every few operations. Its cancel comes on
+// dispatch, once the prompt is pending, or from inside that log record.
 const promptThenCancel = (input: {
   readonly cancelBehavior: "interrupt" | "wait-for-prompt";
   readonly interruptPromptOnCancel?: boolean;
@@ -80,7 +81,7 @@ const promptThenCancel = (input: {
   readonly releaseLog?: Effect.Effect<void>;
   readonly holdPrompt?: {
     readonly in: "protocol-log" | "scheduler";
-    readonly cancelOn: "dispatch" | "call";
+    readonly cancelOn: "dispatch" | "call" | "log";
   };
 }) =>
   Effect.gen(function* () {
@@ -99,6 +100,18 @@ const promptThenCancel = (input: {
           }).acp;
     const promptLogged = yield* Deferred.make<void>();
     const promptReleased = yield* Deferred.make<void>();
+    const harnessScope = yield* Scope.Scope;
+    const runtimeMade = yield* Deferred.make<AcpSessionRuntime.AcpSessionRuntime["Service"]>();
+    const cancelledFromLog = yield* Deferred.make<Fiber.Fiber<void, EffectAcpErrors.AcpError>>();
+    const cancelFromLog =
+      input.holdPrompt?.cancelOn === "log"
+        ? Deferred.await(runtimeMade).pipe(
+            Effect.flatMap((made) =>
+              made.cancel.pipe(Effect.forkIn(harnessScope, { startImmediately: true })),
+            ),
+            Effect.flatMap((fiber) => Deferred.succeed(cancelledFromLog, fiber)),
+          )
+        : Effect.void;
     const runtime = yield* AcpSessionRuntime.make({
       ...mockRuntimeOptions,
       spawn: {
@@ -117,7 +130,8 @@ const promptThenCancel = (input: {
               logOutgoing: true,
               logger: (event) =>
                 isOutgoingPrompt(event)
-                  ? Deferred.succeed(promptLogged, undefined).pipe(
+                  ? cancelFromLog.pipe(
+                      Effect.andThen(Deferred.succeed(promptLogged, undefined)),
                       Effect.andThen(Deferred.await(promptReleased)),
                     )
                   : Effect.void,
@@ -142,6 +156,7 @@ const promptThenCancel = (input: {
               ),
       }),
     );
+    yield* Deferred.succeed(runtimeMade, runtime);
     const releaseLog = input.releaseLog ?? Effect.void;
     yield* Effect.addFinalizer(() =>
       releaseLog.pipe(Effect.andThen(Deferred.succeed(promptReleased, undefined))),
@@ -182,6 +197,8 @@ const promptThenCancel = (input: {
           Effect.andThen(runtime.cancel),
           Effect.forkChild({ startImmediately: true }),
         );
+      } else if (input.holdPrompt.cancelOn === "log") {
+        cancel = yield* Deferred.await(cancelledFromLog);
       } else {
         yield* roundTrip;
         cancel = yield* runtime.cancel.pipe(Effect.forkChild({ startImmediately: true }));
@@ -1463,6 +1480,7 @@ describe("AcpSessionRuntime", () => {
           [
             { in: "protocol-log", cancelOn: "dispatch" },
             { in: "protocol-log", cancelOn: "call" },
+            { in: "protocol-log", cancelOn: "log" },
             { in: "scheduler", cancelOn: "dispatch" },
           ] as const
         ).map((holdPrompt) => ({ cancelBehavior, workers, holdPrompt })),

@@ -1099,6 +1099,56 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
     }),
   );
 
+  // In-thread, termination stops stdout at its next read; a read already being handled completes
+  // (its later messages are dropped, as every message is once the protocol has terminated).
+  it.effect("completes a read it is handling when the protocol terminates, as in-thread", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const hold = yield* Deferred.make<void>();
+      const holding = yield* Deferred.make<void>();
+      const interrupted = yield* Deferred.make<void>();
+      const firstHandled = yield* Deferred.make<void>();
+      const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const died = yield* Deferred.make<never, CodexError.CodexAppServerError>();
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        lineOffload: {
+          minChars: 64,
+          decode: (line) => Effect.succeed(CodexOffload.decodeOffloadedLine(line)),
+          writeLog: () => Effect.void,
+          failure: Deferred.await(died),
+        },
+        onNotification: () =>
+          Deferred.succeed(holding, undefined).pipe(
+            Effect.andThen(Deferred.await(hold)),
+            Effect.andThen(Deferred.succeed(firstHandled, undefined)),
+            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+            Effect.asVoid,
+          ),
+        onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(
+        input,
+        encoder.encode(`${shortLine("x/first")}\n${shortLine("x/second")}\n`),
+      );
+      yield* Deferred.await(holding);
+      const workerStopped = new CodexError.CodexAppServerTransportError({
+        operation: "read-input-stream",
+        cause: new Error("Provider I/O worker stopped."),
+      });
+      yield* Deferred.fail(died, workerStopped);
+      assert.strictEqual(yield* Deferred.await(termination), workerStopped);
+      yield* Deferred.succeed(hold, undefined);
+
+      const outcome = yield* Effect.raceFirst(
+        Deferred.await(firstHandled).pipe(Effect.as("read completed")),
+        Deferred.await(interrupted).pipe(Effect.as("read interrupted")),
+      );
+      assert.equal(outcome, "read completed");
+    }),
+  );
+
   it.effect("routes the lines before a long line whose worker call fails, as in-thread", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();

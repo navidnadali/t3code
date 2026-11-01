@@ -1,6 +1,20 @@
+// @effect-diagnostics nodeBuiltinImport:off - Tests build real fixture templates on disk.
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
 import { describe, expect, it } from "vite-plus/test";
 
-import { benchEnvHash, readDriverResult, runOrder, traceRequired } from "./run.ts";
+import { benchEnvHash, fixtureInfo, readDriverResult, runOrder, traceRequired } from "./run.ts";
+
+const withTempDir = async (run: (directory: string) => Promise<void>) => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "server-bench-run-"));
+  try {
+    await run(directory);
+  } finally {
+    NodeFS.rmSync(directory, { recursive: true, force: true });
+  }
+};
 
 describe("readDriverResult", () => {
   it("reads the P1-004 driver.json: window, per-call latencies and event rates", () => {
@@ -95,5 +109,47 @@ describe("traceRequired", () => {
     expect(traceRequired({ T3CODE_TRACE_MIN_LEVEL: "Debug" })).toBe(true);
     expect(traceRequired({ T3CODE_TRACE_MIN_LEVEL: "Warn" })).toBe(false);
     expect(traceRequired({ T3CODE_TRACE_MIN_LEVEL: "none" })).toBe(false);
+  });
+});
+
+describe("fixtureInfo", () => {
+  it("refuses a template whose database or userdata is a symlink out of it", async () => {
+    await withTempDir(async (root) => {
+      const work = NodePath.join(root, "work");
+      NodeFS.mkdirSync(work);
+      const outside = NodePath.join(root, "outside");
+      NodeFS.mkdirSync(outside);
+      NodeFS.writeFileSync(NodePath.join(outside, "statev2.sqlite"), "original");
+      const linkedFile = NodePath.join(root, "linked-file");
+      NodeFS.mkdirSync(NodePath.join(linkedFile, "userdata"), { recursive: true });
+      NodeFS.symlinkSync(
+        NodePath.join(outside, "statev2.sqlite"),
+        NodePath.join(linkedFile, "userdata", "statev2.sqlite"),
+      );
+      const linkedDir = NodePath.join(root, "linked-dir");
+      NodeFS.mkdirSync(linkedDir);
+      NodeFS.symlinkSync(outside, NodePath.join(linkedDir, "userdata"));
+
+      await expect(fixtureInfo(linkedFile, work)).rejects.toThrow(
+        /symlink at userdata\/statev2\.sqlite/,
+      );
+      await expect(fixtureInfo(linkedDir, work)).rejects.toThrow(/symlink at userdata\b/);
+    });
+  });
+
+  it("hashes a template of regular files", async () => {
+    await withTempDir(async (root) => {
+      const work = NodePath.join(root, "work");
+      NodeFS.mkdirSync(work);
+      const template = NodePath.join(root, "template");
+      NodeFS.mkdirSync(NodePath.join(template, "userdata"), { recursive: true });
+      NodeFS.writeFileSync(NodePath.join(template, "userdata", "statev2.sqlite"), "database");
+      NodeFS.writeFileSync(NodePath.join(template, "userdata", "settings.json"), "{}");
+
+      const info = await fixtureInfo(template, work);
+
+      expect(info).toMatchObject({ kind: "dir", bytes: 10 });
+      expect(info.sha256).toMatch(/^[0-9a-f]{64}$/);
+    });
   });
 });

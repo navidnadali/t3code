@@ -60,21 +60,6 @@ export const encodeOptionalPayload = <A, I>(
   );
 };
 
-export const decodeNotificationPayload = <A, I>(
-  method: string,
-  schema: Schema.Codec<A, I> | undefined,
-  raw: unknown,
-): Effect.Effect<A, CodexError.CodexAppServerProtocolParseError> =>
-  decodeOptionalPayload(method, schema, raw).pipe(
-    Effect.mapError((error) =>
-      CodexError.CodexAppServerProtocolParseError.fromRequestError(
-        "decode-notification-payload",
-        method,
-        error,
-      ),
-    ),
-  );
-
 export const runHandler = Effect.fnUntraced(function* <A, B>(
   handler: ((payload: A) => Effect.Effect<B, CodexError.CodexAppServerError>) | undefined,
   payload: A,

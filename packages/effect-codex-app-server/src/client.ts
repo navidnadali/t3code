@@ -12,13 +12,13 @@ import * as CodexSchema from "./_generated/schema.gen.ts";
 import * as CodexError from "./errors.ts";
 import * as CodexProtocol from "./protocol.ts";
 import {
-  decodeNotificationPayload,
   decodeOptionalPayload,
   encodeOptionalPayload,
   runHandler,
   timeStage,
 } from "./_internal/shared.ts";
 import { makeChildStdio, makeStderrTail, makeTerminationError } from "./_internal/stdio.ts";
+import * as CodexWire from "./wire.ts";
 
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
@@ -180,17 +180,14 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
   const dispatchNotification = (
     notification: CodexProtocol.CodexAppServerIncomingNotification,
   ): Effect.Effect<void, never> => {
-    const schema =
-      notification.method in CodexRpc.SERVER_NOTIFICATION_PARAMS
-        ? CodexRpc.SERVER_NOTIFICATION_PARAMS[
-            notification.method as CodexRpc.ServerNotificationMethod
-          ]
-        : undefined;
+    const schema = CodexWire.serverNotificationParamsSchema(notification.method);
     const handlers = notificationHandlers.get(notification.method) ?? [];
 
     if (schema) {
       return timeStage(options.stageTiming, "decode", 0, () =>
-        decodeNotificationPayload(notification.method, schema, notification.params),
+        Effect.fromResult(
+          CodexWire.decodeNotificationPayload(notification.method, schema, notification.params),
+        ),
       ).pipe(
         Effect.tapError(warnUndecodableNotification),
         Effect.flatMap((decoded) =>

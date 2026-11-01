@@ -9,6 +9,7 @@ import type * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
@@ -20,7 +21,7 @@ import * as CodexWire from "./wire.ts";
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
 const MAX_BUFFERED_RAW_MESSAGES = 32;
-// Reads framed and sent to a line offload ahead of the one being handled; stdout waits beyond.
+// Reads queued and not yet handled with a line offload, at most; past this, stdout waits.
 const READ_AHEAD_LIMIT = 16;
 // A worker call's outcome, kept so that a failure surfaces at its line, as it would in-thread.
 type OffloadOutcome = Exit.Exit<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
@@ -499,11 +500,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     // queue that a second fiber handles in order, so the next reads arrive at their own pace
     // instead of each waiting a round trip; one whose lines are back is handled at once.
     const readAhead = (offload: CodexAppServerLineOffload) => {
-      // Reads queued and not yet handled.
+      // Reads queued and not yet handled, and a slot for each, released once it is handled.
       let pending = 0;
+      const slots = Semaphore.makeUnsafe(READ_AHEAD_LIMIT);
       return Stream.unwrap(
         Effect.gen(function* () {
-          const reads = yield* Queue.bounded<
+          const reads = yield* Queue.unbounded<
             {
               readonly chunk: Uint8Array;
               readonly lines: CodexWire.FramedLines;
@@ -511,7 +513,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
               readonly offloaded: Fiber.Fiber<ReadonlyArray<OffloadOutcome>> | undefined;
             },
             PlatformError.PlatformError | CodexError.CodexAppServerError | Cause.Done<void>
-          >(READ_AHEAD_LIMIT);
+          >();
           yield* options.stdio.stdin.pipe(
             // As in-thread, termination stops stdout at its next read; reads taken are all handled.
             Stream.interruptWhen(Deferred.await(terminationSignal)),
@@ -528,6 +530,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                 if (long.length === 0 && pending === 0) {
                   yield* handleRead(offload, read, noOffloadedLines);
                 } else {
+                  yield* Semaphore.take(slots, 1);
                   pending += 1;
                   const offloaded =
                     long.length === 0
@@ -556,8 +559,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           (offloaded === undefined ? Effect.succeed([]) : Fiber.join(offloaded)).pipe(
             Effect.flatMap((results) => handleRead(offload, read, results[Symbol.iterator]())),
             Effect.tap(() =>
-              Effect.sync(() => {
+              Effect.suspend(() => {
                 pending -= 1;
+                return Semaphore.release(slots, 1);
               }),
             ),
           ),

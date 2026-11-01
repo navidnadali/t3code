@@ -13,6 +13,7 @@ import * as Result from "effect/Result";
 import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as Stdio from "effect/Stdio";
 import * as RpcClient from "effect/rpc/RpcClient";
@@ -98,7 +99,7 @@ export interface AcpLineOffload {
   readonly failure: Effect.Effect<never, AcpError.AcpError>;
 }
 
-// Reads framed and sent to the worker ahead of the one being handled; stdout waits beyond this.
+// Reads queued and not yet handled, at most; past this, stdout is not read further.
 const READ_AHEAD_LIMIT = 16;
 
 // A worker call's outcome, kept so that a failure surfaces at its line, as it would in-thread.
@@ -790,18 +791,19 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     offload: AcpLineOffload,
     split: (bytes: Uint8Array) => ReadonlyArray<string>,
   ) => {
-    // Reads queued and not yet handled.
+    // Reads queued and not yet handled, and a slot for each, released once it is handled.
     let pending = 0;
+    const slots = Semaphore.makeUnsafe(READ_AHEAD_LIMIT);
     return Stream.unwrap(
       Effect.gen(function* () {
-        const reads = yield* Queue.bounded<
+        const reads = yield* Queue.unbounded<
           {
             readonly data: Uint8Array;
             readonly lines: ReadonlyArray<string>;
             readonly offloaded: Fiber.Fiber<ReadonlyArray<OffloadOutcome>> | undefined;
           },
           PlatformError.PlatformError | AcpError.AcpError | Cause.Done
-        >(READ_AHEAD_LIMIT);
+        >();
         yield* options.stdio.stdin.pipe(
           Stream.runForEach(
             Effect.fnUntraced(function* (data) {
@@ -814,6 +816,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
                   decodeOffloadedLines(offload, lines, noOffloadedLines),
                 );
               }
+              yield* Semaphore.take(slots, 1);
               pending += 1;
               const offloaded =
                 long.length === 0
@@ -849,8 +852,9 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             return readChunk(data, () => decodeOffloadedLines(offload, lines, next));
           }),
           Effect.tap(() =>
-            Effect.sync(() => {
+            Effect.suspend(() => {
               pending -= 1;
+              return Semaphore.release(slots, 1);
             }),
           ),
         ),

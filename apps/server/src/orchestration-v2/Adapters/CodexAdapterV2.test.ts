@@ -362,6 +362,7 @@ describe("CodexAdapterV2 native protocol logging", () => {
             tagged: Object.assign([1, 2], { note: "extra" }),
             sparse: Object.assign(sparse, { note: "extra" }),
             hidden: Object.assign(hidden, { note: "extra" }),
+            error: Object.defineProperty({}, "message", { value: "hidden", enumerable: false }),
           },
         },
       });
@@ -377,6 +378,7 @@ describe("CodexAdapterV2 native protocol logging", () => {
         "tagged",
         "sparse",
         "hidden",
+        "error",
       ]);
       const logged = (key: string): unknown => Reflect.get(Object(params), key);
       assert.deepEqual(logged("endpoint"), {});
@@ -385,6 +387,7 @@ describe("CodexAdapterV2 native protocol logging", () => {
       assert.deepEqual(Object.keys(Object(logged("tagged"))), ["0", "1"]);
       assert.deepEqual(Object.keys(Object(logged("sparse"))), ["1"]);
       assert.deepEqual(Object.keys(Object(logged("hidden"))), ["0", "1"]);
+      assert.deepEqual(Object.getOwnPropertyNames(logged("error")), []);
     }),
   );
 });

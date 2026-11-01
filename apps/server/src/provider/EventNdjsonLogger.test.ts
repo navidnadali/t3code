@@ -24,6 +24,7 @@ import {
   type PendingRecord,
   writeBatchedMessages,
 } from "./EventNdjsonLogger.ts";
+import { serializeEventNdjsonRecord } from "./EventNdjsonRecord.ts";
 
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
@@ -122,6 +123,38 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
           NodeFS.rmSync(tempDir, { recursive: true, force: true });
         }
       }),
+  );
+
+  it.effect("appends a record serialized elsewhere exactly like a written event", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
+      const basePath = NodePath.join(tempDir, "events.log");
+      const event = { id: "native-event", output: "x".repeat(70 * 1_024) };
+      const record = serializeEventNdjsonRecord("native", event);
+      assert.equal(record._tag, "Serialized");
+
+      try {
+        const store = yield* makeEventNdjsonLogStore(basePath, { batchWindowMs: 0 });
+        const native = store.logger("native");
+        const threadId = ThreadId.make("thread-serialized");
+
+        yield* native.write(event, threadId);
+        if (record._tag === "Serialized") {
+          yield* native.writeSerialized?.(record.payload, threadId) ?? Effect.void;
+        }
+        yield* store.close();
+
+        const [written, appended, extra] = NodeFS.readFileSync(
+          ownedLogPath(basePath, "thread-serialized"),
+          "utf8",
+        ).split("\n");
+        assert.match(written ?? "", /^\[[^\]]+\] NTIVE: \{"truncated":true,"id":"native-event"/);
+        assert.equal(appended, written);
+        assert.equal(extra, "");
+      } finally {
+        NodeFS.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }),
   );
 
   it.effect("shares one thread writer across native and canonical streams", () =>

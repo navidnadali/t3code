@@ -100,26 +100,32 @@ const API_ID = /\b(?:msg|toolu|srvtoolu|req)_[A-Za-z0-9]{8,}/gu;
 const TASK_ID = /\\?"(?:task_id|taskId|agent_id|agentId)\\?":\\?"([^"\\]+)\\?"/gu;
 const DURATION_MS = /(\\?"duration_ms\\?":)\d+/gu;
 
-// Writers race even in-thread: they interleave differently, and either an interrupt's settle effect
-// or the provider's own events can end a run. So EventSink writes are compared per entity, in
-// order, without what depends on the writer: its command, the event id and the node and run the
-// write is attributed to.
+// Writers interleave and race even in-thread (an interrupt's settle effect or the provider's own
+// events close a run), so writes are compared per entity, in order, without the command-derived
+// event id. Attribution is kept except on the settle effect's provider-thread write, the only
+// write that race attributes to the run's node and run.
+const SETTLE_EFFECT = /:background-work-settled$/u;
+
 const byEntity = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
   const entities = new Map<string, Array<unknown>>();
-  for (const { event } of storedEvents) {
+  for (const { commandId, event } of storedEvents) {
+    const { id: _id, ...write } = event;
+    const settled =
+      commandId !== null &&
+      SETTLE_EFFECT.test(commandId) &&
+      event.type === "provider-thread.updated";
     const {
-      id: _id,
       nodeId: _nodeId,
       runId: _runId,
-      ...write
-    } = event as typeof event & {
+      ...unattributed
+    } = write as typeof write & {
       readonly nodeId?: unknown;
       readonly runId?: unknown;
     };
     const entityId = (event.payload as { readonly id?: unknown } | undefined)?.id;
     const entity =
       typeof entityId === "string" ? `${event.type.split(".")[0]} ${entityId}` : event.type;
-    entities.set(entity, [...(entities.get(entity) ?? []), write]);
+    entities.set(entity, [...(entities.get(entity) ?? []), settled ? unattributed : write]);
   }
   return Object.fromEntries([...entities].toSorted(([a], [b]) => (a < b ? -1 : 1)));
 };
@@ -588,6 +594,50 @@ describe("provider I/O at 0 and 2 workers", () => {
         }
       }),
   );
+
+  it("tells EventSink writes apart by their run and node, except a settle effect's provider-thread write", () => {
+    const write = (
+      commandId: string | null,
+      type: string,
+      attribution: { readonly runId?: string; readonly nodeId?: string },
+    ) =>
+      ({
+        sequence: 1,
+        commandId,
+        event: {
+          id: `event:${commandId}`,
+          type,
+          threadId: "t",
+          payload: { id: "e" },
+          ...attribution,
+        },
+      }) as unknown as OrchestrationV2StoredEvent;
+    const sinkWrites = (writes: ReadonlyArray<OrchestrationV2StoredEvent>) =>
+      normalize({ adapterEvents: [], logLines: [], sinkWrites: writes }, "/no-tmp-root", false)
+        .sinkWrites;
+    const ordinary = sinkWrites([write("c", "run.updated", { runId: "r1", nodeId: "n1" })]);
+    assert.notDeepEqual(
+      sinkWrites([write("c", "run.updated", { runId: "r2", nodeId: "n1" })]),
+      ordinary,
+    );
+    assert.notDeepEqual(
+      sinkWrites([write("c", "run.updated", { runId: "r1", nodeId: "n2" })]),
+      ordinary,
+    );
+    assert.notDeepEqual(
+      sinkWrites([write("c:background-work-settled", "run.updated", { runId: "r1" })]),
+      sinkWrites([write(null, "run.updated", {})]),
+    );
+    assert.deepStrictEqual(
+      sinkWrites([
+        write("c:background-work-settled", "provider-thread.updated", {
+          runId: "r1",
+          nodeId: "n1",
+        }),
+      ]),
+      sinkWrites([write(null, "provider-thread.updated", {})]),
+    );
+  });
 
   it("names only fixtures that have a Claude recording in the Claude wire row", () => {
     const claude = new Set(

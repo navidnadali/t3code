@@ -82,8 +82,8 @@ Load
   env or the fixture's settings.json), and launchers_sha256 what the fixture's settings.json runs
   (binaryPath, commandPath, absolute commandArgs, e.g. from providers.ts --claude-launcher): a
   launcher in this harness's fake-*/ adds its path, one in another checkout's fake-*/ that
-  checkout's fakes and recorded replay fixtures, an executable its file; a script (#!, or
-  JavaScript) anywhere else is refused, as what it runs cannot be hashed.
+  checkout's fakes and recorded replay fixtures, a native executable (ELF, Mach-O, PE) its file;
+  anything else (a script, JavaScript, data) is refused, as what it runs cannot be hashed.
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -361,12 +361,16 @@ export async function transcriptsHash(
   return hash.digest("hex");
 }
 
-/** A text file the kernel runs through an interpreter (#!), unlike a self-contained executable. */
-const isScript = (path: string) => {
-  const head = Buffer.alloc(2);
+// ELF, Mach-O (both byte orders, 32/64-bit, universal) and PE: a self-contained executable.
+const NATIVE_MAGIC = ["7f454c46", "feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe"];
+
+const isNativeExecutable = (path: string) => {
+  const head = Buffer.alloc(4);
   const fd = NodeFS.openSync(path, "r");
   try {
-    return NodeFS.readSync(fd, head, 0, 2, 0) === 2 && head.toString("latin1") === "#!";
+    const read = NodeFS.readSync(fd, head, 0, 4, 0);
+    const hex = head.subarray(0, read).toString("hex");
+    return NATIVE_MAGIC.includes(hex) || hex.startsWith("4d5a");
   } finally {
     NodeFS.closeSync(fd);
   }
@@ -383,7 +387,7 @@ const realPath = (path: string) => {
 /**
  * The absolute binaryPath, commandPath and commandArgs of the fixture settings' instances: one in
  * this harness's fake-* dirs adds its path (fakes_sha256 has it), one in another checkout's adds
- * that checkout's fakes and recordings, an executable its file; any other script is refused.
+ * that checkout's fakes and recordings, a native executable its file; anything else is refused.
  */
 export async function launchersHash(fixture: FixtureInfo, benchDir: string): Promise<string> {
   const launchers = new Set<string>();
@@ -414,9 +418,9 @@ export async function launchersHash(fixture: FixtureInfo, benchDir: string): Pro
       const checkout = NodePath.dirname(NodePath.dirname(real));
       content =
         checkout === harness ? "harness" : `checkout ${checkout} ${await checkoutHash(checkout)}`;
-    } else if (/\.[cm]?[jt]sx?$/.test(real) || isScript(real)) {
+    } else if (!isNativeExecutable(real)) {
       throw new Error(
-        `${launcher} (fixture settings) is a script outside a fake-* directory: what it runs cannot be fingerprinted; move it into a fake-* directory`,
+        `${launcher} (fixture settings) is outside a fake-* directory and not a native executable: what it runs cannot be fingerprinted; move it into a fake-* directory`,
       );
     } else {
       content = await sha256File(real);

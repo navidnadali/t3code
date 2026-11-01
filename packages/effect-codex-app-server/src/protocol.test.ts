@@ -9,6 +9,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 
 import * as CodexError from "./errors.ts";
 import * as CodexProtocol from "./protocol.ts";
@@ -191,9 +192,37 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
         const { stdio, input } = yield* makeInMemoryStdio();
         const notifications: Array<CodexProtocol.CodexAppServerIncomingNotification> = [];
         const rawLines: Array<unknown> = [];
+        // Text decoding and JSON parsing each advance the clock, so only their windows see time.
+        let clock = 0;
+        const parse = JSON.parse;
+        using _parse = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+          clock += 5;
+          return parse(text, reviver);
+        });
+        const decode = TextDecoder.prototype.decode;
+        using _decode = vi.spyOn(TextDecoder.prototype, "decode").mockImplementation(function (
+          this: TextDecoder,
+          input,
+          options,
+        ) {
+          clock += 7;
+          return decode.call(this, input, options);
+        });
+        const framingMs: Array<number> = [];
+        let framingBytes = 0;
+        const jsonFrames: Array<{ readonly elapsedMs: number; readonly bytes: number }> = [];
         const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
         yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
           stdio,
+          stageTiming: {
+            now: () => clock,
+            record: (stage, elapsedMs, bytes) => {
+              if (stage === "json") jsonFrames.push({ elapsedMs, bytes });
+              if (stage !== "framing") return;
+              framingMs.push(elapsedMs);
+              framingBytes += bytes;
+            },
+          },
           logIncoming: true,
           logger: (event) =>
             Effect.sync(() => {
@@ -227,6 +256,18 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
           { method: "x/final", params: { text: "最後" } },
         ]);
         assert.deepEqual(rawLines, [firstLine, secondLine, finalLine]);
+        assert.deepEqual(
+          jsonFrames,
+          [firstLine, secondLine, finalLine].map((line) => ({
+            elapsedMs: 5,
+            bytes: encoder.encode(line).byteLength,
+          })),
+        );
+        assert.deepEqual(
+          framingMs,
+          Array.from({ length: Math.ceil(bytes.byteLength / chunkSize) }, () => 7),
+        );
+        assert.equal(framingBytes, bytes.byteLength);
       }),
   );
 

@@ -1069,7 +1069,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
             if ("aggregateKind" in stored) {
               return yield* projectItem(stored);
             }
-            const shell = yield* threadManagement.getThreadShell(stored.event.threadId);
+            const shell = yield* threadManagement.getThreadShellForEvent({
+              threadId: stored.event.threadId,
+              sequence: stored.sequence,
+            });
             return shellStreamItemFromThreadShell({ stored, shell });
           }),
         { concurrency: 8 },

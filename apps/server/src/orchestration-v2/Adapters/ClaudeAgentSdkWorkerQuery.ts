@@ -281,9 +281,12 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   };
 
   // What the SDK's close would do when its session can no longer run it.
+  let closeRequested = false;
+  let stopping = false;
   const stopChild = () => {
     const target = child;
-    if (target === undefined || childDone) return;
+    if (target === undefined || childDone || stopping) return;
+    stopping = true;
     target.stdin.end();
     runFork(
       Effect.gen(function* () {
@@ -468,6 +471,10 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       }),
       killAfterEnd: true,
       onEvent,
+      // A failed session drops the worker's stdin end and kills, so a requested close is main's.
+      onSessionFailure: () => {
+        if (closeRequested) stopChild();
+      },
     })
     .pipe(
       Effect.provideService(Scope.Scope, scope),
@@ -533,6 +540,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     // callback there; here a callback raised after close never starts.
     close: () => {
       if (released) return;
+      closeRequested = true;
       cleanUp();
       enqueue({ type: "close" });
     },

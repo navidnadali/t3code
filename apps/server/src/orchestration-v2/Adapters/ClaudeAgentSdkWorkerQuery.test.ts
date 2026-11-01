@@ -747,6 +747,36 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     ),
   );
 
+  it.effect("stops the CLI when the worker session fails after the close was sent", () =>
+    withRunner("worker", ({ runner }) =>
+      Effect.gen(function* () {
+        const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+        const openedBefore = workers.opened.length;
+        const session = yield* runner.open(openInput(cli));
+        const messages = yield* Stream.runDrain(session.messages).pipe(
+          Effect.flip,
+          Effect.forkChild,
+        );
+        const [opened] = workers.opened.slice(openedBefore);
+        assert.isDefined(opened);
+        yield* session.close;
+        // The session fails before the worker's SDK could end the CLI's input or kill it.
+        opened.worker.emit("message", {
+          type: "fail",
+          session: opened.session,
+          error: new Error("injected stage failure"),
+        });
+        yield* Fiber.join(messages);
+        yield* Effect.promise(() => cli.stdinEnded);
+        yield* TestClock.adjust("2 seconds");
+        yield* Effect.promise(() => cli.waitForKill("SIGTERM"));
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.promise(() => cli.waitForKill("SIGKILL"));
+        assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGKILL"]);
+      }),
+    ),
+  );
+
   it.effect("fails a control call after the query ended with the in-thread error", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>

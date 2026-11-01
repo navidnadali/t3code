@@ -69,8 +69,8 @@ const comparable = (
 
 // Each writer's own sequence must match: independent writers interleave by timing in-thread too.
 // Known in-thread race: an interrupt's effect and ingestion both record a stopped run, so those
-// records are compared per thread whoever wrote them, and an update repeating the last state is
-// dropped (the thread's unchanged state may be written once more).
+// records are compared per thread whoever wrote them; a commandless provider-thread update that
+// repeats the previous state (the losing writer's) is dropped.
 const INTERRUPTION_RECORDS = new Set([
   "run-attempt.updated",
   "run.updated",
@@ -125,8 +125,13 @@ const byWriter = (
     .toSorted()
     .map((writer) => {
       const written = ranked(grouped[writer]!);
+      const repeatsThread = (event: (typeof written)[number], index: number) =>
+        writer.startsWith("provider|") &&
+        event.type === "provider-thread.updated" &&
+        index > 0 &&
+        state(event) === state(written[index - 1]!);
       const changes = written
-        .filter((event, index) => index === 0 || state(event) !== state(written[index - 1]!))
+        .filter((event, index) => !repeatsThread(event, index))
         .map((event) => JSON.stringify(event));
       return [
         writer,

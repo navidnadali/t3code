@@ -1235,6 +1235,21 @@ describe("ref and index reads", () => {
       reused: true,
     },
     {
+      name: "a root ref file alone that makes the upstream's short name ambiguous",
+      setup: (cwd) =>
+        trackUpTrunk(cwd).pipe(Effect.tap(() => git(cwd, ["branch", "remotes/up/trunk"]))),
+      change: (cwd) =>
+        git(cwd, ["rev-parse", "HEAD"]).pipe(
+          Effect.map((sha) => {
+            NodeFS.mkdirSync(NodePath.join(cwd, ".git", "up"));
+            NodeFS.writeFileSync(NodePath.join(cwd, ".git", "up", "trunk"), `${sha}\n`);
+          }),
+        ),
+      before: "main up/trunk +0",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
       name: "a deleted upstream ref",
       setup: (cwd) => addOrigin(cwd, ["main"]).pipe(Effect.as(cwd)),
       change: (cwd) =>

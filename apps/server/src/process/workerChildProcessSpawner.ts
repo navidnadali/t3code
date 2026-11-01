@@ -14,119 +14,32 @@ import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Predicate from "effect/Predicate";
 import * as Sink from "effect/Sink";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import {
+  type ChildProcessHandle,
   ChildProcessSpawner,
   ExitCode,
   make as makeSpawner,
   makeHandle,
   ProcessId,
 } from "effect/process/ChildProcessSpawner";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 
+import { spawnerProcessSource, spawnWorkerSource } from "./spawnerSources.ts";
+
+export { spawnerProcessSource, spawnWorkerSource };
+
 export const VCS_SPAWN_WORKER_ENV = "T3CODE_VCS_SPAWN_WORKER";
+export const PROCESS_SPAWNER_ENV = "T3CODE_PROCESS_SPAWNER";
 
 const STREAM_WINDOW_BYTES = 1024 * 1024;
 const processGroupGraceMillis = 1_000;
 const processGroupPollIntervalMillis = 10;
-
-// Inline worker source also runs in bundles and single-executable builds without module files.
-export const spawnWorkerSource = `
-"use strict";
-const { parentPort, workerData } = require("node:worker_threads");
-const { spawn } = require("node:child_process");
-const windowBytes = workerData.windowBytes;
-const streamNames = ["stdout", "stderr"];
-const children = new Map();
-const post = (message, transfer) => parentPort.postMessage(message, transfer);
-const errorFields = (error) => {
-  if (!(error instanceof Error)) return { name: "Error", message: String(error) };
-  const fields = { name: error.name, message: error.message, stack: error.stack };
-  for (const key of ["code", "errno", "syscall", "path", "spawnargs"]) {
-    if (error[key] !== undefined) fields[key] = error[key];
-  }
-  return fields;
-};
-const start = (message) => {
-  const id = message.id;
-  let child;
-  try {
-    child = spawn(message.command, message.args, message.options);
-  } catch (error) {
-    post({ t: "throw", id, error: errorFields(error) });
-    return;
-  }
-  const entry = { child, inflight: [0, 0], paused: [false, false] };
-  children.set(id, entry);
-  child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));
-  child.on("error", (error) => post({ t: "error", id, error: errorFields(error) }));
-  child.on("exit", (code, signal) => post({ t: "exit", id, code, signal }));
-  child.on("close", () => {
-    children.delete(id);
-    post({ t: "close", id });
-  });
-  child.stdin.on("error", (error) => post({ t: "stdin-error", id, error: errorFields(error) }));
-  streamNames.forEach((name, s) => {
-    const stream = child[name];
-    stream.on("data", (chunk) => {
-      const data = new Uint8Array(chunk.byteLength);
-      data.set(chunk);
-      entry.inflight[s] += data.byteLength;
-      post({ t: "data", id, s, chunk: data }, [data.buffer]);
-      if (entry.inflight[s] >= windowBytes && !entry.paused[s]) {
-        entry.paused[s] = true;
-        stream.pause();
-      }
-    });
-    stream.on("end", () => post({ t: "end", id, s }));
-    stream.on("error", (error) => post({ t: "stream-error", id, s, error: errorFields(error) }));
-  });
-};
-const destroyedStdin = { name: "Error", message: "Cannot call write after a stream was destroyed", code: "ERR_STREAM_DESTROYED" };
-parentPort.on("message", (message) => {
-  const entry = children.get(message.id);
-  switch (message.t) {
-    case "spawn":
-      start(message);
-      return;
-    case "stdin":
-      if (entry === undefined) return post({ t: "stdin-done", id: message.id, seq: message.seq, error: destroyedStdin });
-      entry.child.stdin.write(message.chunk, (error) =>
-        post({ t: "stdin-done", id: message.id, seq: message.seq, error: error ? errorFields(error) : undefined }),
-      );
-      return;
-    case "stdin-end":
-      if (entry === undefined) return post({ t: "stdin-done", id: message.id, seq: message.seq, error: destroyedStdin });
-      entry.child.stdin.end((error) =>
-        post({ t: "stdin-done", id: message.id, seq: message.seq, error: error ? errorFields(error) : undefined }),
-      );
-      return;
-    case "stdin-destroy":
-      if (entry !== undefined) entry.child.stdin.destroy();
-      return;
-    case "kill": {
-      if (entry === undefined) return post({ t: "kill-result", id: message.id, seq: message.seq, killed: false });
-      let killed;
-      try {
-        killed = entry.child.kill(message.signal);
-      } catch (error) {
-        return post({ t: "kill-result", id: message.id, seq: message.seq, killed: false, error: errorFields(error) });
-      }
-      return post({ t: "kill-result", id: message.id, seq: message.seq, killed });
-    }
-    case "ack":
-      if (entry === undefined) return;
-      entry.inflight[message.s] -= message.bytes;
-      if (entry.paused[message.s] && entry.inflight[message.s] < windowBytes) {
-        entry.paused[message.s] = false;
-        entry.child[streamNames[message.s]].resume();
-      }
-      return;
-  }
-});
-`;
+const spawnerCloseGraceMillis = 1_000;
 
 type ExitCodeWithSignal = readonly [code: number | null, signal: NodeJS.Signals | null];
 
@@ -209,6 +122,7 @@ interface RemoteChild {
   referenced: boolean;
   closed: boolean;
   killedOnStop: boolean;
+  stopError: Error | undefined;
 }
 
 interface SpawnCallbacks {
@@ -227,25 +141,49 @@ interface Entry {
   readonly killCallbacks: Map<number, (outcome: KillOutcome) => void>;
 }
 
+/** Where spawn requests run: a worker thread or the spawner process. */
+interface Transport {
+  readonly post: (message: unknown, transfer?: ReadonlyArray<ArrayBuffer>) => void;
+  readonly ref: () => void;
+  readonly unref: () => void;
+  readonly terminate: () => Promise<void>;
+}
+
+interface TransportEvents {
+  readonly onMessage: (message: WorkerMessage) => void;
+  readonly onStop: (cause: unknown) => void;
+}
+
 const WORKER_STOPPED_MESSAGE = "The child process spawner worker stopped";
+const SPAWNER_STOPPED_MESSAGE = "The process spawner stopped";
 const DESTROYED_STDIN: SerializedError = {
   name: "Error",
   message: "Cannot call write after a stream was destroyed",
   code: "ERR_STREAM_DESTROYED",
 };
 
-const makeWorkerHost = (options: { readonly source: string; readonly windowBytes: number }) => {
-  let worker: NodeWorkerThreads.Worker | undefined;
+const makeRemoteHost = (options: {
+  readonly open: (events: TransportEvents) => Transport;
+  readonly windowBytes: number;
+  readonly stoppedMessage: string;
+  readonly closedMessage: string;
+  /** Stops in a row, with no command started in between, after which the host stays down. */
+  readonly restarts: number;
+  readonly onStop?: (cause: unknown, restarting: boolean) => void;
+}) => {
+  let transport: Transport | undefined;
+  let generation: object | undefined;
   let failure: unknown;
-  let failed = false;
+  let down = false;
   let closing = false;
+  let stopsInARow = 0;
   let nextId = 1;
   let nextSeq = 1;
   let holding = 0;
   const entries = new Map<number, Entry>();
 
   const post = (message: unknown, transfer?: ReadonlyArray<ArrayBuffer>) => {
-    worker?.postMessage(message, transfer as Array<ArrayBuffer> | undefined);
+    transport?.post(message, transfer);
   };
 
   // A child keeps the event loop alive as Node's handles do: until close, or until its
@@ -256,8 +194,8 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
     if (holds === entry.holdsLoop) return;
     entry.holdsLoop = holds;
     holding += holds ? 1 : -1;
-    if (holding === 0) worker?.unref();
-    else if (holding === 1 && holds) worker?.ref();
+    if (holding === 0) transport?.unref();
+    else if (holding === 1 && holds) transport?.ref();
   };
 
   const completeExit = (entry: Entry, code: number | null, signal: NodeJS.Signals | null) => {
@@ -265,7 +203,7 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
     for (const listener of entry.child.exitListeners) listener(code, signal);
   };
 
-  // A closed child stays known until the worker has answered its stdin writes and kills.
+  // A closed child stays known until the transport has answered its stdin writes and kills.
   const forgetIfSettled = (entry: Entry) => {
     if (entry.child.closed && entry.stdinCallbacks.size === 0 && entry.killCallbacks.size === 0) {
       entries.delete(entry.child.id);
@@ -279,11 +217,19 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
   };
 
   const stop = (cause: unknown) => {
-    if (failed) return;
-    failed = true;
+    const stopped = transport;
+    // Callers resume inside the callbacks below and may start commands on a restarted transport.
+    const stoppedEntries = [...entries.values()];
+    transport = undefined;
+    generation = undefined;
     failure = cause;
-    const error = new Error(WORKER_STOPPED_MESSAGE, { cause });
-    for (const entry of entries.values()) {
+    stopsInARow += 1;
+    const restarting = !closing && stopsInARow <= options.restarts;
+    if (!restarting) down = true;
+    if (!closing) options.onStop?.(cause, restarting);
+    const error = new Error(options.stoppedMessage, { cause });
+    for (const { child } of stoppedEntries) child.stopError = error;
+    for (const entry of stoppedEntries) {
       const { child } = entry;
       if (!entry.spawned) {
         entry.callbacks.onError(error);
@@ -300,7 +246,8 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
             // Already gone.
           }
         }
-        // Node cannot reap another thread's children: a zombie stays until the server exits.
+        // Node cannot reap another thread's children: a stopped worker's stay zombies until the
+        // server exits (a stopped spawner process's pass to init).
         child.killedOnStop = true;
         if (running) completeExit(entry, null, "SIGKILL");
       }
@@ -316,8 +263,10 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
       for (const callback of killCallbacks) callback({ _tag: "Sent", killed: false });
       remove(entry);
     }
-    void worker?.terminate();
-    worker?.unref();
+    if (stopped !== undefined) {
+      void stopped.terminate();
+      stopped.unref();
+    }
   };
 
   const onMessage = (message: WorkerMessage) => {
@@ -326,6 +275,7 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
     const { child } = entry;
     switch (message.t) {
       case "spawn":
+        stopsInARow = 0;
         entry.spawned = true;
         child.pid = message.pid;
         entry.callbacks.onSpawn();
@@ -388,24 +338,24 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
     }
   };
 
-  const ensureWorker = () => {
-    if (worker !== undefined || failed) return;
+  // Events of a transport that already stopped must not touch its successor.
+  const ensureTransport = () => {
+    if (transport !== undefined || down) return;
+    const current = {};
+    generation = current;
     try {
-      const started = new NodeWorkerThreads.Worker(options.source, {
-        eval: true,
-        name: "t3-child-process-spawner",
-        workerData: { windowBytes: options.windowBytes },
-        stdout: false,
-        stderr: false,
+      const opened = options.open({
+        onMessage: (message) => {
+          if (generation === current) onMessage(message);
+        },
+        onStop: (cause) => {
+          if (generation === current) stop(cause);
+        },
       });
-      started.on("message", onMessage);
-      started.on("messageerror", stop);
-      started.on("error", stop);
-      started.on("exit", (code) => stop(new Error(`spawner worker exited with code ${code}`)));
-      started.unref();
-      worker = started;
+      if (generation === current) transport = opened;
+      else void opened.terminate();
     } catch (error) {
-      stop(error);
+      if (generation === current) stop(error);
     }
   };
 
@@ -415,14 +365,14 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
     spawnOptions: Record<string, unknown>,
     callbacks: SpawnCallbacks,
   ): RemoteChild => {
-    ensureWorker();
+    ensureTransport();
     const id = nextId++;
     const stdinCallbacks = new Map<number, (error?: Error | null) => void>();
     const sendStdin = (
       message: Record<string, unknown>,
       callback: (error?: Error | null) => void,
     ) => {
-      if (failed) return callback(new Error(WORKER_STOPPED_MESSAGE, { cause: failure }));
+      if (child.stopError !== undefined) return callback(child.stopError);
       if (child.closed) return callback(reviveError(DESTROYED_STDIN));
       const seq = nextSeq++;
       stdinCallbacks.set(seq, callback);
@@ -449,7 +399,7 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
           sendStdin({ t: "stdin-end" }, callback);
         },
         destroy(error, callback) {
-          if (!failed) post({ t: "stdin-destroy", id });
+          if (child.stopError === undefined) post({ t: "stdin-destroy", id });
           callback(error);
         },
       }),
@@ -458,6 +408,7 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
       referenced: true,
       closed: false,
       killedOnStop: false,
+      stopError: undefined,
     };
     const entry: Entry = {
       child,
@@ -470,8 +421,9 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
     };
     // Errors this host raises on the streams must not crash the process before a consumer listens.
     for (const stream of [child.stdout, child.stderr, child.stdin]) stream.on("error", () => {});
-    if (failed) {
-      callbacks.onError(new Error(WORKER_STOPPED_MESSAGE, { cause: failure }));
+    if (transport === undefined) {
+      child.stopError = new Error(options.stoppedMessage, { cause: failure });
+      callbacks.onError(child.stopError);
       return child;
     }
     entries.set(id, entry);
@@ -487,7 +439,11 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
     callback: (outcome: KillOutcome) => void,
   ) => {
     const entry = entries.get(child.id);
-    if (entry === undefined || failed || Deferred.isDoneUnsafe(child.exitSignal)) {
+    if (
+      entry === undefined ||
+      child.stopError !== undefined ||
+      Deferred.isDoneUnsafe(child.exitSignal)
+    ) {
       return callback({ _tag: "Sent", killed: false });
     }
     const seq = nextSeq++;
@@ -502,26 +458,137 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
   };
 
   return {
-    /** Starts the worker on first use; false once it has failed or closed. */
+    /** Starts the transport if needed; false once it is down for good or closed. */
     start: () => {
-      ensureWorker();
-      return !failed;
+      ensureTransport();
+      return transport !== undefined;
     },
     get closing() {
       return closing;
+    },
+    get failure() {
+      return failure;
     },
     spawn,
     kill,
     setReferenced,
     terminate: () =>
       Effect.promise(async () => {
-        const current = worker;
+        const current = transport;
         closing = true;
-        stop(new Error("spawner worker closed"));
-        if (current !== undefined) await current.terminate();
+        down = true;
+        if (current !== undefined) stop(new Error(options.closedMessage));
+        await current?.terminate();
       }),
   };
 };
+
+type RemoteHost = ReturnType<typeof makeRemoteHost>;
+
+const openWorker =
+  (source: string, windowBytes: number) =>
+  (events: TransportEvents): Transport => {
+    const worker = new NodeWorkerThreads.Worker(source, {
+      eval: true,
+      name: "t3-child-process-spawner",
+      workerData: { windowBytes },
+      stdout: false,
+      stderr: false,
+    });
+    worker.on("message", events.onMessage);
+    worker.on("messageerror", events.onStop);
+    worker.on("error", events.onStop);
+    worker.on("exit", (code) =>
+      events.onStop(new Error(`spawner worker exited with code ${code}`)),
+    );
+    worker.unref();
+    return {
+      post: (message, transfer) =>
+        worker.postMessage(message, transfer as Array<ArrayBuffer> | undefined),
+      ref: () => worker.ref(),
+      unref: () => worker.unref(),
+      terminate: async () => {
+        await worker.terminate();
+      },
+    };
+  };
+
+/** How the server starts its spawner process; single executables dispatch `__process-spawner`. */
+export const spawnerProcessLaunch = (input: {
+  readonly executable: string;
+  readonly isExecutable: boolean;
+  readonly environment: NodeJS.ProcessEnv;
+  readonly windowBytes: number;
+  readonly source?: string;
+}) => {
+  // Children get the server's environment with each request; the server's heap options are not the spawner's.
+  const { NODE_OPTIONS: _nodeOptions, ...environment } = input.environment;
+  return {
+    command: input.executable,
+    args: input.isExecutable
+      ? ["__process-spawner", String(input.windowBytes)]
+      : ["-e", input.source ?? spawnerProcessSource, String(input.windowBytes)],
+    options: {
+      stdio: ["ignore", "ignore", "inherit", "ipc"],
+      serialization: "advanced",
+      // Its own process group: signals for the server's group, such as Ctrl-C, pass it by.
+      detached: true,
+      env: { ...environment, ELECTRON_RUN_AS_NODE: "1" },
+      windowsHide: true,
+    } satisfies NodeChildProcess.SpawnOptions,
+  };
+};
+
+const openSpawnerProcess =
+  (launch: ReturnType<typeof spawnerProcessLaunch>) =>
+  (events: TransportEvents): Transport => {
+    const spawner = NodeChildProcess.spawn(launch.command, launch.args, launch.options);
+    // A spawner that failed to start reports only an error, with a negative exitCode.
+    const hasExited = () => spawner.exitCode !== null || spawner.signalCode !== null;
+    const exited = new Promise<void>((resolve) => {
+      const settle = () => {
+        if (hasExited()) resolve();
+      };
+      spawner.on("exit", settle);
+      spawner.on("error", settle);
+    });
+    spawner.on("message", events.onMessage);
+    spawner.on("error", events.onStop);
+    spawner.on("exit", (code, signal) =>
+      events.onStop(new Error(`The process spawner exited with ${signal ?? `code ${code}`}`)),
+    );
+    // Without its channel the spawner can no longer answer; it exits on disconnect itself.
+    spawner.on("disconnect", () => {
+      if (!hasExited()) spawner.kill("SIGKILL");
+    });
+    spawner.unref();
+    spawner.channel?.unref();
+    let terminated: Promise<void> | undefined;
+    return {
+      post: (message) => {
+        if (spawner.connected) spawner.send(message as NodeChildProcess.Serializable);
+      },
+      ref: () => {
+        spawner.ref();
+        spawner.channel?.ref();
+      },
+      unref: () => {
+        spawner.unref();
+        spawner.channel?.unref();
+      },
+      terminate: () =>
+        (terminated ??= new Promise<void>((resolve) => {
+          if (hasExited()) return resolve();
+          const timer = setTimeout(() => spawner.kill("SIGKILL"), spawnerCloseGraceMillis);
+          void exited.then(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+          if (spawner.connected) spawner.disconnect();
+          else spawner.kill("SIGKILL");
+        })),
+    };
+  };
 
 // Mirrors @effect/platform-node-shared's internal handleErrnoException, which the package does not export.
 const toPlatformError = (
@@ -582,24 +649,17 @@ const runsOnWorker = (command: ChildProcess.Command): command is ChildProcess.St
   );
 };
 
-/**
- * Starts child processes on a worker thread: Node's async `spawn` still forks and execs on the
- * calling thread, which costs the server's main thread up to a millisecond per Git command.
- * Handles keep `NodeChildProcessSpawner`'s semantics; other command shapes use `fallback`.
- */
-export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
+/** Handles keep `NodeChildProcessSpawner`'s semantics; other command shapes use `fallback`. */
+const makeRemoteSpawner = Effect.fnUntraced(function* (
   fallback: ChildProcessSpawner["Service"],
-  options: { readonly workerSource?: string; readonly windowBytes?: number } = {},
+  host: RemoteHost,
+  unavailable: (
+    command: ChildProcess.StandardCommand,
+  ) => Effect.Effect<ChildProcessHandle, PlatformError.PlatformError, Scope.Scope>,
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const platform = yield* HostProcess.Platform;
-  const host = makeWorkerHost({
-    source: options.workerSource ?? spawnWorkerSource,
-    windowBytes: options.windowBytes ?? STREAM_WINDOW_BYTES,
-  });
-  yield* Effect.addFinalizer(() => host.terminate());
-  let announcedFallback = false;
 
   const resolveWorkingDirectory = Effect.fnUntraced(function* (
     commandOptions: ChildProcess.CommandOptions,
@@ -836,35 +896,113 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
       if (platform === "win32" || !runsOnWorker(command)) {
         return yield* fallback.spawn(command);
       }
-      if (!host.start()) {
-        if (!announcedFallback && !host.closing) {
-          announcedFallback = true;
-          yield* Effect.logWarning(
-            "Child process spawner worker unavailable; spawning on the main thread",
-          );
-        }
-        return yield* fallback.spawn(command);
-      }
+      if (!host.start()) return yield* unavailable(command);
       return yield* spawnOnWorker(command);
     }),
   );
 });
 
 /**
- * Replaces the ambient ChildProcessSpawner with the worker-backed one when
- * T3CODE_VCS_SPAWN_WORKER is true; unset or false keeps it. The worker spawns real processes,
- * so an injected (fake) spawner then only sees the command shapes the worker does not run.
+ * Starts child processes on a worker thread: Node's async `spawn` still forks and execs on the
+ * calling thread, which costs the server's main thread up to a millisecond per Git command.
+ */
+export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
+  fallback: ChildProcessSpawner["Service"],
+  options: { readonly workerSource?: string; readonly windowBytes?: number } = {},
+) {
+  const windowBytes = options.windowBytes ?? STREAM_WINDOW_BYTES;
+  const host = makeRemoteHost({
+    open: openWorker(options.workerSource ?? spawnWorkerSource, windowBytes),
+    windowBytes,
+    stoppedMessage: WORKER_STOPPED_MESSAGE,
+    closedMessage: "spawner worker closed",
+    restarts: 0,
+  });
+  yield* Effect.addFinalizer(() => host.terminate());
+  let announcedFallback = false;
+  return yield* makeRemoteSpawner(fallback, host, (command) =>
+    Effect.gen(function* () {
+      if (!announcedFallback && !host.closing) {
+        announcedFallback = true;
+        yield* Effect.logWarning(
+          "Child process spawner worker unavailable; spawning on the main thread",
+        );
+      }
+      return yield* fallback.spawn(command);
+    }),
+  );
+});
+
+/**
+ * Starts child processes from a small spawner process, so the server itself never forks: on
+ * Linux, Node forks and copies the page tables of the whole server for every command. A spawner
+ * that stops is restarted once; if it stops again before starting a command, commands fail.
+ */
+export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
+  fallback: ChildProcessSpawner["Service"],
+  options: { readonly source?: string; readonly windowBytes?: number } = {},
+) {
+  const windowBytes = options.windowBytes ?? STREAM_WINDOW_BYTES;
+  const launch = spawnerProcessLaunch({
+    executable: yield* HostProcess.ExecutablePath,
+    isExecutable: yield* HostProcess.IsExecutable,
+    environment: yield* HostProcess.Environment,
+    windowBytes,
+    ...(options.source === undefined ? {} : { source: options.source }),
+  });
+  const runLog = Effect.runSyncExitWith(yield* Effect.context<never>());
+  const host = makeRemoteHost({
+    open: openSpawnerProcess(launch),
+    windowBytes,
+    stoppedMessage: SPAWNER_STOPPED_MESSAGE,
+    closedMessage: "process spawner closed",
+    restarts: 1,
+    onStop: (cause, restarting) => {
+      runLog(
+        restarting
+          ? Effect.logWarning("Process spawner stopped; the next command restarts it", cause)
+          : Effect.logError(
+              "Process spawner stopped again without starting a command; commands fail until the server restarts",
+              cause,
+            ),
+      );
+    },
+  });
+  yield* Effect.addFinalizer(() => host.terminate());
+  // Started while the server is small: starting it is the one fork it costs.
+  host.start();
+  return yield* makeRemoteSpawner(fallback, host, (command) =>
+    Effect.fail(
+      toPlatformError(
+        "spawn",
+        new globalThis.Error(SPAWNER_STOPPED_MESSAGE, { cause: host.failure }),
+        command,
+      ),
+    ),
+  );
+});
+
+/**
+ * Replaces the ambient ChildProcessSpawner: T3CODE_PROCESS_SPAWNER=child starts commands from a
+ * spawner process, else T3CODE_VCS_SPAWN_WORKER=true from a worker thread; unset keeps it. Both
+ * spawn real processes, so an injected (fake) spawner then only sees the command shapes they do not run.
  */
 export const layerFromConfig = Layer.effect(
   ChildProcessSpawner,
   Effect.gen(function* () {
     const fallback = yield* ChildProcessSpawner;
     const platform = yield* HostProcess.Platform;
-    const enabled = yield* Config.Boolean(VCS_SPAWN_WORKER_ENV).pipe(
+    const spawner = yield* Config.Literals(["default", "child"], PROCESS_SPAWNER_ENV).pipe(
+      Config.withDefault("default"),
+      Effect.orDie,
+    );
+    const worker = yield* Config.Boolean(VCS_SPAWN_WORKER_ENV).pipe(
       Config.withDefault(false),
       Effect.orDie,
     );
-    if (!enabled || platform === "win32") return fallback;
+    if (platform === "win32") return fallback;
+    if (spawner === "child") return yield* makeProcessSpawner(fallback);
+    if (!worker) return fallback;
     return yield* make(fallback);
   }),
 );

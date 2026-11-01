@@ -1,11 +1,21 @@
+// @effect-diagnostics nodeBuiltinImport:off - Children prove they are gone by closing a socket; a server process is killed outright.
+import * as NodeChildProcess from "node:child_process";
+import * as NodeNet from "node:net";
+import * as NodeOS from "node:os";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
@@ -39,15 +49,14 @@ const summarizeError = (error: PlatformError.PlatformError) => {
   };
 };
 
+const bytes = (stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>) =>
+  Effect.map(Stream.runCollect(stream), (chunks) => Buffer.concat(chunks));
+
 const collect = (spawner: ChildProcessSpawner["Service"], command: ChildProcess.Command) =>
   Effect.gen(function* () {
     const handle = yield* spawner.spawn(command);
     const [stdout, stderr, exit] = yield* Effect.all(
-      [
-        Stream.mkString(Stream.decodeText(handle.stdout)),
-        Stream.mkString(Stream.decodeText(handle.stderr)),
-        Effect.exit(handle.exitCode),
-      ],
+      [bytes(handle.stdout), bytes(handle.stderr), Effect.exit(handle.exitCode)],
       { concurrency: "unbounded" },
     );
     return {
@@ -77,80 +86,177 @@ const recordingSpawner = Effect.gen(function* () {
   return { calls, spawner };
 });
 
+interface RemoteOptions {
+  readonly source?: string;
+  readonly windowBytes?: number;
+}
+
+const remotes = [
+  {
+    name: "worker thread",
+    make: (fallback: ChildProcessSpawner["Service"], options: RemoteOptions = {}) =>
+      WorkerChildProcessSpawner.make(fallback, {
+        ...(options.source === undefined ? {} : { workerSource: options.source }),
+        ...(options.windowBytes === undefined ? {} : { windowBytes: options.windowBytes }),
+      }),
+  },
+  {
+    name: "spawner process",
+    make: (fallback: ChildProcessSpawner["Service"], options: RemoteOptions = {}) =>
+      WorkerChildProcessSpawner.makeProcessSpawner(fallback, options),
+  },
+] as const;
+
+// A child connects to this server and holds the connection until it dies.
+const childWatch = Effect.gen(function* () {
+  const connections = yield* Queue.unbounded<NodeNet.Socket>();
+  const sockets = new Set<NodeNet.Socket>();
+  const server = yield* Effect.acquireRelease(
+    Effect.callback<NodeNet.Server>((resume) => {
+      const server = NodeNet.createServer((socket) => {
+        sockets.add(socket);
+        socket.on("error", () => {});
+        socket.resume();
+        Queue.offerUnsafe(connections, socket);
+      });
+      server.listen(0, "127.0.0.1", () => resume(Effect.succeed(server)));
+    }),
+    (server) =>
+      Effect.callback<void>((resume) => {
+        server.close(() => resume(Effect.void));
+        for (const socket of sockets) socket.destroy();
+      }),
+  );
+  const { port } = server.address() as NodeNet.AddressInfo;
+  return {
+    connectScript: (then = "") =>
+      `require("node:net").connect(${port}, "127.0.0.1").on("connect", () => { process.stdout.write(String(process.ppid)); ${then} }); setInterval(() => {}, 1000)`,
+    connected: Queue.take(connections),
+    closed: (socket: NodeNet.Socket) =>
+      Effect.callback<void>((resume) => {
+        if (socket.closed) return resume(Effect.void);
+        socket.once("close", () => resume(Effect.void));
+      }),
+  };
+});
+
+const capturedLogs = () => {
+  const logs: Array<{ readonly level: string; readonly message: unknown }> = [];
+  const layer = Logger.layer(
+    [Logger.make(({ logLevel, message }) => logs.push({ level: logLevel, message }))],
+    { mergeWithExisting: false },
+  );
+  return { logs, layer };
+};
+
 describe("WorkerChildProcessSpawner", () => {
-  it.live.skipIf(!workerPlatform)(
-    "matches the Node spawner's output, stdin, exit codes and signal exits",
-    () =>
-      Effect.gen(function* () {
-        const nodeSpawner = yield* ChildProcessSpawner;
-        // A small window makes the 3 MiB output pause and resume the worker's reads.
-        const workerSpawner = yield* WorkerChildProcessSpawner.make(nodeSpawner, {
-          windowBytes: 64 * 1024,
-        });
-        const commands = [
-          node("process.stdout.write('out'); process.stderr.write('err'); process.exitCode = 3"),
-          node("process.stdin.pipe(process.stdout)", {
-            stdin: Stream.encodeText(Stream.make("from ", "stdin")),
-          }),
-          node("process.kill(process.pid, 'SIGTERM')"),
-          node(`process.stdout.write(Buffer.alloc(${3 * 1024 * 1024}, 97))`),
-        ];
-        for (const command of commands) {
-          const expected = yield* collect(nodeSpawner, command);
-          expect(yield* collect(workerSpawner, command)).toEqual(expected);
-        }
-        expect((yield* collect(workerSpawner, commands[3]!)).stdout).toHaveLength(3 * 1024 * 1024);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
+  for (const remote of remotes) {
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: matches the Node spawner's output bytes, stdin, cwd, env, exit codes and signal exits`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          // A small window makes the 3 MiB output pause and resume the remote reads.
+          const remoteSpawner = yield* remote.make(nodeSpawner, { windowBytes: 64 * 1024 });
+          // Set after the remote side started: Node reads process.env at each spawn.
+          yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              process.env.T3_P1070_LATE = "late";
+            }),
+            () =>
+              Effect.sync(() => {
+                delete process.env.T3_P1070_LATE;
+              }),
+          );
+          const printEnv =
+            "process.stdout.write(JSON.stringify([process.env.T3_P1070_SET, process.env.T3_P1070_LATE, typeof process.env.PATH]))";
+          const commands = [
+            node("process.stdout.write('out'); process.stderr.write('err'); process.exitCode = 3"),
+            node(
+              "process.stdout.write(Buffer.from([0xff, 0x00, 0xfe, 0x80])); process.stderr.write(Buffer.from([0xc3, 0x28]))",
+            ),
+            node("process.stdin.pipe(process.stdout)", {
+              stdin: Stream.encodeText(Stream.make("from ", "stdin")),
+            }),
+            node("process.stdout.write(process.cwd())", { cwd: NodeOS.tmpdir() }),
+            node(printEnv),
+            node(printEnv, { env: { T3_P1070_SET: "set" }, extendEnv: true }),
+            node(printEnv, { env: { T3_P1070_SET: "set" } }),
+            node("process.kill(process.pid, 'SIGTERM')"),
+            node("process.kill(process.pid, 'SIGKILL')"),
+            node(`process.stdout.write(Buffer.alloc(${3 * 1024 * 1024}, 97))`),
+            ChildProcess.make("git", ["--version"]),
+            ChildProcess.make("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd() }),
+            ChildProcess.make("git", ["cat-file", "-p", "HEAD"], { cwd: process.cwd() }),
+            ChildProcess.make("git", ["rev-parse", "--verify", "refs/heads/t3-missing-p1070"], {
+              cwd: process.cwd(),
+            }),
+            ChildProcess.make("git", ["hash-object", "--stdin"], {
+              stdin: Stream.encodeText(Stream.make("p1-070\n")),
+            }),
+          ];
+          for (const command of commands) {
+            const expected = yield* collect(nodeSpawner, command);
+            expect(yield* collect(remoteSpawner, command)).toEqual(expected);
+          }
+          expect((yield* collect(remoteSpawner, commands[4]!)).stdout.toString()).toBe(
+            JSON.stringify([undefined, "late", "string"]),
+          );
+          expect((yield* collect(remoteSpawner, commands[9]!)).stdout).toHaveLength(
+            3 * 1024 * 1024,
+          );
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
 
-  it.live.skipIf(!workerPlatform)(
-    "fails like the Node spawner for a missing executable or working directory",
-    () =>
-      Effect.gen(function* () {
-        const nodeSpawner = yield* ChildProcessSpawner;
-        const workerSpawner = yield* WorkerChildProcessSpawner.make(nodeSpawner);
-        const missingExecutable = ChildProcess.make("t3-missing-executable-p1060", ["--version"]);
-        const missingCwd = node("1", { cwd: "/nonexistent/t3-missing-cwd-p1060" });
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: fails like the Node spawner for a missing executable or working directory`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          const missingExecutable = ChildProcess.make("t3-missing-executable-p1060", ["--version"]);
+          const missingCwd = node("1", { cwd: "/nonexistent/t3-missing-cwd-p1060" });
 
-        const expected = yield* spawnError(nodeSpawner, missingExecutable);
-        expect(expected).toMatchObject({
-          reason: "NotFound",
-          method: "spawn",
-          causeCode: "ENOENT",
-        });
-        expect(yield* spawnError(workerSpawner, missingExecutable)).toEqual(expected);
-        expect(yield* spawnError(workerSpawner, missingCwd)).toEqual(
-          yield* spawnError(nodeSpawner, missingCwd),
-        );
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
+          const expected = yield* spawnError(nodeSpawner, missingExecutable);
+          expect(expected).toMatchObject({
+            reason: "NotFound",
+            method: "spawn",
+            causeCode: "ENOENT",
+          });
+          expect(yield* spawnError(remoteSpawner, missingExecutable)).toEqual(expected);
+          expect(yield* spawnError(remoteSpawner, missingCwd)).toEqual(
+            yield* spawnError(nodeSpawner, missingCwd),
+          );
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
 
-  it.live.skipIf(!workerPlatform)(
-    "kills a running child, escalating to SIGKILL after forceKillAfter",
-    () =>
-      Effect.gen(function* () {
-        const nodeSpawner = yield* ChildProcessSpawner;
-        const workerSpawner = yield* WorkerChildProcessSpawner.make(nodeSpawner);
-        const killed = (spawner: ChildProcessSpawner["Service"], ignoreSigterm: boolean) =>
-          Effect.gen(function* () {
-            const handle = yield* spawner.spawn(
-              node(
-                `${ignoreSigterm ? "process.on('SIGTERM', () => {});" : ""} process.stdout.write('ready'); setInterval(() => {}, 1000)`,
-              ),
-            );
-            yield* Stream.runHead(handle.stdout);
-            yield* handle.kill({ forceKillAfter: "100 millis" });
-            const exit = yield* Effect.flip(handle.exitCode);
-            return { exit: summarizeError(exit), running: yield* handle.isRunning };
-          }).pipe(Effect.scoped);
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: kills a running child, escalating to SIGKILL after forceKillAfter`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          const killed = (spawner: ChildProcessSpawner["Service"], ignoreSigterm: boolean) =>
+            Effect.gen(function* () {
+              const handle = yield* spawner.spawn(
+                node(
+                  `${ignoreSigterm ? "process.on('SIGTERM', () => {});" : ""} process.stdout.write('ready'); setInterval(() => {}, 1000)`,
+                ),
+              );
+              yield* Stream.runHead(handle.stdout);
+              yield* handle.kill({ forceKillAfter: "100 millis" });
+              const exit = yield* Effect.flip(handle.exitCode);
+              return { exit: summarizeError(exit), running: yield* handle.isRunning };
+            }).pipe(Effect.scoped);
 
-        for (const ignoreSigterm of [false, true]) {
-          const result = yield* killed(workerSpawner, ignoreSigterm);
-          expect(result).toEqual(yield* killed(nodeSpawner, ignoreSigterm));
-          expect(result.exit.causeMessage).toContain(ignoreSigterm ? "SIGKILL" : "SIGTERM");
-        }
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
+          for (const ignoreSigterm of [false, true]) {
+            const result = yield* killed(remoteSpawner, ignoreSigterm);
+            expect(result).toEqual(yield* killed(nodeSpawner, ignoreSigterm));
+            expect(result.exit.causeMessage).toContain(ignoreSigterm ? "SIGKILL" : "SIGTERM");
+          }
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
 
   it.live("runs other command shapes on the fallback spawner", () =>
     Effect.gen(function* () {
@@ -163,7 +269,7 @@ describe("WorkerChildProcessSpawner", () => {
       expect(calls).toEqual(onMain);
 
       const ignoredStdin = node("process.stdout.write('fallback')", { stdin: "ignore" });
-      expect((yield* collect(workerSpawner, ignoredStdin)).stdout).toBe("fallback");
+      expect((yield* collect(workerSpawner, ignoredStdin)).stdout.toString()).toBe("fallback");
       onMain.push(ignoredStdin);
       expect(calls).toEqual(onMain);
 
@@ -171,7 +277,7 @@ describe("WorkerChildProcessSpawner", () => {
         Effect.provideService(HostProcess.Platform, "win32"),
       );
       const onWindows = node("process.stdout.write('windows')");
-      expect((yield* collect(windowsSpawner, onWindows)).stdout).toBe("windows");
+      expect((yield* collect(windowsSpawner, onWindows)).stdout.toString()).toBe("windows");
       onMain.push(onWindows);
       expect(calls).toEqual(onMain);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
@@ -330,7 +436,7 @@ describe("WorkerChildProcessSpawner", () => {
         workerSource: 0 as unknown as string,
       });
       const command = node("process.stdout.write('fallback')");
-      expect((yield* collect(workerSpawner, command)).stdout).toBe("fallback");
+      expect((yield* collect(workerSpawner, command)).stdout.toString()).toBe("fallback");
       expect(calls).toEqual([command]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
@@ -350,7 +456,7 @@ describe("WorkerChildProcessSpawner", () => {
           method: "spawn",
         });
         expect(calls).toHaveLength(0);
-        expect((yield* collect(workerSpawner, command)).stdout).toBe("after");
+        expect((yield* collect(workerSpawner, command)).stdout.toString()).toBe("after");
         expect(calls).toEqual([command]);
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
@@ -392,11 +498,177 @@ describe("WorkerChildProcessSpawner", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live(
-    `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} moves VCS commands off the main spawner, results and errors unchanged`,
+  it.live.skipIf(!workerPlatform)(
+    "kills the running children of a spawner process that stops and restarts it for the next command",
+    () => {
+      const { logs, layer } = capturedLogs();
+      return Effect.gen(function* () {
+        const { calls, spawner } = yield* recordingSpawner;
+        const watch = yield* childWatch;
+        // The spawner exits on the first stdin write, after the child is running.
+        const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
+          'case "stdin":',
+          'case "stdin": process.exit(70);',
+        );
+        expect(source).not.toBe(WorkerChildProcessSpawner.spawnerProcessSource);
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(spawner, {
+          source,
+        });
+        const run = Effect.gen(function* () {
+          const handle = yield* remoteSpawner.spawn(
+            node(watch.connectScript("process.stdin.resume();")),
+          );
+          const socket = yield* watch.connected;
+          const spawnerPid = (yield* bytes(Stream.take(handle.stdout, 1))).toString();
+          yield* Stream.run(Stream.make(new Uint8Array([1])), handle.stdin).pipe(Effect.ignore);
+          const error = yield* Effect.flip(handle.exitCode);
+          expect(summarizeError(error).causeMessage).toContain("SIGKILL");
+          expect(yield* handle.isRunning).toBe(false);
+          yield* watch.closed(socket);
+          return spawnerPid;
+        }).pipe(Effect.scoped);
+
+        const first = yield* run;
+        // The next command restarts the spawner; it may stop again once it has started one.
+        const second = yield* run;
+        expect(second).not.toBe(first);
+        const after = node("process.stdout.write(String(process.ppid))");
+        const third = (yield* collect(remoteSpawner, after)).stdout.toString();
+        expect([first, second]).not.toContain(third);
+        expect(calls).toEqual([]);
+        expect(logs.map(({ level }) => level)).toEqual(["Warn", "Warn"]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
+    },
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "fails commands, never on the server's spawner, once a restarted spawner process stops before starting one",
+    () => {
+      const { logs, layer } = capturedLogs();
+      return Effect.gen(function* () {
+        const { calls, spawner } = yield* recordingSpawner;
+        const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
+          'case "spawn":',
+          'case "spawn": if (message.args.includes("stop-spawner")) process.exit(70);',
+        );
+        expect(source).not.toBe(WorkerChildProcessSpawner.spawnerProcessSource);
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(spawner, {
+          source,
+        });
+        const stopping = ChildProcess.make(process.execPath, ["-e", "1", "stop-spawner"]);
+        const healthy = node("process.stdout.write('ok')");
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          expect(yield* spawnError(remoteSpawner, stopping)).toMatchObject({
+            reason: "Unknown",
+            method: "spawn",
+            causeMessage: "The process spawner stopped",
+          });
+        }
+        expect(yield* spawnError(remoteSpawner, healthy)).toMatchObject({
+          reason: "Unknown",
+          method: "spawn",
+          causeMessage: "The process spawner stopped",
+        });
+        expect(calls).toEqual([]);
+        expect(logs.map(({ level }) => level)).toEqual(["Warn", "Error"]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
+    },
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "closing the spawner process kills the children it still runs and ends the spawner",
     () =>
       Effect.gen(function* () {
-        const outcome = (knob: string | undefined) =>
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const watch = yield* childWatch;
+        const { socket, spawnerPid } = yield* Effect.gen(function* () {
+          const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner);
+          const handle = yield* remoteSpawner.spawn(node(watch.connectScript()));
+          // Unreferenced, so its own release leaves it running.
+          yield* Effect.asVoid(handle.unref);
+          const socket = yield* watch.connected;
+          const spawnerPid = Number((yield* bytes(Stream.take(handle.stdout, 1))).toString());
+          return { socket, spawnerPid };
+        }).pipe(Effect.scoped);
+        yield* watch.closed(socket);
+        // Node reaps the spawner before reporting its exit, which closing waited for.
+        expect(() => process.kill(spawnerPid, 0)).toThrow(
+          expect.objectContaining({ code: "ESRCH" }),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "the spawner process kills its children and exits when the server dies",
+    () =>
+      Effect.gen(function* () {
+        const watch = yield* childWatch;
+        const launch = WorkerChildProcessSpawner.spawnerProcessLaunch({
+          executable: process.execPath,
+          isExecutable: false,
+          environment: process.env,
+          windowBytes: 64 * 1024,
+        });
+        const children = [true, false].map((detached) => ({
+          command: process.execPath,
+          args: ["-e", watch.connectScript()],
+          options: { env: process.env, stdio: ["pipe", "pipe", "pipe"], detached },
+        }));
+        // Stands in for the server: starts the spawner as the server does, then is killed.
+        const server = `
+          const launch = JSON.parse(process.argv[1]);
+          const spawner = require("node:child_process").spawn(launch.command, launch.args, launch.options);
+          launch.children.forEach((child, index) => spawner.send({ t: "spawn", id: index + 1, ...child }));`;
+        const host = NodeChildProcess.spawn(
+          process.execPath,
+          ["-e", server, JSON.stringify({ ...launch, children })],
+          { stdio: ["ignore", "ignore", "pipe"] },
+        );
+        // The spawner shares the server's stderr: its end means both have exited.
+        const stderrEnded = yield* Deferred.make<string>();
+        let stderr = "";
+        host.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+        host.stderr.on("end", () => Deferred.doneUnsafe(stderrEnded, Exit.succeed(stderr)));
+        const sockets = [yield* watch.connected, yield* watch.connected];
+        host.kill("SIGKILL");
+        yield* Effect.forEach(sockets, watch.closed);
+        expect(yield* Deferred.await(stderrEnded)).toBe("");
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "single executables start the spawner process through the CLI entry",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-process-spawner-" });
+        // Runs the CLI entry the way a single executable runs itself.
+        const executable = path.join(directory, "t3");
+        const entry = path.join(import.meta.dirname, "..", "bin.ts");
+        yield* fs.writeFileString(
+          executable,
+          `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(entry)} "$@"\n`,
+        );
+        yield* fs.chmod(executable, 0o755);
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner).pipe(
+          Effect.provideService(HostProcess.ExecutablePath, executable),
+          Effect.provideService(HostProcess.IsExecutable, true),
+        );
+        const command = ChildProcess.make("git", ["--version"]);
+        expect(yield* collect(remoteSpawner, command)).toEqual(
+          yield* collect(nodeSpawner, command),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} and ${WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV}=child move VCS commands off the main spawner, results and errors unchanged`,
+    () =>
+      Effect.gen(function* () {
+        const outcome = (knobs: Record<string, string>) =>
           Effect.gen(function* () {
             const { calls, spawner } = yield* recordingSpawner;
             // As in server.ts, a shared ProcessRunner is provided outside VcsProcess too.
@@ -406,15 +678,7 @@ describe("WorkerChildProcessSpawner", () => {
                 ServerConfig.layerTest(process.cwd(), { prefix: "t3-worker-spawner-test-" }),
               ),
               Layer.provide(Layer.succeed(ChildProcessSpawner, spawner)),
-              Layer.provide(
-                ConfigProvider.layer(
-                  ConfigProvider.fromUnknown(
-                    knob === undefined
-                      ? {}
-                      : { [WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV]: knob },
-                  ),
-                ),
-              ),
+              Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(knobs))),
             );
             return yield* Effect.gen(function* () {
               const vcs = yield* VcsProcess.VcsProcess;
@@ -467,15 +731,19 @@ describe("WorkerChildProcessSpawner", () => {
             }).pipe(Effect.provide(layer));
           });
 
-        const unset = yield* outcome(undefined);
+        const { VCS_SPAWN_WORKER_ENV: worker, PROCESS_SPAWNER_ENV: spawner } =
+          WorkerChildProcessSpawner;
+        const unset = yield* outcome({});
         expect(unset.mainSpawns).toBe(4);
         expect(unset.missing.tag).toBe("VcsProcessSpawnError");
         expect(unset.missingCwd).toMatchObject({
           tag: "GitCommandError",
           cause: { reason: "NotFound" },
         });
-        expect(yield* outcome("false")).toEqual(unset);
-        expect(yield* outcome("true")).toEqual({ ...unset, mainSpawns: workerPlatform ? 0 : 4 });
+        expect(yield* outcome({ [worker]: "false", [spawner]: "default" })).toEqual(unset);
+        const offMain = { ...unset, mainSpawns: workerPlatform ? 0 : 4 };
+        expect(yield* outcome({ [worker]: "true" })).toEqual(offMain);
+        expect(yield* outcome({ [spawner]: "child" })).toEqual(offMain);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

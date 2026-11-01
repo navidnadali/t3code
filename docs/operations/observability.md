@@ -172,8 +172,16 @@ same output, exit codes and errors. Git run through other services, such as the 
 identity lookup, still spawns on the event loop. On Linux a `fork` from the worker still write-locks
 the server's address space while page tables are copied, interrupts every CPU running the server to
 flush its TLB, and leaves copy-on-write faults for the event loop, so measure before enabling it.
-With the knob on, those services run real processes even when a test injects a fake
-`ChildProcessSpawner`. Unset or `false` spawns them on the event loop, as Windows always does.
+
+`T3CODE_PROCESS_SPAWNER=child` (it takes precedence over the worker) starts the same commands from
+a small spawner process instead, started once while the server is small, so the server never forks
+for them: each fork copies only the spawner's page tables. A spawner that stops is restarted once;
+if it stops again before starting a command, those commands fail with a logged error until the
+server restarts. It exits and kills its children when the server exits. macOS already spawns with
+`posix_spawn`, which copies no page tables, so the gain there is only the event-loop time.
+
+With either knob on, those services run real processes even when a test injects a fake
+`ChildProcessSpawner`. Unset spawns them on the event loop, as Windows always does.
 
 ### Related Artifacts
 

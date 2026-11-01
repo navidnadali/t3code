@@ -557,9 +557,11 @@ const openSpawnerProcess =
     spawner.on("exit", (code, signal) =>
       events.onStop(new Error(`The process spawner exited with ${signal ?? `code ${code}`}`)),
     );
-    // Without its channel the spawner can no longer answer; it exits on disconnect itself.
+    let closing = false;
+    // A spawner that closed its channel can no longer answer; one this host disconnects kills
+    // its children first, including those whose start it has not reported yet.
     spawner.on("disconnect", () => {
-      if (!hasExited()) spawner.kill("SIGKILL");
+      if (!closing && !hasExited()) spawner.kill("SIGKILL");
     });
     spawner.unref();
     spawner.channel?.unref();
@@ -584,6 +586,7 @@ const openSpawnerProcess =
             clearTimeout(timer);
             resolve();
           });
+          closing = true;
           if (spawner.connected) spawner.disconnect();
           else spawner.kill("SIGKILL");
         })),

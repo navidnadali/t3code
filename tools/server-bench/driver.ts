@@ -57,6 +57,7 @@ import {
   type ShellSnapshot,
   Subscriber,
   type ThreadShell,
+  withArchivedThreads,
 } from "./driver/clients.ts";
 
 const RESULT_FILE = "driver.json";
@@ -803,7 +804,9 @@ class BenchRun implements RunContext {
       watcher.follow(this, control, snapshot.value.snapshotSequence);
       const workload = await this.race(
         options.mode === "history"
-          ? this.prepareHistory(snapshot.value, watcher)
+          ? withArchivedThreads(snapshot.value, control, options.callTimeoutMs).then((shells) =>
+              this.prepareHistory(shells, watcher),
+            )
           : this.prepareFresh(watcher),
       );
       for (const session of sessions) session.watch();

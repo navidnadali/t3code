@@ -177,8 +177,9 @@ providers:manage whenever a planned instance has a settings entry (every bench i
     --scope orchestration:read --scope orchestration:operate --scope access:write \\
     --scope settings:write --scope providers:manage
 
-  --mode history|fresh      history (default): sessions continue, and readers read, seeded
-                            threads picked to match the fixture's turn-item distribution;
+  --mode history|fresh      history (default): sessions continue seeded active threads, and
+                            readers read seeded threads (archived ones too), picked to match the
+                            turn-item distribution of every fixture thread, archive included;
                             fresh: new projects and threads
   --sessions N              streaming sessions on --provider (default 80)
 ${PROVIDER_LOAD_USAGE}

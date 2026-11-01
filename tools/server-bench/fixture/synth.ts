@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off preferSchemaOverJson:off - reads the shape file and measures the result through node:sqlite.
 import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -23,8 +24,8 @@ import * as ProjectStore from "../../../apps/server/src/orchestration-v2/Project
 import * as Sqlite from "../../../apps/server/src/persistence/Sqlite.ts";
 import { Builder, type LegacyRows } from "./entities.ts";
 import { type SynthPlan, planSynth } from "./plan.ts";
-import { checkFixture, compactInto, isClean } from "./sanitise.ts";
-import { withSidecars } from "./guards.ts";
+import { checkFixture, compactInto, isClean, ownedFiles } from "./sanitise.ts";
+import { createExclusive, fillExclusive, privateScratchDirectory, withSidecars } from "./guards.ts";
 import { failed, safeDestination } from "./server.ts";
 import { type Shape, measureShape, parseShape, shapeRows } from "./shape.ts";
 
@@ -157,25 +158,19 @@ const writeDatabase = Effect.fn("fixture.synth.write")(function* (
   return written;
 });
 
-const removeFiles = (path: string) => {
-  for (const suffix of ["", "-wal", "-shm", "-journal"])
-    NodeFS.rmSync(`${path}${suffix}`, { force: true });
-};
-
 export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput) {
-  const scratch = `${input.destination}.synth-tmp`;
   const destination = yield* safeDestination({
     destination: input.destination,
-    scratch: withSidecars(scratch),
     ...(input.report === undefined ? {} : { distinctFrom: [input.report] }),
   });
-  if (input.report !== undefined) {
-    yield* safeDestination({
-      destination: input.report,
-      source: input.shapePath,
-      distinctFrom: [...withSidecars(input.destination), ...withSidecars(scratch)],
-    });
-  }
+  const report =
+    input.report === undefined
+      ? undefined
+      : yield* safeDestination({
+          destination: input.report,
+          source: input.shapePath,
+          distinctFrom: withSidecars(input.destination),
+        });
   const shape = yield* Effect.try({
     try: () => parseShape(JSON.parse(NodeFS.readFileSync(input.shapePath, "utf8"))),
     catch: (cause) => failed(`--like ${input.shapePath}`, cause),
@@ -195,7 +190,16 @@ export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput)
     capabilities: ClaudeProviderCapabilitiesV2,
   });
 
+  const owned = ownedFiles();
   return yield* Effect.gen(function* () {
+    owned.watch();
+    if (report !== undefined) {
+      createExclusive(report);
+      owned.file(report);
+    }
+    const directory = privateScratchDirectory(destination, ".fixture-synth-");
+    owned.directory(directory);
+    const scratch = NodePath.join(directory, "scratch.sqlite");
     yield* Console.log(
       `Planned ${plan.projects} projects, ${plan.threads.length} threads, ${plan.totals.turnItems} turn items, ${plan.expected.orchestration_events} events.`,
     );
@@ -212,6 +216,7 @@ export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput)
       ),
     );
     yield* Console.log(`Wrote ${events} events; compacting into ${destination}...`);
+    owned.file(destination);
     yield* compactInto(scratch, destination);
 
     const db = new NodeSqlite.DatabaseSync(destination, { readOnly: true });
@@ -223,7 +228,8 @@ export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput)
     }
     const tables = compare(shape, plan, actual);
     const mismatched = tables.filter((row) => row.planned !== null && row.planned !== row.actual);
-    const check = yield* checkFixture(destination);
+    // Generated text is not filler: the pattern layer checks it, as for a --keep-content copy.
+    const check = yield* checkFixture(destination, "redact");
     if (mismatched.length > 0 || !isClean(check)) {
       return yield* failed(
         `Self-check failed: ${JSON.stringify({ notAsPlanned: mismatched, check }, null, 2)}`,
@@ -231,7 +237,7 @@ export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput)
     }
     const targetBytes = Math.round(shape.pageSize * shape.pageCount * plan.scale);
     const sizeBytes = actual.pageSize * actual.pageCount;
-    return {
+    const result = {
       destination,
       scale: plan.scale,
       seed: plan.seed,
@@ -242,8 +248,15 @@ export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput)
       tables,
       shape: actual,
     };
+    if (report !== undefined) fillExclusive(report, `${JSON.stringify(result, null, 2)}\n`);
+    owned.keep();
+    return result;
   }).pipe(
-    Effect.onError(() => Effect.sync(() => removeFiles(destination))),
-    Effect.ensuring(Effect.sync(() => removeFiles(scratch))),
+    Effect.ensuring(
+      Effect.sync(() => {
+        owned.cleanup();
+        owned.unwatch();
+      }),
+    ),
   );
 });

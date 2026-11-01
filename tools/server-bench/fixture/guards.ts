@@ -5,18 +5,53 @@ import * as NodePath from "node:path";
 
 export class UnsafePathError extends Error {}
 
-/** Resolves symlinks in the longest existing prefix, so a path not yet created still resolves. */
+/**
+ * Resolves a path as the OS does: each component is followed through symlinks before the next,
+ * so `link/..` is the parent of the link's target, not the directory holding the link (text
+ * normalisation, as `path.resolve` does, gets that wrong). Missing components are appended as
+ * written; a dangling symlink is refused, since writing through it lands wherever it points.
+ */
 export const canonicalPath = (path: string): string => {
-  const absolute = NodePath.resolve(path);
-  const missing: Array<string> = [];
-  let existing = absolute;
-  while (!NodeFS.existsSync(existing)) {
-    const parent = NodePath.dirname(existing);
-    if (parent === existing) break;
-    missing.unshift(NodePath.basename(existing));
-    existing = parent;
+  const absolute = NodePath.isAbsolute(path) ? path : `${process.cwd()}${NodePath.sep}${path}`;
+  let current = NodePath.parse(absolute).root;
+  for (const part of absolute.slice(current.length).split(NodePath.sep)) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      current = NodePath.dirname(current);
+      continue;
+    }
+    const next = NodePath.join(current, part);
+    const entry = NodeFS.lstatSync(next, { throwIfNoEntry: false });
+    if (entry === undefined) {
+      current = next;
+    } else if (entry.isSymbolicLink() && !NodeFS.existsSync(next)) {
+      throw new UnsafePathError(`Refusing ${path}: ${next} is a symlink to nothing.`);
+    } else {
+      current = NodeFS.realpathSync.native(next);
+    }
   }
-  return NodePath.join(NodeFS.realpathSync.native(existing), ...missing);
+  return current;
+};
+
+/**
+ * Creates `path` empty and private (0600), failing if anything is already there, a symlink
+ * included. Callers pass the canonical path the guard checked, so the file lands where checked.
+ */
+export const createExclusive = (path: string) =>
+  NodeFS.closeSync(NodeFS.openSync(path, "wx", 0o600));
+
+/** A private (0700) directory beside `destination` for the copy that is not yet sanitised. */
+export const privateScratchDirectory = (destination: string, prefix: string) =>
+  NodeFS.mkdtempSync(NodePath.join(NodePath.dirname(destination), prefix));
+
+/** Writes into a file `createExclusive` made; refuses anything else that took its place. */
+export const fillExclusive = (path: string, text: string) => {
+  const handle = NodeFS.openSync(path, NodeFS.constants.O_WRONLY | NodeFS.constants.O_NOFOLLOW);
+  try {
+    NodeFS.writeFileSync(handle, text);
+  } finally {
+    NodeFS.closeSync(handle);
+  }
 };
 
 const isWithin = (path: string, directory: string) => {

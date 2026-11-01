@@ -186,6 +186,9 @@ export const summarize = (ascending: ArrayLike<number>): Quantiles => {
   });
 };
 
+/** An SQL identifier, quoted: table names come from the database, not from this code. */
+const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
+
 const tableNames = (db: NodeSqlite.DatabaseSync) =>
   (
     db
@@ -259,7 +262,7 @@ export const measureShape = (
   const tables: Record<string, TableShape> = {};
   for (const name of tableNames(db)) {
     const rows = Number(
-      (db.prepare(`SELECT COUNT(*) AS n FROM "${name}"`).get() as { n: number }).n,
+      (db.prepare(`SELECT COUNT(*) AS n FROM ${quote(name)}`).get() as { n: number }).n,
     );
     const columns = (
       db.prepare(`SELECT name FROM pragma_table_info(?)`).all(name) as Array<{ name: string }>
@@ -270,7 +273,7 @@ export const measureShape = (
     const lengths =
       column === undefined || rows === 0
         ? new Float64Array(0)
-        : columnValues(db, `SELECT length("${column}") AS value FROM "${name}"`);
+        : columnValues(db, `SELECT length(${quote(column)}) AS value FROM ${quote(name)}`);
     tables[name] = {
       rows,
       bytes: bytesByTable.get(name) ?? 0,

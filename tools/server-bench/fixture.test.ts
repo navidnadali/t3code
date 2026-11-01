@@ -10,6 +10,7 @@ import * as NodeSqlite from "node:sqlite";
 
 import { describe, expect, it, onTestFinished } from "vite-plus/test";
 
+import { fillText, isFiller, keptAs, rewriteContent, emptyCounts } from "./fixture/content.ts";
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { TOKEN_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
@@ -986,6 +987,87 @@ describe("sanitise content", () => {
       `${"q8Zr3Vt9Lp2Xw7Ms".repeat(2)}`,
     );
     expect([inId, prose, sessionKey]).toEqual([1, 1, 1]);
+  });
+});
+
+describe("content blanking", () => {
+  it("fills text to the same UTF-8 and UTF-16 size, keeps lines and escapes, and recognises only filler", () => {
+    const texts = [
+      "short",
+      "deploy with the staging key, then restart",
+      'line one\n\tline "two" \\ /usr/local/bin\nnaïve café 日本語 🚀 done',
+      "x".repeat(10_000),
+    ];
+    const filled = texts.map((text, index) => fillText(text, 12_345 + index));
+    expect(filled.map((text) => Buffer.byteLength(text))).toEqual(
+      texts.map((text) => Buffer.byteLength(text)),
+    );
+    expect(filled.map((text) => text.length)).toEqual(texts.map((text) => text.length));
+    expect(filled[2]?.split("\n").length).toBe(3);
+    expect(filled.every(isFiller)).toBe(true);
+    expect(texts.filter(isFiller)).toEqual([]);
+    expect(isFiller(`${filled[1]}x`)).toBe(false);
+  });
+
+  it("keeps only the allowlist and blanks the rest, at any JSON depth", () => {
+    const payload = JSON.stringify({
+      id: "turn-item:provider:claudeAgent:native-item:toolu_01",
+      type: "command_execution",
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      model: "claude-sonnet-4-6",
+      exitCode: 0,
+      input: JSON.stringify({ command: "cat ~/.netrc", cwd: "/Users/someone/project" }),
+      env: { DB_PASSWORD: "plain", "/odd key": "value" },
+      token: "completed",
+      tokenId: "abc",
+    });
+    const counts = emptyCounts();
+    const out = JSON.parse(rewriteContent(payload, "payload_json", "blank", counts)) as Record<
+      string,
+      unknown
+    >;
+    expect([out.id, out.type, out.status, out.createdAt, out.model, out.exitCode]).toEqual([
+      "turn-item:provider:claudeAgent:native-item:toolu_01",
+      "command_execution",
+      "completed",
+      "2026-01-01T00:00:00.000Z",
+      "claude-sonnet-4-6",
+      0,
+    ]);
+    const input = JSON.parse(out.input as string) as { command: string; cwd: string };
+    expect([isFiller(input.command), isFiller(input.cwd), input.cwd.length]).toEqual([
+      true,
+      true,
+      "/Users/someone/project".length,
+    ]);
+    const env = out.env as Record<string, string>;
+    expect(Object.keys(env)[0]).toBe("DB_PASSWORD");
+    expect(Object.keys(env)[1]).toMatch(/^[a-z]{8}$/);
+    expect(Object.values(env).every(isFiller)).toBe(true);
+    // A credential-named key keeps no value P1-002's check could read; an id under one is blanked.
+    expect([isFiller(out.token as string), isFiller(out.tokenId as string)]).toEqual([true, true]);
+    expect(keptAs("thread_id", `gh${"p"}_${"A1b2".repeat(9)}`)).toBe("id");
+    expect(
+      isFiller(rewriteContent(`gh${"p"}_${"A1b2".repeat(9)}`, "thread_id", "blank", emptyCounts())),
+    ).toBe(true);
+  });
+
+  it("--keep-content removes every planted credential with the pattern layer alone", () => {
+    const directory = scratch("keep-content");
+    const seeded = NodePath.join(directory, "seeded.sqlite");
+    synth(seeded, "0.25");
+    const secrets = seedCredentials(seeded);
+    const kept = NodePath.join(directory, "kept.sqlite");
+    expect(run(["sanitise", "--keep-content", seeded, kept]).status).toBe(0);
+    const raw = NodeFS.readFileSync(kept).toString("latin1");
+    const survivors = secrets.filter(
+      (secret) => raw.includes(secret) || raw.includes(JSON.stringify(secret).slice(1, -1)),
+    );
+    expect(survivors).toEqual([]);
+    expect([run(["scan", "--keep-content", kept]).status, run(["scan", kept]).status]).toEqual([
+      0, 1,
+    ]);
   });
 });
 

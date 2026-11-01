@@ -1,67 +1,138 @@
 // @effect-diagnostics nodeBuiltinImport:off - reads raw file bytes in chunks.
 import * as NodeFS from "node:fs";
 
-/** Credential shapes the sanitiser redacts and the self-check must find none of. */
-export const SECRET_PATTERNS: ReadonlyArray<{ readonly name: string; readonly pattern: RegExp }> = [
-  // Found by its header; `redact` masks the whole block inside its decoded string (redactKeys).
-  { name: "private-key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g },
-  { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}/g },
-  { name: "github-pat", pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}/g },
-  { name: "gitlab-token", pattern: /\bglpat-[A-Za-z0-9_-]{20,}/g },
-  { name: "anthropic-key", pattern: /\bsk-ant-[A-Za-z0-9_-]{20,}/g },
-  { name: "openai-key", pattern: /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}/g },
-  { name: "aws-access-key", pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
-  { name: "google-api-key", pattern: /\bAIza[0-9A-Za-z_-]{35}/g },
-  { name: "slack-token", pattern: /\bxox[abeprs]-[A-Za-z0-9-]{10,}/g },
-  { name: "slack-webhook", pattern: /hooks\.slack\.com\/services\/[A-Za-z0-9/_-]{20,}/g },
-  { name: "stripe-key", pattern: /\b[rs]k_live_[0-9A-Za-z]{20,}/g },
-  { name: "npm-token", pattern: /\bnpm_[A-Za-z0-9]{36}\b/g },
-  { name: "huggingface-token", pattern: /\bhf_[A-Za-z0-9]{30,}/g },
-  { name: "sendgrid-key", pattern: /\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b/g },
-  { name: "mailgun-key", pattern: /\bkey-[0-9a-f]{32}\b/g },
-  { name: "tokenfeed-token", pattern: /\btfe_[A-Za-z0-9_-]{16,}/g },
-  { name: "jwt", pattern: /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g },
-  { name: "bearer", pattern: /\b[Bb]earer\s+[A-Za-z0-9._~+/-]{20,}=*/g },
-  { name: "url-credentials", pattern: /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@"'\\]+:[^\s/@"'\\]+@/g },
+import { parseJsonContainer, rewriteJson } from "./json.ts";
+
+interface TokenPattern {
+  readonly name: string;
+  readonly pattern: RegExp;
+  /** A match only counts when this holds (Basic auth must decode to `user:password`). */
+  readonly confirm?: (match: RegExpMatchArray) => boolean;
+}
+
+// No `\b`: a token right after `\n` in JSON text follows the escape's `n`, a word character.
+// The lookbehinds only refuse a letter or digit run-in on decoded text; raw bytes are de-escaped.
+const AFTER = "(?<![A-Za-z0-9])";
+
+const basicCredentials = (match: RegExpMatchArray) => {
+  const decoded = Buffer.from(match.groups?.secret ?? "", "base64").toString("latin1");
+  return /^[\x20-\x7e]+:[\x20-\x7e]+$/.test(decoded);
+};
+
+/** Credential formats with a recognisable shape; safe on raw bytes, where escapes are blanked first. */
+export const TOKEN_PATTERNS: ReadonlyArray<TokenPattern> = [
+  { name: "private-key", pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g },
+  { name: "github-token", pattern: new RegExp(`${AFTER}gh[pousr]_[A-Za-z0-9]{36,}`, "g") },
+  { name: "github-pat", pattern: new RegExp(`${AFTER}github_pat_[A-Za-z0-9_]{22,}`, "g") },
+  { name: "gitlab-token", pattern: new RegExp(`${AFTER}glpat-[A-Za-z0-9_-]{20,}`, "g") },
+  { name: "anthropic-key", pattern: new RegExp(`${AFTER}sk-ant-[A-Za-z0-9_-]{20,}`, "g") },
   {
-    name: "assignment",
+    name: "openai-key",
+    pattern: new RegExp(`${AFTER}sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}`, "g"),
+  },
+  {
+    name: "aws-access-key",
+    pattern: new RegExp(`${AFTER}(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])`, "g"),
+  },
+  { name: "google-api-key", pattern: new RegExp(`${AFTER}AIza[0-9A-Za-z_-]{35}`, "g") },
+  { name: "google-oauth", pattern: new RegExp(`${AFTER}ya29\\.[0-9A-Za-z_-]{20,}`, "g") },
+  { name: "slack-token", pattern: new RegExp(`${AFTER}xox[abcdeoprs]-[A-Za-z0-9-]{10,}`, "g") },
+  { name: "slack-app-token", pattern: new RegExp(`${AFTER}xapp-[A-Za-z0-9-]{10,}`, "g") },
+  { name: "slack-webhook", pattern: /hooks\.slack\.com\/services\/[A-Za-z0-9/_-]{20,}/g },
+  { name: "atlassian-token", pattern: new RegExp(`${AFTER}ATATT[A-Za-z0-9_=-]{20,}`, "g") },
+  { name: "stripe-key", pattern: new RegExp(`${AFTER}[rs]k_live_[0-9A-Za-z]{20,}`, "g") },
+  { name: "npm-token", pattern: new RegExp(`${AFTER}npm_[A-Za-z0-9]{36}`, "g") },
+  { name: "huggingface-token", pattern: new RegExp(`${AFTER}hf_[A-Za-z0-9]{30,}`, "g") },
+  {
+    name: "sendgrid-key",
+    pattern: new RegExp(`${AFTER}SG\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}`, "g"),
+  },
+  { name: "mailgun-key", pattern: new RegExp(`${AFTER}key-[0-9a-f]{32}(?![0-9a-f])`, "g") },
+  { name: "tokenfeed-token", pattern: new RegExp(`${AFTER}tfe_[A-Za-z0-9_-]{16,}`, "g") },
+  {
+    name: "jwt",
+    pattern: new RegExp(
+      `${AFTER}eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}`,
+      "g",
+    ),
+  },
+  { name: "bearer", pattern: new RegExp(`${AFTER}[Bb]earer\\s+[A-Za-z0-9._~+/-]{20,}=*`, "g") },
+  {
+    name: "basic-auth",
+    pattern: new RegExp(`${AFTER}[Bb]asic\\s+(?<secret>[A-Za-z0-9+/]{8,}={0,2})`, "g"),
+    confirm: basicCredentials,
+  },
+  // The scheme is bounded, so a long run of letters cannot make this quadratic.
+  {
+    name: "url-credentials",
     pattern:
-      /\b(?:api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|password|passwd)\b\\*["']?\s*[:=]\s*\\*["']?(?<secret>[A-Za-z0-9_\-+/=.]{12,})/gi,
+      /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/[^\s/:@"'\\]{0,256}:(?<secret>[^\s/@"'\\]{1,256})@/g,
   },
 ];
 
+/** A name that says its value is a credential: DB_PASSWORD, cfApiToken, refresh_token, SSH_KEY … */
+export const CREDENTIAL_NAME =
+  /(?:password|passwd|passphrase|secret|token|credential|api[_-]?key|access[_-]?key|private[_-]?key|auth)|(?:^|[_.-])(?:key|pass|pwd)(?:$|[_.-])/i;
+
+/** `NAME=value`, `NAME: value`, `"name": "value"`, quoted or not; the name decides. */
+const ASSIGNMENT =
+  /(?<![A-Za-z0-9_.-])(?<name>[A-Za-z_][A-Za-z0-9_.-]{0,80})["']?\s*[:=]\s*["']?(?<secret>[^\s"'`,;&|<>(){}[\]]{6,})/g;
+
+/** Long runs of base64 and token characters. */
+const HIGH_ENTROPY = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{24,}(?![A-Za-z0-9+/=_-])/g;
+
 /**
- * Same length, so payload sizes keep their shape: letters and digits become `*`. Punctuation and
- * every escape (a backslash run and the character or `uXXXX` after it, at any JSON nesting depth)
- * stay, so the JSON around a match still parses.
+ * Random runs, as [start, end) pairs. A URL escape (`%3A`, or `%253A` encoded twice) splits a
+ * run, so URL-encoded ids in refs read as their parts.
  */
-const mask = (match: string) => {
-  let out = "";
-  for (let index = 0; index < match.length; index++) {
-    const char = match[index] as string;
-    if (char !== "\\") {
-      out += /[A-Za-z0-9]/.test(char) ? "*" : char;
-      continue;
-    }
-    let end = index;
-    while (match[end] === "\\") end++;
-    const keep = match[end] === "u" ? 5 : end < match.length ? 1 : 0;
-    out += match.slice(index, end + keep);
-    index = end + keep - 1;
+const randomRuns = function* (text: string) {
+  const split = text.includes("%")
+    ? text.replace(/%(?:25)*[0-9A-Fa-f]{2}/g, (escape) => " ".repeat(escape.length))
+    : text;
+  for (const match of split.matchAll(HIGH_ENTROPY)) {
+    if (looksRandom(match[0])) yield [match.index, match.index + match[0].length] as const;
   }
-  return out;
 };
 
-/** One case-insensitive pass that every precise pattern implies; rows without a match skip redaction. */
-export const MAYBE_SECRET = new RegExp(
-  SECRET_PATTERNS.map(({ pattern }) => `(?:${pattern.source})`).join("|"),
-  "i",
-);
+const entropyBits = (text: string) => {
+  const counts = new Map<string, number>();
+  for (const char of text) counts.set(char, (counts.get(char) ?? 0) + 1);
+  let bits = 0;
+  for (const count of counts.values()) {
+    const p = count / text.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits;
+};
 
-const KEY_HEADER = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
-const KEY_FOOTER = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
+/**
+ * Random keys mix upper case, lower case and digits with the entropy of noise. Hex digests and
+ * UUIDs (one letter case) are ids, and a run of seven lower-case letters is a word: a path or a
+ * camelCase name, not a key (random base64 has one in about 6 % of 40-character keys).
+ */
+export const looksRandom = (token: string) =>
+  /[a-z]/.test(token) &&
+  /[A-Z]/.test(token) &&
+  /[0-9]/.test(token) &&
+  !/[a-z]{7}/.test(token) &&
+  entropyBits(token) >= 3.5;
 
-/** Header to footer, else to the end of the text; plain index scans, no backtracking on big text. */
+/** Letters and digits become `*`; the shape and length stay. */
+/**
+ * Every visible character becomes `*` (whitespace stays, so lines and length stay): no
+ * punctuation is left for a looser check to read as a value (`*//****` still looks like one).
+ */
+const mask = (text: string) => text.replace(/\S/g, "*");
+
+// A key split across strings (a diff's lines in an array): the markers and the base64 body lines
+// on their own, as P1-002's extended check reads them.
+const KEY_MARKER = /-----(?:BEGIN|END)[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----/g;
+const KEY_BODY_LINE = /^[ +-]?[A-Za-z0-9+/]{60,76}={0,2}$/gm;
+
+const KEY_HEADER = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g;
+const KEY_FOOTER = /-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g;
+
+/** Header to footer, else to the end of the text; index scans, no backtracking on big text. */
 const maskKeyBlocks = (text: string): string => {
   let out = "";
   let copied = 0;
@@ -77,84 +148,155 @@ const maskKeyBlocks = (text: string): string => {
   return copied === 0 ? text : out + text.slice(copied);
 };
 
-/** The index of the quote closing a JSON string that starts before `from`: one after an even backslash run. */
-const closingQuote = (text: string, from: number) => {
-  for (let at = text.indexOf('"', from); at !== -1; at = text.indexOf('"', at + 1)) {
-    let slashes = 0;
-    while (at - slashes - 1 >= from && text[at - slashes - 1] === "\\") slashes++;
-    if (slashes % 2 === 0) return at;
+export interface DecodedScan {
+  /** Also flag high-entropy runs: right for free text, wrong for kept ids (tool ids look random). */
+  readonly entropy: boolean;
+}
+
+/** A credential name with a value that still holds a letter or digit (a masked one does not). */
+/**
+ * A credential name with a value that still holds a letter or digit (a masked one does not) and
+ * is not a plain number, time or version (`inputTokens: 123456` counts tokens).
+ */
+const isAssignment = (name: string | undefined, secret: string | undefined) =>
+  CREDENTIAL_NAME.test(name ?? "") &&
+  /[A-Za-z0-9]/.test(secret ?? "") &&
+  !/^[\d.:+-]+$/.test(secret ?? "");
+
+const assignments = function* (text: string) {
+  for (const match of text.matchAll(ASSIGNMENT)) {
+    if (isAssignment(match.groups?.name, match.groups?.secret)) yield match;
   }
-  return -1;
 };
 
-const parsesAsJson = (text: string) => {
-  const start = text.trimStart()[0];
-  if (start !== "{" && start !== "[") return false;
-  try {
-    JSON.parse(text);
-    return true;
-  } catch {
-    return false;
+// Terminal colour and cursor codes read as spaces, so a token printed in colour is still found.
+const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const withoutAnsi = (text: string) =>
+  text.includes("\x1b") ? text.replace(ANSI, (code) => " ".repeat(code.length)) : text;
+
+/** Credential kinds found in one decoded string. */
+export const scanDecoded = (raw: string, options: DecodedScan): Array<string> => {
+  const text = withoutAnsi(raw);
+  const hits = new Set<string>();
+  for (const { name, pattern, confirm } of TOKEN_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      if (confirm === undefined || confirm(match)) {
+        hits.add(name);
+        break;
+      }
+    }
   }
+  for (const _ of assignments(text)) {
+    hits.add("credential-assignment");
+    break;
+  }
+  KEY_MARKER.lastIndex = 0;
+  KEY_BODY_LINE.lastIndex = 0;
+  if (KEY_MARKER.test(text) || KEY_BODY_LINE.test(text)) hits.add("private-key");
+  if (options.entropy) {
+    for (const _ of randomRuns(text)) {
+      hits.add("high-entropy");
+      break;
+    }
+  }
+  return [...hits];
+};
+
+/** Masks every finding in one decoded string: key blocks, tokens, assigned values, random runs. */
+export const redactDecoded = (raw: string, options: DecodedScan): string => {
+  const text = withoutAnsi(raw);
+  let out = maskKeyBlocks(text).replace(KEY_MARKER, mask).replace(KEY_BODY_LINE, mask);
+  const maskMatch = (match: string, ...rest: Array<unknown>) => {
+    const groups = rest.at(-1) as { secret?: string } | string;
+    const secret = typeof groups === "object" ? groups.secret : undefined;
+    return secret === undefined
+      ? mask(match)
+      : match.slice(0, match.length - secret.length) + mask(secret);
+  };
+  for (const { pattern, confirm } of TOKEN_PATTERNS) {
+    out = out.replace(pattern, (match: string, ...rest: Array<unknown>) => {
+      if (confirm !== undefined) {
+        const groups = rest.at(-1);
+        const probe = Object.assign([match], { groups }) as unknown as RegExpMatchArray;
+        if (!confirm(probe)) return match;
+      }
+      return maskMatch(match, ...rest);
+    });
+  }
+  out = out.replace(ASSIGNMENT, (match: string, ...rest: Array<unknown>) => {
+    const groups = rest.at(-1) as { name?: string; secret?: string };
+    return isAssignment(groups.name, groups.secret) ? maskMatch(match, ...rest) : match;
+  });
+  if (options.entropy) {
+    // Masking keeps length, so the runs found on the masked text sit at the same places.
+    const parts: Array<string> = [];
+    let copied = 0;
+    for (const [start, end] of randomRuns(out)) {
+      parts.push(out.slice(copied, start), mask(out.slice(start, end)));
+      copied = end;
+    }
+    if (copied > 0) out = parts.join("") + out.slice(copied);
+  }
+  if (text === raw) return out;
+  // Masking keeps length, so the masked positions carry back onto the text with its colour codes.
+  let merged = "";
+  for (let index = 0; index < raw.length; index++) {
+    merged += out[index] !== text[index] ? out[index] : raw[index];
+  }
+  return merged;
 };
 
 /**
- * Masks whole private key blocks inside the decoded string value that holds them, recursing into
- * JSON-encoded strings, so armor headers with quotes stay covered and no match crosses a field.
+ * Redacts text, JSON or not: inside JSON each decoded string (nested JSON unwrapped) is redacted on
+ * its own, and a value under a credential-named key is masked whatever it holds.
  */
-const redactKeys = (text: string): string => {
-  if (!text.includes("PRIVATE KEY")) return text;
-  if (!parsesAsJson(text)) return maskKeyBlocks(text);
-  let out = "";
-  let copied = 0;
-  for (let open = text.indexOf('"'); open !== -1;) {
-    const close = closingQuote(text, open + 1);
-    if (close === -1) break;
-    const token = text.slice(open, close + 1);
-    if (token.includes("PRIVATE KEY")) {
-      const decoded = JSON.parse(token) as string;
-      const redacted = redactKeys(decoded);
-      if (redacted !== decoded) {
-        out += text.slice(copied, open) + JSON.stringify(redacted);
-        copied = close + 1;
-      }
+export const redact = (text: string, options: DecodedScan = { entropy: true }): string => {
+  if (parseJsonContainer(text) === null) return redactDecoded(text, options);
+  return rewriteJson(text, (decoded, where) => {
+    if (
+      where.role === "value" &&
+      where.key !== null &&
+      CREDENTIAL_NAME.test(where.key) &&
+      decoded !== ""
+    ) {
+      return mask(decoded);
     }
-    open = text.indexOf('"', close + 1);
-  }
-  return copied === 0 ? text : out + text.slice(copied);
+    return redact(decoded, options);
+  });
 };
 
-/** Masks each match; a pattern with a `secret` group masks only that part (an assignment's value). */
-export const redact = (text: string): string => {
-  let out = redactKeys(text);
-  for (const { name, pattern } of SECRET_PATTERNS) {
-    if (name === "private-key") continue;
-    out = out.replace(pattern, (match: string, ...rest: Array<unknown>) => {
-      const groups = rest.at(-1) as { secret?: string } | string;
-      const secret = typeof groups === "object" ? groups.secret : undefined;
-      if (secret === undefined) return mask(match);
-      const start = match.length - secret.length;
-      return match.slice(0, start) + mask(secret);
-    });
-  }
-  return out;
-};
-
-export const secretHits = (text: string): Array<string> => {
-  const hits: Array<string> = [];
-  for (const { name, pattern } of SECRET_PATTERNS) {
-    pattern.lastIndex = 0;
-    if (pattern.test(text)) hits.push(name);
-    pattern.lastIndex = 0;
-  }
-  return hits;
+/** Credential kinds in text, JSON or not, read on decoded strings (nested JSON unwrapped). */
+export const secretHits = (
+  text: string,
+  options: DecodedScan = { entropy: true },
+): Array<string> => {
+  if (parseJsonContainer(text) === null) return scanDecoded(text, options);
+  const hits = new Set<string>();
+  rewriteJson(text, (decoded, where) => {
+    if (
+      where.role === "value" &&
+      where.key !== null &&
+      CREDENTIAL_NAME.test(where.key) &&
+      /[A-Za-z0-9]/.test(decoded)
+    ) {
+      hits.add("credential-field");
+    }
+    for (const hit of secretHits(decoded, options)) hits.add(hit);
+    return decoded;
+  });
+  return [...hits];
 };
 
 /** Columns whose name says they hold a credential; a sanitised table keeps none of them non-null. */
 export const CREDENTIAL_COLUMN =
   /(?:secret|token|credential|password|passwd|cookie|api_?key|private_?key)/i;
 
-/** Scans the raw file bytes, free pages and indexes included, in overlapping chunks. */
+// JSON escapes (any depth: a backslash run and what it escapes) and colour codes, escaped or not,
+// read as spaces on raw bytes, so a token right after one is still found.
+const ESCAPES =
+  /\\+u001[bB]\[[0-9;?]*[A-Za-z]|\x1b\[[0-9;?]*[A-Za-z]|\\+(?:u[0-9a-fA-F]{4}|[^\\])/g;
+
+/** Token formats in the raw file bytes (free pages and indexes included), in overlapping chunks. */
 export const scanFileBytes = (path: string, chunkBytes = 8 << 20): Map<string, number> => {
   const hits = new Map<string, number>();
   const overlap = 4096;
@@ -168,12 +310,16 @@ export const scanFileBytes = (path: string, chunkBytes = 8 << 20): Map<string, n
       if (read === 0) break;
       position += read;
       const length = tail + read;
-      const text = buffer.toString("latin1", 0, length);
-      for (const { name, pattern } of SECRET_PATTERNS) {
+      const text = buffer
+        .toString("latin1", 0, length)
+        .replace(ESCAPES, (escape) => " ".repeat(escape.length));
+      const count = (name: string, match: RegExpMatchArray) => {
+        // A match ending inside the carried tail was counted with the previous chunk.
+        if ((match.index ?? 0) + match[0].length > tail) hits.set(name, (hits.get(name) ?? 0) + 1);
+      };
+      for (const { name, pattern, confirm } of TOKEN_PATTERNS) {
         for (const match of text.matchAll(pattern)) {
-          // A match ending inside the carried tail was counted with the previous chunk.
-          if ((match.index ?? 0) + match[0].length > tail)
-            hits.set(name, (hits.get(name) ?? 0) + 1);
+          if (confirm === undefined || confirm(match)) count(name, match);
         }
       }
       const keep = Math.min(overlap, length);

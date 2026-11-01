@@ -3,53 +3,169 @@
 `node tools/server-bench/fixture.ts <command>` (Node 26.12.1, after `vp i`). Every command prints `--help`.
 Server code runs in-process: the server's own migrations, event sink, projection store and id rules.
 
-| Command                                               | Does                                                                                                          |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `sanitise <source> <destination>`                     | Copies a database with `VACUUM INTO` (the source is opened read-only), makes it safe to boot, self-checks it. |
-| `synth --like <shape.json> --scale <f> <destination>` | Builds a database of a shape's schema and shape.                                                              |
-| `shape <database>`                                    | Prints a database's shape as JSON (counts and sizes only, no row content).                                    |
-| `scan <database>`                                     | The self-check on its own: exits 1 unless the database is clean.                                              |
+| Command                                               | Does                                                                                                                         |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `sanitise <source> <destination>`                     | Copies a database with `VACUUM INTO` (the source is opened read-only), blanks its content, makes it safe to boot, checks it. |
+| `synth --like <shape.json> --scale <f> <destination>` | Builds a database of a shape's schema and shape.                                                                             |
+| `shape <database>`                                    | Prints a database's shape as JSON (counts and sizes only, no row content).                                                   |
+| `scan <database>`                                     | The self-check on its own: exits 1 unless the database is clean.                                                             |
 
-Both writers refuse a destination (or `--report` file) inside `~/.t3` or `$T3CODE_HOME` (symlinks resolved), an
-existing file, the source itself or its `-wal`/`-shm`/`-journal`, and a report path the run writes as a database
-(exit 2). A failed run leaves no destination behind.
+Both writers resolve every path physically (each component through its symlinks before the next, so
+`link/../x` is beside the link's target), then refuse a destination or `--report` file inside `~/.t3` or
+`$T3CODE_HOME`, a dangling symlink, an existing file, the source itself or its `-wal`/`-shm`/`-journal`, and a
+report path the run writes as a database (exit 2). They write exactly the resolved path, created exclusively
+(`O_EXCL`, so not through a symlink) and `0600`. A failed or interrupted run (SIGINT exits 130, SIGTERM 143)
+removes what it created; SIGKILL cannot, and leaves a `.fixture-sanitise-*` (or `.fixture-synth-*`) directory
+beside the destination, which holds an unsanitised copy until deleted.
+
+The source may be the live `~/.t3/userdata/statev2.sqlite`: `VACUUM INTO` reads one consistent snapshot through a
+read-only connection while the server writes. For a fixture that leaves the machine, copy it first (as P1-002
+does) and sanitise the copy.
+
+`tsc -p tools/server-bench --noEmit` runs in no script or CI job: run it by hand after changing these files.
 
 ## sanitise
 
-1. `VACUUM INTO` a scratch file beside the destination; run the server's migrations on it.
-2. Find live threads with the server's own queries (`getRecoveryThreadIds` for queued runs, runtime, subagent
-   results and delegated completions; `getLimitRecoveryCandidates`) plus, as `migrate-dev-db` does, threads whose
-   latest run failed, that carry `limitRecovery`, or that keep a pull request watch (resumed on boot). Drop their
-   whole families (lineage root) from every table with
-   a `thread_id`, their provider sessions, context transfers, subagent rows and `orchestration_events`, and keep
-   `orchestration_v2_projection_metadata` at the remaining high-water mark.
-3. Clear the `migrate-dev-db` tables (`scheduled_tasks`, `orchestration_v2_effect_outbox`,
-   `orchestration_v2_thread_launch_workflows`, `orchestration_command_receipts`, `provider_session_runtime`,
-   `auth_sessions`, `auth_pairing_links`, `peer_environment_links`) plus `scheduled_task_webhook_deliveries` and
-   `scheduled_task_webhook_relay_deliveries`, and every table whose foreign keys reach one of them.
-4. Set `projection_projects.auto_pull = 0` (auto-pull fetches remotes on boot). Through the server's event sink
-   (one `thread.metadata-updated` per thread, `updatedAt` kept): turn automatic settlement off on every thread the
-   settle sweep could pick (no settle event, no settle hook), and clear pull request links and the branch, which
-   the pull request sync and branch discovery read from the host and git.
-5. Redact credential-shaped text (`fixture/secrets.ts`) in every text column: letters and digits become `*`,
-   punctuation and escapes stay (JSON keeps parsing at any nesting depth, sizes keep their shape); private keys go
-   as whole blocks inside the decoded string that holds them (to the footer, else to the end of that string, JSON
-   encodings unwrapped) and an assignment loses only its value.
-6. Rebuild the message search index, `VACUUM INTO` the destination (no free pages keep deleted text), `chmod 600`.
-7. Self-check, else delete the destination and fail: no pattern hit in any text column or in the raw file bytes, no
-   non-null credential-named column, and nothing a server would run on boot (recovery threads, scheduled tasks,
-   outbox, launch workflows, peer links, sessions, pairing links, provider runtime, auto-pull, `limitRecovery`,
-   pull request watches, pull request links or branches, settlement candidates).
+Every thread, run, item, message and event stays. The work a boot would do on start is done now, the way the
+server does it, so the fixture keeps its production scale and a boot writes nothing:
 
-Settings and `secrets/` live outside the database; copy only `statev2.sqlite`. Never boot a sanitised copy on the
-machine its data came from: thread worktree paths still point at real folders.
+1. Make a private (`0700`) scratch directory beside the destination and `VACUUM INTO` a `0600` scratch file
+   there; run the server's migrations on it.
+2. Delete what is unsafe or unneeded, and nothing else (counts in the report's `clearedRows`):
+   - credentials and links: `auth_sessions`, `auth_pairing_links`, `peer_environment_links`,
+     `provider_session_runtime` (live provider handles);
+   - queued work, as `migrate-dev-db` does: `scheduled_tasks` (and every table whose foreign keys reach it:
+     `scheduled_task_webhook_pending`, `scheduled_task_webhook_replay_keys`), `orchestration_v2_effect_outbox`,
+     `orchestration_v2_thread_launch_workflows`, `orchestration_command_receipts`;
+   - webhook requests (headers, bodies, signatures): `scheduled_task_webhook_deliveries`,
+     `scheduled_task_webhook_relay_deliveries`;
+   - pull request state read from the host: `projection_thread_pull_requests`, `pull_request_files_viewed`,
+     `pull_request_review_guides`.
+
+   Then `projection_projects.auto_pull = 0` (auto-pull fetches remotes on start) and v1
+   `projection_thread_sessions` to `stopped`.
+
+3. Run the server's own start-up work in-process: the v1 importer (`reconcileShells`,
+   `importPendingTranscripts`), then the restart recovery (`ProviderRuntimeRecoveryService.reconcile("startup")`,
+   continuation off): active runs, attempts, nodes, provider turns and items cancelled, pending runtime requests
+   closed, provider threads idle, sessions stopped, unheld queues held.
+4. Settle what a boot would still deliver, as the server leaves it once delivered (P1-002's production sanitiser
+   is the reference): remote delegated completions lose their pending delivery, subagent completion deliveries
+   are disposed, messages still streaming are final, a finished app-owned subagent child gets its task's result
+   (`[bench fixture] Result withheld…`) and a consumed `subagent_result` transfer to its parent, and a v1
+   transcript the importer cannot copy is marked imported (the server retries it on every start).
+5. Through the server's event sink (one `thread.metadata-updated` per thread, `updatedAt` kept): automatic
+   settlement off on every thread the settle sweep could pick (no settle event, hook or `git`), pull request
+   links and the branch cleared (the pull request sync and branch discovery read the host and `git`), usage-limit
+   recovery and snooze timers removed (nothing wakes later).
+6. Run the server's event-store compaction (`ProjectionMaintenance.compactEventStore`), as a first boot would.
+   Then the server's own recovery queries must find nothing to resume, recover or deliver, and nothing else may
+   be due on start (the list under Self-check), else the run fails here.
+7. Content pass (below): every string outside the allowlist becomes filler, BLOBs become zeros of their length.
+   Triggers are dropped for the pass and restored, then the message search index is rebuilt from the filler.
+   Every thread's projection and event history is decoded with the server's schemas before and after; a thread
+   that read before and not after fails the run (nothing written).
+8. `VACUUM INTO` the destination: no free pages, so no deleted or blanked text survives on disk.
+9. Self-check, else delete the destination and fail (below).
+
+The report (`--report`) lists every table's rows in the source and the fixture. On ws1's database every table but
+the ones in step 2 keeps its row count; events change by the step-5 updates less the compaction (−14 of 107,221),
+and the file is 1.6 % smaller. Settings and `secrets/` live outside the database; copy only `statev2.sqlite`.
+
+### Content blanking (default)
+
+A denylist of credential patterns can never be shown complete, so content goes by construction: every stored
+string, in every column of every table, is replaced unless the allowlist keeps it. JSON (any object or array,
+including JSON encoded inside a string, at any depth) is walked: numbers, booleans, nulls, key order and
+formatting stay; each string value is judged by the key it sits under (array items inherit it). Text that is not
+JSON is judged by its column name the same way.
+
+Kept as written (`fixture/content.ts`):
+
+| Kept                          | When                                                                                                      |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Known literals                | the whole string is a string literal or enum value declared in `@t3tools/contracts` (≤ 64 chars)          |
+| Timestamps                    | ISO 8601 date or date-time                                                                                |
+| Ids                           | key `id`/`ids`/`uuid`, `…Id`/`…Ids`, `…_id`/`…_ids`; value without whitespace, ≤ 4096 chars               |
+| `type`/`kind`/`status`/`role` | key is one of these or ends in one (`event_type`, `itemKind`); value `[A-Za-z][A-Za-z0-9_.:/-]{0,63}`     |
+| Model and provider names      | key ends in `model`/`provider`/`driver` (also `…Name`, `…Slug`); value without spaces, ≤ 128              |
+| Git hashes                    | key ends in `sha`/`hash`/`oid`/`commit`/`revision`; value 7–64 hex digits                                 |
+| Object keys                   | identifiers `[A-Za-z_$@][A-Za-z0-9_$@.:-]{0,63}`; any other key becomes filler letters of its byte length |
+| Structural tables             | `effect_sql_migrations` and `orchestration_v2_projection_metadata`, whole                                 |
+
+A value under a credential-named key (`password`, `token`, `secret`, `api_key`, `auth`, …) keeps only a known
+literal. The pattern layer (`fixture/secrets.ts`) still reads every kept value and key, and a kept value it flags
+is blanked after all.
+
+Filler keeps the size: the same UTF-8 bytes and UTF-16 length, and in place every control character (newlines,
+tabs, escapes), `"` and `\`, so lines and JSON escaping survive. Between those, text becomes pseudo-words: an
+all-ASCII segment of 13 or more characters starts with a seed (three short words) that fixes the rest, a shorter
+one is a fixed string, and a segment with wider characters is a fixed stream where a 2, 3 or 4 byte character
+becomes `é`, `あ` or `𝑥` (a no-break or ideographic space where the stream has a space). So the check can
+regenerate any filler without the original. Seeds come from an HMAC with a random key per run, never stored:
+equal texts get equal filler within a run (duplicates stay duplicates) and filler cannot be matched against a
+guessed original. The letters cannot spell a credential word (no c, h, k, t, w or y, never two consonants
+together), words run at most seven letters, and there are no digits, capitals, `:` or `=`, so no pattern of
+either check can match in or right after filler. On ws1's database payload size quantiles are unchanged; the
+search index is smaller (fewer distinct words) and thread payloads lose their pull request snapshots (step 5).
+
+`--keep-content` skips blanking and runs the pattern layer alone (every visible character of a finding becomes
+`*`). It fails open by nature: use it only for a copy that never leaves the machine. `scan --keep-content`
+checks such a copy; synth output is checked the same way.
+
+### Pattern layer
+
+Matched on decoded strings (JSON unwrapped, ANSI colour codes read as spaces), so a token right after `\n`, a tab
+or a colour code is found: private key blocks (whole, to the footer or the end of the string, and markers and
+60–76 column base64 body lines on their own, for a key split across strings), token formats
+(GitHub, GitLab, Anthropic, OpenAI, AWS, Google API and OAuth `ya29.`, Slack `xox?-`/`xapp-`/webhooks, Atlassian
+`ATATT`, Stripe, npm, Hugging Face, SendGrid, Mailgun, TokenFeed, JWT, `Bearer`, `Basic` that decodes to
+`user:password`, URLs with a password, the user name possibly empty), assignments whose name contains
+`password`, `passwd`, `passphrase`, `secret`, `token`, `credential`, `api_key`, `access_key`, `private_key` or
+`auth`, or is `key`/`pass`/`pwd` between separators (`DB_PASSWORD=`, `export CF_API_TOKEN=`, `"refresh_token":`,
+`session_token:`; a plain number is not a credential), and high-entropy runs: 24 or more of `[A-Za-z0-9+/=_-]`
+with upper case, lower case and digits, Shannon entropy ≥ 3.5 bits and no run of seven lower-case letters (a word,
+so a path or a name; URL escapes split runs). Hex digests and UUIDs have one letter case and pass as ids.
+
+### Self-check (`scan`)
+
+Three independent gates, on every value of every table:
+
+- Content: each string is allowlisted and unflagged by the pattern layer, or filler; every key is an identifier or
+  rewritten; every BLOB is zeros (`notBlanked`, `secretHits`).
+- P1-002's extended check (`fixture/extended.ts`, a rule-for-rule port of `p1002_extended_check.py` with the 52
+  patterns of `p1002_sanitise.py`): every value as stored and, when JSON, every decoded string with keys and
+  nested JSON, the search index's shadow tables included; keyword, env-var and name=value high-entropy
+  assignments, extra token forms, PEM markers, base64 body lines and arrays of them (`extendedHits`, by
+  `table:scope|kind`). On ws1's source copy the port and the Python script give the same count in every row.
+- Raw file bytes: the token patterns find nothing (free pages and indexes included, escapes read as spaces), and
+  no credential-named column is non-null.
+
+And nothing a server would run on start: recovery threads (runtime, subagent results, delegated completions),
+startable queued runs, settlement candidates, usage-limit recovery and snoozes, pending subagent deliveries,
+streaming messages, live v1 sessions, scheduled tasks, outbox, launch workflows, peer links, sessions, pairing
+links, provider runtime, auto-pull, pull request watches, links or branches, and pending v1 shell and transcript
+imports (`runnable`). Anything planted after sanitising, a token in an id or prose in a message, fails it.
+
+### Booting a fixture
+
+Boot it with its own `--base-dir` and `HOME`, never on the machine its data came from without one. With content
+blanked, project and worktree paths point nowhere. A first boot of a sanitised fixture writes no event: the
+start-up work (step 3), deliveries (4), settle sweep, pull request sync and timers (5) and compaction (6) are
+done, and the recovery queries find nothing (on ws1's fixture: no event, row or sequence change, all recovery
+counts 0, no `git` call in the first 20 s). For bench runs (P1-007) set, in `<base-dir>/userdata/settings.json`,
+`"enableProviderUpdateChecks": false` (no model manifest fetch), `"sidebarAutoSettleAfterDays": null` and
+`"sidebarAutoSettleOnMerge": false` (no settle sweep on threads the bench creates), and the environment variable
+`T3CODE_TELEMETRY_ENABLED=false`. Read-only repository identity probes (`git rev-parse` per project on start)
+cannot be switched off; on a blanked fixture they find no repository.
 
 ## synth
 
 Plans every row from the shape, then writes it through the server's `EventSink` (event store, projections, turn
 item positions, search index triggers) on a database created by the server's own `Sqlite.layerFromPath`, then
 compacts it with `VACUUM INTO`. It reports rows and bytes per table against the shape times `--scale`, and fails
-if any table differs from its own plan or the result is not clean (as `scan`).
+if any table differs from its own plan or the result is not clean (as `scan --keep-content`: generated text is
+not filler). "A boot writes nothing" holds for synth output as written and for sanitised copies (steps 3–6).
 
 - `--scale` multiplies projects, threads and every row count; each thread keeps the shape's turn-items-per-thread
   distribution (stratified draws), so long-history threads stay long at any scale.

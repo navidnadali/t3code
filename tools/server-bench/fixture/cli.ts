@@ -1,5 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off preferSchemaOverJson:off - opens SQLite files and writes JSON reports directly.
-import * as NodeFS from "node:fs";
+// @effect-diagnostics nodeBuiltinImport:off preferSchemaOverJson:off - opens SQLite files and prints JSON directly.
 import * as NodeSqlite from "node:sqlite";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -21,16 +20,17 @@ const percent = (value: number | null) =>
 const mib = (bytes: number | null) =>
   bytes === null ? "n/a" : `${(bytes / 1048576).toFixed(1)} MiB`;
 
-const writeReport = (path: Option.Option<string>, report: unknown) =>
-  Effect.sync(() => {
-    if (Option.isSome(path))
-      NodeFS.writeFileSync(path.value, `${JSON.stringify(report, null, 2)}\n`);
-  });
-
 const reportFlag = Flag.String("report").pipe(
   Flag.optional,
   Flag.withDescription(
-    "Also write the full result as JSON to this new file (checked like the destination).",
+    "Also write the full result as JSON to this new file (checked like the destination, created exclusively).",
+  ),
+);
+
+const keepContentFlag = Flag.Boolean("keep-content").pipe(
+  Flag.withDefault(false),
+  Flag.withDescription(
+    "Keep text and only redact credential patterns. Fails open by nature: for a fixture that never leaves this machine.",
   ),
 );
 
@@ -44,29 +44,33 @@ const sanitiseCommand = Command.make(
       Argument.withDescription("New file outside ~/.t3 and $T3CODE_HOME; must not exist."),
     ),
     report: reportFlag,
+    keepContent: keepContentFlag,
   },
-  ({ source, destination, report }) =>
+  ({ source, destination, report, keepContent }) =>
     Effect.gen(function* () {
       const result = yield* runSanitise({
         source,
         destination,
         report: Option.getOrUndefined(report),
+        keepContent,
       });
       yield* Console.log(
         [
           `Sanitised fixture: ${result.destination} (${mib(result.sizeBytes)})`,
-          `  live threads ${result.liveThreads}, dropped with their families ${result.droppedThreads}`,
+          `  start-up work on ${result.threadsWithStartupWork} threads, done in place: ${JSON.stringify(result.restartRecovery)}; deliveries settled ${JSON.stringify(result.deliveriesSettled)}; v1 imports ${JSON.stringify(result.legacyImport)}`,
           `  cleared ${JSON.stringify(result.clearedRows)}`,
-          `  auto-pull off on ${result.autoPullDisabled} projects, auto-settle off on ${result.autoSettleDisabled} threads, pull request links and branch cleared on ${result.pullRequestInputsCleared}`,
-          `  rows redacted ${JSON.stringify(result.redactedRows)}`,
-          `  self-check: 0 secret hits, 0 credential columns, nothing runnable`,
+          `  auto-pull off on ${result.autoPullDisabled} projects, auto-settle off on ${result.autoSettleDisabled} threads, pull request links and branch cleared on ${result.pullRequestInputsCleared}, timers cleared on ${result.timersCleared}`,
+          `  event store compacted: ${result.compaction.deletedEventCount} events, ${result.compaction.deletedReceiptCount} receipts`,
+          result.mode === "blank"
+            ? `  content blanked: ${result.content.changed} values (${result.content.flaggedKept} allowlisted but flagged), ${result.content.keys} keys`
+            : `  --keep-content: ${result.content.changed} values redacted, ${result.content.keys} keys; text kept`,
+          `  self-check: every value allowlisted or filler, 0 pattern hits, nothing runnable`,
         ].join("\n"),
       );
-      yield* writeReport(report, result);
     }),
 ).pipe(
   Command.withDescription(
-    "Copy a T3 database with VACUUM INTO, run the server's migrations, drop thread families with live work or a pull request watch, clear credentials and queued work (scheduled tasks, outbox, launch workflows, peer links, sessions, pairing, provider runtime), turn off auto-pull and auto-settle, redact credential-shaped text, compact, and self-check.",
+    "Copy a T3 database with VACUUM INTO, run the server's migrations, drop thread families with live work, a pull request watch or a pending v1 import, clear credentials and queued work (scheduled tasks, outbox, launch workflows, peer links, sessions, pairing, provider runtime, pull request state), turn off auto-pull and auto-settle, compact the event store, blank every string outside the allowlist (see fixture.md), compact, and check both layers.",
   ),
 );
 
@@ -138,7 +142,6 @@ const synthCommand = Command.make(
             : []),
         ].join("\n"),
       );
-      yield* writeReport(input.report, result);
     }),
 ).pipe(
   Command.withDescription(
@@ -176,10 +179,18 @@ const shapeCommand = Command.make(
 
 const scanCommand = Command.make(
   "scan",
-  { database: Argument.String("database") },
-  ({ database }) =>
+  {
+    database: Argument.String("database"),
+    keepContent: Flag.Boolean("keep-content").pipe(
+      Flag.withDefault(false),
+      Flag.withDescription(
+        "The fixture was made with --keep-content (or by synth): run the pattern layer, not the filler check.",
+      ),
+    ),
+  },
+  ({ database, keepContent }) =>
     Effect.gen(function* () {
-      const check = yield* checkFixture(database);
+      const check = yield* checkFixture(database, keepContent ? "redact" : "blank");
       yield* Console.log(JSON.stringify(check, null, 2));
       if (!isClean(check)) {
         return yield* failed(`${database} is not a clean fixture.`);
@@ -187,7 +198,7 @@ const scanCommand = Command.make(
     }),
 ).pipe(
   Command.withDescription(
-    "Check a fixture: credential patterns in every text column and in the raw file, credential-named columns, and work a server would run on start.",
+    "Check a fixture: every value allowlisted or filler, credential patterns in decoded content and in the raw file, P1-002's extended check, credential-named columns, and work a server would run on start.",
   ),
 );
 

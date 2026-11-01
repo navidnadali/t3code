@@ -1215,7 +1215,10 @@ describe("content blanking", () => {
     synth(seeded, "0.25");
     const secrets = seedCredentials(seeded);
     const kept = NodePath.join(directory, "kept.sqlite");
-    expect(run(["sanitise", "--keep-content", seeded, kept]).status).toBe(0);
+    const sanitised = run(["sanitise", "--keep-content", seeded, kept]);
+    expect(sanitised.status).toBe(0);
+    // Its summary names the checks it ran, not the blank-mode filler check.
+    expect(sanitised.stdout).not.toMatch(/allowlisted or filler/);
     const raw = NodeFS.readFileSync(kept).toString("latin1");
     const survivors = secrets.filter(
       (secret) => raw.includes(secret) || raw.includes(JSON.stringify(secret).slice(1, -1)),
@@ -1224,6 +1227,98 @@ describe("content blanking", () => {
     expect([run(["scan", "--keep-content", kept]).status, run(["scan", kept]).status]).toEqual([
       0, 1,
     ]);
+  });
+});
+
+describe("allowlist limits", () => {
+  const secret = "q8Zr3Vt9Lp2Xw7MsHn4Kd8Yb";
+
+  it("blanks ids under credential-named ancestors and token-like keys, keeping names and prefixed ids", () => {
+    const payload = JSON.stringify({
+      credentials: { id: secret, clientId: secret },
+      session: { token: { refreshTokenId: secret } },
+      threadId: "thread-1",
+      [secret]: 1,
+      cacheReadInputTokens: 7,
+      mcp__atlassian__getJiraIssue: 2,
+      toolu_01ABCdefGHIjklMNOpqrSTU: 3,
+    });
+    const out = JSON.parse(rewriteContent(payload, "payload_json", "blank", emptyCounts())) as {
+      credentials: { id: string; clientId: string };
+      session: { token: { refreshTokenId: string } };
+      threadId: string;
+    };
+    expect([
+      isFiller(out.credentials.id),
+      isFiller(out.credentials.clientId),
+      isFiller(out.session.token.refreshTokenId),
+      out.threadId,
+    ]).toEqual([true, true, true, "thread-1"]);
+    const keys = Object.keys(out);
+    expect(keys.includes(secret)).toBe(false);
+    expect(
+      [
+        "cacheReadInputTokens",
+        "mcp__atlassian__getJiraIssue",
+        "toolu_01ABCdefGHIjklMNOpqrSTU",
+      ].filter((key) => !keys.includes(key)),
+    ).toEqual([]);
+    const planted = (value: unknown) => {
+      const kinds: Array<string> = [];
+      contentFindings(JSON.stringify(value), null, "blank", (kind) => kinds.push(kind));
+      return kinds;
+    };
+    expect([planted({ credentials: { id: secret } }), planted({ [secret]: 1 })]).toEqual([
+      ["not-blanked"],
+      ["key"],
+    ]);
+  });
+
+  it("zeroes numbers under credential names, keeping counts such as token usage", () => {
+    const payload = JSON.stringify({
+      pin: 123456,
+      otp: 654321,
+      passcode: -42.5e3,
+      inputTokens: 1234,
+      exitCode: 1,
+      auth: { expiresIn: 3600 },
+    });
+    const stored = rewriteContent(payload, "payload_json", "blank", emptyCounts());
+    expect(stored.length).toBe(payload.length);
+    const out = JSON.parse(stored) as Record<string, unknown>;
+    expect([out.pin, out.otp, out.passcode, out.inputTokens, out.exitCode, out.auth]).toEqual([
+      0,
+      0,
+      0,
+      1234,
+      1,
+      { expiresIn: 0 },
+    ]);
+    const kinds: Array<string> = [];
+    contentFindings(JSON.stringify({ pin: 123456 }), null, "blank", (kind) => kinds.push(kind));
+    expect(kinds).toEqual(["credential-number"]);
+  });
+
+  // The project timeout (60 s) is the linearity check: a quadratic rule needs minutes on 1 MB here.
+  it("runs the extended rules in linear time and walks deep JSON without recursion", () => {
+    const rows: Array<string> = [];
+    extendedFindings("TOKEN".repeat(200_000), (row) => rows.push(row));
+    extendedFindings("t3_session".repeat(100_000), (row) => rows.push(row));
+    expect(rows).toEqual([]);
+    const found: Array<string> = [];
+    extendedFindings(`export DB_PASSWORD=${"Zx9q".repeat(4)}`, (row) => found.push(row));
+    extendedFindings(`t3_session_id=${"Ab12".repeat(5)}`, (row) => found.push(row));
+    expect(found.filter((row) => row.startsWith("raw|p1002:")).sort()).toEqual([
+      "raw|p1002:secret env var",
+      "raw|p1002:t3 session cookie",
+    ]);
+    const deepArray = `${"[".repeat(5000)}"x"${"]".repeat(5000)}`;
+    const deepObject = `${'{"a":'.repeat(5000)}{"/k":1}${"}".repeat(5000)}`;
+    expect(() => {
+      extendedFindings(deepArray, () => undefined);
+      extendedFindings(deepObject, () => undefined);
+      rewriteContent(deepObject, null, "blank", emptyCounts());
+    }).not.toThrow();
   });
 });
 

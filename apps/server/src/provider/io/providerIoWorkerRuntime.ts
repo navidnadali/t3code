@@ -7,15 +7,19 @@ import type {
   ProviderIoWorkerMessage,
 } from "./providerIoProtocol.ts";
 
+type AnyStage = ProviderIoStage<never, unknown, never, unknown>;
+
 interface WorkerSession {
-  readonly stage: ProviderIoStageSession<unknown>;
+  readonly stage: ProviderIoStageSession<unknown, never, unknown>;
   readonly emit: (output: unknown) => void;
   outputs: Array<unknown>;
-  bytes: number;
+  // Credit of chunks that emitted outputs (returned when main takes them) and of silent ones.
+  held: number;
+  freed: number;
 }
 
-const openSession = (stage: ProviderIoStage<never, unknown>, options: unknown): WorkerSession => {
-  const buffer = { outputs: new Array<unknown>(), bytes: 0 };
+const openSession = (stage: AnyStage, options: unknown): WorkerSession => {
+  const buffer = { outputs: new Array<unknown>(), held: 0, freed: 0 };
   const emit = (output: unknown) => {
     buffer.outputs.push(output);
   };
@@ -23,7 +27,7 @@ const openSession = (stage: ProviderIoStage<never, unknown>, options: unknown): 
 };
 
 // Runs inside the worker bundle, which may require only Node built-ins.
-export const runProviderIoWorker = (stages: ReadonlyArray<ProviderIoStage<never, unknown>>) => {
+export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
   const port = NodeWorkerThreads.parentPort;
   if (port === null) throw new Error("The provider I/O worker must run in a worker thread.");
   const registry = new Map(stages.map((stage) => [stage.name, stage]));
@@ -46,12 +50,13 @@ export const runProviderIoWorker = (stages: ReadonlyArray<ProviderIoStage<never,
   // An output that cannot be cloned fails only its own session.
   const flush = (id: number, session: WorkerSession) => {
     unflushed.delete(id);
-    if (session.outputs.length === 0 && session.bytes === 0) return true;
-    const { outputs, bytes } = session;
+    const { outputs, held, freed } = session;
     session.outputs = [];
-    session.bytes = 0;
+    session.held = 0;
+    session.freed = 0;
     try {
-      post({ type: "output", session: id, outputs, bytes });
+      if (freed > 0) post({ type: "output", session: id, outputs: [], bytes: freed });
+      if (outputs.length > 0) post({ type: "output", session: id, outputs, bytes: held });
       return true;
     } catch (error) {
       fail(id, error);
@@ -79,6 +84,14 @@ export const runProviderIoWorker = (stages: ReadonlyArray<ProviderIoStage<never,
     }
   };
 
+  const reply = (id: number, call: number, ok: boolean, value: unknown) => {
+    try {
+      post({ type: "reply", session: id, call, ok, value });
+    } catch (error) {
+      post({ type: "reply", session: id, call, ok: false, value: new Error(String(error)) });
+    }
+  };
+
   port.on("message", (message: ProviderIoMainMessage) => {
     const id = message.session;
     if (message.type === "open") {
@@ -95,17 +108,26 @@ export const runProviderIoWorker = (stages: ReadonlyArray<ProviderIoStage<never,
       return;
     }
     const session = sessions.get(id);
-    if (session === undefined) return;
+    if (session === undefined) {
+      // Main may still be waiting on a call to a session the worker has ended or failed.
+      if (message.type === "call") {
+        reply(id, message.call, false, new Error("The provider I/O session has ended."));
+      }
+      return;
+    }
     switch (message.type) {
-      case "bytes":
-        session.bytes += message.chunk.byteLength;
+      case "bytes": {
+        const emitted = session.outputs.length;
         if (!run(id, session, () => session.stage.push(message.chunk, session.emit))) return;
+        if (session.outputs.length > emitted) session.held += message.chunk.byteLength;
+        else session.freed += message.chunk.byteLength;
         unflushed.add(id);
         if (!flushScheduled) {
           flushScheduled = true;
           setImmediate(flushAll);
         }
         return;
+      }
       case "eof":
         if (!run(id, session, () => session.stage.end(session.emit))) return;
         if (!flush(id, session)) return;
@@ -116,6 +138,22 @@ export const runProviderIoWorker = (stages: ReadonlyArray<ProviderIoStage<never,
         sessions.delete(id);
         unflushed.delete(id);
         return;
+      case "call": {
+        const call = session.stage.call;
+        if (call === undefined) {
+          reply(id, message.call, false, new Error("This provider I/O stage takes no calls."));
+          return;
+        }
+        let value: unknown;
+        try {
+          value = call(message.request as never);
+        } catch (error) {
+          reply(id, message.call, false, error);
+          return;
+        }
+        reply(id, message.call, true, value);
+        return;
+      }
     }
   });
 

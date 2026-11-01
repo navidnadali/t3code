@@ -22,12 +22,18 @@ export const linesStage: ProviderIoStage<void, string> = {
 };
 
 // Echoes each chunk; the words below make the worker misbehave on cue.
-export const echoStage: ProviderIoStage<{ readonly tag: string }, string> = {
+export const echoStage: ProviderIoStage<{ readonly tag: string }, string, string, string> = {
   name: "test-echo",
   open: ({ tag }) => {
     const decoder = new TextDecoder();
+    let chunks = 0;
     return {
+      call: (request) => {
+        if (request === "throw") throw new Error("call threw");
+        return `${tag}:${request}:${chunks}`;
+      },
       push: (chunk, emit) => {
+        chunks += 1;
         const text = decoder.decode(chunk);
         if (text === "exit") process.exit(3);
         if (text === "throw") {

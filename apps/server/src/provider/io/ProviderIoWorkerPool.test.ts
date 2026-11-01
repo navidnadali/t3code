@@ -277,6 +277,7 @@ it.effect(
             assert.isFalse(yield* child.isRunning);
           }
           assert.instanceOf(yield* Effect.flip(acp.write(bytes("late"))), AcpTransportError);
+          assert.instanceOf(yield* Effect.flip(acp.call("late")), AcpTransportError);
           assert.deepEqual(yield* Queue.take(lines), [
             "Warn",
             "Provider I/O worker stopped; its sessions failed",
@@ -295,6 +296,26 @@ it.effect(
         }),
       ),
     ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("runs a session's calls on its worker after the chunks sent before them", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const session = yield* openEcho(pool, "t");
+      yield* session.write(bytes("a"));
+      yield* session.write(bytes("b"));
+      assert.equal(yield* session.call("count"), "t:count:2");
+      const failed = yield* Effect.flip(session.call("throw"));
+      assert.instanceOf(failed, CodexAppServerTransportError);
+      assert.instanceOf(failed.cause, ProviderIoWorkerPool.ProviderIoStageError);
+
+      yield* session.write(bytes("c"));
+      yield* session.end;
+      assert.deepEqual(yield* Stream.runCollect(session.output), ["t:a", "t:b", "t:c", "t:end"]);
+      // The worker has dropped the session after its end; a late call fails instead of waiting.
+      assert.instanceOf(yield* Effect.flip(session.call("late")), CodexAppServerTransportError);
+    }),
+  ),
 );
 
 it.effect("fails only the session whose stage throws, after the outputs it emitted first", () =>

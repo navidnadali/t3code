@@ -338,6 +338,8 @@ export interface ProjectionRecordFilter {
   readonly runIds?: ReadonlyArray<RunId>;
   readonly subagentIds?: ReadonlyArray<NodeId>;
   readonly subagentRunIds?: ReadonlyArray<RunId>;
+  readonly subagentChildThreadIds?: ReadonlyArray<ThreadId>;
+  readonly contextTransferSourceThreadIds?: ReadonlyArray<ThreadId>;
   readonly nodeIds?: ReadonlyArray<NodeId>;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
@@ -3289,15 +3291,26 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ),
           (fields !== undefined && !fields.includes("subagents")) ||
           (window === undefined &&
-            (matchesNothing(filter?.subagentIds) || matchesNothing(filter?.subagentRunIds)))
+            matchesNothing(
+              filter?.subagentIds,
+              filter?.subagentRunIds,
+              filter?.subagentChildThreadIds,
+            ))
             ? Effect.succeed([])
             : window === undefined
               ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_subagents AS subagent
+              ${
+                // Seek the named children's tasks, not every task in this thread.
+                filter?.subagentChildThreadIds === undefined
+                  ? sql``
+                  : sql`INDEXED BY orchestration_v2_projection_subagents_child_thread_idx`
+              }
             WHERE thread_id = ${threadId}
               ${filter?.subagentIds === undefined ? sql`` : sql`AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentIds)}))`}
               ${filter?.subagentRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentRunIds)}))`}
+              ${filter?.subagentChildThreadIds === undefined ? sql`` : sql`AND child_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentChildThreadIds)}))`}
               ${
                 filter?.omitSettledSubagents !== undefined
                   ? sql`AND (${
@@ -3515,13 +3528,24 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   )
                 ORDER BY rowid ASC
               `,
-          fields !== undefined && !fields.includes("contextTransfers")
+          (fields !== undefined && !fields.includes("contextTransfers")) ||
+          (window === undefined && matchesNothing(filter?.contextTransferSourceThreadIds))
             ? Effect.succeed([])
             : window === undefined
-              ? sql<PayloadRow>`
+              ? filter?.contextTransferSourceThreadIds === undefined
+                ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_context_transfers
             WHERE source_thread_id = ${threadId} OR target_thread_id = ${threadId}
+            ORDER BY rowid ASC
+          `
+                : sql<PayloadRow>`
+            -- Seek the named sources' transfers, not every transfer of this thread.
+            SELECT payload_json
+            FROM orchestration_v2_projection_context_transfers
+              INDEXED BY orchestration_v2_projection_context_transfers_source_thread_idx
+            WHERE source_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.contextTransferSourceThreadIds)}))
+              AND (source_thread_id = ${threadId} OR target_thread_id = ${threadId})
             ORDER BY rowid ASC
           `
               : sql<PayloadRow>`

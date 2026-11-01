@@ -10,7 +10,14 @@ import * as NodeSqlite from "node:sqlite";
 
 import { describe, expect, it, onTestFinished } from "vite-plus/test";
 
-import { fillText, isFiller, keptAs, rewriteContent, emptyCounts } from "./fixture/content.ts";
+import {
+  contentFindings,
+  emptyCounts,
+  fillText,
+  isFiller,
+  keptAs,
+  rewriteContent,
+} from "./fixture/content.ts";
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { TOKEN_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
@@ -406,6 +413,15 @@ const seedPendingWork = (path: string) => {
     `DELETE FROM orchestration_v2_projection_context_transfers
      WHERE source_thread_id = ? AND type = 'subagent_result'`,
   ).run(child.id);
+  // A task delegated to another machine, still without its result: its follower resumes on start.
+  db.prepare(
+    `UPDATE orchestration_v2_projection_subagents
+     SET origin = 'app_owned', child_thread_id = NULL, status = 'running', completed_at = NULL,
+       payload_json = json_set(payload_json, '$.origin', 'app_owned', '$.childThreadId', json('null'),
+         '$.status', 'running', '$.completedAt', json('null'), '$.result', json('null'),
+         '$.remoteChild', json_object('environmentId', 'peer-1', 'threadId', 'remote-thread', 'label', 'Peer'))
+     WHERE subagent_id = (SELECT MAX(subagent_id) FROM orchestration_v2_projection_subagents WHERE subagent_id <> ?)`,
+  ).run(task);
   db.close();
   return {
     busy: [running, queued, limited, watched, transcript, startable, child.id, child.parent],
@@ -1142,6 +1158,17 @@ describe("content blanking", () => {
       true,
       "/Users/someone/project".length,
     ]);
+    // A key past the identifier limit is rewritten whatever its letters; planted back, it fails.
+    const long = "mypasswordis".repeat(8);
+    const rewritten = Object.keys(
+      JSON.parse(rewriteContent(JSON.stringify({ [long]: "x" }), null, "blank", emptyCounts())),
+    );
+    expect([rewritten.length, rewritten[0] === long, rewritten[0]?.length]).toEqual([1, false, 96]);
+    const findings: Array<string> = [];
+    contentFindings(JSON.stringify({ [long]: "vamoa" }), null, "blank", (kind) =>
+      findings.push(kind),
+    );
+    expect(findings).toEqual(["key"]);
     const env = out.env as Record<string, string>;
     expect(Object.keys(env)[0]).toBe("DB_PASSWORD");
     expect(Object.keys(env)[1]).toMatch(/^[a-z]{8}$/);

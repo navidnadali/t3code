@@ -72,6 +72,8 @@ export interface ProviderIoOpenInput<
   readonly kill: Effect.Effect<void>;
   /** The child can outlive the session's output (a stage that runs a library), so kill it even then. */
   readonly killAfterEnd?: boolean;
+  /** Takes over stopping the child from the worker's library when the pool closes with the session open. */
+  readonly onPoolClose?: Effect.Effect<void>;
   /** Receives the stage's events on main as they arrive, ahead of queued outputs. */
   readonly onEvent?: (event: Event) => void;
   readonly highWaterMark?: number;
@@ -101,6 +103,7 @@ interface SessionHandle {
   readonly reply: (call: number, ok: boolean, value: unknown) => void;
   readonly failStage: (cause: unknown) => void;
   readonly failWorker: (error: ProviderIoWorkerError, kill: boolean) => void;
+  readonly poolClosing: Effect.Effect<void>;
 }
 
 interface Slot {
@@ -499,6 +502,9 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       failStage: (cause) =>
         fail(new ProviderIoStageError({ stage: input.stage.name, cause }), false),
       failWorker: fail,
+      poolClosing: Effect.suspend(() =>
+        closed || input.onPoolClose === undefined ? Effect.void : Effect.exit(input.onPoolClose),
+      ),
     });
     if (slot.sessions.size === 1) slot.worker.ref();
 
@@ -669,10 +675,15 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
         );
 
   yield* Effect.addFinalizer(() =>
-    Effect.promise(() => {
+    Effect.suspend(() => {
       closing = true;
-      return Promise.all(slots.map((slot) => slot?.worker.terminate()));
-    }),
+      const sessions = slots.flatMap((slot) => [...(slot?.sessions.values() ?? [])]);
+      return Effect.forEach(sessions, (session) => session.poolClosing, { discard: true });
+    }).pipe(
+      Effect.andThen(
+        Effect.promise(() => Promise.all(slots.map((slot) => slot?.worker.terminate()))),
+      ),
+    ),
   );
 
   for (let index = 0; index < options.workers; index++) {

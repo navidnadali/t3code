@@ -467,6 +467,11 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
         if (child !== undefined && !childDone) child.kill("SIGKILL");
       }),
       killAfterEnd: true,
+      // The worker's SDK would still end the CLI's input, SIGTERM and SIGKILL it; now main does.
+      onPoolClose: Effect.sync(() => {
+        cleanUp();
+        stopChild();
+      }),
       onEvent,
     })
     .pipe(

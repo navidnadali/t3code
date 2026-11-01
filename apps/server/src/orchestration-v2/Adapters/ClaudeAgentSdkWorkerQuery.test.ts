@@ -803,6 +803,21 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
+  it.effect("stops a CLI whose query is closing before the pool's close returns", () =>
+    Effect.gen(function* () {
+      const cli = new FakeClaudeCli({ exitOnStdinEnd: false });
+      yield* withRunner("worker", ({ runner }) =>
+        Effect.gen(function* () {
+          const session = yield* runner.open(openInput(cli));
+          yield* session.close;
+          yield* Effect.promise(() => cli.stdinEnded);
+        }),
+      );
+      assert.deepStrictEqual(cli.kills, ["SIGTERM"]);
+      assert.strictEqual(cli.signalCode, "SIGTERM");
+    }),
+  );
+
   it.effect("keeps the query in-thread when the pool has no workers", () =>
     Effect.gen(function* () {
       const startedBefore = workers.started.length;

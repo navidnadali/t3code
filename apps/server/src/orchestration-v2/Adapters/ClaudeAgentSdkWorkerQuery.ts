@@ -23,9 +23,9 @@ import {
   type ClaudeAgentSdkWorkerCallback,
   type ClaudeAgentSdkWorkerEvent,
   type ClaudeAgentSdkWorkerRequest,
-  claudeAgentSdkStage,
+  claudeAgentSdkStageOnMain,
   toClaudeAgentSdkProcessError,
-} from "../../provider/io/claudeAgentSdkStage.ts";
+} from "../../provider/io/claudeAgentSdkProtocol.ts";
 import * as ServerConfig from "../../config.ts";
 import {
   type ProviderIoSession,
@@ -324,7 +324,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
 
   const opened = yield* input.pool
     .open({
-      stage: claudeAgentSdkStage,
+      stage: claudeAgentSdkStageOnMain,
       options: input.stageOptions,
       onFailure: (error: WorkerSessionError) => error,
       kill: Effect.sync(() => {

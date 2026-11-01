@@ -36,6 +36,8 @@ export interface SqliteClientConfig {
   readonly spanAttributes?: Record<string, unknown> | undefined;
   /** Ignored for in-memory databases, which cannot share a second connection. */
   readonly readerWorker?: boolean | undefined;
+  /** Most reader workers to run at once (1 to 32), each started on demand; defaults to 4. */
+  readonly readerPoolSize?: number | undefined;
   /** Ignored for in-memory databases. */
   readonly checkpointWorker?: boolean | undefined;
 }
@@ -297,7 +299,9 @@ const failed = (cause: unknown, message: string, operation: string) =>
 const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test(sql);
 
 // WAL readers run concurrently; one worker serialized every read behind the slowest transaction.
-const READER_POOL_SIZE = 4;
+const DEFAULT_READER_POOL_SIZE = 4;
+// Each reader is a worker thread with its own connection and page cache.
+export const SQLITE_MAX_READER_POOL_SIZE = 32;
 const READER_RETRY_DELAY = Duration.seconds(1);
 const READER_RETRY_MAX_DELAY = Duration.minutes(1);
 
@@ -928,6 +932,16 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
   const compiler = Statement.makeCompilerSqlite();
   const isFileDatabase = options.filename !== ":memory:" && options.filename !== "";
+  const readerPoolSize = options.readerPoolSize ?? DEFAULT_READER_POOL_SIZE;
+  if (
+    !Number.isSafeInteger(readerPoolSize) ||
+    readerPoolSize < 1 ||
+    readerPoolSize > SQLITE_MAX_READER_POOL_SIZE
+  ) {
+    throw new RangeError(
+      `SQLite readerPoolSize must be an integer from 1 to ${SQLITE_MAX_READER_POOL_SIZE}, got ${readerPoolSize}`,
+    );
+  }
 
   const makeConnection = Effect.gen(function* () {
     const scope = yield* Effect.scope;
@@ -1153,43 +1167,50 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const readerPool = { unavailable: false };
   const readers =
     options.readerWorker && isFileDatabase
-      ? yield* Effect.forEach(Array.from({ length: READER_POOL_SIZE }), () =>
-          Effect.map(
-            Effect.all([makeReader(options, readerPool), Semaphore.make(1)]),
-            ([acquire, lock]) => ({
-              acquire,
-              lock,
-              claims: 0,
-            }),
-          ),
+      ? yield* Effect.forEach(Array.from({ length: readerPoolSize }), () =>
+          Effect.map(makeReader(options, readerPool), (acquire) => ({ acquire, busy: false })),
         )
       : [];
+  // Counts idle reader slots, so a read waits for whichever slot frees first.
+  const idleReaders = yield* Semaphore.make(readers.length);
   if (readers.length > 0) yield* Metric.update(readerPoolAvailable, 1);
 
   const writer = { name: "writer" as const, lock: semaphore, connection };
+  type Target = typeof writer | { readonly name: "reader"; readonly connection: Connection };
   let activeWriter: ConnectionOwner | undefined;
-  // Callers must run route uninterruptibly and pass `claimed` a finalizer that runs `release` once.
-  const route = (claimed: (release: Effect.Effect<void>) => Effect.Effect<void>) =>
-    Effect.withFiber((fiber) => {
+  // Callers run route uninterruptibly, wait for a reader slot under `wait`, and pass `claimed` a
+  // finalizer that runs `release` once; a returned reader already holds its slot.
+  const route = (
+    claimed: (release: Effect.Effect<void>) => Effect.Effect<void>,
+    wait: typeof Effect.interruptible,
+  ) =>
+    Effect.withFiber((fiber): Effect.Effect<Target> => {
       if (readers.length === 0 || readerPool.unavailable || !Context.get(fiber.context, ReadOnly)) {
         return Effect.succeed(writer);
       }
-      // Least claimed wins and ties go to the lowest slot, so idle slots never start a worker.
-      let slot = readers[0]!;
-      for (const candidate of readers) if (candidate.claims < slot.claims) slot = candidate;
-      slot.claims++;
-      const reader = slot;
-      return Effect.andThen(
-        claimed(
-          Effect.sync(() => {
-            reader.claims--;
-          }),
-        ),
-        Effect.map(reader.acquire, (readerConnection) =>
-          readerConnection === undefined
-            ? writer
-            : { name: "reader" as const, lock: reader.lock, connection: readerConnection },
-        ),
+      const claim = Effect.flatMap(wait(idleReaders.take(1)), () => {
+        // The lowest idle slot wins, so later slots start a worker only while earlier ones are busy.
+        const slot = readers.find((candidate) => !candidate.busy)!;
+        slot.busy = true;
+        // A writer fallback frees the slot at once; the finalizer's later run then does nothing.
+        let held = true;
+        const release = Effect.suspend(() => {
+          if (!held) return Effect.void;
+          held = false;
+          slot.busy = false;
+          return Effect.asVoid(idleReaders.release(1));
+        });
+        return Effect.as(claimed(release), { slot, release });
+      });
+      return Effect.flatMap(
+        // A scheduler yield after taking the permit must not precede its release finalizer.
+        Effect.provideService(claim, Scheduler.PreventSchedulerYield, true),
+        ({ slot, release }) =>
+          Effect.flatMap(slot.acquire, (readerConnection): Effect.Effect<Target> =>
+            readerConnection === undefined
+              ? Effect.as(release, writer)
+              : Effect.succeed({ name: "reader", connection: readerConnection }),
+          ),
       );
     });
 
@@ -1206,26 +1227,23 @@ const make = Effect.fn("makeWithDatabase")(function* (
   let writerBorrowsSinceYield = 0;
   const borrower: Borrower = (use) =>
     Effect.uninterruptibleMask((restore) => {
+      const start = Fiber.getCurrent()!.getRef(Clock.Clock).monotonicTimeNanosUnsafe();
       let release: Effect.Effect<void> = Effect.void;
       const claimed = (next: Effect.Effect<void>) =>
         Effect.sync(() => {
           release = next;
         });
-      return Effect.flatMap(route(claimed), (target) => restore(borrowTarget(target, use))).pipe(
-        Effect.ensuring(Effect.suspend(() => release)),
-      );
+      return Effect.flatMap(route(claimed, restore), (target) =>
+        restore(borrowTarget(target, start, use)),
+      ).pipe(Effect.ensuring(Effect.suspend(() => release)));
     });
   const borrowTarget = <A, E, R>(
-    target: {
-      readonly name: Acquired["connection"];
-      readonly lock: Semaphore.Semaphore;
-      readonly connection: Connection;
-    },
+    target: Target,
+    start: bigint,
     use: (connection: Connection) => Effect.Effect<A, E, R>,
   ): Effect.Effect<A, E, R> =>
     Effect.withFiber((fiber) => {
       const clock = fiber.getRef(Clock.Clock);
-      const start = clock.monotonicTimeNanosUnsafe();
       const ownerAtWaitStart = target.name === "writer" ? activeWriter : undefined;
       const owner = target.name === "writer" ? connectionOwner(fiber) : undefined;
       const useConnection = Effect.suspend(() => {
@@ -1238,15 +1256,13 @@ const make = Effect.fn("makeWithDatabase")(function* (
         }
         return use(target.connection);
       });
-      const useOwnedConnection =
-        target.name === "writer"
-          ? Effect.onExit(useConnection, () =>
-              Effect.sync(() => {
-                if (activeWriter === owner) activeWriter = undefined;
-              }),
-            )
-          : useConnection;
-      if (!options.checkpointWorker || target.name !== "writer") {
+      if (target.name === "reader") return useConnection;
+      const useOwnedConnection = Effect.onExit(useConnection, () =>
+        Effect.sync(() => {
+          if (activeWriter === owner) activeWriter = undefined;
+        }),
+      );
+      if (!options.checkpointWorker) {
         return target.lock.withPermits(1)(useOwnedConnection);
       }
       const writerUse = Effect.onExit(useOwnedConnection, (exit) =>
@@ -1279,37 +1295,42 @@ const make = Effect.fn("makeWithDatabase")(function* (
     Effect.withFiber((fiber) =>
       Scope.addFinalizer(Context.getUnsafe(fiber.context, Scope.Scope), release),
     );
-  const transactionAcquirer = Effect.uninterruptible(route(claimedUntilScopeCloses)).pipe(
-    Effect.flatMap((target) =>
-      Effect.uninterruptibleMask((restore) => {
-        const fiber = Fiber.getCurrent()!;
-        const scope = Context.getUnsafe(fiber.context, Scope.Scope);
-        const clock = fiber.getRef(Clock.Clock);
-        const start = clock.monotonicTimeNanosUnsafe();
-        const pending = fiber.getRef(TransactionAcquire);
-        const ownerAtWaitStart = target.name === "writer" ? activeWriter : undefined;
-        const owner = target.name === "writer" ? connectionOwner(fiber) : undefined;
-        const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
-          if (target.name === "writer") activeWriter = owner;
-          if (pending !== undefined) {
-            pending.acquired = acquired(target, clock, start);
-            pending.ownerAtWaitStart = ownerAtWaitStart;
-          }
-          return Scope.addFinalizer(
-            scope,
-            Effect.sync(() => {
-              if (target.name === "writer" && activeWriter === owner) activeWriter = undefined;
-            }).pipe(Effect.andThen(target.lock.release(1))),
-          );
-        });
-        return Effect.as(
-          // A scheduler yield after taking the permit must not precede its release finalizer.
-          Effect.provideService(acquire, Scheduler.PreventSchedulerYield, true),
-          target.connection,
+  const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
+    const fiber = Fiber.getCurrent()!;
+    const scope = Context.getUnsafe(fiber.context, Scope.Scope);
+    const clock = fiber.getRef(Clock.Clock);
+    const start = clock.monotonicTimeNanosUnsafe();
+    const pending = fiber.getRef(TransactionAcquire);
+    const wait = pending?.restore ?? restore;
+    return Effect.flatMap(route(claimedUntilScopeCloses, wait), (target) => {
+      const ownerAtWaitStart = target.name === "writer" ? activeWriter : undefined;
+      const owner = target.name === "writer" ? connectionOwner(fiber) : undefined;
+      const record = () => {
+        if (pending === undefined) return;
+        pending.acquired = acquired(target, clock, start);
+        pending.ownerAtWaitStart = ownerAtWaitStart;
+      };
+      if (target.name === "reader") {
+        record();
+        return Effect.succeed(target.connection);
+      }
+      const acquire = Effect.tap(wait(target.lock.take(1)), () => {
+        activeWriter = owner;
+        record();
+        return Scope.addFinalizer(
+          scope,
+          Effect.sync(() => {
+            if (activeWriter === owner) activeWriter = undefined;
+          }).pipe(Effect.andThen(target.lock.release(1))),
         );
-      }),
-    ),
-  );
+      });
+      return Effect.as(
+        // A scheduler yield after taking the permit must not precede its release finalizer.
+        Effect.provideService(acquire, Scheduler.PreventSchedulerYield, true),
+        target.connection,
+      );
+    });
+  });
 
   const client = yield* Client.make({
     acquirer: transactionAcquirer,

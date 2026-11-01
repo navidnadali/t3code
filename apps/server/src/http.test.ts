@@ -214,8 +214,30 @@ describe("untraced requests", () => {
   );
 });
 
-// The platform sends bodies of 1 MB or more with end(body, callback), which runs only on `finish`.
+// The platform sends a 1 MB+ Uint8Array, a Raw body and a HEAD reply with end(…, callback),
+// which runs only on `finish`.
 const LARGE_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+// Node emits the request's `aborted` before it marks the response destroyed, so a handler that
+// resumes on it writes to a live-looking response; one that resumes on the socket's `close` does not.
+const LEAVING_CLIENTS = [
+  {
+    method: "GET",
+    path: "/left-large-close",
+    event: "close",
+    raw: false,
+    bytes: LARGE_RESPONSE_BYTES,
+  },
+  {
+    method: "GET",
+    path: "/left-large-aborted",
+    event: "aborted",
+    raw: false,
+    bytes: LARGE_RESPONSE_BYTES,
+  },
+  { method: "GET", path: "/left-raw-aborted", event: "aborted", raw: true, bytes: 1024 },
+  { method: "HEAD", path: "/left-head-close", event: "close", raw: false, bytes: 1024 },
+] as const;
 
 const readBody = (port: number, path: string) =>
   Effect.callback<Buffer, Error>((resume) => {
@@ -229,72 +251,97 @@ const readBody = (port: number, path: string) =>
   });
 
 describe("responses to disconnected clients", () => {
-  it.live(
-    "finishes a large response whose client left, and still sends one to a client that stays",
-    () =>
-      Effect.gen(function* () {
-        const server = NodeHttp.createServer();
-        const received = yield* Deferred.make<void>();
-        const closed = yield* Deferred.make<void>();
-        const finished = yield* Queue.unbounded<string>();
-        const layerRoutes = Layer.effectDiscard(
-          Effect.gen(function* () {
-            const router = yield* HttpRouter.HttpRouter;
+  it.live("finishes responses whose client left, and still sends one to a client that stays", () =>
+    Effect.gen(function* () {
+      const server = NodeHttp.createServer();
+      const finished = yield* Queue.unbounded<string>();
+      const signals = new Map<
+        string,
+        { readonly received: Deferred.Deferred<void>; readonly left: Deferred.Deferred<boolean> }
+      >();
+      for (const client of LEAVING_CLIENTS) {
+        signals.set(client.path, {
+          received: yield* Deferred.make<void>(),
+          left: yield* Deferred.make<boolean>(),
+        });
+      }
+      const layerRoutes = Layer.effectDiscard(
+        Effect.gen(function* () {
+          const router = yield* HttpRouter.HttpRouter;
+          for (const client of LEAVING_CLIENTS) {
+            const { received, left } = signals.get(client.path)!;
             yield* router.add(
               "GET",
-              "/left",
+              client.path,
               Effect.gen(function* () {
                 const request = yield* HttpServerRequest.HttpServerRequest;
-                const socket = NodeHttpServerRequest.toIncomingMessage(request).socket;
+                const incoming = NodeHttpServerRequest.toIncomingMessage(request);
                 yield* Deferred.succeed(received, undefined);
                 yield* Effect.callback<void>((resume) => {
-                  if (socket.destroyed) return resume(Effect.void);
-                  socket.once("close", () => resume(Effect.void));
+                  if (incoming.socket.destroyed) return resume(Effect.void);
+                  const target = client.event === "aborted" ? incoming : incoming.socket;
+                  target.once(client.event, () => resume(Effect.void));
                 });
-                yield* Deferred.succeed(closed, undefined);
-                return HttpServerResponse.uint8Array(new Uint8Array(LARGE_RESPONSE_BYTES));
+                const response = NodeHttpServerRequest.toServerResponse(request);
+                yield* Deferred.succeed(left, response.destroyed);
+                const body = new Uint8Array(client.bytes);
+                return client.raw
+                  ? HttpServerResponse.raw(body)
+                  : HttpServerResponse.uint8Array(body);
               }),
               // The send after the handler is uninterruptible; this makes the handler reach it.
               { uninterruptible: true },
             );
-            yield* router.add(
-              "GET",
-              "/stays",
-              HttpServerResponse.uint8Array(new Uint8Array(LARGE_RESPONSE_BYTES).fill(7)),
-            );
-          }),
-        );
-        // A request stuck in the server scope would block closing it, so close it apart.
-        const serverScope = yield* Scope.make();
-        yield* Effect.addFinalizer(() => Effect.forkDetach(Scope.close(serverScope, Exit.void)));
-        yield* Layer.buildWithScope(
-          HttpRouter.serve(layerRoutes, {
-            disableListenLog: true,
-            disableLogger: true,
-            middleware: (app) =>
-              Effect.flatMap(HttpServerRequest.HttpServerRequest, (request) =>
-                Effect.onExit(app, () => Queue.offer(finished, request.url)),
-              ),
-          }).pipe(Layer.provide(NodeHttpServer.layer(() => server, { port: 0 }))),
-          serverScope,
-        );
-        const { port } = server.address() as NodeNet.AddressInfo;
+          }
+          yield* router.add(
+            "GET",
+            "/stays",
+            HttpServerResponse.uint8Array(new Uint8Array(LARGE_RESPONSE_BYTES).fill(7)),
+          );
+        }),
+      );
+      // A request stuck in the server scope would block closing it, so close it apart.
+      const serverScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Effect.forkDetach(Scope.close(serverScope, Exit.void)));
+      yield* Layer.buildWithScope(
+        HttpRouter.serve(layerRoutes, {
+          disableListenLog: true,
+          disableLogger: true,
+          middleware: (app) =>
+            Effect.flatMap(HttpServerRequest.HttpServerRequest, (request) =>
+              Effect.onExit(app, () => Queue.offer(finished, `${request.method} ${request.url}`)),
+            ),
+        }).pipe(Layer.provide(NodeHttpServer.layer(() => server, { port: 0 }))),
+        serverScope,
+      );
+      const { port } = server.address() as NodeNet.AddressInfo;
 
+      const destroyedWhenWritten: Record<string, boolean> = {};
+      for (const client of LEAVING_CLIENTS) {
+        const { received, left } = signals.get(client.path)!;
         const leaving = NodeNet.connect({ host: "127.0.0.1", port }, () => {
-          leaving.write("GET /left HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+          leaving.write(`${client.method} ${client.path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`);
         });
         leaving.on("error", () => undefined);
         yield* Deferred.await(received);
         leaving.destroy();
-        yield* Deferred.await(closed);
+        destroyedWhenWritten[client.event] = yield* Deferred.await(left);
+      }
+      // Each event reaches its own write path: an early return, or the wait for `close`.
+      expect(destroyedWhenWritten).toEqual({ close: true, aborted: false });
 
-        const body = yield* readBody(port, "/stays");
-        expect(body.byteLength).toBe(LARGE_RESPONSE_BYTES);
-        expect(body.every((byte) => byte === 7)).toBe(true);
-        const order: Array<string> = [];
-        while (order.at(-1) !== "/stays") order.push(yield* Queue.take(finished));
-        expect(order).toEqual(["/left", "/stays"]);
-      }),
+      const body = yield* readBody(port, "/stays");
+      expect(body.byteLength).toBe(LARGE_RESPONSE_BYTES);
+      expect(body.every((byte) => byte === 7)).toBe(true);
+      const done: Array<string> = [];
+      while (done.at(-1) !== "GET /stays") done.push(yield* Queue.take(finished));
+      expect(done.toSorted()).toEqual(
+        [
+          ...LEAVING_CLIENTS.map((client) => `${client.method} ${client.path}`),
+          "GET /stays",
+        ].toSorted(),
+      );
+    }),
   );
 });
 

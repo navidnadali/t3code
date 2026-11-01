@@ -12,7 +12,7 @@ import { describe, expect, it, onTestFinished } from "vite-plus/test";
 
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
-import { SECRET_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
+import { TOKEN_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
 import { ShapeError, measureShape, parseShape, quantile, shapeRows } from "./fixture/shape.ts";
 
 const ROOT = NodePath.resolve(import.meta.dirname, "..", "..");
@@ -54,7 +54,11 @@ const SAMPLES: Record<string, string> = {
   jwt: `eyJ${"hbGciOi"}J.eyJ${"zdWIiOi"}J.${"Ab12".repeat(3)}`,
   bearer: `Bearer ${"Ab12.".repeat(5)}`,
   "url-credentials": `postgres://${"bench"}:${"hunter2"}@db.invalid/x`,
-  assignment: `api_key = "${"Ab12".repeat(4)}"`,
+  "credential-assignment": `api_key = "${"Ab12".repeat(4)}"`,
+  "google-oauth": `ya${"29"}.${"A0b1C2".repeat(8)}`,
+  "slack-app-token": `xap${"p"}-1-${"A1B2".repeat(6)}`,
+  "atlassian-token": `ATA${"TT"}${"xFfGF0".repeat(8)}`,
+  "basic-auth": `Basic ${Buffer.from("bench:hunter2hunter2").toString("base64")}`,
 };
 
 const run = (args: ReadonlyArray<string>, env: NodeJS.ProcessEnv = {}) =>
@@ -276,8 +280,60 @@ const seedPendingWork = (path: string) => {
     `UPDATE orchestration_events SET payload_json = json_set(payload_json, '$.title', ?)
      WHERE sequence = (SELECT MAX(sequence) FROM orchestration_events WHERE stream_id = ?)`,
   ).run(SAMPLES["private-key"] as string, kept);
+  // v1 imports the server would run on start: a transcript still to copy, a v1-only thread.
+  const transcript = (
+    db
+      .prepare(
+        `SELECT thread_id AS id FROM orchestration_v2_legacy_imports
+         WHERE thread_id NOT IN (?, ?) ORDER BY thread_id LIMIT 1`,
+      )
+      .get(kept, idle) as { id: string }
+  ).id;
+  db.prepare(
+    `UPDATE orchestration_v2_legacy_imports SET transcript_imported_at = NULL WHERE thread_id = ?`,
+  ).run(transcript);
+  db.prepare(
+    `INSERT INTO projection_threads (thread_id, project_id, title, created_at, updated_at)
+     VALUES ('v1-only-thread', ?, 'Old', ?, ?)`,
+  ).run(projectId, at, at);
+  // A queued run free to start, a snooze, a pending subagent delivery, a message still streaming
+  // and a live v1 session: a boot starts, wakes, delivers or finishes each.
+  const startable = (
+    db
+      .prepare(
+        `SELECT r.thread_id AS id FROM orchestration_v2_projection_runs r
+         JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
+         WHERE json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NULL
+           AND r.thread_id NOT IN (?, ?, ?, ?, ?, ?)
+         ORDER BY r.thread_id LIMIT 1`,
+      )
+      .get(running, queued, limited, watched, kept, idle) as { id: string }
+  ).id;
+  db.prepare(
+    `UPDATE orchestration_v2_projection_runs
+     SET status = 'queued', completed_at = NULL,
+       payload_json = json_set(payload_json, '$.status', 'queued', '$.completedAt', NULL, '$.startedAt', NULL)
+     WHERE run_id = (SELECT run_id FROM orchestration_v2_projection_runs WHERE thread_id = ? ORDER BY ordinal DESC LIMIT 1)`,
+  ).run(startable);
+  db.prepare(
+    `UPDATE orchestration_v2_projection_threads
+     SET payload_json = json_set(payload_json, '$.snoozedUntil', ?, '$.snoozedAt', ?) WHERE thread_id = ?`,
+  ).run("2099-01-01T00:00:00.000Z", at, idle);
+  db.exec(`UPDATE orchestration_v2_projection_subagents
+    SET payload_json = json_set(payload_json, '$.completionDelivery',
+      json_object('state', 'pending', 'observedByRunId', json('null')))
+    WHERE subagent_id = (SELECT MIN(subagent_id) FROM orchestration_v2_projection_subagents)`);
+  db.prepare(
+    `UPDATE orchestration_v2_projection_messages
+     SET streaming = 1, payload_json = json_set(payload_json, '$.streaming', json('true'))
+     WHERE message_id = (SELECT MIN(message_id) FROM orchestration_v2_projection_messages WHERE thread_id = ?)`,
+  ).run(idle);
+  db.prepare(
+    `INSERT INTO projection_thread_sessions (thread_id, status, provider_name, updated_at)
+     VALUES (?, 'running', 'claudeAgent', ?)`,
+  ).run(kept, at);
   db.close();
-  return { dropped: [running, queued, limited, watched], kept, idle };
+  return { busy: [running, queued, limited, watched, transcript, startable], kept, idle, running };
 };
 
 /** Plants the review's credential cases where real data held them; returns what must not survive. */
@@ -428,7 +484,8 @@ describe("assertSafeDestination", () => {
     const home = NodePath.join(root, ".t3");
     NodeFS.mkdirSync(NodePath.join(home, "userdata"), { recursive: true });
     NodeFS.symlinkSync(NodePath.join(home, "userdata"), NodePath.join(root, "link"));
-    const physical = NodePath.join(root, "link", "..", "fixture.sqlite");
+    // Built as text: NodePath.join would fold `link/..` away before the guard sees it.
+    const physical = [root, "link", "..", "fixture.sqlite"].join(NodePath.sep);
     expect(() => assertSafeDestination({ destination: physical, homes: [home] })).toThrow(
       /inside the T3 home/,
     );
@@ -468,9 +525,10 @@ describe("assertSafeDestination", () => {
 
 describe("secrets", () => {
   it("redacts every credential pattern to the same length, leaving nothing to find", () => {
-    expect(Object.keys(SAMPLES).sort()).toEqual(SECRET_PATTERNS.map(({ name }) => name).sort());
+    const kinds = [...TOKEN_PATTERNS.map(({ name }) => name), "credential-assignment"];
+    expect(Object.keys(SAMPLES).sort()).toEqual(kinds.sort());
     const text = Object.values(SAMPLES).join(" | ");
-    expect(secretHits(text).sort()).toEqual(Object.keys(SAMPLES).sort());
+    expect(secretHits(text, { entropy: false }).sort()).toEqual(Object.keys(SAMPLES).sort());
     const redacted = redact(text);
     expect(redacted.length).toBe(text.length);
     expect(secretHits(redacted)).toEqual([]);
@@ -804,7 +862,7 @@ describe("fixture CLI", () => {
     NodeFS.symlinkSync(userdata, NodePath.join(work, "link"));
     const source = NodePath.join(work, "source.sqlite");
     new NodeSqlite.DatabaseSync(source).close();
-    const report = NodePath.join(work, "link", "..", "userdata", "statev2.sqlite");
+    const report = [work, "link", "..", "userdata", "statev2.sqlite"].join(NodePath.sep);
     const refused = run(
       ["sanitise", "--report", report, source, NodePath.join(work, "out.sqlite")],
       { HOME: home },
@@ -831,7 +889,7 @@ describe("fixture CLI", () => {
     const directory = scratch("sanitise");
     const seeded = NodePath.join(directory, "seeded.sqlite");
     synth(seeded, "0.25");
-    const { dropped, kept, idle } = seedPendingWork(seeded);
+    const { busy, kept, idle, running } = seedPendingWork(seeded);
     const before = run(["scan", seeded]);
     expect(before.status).toBe(1);
     const found = (JSON.parse(before.stdout) as { runnable: Record<string, number> }).runnable;
@@ -840,6 +898,7 @@ describe("fixture CLI", () => {
     const report = NodePath.join(directory, "report.json");
     const clean = NodePath.join(directory, "clean.sqlite");
     const result = run(["sanitise", "--report", report, seeded, clean]);
+    expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
     const summary = JSON.parse(NodeFS.readFileSync(report, "utf8")) as {
       check: {
@@ -853,11 +912,20 @@ describe("fixture CLI", () => {
     expect(summary.check.credentialColumns).toEqual({});
     expect(summary.check.rawHits).toEqual({});
     expect(Object.values(summary.check.runnable).every((value) => value === 0)).toBe(true);
-    const remaining = count(
+    // Every thread stays: start-up work is done in place, as a restart does it.
+    const kept_ = count(
       clean,
-      `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads WHERE thread_id IN ('${dropped.join("','")}')`,
+      `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads WHERE thread_id IN ('${busy.join("','")}')`,
     );
-    expect(remaining).toBe(0);
+    expect(kept_).toBe(busy.length);
+    // ... plus the v1-only thread, which the server's importer turned into a v2 thread.
+    expect(count(seeded, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads`) + 1).toBe(
+      count(clean, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads`),
+    );
+    const cancelled = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_runs
+      WHERE thread_id = '${running}' AND status = 'cancelled'
+        AND ordinal = (SELECT MAX(ordinal) FROM orchestration_v2_projection_runs WHERE thread_id = '${running}')`;
+    expect(count(clean, cancelled)).toBe(1);
     expect(
       count(
         clean,
@@ -910,7 +978,14 @@ describe("sanitise content", () => {
        WHERE message_id = (SELECT MIN(message_id) FROM orchestration_v2_projection_messages)`,
       "the staging db password is hunter two, keep it quiet",
     );
-    expect([inId, prose]).toEqual([1, 1]);
+    // A random value under a session/key/auth name: P1-002's extended check reads it as one.
+    const sessionKey = plant(
+      "session-key",
+      `UPDATE orchestration_v2_projection_messages SET payload_json = json_set(payload_json, '$.sessionId', ?)
+       WHERE message_id = (SELECT MIN(message_id) FROM orchestration_v2_projection_messages)`,
+      `${"q8Zr3Vt9Lp2Xw7Ms".repeat(2)}`,
+    );
+    expect([inId, prose, sessionKey]).toEqual([1, 1, 1]);
   });
 });
 

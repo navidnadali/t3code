@@ -1550,7 +1550,11 @@ const checkpointTurn = Effect.fn("test.checkpointTurn")(function* (
       ])
     : (["", null] as const);
   const patch = previousExists
-    ? yield* checkpoints.diffCheckpoints({ ...refs, fallbackFromToHead: false, ignoreWhitespace: true })
+    ? yield* checkpoints.diffCheckpoints({
+        ...refs,
+        fallbackFromToHead: false,
+        ignoreWhitespace: true,
+      })
     : "";
   return {
     baselineExists,
@@ -1627,7 +1631,8 @@ const makeTurnHarness = Effect.fn("test.makeTurnHarness")(function* (prefix: str
       (cwd) => fileSystem.remove(path.join(cwd, relativePath), { force: true }),
       { discard: true },
     );
-  const commitBoth = (message: string) => gitBoth(["commit", "-q", "-m", message], FIXED_COMMIT_ENV);
+  const commitBoth = (message: string) =>
+    gitBoth(["commit", "-q", "-m", message], FIXED_COMMIT_ENV);
   for (const cwd of [repos.warm, repos.cold]) {
     yield* fileSystem.makeDirectory(cwd, { recursive: true });
     yield* gitIn(cwd, ["init", "-q", "-b", "main"]);
@@ -1655,7 +1660,15 @@ const makeTurnHarness = Effect.fn("test.makeTurnHarness")(function* (prefix: str
       const warmTag = warmResult._tag === "Failure" ? warmResult.failure._tag : null;
       const coldTag = coldResult._tag === "Failure" ? coldResult.failure._tag : null;
       assert.strictEqual(warmTag, coldTag);
-      return { commands, failed: warmTag };
+      return {
+        commands,
+        failed: warmTag,
+        baselineExists: false,
+        previousExists: false,
+        numstat: "",
+        authored: null,
+        patch: "",
+      };
     }
     assert.deepStrictEqual(warmResult.success, coldResult.success);
     for (const probe of [ordinal - 1, ordinal]) {

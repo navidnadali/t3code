@@ -16,7 +16,9 @@ Both writers resolve every path physically (each component through its symlinks 
 report path the run writes as a database (exit 2). They write exactly the resolved path, created exclusively
 (`O_EXCL`, so not through a symlink) and `0600`. A failed or interrupted run (SIGINT exits 130, SIGTERM 143)
 removes what it created; SIGKILL cannot, and leaves a `.fixture-sanitise-*` (or `.fixture-synth-*`) directory
-beside the destination, which holds an unsanitised copy until deleted.
+beside the destination, which holds an unsanitised copy until deleted. A signal is handled between batches of
+the long passes (2,000 rows); a single SQLite step (`VACUUM INTO`, a migration, the server's recovery) finishes
+first.
 
 The source may be the live `~/.t3/userdata/statev2.sqlite`: `VACUUM INTO` reads one consistent snapshot through a
 read-only connection while the server writes. For a fixture that leaves the machine, copy it first (as P1-002
@@ -69,7 +71,12 @@ server does it, so the fixture keeps its production scale and a boot writes noth
    Then the server's own recovery queries must find nothing to resume, recover or deliver, and nothing else may
    be due on start (the list under Self-check), else the run fails here.
 7. Content pass (below): every string outside the allowlist becomes filler, BLOBs become zeros of their length.
-   Triggers are dropped for the pass and restored, then the message search index is rebuilt from the filler.
+   It streams each table in rowid order, a batch at a time (at most 2,000 rows and 64 MiB plus one row), rewrites
+   in JavaScript and writes rows back, committing each batch, so its memory does not grow with the database (a
+   user function in one UPDATE would hold the whole table: node:sqlite keeps every value it sees until the
+   statement ends). It prints rows and MiB per table every 50,000 rows and at each table's end. Triggers are
+   dropped for the pass and restored, then the message search index is rebuilt from the filler, and P1-014's
+   `orchestration_v2_projection_turn_item_counts` (kept, not blanked) is recounted from the turn items.
    Every v2 projection payload and thread event is decoded with the server's schemas before and after, row by
    row (flat memory on threads with millions of items); a row that decoded before and not after fails the run
    (nothing written).
@@ -99,11 +106,22 @@ Kept as written (`fixture/content.ts`):
 | Model and provider names      | key ends in `model`/`provider`/`driver` (also `…Name`, `…Slug`); value without spaces, ≤ 128                                                                                                                   |
 | Git hashes                    | key ends in `sha`/`hash`/`oid`/`commit`/`revision`; value 7–64 hex digits                                                                                                                                      |
 | Object keys                   | identifiers `[A-Za-z_$@][A-Za-z0-9_$@.:-]{0,63}` the pattern layer does not flag; any other key becomes key filler: a seed and the letters it fixes, a `.` every eighth character, one per byte (at least ten) |
-| Structural tables             | `effect_sql_migrations` and `orchestration_v2_projection_metadata`, whole                                                                                                                                      |
+| Structural tables             | `effect_sql_migrations`, `orchestration_v2_projection_metadata` and `orchestration_v2_projection_turn_item_counts`, whole                                                                                      |
 
 A value under a credential-named key (`password`, `token`, `secret`, `api_key`, `auth`, …) keeps only a known
-literal. The pattern layer (`fixture/secrets.ts`) still reads every kept value and key, and a kept value it flags
-is blanked after all.
+literal. Under a credential-holding ancestor (`credentials`, `auth`, `token`, `secret`, `cookie`, `pin`, …; not
+`author`, token counts or a bare `pass`) nothing is kept but literals and timestamps, ids included, and JSON
+numbers become 0 (a PIN, an OTP); numbers under such a key itself are zeroed too, and the check reports any left
+(`credential-number`). Object keys shaped like tokens (an unprefixed run of 16+ letters and digits mixed like
+noise) are rewritten; camelCase names, MCP tool names and vendor-prefixed ids (`toolu_…`) stay. The pattern layer
+(`fixture/secrets.ts`) still reads every kept value and key, and a kept value it flags is blanked after all.
+
+What the allowlist still keeps by design: any value without whitespace under an id key (up to 4,096 characters),
+an identifier under `type`/`kind`/`status`/`role`, a name under `model`/`provider`/`driver`, 7–64 hex digits under
+`sha`/`commit`/…, and identifier object keys up to 64 characters. An unprefixed random secret placed in one of
+those (outside a credential-holding ancestor, and not shaped like a known token) survives. So do ids that act as
+access links: a Google Drive or Docs file id kept as an id opens the file for anyone it is shared with by link.
+Treat a fixture as data that still carries ids, not as public.
 
 Filler keeps the size: the same UTF-8 bytes and UTF-16 length, and in place every control character (newlines,
 tabs, escapes), `"` and `\`, so lines and JSON escaping survive. Between those, text becomes pseudo-words: an
@@ -114,8 +132,9 @@ regenerate any filler without the original. Seeds come from an HMAC with a rando
 equal texts get equal filler within a run (duplicates stay duplicates) and filler cannot be matched against a
 guessed original. The letters cannot spell a credential word (no c, h, k, t, w or y, never two consonants
 together), words run at most seven letters, and there are no digits, capitals, `:` or `=`, so no pattern of
-either check can match in or right after filler. On ws1's database payload size quantiles are unchanged; the
-search index is smaller (fewer distinct words) and thread payloads lose their pull request snapshots (step 5).
+either check can match in or right after filler. On ws1's database payload size quantiles are unchanged; thread
+payloads lose their pull request snapshots (step 5), and the message search index is 14 % smaller on
+ws1 (14–19 % on the production copy: fewer distinct words), so search benches on a fixture will not match production.
 
 `--keep-content` skips blanking and runs the pattern layer alone (every visible character of a finding becomes
 `*`). It fails open by nature: use it only for a copy that never leaves the machine. `scan --keep-content`
@@ -161,11 +180,12 @@ Boot it with its own `--base-dir` and `HOME`, never on the machine its data came
 blanked, project and worktree paths point nowhere. A first boot of a sanitised fixture writes no event: the
 start-up work (step 3), deliveries (4), settle sweep, pull request sync and timers (5) and compaction (6) are
 done, and the recovery queries find nothing (on ws1's fixture: no event, row or sequence change, all recovery
-counts 0, no `git` call in the first 20 s). For bench runs (P1-007) set, in `<base-dir>/userdata/settings.json`,
+counts 0). It may still run `git`: read-only repository identity probes per project (the re-review counted 81 on
+the production copy; on ws1's fixture `GIT_TRACE` recorded none in the first 20 s after ready). At the blanked
+paths they find no repository. For bench runs (P1-007) set, in `<base-dir>/userdata/settings.json`,
 `"enableProviderUpdateChecks": false` (no model manifest fetch), `"sidebarAutoSettleAfterDays": null` and
 `"sidebarAutoSettleOnMerge": false` (no settle sweep on threads the bench creates), and the environment variable
-`T3CODE_TELEMETRY_ENABLED=false`. Read-only repository identity probes (`git rev-parse` per project on start)
-cannot be switched off; on a blanked fixture they find no repository.
+`T3CODE_TELEMETRY_ENABLED=false`. The identity probes cannot be switched off.
 
 ## synth
 
@@ -184,8 +204,9 @@ not filler). "A boot writes nothing" holds for synth output as written and for s
 - Runs carry attempts, a root node and child nodes, provider turns, a provider thread and stopped sessions; turn
   items follow the shape's type mix (types this generator does not write become `system_notice`, reported) and its
   payload size spread; checkpoints share one root scope per thread.
-- Ids follow the server's `IdAllocator` (`derive.run`, `derive.providerTurn`, …) and Claude-style native ids, so
-  index and payload sizes match. Text comes from a fixed word list: no data, nothing credential-shaped.
+- Ids follow the server's `IdAllocator` (`derive.run`, `derive.providerTurn`, …) and Claude-style native ids
+  (14 random base62 characters, redrawn while they spell a credential word, then an 8-digit counter), so index
+  and payload sizes match. Text comes from a fixed word list: no data, nothing credential-shaped.
 - Events: one per entity, plus the shape's extra updates per event type (compactable types stay at first + latest,
   so the store's compaction finds nothing to delete).
 - Not written: tables the generator has no model for (pull request links, v1 sessions, …) show as `0 / target`.

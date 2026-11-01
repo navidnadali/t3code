@@ -63,6 +63,11 @@ span spent waiting for that connection, behind other SQL. That wait does not blo
 so subtract it before you blame a slow span on the query. Statements inside a transaction use its
 connection and do not carry these attributes.
 
+An MCP request over HTTP has a `McpHttpServer.authenticateRequest` span that covers only admitting
+it: the credential check, the mode limit, and the Linked environments gate. The request runs after
+it, under the `McpServer.…/<method>` span, and each tool call has its own `mcp.tool.<name>` span
+that times it. That span's attributes name the tool, never its arguments.
+
 DPoP proof failures include the safe `environment.dpop.failure_code` span
 attribute. A `time_window` failure means that a signed proof was too old or too
 far in the future for the environment server's allowed window. It can point to
@@ -664,11 +669,12 @@ no memory map.
   most `2047` with Node's bundled SQLite
 
 Each connection allocates its cache as it reads pages, up to the limit, so the cost is the main
-connection's plus each reader worker's. Readers drop their cache and memory map whenever another
-connection commits, so the main connection gains most. While the database is mapped, an I/O error or
-a truncation from outside SQLite raises SIGBUS and terminates the process. CLI commands that open the
-database, such as `t3 project`, `t3 auth`, `t3 environment`, and `t3 thread`, use the same settings,
-and an invalid value stops them as well as the server.
+connection's plus each reader worker's, up to `T3CODE_SQLITE_READER_POOL` (default 4) of them.
+Readers drop their cache and memory map whenever another connection commits, so the main connection
+gains most. While the database is mapped, an I/O error or a truncation from outside SQLite raises
+SIGBUS and terminates the process. CLI commands that open the database, such as `t3 project`,
+`t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
+as well as the server.
 
 ### The Kill Switch
 

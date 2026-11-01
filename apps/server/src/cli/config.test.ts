@@ -930,6 +930,29 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect("accepts a SQLite reader pool of 1 to 32 workers and rejects any other size", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-reader-pool-" })),
+      );
+      const resolvePoolSize = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.sqliteReaderPoolSize),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolvePoolSize({})).toBeUndefined();
+      expect(yield* resolvePoolSize({ T3CODE_SQLITE_READER_POOL: "1" })).toBe(1);
+      expect(yield* resolvePoolSize({ T3CODE_SQLITE_READER_POOL: "32" })).toBe(32);
+      for (const size of ["0", "33"]) {
+        const error = yield* resolvePoolSize({ T3CODE_SQLITE_READER_POOL: size }).pipe(Effect.flip);
+        expect(String(error)).toMatch(/between 1 and 32\s+at \["T3CODE_SQLITE_READER_POOL"\]/);
+      }
+    }),
+  );
+
   it.effect("reads SQLite page cache and memory map sizes and refuses ones SQLite cannot use", () =>
     Effect.gen(function* () {
       const { join } = yield* Path.Path;

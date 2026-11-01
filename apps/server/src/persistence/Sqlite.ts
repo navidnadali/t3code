@@ -48,7 +48,7 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (
   dbPath: string,
   tuning?: Pick<
     NodeSqliteClient.SqliteClientConfig,
-    "cacheSizeMb" | "readerCacheSizeMb" | "mmapSizeMb"
+    "readerPoolSize" | "cacheSizeMb" | "readerCacheSizeMb" | "mmapSizeMb"
   >,
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -81,6 +81,7 @@ export const layerConfig = Layer.unwrap(
     const config = yield* ServerConfig.ServerConfig;
     yield* initializeV2Database(config.dbPath);
     return layerFromPath(config.dbPath, {
+      readerPoolSize: config.sqliteReaderPoolSize,
       cacheSizeMb: config.sqliteCacheSizeMb,
       readerCacheSizeMb: config.sqliteReaderCacheSizeMb,
       mmapSizeMb: config.sqliteMmapSizeMb,

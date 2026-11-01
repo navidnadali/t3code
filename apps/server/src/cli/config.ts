@@ -9,6 +9,7 @@ import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serve
 import {
   SQLITE_MAX_CACHE_SIZE_MB,
   SQLITE_MAX_MMAP_SIZE_MB,
+  SQLITE_MAX_READER_POOL_SIZE,
 } from "@t3tools/shared/nodeSqliteClient";
 import { DesktopBackendBootstrap, PortSchema } from "@t3tools/contracts";
 import * as Config from "effect/Config";
@@ -187,6 +188,10 @@ const EnvServerConfig = Config.all({
     Config.map(Option.getOrUndefined),
   ),
   lan: Config.Boolean("T3CODE_LAN").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  sqliteReaderPoolSize: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: SQLITE_MAX_READER_POOL_SIZE })),
+    "T3CODE_SQLITE_READER_POOL",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
   sqliteCacheSizeMb: sqliteMebibytesConfig("T3CODE_SQLITE_CACHE_MB", SQLITE_MAX_CACHE_SIZE_MB),
   sqliteReaderCacheSizeMb: sqliteMebibytesConfig(
     "T3CODE_SQLITE_READER_CACHE_MB",
@@ -540,6 +545,9 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logWebSocketEvents,
     tailscaleServeEnabled,
     tailscaleServePort,
+    ...(env.sqliteReaderPoolSize === undefined
+      ? {}
+      : { sqliteReaderPoolSize: env.sqliteReaderPoolSize }),
     sqliteCacheSizeMb: env.sqliteCacheSizeMb,
     sqliteReaderCacheSizeMb: env.sqliteReaderCacheSizeMb,
     sqliteMmapSizeMb: env.sqliteMmapSizeMb,

@@ -19,7 +19,7 @@ import {
   keptAs,
   rewriteContent,
 } from "./fixture/content.ts";
-import { extendedFindings } from "./fixture/extended.ts";
+import { extendedFindings, extendedMayMatch } from "./fixture/extended.ts";
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { TOKEN_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
@@ -1429,6 +1429,42 @@ describe("allowlisted ids", () => {
       "raw|keyword assignment (loose)",
       "raw|keyword assignment (loose)",
     ]);
+  });
+
+  it("skips the extended rules only on values none of them can match", () => {
+    // Id-like strings built from id characters and fragments of every rule's literals.
+    const parts = [
+      ..."abcXYZ019_-:.%/+=@ ",
+      "pWd",
+      "PASS",
+      "Key",
+      "tok",
+      "en",
+      "DSN",
+      "AKIA",
+      "sk-",
+      "eyJ",
+      "-----",
+      "://",
+      "\n",
+      "0123456789abcdef",
+      "A".repeat(64),
+    ];
+    let state = 7;
+    const random = () => {
+      state = (state * 48271) % 2147483647;
+      return state / 2147483647;
+    };
+    const missed: Array<string> = [];
+    for (let index = 0; index < 50_000; index++) {
+      let text = "";
+      for (let length = 1 + Math.floor(random() * 30); length > 0; length--) {
+        text += parts[Math.floor(random() * parts.length)];
+      }
+      if (extendedMayMatch(text)) continue;
+      extendedFindings(text, () => missed.push(text));
+    }
+    expect(missed).toEqual([]);
   });
 
   it("sanitises a turn item and its event whose native id reads as an assignment", () => {

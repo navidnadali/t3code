@@ -66,11 +66,13 @@ const findLoads = (code: string) => {
   return { problems: [...found].sort(), builtins: [...builtins].sort() };
 };
 
-// Static checks cannot see computed names (`module[key]`), so the worker also runs with a
-// `require`, `module` and `process` that reach only the built-ins found above, and
-// worker_threads only as its own port: nothing can load a file from the working directory.
+// Static checks cannot see computed names (`globalThis[key]`) or code built from strings, so
+// the worker resolves its few built-ins first and then registers a loader hook that refuses
+// every later `require`, `import()` and `createRequire`. Process-level loaders are disabled
+// too, and worker_threads is visible only as the worker's own port.
 const guard = (code: string, builtins: ReadonlyArray<string>) => `"use strict";
 {
+  const NodeModule = require("node:module");
   const threads = require("node:worker_threads");
   const port = Object.freeze({
     parentPort: threads.parentPort,
@@ -85,6 +87,7 @@ const guard = (code: string, builtins: ReadonlyArray<string>) => `"use strict";
     throw new Error("The provider I/O worker may load only the built-ins it was built with, not " + what + ".");
   };
   const load = (id) => (typeof id === "string" && allowed.has(id) ? allowed.get(id) : refuse(String(id)));
+  NodeModule.registerHooks({ resolve: (specifier) => refuse(String(specifier)) });
   for (const name of ["dlopen", "binding", "_linkedBinding"]) process[name] = () => refuse("process." + name);
   process.getBuiltinModule = load;
   ((require, module, exports, __filename, __dirname) => {

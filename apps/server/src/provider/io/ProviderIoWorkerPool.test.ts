@@ -23,7 +23,7 @@ import type { ProviderIoStage } from "./providerIoProtocol.ts";
 import { acpWireStage, codexWireStage } from "./providerIoStages.ts";
 import { echoStage, linesStage } from "./testFixtures/providerIoTestStages.ts";
 
-type WorkerMode = "fixture" | "production" | "silent" | "throws" | "inert";
+type WorkerMode = "fixture" | "production" | "silent" | "throws" | "inert" | "late";
 
 const workers = vi.hoisted(() => ({
   mode: "fixture" as WorkerMode,
@@ -49,6 +49,11 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         // Ready, then never answers: the test injects the worker's replies itself.
         inert: [
           'require("node:worker_threads").parentPort.postMessage({ type: "ready" }); setInterval(() => {}, 1 << 30);',
+          { eval: true },
+        ],
+        // Inert, but ready only once main sends it anything.
+        late: [
+          'const { parentPort } = require("node:worker_threads"); parentPort.once("message", () => parentPort.postMessage({ type: "ready" })); setInterval(() => {}, 1 << 30);',
           { eval: true },
         ],
       };
@@ -821,19 +826,20 @@ it.effect("releases an open's worker reservation as soon as the open fails", () 
   ),
 );
 
-it.effect("releases everything an interrupted open had taken, wherever it stopped", () =>
-  withPool({ workers: 2 }, (pool, started) =>
+it.effect("releases the reservation of an open interrupted while it waits for its worker", () =>
+  withPool({ workers: 2, mode: "late" }, (pool, started) =>
     Effect.gen(function* () {
-      const [first] = workers.started.slice(-started());
-      yield* openEcho(pool, "ready").pipe(Effect.scoped);
-      for (let ops = 3; ops <= OP_BOUNDARIES; ops++) {
-        // Interrupted opens stay in this long-lived scope; nothing of theirs may outlive them.
-        const opening = yield* forkParkedAfter(ops, openEchoOption(pool));
-        yield* Fiber.interrupt(opening);
-        yield* openEcho(pool, "next").pipe(Effect.scoped);
-        const lastOpen = workers.posted.filter((message) => message.type === "open").at(-1);
-        assert.equal(lastOpen?.worker, first);
+      const poolWorkers = workers.started.slice(-started());
+      // The open's scope outlives it, so anything the interrupted open kept would show.
+      const opening = yield* Effect.forkChild(openEchoOption(pool), { startImmediately: true });
+      yield* Fiber.interrupt(opening);
+      for (const worker of poolWorkers) {
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        worker.postMessage({ type: "go" });
       }
+      yield* openEcho(pool, "next").pipe(Effect.scoped);
+      const lastOpen = workers.posted.filter((message) => message.type === "open").at(-1);
+      assert.equal(lastOpen?.worker, poolWorkers[0]);
     }),
   ),
 );

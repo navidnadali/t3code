@@ -67,7 +67,10 @@ export interface ProviderIoOpenInput<Options, Output, E, Request = never, Reply 
 export class ProviderIoWorkerPool extends Context.Service<
   ProviderIoWorkerPool,
   {
-    /** None when the pool is off or unavailable; the caller then runs the stage in-thread. */
+    /**
+     * None when the pool is off or unavailable; the caller then runs the stage in-thread. An
+     * open that fails or is interrupted before it returns keeps nothing.
+     */
     readonly open: <Options, Output, E, Request = never, Reply = never>(
       input: ProviderIoOpenInput<Options, Output, E, Request, Reply>,
     ) => Effect.Effect<Option.Option<ProviderIoSession<Output, E, Request, Reply>>, E, Scope.Scope>;
@@ -562,17 +565,14 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     return Option.some(session);
   }, Effect.uninterruptible);
 
-  const open = Effect.fn("ProviderIoWorkerPool.open")(function* <
+  // Runs in the scope `open` forks; returning a session is what keeps that scope.
+  const openInScope = Effect.fn("ProviderIoWorkerPool.open")(function* <
     Options,
     Output,
     E,
-    Request = never,
-    Reply = never,
+    Request,
+    Reply,
   >(input: ProviderIoOpenInput<Options, Output, E, Request, Reply>) {
-    if (options.workers === 0) return Option.none();
-    // The open runs in its own scope, kept only when it returns a session: a failed, empty or
-    // interrupted open releases its reservation and any session at once.
-    const scope = yield* Scope.fork(yield* Effect.scope);
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const reserved = yield* reserve;
@@ -589,13 +589,28 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
         if (!ready) return Option.none();
         return yield* makeSession(slot, input);
       }),
-    ).pipe(
-      Scope.provide(scope),
-      Effect.onExit((exit) =>
-        Exit.isSuccess(exit) && Option.isSome(exit.value) ? Effect.void : Scope.close(scope, exit),
-      ),
     );
   });
+
+  // An open that fails, finds no worker or is interrupted before it returns releases its
+  // reservation and session at once; a returned session belongs to the caller's scope.
+  const open = <Options, Output, E, Request = never, Reply = never>(
+    input: ProviderIoOpenInput<Options, Output, E, Request, Reply>,
+  ): Effect.Effect<Option.Option<ProviderIoSession<Output, E, Request, Reply>>, E, Scope.Scope> =>
+    options.workers === 0
+      ? Effect.succeedNone
+      : Effect.flatMap(Effect.scope, (parent) =>
+          Effect.flatMap(Scope.fork(parent), (scope) =>
+            openInScope(input).pipe(
+              Scope.provide(scope),
+              Effect.onExit((exit) =>
+                Exit.isSuccess(exit) && Option.isSome(exit.value)
+                  ? Effect.void
+                  : Scope.close(scope, exit),
+              ),
+            ),
+          ),
+        );
 
   yield* Effect.addFinalizer(() =>
     Effect.promise(() => {

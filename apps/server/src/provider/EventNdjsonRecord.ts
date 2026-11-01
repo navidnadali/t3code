@@ -201,7 +201,8 @@ interface RecordUsage {
   readonly depth: number;
 }
 
-// Events the adapters bounded whole, so the record that wraps one does not walk it again.
+// Events the adapters bounded whole, so the native record that wraps one does not walk it
+// again. Each size is used once; a later record walks the event afresh.
 const fittingEventUsage = new WeakMap<object, RecordUsage>();
 
 function measureProviderEvent(event: unknown, reuseFitting: boolean): RecordUsage | undefined {
@@ -220,6 +221,7 @@ function measureProviderEvent(event: unknown, reuseFitting: boolean): RecordUsag
     const usedFields = MAX_RECORD_FIELDS - remainingFields;
     const known = reuseFitting ? fittingEventUsage.get(value) : undefined;
     if (known !== undefined) {
+      fittingEventUsage.delete(value);
       if (depth + known.depth > MAX_RECORD_DEPTH || remainingFields < known.requiredFields) {
         return false;
       }
@@ -263,6 +265,7 @@ function measureProviderEvent(event: unknown, reuseFitting: boolean): RecordUsag
   };
 }
 
+/** Write the record that wraps the event before changing it: the writer trusts this size once. */
 export function boundProviderEventForLogging(event: unknown): unknown {
   const usage = measureProviderEvent(event, false);
   if (usage === undefined) return summarizeProviderEvent(event);
@@ -284,7 +287,9 @@ export function serializeEventNdjsonRecord(
   if (!shouldPersistProviderEvent(stream, event)) return skipped;
   const record = serialize(
     stream,
-    measureProviderEvent(event, true) === undefined ? summarizeProviderEvent(event) : event,
+    measureProviderEvent(event, stream === "native") === undefined
+      ? summarizeProviderEvent(event)
+      : event,
   );
   // Escaping can expand strings beyond their input size.
   if (record._tag === "Serialized" && Buffer.byteLength(record.payload) > MAX_RECORD_CHARACTERS) {

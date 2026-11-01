@@ -20,6 +20,7 @@ import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
+import * as EventNdjsonLogger from "../../provider/EventNdjsonLogger.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import {
   serializedRecordProblem,
@@ -93,6 +94,7 @@ interface AdapterRow {
   readonly capture: (input: ReplayFixtureCase, mode: WorkerMode) => Effect.Effect<CaptureRun>;
 }
 
+const LOG_LINE = /^\[[^\]]*\] ([A-Z]+): (.*)$/u;
 const ISO_TIMESTAMP = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/gu;
 const UUID_V4 = /[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gu;
 const ANY_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/giu;
@@ -138,16 +140,26 @@ interface LogLine {
 
 // Each session's incoming protocol records come from its stdout reader and the outgoing ones from
 // its request senders, so the order is compared per file, stream, direction and session.
-const byLogWriter = (logLines: ReadonlyArray<LogLine>) => {
+// With `perRequest`, request records are also split per request: the real log store can append
+// different requests' records out of send order under contention (P1-069 follow-up pending).
+const byLogWriter = (logLines: ReadonlyArray<LogLine>, perRequest: boolean) => {
   const writers = new Map<string, Array<unknown>>();
   for (const { file, stream, record } of logLines) {
     const { event, providerSessionId } = record as {
-      readonly event?: { readonly direction?: unknown };
+      readonly event?: {
+        readonly direction?: unknown;
+        readonly kind?: unknown;
+        readonly payload?: { readonly method?: unknown; readonly request?: unknown };
+      };
       readonly providerSessionId?: unknown;
     };
     const direction = typeof event?.direction === "string" ? event.direction : "-";
     const session = typeof providerSessionId === "string" ? providerSessionId : "-";
-    const writer = `${file} ${String(stream)} ${direction} ${session}`;
+    const request =
+      perRequest && event?.kind === "request"
+        ? ` ${String(event.payload?.method)} ${JSON.stringify(event.payload?.request)}`
+        : "";
+    const writer = `${file} ${String(stream)} ${direction} ${session}${request}`;
     writers.set(writer, [...(writers.get(writer) ?? []), record]);
   }
   return Object.fromEntries([...writers].toSorted(([a], [b]) => (a < b ? -1 : 1)));
@@ -176,8 +188,9 @@ const normalize = (
     readonly sinkWrites: ReadonlyArray<OrchestrationV2StoredEvent>;
   },
   tmpRoot: string,
-  freshIds: boolean,
+  options: { readonly freshIds: boolean; readonly perRequest: boolean },
 ): Capture => {
+  const { freshIds } = options;
   // Either separator (Windows), repeated where a path sits inside an escaped JSON string.
   const separator = String.raw`[\\/]+`;
   const tmpDirectory = new RegExp(
@@ -202,7 +215,7 @@ const normalize = (
   };
   const texts = [
     scrub(raw.adapterEvents),
-    scrub(byLogWriter(raw.logLines)),
+    scrub(byLogWriter(raw.logLines, options.perRequest)),
     scrub(byEntity(raw.sinkWrites)),
     scrub(firstWrites(raw.sinkWrites)),
   ];
@@ -275,6 +288,8 @@ const adapterRow = <
   readonly fixtures?: ReadonlySet<string>;
   readonly modes: AdapterRow["modes"];
   readonly freshIds?: boolean;
+  /** Writes the native log through the real store instead of the synchronous capture. */
+  readonly realLogStore?: true;
   /** Off where the provider is not replayed from the fixture's recording, so its checks do not apply. */
   readonly checkOutput?: boolean;
   readonly harness: (
@@ -303,10 +318,16 @@ const adapterRow = <
       const logDir = yield* fileSystem.makeTempDirectoryScoped({
         prefix: "t3-provider-io-equivalence-",
       });
-      // The native log as the store accepts it, appended synchronously: a slower append would
-      // delay ACP requests (logged before they are sent) and race them against interrupts.
+      // Otherwise the native log as the store accepts it, appended synchronously and so in call
+      // order: the real store can reorder records of different requests under contention.
+      const store =
+        row.realLogStore === true
+          ? yield* EventNdjsonLogger.makeEventNdjsonLogStore(path.join(logDir, "events.log"), {
+              batchWindowMs: 0,
+            })
+          : undefined;
       const logLines: Array<LogLine> = [];
-      const native: ProviderEventLoggers.EventNdjsonLogger = {
+      const captured: ProviderEventLoggers.EventNdjsonLogger = {
         filePath: path.join(logDir, "events.log"),
         write: (event, threadId) =>
           Effect.sync(() => {
@@ -332,6 +353,7 @@ const adapterRow = <
           }),
         close: () => Effect.void,
       };
+      const native = store === undefined ? captured : store.logger("native");
       const pool = yield* ProviderIoWorkerPool.make({ workers: mode.workers });
       const use: Record<string, { sessions: number; decoded: number }> = {};
       const layerPool = Layer.succeed(
@@ -414,10 +436,22 @@ const adapterRow = <
           ? {}
           : { materializeWorkspace: row.materializeWorkspace }),
       }).pipe(Effect.provide(services));
+      if (store !== undefined) {
+        yield* store.close();
+        for (const file of (yield* fileSystem.readDirectory(logDir)).toSorted()) {
+          const contents = yield* fileSystem.readFileString(path.join(logDir, file));
+          for (const line of contents.split("\n")) {
+            if (line.length === 0) continue;
+            const [, stream, payload] = LOG_LINE.exec(line) ?? [];
+            assert.isDefined(payload, `log line format: ${line}`);
+            logLines.push({ file, stream, record: JSON.parse(payload) });
+          }
+        }
+      }
       const capture = normalize(
         { adapterEvents, logLines, sinkWrites: result.storedEvents },
         path.dirname(logDir),
-        row.freshIds === true,
+        { freshIds: row.freshIds === true, perRequest: row.realLogStore === true },
       );
       return { capture, pool: use };
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.orDie),
@@ -518,6 +552,14 @@ const LINE_OFFLOAD_MODES: ReadonlyArray<WorkerMode> = [
   { name: "2 workers, every line offloaded", workers: 2, offloadMinChars: 0 },
 ];
 
+// The fixtures that stalled when a slow log append let an interrupt overtake the prompt.
+const ACP_REAL_LOG_STORE_FIXTURES = new Set([
+  "message_steering",
+  "queued_turn",
+  "simple",
+  "turn_interrupt",
+]);
+
 const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "codex",
@@ -537,6 +579,17 @@ const ROWS: ReadonlyArray<AdapterRow> = [
     offload: "required",
     stage: "acp",
     modes: LINE_OFFLOAD_MODES,
+    harness: replayHarness(AcpRegistryOrchestratorReplayHarness),
+  }),
+  adapterRow({
+    driver: "acpRegistry",
+    path: "replay, real log store",
+    // End to end with the store the server uses: ACP logs a request before sending it (P1-069).
+    offload: "required",
+    stage: "acp",
+    modes: LINE_OFFLOAD_MODES,
+    fixtures: ACP_REAL_LOG_STORE_FIXTURES,
+    realLogStore: true,
     harness: replayHarness(AcpRegistryOrchestratorReplayHarness),
   }),
   adapterRow({
@@ -620,8 +673,10 @@ describe("provider I/O at 0 and 2 workers", () => {
         },
       }) as unknown as OrchestrationV2StoredEvent;
     const sinkWrites = (writes: ReadonlyArray<OrchestrationV2StoredEvent>) =>
-      normalize({ adapterEvents: [], logLines: [], sinkWrites: writes }, "/no-tmp-root", false)
-        .sinkWrites;
+      normalize({ adapterEvents: [], logLines: [], sinkWrites: writes }, "/no-tmp-root", {
+        freshIds: false,
+        perRequest: false,
+      }).sinkWrites;
     const ordinary = sinkWrites([write("c", "run.updated", { runId: "r1", nodeId: "n1" })]);
     assert.notDeepEqual(
       sinkWrites([write("c", "run.updated", { runId: "r2", nodeId: "n1" })]),

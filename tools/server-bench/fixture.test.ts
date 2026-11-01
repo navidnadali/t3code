@@ -8,7 +8,7 @@ import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeSqlite from "node:sqlite";
 
-import { describe, expect, it, onTestFinished } from "vite-plus/test";
+import { afterAll, describe, expect, it, onTestFinished } from "vite-plus/test";
 
 import {
   contentFindings,
@@ -91,6 +91,22 @@ const synth = (destination: string, scale: string, seed = "1", report?: string) 
   ]);
   expect(result.stderr).toBe("");
   expect(result.status).toBe(0);
+};
+
+// One synthetic database at scale 0.25 for every test that seeds and sanitises: each test
+// mutates its own copy. Synthesising it once per test cost the most time on a loaded machine.
+const sharedDirectory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fixture-shared-"));
+afterAll(() => NodeFS.rmSync(sharedDirectory, { recursive: true, force: true }));
+let sharedDatabase: string | undefined;
+
+/** A fresh copy of the shared scale-0.25 synthetic database at `destination`. */
+const synthCopy = (destination: string) => {
+  if (sharedDatabase === undefined) {
+    const database = NodePath.join(sharedDirectory, "synthetic.sqlite");
+    synth(database, "0.25");
+    sharedDatabase = database;
+  }
+  NodeFS.copyFileSync(sharedDatabase, destination);
 };
 
 const count = (path: string, sql: string) => {
@@ -993,7 +1009,7 @@ describe("fixture CLI", () => {
   it("sanitise leaves a seeded fixture with nothing runnable and no credentials", () => {
     const directory = scratch("sanitise");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     const { busy, kept, idle, running, limited, task } = seedPendingWork(seeded);
     const before = run(["scan", seeded]);
     expect(before.status).toBe(1);
@@ -1064,7 +1080,7 @@ describe("sanitise content", () => {
   it("leaves none of the review's planted credentials, and scan fails on any planted afterwards", () => {
     const directory = scratch("credentials");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     const secrets = seedCredentials(seeded);
     const clean = NodePath.join(directory, "clean.sqlite");
     const result = run(["sanitise", seeded, clean]);
@@ -1076,35 +1092,36 @@ describe("sanitise content", () => {
     expect(survivors).toEqual([]);
     expect(run(["scan", clean]).status).toBe(0);
 
-    const plant = (name: string, sql: string, value: string) => {
-      const copy = NodePath.join(directory, `${name}.sqlite`);
-      NodeFS.copyFileSync(clean, copy);
-      const db = new NodeSqlite.DatabaseSync(copy);
-      db.prepare(sql).run(value);
-      db.close();
-      return run(["scan", copy]).status;
-    };
-    const inId = plant(
-      "token-in-id",
+    // Planted afterwards, each in its own row, all in one copy and one scan: a token in an id
+    // field, prose in a message, and a random value under a session name (P1-002 reads it as one).
+    const planted = NodePath.join(directory, "planted.sqlite");
+    NodeFS.copyFileSync(clean, planted);
+    const db = new NodeSqlite.DatabaseSync(planted);
+    db.prepare(
       `UPDATE orchestration_v2_projection_turn_items
        SET payload_json = json_set(payload_json, '$.nativeItemRef', json_object('driver', 'claudeAgent', 'nativeId', ?, 'strength', 'strong'))
        WHERE turn_item_id = (SELECT MIN(turn_item_id) FROM orchestration_v2_projection_turn_items)`,
-      TOKENS.github as string,
-    );
-    const prose = plant(
-      "prose",
+    ).run(TOKENS.github as string);
+    db.prepare(
       `UPDATE orchestration_v2_projection_messages SET payload_json = json_set(payload_json, '$.text', ?)
        WHERE message_id = (SELECT MIN(message_id) FROM orchestration_v2_projection_messages)`,
-      "the staging db password is hunter two, keep it quiet",
-    );
-    // A random value under a session/key/auth name: P1-002's extended check reads it as one.
-    const sessionKey = plant(
-      "session-key",
+    ).run("the staging db password is hunter two, keep it quiet");
+    db.prepare(
       `UPDATE orchestration_v2_projection_messages SET payload_json = json_set(payload_json, '$.sessionId', ?)
-       WHERE message_id = (SELECT MIN(message_id) FROM orchestration_v2_projection_messages)`,
-      `${"q8Zr3Vt9Lp2Xw7Ms".repeat(2)}`,
-    );
-    expect([inId, prose, sessionKey]).toEqual([1, 1, 1]);
+       WHERE message_id = (SELECT MAX(message_id) FROM orchestration_v2_projection_messages)`,
+    ).run(`${"q8Zr3Vt9Lp2Xw7Ms".repeat(2)}`);
+    db.close();
+    const scan = run(["scan", planted]);
+    const found = JSON.parse(scan.stdout) as {
+      secretHits: Record<string, number>;
+      notBlanked: Record<string, number>;
+    };
+    expect([
+      scan.status,
+      (found.secretHits["orchestration_v2_projection_turn_items:github-token"] ?? 0) > 0,
+      (found.notBlanked["orchestration_v2_projection_messages.payload_json"] ?? 0) > 0,
+      (found.secretHits["orchestration_v2_projection_messages:high-entropy"] ?? 0) > 0,
+    ]).toEqual([1, true, true, true]);
   });
 });
 
@@ -1212,7 +1229,7 @@ describe("content blanking", () => {
   it("--keep-content removes every planted credential with the pattern layer alone", () => {
     const directory = scratch("keep-content");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     const secrets = seedCredentials(seeded);
     const kept = NodePath.join(directory, "kept.sqlite");
     const sanitised = run(["sanitise", "--keep-content", seeded, kept]);
@@ -1328,7 +1345,7 @@ describe("v1 imports", () => {
   it("scan counts pending v1 shell and transcript imports, and sanitise leaves none", () => {
     const directory = scratch("legacy");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     const db = new NodeSqlite.DatabaseSync(seeded);
     const at = "2026-01-01T00:00:00.000Z";
     db.exec(`UPDATE orchestration_v2_legacy_imports SET transcript_imported_at = NULL
@@ -1364,7 +1381,7 @@ describe("server on a fixture", () => {
   it("runs none of a sanitised fixture's seeded work, where the unsanitised copy recovers it", async () => {
     const directory = scratch("boot-seeded");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     seedPendingWork(seeded);
     const clean = NodePath.join(directory, "clean.sqlite");
     expect(run(["sanitise", seeded, clean]).status).toBe(0);

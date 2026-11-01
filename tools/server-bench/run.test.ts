@@ -356,6 +356,31 @@ describe("workload fingerprint", () => {
     });
   });
 
+  it("ignores the launchers of disabled instances", async () => {
+    await withTempDir(async (root) => {
+      const harness = NodePath.join(root, "harness", "tools", "server-bench");
+      const script = NodePath.join(root, "bin", "codex");
+      write(script, "#!/bin/sh\n");
+      const work = NodePath.join(root, "work");
+      NodeFS.mkdirSync(work);
+      const hashes = new Set<string>();
+      // As providers.ts settings leaves a built-in: disabled, its config kept.
+      for (const [index, codex] of [
+        { driver: "codex", enabled: false, config: { binaryPath: script } },
+        { driver: "codex", config: { enabled: false, binaryPath: script } },
+        { driver: "codex", enabled: false },
+      ].entries()) {
+        const template = NodePath.join(root, `template-${index}`);
+        write(
+          NodePath.join(template, "userdata", "settings.json"),
+          JSON.stringify({ providerInstances: { codex } }),
+        );
+        hashes.add(await launchersHash(await fixtureInfo(template, work), harness));
+      }
+      expect(hashes.size).toBe(1);
+    });
+  });
+
   it("covers the recorded transcripts and the absolute ones the settings name", async () => {
     await withTempDir(async (root) => {
       const fixtures = NodePath.join(root, "replay-fixtures");

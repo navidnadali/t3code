@@ -1372,6 +1372,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
   const appendRequestRecord = (
     event: AcpSessionRequestLogEvent,
     started?: Deferred.Deferred<void>,
+    withdrawn?: () => boolean,
   ): Effect.Effect<Deferred.Deferred<void>> =>
     Effect.suspend(() => {
       const written = Deferred.makeUnsafe<void>();
@@ -1387,6 +1388,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         if (started !== undefined && Exit.isFailure(yield* Effect.exit(Deferred.await(started)))) {
           return Exit.void;
         }
+        if (withdrawn?.() === true) return Exit.void;
         return yield* Effect.exit(Effect.suspend(() => logRequest(event)));
       }).pipe(
         // Only an interrupt (the runtime closing) ends it otherwise: the record is dropped.
@@ -1420,9 +1422,24 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
                 Effect.flatMap((written) => Effect.interruptible(Deferred.await(written))),
               );
             const exit = yield* restore(effect).pipe(Effect.exit);
+            let succeededWithdrawn = false;
             const outcome = yield* restore(
               exit.pipe(
-                Effect.tap((result) => record({ method, payload, status: "succeeded", result })),
+                Effect.tap((result) =>
+                  appendRequestRecord(
+                    { method, payload, status: "succeeded", result },
+                    started,
+                    () => succeededWithdrawn,
+                  ).pipe(
+                    Effect.flatMap((written) => Effect.interruptible(Deferred.await(written))),
+                    // Interrupted before it is written: the failed record that follows replaces it.
+                    Effect.onInterrupt(() =>
+                      Effect.sync(() => {
+                        succeededWithdrawn = true;
+                      }),
+                    ),
+                  ),
+                ),
               ),
             ).pipe(
               // An interrupted request queues its failed record without waiting on the log.

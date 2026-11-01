@@ -110,6 +110,17 @@ describe("traceRequired", () => {
     expect(traceRequired({ T3CODE_TRACE_MIN_LEVEL: "Warn" })).toBe(false);
     expect(traceRequired({ T3CODE_TRACE_MIN_LEVEL: "none" })).toBe(false);
   });
+
+  it("expects no timed trace when trace timing is off", () => {
+    // The server's spans are untimed then (start and end 0), so every window reads trace_stale.
+    expect(traceRequired({ T3CODE_TRACE_TIMING_ENABLED: "false" })).toBe(false);
+    expect(traceRequired({ T3CODE_TRACE_TIMING_ENABLED: "0" })).toBe(false);
+    expect(
+      traceRequired({ T3CODE_TRACE_TIMING_ENABLED: "off", T3CODE_TRACE_MIN_LEVEL: "Debug" }),
+    ).toBe(false);
+    expect(traceRequired({ T3CODE_TRACE_TIMING_ENABLED: "true" })).toBe(true);
+    expect(traceRequired({ T3CODE_TRACE_TIMING_ENABLED: "yes" })).toBe(true);
+  });
 });
 
 describe("fixtureInfo", () => {

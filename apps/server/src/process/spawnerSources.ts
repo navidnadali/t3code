@@ -19,9 +19,9 @@ const start = (message) => {
     post({ t: "throw", id, error: errorFields(error) });
     return;
   }
-  if (child.pid !== undefined) started(id, child.pid);
   const entry = { child, detached: message.options.detached === true, inflight: [0, 0], paused: [false, false] };
   children.set(id, entry);
+  if (child.pid !== undefined) started(id, child.pid);
   child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));
   child.on("error", (error) => post({ t: "error", id, error: errorFields(error) }));
   child.on("exit", (code, signal) => post({ t: "exit", id, code, signal }));
@@ -102,8 +102,10 @@ parentPort.on("message", onMessage);
 `;
 
 /**
- * The spawner process: the server's IPC channel closes when the server exits, however it
- * exits, and the spawner then kills every child it started and exits too.
+ * The spawner process: the server's IPC channel closes when the server exits, however it exits,
+ * and the spawner then kills every child it started and exits too; it does the same when it
+ * fails or is asked to stop. Only a SIGKILL of the spawner between a fork and the PID report
+ * written right after it can leave a child the server does not know (Node exposes no PDEATHSIG).
  */
 export const spawnerProcessSource = `
 "use strict";
@@ -122,15 +124,31 @@ const started = (id, pid) => {
 ${spawnProtocolSource}
 process.title = "t3-process-spawner";
 process.on("message", onMessage);
-process.on("disconnect", () => {
+const killChildren = () => {
   for (const { child, detached } of children.values()) {
     try {
       if (detached && child.pid > 1) process.kill(-child.pid, "SIGKILL");
       else child.kill("SIGKILL");
     } catch {}
   }
+};
+process.on("disconnect", () => {
+  killChildren();
   process.exit(0);
 });
+process.on("uncaughtException", (error) => {
+  killChildren();
+  try {
+    require("node:fs").writeSync(2, "t3-process-spawner: " + (error && error.stack ? error.stack : String(error)) + "\\n");
+  } catch {}
+  process.exit(70);
+});
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.once(signal, () => {
+    killChildren();
+    process.kill(process.pid, signal);
+  });
+}
 `;
 
 /** Entry of `t3 __process-spawner <windowBytes>`: single executables cannot evaluate `-e`. */

@@ -394,24 +394,56 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const { snapshotSequence, projection } = yield* projections.getThreadSnapshot(FORK);
-      let deep: unknown = TEXT.repeat(40_000);
-      for (let depth = 0; depth < 7_000; depth++) deep = depth % 2 === 0 ? [deep] : { deep };
+      // Deeper than a recursive writer, or one JSON.stringify call, can go: with and without bulk.
+      const nest = (leaf: unknown) => {
+        let deep = leaf;
+        for (let depth = 0; depth < 3_000; depth++) deep = depth % 2 === 0 ? [deep] : { deep };
+        return deep;
+      };
       const snapshot = {
         snapshotSequence,
         projection: {
           ...projectThreadProjectionForWire(projection),
-          // Each answer set is large in its own way; the last one nests deeper than a recursive writer can.
+          // Each answer set is large or deep in its own way.
           runtimeRequests: runtimeRequests([
             { reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) } },
             { [TEXT.repeat(40_000)]: 0 },
             { many: Array.from({ length: 200_000 }, (_, index) => ({ index, text: "x" })) },
-            { deep },
+            { deep: nest(TEXT.repeat(40_000)) },
+            { deep: nest(TEXT) },
           ]),
         },
       };
       const streamed = yield* streamedBody(snapshot);
       assert.isTrue(streamed.bytes.equals(referenceBody(snapshot)));
       assert.isAtMost(streamed.largestChunk, 1024 * 1024);
+    }),
+  );
+
+  it.effect("writes an answer too deep for JSON.stringify here, without failing mid-body", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const { snapshotSequence, projection } = yield* projections.getThreadSnapshot(FORK);
+      const snapshot = (deep: unknown) => ({
+        snapshotSequence,
+        projection: {
+          ...projectThreadProjectionForWire(projection),
+          runtimeRequests: runtimeRequests([{ deep }]),
+        },
+      });
+      // A two-byte string puts JSON.stringify on its recursive path, which this depth overflows.
+      let deep: unknown = "𝄞".repeat(10);
+      let deepJson = JSON.stringify(deep);
+      for (let depth = 0; depth < 20_000; depth++) {
+        deep = depth % 2 === 0 ? [deep] : { deep };
+        deepJson = depth % 2 === 0 ? `[${deepJson}]` : `{"deep":${deepJson}}`;
+      }
+      assert.throws(() => JSON.stringify(deep), RangeError);
+      const expected = referenceBody(snapshot("placeholder"))
+        .toString("utf8")
+        .replace('"deep":"placeholder"', () => `"deep":${deepJson}`);
+      const streamed = yield* streamedBody(snapshot(deep));
+      assert.strictEqual(streamed.bytes.toString("utf8"), expected);
     }),
   );
 });

@@ -7,6 +7,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeSqlite from "node:sqlite";
+import * as NodeURL from "node:url";
 
 import { afterAll, describe, expect, it, onTestFinished } from "vite-plus/test";
 
@@ -71,8 +72,12 @@ const SAMPLES: Record<string, string> = {
   "basic-auth": `Basic ${Buffer.from("bench:hunter2hunter2").toString("base64")}`,
 };
 
-const run = (args: ReadonlyArray<string>, env: NodeJS.ProcessEnv = {}) =>
-  NodeChildProcess.spawnSync(process.execPath, [FIXTURE, ...args], {
+const run = (
+  args: ReadonlyArray<string>,
+  env: NodeJS.ProcessEnv = {},
+  nodeArgs: ReadonlyArray<string> = [],
+) =>
+  NodeChildProcess.spawnSync(process.execPath, [...nodeArgs, FIXTURE, ...args], {
     cwd: ROOT,
     env: { ...process.env, ...env },
     encoding: "utf8",
@@ -92,6 +97,49 @@ const synth = (destination: string, scale: string, seed = "1", report?: string) 
   ]);
   expect(result.stderr).toBe("");
   expect(result.status).toBe(0);
+};
+
+/** The two commands that write a database, each missing only its destination. */
+const writers = (source: string) => [
+  ["sanitise", source],
+  ["synth", "--like", EXAMPLE, "--scale", "0.02", "--seed", "1"],
+];
+
+// Preloaded into the CLI: hooks the first exclusive create of the destination. `race` makes
+// another run's database and WAL appear there just before it; `fail` lets it succeed, then makes
+// the file non-empty, so the VACUUM INTO that follows fails.
+const OPEN_HOOK = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const { destination, mode } = JSON.parse(process.env.FIXTURE_OPEN_HOOK);
+const openSync = fs.openSync;
+let fired = false;
+fs.openSync = (path, flags, ...rest) => {
+  if (fired || path !== destination || flags !== "wx") return openSync(path, flags, ...rest);
+  fired = true;
+  if (mode === "race") {
+    fs.writeFileSync(destination, "another run's database");
+    fs.writeFileSync(destination + "-wal", "another run's WAL");
+    return openSync(path, flags, ...rest);
+  }
+  const fd = openSync(path, flags, ...rest);
+  fs.writeSync(fd, "not empty");
+  return fd;
+};
+syncBuiltinESMExports();
+`;
+
+const runWithOpenHook = (
+  args: ReadonlyArray<string>,
+  destination: string,
+  mode: "race" | "fail",
+) => {
+  const hook = NodePath.join(scratch("open-hook"), "hook.mjs");
+  NodeFS.writeFileSync(hook, OPEN_HOOK);
+  return run(args, { FIXTURE_OPEN_HOOK: JSON.stringify({ destination, mode }) }, [
+    "--import",
+    NodeURL.pathToFileURL(hook).href,
+  ]);
 };
 
 // One synthetic database at scale 0.25 for every test that seeds and sanitises: each test
@@ -1009,6 +1057,48 @@ describe("fixture CLI", () => {
     expect(refused.status).toBe(2);
     expect(NodeFS.readFileSync(live).equals(before)).toBe(true);
     expect(NodeFS.existsSync(NodePath.join(work, "out.sqlite"))).toBe(false);
+  });
+
+  // The guard checks the destination long before the exclusive create: another run can take it.
+  it("sanitise and synth never remove a destination another run created after their guard", () => {
+    const source = NodePath.join(scratch("race-source"), "empty.sqlite");
+    new NodeSqlite.DatabaseSync(source).close();
+    const outcomes = writers(source).map((args) => {
+      const directory = NodeFS.realpathSync(scratch("race"));
+      const destination = NodePath.join(directory, "out.sqlite");
+      const result = runWithOpenHook([...args, destination], destination, "race");
+      return {
+        status: result.status,
+        eexist: result.stderr.includes("EEXIST"),
+        files: NodeFS.readdirSync(directory)
+          .toSorted()
+          .map((name) => [name, NodeFS.readFileSync(NodePath.join(directory, name), "utf8")]),
+      };
+    });
+    const kept = {
+      status: 1,
+      eexist: true,
+      files: [
+        ["out.sqlite", "another run's database"],
+        ["out.sqlite-wal", "another run's WAL"],
+      ],
+    };
+    expect(outcomes).toEqual([kept, kept]);
+  });
+
+  it("sanitise and synth remove a destination they created when compacting into it fails", () => {
+    const source = NodePath.join(scratch("fail-source"), "empty.sqlite");
+    new NodeSqlite.DatabaseSync(source).close();
+    const outcomes = writers(source).map((args) => {
+      const directory = NodeFS.realpathSync(scratch("fail"));
+      const destination = NodePath.join(directory, "out.sqlite");
+      const result = runWithOpenHook([...args, destination], destination, "fail");
+      return { status: result.status, files: NodeFS.readdirSync(directory) };
+    });
+    expect(outcomes).toEqual([
+      { status: 1, files: [] },
+      { status: 1, files: [] },
+    ]);
   });
 
   // The bench compares fixtures by hash: the same shape and seed must give the same bytes.

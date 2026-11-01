@@ -18,10 +18,17 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
+import type * as Tracer from "effect/Tracer";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
@@ -47,7 +54,10 @@ const withFileStore = <A, E>(
   body: Effect.Effect<
     A,
     E,
-    EventSink.EventSinkV2 | ProjectionStore.ProjectionStoreV2 | EventStore.EventStoreV2
+    | EventSink.EventSinkV2
+    | ProjectionStore.ProjectionStoreV2
+    | EventStore.EventStoreV2
+    | SqlClient.SqlClient
   >,
 ) =>
   Effect.gen(function* () {
@@ -440,4 +450,357 @@ it.effect("keeps the results of the reads that hold reader transactions", () =>
       );
     }),
   ),
+);
+
+const spanLineage = (span: Tracer.Span): ReadonlyArray<Tracer.Span> => {
+  const lineage = [span];
+  let parent = Option.getOrUndefined(span.parent);
+  while (parent?._tag === "Span") {
+    lineage.push(parent);
+    parent = Option.getOrUndefined(parent.parent);
+  }
+  return lineage;
+};
+
+// Runs a read with statement spans on and returns its statements grouped by transaction.
+const traced = <A, E, R>(read: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const statements: Array<Tracer.Span> = [];
+    const exit = yield* read.pipe(
+      Effect.provideService(Statement.CurrentTransformer, (statement, _sql, _fiber, span) =>
+        Effect.sync(() => {
+          statements.push(span);
+          return statement;
+        }),
+      ),
+      Effect.provideService(Statement.SpanPropagationEnabled, true),
+      Effect.exit,
+    );
+    const transactions = [
+      ...new Set(
+        statements.map((span) =>
+          spanLineage(span).find((candidate) => candidate.name === "sql.transaction"),
+        ),
+      ),
+    ];
+    return { exit, statements, transactions };
+  });
+
+type Store = ProjectionStore.ProjectionStoreV2["Service"];
+
+interface ReadCase {
+  readonly name: string;
+  readonly read: (
+    store: Store,
+    fixture: Fixture,
+  ) => Effect.Effect<unknown, ProjectionStore.ProjectionStoreV2Error>;
+  /** Statements in the one reader transaction, whatever the size of the thread. */
+  readonly statements: number;
+  /** A row the read decodes, made undecodable. */
+  readonly corrupt: (sql: SqlClient.SqlClient, fixture: Fixture) => Statement.Statement<unknown>;
+  readonly error: string;
+}
+
+const corruptRows = {
+  forkToolItem: (sql: SqlClient.SqlClient, fixture: Fixture) =>
+    sql`UPDATE orchestration_v2_projection_turn_items SET payload_json = '{}'
+      WHERE thread_id = ${fixture.fork} AND type = 'dynamic_tool'`,
+  subagent: (sql: SqlClient.SqlClient, fixture: Fixture) =>
+    sql`UPDATE orchestration_v2_projection_subagents SET payload_json = '{}'
+      WHERE thread_id = ${fixture.fork}`,
+  sourceThread: (sql: SqlClient.SqlClient, fixture: Fixture) =>
+    sql`UPDATE orchestration_v2_projection_threads SET payload_json = '{}'
+      WHERE thread_id = ${fixture.source}`,
+  forkThread: (sql: SqlClient.SqlClient, fixture: Fixture) =>
+    sql`UPDATE orchestration_v2_projection_threads SET payload_json = '{}'
+      WHERE thread_id = ${fixture.fork}`,
+};
+
+const readCases: ReadonlyArray<ReadCase> = [
+  {
+    name: "thread projection",
+    read: (store, fixture) => store.getThreadProjection(fixture.fork),
+    statements: 32,
+    corrupt: corruptRows.forkToolItem,
+    error: "ProjectionStoreReadError",
+  },
+  {
+    name: "thread snapshot",
+    read: (store, fixture) => store.getThreadSnapshot(fixture.fork),
+    statements: 33,
+    corrupt: corruptRows.forkToolItem,
+    error: "ProjectionStoreReadError",
+  },
+  {
+    name: "thread records",
+    read: (store, fixture) =>
+      store.getThreadRecords(fixture.fork, ["messages", "subagents", "contextTransfers"]),
+    statements: 5,
+    corrupt: corruptRows.subagent,
+    error: "ProjectionStoreReadError",
+  },
+  {
+    name: "turn start context",
+    read: (store, fixture) => store.getTurnStartContext(fixture.fork, fixture.forkRunId),
+    statements: 14,
+    corrupt: corruptRows.subagent,
+    error: "ProjectionStoreReadError",
+  },
+  {
+    name: "thread shell",
+    read: (store, fixture) => store.getThreadShell(fixture.fork),
+    statements: 7,
+    corrupt: corruptRows.sourceThread,
+    error: "ProjectionStoreReadError",
+  },
+  {
+    name: "settlement candidates",
+    read: (store, fixture) => store.getSettlementCandidates(fixture.fork),
+    statements: 3,
+    corrupt: corruptRows.forkThread,
+    error: "ProjectionStoreSetupError",
+  },
+];
+
+it.effect.each(readCases)(
+  "runs the $name in one reader transaction of a fixed number of statements",
+  (readCase) =>
+    withFileStore(
+      "reader-scope-bound-",
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const small = yield* writeFixture("small", 0);
+        const large = yield* writeFixture("large", 400);
+        for (const fixture of [small, large]) {
+          const { exit, statements, transactions } = yield* traced(readCase.read(store, fixture));
+          assert.isTrue(Exit.isSuccess(exit));
+          assert.strictEqual(statements.length, readCase.statements);
+          assert.lengthOf(transactions, 1);
+          assert.strictEqual(transactions[0]?.attributes.get("db.connection"), "reader");
+        }
+      }),
+    ),
+);
+
+it.effect.each(readCases)(
+  "ends the $name reader transaction before decoding its rows",
+  (readCase) =>
+    withFileStore(
+      "reader-scope-decode-",
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const fixture = yield* writeFixture("decode", 2);
+        yield* readCase.corrupt(sql, fixture);
+        const { exit, statements, transactions } = yield* traced(readCase.read(store, fixture));
+        // The read still fails on the bad row, but only after its transaction committed.
+        assert.lengthOf(transactions, 1);
+        const status = transactions[0]?.status;
+        assert.strictEqual(status?._tag, "Ended");
+        assert.isTrue(status?._tag === "Ended" && Exit.isSuccess(status.exit));
+        assert.strictEqual(Option.getOrUndefined(Exit.findErrorOption(exit))?._tag, readCase.error);
+        assert.strictEqual(statements.length, readCase.statements);
+      }),
+    ),
+);
+
+const toolItem = (input: {
+  readonly id: string;
+  readonly threadId: ThreadId;
+  readonly runId: RunId | null;
+  readonly ordinal: number;
+  readonly status: "running" | "completed";
+}): OrchestrationV2DomainEvent =>
+  event(`event:${input.id}`, {
+    type: "turn-item.updated",
+    threadId: input.threadId,
+    payload: {
+      id: TurnItemId.make(input.id),
+      threadId: input.threadId,
+      runId: input.runId,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: input.ordinal,
+      status: input.status,
+      title: null,
+      startedAt: at(4),
+      completedAt: input.status === "completed" ? at(4) : null,
+      updatedAt: at(4),
+      type: "dynamic_tool",
+      toolName: "late",
+      input: {},
+      output: input.status === "completed" ? {} : null,
+    },
+  } as never);
+
+interface ConsistencyCase {
+  readonly name: string;
+  readonly read: (
+    store: Store,
+    fixture: Fixture,
+  ) => Effect.Effect<unknown, ProjectionStore.ProjectionStoreV2Error>;
+  /** The statement to pause before; the transaction has already read rows by then. */
+  readonly pauseBefore: (
+    query: string,
+    params: ReadonlyArray<unknown>,
+    fixture: Fixture,
+  ) => boolean;
+  /** Changes rows that only the statements after the pause read. */
+  readonly write: (fixture: Fixture) => ReadonlyArray<OrchestrationV2DomainEvent>;
+}
+
+const consistencyCases: ReadonlyArray<ConsistencyCase> = [
+  {
+    name: "thread projection",
+    read: (store, fixture) => store.getThreadProjection(fixture.fork),
+    pauseBefore: (query, params, fixture) =>
+      query.includes("FROM orchestration_v2_projection_threads") && params.includes(fixture.source),
+    write: (fixture) => [
+      toolItem({
+        id: "item:snapshot:source:late",
+        threadId: fixture.source,
+        runId: RunId.make("run:snapshot:source"),
+        ordinal: 1_000,
+        status: "completed",
+      }),
+    ],
+  },
+  {
+    name: "thread snapshot",
+    read: (store, fixture) => store.getThreadSnapshot(fixture.fork),
+    pauseBefore: (query) => query.includes("MAX(sequence)"),
+    write: (fixture) => [
+      toolItem({
+        id: "item:snapshot:fork:late",
+        threadId: fixture.fork,
+        runId: fixture.forkRunId,
+        ordinal: 1_000,
+        status: "completed",
+      }),
+    ],
+  },
+  {
+    name: "thread records",
+    read: (store, fixture) =>
+      store.getThreadRecords(fixture.fork, ["messages", "subagents", "contextTransfers"]),
+    pauseBefore: (query) => query.includes("FROM orchestration_v2_projection_context_transfers"),
+    write: (fixture) => [
+      event("event:snapshot:fork:late-transfer", {
+        type: "context-transfer.created",
+        threadId: fixture.fork,
+        providerInstanceId,
+        payload: {
+          id: ContextTransferId.make("transfer:snapshot:late"),
+          type: "subagent_spawn",
+          sourceThreadId: fixture.fork,
+          targetThreadId: fixture.child,
+          sourcePoint: { threadId: fixture.fork },
+          basePoint: null,
+          sourceProviderInstanceId: providerInstanceId,
+          targetProviderInstanceId: providerInstanceId,
+          targetRunId: null,
+          status: "consumed",
+          resolution: null,
+          createdBy: "agent",
+          error: null,
+          createdAt: at(4),
+          updatedAt: at(4),
+          consumedAt: at(4),
+        },
+      } as never),
+    ],
+  },
+  {
+    name: "turn start context",
+    read: (store, fixture) => store.getTurnStartContext(fixture.fork, fixture.forkRunId),
+    pauseBefore: (query) => query.includes("GLOB '/goal*'"),
+    write: (fixture) => [
+      event("event:snapshot:fork:compact", {
+        type: "message.updated",
+        threadId: fixture.fork,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          id: MessageId.make("message:snapshot:fork:compact"),
+          threadId: fixture.fork,
+          runId: null,
+          nodeId: null,
+          role: "user",
+          text: "/compact",
+          attachments: [],
+          streaming: false,
+          createdAt: at(4),
+          updatedAt: at(4),
+        },
+      } as never),
+    ],
+  },
+  {
+    name: "thread shell",
+    read: (store, fixture) => store.getThreadShell(fixture.fork),
+    pauseBefore: (query) => query.includes("orchestration_v2_projection_turn_item_counts"),
+    write: (fixture) => [
+      toolItem({
+        id: "item:snapshot:fork:counted",
+        threadId: fixture.fork,
+        runId: fixture.forkRunId,
+        ordinal: 1_000,
+        status: "completed",
+      }),
+    ],
+  },
+  {
+    name: "settlement candidates",
+    read: (store, fixture) => store.getSettlementCandidates(fixture.fork),
+    pauseBefore: (query) => query.includes("owning_provider_instance_id"),
+    write: (fixture) => [
+      toolItem({
+        id: "item:snapshot:fork:background",
+        threadId: fixture.fork,
+        runId: null,
+        ordinal: 1_000,
+        status: "running",
+      }),
+    ],
+  },
+];
+
+it.effect.each(consistencyCases)(
+  "keeps a write that commits between the $name statements out of that read",
+  (consistencyCase) =>
+    withFileStore(
+      "reader-scope-snapshot-",
+      Effect.gen(function* () {
+        const sink = yield* EventSink.EventSinkV2;
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const fixture = yield* writeFixture("snapshot", 2);
+        const before = yield* consistencyCase.read(store, fixture);
+        const paused = yield* Deferred.make<void>();
+        const resume = yield* Deferred.make<void>();
+        const pause: Statement.Transformer = (statement) =>
+          Effect.gen(function* () {
+            const [query, params] = statement.compile();
+            if (
+              consistencyCase.pauseBefore(query, params, fixture) &&
+              (yield* Deferred.succeed(paused, undefined))
+            ) {
+              yield* Deferred.await(resume);
+            }
+            return statement;
+          });
+        const reading = yield* consistencyCase
+          .read(store, fixture)
+          .pipe(Effect.provideService(Statement.CurrentTransformer, pause), Effect.forkChild);
+        yield* Deferred.await(paused);
+        yield* sink.write({ events: consistencyCase.write(fixture) });
+        yield* Deferred.succeed(resume, undefined);
+        const during = yield* Fiber.join(reading);
+        const after = yield* consistencyCase.read(store, fixture);
+        assert.notDeepEqual(after, before);
+        assert.deepStrictEqual(during, before);
+      }),
+    ),
 );

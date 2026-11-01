@@ -260,3 +260,15 @@ it.effect("lets the worker use any built-in, however a bundled module names it",
     assert.deepEqual(yield* runEmbedded(source), [true, "function"]);
   }),
 );
+
+// The Claude Agent SDK loads only when a session needs it; inlined, its import names the bundle itself.
+it.effect("builds and runs a worker that imports a bundled module lazily", () =>
+  Effect.gen(function* () {
+    const source = yield* embeddedSource(
+      'import * as NodeWorkerThreads from "node:worker_threads";\n' +
+        'void import("./lazy.ts").then((lazy) => NodeWorkerThreads.parentPort?.postMessage(lazy.value));\n',
+      { "lazy.ts": 'export const value = "loaded lazily";\n' },
+    );
+    assert.equal(yield* runEmbedded(source), "loaded lazily");
+  }),
+);

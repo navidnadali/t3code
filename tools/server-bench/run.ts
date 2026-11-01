@@ -80,10 +80,11 @@ Load
   they import), the fake providers (fake-*/ and what they import) and the transcripts they replay
   (the server's recorded replay fixtures, and every absolute BENCH_*TRANSCRIPT path in the server
   env or the fixture's settings.json), and launchers_sha256 what the fixture's settings.json runs
-  (binaryPath, commandPath, absolute commandArgs, e.g. from providers.ts --claude-launcher): a
-  launcher in this harness's fake-*/ adds its path, one in another checkout's fake-*/ that
-  checkout's fakes and recorded replay fixtures, a native executable (ELF, Mach-O, PE) its file;
-  anything else (a script, JavaScript, data) is refused, as what it runs cannot be hashed.
+  (enabled instances' binaryPath, commandPath, absolute commandArgs, e.g. from providers.ts
+  --claude-launcher): a launcher in this harness's fake-*/ adds its path, one in another
+  checkout's fake-*/ that checkout's fakes and recorded replay fixtures, a native executable (ELF,
+  Mach-O, PE) its file; anything else (a script, JavaScript, data) is refused, as what it runs
+  cannot be hashed.
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -385,14 +386,17 @@ const realPath = (path: string) => {
 };
 
 /**
- * The absolute binaryPath, commandPath and commandArgs of the fixture settings' instances: one in
- * this harness's fake-* dirs adds its path (fakes_sha256 has it), one in another checkout's adds
- * that checkout's fakes and recordings, a native executable its file; anything else is refused.
+ * The absolute binaryPath, commandPath and commandArgs of the fixture settings' enabled instances:
+ * one in this harness's fake-* dirs adds its path (fakes_sha256 has it), one in another
+ * checkout's adds that checkout's fakes and recordings, a native executable its file; anything
+ * else is refused.
  */
 export async function launchersHash(fixture: FixtureInfo, benchDir: string): Promise<string> {
   const launchers = new Set<string>();
   for (const instance of settingsInstances(fixture)) {
     const config = recordOf(instance.config);
+    // A disabled instance runs nothing (providers.ts settings keeps built-ins' config, disabled).
+    if (instance.enabled === false || config.enabled === false) continue;
     const args = Array.isArray(config.commandArgs) ? config.commandArgs : [];
     for (const value of [config.binaryPath, config.commandPath, ...args]) {
       if (typeof value === "string" && NodePath.isAbsolute(value)) launchers.add(value);

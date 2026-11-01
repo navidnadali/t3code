@@ -11,7 +11,9 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
 import { vi } from "vite-plus/test";
 
+import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
 
@@ -155,19 +157,23 @@ describe("WorkerChildProcessSpawner", () => {
       const { calls, spawner } = yield* recordingSpawner;
       const workerSpawner = yield* WorkerChildProcessSpawner.make(spawner);
 
-      yield* collect(workerSpawner, node("process.stdout.write('worker')"));
-      expect(calls).toHaveLength(0);
+      const piped = node("process.stdout.write('worker')");
+      yield* collect(workerSpawner, piped);
+      const onMain = workerPlatform ? [] : [piped];
+      expect(calls).toEqual(onMain);
 
       const ignoredStdin = node("process.stdout.write('fallback')", { stdin: "ignore" });
       expect((yield* collect(workerSpawner, ignoredStdin)).stdout).toBe("fallback");
-      expect(calls).toEqual([ignoredStdin]);
+      onMain.push(ignoredStdin);
+      expect(calls).toEqual(onMain);
 
       const windowsSpawner = yield* WorkerChildProcessSpawner.make(spawner).pipe(
         Effect.provideService(HostProcess.Platform, "win32"),
       );
       const onWindows = node("process.stdout.write('windows')");
       expect((yield* collect(windowsSpawner, onWindows)).stdout).toBe("windows");
-      expect(calls).toEqual([ignoredStdin, onWindows]);
+      onMain.push(onWindows);
+      expect(calls).toEqual(onMain);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
@@ -217,6 +223,43 @@ describe("WorkerChildProcessSpawner", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.live.skipIf(!workerPlatform)(
+    "settles stdin writes and kills that the worker answers after the child closed",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        // The worker reports exit and close before it answers, as when the child exits meanwhile.
+        const workerSource = WorkerChildProcessSpawner.spawnWorkerSource.replace(
+          "const post = (message, transfer) => parentPort.postMessage(message, transfer);",
+          `const post = (message, transfer) => {
+            if (message.t === "stdin-done" || message.t === "kill-result") {
+              parentPort.postMessage({ t: "exit", id: message.id, code: 0, signal: null });
+              parentPort.postMessage({ t: "close", id: message.id });
+            }
+            parentPort.postMessage(message, transfer);
+          };`,
+        );
+        expect(workerSource).not.toBe(WorkerChildProcessSpawner.spawnWorkerSource);
+        const script = "process.stdin.resume(); setInterval(() => {}, 1000)";
+
+        const writer = yield* WorkerChildProcessSpawner.make(nodeSpawner, { workerSource });
+        yield* Effect.gen(function* () {
+          const handle = yield* writer.spawn(node(script));
+          // Ending stdin after the close fails as Node's does; the write itself settles.
+          yield* Effect.exit(Stream.run(Stream.make(new Uint8Array([1])), handle.stdin));
+          expect(yield* handle.exitCode).toBe(0);
+        }).pipe(Effect.scoped);
+
+        const killer = yield* WorkerChildProcessSpawner.make(nodeSpawner, { workerSource });
+        yield* Effect.gen(function* () {
+          // Without its own process group, the kill goes through the worker.
+          const handle = yield* killer.spawn(node(script, { detached: false }));
+          yield* handle.kill({ killSignal: "SIGKILL" });
+          expect(yield* handle.exitCode).toBe(0);
+        }).pipe(Effect.scoped);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live(
     `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} moves VCS commands off the main spawner, results and errors unchanged`,
     () =>
@@ -225,8 +268,11 @@ describe("WorkerChildProcessSpawner", () => {
           Effect.gen(function* () {
             const { calls, spawner } = yield* recordingSpawner;
             // As in server.ts, a shared ProcessRunner is provided outside VcsProcess too.
-            const layer = VcsProcess.layer.pipe(
+            const layer = Layer.mergeAll(VcsProcess.layer, GitVcsDriver.layer).pipe(
               Layer.provide(ProcessRunner.layer),
+              Layer.provide(
+                ServerConfig.layerTest(process.cwd(), { prefix: "t3-worker-spawner-test-" }),
+              ),
               Layer.provide(Layer.succeed(ChildProcessSpawner, spawner)),
               Layer.provide(
                 ConfigProvider.layer(
@@ -254,6 +300,19 @@ describe("WorkerChildProcessSpawner", () => {
                   cwd: process.cwd(),
                 }),
               );
+              const git = yield* GitVcsDriver.GitVcsDriver;
+              const gitVersion = yield* git.execute({
+                operation: "test.worker-spawner",
+                cwd: process.cwd(),
+                args: ["--version"],
+              });
+              const missingCwd = yield* Effect.flip(
+                git.execute({
+                  operation: "test.worker-spawner",
+                  cwd: "/nonexistent/t3-missing-cwd-p1060",
+                  args: ["--version"],
+                }),
+              );
               return {
                 version: {
                   exitCode: version.exitCode,
@@ -261,16 +320,30 @@ describe("WorkerChildProcessSpawner", () => {
                   stderr: version.stderr,
                 },
                 missing: { tag: missing._tag, message: missing.message },
+                gitVersion: {
+                  exitCode: gitVersion.exitCode,
+                  stdout: gitVersion.stdout,
+                  stderr: gitVersion.stderr,
+                },
+                missingCwd: {
+                  tag: missingCwd._tag,
+                  detail: missingCwd.detail,
+                  cause: summarizeError(missingCwd.cause as PlatformError.PlatformError),
+                },
                 mainSpawns: calls.length,
               };
             }).pipe(Effect.provide(layer));
           });
 
         const unset = yield* outcome(undefined);
-        expect(unset.mainSpawns).toBe(2);
+        expect(unset.mainSpawns).toBe(4);
         expect(unset.missing.tag).toBe("VcsProcessSpawnError");
+        expect(unset.missingCwd).toMatchObject({
+          tag: "GitCommandError",
+          cause: { reason: "NotFound" },
+        });
         expect(yield* outcome("false")).toEqual(unset);
-        expect(yield* outcome("true")).toEqual({ ...unset, mainSpawns: workerPlatform ? 0 : 2 });
+        expect(yield* outcome("true")).toEqual({ ...unset, mainSpawns: workerPlatform ? 0 : 4 });
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

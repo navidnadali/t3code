@@ -225,6 +225,11 @@ interface Entry {
 }
 
 const WORKER_STOPPED_MESSAGE = "The child process spawner worker stopped";
+const DESTROYED_STDIN: SerializedError = {
+  name: "Error",
+  message: "Cannot call write after a stream was destroyed",
+  code: "ERR_STREAM_DESTROYED",
+};
 
 const makeWorkerHost = (options: { readonly source: string; readonly windowBytes: number }) => {
   let worker: NodeWorkerThreads.Worker | undefined;
@@ -257,10 +262,17 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
     for (const listener of entry.child.exitListeners) listener(code, signal);
   };
 
+  // A closed child stays known until the worker has answered its stdin writes and kills.
+  const forgetIfSettled = (entry: Entry) => {
+    if (entry.child.closed && entry.stdinCallbacks.size === 0 && entry.killCallbacks.size === 0) {
+      entries.delete(entry.child.id);
+    }
+  };
+
   const remove = (entry: Entry) => {
     entry.child.closed = true;
     updateHold(entry);
-    entries.delete(entry.child.id);
+    forgetIfSettled(entry);
   };
 
   const stop = (cause: unknown) => {
@@ -289,9 +301,12 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
         if (!child.ended[index]) stream.destroy(error);
       }
       child.stdin.destroy(error);
-      for (const callback of entry.stdinCallbacks.values()) callback(error);
-      for (const callback of entry.killCallbacks.values())
-        callback({ _tag: "Sent", killed: false });
+      const stdinCallbacks = [...entry.stdinCallbacks.values()];
+      const killCallbacks = [...entry.killCallbacks.values()];
+      entry.stdinCallbacks.clear();
+      entry.killCallbacks.clear();
+      for (const callback of stdinCallbacks) callback(error);
+      for (const callback of killCallbacks) callback({ _tag: "Sent", killed: false });
       remove(entry);
     }
     void worker?.terminate();
@@ -348,12 +363,14 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
       case "stdin-done": {
         const callback = entry.stdinCallbacks.get(message.seq);
         entry.stdinCallbacks.delete(message.seq);
+        forgetIfSettled(entry);
         callback?.(message.error === undefined ? null : reviveError(message.error));
         return;
       }
       case "kill-result": {
         const callback = entry.killCallbacks.get(message.seq);
         entry.killCallbacks.delete(message.seq);
+        forgetIfSettled(entry);
         callback?.(
           message.error === undefined
             ? { _tag: "Sent", killed: message.killed }
@@ -399,6 +416,7 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
       callback: (error?: Error | null) => void,
     ) => {
       if (failed) return callback(new Error(WORKER_STOPPED_MESSAGE, { cause: failure }));
+      if (child.closed) return callback(reviveError(DESTROYED_STDIN));
       const seq = nextSeq++;
       stdinCallbacks.set(seq, callback);
       if (message.chunk instanceof Uint8Array) {

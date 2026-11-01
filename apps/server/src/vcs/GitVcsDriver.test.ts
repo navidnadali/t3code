@@ -16,7 +16,12 @@ import { ChildProcessSpawner } from "effect/process";
 import * as Metric from "effect/Metric";
 import { assert, it } from "@effect/vitest";
 
-import { CheckpointRef, GitCommandError, VcsProcessExitError } from "@t3tools/contracts";
+import {
+  CheckpointRef,
+  GitCommandError,
+  VcsProcessExitError,
+  VcsUnsupportedOperationError,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as ServerConfig from "../config.ts";
@@ -1511,4 +1516,211 @@ it.effect("git metrics count fsync fallback and transient retry subprocesses sep
     Effect.provide(NodeServices.layer),
     Effect.provideService(Metric.MetricRegistry, new Map()),
   ),
+);
+
+// The git commands a turn runs, as the orchestrator issues them: the baseline probe at run start
+// (RunExecutionService.startRootRun → captureBaseline), then CheckpointService.capture, then the
+// turn diff a client asks for. Equivalence tests run it on a warm driver and on a fresh one.
+const TURN_REFS_PREFIX = "refs/t3/orchestration-v2/checkpoints/dGVzdA/ordinal";
+const turnRef = (ordinal: number) => CheckpointRef.make(`${TURN_REFS_PREFIX}/${ordinal}`);
+
+const checkpointTurn = Effect.fn("test.checkpointTurn")(function* (
+  driver: VcsDriver.VcsDriver["Service"],
+  cwd: string,
+  ordinal: number,
+) {
+  const checkpoints = driver.checkpoints;
+  const previousRef = turnRef(Math.max(0, ordinal - 1));
+  const baselineExists = yield* checkpoints.hasCheckpointRef({ cwd, checkpointRef: previousRef });
+  if (!baselineExists) {
+    yield* checkpoints.captureCheckpoint({ cwd, checkpointRef: previousRef });
+  }
+  yield* checkpoints.captureCheckpoint({ cwd, checkpointRef: turnRef(ordinal) });
+  const previousExists = yield* checkpoints.hasCheckpointRef({ cwd, checkpointRef: previousRef });
+  const refs = { cwd, fromCheckpointRef: previousRef, toCheckpointRef: turnRef(ordinal) };
+  const [numstat, authored] = previousExists
+    ? yield* Effect.all([
+        checkpoints.diffCheckpoints({
+          ...refs,
+          fallbackFromToHead: false,
+          ignoreWhitespace: false,
+          format: "numstat",
+        }),
+        checkpoints.listAuthoredPaths(refs),
+      ])
+    : (["", null] as const);
+  const patch = previousExists
+    ? yield* checkpoints.diffCheckpoints({ ...refs, fallbackFromToHead: false, ignoreWhitespace: true })
+    : "";
+  return {
+    baselineExists,
+    previousExists,
+    numstat,
+    authored: authored === null ? null : [...authored].sort(),
+    patch,
+  };
+});
+
+const gitSubcommand = (args: ReadonlyArray<string>) => {
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (argument === "-C" || argument === "-c") {
+      index++;
+      continue;
+    }
+    if (argument.startsWith("-")) continue;
+    return argument;
+  }
+  return "?";
+};
+
+const FIXED_COMMIT_ENV = {
+  ...process.env,
+  GIT_AUTHOR_DATE: "2024-01-01T00:00:00Z",
+  GIT_COMMITTER_DATE: "2024-01-01T00:00:00Z",
+};
+
+// A warm driver whose git commands are recorded, a fresh driver per call for comparison, and two
+// repositories with identical commits (fixed dates) so checkpoint parents match across them.
+const makeTurnHarness = Effect.fn("test.makeTurnHarness")(function* (prefix: string) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const liveRunner = yield* ProcessRunner.ProcessRunner;
+  const spawned: Array<ReadonlyArray<string>> = [];
+  const countingProcess = yield* VcsProcess.make.pipe(
+    Effect.provideService(ProcessRunner.ProcessRunner, {
+      run: (input) => {
+        spawned.push(input.args);
+        return liveRunner.run(input);
+      },
+    }),
+  );
+  const warm = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+    Effect.provideService(VcsProcess.VcsProcess, countingProcess),
+  );
+  const reference = yield* GitVcsDriver.makeVcsDriverShape();
+  const root = yield* fileSystem.makeTempDirectoryScoped({ prefix });
+  const repos = { warm: path.join(root, "warm"), cold: path.join(root, "cold") } as const;
+  const gitIn = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv) =>
+    reference.execute({
+      operation: "turn-test",
+      cwd,
+      args,
+      allowNonZeroExit: true,
+      ...(env === undefined ? {} : { env }),
+    });
+  // Runs the same command in both repositories.
+  const gitBoth = (args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv) =>
+    Effect.forEach([repos.warm, repos.cold], (cwd) => gitIn(cwd, args, env), { discard: true });
+  const writeBoth = (relativePath: string, contents: string) =>
+    Effect.forEach(
+      [repos.warm, repos.cold],
+      (cwd) =>
+        fileSystem
+          .makeDirectory(path.join(cwd, path.dirname(relativePath)), { recursive: true })
+          .pipe(Effect.andThen(fileSystem.writeFileString(path.join(cwd, relativePath), contents))),
+      { discard: true },
+    );
+  const removeBoth = (relativePath: string) =>
+    Effect.forEach(
+      [repos.warm, repos.cold],
+      (cwd) => fileSystem.remove(path.join(cwd, relativePath), { force: true }),
+      { discard: true },
+    );
+  const commitBoth = (message: string) => gitBoth(["commit", "-q", "-m", message], FIXED_COMMIT_ENV);
+  for (const cwd of [repos.warm, repos.cold]) {
+    yield* fileSystem.makeDirectory(cwd, { recursive: true });
+    yield* gitIn(cwd, ["init", "-q", "-b", "main"]);
+    yield* gitIn(cwd, ["config", "user.name", "Test"]);
+    yield* gitIn(cwd, ["config", "user.email", "test@test.com"]);
+  }
+  // Checkpoint commits carry the capture time; compare what the turn reads from them instead.
+  const describeRef = (cwd: string, ordinal: number) =>
+    gitIn(cwd, ["log", "-1", "--format=%T %P", `${turnRef(ordinal)}^{commit}`]).pipe(
+      Effect.map((result) => (result.exitCode === 0 ? result.stdout.trim() : "missing")),
+    );
+  // One turn on both repositories; the fresh driver has nothing remembered.
+  const turn = Effect.fn("test.turn")(function* (ordinal: number, subdirectory = "") {
+    spawned.length = 0;
+    const warmResult = yield* Effect.result(
+      checkpointTurn(warm, path.join(repos.warm, subdirectory), ordinal),
+    );
+    const commands = spawned.map((args) => gitSubcommand(args.slice(2)));
+    const cold = yield* GitVcsDriver.makeVcsDriverShape();
+    const coldResult = yield* Effect.result(
+      checkpointTurn(cold, path.join(repos.cold, subdirectory), ordinal),
+    );
+    if (warmResult._tag === "Failure" || coldResult._tag === "Failure") {
+      assert.strictEqual(warmResult._tag, coldResult._tag);
+      const warmTag = warmResult._tag === "Failure" ? warmResult.failure._tag : null;
+      const coldTag = coldResult._tag === "Failure" ? coldResult.failure._tag : null;
+      assert.strictEqual(warmTag, coldTag);
+      return { commands, failed: warmTag };
+    }
+    assert.deepStrictEqual(warmResult.success, coldResult.success);
+    for (const probe of [ordinal - 1, ordinal]) {
+      assert.strictEqual(
+        yield* describeRef(repos.warm, Math.max(0, probe)),
+        yield* describeRef(repos.cold, Math.max(0, probe)),
+        `checkpoint ${probe} differs between the warm and the fresh driver`,
+      );
+    }
+    return { commands, failed: null, ...warmResult.success };
+  });
+  return { repos, gitIn, gitBoth, writeBoth, removeBoth, commitBoth, turn, spawned };
+});
+
+const STEADY_TURN_COMMANDS = [
+  "read-tree",
+  "ls-files",
+  "add",
+  "write-tree",
+  "commit-tree",
+  "update-ref",
+];
+
+it.effect("checkpoint turns reuse refs, commits and repository paths it already knows", () =>
+  Effect.gen(function* () {
+    const h = yield* makeTurnHarness("t3-checkpoint-turns-");
+    yield* h.writeBoth("file.txt", "initial\n");
+    yield* h.writeBoth("other.txt", "other\n");
+    yield* h.gitBoth(["add", "."]);
+    yield* h.commitBoth("initial");
+    yield* h.writeBoth("file.txt", "staged\n");
+    yield* h.gitBoth(["add", "file.txt"]);
+    yield* h.writeBoth("file.txt", "unstaged\n");
+
+    const first = yield* h.turn(1);
+    assert.strictEqual(first.baselineExists, false);
+    assert.strictEqual(first.previousExists, true);
+    yield* h.turn(2);
+    const steady = yield* h.turn(3);
+    assert.deepStrictEqual(steady.commands, STEADY_TURN_COMMANDS);
+    assert.deepStrictEqual(
+      { numstat: steady.numstat, authored: steady.authored, patch: steady.patch },
+      { numstat: "", authored: null, patch: "" },
+    );
+
+    // A turn that changes files runs the diff it needs and nothing else.
+    yield* h.writeBoth("file.txt", "edited\n");
+    const edited = yield* h.turn(4);
+    assert.deepStrictEqual(edited.commands, [...STEADY_TURN_COMMANDS, "diff", "diff"]);
+    assert.strictEqual(edited.numstat, "1\t1\tfile.txt\0");
+    assert.isTrue(edited.patch.includes("+edited"));
+
+    // HEAD moved: the HEAD probe runs once more and the authored-path listing runs (never git log
+    // for the checkpoint commits themselves).
+    yield* h.gitBoth(["add", "file.txt"]);
+    yield* h.commitBoth("edit");
+    const moved = yield* h.turn(5);
+    assert.deepStrictEqual(
+      [...moved.commands].sort(),
+      [...STEADY_TURN_COMMANDS, "rev-parse", "diff", "diff", "log", "log"].sort(),
+    );
+    assert.deepStrictEqual(moved.authored, ["file.txt"]);
+    assert.strictEqual(moved.numstat, "");
+
+    const settled = yield* h.turn(6);
+    assert.deepStrictEqual(settled.commands, STEADY_TURN_COMMANDS);
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

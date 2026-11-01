@@ -1239,9 +1239,13 @@ interface EnsureActiveAssistantSegmentResult {
 interface AcpActivePrompt {
   readonly fiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
   readonly completed: Deferred.Deferred<void>;
-  /** Settles once the prompt is queued to the agent, or has ended without that. */
+  /** Settles once the prompt is queued to the agent, or its call has ended without that. */
   readonly queued: Deferred.Deferred<void>;
 }
+
+// A fiber stopped before its call began never settles queued, so its end counts too.
+const awaitPromptQueued = (prompt: AcpActivePrompt) =>
+  Effect.raceFirst(Deferred.await(prompt.queued), Fiber.await(prompt.fiber).pipe(Effect.asVoid));
 
 export const make = Effect.fn("AcpSessionRuntime.make")(function* (
   options: AcpSessionRuntimeOptions,
@@ -2374,7 +2378,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
     // An agent drops a cancel that comes before the prompt it targets, so it waits for the prompt
     // to be queued. An interrupted prompt that was not queued yet is never sent.
     const promptQueued = Option.isSome(activePrompt)
-      ? Deferred.await(activePrompt.value.queued)
+      ? awaitPromptQueued(activePrompt.value)
       : Effect.void;
     if (options.cancelBehavior !== "wait-for-prompt") {
       if (options.interruptPromptOnCancel === false) {
@@ -2635,7 +2639,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
             }).pipe(notificationSemaphore.withPermit),
           ),
           (activePrompt) =>
-            Deferred.await(activePrompt.queued).pipe(
+            awaitPromptQueued(activePrompt).pipe(
               Effect.andThen(
                 promptOptions?.dispatched
                   ? Deferred.succeed(promptOptions.dispatched, undefined)

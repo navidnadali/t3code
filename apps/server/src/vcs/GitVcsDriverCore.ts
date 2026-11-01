@@ -542,6 +542,21 @@ function parseDefaultBranchFromRemoteHeadRef(value: string, remoteName: string):
   return refName.length > 0 ? refName : null;
 }
 
+// The refs `rev-parse --symbolic-full-name <branch>@{upstream}` read: the ref it printed, and the
+// refs that would also match that name (Git's rev-parse rules) and make it ambiguous.
+function upstreamResultRefs(result: GitVcsDriver.ExecuteGitResult): ReadonlyArray<string> | null {
+  const ref = result.stdout.endsWith("\n") ? result.stdout.slice(0, -1) : "";
+  if (result.exitCode !== 0 || !ref.startsWith("refs/") || ref.includes("\n")) return null;
+  return [
+    ref,
+    `refs/${ref}`,
+    `refs/tags/${ref}`,
+    `refs/heads/${ref}`,
+    `refs/remotes/${ref}`,
+    `refs/remotes/${ref}/HEAD`,
+  ];
+}
+
 function isMissingGitCwdError(error: GitCommandError): boolean {
   if (!(error.cause instanceof PlatformError.PlatformError)) {
     return false;
@@ -1265,16 +1280,29 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ),
     );
 
+  // `show-ref --verify` reads only the ref, so its result holds while the ref's files do.
+  const refExists = (
+    operation: string,
+    cwd: string,
+    ref: string,
+    options: ExecuteGitOptions = {},
+  ): Effect.Effect<boolean, GitCommandError> => {
+    const args = ["show-ref", "--verify", "--quiet", ref];
+    return configSnapshots.read(cwd).pipe(
+      Effect.flatMap((snapshot) =>
+        configSnapshots.runWithRefs(
+          snapshot,
+          args,
+          () => [ref],
+          executeGit(operation, cwd, args, { ...options, allowNonZeroExit: true }),
+        ),
+      ),
+      Effect.map((result) => result.exitCode === 0),
+    );
+  };
+
   const branchExists = (cwd: string, refName: string): Effect.Effect<boolean, GitCommandError> =>
-    executeGit(
-      "GitVcsDriver.branchExists",
-      cwd,
-      ["show-ref", "--verify", "--quiet", `refs/heads/${refName}`],
-      {
-        allowNonZeroExit: true,
-        timeoutMs: 5_000,
-      },
-    ).pipe(Effect.map((result) => result.exitCode === 0));
+    refExists("GitVcsDriver.branchExists", cwd, `refs/heads/${refName}`, { timeoutMs: 5_000 });
 
   const resolveAvailableBranchName = Effect.fn("resolveAvailableBranchName")(function* (
     cwd: string,
@@ -1686,14 +1714,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     );
 
   const remoteBranchExists: GitVcsDriver.GitVcsDriver["Service"]["remoteBranchExists"] = (input) =>
-    executeGit(
+    refExists(
       "GitVcsDriver.remoteBranchExists",
       input.cwd,
-      ["show-ref", "--verify", "--quiet", `refs/remotes/${input.remoteName}/${input.refName}`],
-      {
-        allowNonZeroExit: true,
-      },
-    ).pipe(Effect.map((result) => result.exitCode === 0));
+      `refs/remotes/${input.remoteName}/${input.refName}`,
+    );
 
   const remoteExists: GitVcsDriver.GitVcsDriver["Service"]["remoteExists"] = (input) =>
     executeConfigGit(
@@ -1826,13 +1851,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ? `refs/remotes/${baseRef}`
           : null;
     if (comparisonRef === null) return null;
-    const resolved = yield* executeGit(
-      "GitVcsDriver.resolveComparisonBaseRef",
-      cwd,
-      ["show-ref", "--verify", "--quiet", comparisonRef],
-      { allowNonZeroExit: true },
-    );
-    return resolved.exitCode === 0 ? { baseRef, comparisonRef } : null;
+    const exists = yield* refExists("GitVcsDriver.resolveComparisonBaseRef", cwd, comparisonRef);
+    return exists ? { baseRef, comparisonRef } : null;
   });
 
   // Tracking may point to a different remote than the primary one. Resolve its
@@ -1841,11 +1861,20 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     cwd: string,
     refName: string,
   ) {
-    const upstream = yield* executeGit(
-      "GitVcsDriver.resolveTrackedRemoteBaseRef",
-      cwd,
-      ["rev-parse", "--symbolic-full-name", `${refName}@{upstream}`],
-      { allowNonZeroExit: true },
+    const snapshot = yield* configSnapshots.read(cwd);
+    // Git takes the upstream from branch.<name>.merge and fails without it.
+    if (snapshot !== null && !snapshot.values.has(`branch.${refName}.merge`)) return null;
+    const args = ["rev-parse", "--symbolic-full-name", `${refName}@{upstream}`];
+    const upstream = yield* configSnapshots.runWithRefs(
+      snapshot,
+      args,
+      (result) =>
+        result === undefined || snapshot?.values.get(`branch.${refName}.remote`) === "."
+          ? null
+          : upstreamResultRefs(result),
+      executeGit("GitVcsDriver.resolveTrackedRemoteBaseRef", cwd, args, {
+        allowNonZeroExit: true,
+      }),
     );
     const comparisonRef = upstream.stdout.trim();
     if (upstream.exitCode !== 0 || !comparisonRef.startsWith("refs/remotes/")) return null;
@@ -2099,20 +2128,25 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       "-z",
       ...(includeDivergence ? [] : ["--no-ahead-behind"]),
     ];
-    const indexResult = yield* executeGitWithStableDiagnostics(
-      "GitVcsDriver.statusDetails.indexPath",
-      cwd,
-      ["rev-parse", "--git-path", "index"],
-      { allowNonZeroExit: true },
-    ).pipe(
-      Effect.catchTags({
-        GitCommandError: (error) =>
-          isMissingGitCwdError(error) ? Effect.succeed(null) : Effect.fail(error),
-      }),
-    );
-    if (indexResult === null) return NON_REPOSITORY_STATUS_DETAILS;
-    if (indexResult.exitCode === 0) {
-      const lockPath = `${path.resolve(cwd, indexResult.stdout.trim())}.lock`;
+    const snapshot = yield* configSnapshots.peek(cwd);
+    let indexPath = snapshot?.indexPath ?? null;
+    if (snapshot === null) {
+      const indexResult = yield* executeGitWithStableDiagnostics(
+        "GitVcsDriver.statusDetails.indexPath",
+        cwd,
+        ["rev-parse", "--git-path", "index"],
+        { allowNonZeroExit: true },
+      ).pipe(
+        Effect.catchTags({
+          GitCommandError: (error) =>
+            isMissingGitCwdError(error) ? Effect.succeed(null) : Effect.fail(error),
+        }),
+      );
+      if (indexResult === null) return NON_REPOSITORY_STATUS_DETAILS;
+      if (indexResult.exitCode === 0) indexPath = indexResult.stdout;
+    }
+    if (indexPath !== null) {
+      const lockPath = `${path.resolve(cwd, indexPath.trim())}.lock`;
       const lockError = new GitCommandError({
         operation: "GitVcsDriver.statusDetails.indexPath",
         command: "git",
@@ -2975,11 +3009,19 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ["diff", "--cached", "--name-only", "--diff-filter=D", "-z", "HEAD", "--"],
           { allowNonZeroExit: true, maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
         ),
-        runGitStdout("GitVcsDriver.readUnifiedWorkingTreeReviewDiff.indexPath", cwd, [
-          "rev-parse",
-          "--git-path",
-          "index",
-        ]),
+        configSnapshots
+          .read(cwd)
+          .pipe(
+            Effect.flatMap((snapshot) =>
+              snapshot === null
+                ? runGitStdout("GitVcsDriver.readUnifiedWorkingTreeReviewDiff.indexPath", cwd, [
+                    "rev-parse",
+                    "--git-path",
+                    "index",
+                  ])
+                : Effect.succeed(snapshot.indexPath),
+            ),
+          ),
       ],
       { concurrency: 2 },
     );

@@ -43,6 +43,7 @@ import {
   splitNullSeparatedGitStdoutPaths,
 } from "./GitVcsDriverCore.ts";
 import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
+import { gitConfigBool, makeGitConfigSnapshots } from "./gitConfigSnapshot.ts";
 import * as VcsDriver from "./VcsDriver.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 
@@ -590,6 +591,10 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         : {}),
     });
 
+  const configSnapshots = yield* makeGitConfigSnapshots((operation, cwd, args) =>
+    execute({ operation, cwd, args, allowNonZeroExit: true }),
+  );
+
   const detectRepository: VcsDriver.VcsDriver["Service"]["detectRepository"] = Effect.fn(
     "detectRepository",
   )(function* (cwd) {
@@ -921,13 +926,18 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       );
 
       yield* Effect.gen(function* () {
-        const sparseConfig = yield* execute({
-          operation,
-          cwd: input.cwd,
-          args: ["config", "--bool", "core.sparseCheckout"],
-          allowNonZeroExit: true,
-        });
-        let sparseCheckout = sparseConfig.stdout.trim() === "true";
+        const snapshot = yield* configSnapshots.read(input.cwd);
+        let sparseCheckout =
+          snapshot === null ? null : gitConfigBool(snapshot.values, "core.sparseCheckout");
+        if (sparseCheckout === null) {
+          const sparseConfig = yield* execute({
+            operation,
+            cwd: input.cwd,
+            args: ["config", "--bool", "core.sparseCheckout"],
+            allowNonZeroExit: true,
+          });
+          sparseCheckout = sparseConfig.stdout.trim() === "true";
+        }
         if (sparseCheckout) {
           const help = yield* execute({
             operation,

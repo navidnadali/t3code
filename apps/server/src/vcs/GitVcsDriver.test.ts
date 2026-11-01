@@ -24,6 +24,7 @@ import { gitCommandDuration, gitCommandsTotal } from "../observability/Metrics.t
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
+import { gitConfigBool, parseGitConfigList } from "./gitConfigSnapshot.ts";
 import type * as VcsDriver from "./VcsDriver.ts";
 import * as VcsDriverRegistry from "./VcsDriverRegistry.ts";
 import * as VcsProcess from "./VcsProcess.ts";
@@ -581,6 +582,66 @@ it.effect("checkpoint recovery preserves interruption and removes the private in
     assert.isDefined(privateIndex);
     assert.isFalse(yield* fs.exists(privateIndex!));
     assert.isFalse(yield* driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef }));
+  }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect("reads a boolean the way git config --bool does", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-config-bool-" });
+    const git = (args: ReadonlyArray<string>) =>
+      driver.execute({ operation: "config-bool-test", cwd, args, allowNonZeroExit: true });
+    yield* git(["init", "-q"]);
+    const cases: ReadonlyArray<readonly [value: string | null, parsed: boolean]> = [
+      [null, true],
+      ["", true],
+      ["true", true],
+      ["TRUE", true],
+      ["Yes", true],
+      ["on", true],
+      ["false", true],
+      ["No", true],
+      ["OFF", true],
+      ["0", true],
+      ["1", true],
+      ["2", true],
+      ["123456789", true],
+      ["1234567890", false],
+      ["007", false],
+      ["08", false],
+      ["0x1", false],
+      ["1k", false],
+      ["-1", false],
+      ['" 1"', false],
+      ["maybe", false],
+    ];
+    const include = path.join(cwd, "flags.inc");
+    yield* fileSystem.writeFileString(
+      include,
+      `[t3]\n${cases.map(([value], index) => (value === null ? `\tflag${index}\n` : `\tflag${index} = ${value}\n`)).join("")}`,
+    );
+    yield* git(["config", "include.path", include]);
+    const listed = parseGitConfigList(
+      (yield* git(["config", "--list", "--show-origin", "-z"])).stdout,
+    );
+    const values = new Map((listed ?? []).map((entry) => [entry.key, entry.value]));
+    const keys = [...cases.keys(), cases.length].map((index) => `t3.Flag${index}`);
+
+    const parsed = keys.map((key) => gitConfigBool(values, key));
+
+    const printed = yield* Effect.forEach(keys, (key) =>
+      git(["config", "--bool", key]).pipe(Effect.map(({ stdout }) => stdout.trim() === "true")),
+    );
+    assert.deepStrictEqual(
+      parsed.map((value, index) => value ?? printed[index]),
+      printed,
+    );
+    assert.deepStrictEqual(
+      parsed.map((value) => value !== null),
+      [...cases.map(([, known]) => known), true],
+    );
   }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
 );
 

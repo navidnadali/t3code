@@ -1,7 +1,7 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off - Effect's File.Info has no ctime or nanosecond mtime, which the fingerprint needs.
 import * as NodeFS from "node:fs";
 
-import type { GitCommandError } from "@t3tools/contracts";
+import type { GitCommandError, VcsError } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
@@ -56,6 +56,33 @@ export const gitConfigGetOutput = (
   const canonicalKey = canonicalGitConfigKey(key);
   if (!values.has(canonicalKey)) return "";
   return `${values.get(canonicalKey) ?? ""}\n`;
+};
+
+const GIT_BOOLEAN_WORDS = new Map([
+  ["true", true],
+  ["yes", true],
+  ["on", true],
+  ["false", false],
+  ["no", false],
+  ["off", false],
+]);
+
+/**
+ * Whether `git config --bool <key>` prints "true"; null for an integer beyond plain decimals or an
+ * invalid value, which Git parses (or rejects) itself.
+ */
+export const gitConfigBool = (
+  values: ReadonlyMap<string, string | null>,
+  key: string,
+): boolean | null => {
+  const canonicalKey = canonicalGitConfigKey(key);
+  if (!values.has(canonicalKey)) return false;
+  const value = values.get(canonicalKey) ?? null;
+  if (value === null) return true;
+  if (value === "") return false;
+  const word = GIT_BOOLEAN_WORDS.get(lowerAscii(value));
+  if (word !== undefined) return word;
+  return /^(?:0|[1-9][0-9]{0,8})$/.test(value) ? value !== "0" : null;
 };
 
 const INCLUDE_CONDITION_PREFIXES = ["gitdir:", "gitdir/i:", "hasconfig:remote.*.url:"] as const;
@@ -135,6 +162,7 @@ const CONFIG_ENVIRONMENT_NAMES = [
   "GIT_WORK_TREE",
   "GIT_CEILING_DIRECTORIES",
   "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_INDEX_FILE",
 ] as const;
 const MAX_CONFIG_ENVIRONMENT_ENTRIES = 1_000;
 
@@ -156,9 +184,10 @@ export interface GitConfigDependency {
   /**
    * content: any change. identity: a directory's identity (a file's content), for the `.git` Git
    * rewrites often. presence: whether it exists. absent: the snapshot holds only while it is missing,
-   * for the markers that would make Git find another repository on the way up.
+   * for the markers that would make Git find another repository on the way up. physical: the path
+   * with symbolic links resolved.
    */
-  readonly kind: "content" | "identity" | "presence" | "absent";
+  readonly kind: "content" | "identity" | "presence" | "absent" | "physical";
 }
 
 const dependencyKey = (dependency: GitConfigDependency) => `${dependency.kind}:${dependency.path}`;
@@ -166,6 +195,12 @@ const dependencyKey = (dependency: GitConfigDependency) => `${dependency.kind}:$
 const statFingerprint = (dependency: GitConfigDependency) =>
   new Promise<string>((resolve) => {
     try {
+      if (dependency.kind === "physical") {
+        NodeFS.realpath.native(dependency.path, (error, resolved) =>
+          resolve(error ? `!${error.code ?? "error"}` : resolved),
+        );
+        return;
+      }
       NodeFS.stat(dependency.path, { bigint: true }, (error, stats) => {
         if (error) {
           resolve(`!${error.code ?? "error"}`);
@@ -194,6 +229,19 @@ export interface GitConfigSnapshot {
   readonly values: ReadonlyMap<string, string | null>;
   // Results of commands that read only config, valid while the snapshot is.
   readonly results: Map<string, GitVcsDriver.ExecuteGitResult>;
+  // What `git rev-parse --git-path index` prints in the directory.
+  readonly indexPath: string;
+  // The common directory while refs are files there (Git's files backend), else null.
+  readonly commonDir: string | null;
+  // Results of commands that read only config and refs, see runWithRefs.
+  readonly refResults: Map<string, CachedGitRefResult>;
+}
+
+interface CachedGitRefResult {
+  readonly dependencies: ReadonlyArray<GitConfigDependency>;
+  // Null when the run was not preceded by a stat of every dependency, so it must run again.
+  readonly fingerprint: string | null;
+  readonly result: GitVcsDriver.ExecuteGitResult;
 }
 
 interface CachedGitConfigSnapshot {
@@ -208,15 +256,45 @@ type RunGit = (
   operation: string,
   cwd: string,
   args: ReadonlyArray<string>,
-) => Effect.Effect<GitVcsDriver.ExecuteGitResult, GitCommandError>;
+) => Effect.Effect<GitVcsDriver.ExecuteGitResult, GitCommandError | VcsError>;
 
 const CONFIG_SNAPSHOT_CACHE_CAPACITY = 2_048;
 const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
 const CONFIG_SNAPSHOT_LOAD_ATTEMPTS = 3;
 const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
-const REPOSITORY_PATH_COUNT = 10;
+const REF_RESULTS_CAPACITY = 256;
+const REPOSITORY_PATH_COUNT = 11;
+// Ref names whose loose file Git's files backend keeps at <common dir>/<name>.
+const isLooseRefName = (name: string) =>
+  name.startsWith("refs/") &&
+  !/^refs\/(?:worktree|bisect|rewritten)\//.test(name) &&
+  !/[\0-\x20\x7f~^:?*[\\]|\.\.|@\{|\.$/.test(name) &&
+  name
+    .split("/")
+    .every((part) => part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock"));
+
+const isReusableResult = (result: GitVcsDriver.ExecuteGitResult) =>
+  result.exitCode !== null &&
+  result.exitCode < 128 &&
+  !result.stdoutTruncated &&
+  !result.stderrTruncated;
+
+const readsSymbolicRef = (file: string) =>
+  new Promise<boolean>((resolve) => {
+    try {
+      NodeFS.readFile(file, (error, data) =>
+        resolve(error === null && data.subarray(0, 4).toString("latin1") === "ref:"),
+      );
+    } catch {
+      resolve(true);
+    }
+  });
+
 const REPOSITORY_PATH_ARGS = [
   "rev-parse",
+  // Before --path-format, so it prints what `git rev-parse --git-path index` prints.
+  "--git-path",
+  "index",
   "--path-format=absolute",
   "--show-toplevel",
   "--absolute-git-dir",
@@ -300,20 +378,21 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     if (pathsResult.exitCode !== 0) return null;
     const lines = pathsResult.stdout.split("\n");
     // Git before 2.31 echoes --path-format; a path containing a newline spans lines.
-    if (lines[0] === "--path-format=absolute") {
+    if (lines[1] === "--path-format=absolute") {
       supported = false;
       return null;
     }
-    const paths = lines.slice(0, -1);
+    const [indexPath = "", ...paths] = lines.slice(0, -1);
     if (
-      paths.length !== REPOSITORY_PATH_COUNT ||
+      paths.length !== REPOSITORY_PATH_COUNT - 1 ||
       lines.at(-1) !== "" ||
+      indexPath.length === 0 ||
       !paths.every((line) => line.length > 0 && path.isAbsolute(line))
     ) {
       return null;
     }
-    const [toplevel, , config, configWorktree, commondir, remotes, branches, ...markers] =
-      paths as [string, string, string, string, string, string, string, ...string[]];
+    const [toplevel, , config, configWorktree, commondir, remotes, branches, head, objects, refs] =
+      paths as [string, string, string, string, string, string, string, string, string, string];
     const [locations, listResult, physicalCwd, remoteFiles, branchFiles] = yield* Effect.all(
       [
         readConfigFileLocations(cwd, environment),
@@ -333,7 +412,10 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
 
     // Discovery: the directory, what would make Git stop below the top level (a `.git`, or HEAD of a
     // bare repository), the `.git` it found, and what keeps that a repository.
-    const dependencies: GitConfigDependency[] = [{ path: cwd, kind: "identity" }];
+    const dependencies: GitConfigDependency[] = [
+      { path: cwd, kind: "identity" },
+      { path: cwd, kind: "physical" },
+    ];
     for (let directory = physicalCwd.value; ;) {
       const relative = path.relative(toplevel, directory);
       if (relative === "") break;
@@ -348,7 +430,12 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       directory = parent;
     }
     dependencies.push({ path: path.join(toplevel, ".git"), kind: "identity" });
-    for (const marker of markers) dependencies.push({ path: marker, kind: "presence" });
+    // HEAD's content too: Git takes a directory whose HEAD is invalid for no repository.
+    dependencies.push(
+      { path: head, kind: "content" },
+      { path: objects, kind: "presence" },
+      { path: refs, kind: "presence" },
+    );
     const files = [
       config,
       configWorktree,
@@ -378,7 +465,14 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     for (const file of files) dependencies.push({ path: file, kind: "content" });
     const values = new Map<string, string | null>();
     for (const entry of entries ?? []) values.set(entry.key, entry.value);
-    return { dependencies, values: snapshotSupported ? values : null };
+    const refStorage = values.get("extensions.refstorage");
+    return {
+      dependencies,
+      values: snapshotSupported ? values : null,
+      indexPath,
+      // Refs live in the common directory, the one `--git-path refs` names.
+      commonDir: refStorage === undefined || refStorage === "files" ? path.dirname(refs) : null,
+    };
   });
 
   const load = Effect.fn("GitVcsDriver.configSnapshot.load")(
@@ -417,7 +511,13 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
             snapshot:
               state.values === null || !discovered
                 ? null
-                : { values: state.values, results: new Map() },
+                : {
+                    values: state.values,
+                    results: new Map(),
+                    indexPath: state.indexPath,
+                    commonDir: state.commonDir,
+                    refResults: new Map(),
+                  },
           } satisfies CachedGitConfigSnapshot;
         }
         // Something was read before it was stat'ed; stat it and read again.
@@ -425,7 +525,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       }
       return null;
     },
-    Effect.catchTags({ GitCommandError: () => Effect.succeed(null) }),
+    Effect.orElseSucceed(() => null),
   );
 
   const snapshots = yield* Cache.makeWith(load, {
@@ -464,7 +564,70 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     return (yield* Cache.get(snapshots, cwd))?.snapshot ?? null;
   });
 
-  return { read };
+  // Like read, but a directory without a snapshot stays without one (a non-repository polled for status).
+  const peek = Effect.fnUntraced(function* (cwd: string) {
+    if (!supported || !(yield* Cache.has(snapshots, cwd))) return null;
+    return yield* read(cwd);
+  });
+
+  const refDependencies = (
+    commonDir: string,
+    names: ReadonlyArray<string>,
+  ): ReadonlyArray<GitConfigDependency> => [
+    ...names.map((name) => ({ path: path.join(commonDir, name), kind: "content" as const })),
+    { path: path.join(commonDir, "packed-refs"), kind: "content" },
+  ];
+
+  /**
+   * Runs a command whose result depends only on the snapshot and on some refs, once per state of
+   * their loose files and packed-refs. `refs` names those refs before the run (called without a
+   * result) or from its result; null means the result cannot be reused.
+   */
+  const runWithRefs = <E>(
+    snapshot: GitConfigSnapshot | null,
+    args: ReadonlyArray<string>,
+    refs: (result?: GitVcsDriver.ExecuteGitResult) => ReadonlyArray<string> | null,
+    run: Effect.Effect<GitVcsDriver.ExecuteGitResult, E>,
+  ): Effect.Effect<GitVcsDriver.ExecuteGitResult, E> => {
+    const commonDir = snapshot?.commonDir ?? null;
+    if (snapshot === null || commonDir === null) return run;
+    const key = args.join("\0");
+    return Effect.gen(function* () {
+      const cached = snapshot.refResults.get(key);
+      const known = refs();
+      const dependencies =
+        cached?.dependencies ?? (known === null ? [] : refDependencies(commonDir, known));
+      const fingerprint = (yield* fingerprintDependencies(dependencies)).join("\n");
+      if (cached !== undefined && cached.fingerprint === fingerprint) return cached.result;
+      const result = yield* run;
+      const names = isReusableResult(result) ? refs(result) : null;
+      const needed = names?.every(isLooseRefName) ? refDependencies(commonDir, names) : null;
+      // A symbolic ref's result depends on its target, which is not tracked.
+      const symbolic =
+        needed !== null &&
+        (yield* Effect.promise(() =>
+          Promise.all(needed.slice(0, -1).map((dependency) => readsSymbolicRef(dependency.path))),
+        )).some(Boolean);
+      if (needed === null || symbolic) {
+        snapshot.refResults.delete(key);
+        return result;
+      }
+      const statedFirst =
+        needed.length === dependencies.length &&
+        needed.every((dependency, index) => dependency.path === dependencies[index]!.path);
+      if (!snapshot.refResults.has(key) && snapshot.refResults.size >= REF_RESULTS_CAPACITY) {
+        snapshot.refResults.delete(snapshot.refResults.keys().next().value!);
+      }
+      snapshot.refResults.set(key, {
+        dependencies: needed,
+        fingerprint: statedFirst ? fingerprint : null,
+        result,
+      });
+      return result;
+    });
+  };
+
+  return { read, peek, runWithRefs };
 });
 
 /**
@@ -483,14 +646,7 @@ export const runWithGitConfigSnapshot = (
   return run.pipe(
     Effect.tap((result) =>
       Effect.sync(() => {
-        if (
-          result.exitCode !== null &&
-          result.exitCode < 128 &&
-          !result.stdoutTruncated &&
-          !result.stderrTruncated
-        ) {
-          snapshot.results.set(key, result);
-        }
+        if (isReusableResult(result)) snapshot.results.set(key, result);
       }),
     ),
   );

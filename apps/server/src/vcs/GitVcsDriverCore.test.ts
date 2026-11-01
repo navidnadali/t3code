@@ -824,6 +824,86 @@ describe("ref and index reads", () => {
     ).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect.skipIf(!symlinksSupported)(
+    "reads the index path again after the directory moves behind a symbolic link",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { driver } = yield* makeCountingDriver;
+          const sandbox = yield* makeTmpDir();
+          const repository = NodePath.join(sandbox, "outer", "inner", "repo");
+          const cwd = NodePath.join(repository, "a");
+          NodeFS.mkdirSync(cwd, { recursive: true });
+          yield* initMain(repository);
+          for (let refresh = 0; refresh < 3; refresh++) {
+            assert.equal((yield* driver.statusDetailsLocal(cwd)).branch, "main");
+          }
+
+          // Git now prints ../../../.git/index, which the status check resolves from the link.
+          const moved = NodePath.join(repository, "x", "y", "a");
+          NodeFS.mkdirSync(NodePath.dirname(moved), { recursive: true });
+          NodeFS.renameSync(cwd, moved);
+          NodeFS.symlinkSync(moved, cwd);
+          NodeFS.mkdirSync(NodePath.join(sandbox, "outer", ".git"));
+          NodeFS.writeFileSync(NodePath.join(sandbox, "outer", ".git", "index.lock"), "");
+
+          const status = yield* driver.statusDetailsLocal(cwd).pipe(Effect.flip);
+          assert.include(status.detail, "index is locked");
+        }),
+      ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("reads the index path again when GIT_INDEX_FILE changes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initMain(cwd);
+        for (let refresh = 0; refresh < 3; refresh++) {
+          assert.equal((yield* driver.statusDetailsLocal(cwd)).branch, "main");
+        }
+        const index = NodePath.join(yield* makeTmpDir("git-index-"), "index");
+        NodeFS.copyFileSync(NodePath.join(cwd, ".git", "index"), index);
+        NodeFS.writeFileSync(`${index}.lock`, "");
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            process.env.GIT_INDEX_FILE = index;
+          }),
+          () => Effect.sync(() => delete process.env.GIT_INDEX_FILE),
+        );
+
+        const status = yield* driver.statusDetailsLocal(cwd).pipe(Effect.flip);
+        assert.include(status.detail, "index is locked");
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["emptied", "corrupt"] as const)(
+    "reads the index path again after HEAD is %s",
+    (state) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { driver } = yield* makeCountingDriver;
+          const cwd = yield* makeTmpDir();
+          yield* initMain(cwd);
+          for (let refresh = 0; refresh < 3; refresh++) {
+            assert.equal((yield* driver.statusDetailsLocal(cwd)).branch, "main");
+          }
+          NodeFS.writeFileSync(NodePath.join(cwd, ".git", "index.lock"), "");
+          NodeFS.writeFileSync(
+            NodePath.join(cwd, ".git", "HEAD"),
+            state === "emptied" ? "" : "not a ref\n",
+          );
+
+          const status = yield* driver.statusDetailsLocal(cwd);
+
+          assert.isFalse(status.isRepo);
+          const cold = yield* makeCountingDriver;
+          assert.deepStrictEqual(yield* cold.driver.statusDetailsLocal(cwd), status);
+        }),
+      ).pipe(Effect.provide(layerTest)),
+  );
+
   interface RefChange {
     readonly name: string;
     // Prepares the repository at `cwd` and returns the directory to refresh.
@@ -874,6 +954,14 @@ describe("ref and index reads", () => {
       change: (cwd) => git(cwd, ["checkout", "-q", "-b", "feature"]).pipe(Effect.asVoid),
       before: "main master +0",
       after: "feature main +0",
+      reused: true,
+    },
+    {
+      name: "a detached HEAD",
+      setup: (cwd) => git(cwd, ["branch", "master"]).pipe(Effect.as(cwd)),
+      change: (cwd) => git(cwd, ["checkout", "-q", "--detach"]).pipe(Effect.asVoid),
+      before: "main master +0",
+      after: "null - +0",
       reused: true,
     },
     {

@@ -566,7 +566,8 @@ function upstreamLookupRefs(ref: string): ReadonlyArray<string> {
 }
 
 // The remote-tracking ref branch.<name>.merge maps to, when the config leaves one reading: a single
-// merge branch and a remote with a URL and a single `refs/heads/*:refs/remotes/<x>/*` refspec.
+// merge branch and a remote with a URL and a single `refs/heads/*:refs/remotes/<x>/*` refspec. Not
+// for a ref ending in /HEAD, which Git can also shorten to the name before it.
 function configuredUpstreamRef(snapshot: GitConfigSnapshot, branch: string): string | null {
   const list = (key: string) => snapshot.valueLists.get(key) ?? [];
   const merges = list(`branch.${branch}.merge`);
@@ -579,7 +580,8 @@ function configuredUpstreamRef(snapshot: GitConfigSnapshot, branch: string): str
   if (fetches.length !== 1 || tracking === null || !snapshot.values.get(`remote.${remote}.url`)) {
     return null;
   }
-  return `${tracking[1]}${merges[0].slice("refs/heads/".length)}`;
+  const ref = `${tracking[1]}${merges[0].slice("refs/heads/".length)}`;
+  return ref.endsWith("/HEAD") ? null : ref;
 }
 
 function isMissingGitCwdError(error: GitCommandError): boolean {

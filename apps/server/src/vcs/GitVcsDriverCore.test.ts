@@ -1037,7 +1037,14 @@ describe("ref and index reads", () => {
       Effect.gen(function* () {
         const { driver, spawned } = yield* makeCountingDriver;
         const cwd = yield* makeTmpDir();
-        yield* git(cwd, ["init", "-q", "--ref-format=reftable"]);
+        const init = yield* driver.execute({
+          operation: "GitVcsDriver.test.git",
+          cwd,
+          args: ["init", "-q", "--ref-format=reftable"],
+          allowNonZeroExit: true,
+        });
+        // Git before 2.45 cannot create a reftable repository.
+        if (init.exitCode !== 0) return;
         yield* git(cwd, [
           "-c",
           "user.name=Test",

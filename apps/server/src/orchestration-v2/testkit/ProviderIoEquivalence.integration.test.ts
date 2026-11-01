@@ -51,7 +51,7 @@ interface Capture {
   readonly adapterEvents: ReadonlyArray<ReadonlyArray<unknown>>;
   /** Per file, stream, direction and provider session (see `byLogWriter`), in order. */
   readonly logLines: Readonly<Record<string, ReadonlyArray<unknown>>>;
-  /** Per writer (see `bySource`), in order. */
+  /** Per entity (see `byEntity`), in order. */
   readonly sinkWrites: Readonly<Record<string, ReadonlyArray<unknown>>>;
   /** The type of each thread's and run's first EventSink write, across writers. */
   readonly firstWrites: Readonly<Record<string, string>>;
@@ -100,18 +100,28 @@ const API_ID = /\b(?:msg|toolu|srvtoolu|req)_[A-Za-z0-9]{8,}/gu;
 const TASK_ID = /\\?"(?:task_id|taskId|agent_id|agentId)\\?":\\?"([^"\\]+)\\?"/gu;
 const DURATION_MS = /(\\?"duration_ms\\?":)\d+/gu;
 
-// Independent writers interleave differently between runs even in-thread, so EventSink writes are
-// compared per writer: each command; the session manager's own session-status writes; and the run
-// events it hands to run execution (ProviderSessionManager event pump).
-const bySource = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
-  const sources = new Map<string, Array<unknown>>();
-  for (const { sequence: _sequence, ...write } of storedEvents) {
-    const source =
-      write.commandId ??
-      (write.event.type.startsWith("provider-session.") ? "provider sessions" : "provider runs");
-    sources.set(source, [...(sources.get(source) ?? []), write]);
+// Writers race even in-thread: they interleave differently, and either an interrupt's settle effect
+// or the provider's own events can end a run. So EventSink writes are compared per entity, in
+// order, without what depends on the writer: its command, the event id and the node and run the
+// write is attributed to.
+const byEntity = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
+  const entities = new Map<string, Array<unknown>>();
+  for (const { event } of storedEvents) {
+    const {
+      id: _id,
+      nodeId: _nodeId,
+      runId: _runId,
+      ...write
+    } = event as typeof event & {
+      readonly nodeId?: unknown;
+      readonly runId?: unknown;
+    };
+    const entityId = (event.payload as { readonly id?: unknown } | undefined)?.id;
+    const entity =
+      typeof entityId === "string" ? `${event.type.split(".")[0]} ${entityId}` : event.type;
+    entities.set(entity, [...(entities.get(entity) ?? []), write]);
   }
-  return Object.fromEntries([...sources].toSorted(([a], [b]) => (a < b ? -1 : 1)));
+  return Object.fromEntries([...entities].toSorted(([a], [b]) => (a < b ? -1 : 1)));
 };
 
 interface LogLine {
@@ -187,7 +197,7 @@ const normalize = (
   const texts = [
     scrub(raw.adapterEvents),
     scrub(byLogWriter(raw.logLines)),
-    scrub(bySource(raw.sinkWrites)),
+    scrub(byEntity(raw.sinkWrites)),
     scrub(firstWrites(raw.sinkWrites)),
   ];
   const ids = new Map<string, string>();

@@ -84,6 +84,7 @@ export type AcpSessionRuntimeEvent =
 const defaultSessionLoadTimeout = Duration.seconds(90);
 const defaultSessionLoadReplayIdleGap = Duration.seconds(2);
 const defaultCancelTimeout = Duration.seconds(15);
+const requestRecordCloseGrace = Duration.seconds(1);
 const maxStartupMetadataUpdates = 32;
 // Antigravity can emit an accepted 16 KiB Google authorization URL on stderr.
 const maxStderrChunkLength = 32_768;
@@ -1347,25 +1348,32 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
     options.requestLogger ? options.requestLogger(event) : Effect.void;
 
   // Request records are written one at a time, in the order they are produced; requests go out
-  // without waiting for them, and a call returns once its records are written. A record still
-  // pending when the runtime closes is dropped and counted in a warning, so a logger that never
-  // completes cannot hold the close.
+  // without waiting for them, and a call returns once its records are written. At close, pending
+  // records get a short wall-clock grace (a slow logger keeps them) and are then dropped and
+  // counted in a warning, so a logger that never completes cannot hold the close.
   const recordScope = yield* Scope.make();
   let lastRecord: Deferred.Deferred<void> | undefined;
   let droppedRecords = 0;
+  let recordsClosed = false;
   yield* Scope.addFinalizer(
     runtimeScope,
-    Scope.close(recordScope, Exit.void).pipe(
-      Effect.andThen(
-        Effect.suspend(() =>
-          droppedRecords === 0
-            ? Effect.void
-            : Effect.logWarning("Dropped native ACP request records when the runtime closed.", {
-                dropped: droppedRecords,
-              }),
-        ),
-      ),
-    ),
+    Effect.gen(function* () {
+      const tail = lastRecord;
+      if (tail !== undefined) {
+        yield* Deferred.await(tail).pipe(
+          Effect.exit,
+          Effect.timeoutOption(requestRecordCloseGrace),
+          withWallClock,
+        );
+      }
+      yield* Scope.close(recordScope, Exit.void);
+      recordsClosed = true;
+      if (droppedRecords > 0) {
+        yield* Effect.logWarning("Dropped native ACP request records when the runtime closed.", {
+          dropped: droppedRecords,
+        });
+      }
+    }),
   );
 
   /** Queues a record; the result settles once it is written (with the logger's exit) or not. */
@@ -1395,8 +1403,14 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         Effect.onExit((exit) =>
           Exit.isSuccess(exit)
             ? Deferred.done(written, exit.value)
-            : Effect.sync(() => {
+            : Effect.suspend(() => {
+                if (recordsClosed) {
+                  return Effect.logWarning(
+                    "Dropped a native ACP request record after the runtime closed.",
+                  );
+                }
                 droppedRecords += 1;
+                return Effect.void;
               }).pipe(Effect.andThen(Deferred.succeed(written, undefined))),
         ),
         Effect.forkIn(recordScope, { startImmediately: true }),

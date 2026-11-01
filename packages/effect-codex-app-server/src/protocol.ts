@@ -26,11 +26,14 @@ export interface CodexAppServerProtocolLogEvent {
   readonly payload: unknown;
 }
 
-/** Optional main-thread timing of incoming frames; unset costs nothing. */
+/**
+ * Optional main-thread timing of incoming frames; unset costs nothing. A line sent to a line
+ * offload records `offload` (its wait for the result) instead of `json`, which runs off-thread.
+ */
 export interface CodexAppServerStageTiming {
   readonly now: () => number;
   readonly record: (
-    stage: "framing" | "json" | "decode" | "adapter",
+    stage: "framing" | "json" | "decode" | "adapter" | "offload",
     elapsedMs: number,
     bytes: number,
   ) => void;
@@ -54,8 +57,8 @@ export interface CodexAppServerLineOffload {
   readonly decode: (
     line: string,
   ) => Effect.Effect<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
-  /** Appends an incoming log entry built off-thread. */
-  readonly writeLog: (payload: string) => Effect.Effect<void>;
+  /** Appends an incoming log record serialized off-thread. */
+  readonly writeLog: (record: CodexOffload.SerializedLogRecord) => Effect.Effect<void>;
   /** Fails when the offload stops working (its worker died); that error then ends the protocol. */
   readonly failure: Effect.Effect<never, CodexError.CodexAppServerError>;
 }
@@ -401,7 +404,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         return Effect.void;
       }
       if (lineOffload !== undefined && line.length >= lineOffload.minChars) {
-        return lineOffload.decode(line).pipe(
+        return (
+          timing === undefined
+            ? lineOffload.decode(line)
+            : timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () =>
+                lineOffload.decode(line),
+              )
+        ).pipe(
           Effect.flatMap((offloaded) =>
             offloaded._tag === "InThread"
               ? handleLineInThread(line)

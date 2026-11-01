@@ -8,6 +8,7 @@ import * as Stream from "effect/Stream";
 import { AcpTransportError } from "effect-acp/errors";
 import { CodexAppServerTransportError } from "effect-codex-app-server/errors";
 import type { AcpLineOffload } from "effect-acp/protocol";
+import type { SerializedLogRecord } from "effect-codex-app-server/offload";
 import type { CodexAppServerLineOffload } from "effect-codex-app-server/protocol";
 import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime";
 
@@ -21,9 +22,9 @@ import {
   ProviderIoWorkerPool,
 } from "./ProviderIoWorkerPool.ts";
 
-// Shorter lines cost main less in-thread than a worker round trip (P1-025 measurements).
-const DEFAULT_CODEX_OFFLOAD_MIN_CHARS = 2048;
-const DEFAULT_ACP_OFFLOAD_MIN_CHARS = 16384;
+// Below this a worker round trip can cost main more than the line itself when few sessions are
+// busy; above it the offload paid in every measurement (P1-025).
+const DEFAULT_OFFLOAD_MIN_CHARS = 64 * 1024;
 
 export interface CodexLineOffloadInput {
   /** Stops the app-server when its worker dies. */
@@ -31,7 +32,7 @@ export interface CodexLineOffloadInput {
   /** Set when incoming protocol events go to the native log. */
   readonly log?: {
     readonly providerSessionId: string;
-    readonly writeSerialized: (payload: string) => Effect.Effect<void>;
+    readonly writeSerialized: (record: SerializedLogRecord) => Effect.Effect<void>;
   };
 }
 
@@ -47,7 +48,8 @@ export class CodexLineOffloads extends Context.Service<
 >()("t3/provider/io/ProviderIoOffloads/CodexLineOffloads") {}
 
 // The line stages emit no outputs, so the output stream only fails: when the worker dies. The
-// child is killed only after that failure is seen, so it explains the input end the kill causes.
+// child is killed only once that failure is seen (or the watch has ended with the session), so
+// the failure explains the input end the kill causes.
 const openLineSession = Effect.fnUntraced(function* <Options, Reply, E>(
   pool: ProviderIoWorkerPool["Service"],
   input: {
@@ -58,17 +60,18 @@ const openLineSession = Effect.fnUntraced(function* <Options, Reply, E>(
   },
 ) {
   const failed = yield* Deferred.make<never, E>();
-  // Opening fails only for options that do not clone; these stages take plain data.
+  const watched = yield* Deferred.make<void>();
+  // Opening fails only on options a worker cannot receive; the session then stays in-thread.
   const session = yield* pool
-    .open({
-      ...input,
-      kill: Deferred.await(failed).pipe(Effect.ignore, Effect.andThen(input.kill)),
-    })
-    .pipe(Effect.orDie);
+    .open({ ...input, kill: Deferred.await(watched).pipe(Effect.andThen(input.kill)) })
+    .pipe(Effect.catch(() => Effect.succeedNone));
   if (Option.isNone(session)) return Option.none();
+  // Also on close: the scope can close before the watch below has started.
+  yield* Effect.addFinalizer(() => Deferred.succeed(watched, undefined));
   yield* session.value.output.pipe(
     Stream.runDrain,
     Effect.catch((error) => Deferred.fail(failed, error)),
+    Effect.ensuring(Deferred.succeed(watched, undefined)),
     Effect.forkScoped,
   );
   return Option.some({ call: session.value.call, failure: Deferred.await(failed) });
@@ -115,14 +118,25 @@ export const make = (pool: ProviderIoWorkerPool["Service"], minChars: LineOffloa
   }),
 });
 
+const openNothing = Effect.fnUntraced(function* () {
+  return Option.none<never>();
+});
+
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const pool = yield* ProviderIoWorkerPool;
     const config = yield* ServerConfig.ServerConfig;
-    const { codex, acp } = make(pool, {
-      codex: config.providerIoCodexOffloadMinChars ?? DEFAULT_CODEX_OFFLOAD_MIN_CHARS,
-      acp: config.providerIoAcpOffloadMinChars ?? DEFAULT_ACP_OFFLOAD_MIN_CHARS,
-    });
+    // Without workers, sessions open nothing at all.
+    const { codex, acp } =
+      (config.providerIoWorkers ?? 0) === 0
+        ? {
+            codex: CodexLineOffloads.of({ open: openNothing }),
+            acp: AcpLineOffloads.of({ open: openNothing }),
+          }
+        : make(pool, {
+            codex: config.providerIoCodexOffloadMinChars ?? DEFAULT_OFFLOAD_MIN_CHARS,
+            acp: config.providerIoAcpOffloadMinChars ?? DEFAULT_OFFLOAD_MIN_CHARS,
+          });
     return Layer.mergeAll(
       Layer.succeed(CodexLineOffloads, codex),
       Layer.succeed(AcpLineOffloads, acp),

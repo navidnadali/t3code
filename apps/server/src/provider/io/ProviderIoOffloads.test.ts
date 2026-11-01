@@ -10,6 +10,7 @@ import type * as ProviderEventLoggers from "@t3tools/provider-core/server/Provid
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -22,10 +23,12 @@ import * as AcpError from "effect-acp/errors";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexError from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
+import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { vi } from "vite-plus/test";
 
+import * as ServerConfig from "../../config.ts";
 import { makeCodexAppServerProtocolLogger } from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
-import { serializeEventNdjsonRecord } from "../EventNdjsonRecord.ts";
+import { serializedRecordProblem, serializeEventNdjsonRecord } from "../EventNdjsonRecord.ts";
 import * as ProviderIoOffloads from "./ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
 
@@ -173,9 +176,11 @@ const nativeLogger = (payloads: Array<string>): ProviderEventLoggers.EventNdjson
       const record = serializeEventNdjsonRecord("native", event);
       if (record._tag === "Serialized") payloads.push(record.payload);
     }),
+  // As the real view: a record serialized for another stream, or one write never builds, is refused.
   writeSerialized: (record) =>
     Effect.sync(() => {
-      payloads.push(record.payload);
+      const problem = serializedRecordProblem("native", record);
+      payloads.push(problem === undefined ? record.payload : `refused: ${problem}`);
     }),
   close: () => Effect.void,
 });
@@ -198,8 +203,7 @@ const runCodex = (
               kill: Effect.void,
               log: {
                 providerSessionId,
-                writeSerialized: (payload) =>
-                  native.writeSerialized!({ stream: "native", payload }, threadId),
+                writeSerialized: (record) => native.writeSerialized!(record, threadId),
               },
             }),
           );
@@ -466,5 +470,212 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
       }).pipe(Effect.scoped);
       assert.equal(workers.started.length - startedBefore, 2);
     }).pipe(Effect.scoped),
+  );
+
+  // Past about 2,400 nested objects main cannot read a clone back; at 30,000 the worker cannot send.
+  const nested = (shape: "objects" | "arrays", depth: number) =>
+    shape === "objects"
+      ? `${'{"a":'.repeat(depth)}1${"}".repeat(depth)}`
+      : `${"[".repeat(depth)}${"]".repeat(depth)}`;
+  const depthOf = (value: unknown) => {
+    let deepest = 0;
+    const stack: Array<readonly [unknown, number]> = [[value, 0]];
+    while (stack.length > 0) {
+      const [current, depth] = stack.pop()!;
+      if (typeof current !== "object" || current === null) continue;
+      deepest = Math.max(deepest, depth + 1);
+      for (const child of Object.values(current)) stack.push([child, depth + 1]);
+    }
+    return deepest;
+  };
+
+  // A session whose next line or termination is awaited, so a dead worker fails rather than hangs.
+  const codexLineSession = (
+    offloads: ReturnType<typeof ProviderIoOffloads.make> | undefined,
+    logs: Array<string>,
+  ) =>
+    Effect.gen(function* () {
+      const { input, stdio } = yield* makeStdio;
+      const native = nativeLogger(logs);
+      const lineOffload =
+        offloads === undefined
+          ? undefined
+          : Option.getOrThrow(
+              yield* offloads.codex.open({
+                kill: Effect.void,
+                log: {
+                  providerSessionId,
+                  writeSerialized: (record) => native.writeSerialized!(record, threadId),
+                },
+              }),
+            );
+      const client = yield* CodexClient.make(stdio, {
+        logIncoming: true,
+        logOutgoing: true,
+        logger: makeCodexAppServerProtocolLogger({
+          nativeEventLogger: native,
+          threadId,
+          providerSessionId: providerSessionId as never,
+        })!,
+        ...(lineOffload === undefined ? {} : { lineOffload }),
+      });
+      const received = yield* Queue.unbounded<unknown>();
+      yield* client.handleUnknownServerNotification((_method, params) =>
+        Queue.offer(received, params).pipe(Effect.asVoid),
+      );
+      const send = (params: string) =>
+        Queue.offer(input, encoder.encode(`{"method":"x/line","params":${params}}\n`));
+      const next = Effect.raceFirst(
+        Queue.take(received),
+        client.awaitTermination.pipe(
+          Effect.flip,
+          Effect.flatMap((error) => Effect.die(`Codex session ended: ${error._tag}`)),
+        ),
+      );
+      return { send, next };
+    });
+
+  const acpLineSession = (offloads: ReturnType<typeof ProviderIoOffloads.make> | undefined) =>
+    Effect.gen(function* () {
+      const { input, stdio } = yield* makeStdio;
+      const lineOffload =
+        offloads === undefined
+          ? undefined
+          : Option.getOrThrow(yield* offloads.acp.open({ kill: Effect.void }));
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      const client = yield* AcpClient.make(stdio, {
+        ...(lineOffload === undefined ? {} : { lineOffload }),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+      const received = yield* Queue.unbounded<unknown>();
+      yield* client.handleUnknownExtNotification((_method, params) =>
+        Queue.offer(received, params).pipe(Effect.asVoid),
+      );
+      const send = (params: string) =>
+        Queue.offer(
+          input,
+          encoder.encode(`{"jsonrpc":"2.0","method":"x/line","params":{"tree":${params}}}\n`),
+        );
+      const next = Effect.raceFirst(
+        Queue.take(received),
+        Deferred.await(terminated).pipe(
+          Effect.flatMap((error) => Effect.die(`ACP session ended: ${error._tag}`)),
+        ),
+      );
+      return { send, next };
+    });
+
+  it.effect.each([
+    ["codex", "objects", 3000],
+    ["codex", "arrays", 30_000],
+    ["acp", "objects", 3000],
+    ["acp", "arrays", 30_000],
+  ] as const)(
+    "%s: a line of %s nested %i deep gives the in-thread result and spares other sessions",
+    ([kind, shape, depth]) =>
+      Effect.gen(function* () {
+        const deep = nested(shape, depth);
+        const run = (offloads: ReturnType<typeof ProviderIoOffloads.make> | undefined) =>
+          Effect.gen(function* () {
+            const logs: Array<string> = [];
+            const session =
+              kind === "codex"
+                ? yield* codexLineSession(offloads, logs)
+                : yield* acpLineSession(offloads);
+            yield* session.send(deep);
+            const deepResult = depthOf(yield* session.next);
+            yield* session.send('"after"');
+            const after = yield* session.next;
+            return { deepResult, after, logs: logs.filter(isIncoming) };
+          });
+
+        const inThread = yield* run(undefined).pipe(Effect.scoped);
+        const offloaded = yield* Effect.gen(function* () {
+          const pool = yield* ProviderIoWorkerPool.make({ workers: 1 });
+          const offloads = ProviderIoOffloads.make(pool, { codex: 0, acp: 0 });
+          const codexBystander = yield* codexLineSession(offloads, []);
+          const acpBystander = yield* acpLineSession(offloads);
+          yield* codexBystander.send('"before"');
+          yield* acpBystander.send('"before"');
+          assert.equal(yield* codexBystander.next, "before");
+          assert.deepEqual(yield* acpBystander.next, { tree: "before" });
+
+          const result = yield* run(offloads);
+
+          yield* codexBystander.send('"still"');
+          yield* acpBystander.send('"still"');
+          assert.equal(yield* codexBystander.next, "still");
+          assert.deepEqual(yield* acpBystander.next, { tree: "still" });
+          return result;
+        }).pipe(Effect.scoped);
+
+        assert.equal(inThread.deepResult, kind === "codex" ? depth : depth + 1);
+        assert.deepStrictEqual(offloaded, inThread);
+      }),
+  );
+
+  it.effect.each([0, 1])(
+    "with %i workers the offload layer opens offloads only when there are workers",
+    (count) =>
+      Effect.gen(function* () {
+        const startedBefore = workers.started.length;
+        const config = {
+          providerIoWorkers: count,
+        } as unknown as ServerConfig.ServerConfig["Service"];
+        const opened = yield* Effect.gen(function* () {
+          const codex = yield* ProviderIoOffloads.CodexLineOffloads;
+          const acp = yield* AcpLineOffloads;
+          return [
+            Option.isSome(yield* codex.open({ kill: Effect.void })),
+            Option.isSome(yield* acp.open({ kill: Effect.void })),
+          ];
+        }).pipe(
+          Effect.provide(
+            ProviderIoOffloads.layer.pipe(
+              Layer.provideMerge(ProviderIoWorkerPool.layer),
+              Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+            ),
+          ),
+          Effect.scoped,
+        );
+        assert.deepEqual(opened, [count > 0, count > 0]);
+        assert.equal(workers.started.length - startedBefore, count);
+      }),
+  );
+
+  // The worker dies inside the session scope's close, after the offload's own finalizers ran.
+  it.effect.each(["after", "before"])(
+    "kills the child of a session whose worker dies while it closes, %s its failure watch started",
+    (when) =>
+      Effect.gen(function* () {
+        const startedBefore = workers.started.length;
+        const pool = yield* ProviderIoWorkerPool.make({ workers: 1 });
+        const dyingPool: ProviderIoWorkerPool.ProviderIoWorkerPool["Service"] = {
+          open: <Options, Output, E, Request = never, Reply = never>(
+            input: ProviderIoWorkerPool.ProviderIoOpenInput<Options, Output, E, Request, Reply>,
+          ) =>
+            pool
+              .open(input)
+              .pipe(
+                Effect.tap(() =>
+                  Effect.addFinalizer(() =>
+                    Effect.promise(() => workers.started[startedBefore]!.terminate()),
+                  ),
+                ),
+              ),
+        };
+        const offloads = ProviderIoOffloads.make(dyingPool, { codex: 0, acp: 0 });
+        const killed = yield* Deferred.make<void>();
+
+        yield* Effect.gen(function* () {
+          const offload = Option.getOrThrow(
+            yield* offloads.codex.open({ kill: Deferred.succeed(killed, undefined) }),
+          );
+          // A round trip lets the failure watch start; without it the scope closes first.
+          if (when === "after") yield* offload.decode('{"id":1,"result":{}}');
+        }).pipe(Effect.scoped);
+
+        yield* Deferred.await(killed);
+      }).pipe(Effect.scoped),
   );
 });

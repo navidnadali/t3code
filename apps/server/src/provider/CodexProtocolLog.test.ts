@@ -53,6 +53,8 @@ const keys = [
   "secretName",
   "ſecret",
   "id",
+  `${"k".repeat(300)}_token`,
+  "k".repeat(300),
 ];
 
 const payload = (salt: string) => ({

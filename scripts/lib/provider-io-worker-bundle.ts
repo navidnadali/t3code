@@ -4,9 +4,10 @@ import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import { Rolldown } from "vite-plus/pack";
 
-// The build sees only what Rolldown resolved, so the worker guards its loaders itself: any
-// built-in, lazily and however prefixed (`node:module` and `worker_threads` only as facades),
-// loader hooks that resolve and load nothing else, and the eval wrapper's globals deleted.
+// Threat model: bundled code must not resolve or load a module from the server's directory (nor
+// reach the main thread or native code); it is not a sandbox for hostile code. The build sees only
+// what Rolldown resolved, so the worker guards itself: built-ins only, through facades and loader
+// hooks, the eval wrapper's globals deleted, and process-level escapes refused.
 const guard = (code: string) => `"use strict";
 {
   const builtin = require;
@@ -36,8 +37,15 @@ const guard = (code: string) => `"use strict";
       }),
     ],
   ]);
-  // A REPL context holds the real Module class; the inspector can reach the main thread.
-  const refused = new Set(["node:repl", "node:inspector", "node:inspector/promises"]);
+  // A REPL context holds the real Module class, the inspector reaches the main thread, and ffi
+  // and sqlite (loadExtension) load native code.
+  const refused = new Set([
+    "node:repl",
+    "node:inspector",
+    "node:inspector/promises",
+    "node:ffi",
+    "node:sqlite",
+  ]);
   const allowed = (id) =>
     typeof id === "string" && NodeModule.isBuiltin(id) && !refused.has(prefixed(id));
   load = (id) => {
@@ -54,20 +62,32 @@ const guard = (code: string) => `"use strict";
       typeof url === "string" && url.startsWith("node:") ? nextLoad(url, context) : refuse(String(url)),
   });
   for (const name of ["module", "require", "exports", "__filename", "__dirname"]) delete globalThis[name];
-  for (const name of ["dlopen", "binding", "_linkedBinding"]) process[name] = () => refuse("process." + name);
+  for (const name of ["dlopen", "binding", "_linkedBinding", "execve"]) {
+    process[name] = () => refuse("process." + name);
+  }
   process.getBuiltinModule = load;
+  // A signal to this process or its group (SIGUSR1) would start main's inspector.
+  const kill = process.kill.bind(process);
+  process.kill = (pid, signal) =>
+    [process.pid, 0, -process.pid].includes(Number(pid))
+      ? refuse("a signal to its own process")
+      : kill(pid, signal);
+  // The bundle's text comes from a function that never runs, so it is not escaped into a string.
+  const text = function bundle() {
+${code}
+  }.toString();
   // Compiled in the global scope, so not even a direct eval in the bundle reaches these bindings.
   const run = new Function(
+    "exports",
     "require",
     "module",
-    "exports",
     "__filename",
     "__dirname",
-    ${JSON.stringify(`"use strict";
-${code}`)},
+    '"use strict";' + text.slice(text.indexOf("{") + 1, text.lastIndexOf("}")) +
+      "\\n//# sourceURL=t3-provider-io-worker.js",
   );
   const exported = { exports: {} };
-  run.call(exported.exports, load, exported, exported.exports, "", "");
+  run.call(exported.exports, exported.exports, load, exported, "", "");
 }
 `;
 

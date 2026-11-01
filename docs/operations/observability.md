@@ -723,12 +723,14 @@ threads that parse long lines of Codex app-server and ACP agent output off the m
 Codex, build their provider-log records. The main thread still reads and splits the output, decodes
 each message against its schema and handles the messages in order. Each worker uses about 17 MiB.
 
-- `T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS` (default `2048`): Codex lines at least this long go to
+- `T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS` (default `65536`): Codex lines at least this long go to
   a worker
-- `T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS` (default `16384`): the same for ACP lines; JSON-RPC
+- `T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS` (default `65536`): the same for ACP lines; JSON-RPC
   batches always stay on the main thread
 
-Shorter lines cost the main thread less to handle itself than to hand to a worker and take back.
+With few busy sessions, handing a shorter line to a worker and taking it back can cost the main
+thread more than handling it there. With `T3CODE_PROVIDER_IO_STAGE_TIMING=1`, every line sent to a
+worker is counted under the `offload` stage.
 
 ### The Kill Switch
 

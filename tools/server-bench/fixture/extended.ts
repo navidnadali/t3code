@@ -560,6 +560,28 @@ const walk = (root: unknown, report: (row: string) => void, leaves: Array<string
   }
 };
 
+/**
+ * False only when no rule can match text that is not JSON: none of the p1002 or EXTRA literals,
+ * no credential word any assignment, name=value or env-var rule starts from (case-insensitive),
+ * no PEM dashes, no mailgun-private shape, no base64 line, no ANSI escape (read as spaces). Lets
+ * callers skip the full rules on kept values, most of which hold none of these.
+ */
+const CREDENTIAL_WORDS =
+  /token|secret|pass|pwd|credential|key|auth|cookie|session|private|bearer|dsn|webhook/i;
+const MAILGUN_PRIVATE = /-[0-9a-f]{8}-[0-9a-f]{8}/;
+const B64_LINE_ANYWHERE = /^[ +-]?[A-Za-z0-9+/]{60,76}={0,2}$/m;
+export const extendedMayMatch = (text: string): boolean =>
+  text.includes("\x1b") ||
+  text[0] === "{" ||
+  text[0] === "[" ||
+  CREDENTIAL_WORDS.test(text) ||
+  RAW_HINT.test(text) ||
+  LOWER_HINT.test(asciiLower(text)) ||
+  EXTRA_HINT.test(text) ||
+  text.includes("-----") ||
+  MAILGUN_PRIVATE.test(text) ||
+  B64_LINE_ANYWHERE.test(text);
+
 /** Every finding in one stored value, by `scope|kind` row. */
 export const extendedFindings = (stored: string, report: (row: string) => void): void => {
   if (stored === "") return;

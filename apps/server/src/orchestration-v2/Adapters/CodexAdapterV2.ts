@@ -1493,10 +1493,8 @@ export const layerAppServerClientFactory: Layer.Layer<
                       : {
                           log: {
                             providerSessionId: input.providerSessionId,
-                            writeSerialized: (payload) =>
-                              writeSerialized({ stream: "native", payload }, input.threadId).pipe(
-                                Effect.ignore,
-                              ),
+                            writeSerialized: (record) =>
+                              writeSerialized(record, input.threadId).pipe(Effect.ignore),
                           },
                         }),
                   })

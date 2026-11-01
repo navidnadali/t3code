@@ -1145,6 +1145,107 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
     }),
   );
 
+  it.effect("times framing per chunk, json per short line and offload per long line", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const recorded: Array<readonly [string, number]> = [];
+      const routed = yield* Deferred.make<void>();
+      let count = 0;
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        stageTiming: {
+          now: () => 0,
+          record: (stage, _elapsedMs, bytes) => {
+            if (stage === "framing" || stage === "json" || stage === "offload") {
+              recorded.push([stage, bytes]);
+            }
+          },
+        },
+        lineOffload: makeOffload([]),
+        onNotification: () =>
+          Effect.suspend(() =>
+            ++count === 2 ? Deferred.succeed(routed, undefined) : Effect.void,
+          ).pipe(Effect.asVoid),
+      });
+
+      const chunk = encoder.encode(`${update("short")}\n${update(long)}\n`);
+      yield* Queue.offer(input, chunk);
+      yield* Deferred.await(routed);
+
+      assert.deepEqual(recorded, [
+        ["framing", chunk.byteLength],
+        ["json", update("short").length],
+        ["offload", update(long).length],
+      ]);
+    }),
+  );
+
+  it.effect("routes a batch with more messages than a call takes arguments", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const decoded = yield* Deferred.make<number>();
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        logIncoming: true,
+        logger: (event) =>
+          event.stage === "decoded" && event.direction === "incoming"
+            ? Deferred.succeed(decoded, (event.payload as ReadonlyArray<unknown>).length).pipe(
+                Effect.asVoid,
+              )
+            : Effect.void,
+        lineOffload: makeOffload([]),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+
+      const count = 200_000;
+      const batch = Array.from(
+        { length: count },
+        (_, id) => `{"jsonrpc":"2.0","id":${id},"result":null}`,
+      );
+      yield* Queue.offer(input, encoder.encode(`[${batch.join(",")}]\n`));
+
+      const outcome = yield* Effect.raceFirst(
+        Deferred.await(decoded),
+        Deferred.await(terminated).pipe(Effect.map((error) => error._tag)),
+      );
+      assert.strictEqual(outcome, count);
+    }),
+  );
+
+  it.effect("decodes a line on main when the offload hands it back", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const offloaded: Array<string> = [];
+      const routed = yield* Deferred.make<unknown>();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        lineOffload: {
+          minChars: 200,
+          decode: (line) =>
+            Effect.sync(() => {
+              offloaded.push(line);
+              return { _tag: "InThread" } as const;
+            }),
+          failure: Effect.never,
+        },
+        onNotification: (notification) =>
+          Deferred.succeed(routed, notification.params).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${update(long)}\n`));
+
+      assert.deepEqual(yield* Deferred.await(routed), {
+        sessionId: "session-1",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: long } },
+      });
+      assert.deepEqual(offloaded, [update(long)]);
+    }),
+  );
+
   it.effect.each(["main", "offload"])(
     "fails the chunk and routes none of it when a line fails to decode on %s",
     (where) =>

@@ -5,7 +5,7 @@ import * as NodeCrypto from "node:crypto";
 import * as Contracts from "../../../packages/contracts/src/index.ts";
 import type * as SchemaAST from "effect/SchemaAST";
 
-import { NAMEY, highEntropy } from "./extended.ts";
+import { NAMEY, extendedFindings, extendedMayMatch, highEntropy } from "./extended.ts";
 import { type NumberPlace, parseJsonContainer, rewriteJson } from "./json.ts";
 import { CREDENTIAL_NAME, redactDecoded, scanDecoded } from "./secrets.ts";
 
@@ -328,12 +328,15 @@ const keptFindings = (value: string, kept: Kept, key: string | null): Array<stri
   const findings = scanDecoded(value, { entropy: false });
   // P1-002's rule: a high-entropy value under a key/token/session/auth/… name is a credential.
   if (key !== null && NAMEY.test(key) && highEntropy(value)) findings.push("high-entropy");
+  // And P1-002's rules on the value alone: a random id can read as one (`…pWd:abcdefgh:1`).
+  if (extendedMayMatch(value)) extendedFindings(value, (row) => findings.push(row));
   return findings;
 };
 
 /** What an identifier key holds that disqualifies it: a pattern finding, or a token's shape. */
 const identifierFindings = (key: string) => {
   const findings = scanDecoded(key, { entropy: false });
+  if (extendedMayMatch(key)) extendedFindings(key, (row) => findings.push(row));
   if (tokenLikeKey(key)) findings.push("key");
   return findings;
 };

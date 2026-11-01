@@ -882,13 +882,14 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
               Effect.andThen(Deferred.await(release)),
               Effect.as(
                 CodexOffload.decodeOffloadedLine(line, (event) => ({
+                  stream: "native",
                   payload: `${event.stage}:${JSON.stringify(event.payload).length}`,
                 })),
               ),
             ),
-          writeLog: (payload) =>
+          writeLog: (record) =>
             Effect.sync(() => {
-              written.push(payload);
+              written.push(`${record.stream}/${record.payload}`);
             }),
           failure: Effect.never,
         },
@@ -916,8 +917,8 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
         { method: "x/last", params: {} },
       ]);
       assert.deepEqual(written, [
-        `raw:${JSON.stringify(longLine).length}`,
-        `decoded:${longLine.length}`,
+        `native/raw:${JSON.stringify(longLine).length}`,
+        `native/decoded:${longLine.length}`,
       ]);
       assert.deepEqual(
         logged.map(({ stage, payload }) => [stage, payload]),
@@ -962,6 +963,42 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
         logged.map(({ stage }) => stage),
         ["raw", "decode_failed"],
       );
+    }),
+  );
+
+  it.effect("times a line sent off-thread as offload and a short line as json", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const recorded: Array<readonly [string, number]> = [];
+      const routed = yield* Deferred.make<void>();
+      let count = 0;
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        stageTiming: {
+          now: () => 0,
+          record: (stage, _elapsedMs, bytes) => {
+            if (stage !== "framing") recorded.push([stage, bytes]);
+          },
+        },
+        lineOffload: {
+          minChars: 64,
+          decode: (line) => Effect.succeed(CodexOffload.decodeOffloadedLine(line)),
+          writeLog: () => Effect.void,
+          failure: Effect.never,
+        },
+        onNotification: () =>
+          Effect.suspend(() =>
+            ++count === 2 ? Deferred.succeed(routed, undefined) : Effect.void,
+          ).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${shortLine("x/short")}\n${longLine}\n`));
+      yield* Deferred.await(routed);
+
+      assert.deepEqual(recorded, [
+        ["json", shortLine("x/short").length],
+        ["offload", longLine.length],
+      ]);
     }),
   );
 

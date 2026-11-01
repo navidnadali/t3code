@@ -19,8 +19,8 @@ export function codexProtocolLogRecord(
 }
 
 // Plain objects and arrays with nothing to redact come back as they are, so the native log
-// reuses the size check the adapter already made on them. Frames must hold plain data
-// properties only: the log reads the original again, so an accessor could hand it a secret.
+// reuses the size check made on them. Frames must hold plain data properties only: the log reads
+// the original again, so an accessor could hand it a secret.
 function redactCodexProtocolValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     const redacted = value.map(redactCodexProtocolValue);
@@ -74,6 +74,7 @@ function redactCodexProtocolValue(value: unknown): unknown {
 }
 
 const SENSITIVE_KEY_CACHE_LIMIT = 4096;
+const SENSITIVE_KEY_CACHE_MAX_LENGTH = 256;
 // Frames repeat a small set of keys; bounded because keys can also be data (e.g. paths).
 const sensitiveKeys = new Map<string, boolean>();
 
@@ -87,6 +88,7 @@ function isSensitiveCodexProtocolKey(key: string): boolean {
     normalized.endsWith("token") ||
     normalized.endsWith("password") ||
     normalized.endsWith("secret");
+  if (key.length > SENSITIVE_KEY_CACHE_MAX_LENGTH) return sensitive;
   if (sensitiveKeys.size >= SENSITIVE_KEY_CACHE_LIMIT) sensitiveKeys.clear();
   sensitiveKeys.set(key, sensitive);
   return sensitive;

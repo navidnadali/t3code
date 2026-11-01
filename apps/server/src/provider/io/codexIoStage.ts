@@ -4,6 +4,7 @@ import type { CodexAppServerProtocolLogEvent } from "effect-codex-app-server/pro
 import { codexProtocolLogRecord } from "../CodexProtocolLog.ts";
 import { serializeEventNdjsonRecord } from "../EventNdjsonRecord.ts";
 import type { ProviderIoStage } from "./providerIoProtocol.ts";
+import { MAX_OFFLOADED_RESULT_DEPTH, nestsDeeperThan } from "./resultDepth.ts";
 
 export interface CodexIoStageOptions {
   /** Set when incoming protocol events go to the native log. */
@@ -21,7 +22,7 @@ const logEntry = (
     case "Skipped":
       return "skip";
     case "Serialized":
-      return { payload: serialized.payload };
+      return { stream: serialized.stream, payload: serialized.payload };
     case "Failed":
       // Main logs it, so the logger reports the failure as it does today.
       return "in-thread";
@@ -45,7 +46,13 @@ export const codexIoStage: ProviderIoStage<
     return {
       push: () => {},
       end: () => {},
-      call: (line) => CodexOffload.decodeOffloadedLine(line, log),
+      call: (line) => {
+        const result = CodexOffload.decodeOffloadedLine(line, log);
+        return result._tag === "Decoded" &&
+          nestsDeeperThan(result.message, MAX_OFFLOADED_RESULT_DEPTH)
+          ? { _tag: "InThread" }
+          : result;
+      },
     };
   },
 };

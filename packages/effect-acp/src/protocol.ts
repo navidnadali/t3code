@@ -33,11 +33,14 @@ export interface AcpProtocolLogEvent {
   readonly payload: unknown;
 }
 
-/** Optional main-thread timing of incoming frames; unset costs nothing. */
+/**
+ * Optional main-thread timing of incoming frames; unset costs nothing. A line sent to a line
+ * offload records `offload` (its wait for the result) instead of `json`, which runs off-thread.
+ */
 export interface AcpStageTiming {
   readonly now: () => number;
   readonly record: (
-    stage: "framing" | "json" | "decode" | "logShape" | "adapter",
+    stage: "framing" | "json" | "decode" | "logShape" | "adapter" | "offload",
     elapsedMs: number,
     bytes: number,
   ) => void;
@@ -193,8 +196,18 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
 ): Effect.fn.Return<AcpPatchedProtocol, never, Scope.Scope> {
   const timing = options.stageTiming;
   const onNotification = options.onNotification;
-  const parser = AcpWire.makeStrictNdJsonRpcParser(timing);
   const lineOffload = options.lineOffload;
+  // With an offload, main splits each chunk and times that as framing; the parser sees lines.
+  const parser = AcpWire.makeStrictNdJsonRpcParser(
+    timing === undefined || lineOffload === undefined
+      ? timing
+      : {
+          now: timing.now,
+          record: (stage, elapsedMs, bytes) => {
+            if (stage !== "framing") timing.record(stage, elapsedMs, bytes);
+          },
+        },
+  );
   const splitLines = lineOffload === undefined ? undefined : AcpWire.makeLineSplitter();
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
@@ -681,21 +694,34 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     data: Uint8Array,
   ) {
     const messages: Array<AcpWire.WireMessage> = [];
-    for (const line of split(data)) {
+    const startedAt = timing?.now() ?? 0;
+    const lines = split(data);
+    timing?.record("framing", timing.now() - startedAt, data.byteLength);
+    // Not a spread: a JSON-RPC batch can hold more messages than a call takes arguments.
+    const append = (decoded: ReadonlyArray<AcpWire.WireMessage>) => {
+      for (const message of decoded) messages.push(message);
+    };
+    const decodeHere = (line: string) =>
+      Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`)).pipe(Effect.map(append));
+    for (const line of lines) {
       if (line.length < offload.minChars || AcpWire.isBatchLine(line)) {
-        messages.push(...(yield* Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`))));
+        yield* decodeHere(line);
         continue;
       }
-      const decoded = yield* offload.decode(line);
+      const decoded = yield* timing === undefined
+        ? offload.decode(line)
+        : timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () => offload.decode(line));
+      if (decoded._tag === "InThread") {
+        yield* decodeHere(line);
+        continue;
+      }
       if (decoded._tag === "Failed") {
         return yield* new AcpError.AcpProtocolParseError({
           operation: "decode-wire-message",
           cause: decoded.cause,
         });
       }
-      messages.push(
-        ...(yield* Effect.fromResult(AcpWire.normalizeOffloadedMessages(decoded.messages))),
-      );
+      append(yield* Effect.fromResult(AcpWire.normalizeOffloadedMessages(decoded.messages)));
     }
     return messages;
   });

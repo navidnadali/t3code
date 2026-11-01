@@ -13,6 +13,7 @@ import * as Stream from "effect/Stream";
 
 import * as CodexError from "./errors.ts";
 import { isJsonRpcId, isObject, JsonRpcResponseEnvelope, timeStage } from "./_internal/shared.ts";
+import type * as CodexOffload from "./offload.ts";
 import * as CodexWire from "./wire.ts";
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
@@ -25,11 +26,14 @@ export interface CodexAppServerProtocolLogEvent {
   readonly payload: unknown;
 }
 
-/** Optional main-thread timing of incoming frames; unset costs nothing. */
+/**
+ * Optional main-thread timing of incoming frames; unset costs nothing. A line sent to a line
+ * offload records `offload` (its wait for the result) instead of `json`, which runs off-thread.
+ */
 export interface CodexAppServerStageTiming {
   readonly now: () => number;
   readonly record: (
-    stage: "framing" | "json" | "decode" | "adapter",
+    stage: "framing" | "json" | "decode" | "adapter" | "offload",
     elapsedMs: number,
     bytes: number,
   ) => void;
@@ -46,8 +50,22 @@ export interface CodexAppServerIncomingRequest {
   readonly params?: unknown;
 }
 
+/** Parses long incoming lines and builds their log entries off the main thread. */
+export interface CodexAppServerLineOffload {
+  /** Lines at least this many characters long go off-thread; shorter ones cost less in-thread. */
+  readonly minChars: number;
+  readonly decode: (
+    line: string,
+  ) => Effect.Effect<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
+  /** Appends an incoming log record serialized off-thread. */
+  readonly writeLog: (record: CodexOffload.SerializedLogRecord) => Effect.Effect<void>;
+  /** Fails when the offload stops working (its worker died); that error then ends the protocol. */
+  readonly failure: Effect.Effect<never, CodexError.CodexAppServerError>;
+}
+
 export interface CodexAppServerPatchedProtocolOptions {
   readonly stdio: Stdio.Stdio;
+  readonly lineOffload?: CodexAppServerLineOffload;
   readonly terminationError?: Effect.Effect<CodexError.CodexAppServerError>;
   readonly logIncoming?: boolean;
   readonly logOutgoing?: boolean;
@@ -194,6 +212,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         Effect.andThen(Ref.set(pending, new Map())),
       );
 
+    const offloadFailure = options.lineOffload?.failure;
     const handleTermination = (classify: () => Effect.Effect<CodexError.CodexAppServerError>) =>
       Ref.modify(terminationHandled, (handled) => {
         if (handled) {
@@ -201,7 +220,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         }
         return [
           Effect.gen(function* () {
-            const error = yield* classify();
+            // A dead offload kills the process, so its error explains the input end that follows.
+            const error = yield* offloadFailure === undefined
+              ? classify()
+              : Effect.raceFirst(Effect.flip(offloadFailure), classify());
             yield* Ref.set(terminationFailure, Option.some(error));
             yield* failAllPending(error);
             yield* Queue.end(outgoing);
@@ -217,6 +239,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           true,
         ] as const;
       }).pipe(Effect.flatten);
+
+    if (offloadFailure !== undefined) {
+      yield* offloadFailure.pipe(
+        Effect.catch((error) => handleTermination(() => Effect.succeed(error))),
+        Effect.forkScoped,
+      );
+    }
 
     const offerOutgoing =
       /* Every protocol write reaches this helper; request spans cover the operation. */
@@ -369,11 +398,35 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       return yield* CodexError.CodexAppServerProtocolParseError.fromUnroutableMessage(message);
     });
 
+    const lineOffload = options.lineOffload;
     const handleLine = (line: string): Effect.Effect<void, CodexError.CodexAppServerError> => {
       if (line.trim().length === 0) {
         return Effect.void;
       }
-      return logProtocol({
+      if (lineOffload !== undefined && line.length >= lineOffload.minChars) {
+        return (
+          timing === undefined
+            ? lineOffload.decode(line)
+            : timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () =>
+                lineOffload.decode(line),
+              )
+        ).pipe(
+          Effect.flatMap((offloaded) =>
+            offloaded._tag === "InThread"
+              ? handleLineInThread(line)
+              : Effect.forEach(offloaded.logs ?? [], lineOffload.writeLog, {
+                  discard: true,
+                }).pipe(Effect.andThen(routeMessage(offloaded.message))),
+          ),
+        );
+      }
+      return handleLineInThread(line);
+    };
+
+    const handleLineInThread = (
+      line: string,
+    ): Effect.Effect<void, CodexError.CodexAppServerError> =>
+      logProtocol({
         direction: "incoming",
         stage: "raw",
         payload: line,
@@ -401,7 +454,6 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         ),
         Effect.flatMap(routeMessage),
       );
-    };
 
     yield* options.stdio.stdin.pipe(
       Stream.interruptWhen(Deferred.await(terminationSignal)),

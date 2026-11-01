@@ -51,6 +51,7 @@ import * as ProviderEventIngestor from "./orchestration-v2/ProviderEventIngestor
 import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as ResetCreditCoordinator from "./provider/resetCreditCoordinator.ts";
 import * as EventNdjsonLogger from "./provider/EventNdjsonLogger.ts";
+import * as ProviderIoOffloads from "./provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "./provider/io/ProviderIoWorkerPool.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderIoStageTiming from "@t3tools/provider-core/server/ProviderIoStageTiming";
@@ -660,7 +661,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       layerProviderEventLoggers,
-      ProviderIoWorkerPool.layer,
+      ProviderIoOffloads.layer.pipe(Layer.provideMerge(ProviderIoWorkerPool.layer)),
       ModelManifest.layerModelCatalog.pipe(Layer.provideMerge(ModelManifest.layer)),
       ResetCreditCoordinator.layer,
       ProviderLatestVersions.layer,

@@ -13,6 +13,7 @@ import { vi } from "vite-plus/test";
 
 import * as CodexError from "./errors.ts";
 import * as CodexProtocol from "./protocol.ts";
+import * as CodexOffload from "./offload.ts";
 import { makeInMemoryStdio } from "./_internal/stdio.ts";
 const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -850,5 +851,209 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
 
       assert.strictEqual(yield* Deferred.await(termination), exitError);
     }),
+  );
+});
+
+it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (it) => {
+  const longParams = { threadId: "t", turnId: "u", itemId: "i", delta: "x".repeat(80) };
+  const shortLine = (method: string) => JSON.stringify({ method, params: {} });
+  const longLine = JSON.stringify({ method: "item/agentMessage/delta", params: longParams });
+
+  it.effect("sends long lines off-thread, keeps short ones and routes them in stdout order", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const routed: Array<{ readonly method: string; readonly params?: unknown }> = [];
+      const logged: Array<CodexProtocol.CodexAppServerProtocolLogEvent> = [];
+      const written: Array<string> = [];
+      const offloaded = yield* Deferred.make<string>();
+      const release = yield* Deferred.make<void>();
+      const allRouted = yield* Deferred.make<void>();
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        logIncoming: true,
+        logger: (event) =>
+          Effect.sync(() => {
+            logged.push(event);
+          }),
+        lineOffload: {
+          minChars: 64,
+          decode: (line) =>
+            Deferred.succeed(offloaded, line).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(
+                CodexOffload.decodeOffloadedLine(line, (event) => ({
+                  stream: "native",
+                  payload: `${event.stage}:${JSON.stringify(event.payload).length}`,
+                })),
+              ),
+            ),
+          writeLog: (record) =>
+            Effect.sync(() => {
+              written.push(`${record.stream}/${record.payload}`);
+            }),
+          failure: Effect.never,
+        },
+        onNotification: (notification) =>
+          Effect.suspend(() => {
+            routed.push({ method: notification.method, params: notification.params });
+            return routed.length === 3 ? Deferred.succeed(allRouted, undefined) : Effect.void;
+          }).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${shortLine("x/first")}\n`));
+      yield* Queue.offer(input, encoder.encode(`${longLine}\n`));
+      assert.equal(yield* Deferred.await(offloaded), longLine);
+      // While the long line is off-thread, stdout is not read and nothing overtakes it.
+      yield* Queue.offer(input, encoder.encode(`${shortLine("x/last")}\n`));
+      assert.equal(yield* Queue.size(input), 1);
+      assert.deepEqual(routed, [{ method: "x/first", params: {} }]);
+
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(allRouted);
+
+      assert.deepEqual(routed, [
+        { method: "x/first", params: {} },
+        { method: "item/agentMessage/delta", params: longParams },
+        { method: "x/last", params: {} },
+      ]);
+      assert.deepEqual(written, [
+        `native/raw:${JSON.stringify(longLine).length}`,
+        `native/decoded:${longLine.length}`,
+      ]);
+      assert.deepEqual(
+        logged.map(({ stage, payload }) => [stage, payload]),
+        [
+          ["raw", shortLine("x/first")],
+          ["decoded", { method: "x/first", params: {} }],
+          ["raw", shortLine("x/last")],
+          ["decoded", { method: "x/last", params: {} }],
+        ],
+      );
+    }),
+  );
+
+  it.effect("handles a line the offload hands back exactly as an in-thread line", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const logged: Array<CodexProtocol.CodexAppServerProtocolLogEvent> = [];
+      const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const malformed = `{"method":"x/long","params":"${"y".repeat(80)}"`;
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        logIncoming: true,
+        logger: (event) =>
+          Effect.sync(() => {
+            logged.push(event);
+          }),
+        lineOffload: {
+          minChars: 64,
+          decode: (line) => Effect.succeed(CodexOffload.decodeOffloadedLine(line)),
+          writeLog: () => Effect.die("no log entries expected"),
+          failure: Effect.never,
+        },
+        onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${malformed}\n`));
+      const error = yield* Deferred.await(termination);
+
+      assert.instanceOf(error, CodexError.CodexAppServerProtocolParseError);
+      assert.equal(error.operation, "decode-wire-message");
+      assert.deepEqual(
+        logged.map(({ stage }) => stage),
+        ["raw", "decode_failed"],
+      );
+    }),
+  );
+
+  it.effect("times a line sent off-thread as offload and a short line as json", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const recorded: Array<readonly [string, number]> = [];
+      const routed = yield* Deferred.make<void>();
+      let count = 0;
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        stageTiming: {
+          now: () => 0,
+          record: (stage, _elapsedMs, bytes) => {
+            if (stage !== "framing") recorded.push([stage, bytes]);
+          },
+        },
+        lineOffload: {
+          minChars: 64,
+          decode: (line) => Effect.succeed(CodexOffload.decodeOffloadedLine(line)),
+          writeLog: () => Effect.void,
+          failure: Effect.never,
+        },
+        onNotification: () =>
+          Effect.suspend(() =>
+            ++count === 2 ? Deferred.succeed(routed, undefined) : Effect.void,
+          ).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${shortLine("x/short")}\n${longLine}\n`));
+      yield* Deferred.await(routed);
+
+      assert.deepEqual(recorded, [
+        ["json", shortLine("x/short").length],
+        ["offload", longLine.length],
+      ]);
+    }),
+  );
+
+  it.effect.each(["while it decodes a line", "before stdout closes", "after stdout closes"])(
+    "ends the protocol with the offload's error when its worker dies %s",
+    (when) =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+        const died = yield* Deferred.make<never, CodexError.CodexAppServerError>();
+        const classifying = yield* Deferred.make<void>();
+        const exited = yield* Deferred.make<CodexError.CodexAppServerError>();
+        const workerStopped = new CodexError.CodexAppServerTransportError({
+          operation: "read-input-stream",
+          cause: new Error("Provider I/O worker stopped."),
+        });
+        const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          terminationError: Deferred.succeed(classifying, undefined).pipe(
+            Effect.andThen(Deferred.await(exited)),
+          ),
+          lineOffload: {
+            minChars: 64,
+            decode: () => Deferred.await(died),
+            writeLog: () => Effect.void,
+            failure: Deferred.await(died),
+          },
+          onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+        });
+        const pending = yield* transport.request("thread/read", {}).pipe(Effect.forkScoped);
+        yield* Queue.take(output);
+
+        // The pool kills the process when the worker dies, which closes stdout.
+        const processExited = new CodexError.CodexAppServerProcessExitedError({ code: 143 });
+        if (when === "while it decodes a line") {
+          yield* Queue.offer(input, encoder.encode(`${longLine}\n`));
+          yield* Deferred.fail(died, workerStopped);
+        } else if (when === "before stdout closes") {
+          yield* Deferred.fail(died, workerStopped);
+          yield* Queue.end(input);
+        } else {
+          yield* Queue.end(input);
+          yield* Deferred.await(classifying);
+          yield* Deferred.fail(died, workerStopped);
+        }
+        yield* Deferred.succeed(exited, processExited);
+
+        assert.strictEqual(yield* Deferred.await(termination), workerStopped);
+        const failure = yield* Fiber.join(pending).pipe(
+          Effect.match({
+            onFailure: (error) => error,
+            onSuccess: () => assert.fail("Expected the pending request to fail"),
+          }),
+        );
+        assert.strictEqual(failure, workerStopped);
+      }),
   );
 });

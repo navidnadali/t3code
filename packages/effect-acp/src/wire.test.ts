@@ -90,3 +90,13 @@ it("decodes an idle state update carrying a prompt failure", () => {
   assert.deepEqual(AcpWire.decodeSessionUpdate(params), Result.succeed(params));
   assert.isTrue(Result.isFailure(AcpWire.decodeSessionUpdate({ sessionId: 1 })));
 });
+
+it("splits lines as the strict parser does and recognises JSON-RPC batches", () => {
+  const split = AcpWire.makeLineSplitter();
+  const bytes = encoder.encode('{"a":"hé"}\n \t[1]\n{"b":');
+  assert.deepEqual(split(bytes.subarray(0, 8)), []);
+  assert.deepEqual(split(bytes.subarray(8)), ['{"a":"hé"}', " \t[1]"]);
+  assert.deepEqual(split("2}\n"), ['{"b":2}']);
+  assert.isTrue(AcpWire.isBatchLine(" \t\r[{}]"));
+  assert.isFalse(AcpWire.isBatchLine('{"a":[1]}'));
+});

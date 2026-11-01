@@ -718,6 +718,20 @@ SIGBUS and terminates the process. CLI commands that open the database, such as 
 `t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
 as well as the server.
 
+Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
+threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for
+Codex, build their provider-log records. The main thread still reads and splits the output, decodes
+each message against its schema and handles the messages in order. Each worker uses about 17 MiB.
+
+- `T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS` (default `65536`): Codex lines at least this long go to
+  a worker
+- `T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS` (default `65536`): the same for ACP lines; JSON-RPC
+  batches always stay on the main thread
+
+With few busy sessions, handing a shorter line to a worker and taking it back can cost the main
+thread more than handling it there. With `T3CODE_PROVIDER_IO_STAGE_TIMING=1`, every line sent to a
+worker is counted under the `offload` stage.
+
 ### The Kill Switch
 
 `T3CODE_OTEL_SDK_DISABLED` and `OTEL_SDK_DISABLED` turn off every OTLP export in both the server and

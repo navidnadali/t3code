@@ -113,3 +113,31 @@ function normalizeAcpJsonRpcError(message: WireMessage): WireMessage {
     },
   };
 }
+
+/** Splits stdout into complete lines as `makeStrictNdJsonRpcParser` does. */
+export const makeLineSplitter = () => {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return (bytes: Uint8Array | string): ReadonlyArray<string> => {
+    buffer += typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    return lines;
+  };
+};
+
+/** A JSON-RPC batch: its request ids are state the encoder of the responses must hold. */
+export const isBatchLine = (line: string) => /^[ \t\r]*\[/.test(line);
+
+/** Finishes the messages of a line `makeOffloadedLineDecoder` decoded, as `decodeWireChunk` does. */
+export const normalizeOffloadedMessages = (
+  messages: ReadonlyArray<WireMessage>,
+): Result.Result<ReadonlyArray<WireMessage>, AcpError.AcpProtocolParseError> =>
+  Result.try({
+    try: () => messages.map(normalizeAcpJsonRpcError),
+    catch: (cause) =>
+      new AcpError.AcpProtocolParseError({
+        operation: "decode-wire-message",
+        cause,
+      }),
+  });

@@ -112,6 +112,8 @@ export class ServerConfig extends Context.Service<
     readonly sqliteReaderCacheSizeMb?: number | undefined;
     readonly sqliteMmapSizeMb?: number | undefined;
     readonly providerIoWorkers?: number | undefined;
+    readonly providerIoCodexOffloadMinChars?: number | undefined;
+    readonly providerIoAcpOffloadMinChars?: number | undefined;
   }
 >()("t3/config/ServerConfig") {
   static readonly layerTest = (

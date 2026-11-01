@@ -86,6 +86,9 @@ const bump = (counts: Record<string, number>, key: string) => {
   counts[key] = (counts[key] ?? 0) + 1;
 };
 
+/** Rows between turns of the event loop in the long passes: SIGINT and SIGTERM land between. */
+export const BATCH_ROWS = 2_000;
+
 const yieldToSignals = Effect.promise(
   () => new Promise<void>((resolve) => setImmediate(() => resolve())),
 );
@@ -125,8 +128,11 @@ const reportBlankStep = (step: BlankStep) =>
  * P1-002's extended check (`fixture/extended.ts`) on every value of every table, the search
  * index's shadow tables included: `table:scope|kind` counts. A gate beside the self-check.
  */
-export const extendedTables = (db: NodeSqlite.DatabaseSync): Record<string, number> => {
+export const extendedTables = function* (
+  db: NodeSqlite.DatabaseSync,
+): Generator<void, Record<string, number>> {
   const rows: Record<string, number> = {};
+  let seen = 0;
   const tables = db
     .prepare(
       `SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
@@ -152,6 +158,7 @@ export const extendedTables = (db: NodeSqlite.DatabaseSync): Record<string, numb
           extendedFindings(Buffer.from(value).toString("utf8"), report);
         }
       }
+      if (++seen % BATCH_ROWS === 0) yield;
     }
   }
   return rows;
@@ -169,7 +176,11 @@ export interface TableScan {
  * Every value of every table. Blank mode checks both layers: each string is allowlisted and
  * unflagged, or filler; keys are identifiers; BLOBs are zero. Redact mode runs the pattern layer.
  */
-export const scanTables = (db: NodeSqlite.DatabaseSync, mode: ContentMode): TableScan => {
+export const scanTables = function* (
+  db: NodeSqlite.DatabaseSync,
+  mode: ContentMode,
+): Generator<void, TableScan> {
+  let seen = 0;
   const hits: Record<string, number> = {};
   const notBlanked: Record<string, number> = {};
   const credentialColumns: Record<string, number> = {};
@@ -206,6 +217,7 @@ export const scanTables = (db: NodeSqlite.DatabaseSync, mode: ContentMode): Tabl
           bump(notBlanked, `${name}.${column}`);
         }
       });
+      if (++seen % BATCH_ROWS === 0) yield;
     }
   }
   return { hits, notBlanked, credentialColumns };
@@ -705,8 +717,8 @@ export const checkFixture = Effect.fn("fixture.check")(function* (path: string, 
   let tables: TableScan;
   let extendedHits: Record<string, number>;
   try {
-    tables = scanTables(db, mode);
-    extendedHits = extendedTables(db);
+    tables = yield* runSteps(scanTables(db, mode), "The content check failed");
+    extendedHits = yield* runSteps(extendedTables(db), "The extended check failed");
   } finally {
     db.close();
   }
@@ -847,7 +859,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
         )}`,
       );
     }
-    const readBefore = undecodableRows(scratch);
+    const readBefore = yield* runSteps(undecodableRows(scratch), "The decode check failed");
 
     yield* Console.log(
       mode === "blank"
@@ -867,7 +879,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
       reportBlankStep,
     ).pipe(Effect.ensuring(Effect.sync(() => rewriting.close())));
     yield* rebuildSearch.pipe(Effect.provide(database(scratch)));
-    const readAfter = undecodableRows(scratch);
+    const readAfter = yield* runSteps(undecodableRows(scratch), "The decode check failed");
     const broken: Record<string, number> = {};
     for (const row of readAfter) {
       if (!readBefore.has(row)) bump(broken, row.slice(0, row.lastIndexOf(":")));

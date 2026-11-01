@@ -176,11 +176,18 @@ const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 const withoutAnsi = (text: string) =>
   text.includes("\x1b") ? text.replace(ANSI, (code) => " ".repeat(code.length)) : text;
 
+/**
+ * A literal every token pattern's match contains: text without one cannot match any of them, so
+ * one pass here spares the 24 per-pattern passes over the text that holds none (most text).
+ */
+const TOKEN_HINT =
+  /-----BEGIN|gh[pousr]_|github_pat_|glpat-|sk-|AKIA|ASIA|AIza|ya29\.|xox|xapp-|hooks\.slack\.com\/services\/|ATATT|k_live_|npm_|hf_|SG\.|key-|tfe_|eyJ|[Bb]earer|[Bb]asic|:\/\//;
+
 /** Credential kinds found in one decoded string. */
 export const scanDecoded = (raw: string, options: DecodedScan): Array<string> => {
   const text = withoutAnsi(raw);
   const hits = new Set<string>();
-  for (const { name, pattern, confirm } of TOKEN_PATTERNS) {
+  for (const { name, pattern, confirm } of TOKEN_HINT.test(text) ? TOKEN_PATTERNS : []) {
     for (const match of text.matchAll(pattern)) {
       if (confirm === undefined || confirm(match)) {
         hits.add(name);
@@ -216,7 +223,7 @@ export const redactDecoded = (raw: string, options: DecodedScan): string => {
     const at = match.lastIndexOf(secret);
     return match.slice(0, at) + mask(secret) + match.slice(at + secret.length);
   };
-  for (const { pattern, confirm } of TOKEN_PATTERNS) {
+  for (const { pattern, confirm } of TOKEN_HINT.test(text) ? TOKEN_PATTERNS : []) {
     out = out.replace(pattern, (match: string, ...rest: Array<unknown>) => {
       if (confirm !== undefined) {
         const groups = rest.at(-1);

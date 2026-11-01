@@ -124,21 +124,20 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
+import * as ShellDeltaHub from "./orchestration-v2/ShellDeltaHub.ts";
 import {
   bufferShellLiveStream,
-  coalesceShellApplicationEvents,
   composeShellStreamWithEnrichment,
   dedupeShellEnrichment,
   loadOlderSettledThreadsPage,
   loadShellSnapshotParts,
+  projectShellDeltas,
   shellStreamItemFromEnrichmentRefresh,
-  shellStreamItemFromThreadShell,
   shellStreamItemsFromInitialSnapshot,
   loadSubscriberShellSnapshot,
   shellStreamItemsFromResumeSnapshot,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
-  toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
@@ -1032,6 +1031,8 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       shouldPublishShellApplicationEvent(stored, subagentThreadIds);
 
     const enrichmentChanges = yield* projectEnrichment.subscribeChanges;
+    // Subscribe before the snapshot or high-water read: the hub projects every later event once for all subscribers.
+    const shellDeltas = yield* (yield* ShellDeltaHub.ShellDeltaHub).subscribe;
     const loadProjectMetadataSnapshot = Effect.fn("ws.orchestrationV2.loadProjectMetadataSnapshot")(
       function* (snapshotSequence: number) {
         const enriched = yield* enrichProjectShells(yield* projects.listShells());
@@ -1073,49 +1074,14 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
       };
     });
-    const projectItem = Effect.fn("ws.orchestrationV2.projectShellItem")(function* (
-      stored: Extract<ShellApplicationEvent, { readonly aggregateKind: "project" }>,
-    ) {
-      if (stored.type === "project.deleted") {
-        return {
-          kind: "project.removed" as const,
-          sequence: stored.sequence,
-          projectId: stored.aggregateId,
-        };
-      }
-      const project = yield* projectService.getShell(stored.aggregateId);
-      return Option.match(project, {
-        onNone: () => ({
-          kind: "project.removed" as const,
-          sequence: stored.sequence,
-          projectId: stored.aggregateId,
-        }),
-        onSome: (value) => ({
-          kind: "project.updated" as const,
-          sequence: stored.sequence,
-          project: value,
-        }),
-      });
-    });
-
+    // Replay only; the live tail comes projected from the hub.
     const projectShellItems = Effect.fn("ws.orchestrationV2.projectShellItems")(function* (
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
-      return yield* Effect.forEach(
-        coalesceShellApplicationEvents(events),
-        (stored) =>
-          Effect.gen(function* () {
-            if ("aggregateKind" in stored) {
-              return yield* projectItem(stored);
-            }
-            const shell = yield* threadManagement.getThreadShellForEvent({
-              threadId: stored.event.threadId,
-              sequence: stored.sequence,
-            });
-            return shellStreamItemFromThreadShell({ stored, shell });
-          }),
-        { concurrency: 8 },
-      );
+      return yield* projectShellDeltas(events, {
+        threadShell: threadManagement.getThreadShellForEvent,
+        projectShell: projectService.getShell,
+      });
     });
 
     const toShellStream = <E, R>(stream: Stream.Stream<ShellApplicationEvent, E, R>) =>
@@ -1127,15 +1093,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       );
 
     const liveFrom = (afterSequence: number) =>
-      bufferShellLiveStream(
-        toShellStream(
-          applicationEvents.streamProjectedApplicationEvents({
-            afterSequence,
-            project: toShellApplicationEvent,
-            filter: filterSubagentTranscript,
-          }),
-        ),
-      );
+      bufferShellLiveStream(shellDeltas.stream(afterSequence));
 
     const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
       Stream.filter((change) => change.repositoryIdentityResolved),

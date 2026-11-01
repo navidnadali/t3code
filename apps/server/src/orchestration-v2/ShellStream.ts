@@ -26,6 +26,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/sql/SqlClient";
@@ -34,7 +35,13 @@ import * as Stream from "effect/Stream";
 import { bufferLatestLiveStream } from "./LiveStreamBudget.ts";
 import type { ActiveShellIndexEntry } from "./ProjectionStore.ts";
 
-type ShellDelta = Extract<OrchestrationV2ShellStreamItem, { readonly sequence: number }>;
+export type ShellDelta = Extract<OrchestrationV2ShellStreamItem, { readonly sequence: number }>;
+
+export interface VersionedShellDelta {
+  readonly item: ShellDelta;
+  /** `thread.updated` only: unchanged while the shell, `updatedAt` aside, matches the previous item for that thread. */
+  readonly version: number | undefined;
+}
 
 /** Snapshots, synchronization, and enrichment markers must bypass full-state coalescing. */
 export const bufferShellLiveStream = <E, R>(
@@ -627,7 +634,122 @@ export function shellStreamItemsFromResumeSnapshot(input: {
 
 const sameThreadShell = Schema.toEquivalence(ThreadShellSchema);
 
-const UNCHANGED_THREAD_SHELL_RESEND_MS = 5_000;
+export const UNCHANGED_THREAD_SHELL_RESEND_MS = 5_000;
+
+/**
+ * Stamps shared `thread.updated` items with a per-thread version that changes when the shell
+ * changed (`updatedAt` aside) since the previous item for that thread. Threads idle for twice the
+ * resend window are forgotten: every subscriber resends them anyway.
+ */
+export function makeThreadShellVersions() {
+  const latest = new Map<
+    ThreadId,
+    { readonly shell: OrchestrationV2ThreadShell; readonly version: number; readonly at: number }
+  >();
+  let next = 0;
+  return {
+    stamp(item: ShellDelta, now: number): number | undefined {
+      for (const [threadId, entry] of latest) {
+        if (now - entry.at <= 2 * UNCHANGED_THREAD_SHELL_RESEND_MS) break;
+        latest.delete(threadId);
+      }
+      if (item.kind === "thread.removed") {
+        latest.delete(item.threadId);
+        return undefined;
+      }
+      if (item.kind !== "thread.updated") return undefined;
+      const previous = latest.get(item.thread.id);
+      const version =
+        previous !== undefined &&
+        sameThreadShell({ ...item.thread, updatedAt: previous.shell.updatedAt }, previous.shell)
+          ? previous.version
+          : ++next;
+      latest.delete(item.thread.id);
+      latest.set(item.thread.id, { shell: item.thread, version, at: now });
+      return version;
+    },
+  };
+}
+
+/**
+ * Shared deltas for one subscriber: a thread's shell it got with the same version within the
+ * resend window is skipped, as `skipUnchangedThreadShells` decides by comparing the shells.
+ */
+export function skipUnchangedShellDeltas<E, R>(
+  stream: Stream.Stream<ReadonlyArray<VersionedShellDelta>, E, R>,
+): Stream.Stream<ShellDelta, E, R> {
+  return Stream.suspend(() => {
+    const lastSent = new Map<ThreadId, { readonly version: number; readonly sentAt: number }>();
+    return stream.pipe(
+      Stream.mapEffect((batch) =>
+        Effect.map(Clock.currentTimeMillis, (now) => {
+          const items: Array<ShellDelta> = [];
+          for (const { item, version } of batch) {
+            if (item.kind === "thread.removed") {
+              lastSent.delete(item.threadId);
+            } else if (item.kind === "thread.updated" && version !== undefined) {
+              const previous = lastSent.get(item.thread.id);
+              if (
+                previous !== undefined &&
+                previous.version === version &&
+                now - previous.sentAt < UNCHANGED_THREAD_SHELL_RESEND_MS
+              ) {
+                continue;
+              }
+              lastSent.set(item.thread.id, { version, sentAt: now });
+            }
+            items.push(item);
+          }
+          return items;
+        }),
+      ),
+      Stream.flatMap(Stream.fromIterable),
+    );
+  });
+}
+
+/** One item per coalesced event; each thread's or project's shell is read once for the batch. */
+export const projectShellDeltas = <E1, E2>(
+  events: ReadonlyArray<ShellApplicationEvent>,
+  read: {
+    readonly threadShell: (input: {
+      readonly threadId: ThreadId;
+      readonly sequence: number;
+    }) => Effect.Effect<OrchestrationV2ThreadShell | null, E1>;
+    readonly projectShell: (
+      projectId: ProjectId,
+    ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, E2>;
+  },
+): Effect.Effect<ReadonlyArray<ShellDelta>, E1 | E2> =>
+  Effect.forEach(
+    coalesceShellApplicationEvents(events),
+    (stored): Effect.Effect<ShellDelta, E1 | E2> => {
+      if (!("aggregateKind" in stored)) {
+        return read
+          .threadShell({ threadId: stored.event.threadId, sequence: stored.sequence })
+          .pipe(Effect.map((shell) => shellStreamItemFromThreadShell({ stored, shell })));
+      }
+      const removed = {
+        kind: "project.removed" as const,
+        sequence: stored.sequence,
+        projectId: stored.aggregateId,
+      };
+      if (stored.type === "project.deleted") return Effect.succeed(removed);
+      return read.projectShell(stored.aggregateId).pipe(
+        Effect.map(
+          Option.match({
+            onNone: () => removed,
+            onSome: (project) => ({
+              kind: "project.updated" as const,
+              sequence: stored.sequence,
+              project,
+            }),
+          }),
+        ),
+      );
+    },
+    { concurrency: 8 },
+  );
 
 /** Resend unchanged shells after UNCHANGED_THREAD_SHELL_RESEND_MS so skipped deltas cannot leave resume cursors behind. */
 export function skipUnchangedThreadShells<A extends OrchestrationV2ShellStreamItem, E, R>(

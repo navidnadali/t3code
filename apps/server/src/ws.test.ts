@@ -14,6 +14,7 @@ import {
   WS_METHODS,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
+  type OrchestrationV2ShellStreamItem,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadShell,
   type OrchestrationProjectShell,
@@ -21,13 +22,16 @@ import {
   type ServerConfigStreamEvent,
   type ServerProvider,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
@@ -122,6 +126,8 @@ import * as ProjectionMaintenance from "./orchestration-v2/ProjectionMaintenance
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
+import * as ShellDeltaHub from "./orchestration-v2/ShellDeltaHub.ts";
+import { UNCHANGED_THREAD_SHELL_RESEND_MS } from "./orchestration-v2/ShellStream.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
@@ -317,6 +323,7 @@ it.live.each(["thread", "shell"] as const)(
             }).pipe(Effect.flatMap(consume));
       });
       const items = yield* subscription.pipe(
+        Effect.provide(ShellDeltaHub.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getShellSnapshot: () => Effect.die("shell resume must not load a full snapshot"),
@@ -562,7 +569,9 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
       subscribeOrchestrationV2Shell(input).pipe(
         Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
         Effect.map(([item]) => (item?.kind === "snapshot" ? item.snapshot : null)),
+        Effect.provide(ShellDeltaHub.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
+          listActiveSubagentThreadIds: () => Effect.succeed([]),
           listActiveShellIndex: () =>
             Effect.succeed(
               threads.map((thread) => ({
@@ -659,16 +668,21 @@ it.effect("shell subscribers share one thread shell read per event", () =>
       concurrency: "unbounded",
     }).pipe(
       Effect.provide(
-        ThreadManagement.layer.pipe(
-          Layer.provide(
-            Layer.mock(Orchestrator.OrchestratorV2)({
-              listActiveSubagentThreadIds: () => Effect.succeed([]),
-              getThreadShell: (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
-            }),
+        ShellDeltaHub.layer.pipe(
+          Layer.provideMerge(
+            ThreadManagement.layer.pipe(
+              Layer.provide(
+                Layer.mock(Orchestrator.OrchestratorV2)({
+                  listActiveSubagentThreadIds: () => Effect.succeed([]),
+                  getThreadShell: (id) =>
+                    Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
+                }),
+              ),
+              Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+              Layer.provide(ServerSettings.layerTest()),
+              Layer.provide(CommandReceiptStore.layer),
+            ),
           ),
-          Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-          Layer.provide(ServerSettings.layerTest()),
-          Layer.provide(CommandReceiptStore.layer),
         ),
       ),
       Effect.provideService(ProjectStore.ProjectStoreV2, {
@@ -702,8 +716,244 @@ it.effect("shell subscribers share one thread shell read per event", () =>
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
+// The shell delta hub over mocked shell reads; `onStart` runs when the hub subscribes to committed events.
+const layerShellSubscribers = (input: {
+  readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
+  readonly onStart?: () => void;
+}) =>
+  ShellDeltaHub.layer.pipe(
+    Layer.provide(
+      Layer.effect(
+        OrchestrationEventStore.OrchestrationEventStore,
+        Effect.gen(function* () {
+          const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+          return {
+            ...store,
+            subscribeCommitted: Effect.tap(store.subscribeCommitted, () =>
+              Effect.sync(() => input.onStart?.()),
+            ),
+          };
+        }),
+      ),
+    ),
+    Layer.provideMerge(
+      ThreadManagement.layer.pipe(
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            listActiveSubagentThreadIds: () => Effect.succeed([]),
+            getThreadShell: input.getThreadShell,
+          }),
+        ),
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(CommandReceiptStore.layer),
+      ),
+    ),
+    Layer.provideMerge(
+      Layer.succeed(ProjectStore.ProjectStoreV2, {
+        listShells: () => Effect.succeed([]),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+    ),
+    Layer.provideMerge(
+      Layer.succeed(ProjectService.ProjectService, {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"]),
+    ),
+    Layer.provideMerge(
+      Layer.effect(
+        ProjectEnrichment.ProjectEnrichmentService,
+        PubSub.unbounded().pipe(
+          Effect.map(
+            (changes) =>
+              ({
+                subscribeChanges: PubSub.subscribe(changes),
+              }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+          ),
+        ),
+      ),
+    ),
+  );
+
+const insertShellEvent = (sql: SqlClient.SqlClient, threadId: ThreadId, version: number) => {
+  const now = "2026-10-31T00:00:00.000Z";
+  return sql<{ sequence: number }>`
+    INSERT INTO orchestration_events (
+      event_id, aggregate_kind, stream_id, stream_version, event_type,
+      occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+    ) VALUES (
+      ${`${threadId}:${version}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+      ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:hub", detachedAt: now })},
+      '{}', 2
+    ) RETURNING sequence
+  `.pipe(Effect.map(([row]) => row!.sequence));
+};
+
+// Commits and publishes one event, then lets the hub's batch window pass.
+const publishShellEvent = (sql: SqlClient.SqlClient, threadId: ThreadId, version: number) =>
+  Effect.gen(function* () {
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const sequence = yield* insertShellEvent(sql, threadId, version);
+    const events = yield* store
+      .readApplicationEvents({ afterSequence: sequence - 1, throughSequence: sequence })
+      .pipe(Stream.runCollect);
+    yield* store.publishCommitted(events);
+    yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+    return sequence;
+  });
+
+// A shell subscriber resumed at `afterSequence`, drained into a queue once synchronized.
+const openShellSubscriber = (afterSequence: number) =>
+  Effect.gen(function* () {
+    const stream = yield* subscribeOrchestrationV2Shell({
+      afterSequence,
+      requestCompletionMarker: true,
+    });
+    const items = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
+    const exit = yield* Deferred.make<Exit.Exit<void, unknown>>();
+    yield* stream.pipe(
+      Stream.runForEach((item) => Queue.offer(items, item)),
+      Effect.exit,
+      Effect.flatMap((result) => Deferred.succeed(exit, result)),
+      Effect.forkScoped,
+    );
+    while ((yield* Queue.take(items)).kind !== "synchronized") {
+      // drain the replay
+    }
+    return { items, exit };
+  });
+
+const threadUpdate = (item: OrchestrationV2ShellStreamItem) =>
+  item.kind === "thread.updated" ? [item.sequence, item.thread.id] : item.kind;
+
+it.effect("live shell deltas are projected once and shared by every shell subscriber", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shell-hub:shared");
+    const seeded = yield* insertShellEvent(sql, threadId, 0);
+    const reads: Array<ThreadId> = [];
+    const shell = { id: threadId, archivedAt: null } as unknown as OrchestrationV2ThreadShell;
+    yield* Effect.gen(function* () {
+      const first = yield* openShellSubscriber(seeded);
+      const second = yield* openShellSubscriber(seeded);
+      const live = yield* publishShellEvent(sql, threadId, 1);
+      const a = yield* Queue.take(first.items);
+      const b = yield* Queue.take(second.items);
+      assert.strictEqual(a, b);
+      assert.deepEqual(threadUpdate(a), [live, threadId]);
+      assert.deepEqual(reads, [threadId]);
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("a shared unchanged shell is skipped per subscriber from its own first item", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shell-hub:unchanged");
+    const seeded = yield* insertShellEvent(sql, threadId, 0);
+    let reads = 0;
+    const shell = { id: threadId, archivedAt: null } as unknown as OrchestrationV2ThreadShell;
+    yield* Effect.gen(function* () {
+      const first = yield* openShellSubscriber(seeded);
+      const live1 = yield* publishShellEvent(sql, threadId, 1);
+      assert.deepEqual(threadUpdate(yield* Queue.take(first.items)), [live1, threadId]);
+      // Joins after the hub already sent this shell once: its snapshot predates nothing it is told.
+      const second = yield* openShellSubscriber(live1);
+      const live2 = yield* publishShellEvent(sql, threadId, 2);
+      assert.deepEqual(threadUpdate(yield* Queue.take(second.items)), [live2, threadId]);
+      assert.equal(yield* Queue.size(first.items), 0);
+      yield* TestClock.adjust(UNCHANGED_THREAD_SHELL_RESEND_MS);
+      const live3 = yield* publishShellEvent(sql, threadId, 3);
+      assert.deepEqual(threadUpdate(yield* Queue.take(first.items)), [live3, threadId]);
+      assert.deepEqual(threadUpdate(yield* Queue.take(second.items)), [live3, threadId]);
+      assert.equal(reads, 3);
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: () => Effect.sync(() => ++reads).pipe(Effect.as(shell)),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("the shell delta hub runs only while a shell subscriber exists", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shell-hub:lifecycle");
+    const seeded = yield* insertShellEvent(sql, threadId, 0);
+    let starts = 0;
+    yield* Effect.gen(function* () {
+      const first = yield* Scope.make();
+      const second = yield* Scope.make();
+      yield* openShellSubscriber(seeded).pipe(Scope.provide(first));
+      yield* openShellSubscriber(seeded).pipe(Scope.provide(second));
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 1);
+      yield* Scope.close(first, Exit.void);
+      yield* openShellSubscriber(seeded).pipe(Scope.provide(second));
+      assert.equal(starts, 1);
+      yield* Scope.close(second, Exit.void);
+      const third = yield* Scope.make();
+      yield* openShellSubscriber(seeded).pipe(Scope.provide(third));
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 2);
+      yield* Scope.close(third, Exit.void);
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: () => Effect.succeed(null),
+          onStart: () => {
+            starts += 1;
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("a failed shared shell read ends every shell subscriber's stream", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shell-hub:failure");
+    const seeded = yield* insertShellEvent(sql, threadId, 0);
+    yield* Effect.gen(function* () {
+      const first = yield* openShellSubscriber(seeded);
+      const second = yield* openShellSubscriber(seeded);
+      yield* publishShellEvent(sql, threadId, 1);
+      for (const subscriber of [first, second]) {
+        const exit = yield* Deferred.await(subscriber.exit);
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          const error = Cause.squash(exit.cause) as { readonly _tag?: string };
+          assert.equal(error._tag, "OrchestrationV2GetShellSnapshotError");
+        }
+        assert.equal(yield* Queue.size(subscriber.items), 0);
+      }
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: (id) =>
+            Effect.fail(
+              new Orchestrator.OrchestratorProjectionError({
+                threadId: id,
+                cause: new Error("reader gone"),
+              }),
+            ),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
+  Layer.mock(ShellDeltaHub.ShellDeltaHub)({}),
   Layer.mock(DocumentText.DocumentText)({}),
   Layer.mock(ServerSecretStore.ServerSecretStore)({}),
   Layer.mock(WorkspacePaths.WorkspacePaths)({}),

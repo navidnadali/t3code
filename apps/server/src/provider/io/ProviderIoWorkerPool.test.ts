@@ -1029,3 +1029,14 @@ it.effect("keeps an event a stage raises during push between the outputs around 
     }),
   ),
 );
+
+it.effect("takes no notification after its input ended", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const session = yield* openEcho(pool, "t");
+      assert.isTrue(session.notify("before the end"));
+      yield* session.end;
+      assert.isFalse(session.notify("after the end"));
+    }),
+  ),
+);

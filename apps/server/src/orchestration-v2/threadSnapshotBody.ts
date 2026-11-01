@@ -83,20 +83,29 @@ function* arrayParts(batches: Batches): Generator<string> {
   yield "[";
   let separator = "";
   for (const batch of batches) {
-    if (batch.length === 0) continue;
-    yield `${separator}${JSON.stringify(batch).slice(1, -1)}`;
-    separator = ",";
+    for (const element of batch) {
+      // A one-element array keeps JSON.stringify's array rules, such as null for undefined.
+      yield `${separator}${JSON.stringify([element]).slice(1, -1)}`;
+      separator = ",";
+    }
   }
   yield "]";
 }
+
+// Never between the halves of a surrogate pair, which would encode as two replacement characters.
+const chunkEnd = (text: string) => {
+  const last = text.charCodeAt(CHUNK_CHARS - 1);
+  return last >= 0xd800 && last <= 0xdbff ? CHUNK_CHARS - 1 : CHUNK_CHARS;
+};
 
 function* chunks(parts: Iterable<string>): Generator<Uint8Array> {
   let pending = "";
   for (const part of parts) {
     pending += part;
-    if (pending.length >= CHUNK_CHARS) {
-      yield Buffer.from(pending, "utf8");
-      pending = "";
+    while (pending.length >= CHUNK_CHARS) {
+      const end = chunkEnd(pending);
+      yield Buffer.from(pending.slice(0, end), "utf8");
+      pending = pending.slice(end);
     }
   }
   if (pending.length > 0) yield Buffer.from(pending, "utf8");

@@ -53,7 +53,11 @@ const referenceBody = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
 const streamedBody = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
   encodeThreadSnapshotBody(snapshot).pipe(
     Effect.flatMap(Stream.runCollect),
-    Effect.map((chunks) => ({ chunks: chunks.length, bytes: Buffer.concat([...chunks]) })),
+    Effect.map((chunks) => ({
+      chunks: chunks.length,
+      largestChunk: Math.max(...chunks.map((chunk) => chunk.byteLength)),
+      bytes: Buffer.concat([...chunks]),
+    })),
   );
 
 const threadCreated = (
@@ -255,6 +259,14 @@ const seed = Effect.gen(function* () {
     threadCreated(PARENT, at),
     runCreated(PARENT, parentRun, at),
     ...Array.from({ length: ITEMS }, (_, index) => item(PARENT, parentRun, index + 1, at)),
+    // Larger than a chunk, astral throughout, at both offsets: chunks split inside one member.
+    ...["", "x"].map((prefix, index) => {
+      const event = item(PARENT, parentRun, 1_000 * ITEMS + index * 4, at) as Extract<
+        OrchestrationV2DomainEvent,
+        { type: "turn-item.updated" }
+      >;
+      return { ...event, payload: { ...event.payload, input: prefix + "𝄞".repeat(600_000) } };
+    }),
     threadCreated(FORK, at, parentRun),
     ...Array.from({ length: 40 }, (_, index) => item(FORK, null, index + 1, at)),
   ];
@@ -279,8 +291,8 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
         const streamed = yield* streamedBody(snapshot);
         assert.isTrue(streamed.bytes.equals(referenceBody(snapshot)));
         if (threadId === PARENT) {
-          assert.strictEqual(snapshot.projection.turnItems.length, ITEMS);
-          assert.isAbove(streamed.chunks, 1);
+          assert.strictEqual(snapshot.projection.turnItems.length, ITEMS + 2);
+          assert.isAtMost(streamed.largestChunk, 1024 * 1024);
         } else {
           // Inherited rows hold parent items that are not in this thread's turn items.
           assert.isTrue(

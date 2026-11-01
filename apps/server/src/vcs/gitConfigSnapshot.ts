@@ -186,9 +186,9 @@ export interface GitConfigDependency {
    * content: any change. identity: a directory's identity (a file's content), for the `.git` Git
    * rewrites often. presence: whether it exists. absent: the snapshot holds only while it is missing,
    * for the markers that would make Git find another repository on the way up. physical: the path
-   * with symbolic links resolved.
+   * with symbolic links resolved. entry: like content, for the path itself when it is a symbolic link.
    */
-  readonly kind: "content" | "identity" | "presence" | "absent" | "physical";
+  readonly kind: "content" | "identity" | "presence" | "absent" | "physical" | "entry";
 }
 
 const dependencyKey = (dependency: GitConfigDependency) => `${dependency.kind}:${dependency.path}`;
@@ -206,7 +206,8 @@ const statFingerprint = (dependency: GitConfigDependency) =>
         );
         return;
       }
-      NodeFS.stat(dependency.path, { bigint: true }, (error, stats) => {
+      const stat = dependency.kind === "entry" ? NodeFS.lstat : NodeFS.stat;
+      stat(dependency.path, { bigint: true }, (error, stats) => {
         if (error) {
           resolve(`!${error.code ?? "error"}`);
           return;
@@ -305,12 +306,17 @@ const isReusableResult = (result: GitVcsDriver.ExecuteGitResult) =>
   !result.stdoutTruncated &&
   !result.stderrTruncated;
 
+// A loose ref that names another ("ref: ...", or a symbolic link Git reads relative to its directory).
 const readsSymbolicRef = (file: string) =>
   new Promise<boolean>((resolve) => {
     try {
-      NodeFS.readFile(file, (error, data) =>
-        resolve(error === null && data.subarray(0, 4).toString("latin1") === "ref:"),
-      );
+      NodeFS.lstat(file, (statError, stats) => {
+        if (statError) return resolve(false);
+        if (stats.isSymbolicLink()) return resolve(true);
+        NodeFS.readFile(file, (error, data) =>
+          resolve(error === null && data.subarray(0, 4).toString("latin1") === "ref:"),
+        );
+      });
     } catch {
       resolve(true);
     }
@@ -619,7 +625,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     commonDir: string,
     names: ReadonlyArray<string>,
   ): ReadonlyArray<GitConfigDependency> => [
-    ...names.map((name) => ({ path: path.join(commonDir, name), kind: "content" as const })),
+    ...names.map((name) => ({ path: path.join(commonDir, name), kind: "entry" as const })),
     { path: path.join(commonDir, "packed-refs"), kind: "content" },
   ];
 

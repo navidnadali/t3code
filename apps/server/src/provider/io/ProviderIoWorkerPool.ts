@@ -337,7 +337,8 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
         post({ type: "bytes", session: id, chunk });
         return;
       }
-      const copy = chunk.slice();
+      // Not `slice`: on a Buffer that is a view sharing the caller's memory.
+      const copy = new Uint8Array(chunk);
       post({ type: "bytes", session: id, chunk: copy }, [copy.buffer]);
     };
     const admit = () => {

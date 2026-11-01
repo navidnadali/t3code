@@ -31,18 +31,33 @@ export const decodeSessionUpdate = Schema.decodeUnknownResult(
 export const decodeElicitationComplete = Schema.decodeUnknownResult(
   AcpSchema.CompleteElicitationNotification,
 );
+/** Splits stdout into complete lines; `makeStrictNdJsonRpcParser` frames with it too. */
+export const makeLineSplitter = () => {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return (bytes: Uint8Array | string): ReadonlyArray<string> => {
+    const chunk = typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
+    const lastNewline = chunk.lastIndexOf("\n");
+    // Splitting the whole buffer per chunk is quadratic for multi-megabyte lines.
+    if (lastNewline === -1) {
+      buffer += chunk;
+      return [];
+    }
+    const lines = (buffer + chunk.slice(0, lastNewline)).split("\n");
+    buffer = chunk.slice(lastNewline + 1);
+    return lines;
+  };
+};
+
 // ndJsonRpc skips lines that are not JSON. A malformed agent line has to end the
 // session, so frames are split here and each one goes through the strict codec.
 export const makeStrictNdJsonRpcParser = (timing?: AcpStageTiming) => {
   const codec = RpcSerialization.jsonRpc().makeUnsafe();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const split = makeLineSplitter();
   return {
     decode: (bytes: Uint8Array | string): ReadonlyArray<unknown> => {
       const startedAt = timing?.now() ?? 0;
-      buffer += typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
+      const lines = split(bytes);
       if (timing === undefined) return lines.flatMap((line) => codec.decode(line));
       timing.record(
         "framing",
@@ -113,18 +128,6 @@ function normalizeAcpJsonRpcError(message: WireMessage): WireMessage {
     },
   };
 }
-
-/** Splits stdout into complete lines as `makeStrictNdJsonRpcParser` does. */
-export const makeLineSplitter = () => {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  return (bytes: Uint8Array | string): ReadonlyArray<string> => {
-    buffer += typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    return lines;
-  };
-};
 
 /** A JSON-RPC batch: its request ids are state the encoder of the responses must hold. */
 export const isBatchLine = (line: string) => /^[ \t\r]*\[/.test(line);

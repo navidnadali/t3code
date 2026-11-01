@@ -1067,31 +1067,6 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
-  it.effect("keeps Claude queries off the provider I/O workers unless opted in", () =>
-    Effect.gen(function* () {
-      const baseDir = yield* FileSystem.FileSystem.pipe(
-        Effect.flatMap((fs) =>
-          fs.makeTempDirectoryScoped({ prefix: "t3-cli-provider-io-claude-" }),
-        ),
-      );
-      const resolveOptIn = (env: Record<string, string>) =>
-        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
-          Effect.map((config) => config.providerIoClaudeSdk),
-          Effect.provide(
-            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
-          ),
-        );
-
-      expect(yield* resolveOptIn({})).toBeUndefined();
-      expect(yield* resolveOptIn({ T3CODE_PROVIDER_IO_CLAUDE_SDK: "1" })).toBe(true);
-      expect(yield* resolveOptIn({ T3CODE_PROVIDER_IO_CLAUDE_SDK: "false" })).toBe(false);
-      const error = yield* resolveOptIn({ T3CODE_PROVIDER_IO_CLAUDE_SDK: "maybe" }).pipe(
-        Effect.flip,
-      );
-      expect(String(error)).toContain('at ["T3CODE_PROVIDER_IO_CLAUDE_SDK"]');
-    }),
-  );
-
   it.effect(
     "reads the line lengths provider I/O workers parse from and refuses negative ones",
     () =>
@@ -1128,5 +1103,30 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           expect(error).toContain(`at ["${name}"]`);
         }
       }),
+  );
+
+  it.effect("keeps Claude queries off the provider I/O workers unless opted in", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) =>
+          fs.makeTempDirectoryScoped({ prefix: "t3-cli-provider-io-claude-" }),
+        ),
+      );
+      const resolveOptIn = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.providerIoClaudeSdk),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveOptIn({})).toBeUndefined();
+      expect(yield* resolveOptIn({ T3CODE_PROVIDER_IO_CLAUDE_SDK: "1" })).toBe(true);
+      expect(yield* resolveOptIn({ T3CODE_PROVIDER_IO_CLAUDE_SDK: "false" })).toBe(false);
+      const error = yield* resolveOptIn({ T3CODE_PROVIDER_IO_CLAUDE_SDK: "maybe" }).pipe(
+        Effect.flip,
+      );
+      expect(String(error)).toContain('at ["T3CODE_PROVIDER_IO_CLAUDE_SDK"]');
+    }),
   );
 });

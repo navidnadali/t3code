@@ -721,33 +721,31 @@ as well as the server.
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for
 Codex, build their provider-log records. The main thread still reads and splits the output, decodes
-each message against its schema and handles the messages in order. Each worker uses about 17 MiB.
+each message against its schema and handles the messages in order. If the workers fail to start,
+provider output stays on the main thread for the rest of the process, with one warning.
 
 - `T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS` (default `65536`): Codex lines at least this long go to
   a worker
 - `T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS` (default `65536`): the same for ACP lines; JSON-RPC
   batches always stay on the main thread
-- `T3CODE_PROVIDER_IO_CLAUDE_SDK` (default off): also run each Claude session's Agent SDK on those
-  workers; it does nothing while `T3CODE_PROVIDER_IO_WORKERS` is `0`. The server still starts,
-  watches, and stops the Claude CLI; a worker reads its output, and loads the SDK (about 50 MiB more)
-  for its first Claude session. A session whose launch settings the worker cannot reproduce (an
-  abort controller, hooks other than T3's own, a session store or other non-data options, an
-  in-process MCP server, or no Claude binary path) stays on the main thread.
 
 With few busy sessions, handing a shorter line to a worker and taking it back can cost the main
 thread more than handling it there. With `T3CODE_PROVIDER_IO_STAGE_TIMING=1`, every line sent to a
 worker is counted under the `offload` stage.
 
-A Claude session on a worker cannot ask you anything yet. Every question Claude would put to you is
-answered on the worker instead, and a warning is logged once per session and kind:
+Each idle worker uses about 48 MiB (a V8 heap of about 24 MiB). About 30 MiB of that is the Claude
+Agent SDK stage, which every worker carries even with `T3CODE_PROVIDER_IO_CLAUDE_SDK` off.
 
-- tool approval prompts are denied with "T3 Code cannot answer permission requests while Claude runs
-  in a provider I/O worker.", and so are `AskUserQuestion` and `ExitPlanMode`, which Claude asks
-  through the same prompt;
-- MCP elicitations are declined;
-- the resume-compaction dialog is cancelled;
-- the server's own handling of those prompts is skipped: no approval request or question appears in
-  the thread, and no tool row is started for it.
+`T3CODE_PROVIDER_IO_CLAUDE_SDK` (default off; nothing while `T3CODE_PROVIDER_IO_WORKERS` is `0`) also runs
+each Claude session's Agent SDK on those workers. The server still starts, watches, and stops the Claude CLI; a
+worker reads its output. A session whose launch settings the worker cannot reproduce (an abort controller, a
+session store or other non-data options, an in-process MCP server, or no Claude binary path) stays on the main
+thread. A worker that has run a Claude session uses about 16 MiB more, once the Agent SDK has loaded on it.
+
+A Claude session on a worker asks you what it would on the main thread: the worker passes each tool
+approval prompt, question, MCP elicitation, resume-compaction dialog and hook call to the server,
+which answers it as it does without workers, and passes on Claude's cancellation of one. The server
+handles such a request once it has handled the output Claude sent before it.
 
 ### The Kill Switch
 

@@ -209,10 +209,6 @@ const EnvServerConfig = Config.all({
     Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: PROVIDER_IO_MAX_WORKERS })),
     "T3CODE_PROVIDER_IO_WORKERS",
   ).pipe(Config.option, Config.map(Option.getOrUndefined)),
-  providerIoClaudeSdk: Config.Boolean("T3CODE_PROVIDER_IO_CLAUDE_SDK").pipe(
-    Config.option,
-    Config.map(Option.getOrUndefined),
-  ),
   providerIoCodexOffloadMinChars: Config.schema(
     Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
     "T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS",
@@ -221,6 +217,10 @@ const EnvServerConfig = Config.all({
     Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
     "T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS",
   ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  providerIoClaudeSdk: Config.Boolean("T3CODE_PROVIDER_IO_CLAUDE_SDK").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -576,15 +576,15 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     sqliteReaderCacheSizeMb: env.sqliteReaderCacheSizeMb,
     sqliteMmapSizeMb: env.sqliteMmapSizeMb,
     ...(env.providerIoWorkers === undefined ? {} : { providerIoWorkers: env.providerIoWorkers }),
-    ...(env.providerIoClaudeSdk === undefined
-      ? {}
-      : { providerIoClaudeSdk: env.providerIoClaudeSdk }),
     ...(env.providerIoCodexOffloadMinChars === undefined
       ? {}
       : { providerIoCodexOffloadMinChars: env.providerIoCodexOffloadMinChars }),
     ...(env.providerIoAcpOffloadMinChars === undefined
       ? {}
       : { providerIoAcpOffloadMinChars: env.providerIoAcpOffloadMinChars }),
+    ...(env.providerIoClaudeSdk === undefined
+      ? {}
+      : { providerIoClaudeSdk: env.providerIoClaudeSdk }),
   };
 
   return config;

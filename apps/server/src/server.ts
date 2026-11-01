@@ -662,7 +662,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       layerProviderEventLoggers,
-      Layer.mergeAll(ProviderIoOffloads.layer, layerClaudeAgentSdkWorkerPool).pipe(
+      Layer.mergeAll(layerClaudeAgentSdkWorkerPool, ProviderIoOffloads.layer).pipe(
         Layer.provideMerge(ProviderIoWorkerPool.layer),
       ),
       ModelManifest.layerModelCatalog.pipe(Layer.provideMerge(ModelManifest.layer)),

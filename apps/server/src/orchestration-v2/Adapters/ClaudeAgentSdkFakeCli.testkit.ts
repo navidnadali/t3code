@@ -20,6 +20,8 @@ export interface FakeClaudeCliOptions {
   readonly exitOnKill?: boolean;
   /** Delivers stdout in a later macrotask, as a pipe does, instead of within the current one. */
   readonly pipeLatency?: boolean;
+  /** With `pipeLatency`, starts a new read for each control request, after the pending one. */
+  readonly requestsInOwnRead?: boolean;
 }
 
 const defaultAnswer = (request: Record<string, unknown> & { readonly subtype: string }) => {
@@ -70,7 +72,8 @@ export class FakeClaudeCli extends NodeEvents.EventEmitter implements SpawnedPro
   readonly #pending = new Map<string, (answer: Record<string, unknown>) => void>();
   readonly #killWaiters = new Map<NodeJS.Signals, Array<() => void>>();
   #nextRequest = 0;
-  #unsent: Array<string> | undefined;
+  // Reads not yet delivered, each sent in its own macrotask.
+  readonly #unsent: Array<Array<string>> = [];
 
   constructor(options: FakeClaudeCliOptions = {}) {
     super();
@@ -92,23 +95,23 @@ export class FakeClaudeCli extends NodeEvents.EventEmitter implements SpawnedPro
     return this;
   };
 
-  write(message: unknown) {
+  write(message: unknown, options: { readonly ownRead?: boolean } = {}) {
     const line = `${JSON.stringify(message)}\n`;
     if (this.#options.pipeLatency !== true) {
       this.stdout.write(line);
       return;
     }
-    if (this.#unsent !== undefined) {
-      this.#unsent.push(line);
+    const pending = this.#unsent.at(-1);
+    if (pending !== undefined && options.ownRead !== true) {
+      pending.push(line);
       return;
     }
-    this.#unsent = [line];
+    this.#unsent.push([line]);
     setImmediate(() => this.#send());
   }
 
   #send() {
-    const lines = this.#unsent ?? [];
-    this.#unsent = undefined;
+    const lines = this.#unsent.shift() ?? [];
     if (this.exitCode === null && this.signalCode === null) this.stdout.write(lines.join(""));
   }
 
@@ -117,7 +120,10 @@ export class FakeClaudeCli extends NodeEvents.EventEmitter implements SpawnedPro
     const requestId = `cli-${this.#nextRequest++}`;
     return new Promise((resolve) => {
       this.#pending.set(requestId, resolve);
-      this.write({ type: "control_request", request_id: requestId, request });
+      this.write(
+        { type: "control_request", request_id: requestId, request },
+        { ownRead: this.#options.requestsInOwnRead === true },
+      );
     });
   }
 
@@ -154,7 +160,7 @@ export class FakeClaudeCli extends NodeEvents.EventEmitter implements SpawnedPro
 
   exit(code: number | null, signal: NodeJS.Signals | null) {
     if (this.exitCode !== null || this.signalCode !== null) return;
-    if (this.#unsent !== undefined) this.#send();
+    while (this.#unsent.length > 0) this.#send();
     this.exitCode = code;
     this.signalCode = signal;
     this.stdout.end();

@@ -3,6 +3,8 @@ import * as NodeEvents from "node:events";
 import * as NodeStream from "node:stream";
 
 import type {
+  HookCallback,
+  HookEvent,
   Options,
   Query,
   SDKMessage,
@@ -13,12 +15,13 @@ import type {
 
 import {
   CLAUDE_AGENT_SDK_STAGE,
+  type ClaudeAgentSdkCallbackCall,
   type ClaudeAgentSdkProcessError,
   type ClaudeAgentSdkStageOptions,
   type ClaudeAgentSdkWorkerCallback,
   type ClaudeAgentSdkWorkerEvent,
+  type ClaudeAgentSdkWorkerHooks,
   type ClaudeAgentSdkWorkerRequest,
-  REFUSED_PERMISSION_MESSAGE,
 } from "./claudeAgentSdkProtocol.ts";
 import type { ProviderIoStage, ProviderIoStageHost } from "./providerIoProtocol.ts";
 
@@ -118,52 +121,111 @@ const makePromptQueue = (): PromptQueue => {
 
 const loadClaudeAgentSdk = () => import("@anthropic-ai/claude-agent-sdk");
 
-const refusingCallbacks = (
-  refuse: ReadonlyArray<ClaudeAgentSdkWorkerCallback>,
-  signal: Signal,
-): Pick<Options, ClaudeAgentSdkWorkerCallback> => {
-  const refused = (callback: ClaudeAgentSdkWorkerCallback) => signal({ type: "refused", callback });
-  return {
-    ...(refuse.includes("canUseTool")
-      ? {
-          canUseTool: async () => {
-            refused("canUseTool");
-            return { behavior: "deny" as const, message: REFUSED_PERMISSION_MESSAGE };
-          },
-        }
-      : {}),
-    ...(refuse.includes("onElicitation")
-      ? {
-          onElicitation: async () => {
-            refused("onElicitation");
-            return { action: "decline" as const };
-          },
-        }
-      : {}),
-    ...(refuse.includes("onUserDialog")
-      ? {
-          onUserDialog: async () => {
-            refused("onUserDialog");
-            return { behavior: "cancelled" as const };
-          },
-        }
-      : {}),
-  };
-};
+interface PendingCallback {
+  readonly resolve: (result: unknown) => void;
+  readonly reject: (error: Error) => void;
+}
 
-const subagentStartHooks = (context: string): Pick<Options, "hooks"> => ({
-  hooks: {
-    SubagentStart: [
-      {
-        hooks: [
-          async () => ({
-            hookSpecificOutput: { hookEventName: "SubagentStart", additionalContext: context },
-          }),
-        ],
-      },
-    ],
-  },
-});
+const makeCallbackRelay = (signal: Signal, read: () => number) => {
+  const pending = new Map<number, PendingCallback>();
+  let nextId = 0;
+
+  // The SDK aborts a request the CLI cancels (or every one when it closes); main aborts its own.
+  const relay = (call: ClaudeAgentSdkCallbackCall, abort: AbortSignal) =>
+    new Promise<never>((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { resolve: resolve as (result: unknown) => void, reject });
+      signal({ type: "callback", id, after: read(), call });
+      const cancel = () => {
+        if (pending.has(id)) signal({ type: "callbackAbort", id });
+      };
+      if (abort.aborted) cancel();
+      else abort.addEventListener("abort", cancel, { once: true });
+    });
+
+  const callbacks = (
+    names: ReadonlyArray<ClaudeAgentSdkWorkerCallback>,
+  ): Pick<Options, ClaudeAgentSdkWorkerCallback> => ({
+    ...(names.includes("canUseTool")
+      ? {
+          canUseTool: (toolName, input, { signal: abort, ...options }) =>
+            relay({ name: "canUseTool", args: [toolName, input, options] }, abort),
+        }
+      : {}),
+    ...(names.includes("onElicitation")
+      ? {
+          onElicitation: (request, { signal: abort, ...options }) =>
+            relay({ name: "onElicitation", args: [request, options] }, abort),
+        }
+      : {}),
+    ...(names.includes("onUserDialog")
+      ? {
+          onUserDialog: (request, { signal: abort, ...options }) =>
+            relay({ name: "onUserDialog", args: [request, options] }, abort),
+        }
+      : {}),
+  });
+
+  const hooks = (shape: ClaudeAgentSdkWorkerHooks): NonNullable<Options["hooks"]> =>
+    Object.fromEntries(
+      Object.entries(shape).map(([event, matchers]) => [
+        event,
+        matchers.map(({ hooks: count, ...matcher }, matcherIndex) => ({
+          ...matcher,
+          hooks: Array.from(
+            { length: count },
+            (_, index): HookCallback =>
+              (input, toolUseID, { signal: abort }) =>
+                relay(
+                  {
+                    name: "hook",
+                    hook: [event as HookEvent, matcherIndex, index],
+                    args: [input, toolUseID, {}],
+                  },
+                  abort,
+                ),
+          ),
+        })),
+      ]),
+    );
+
+  const settle = (request: Extract<ClaudeAgentSdkWorkerRequest, { readonly id: number }>) => {
+    const callback = pending.get(request.id);
+    if (callback === undefined) return;
+    pending.delete(request.id);
+    if (request.type === "callbackError") {
+      // The SDK writes an Error's message as its error field, so this one writes main's, or fails to.
+      const { json } = request;
+      const error = new Error();
+      Object.defineProperty(error, "message", {
+        value: {
+          toJSON: () => {
+            if (json === undefined) throw new TypeError("The callback's error cannot be written.");
+            return (JSON.parse(json) as { readonly error?: unknown }).error;
+          },
+        },
+      });
+      callback.reject(error);
+      return;
+    }
+    if (request.json === undefined) {
+      callback.resolve(null);
+      return;
+    }
+    // Whatever the SDK does with it (canUseTool's spread copies an own toJSON), it writes this.
+    const { response } = JSON.parse(request.json) as { readonly response?: unknown };
+    callback.resolve({ toJSON: () => response });
+  };
+
+  // Only after the query closed: the SDK sends nothing for a callback that settles then.
+  const drop = () => {
+    const callbacks = [...pending.values()];
+    pending.clear();
+    for (const callback of callbacks) callback.reject(new Error("The Claude query has closed."));
+  };
+
+  return { callbacks, hooks, settle, drop };
+};
 
 /** Runs the SDK's `query()` over a CLI that main spawns and owns; SDK messages are its outputs. */
 export const claudeAgentSdkStage: ProviderIoStage<
@@ -177,6 +239,8 @@ export const claudeAgentSdkStage: ProviderIoStage<
   open: (stageOptions, host?: ProviderIoStageHost<SDKMessage, ClaudeAgentSdkWorkerEvent>) => {
     if (host === undefined) throw new Error("The Claude Agent SDK stage runs only on a worker.");
     const prompts = makePromptQueue();
+    let read = 0;
+    const relay = makeCallbackRelay(host.signal, () => read);
     let child: FacadeProcess | undefined;
     let query: Query | undefined;
     // Main sends the close after every byte it read before closing; what comes later is unread.
@@ -197,6 +261,7 @@ export const claudeAgentSdkStage: ProviderIoStage<
         while (true) {
           const next = await running.next();
           if (next.done === true) break;
+          read += 1;
           host.emit(next.value);
         }
       } catch (error) {
@@ -212,10 +277,8 @@ export const claudeAgentSdkStage: ProviderIoStage<
         prompt: prompts.iterable,
         options: {
           ...stageOptions.options,
-          ...refusingCallbacks(stageOptions.refuse, host.signal),
-          ...(stageOptions.subagentStartContext === undefined
-            ? {}
-            : subagentStartHooks(stageOptions.subagentStartContext)),
+          ...relay.callbacks(stageOptions.callbacks),
+          ...(stageOptions.hooks === undefined ? {} : { hooks: relay.hooks(stageOptions.hooks) }),
           spawnClaudeCodeProcess,
         },
       });
@@ -274,6 +337,10 @@ export const claudeAgentSdkStage: ProviderIoStage<
         case "error":
           child?.failed(fromProcessError(request.error));
           return undefined;
+        case "callbackResult":
+        case "callbackError":
+          relay.settle(request);
+          return undefined;
       }
     };
 
@@ -288,6 +355,7 @@ export const claudeAgentSdkStage: ProviderIoStage<
       close: () => {
         prompts.end();
         query?.close();
+        relay.drop();
       },
     };
   },

@@ -11,7 +11,7 @@ import {
 import { ORCHESTRATOR_REPLAY_FIXTURES } from "./fixtures/index.ts";
 import { runReplayFixture } from "./ProviderReplayFixtures.ts";
 
-// The CLI asks these for a permission, which a worker refuses until P1-028 relays it to main.
+// The CLI asks these for a permission, which the worker relays to main.
 const PERMISSION_FIXTURES = new Set([
   "tool_call_denied_write",
   "tool_call_read_only_on_request",
@@ -176,41 +176,37 @@ const runAtWireLevel = ([name, fixture, provider]: Fixture, workers: 0 | 2) =>
   }).pipe(Effect.scoped);
 
 describe("Claude replay fixtures at the SDK wire level, in-thread and on provider I/O workers", () => {
-  it.effect.each(CLAUDE_FIXTURES.filter(([name]) => !PERMISSION_FIXTURES.has(name)))(
-    "replays %s identically with the SDK on 2 workers",
-    (fixture) =>
-      Effect.gen(function* () {
-        const [name] = fixture;
-        const inThread = yield* runAtWireLevel(fixture, 0);
-        const inWorker = yield* runAtWireLevel(fixture, 2);
+  it.effect.each(CLAUDE_FIXTURES)("replays %s identically with the SDK on 2 workers", (fixture) =>
+    Effect.gen(function* () {
+      const [name] = fixture;
+      const inThread = yield* runAtWireLevel(fixture, 0);
+      const inWorker = yield* runAtWireLevel(fixture, 2);
 
-        assert.isAbove(inWorker.opens.length, 0);
-        assert.isTrue(inWorker.opens.every((opened) => opened));
-        assert.isAbove(inThread.recording.adapterEvents.length, 0);
-        assert.deepStrictEqual(
-          comparable(inWorker.recording.adapterEvents),
-          comparable(inThread.recording.adapterEvents),
+      assert.isAbove(inWorker.opens.length, 0);
+      assert.isTrue(inWorker.opens.every((opened) => opened));
+      assert.isAbove(inThread.recording.adapterEvents.length, 0);
+      if (PERMISSION_FIXTURES.has(name)) {
+        assert.isTrue(
+          inThread.recording.adapterEvents.some(
+            (event) => event.type === "runtime_request.updated",
+          ),
         );
-        const ordered = !INTERLEAVED_WRITERS.has(name);
+      }
+      assert.deepStrictEqual(
+        comparable(inWorker.recording.adapterEvents),
+        comparable(inThread.recording.adapterEvents),
+      );
+      const ordered = !INTERLEAVED_WRITERS.has(name);
+      assert.deepStrictEqual(
+        byWriter(inWorker.result.storedEvents, { ordered }),
+        byWriter(inThread.result.storedEvents, { ordered }),
+      );
+      if (!TRAILING_FRAME_RACE.has(name)) {
         assert.deepStrictEqual(
-          byWriter(inWorker.result.storedEvents, { ordered }),
-          byWriter(inThread.result.storedEvents, { ordered }),
+          byDirection(inWorker.recording.protocolLogs),
+          byDirection(inThread.recording.protocolLogs),
         );
-        if (!TRAILING_FRAME_RACE.has(name)) {
-          assert.deepStrictEqual(
-            byDirection(inWorker.recording.protocolLogs),
-            byDirection(inThread.recording.protocolLogs),
-          );
-        }
-      }),
-  );
-
-  it.effect.each(CLAUDE_FIXTURES.filter(([name]) => PERMISSION_FIXTURES.has(name)))(
-    "replays %s in-thread at the wire level (its permission waits for P1-028 on a worker)",
-    (fixture) =>
-      Effect.gen(function* () {
-        const inThread = yield* runAtWireLevel(fixture, 0);
-        assert.isAbove(inThread.recording.adapterEvents.length, 0);
-      }),
+      }
+    }),
   );
 });

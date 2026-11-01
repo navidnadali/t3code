@@ -77,9 +77,12 @@ const layerWireReplayQueryRunner = (
           session === undefined
             ? Promise.reject(new Error("The replayed query has not opened."))
             : runPromise(effect(session));
+        // In-thread, how many frames read with a permission request the adapter has handled when it
+        // runs is a race; in its own read it comes after all of them, as a worker orders it.
         const cli = new FakeClaudeCli({
           exitOnStdinEnd: false,
           pipeLatency: true,
+          requestsInOwnRead: true,
           onUser: (frame) => {
             void call((replaying) => replaying.offer(frame as unknown as SDKUserMessage)).catch(
               () => {},

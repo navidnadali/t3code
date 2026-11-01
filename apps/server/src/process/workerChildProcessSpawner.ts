@@ -188,10 +188,13 @@ const makeRemoteHost = (options: {
   };
 
   // A child keeps the event loop alive as Node's handles do: until close, or until its
-  // output ends once unreferenced.
+  // output ends once unreferenced; and while a stdin write or kill awaits its answer.
   const updateHold = (entry: Entry) => {
     const { child } = entry;
-    const holds = !child.closed && (child.referenced || !(child.ended[0] && child.ended[1]));
+    const holds =
+      entry.stdinCallbacks.size > 0 ||
+      entry.killCallbacks.size > 0 ||
+      (!child.closed && (child.referenced || !(child.ended[0] && child.ended[1])));
     if (holds === entry.holdsLoop) return;
     entry.holdsLoop = holds;
     holding += holds ? 1 : -1;
@@ -206,6 +209,7 @@ const makeRemoteHost = (options: {
 
   // A closed child stays known until the transport has answered its stdin writes and kills.
   const forgetIfSettled = (entry: Entry) => {
+    updateHold(entry);
     if (entry.child.closed && entry.stdinCallbacks.size === 0 && entry.killCallbacks.size === 0) {
       entries.delete(entry.child.id);
     }
@@ -213,7 +217,6 @@ const makeRemoteHost = (options: {
 
   const remove = (entry: Entry) => {
     entry.child.closed = true;
-    updateHold(entry);
     forgetIfSettled(entry);
   };
 
@@ -356,8 +359,13 @@ const makeRemoteHost = (options: {
           if (generation === current) stop(cause);
         },
       });
-      if (generation === current) transport = opened;
-      else void opened.terminate();
+      if (generation !== current) {
+        void opened.terminate();
+        return;
+      }
+      transport = opened;
+      // Stopped children still holding the loop are released only after their callbacks ran.
+      if (holding > 0) opened.ref();
     } catch (error) {
       if (generation === current) stop(error);
     }
@@ -380,6 +388,7 @@ const makeRemoteHost = (options: {
       if (child.closed) return callback(reviveError(DESTROYED_STDIN));
       const seq = nextSeq++;
       stdinCallbacks.set(seq, callback);
+      updateHold(entry);
       if (message.chunk instanceof Uint8Array) {
         post({ ...message, t: "stdin", id, seq }, [message.chunk.buffer as ArrayBuffer]);
       } else {
@@ -452,6 +461,7 @@ const makeRemoteHost = (options: {
     }
     const seq = nextSeq++;
     entry.killCallbacks.set(seq, callback);
+    updateHold(entry);
     post({ t: "kill", id: child.id, seq, signal });
   };
 
@@ -609,13 +619,16 @@ const openSpawnerProcess =
       post: (message) => {
         if (spawner.connected) spawner.send(message as NodeChildProcess.Serializable);
       },
+      // Held while a command runs, until its spawner's replies and start reports are drained.
       ref: () => {
         spawner.ref();
         spawner.channel?.ref();
+        starts.ref();
       },
       unref: () => {
         spawner.unref();
         spawner.channel?.unref();
+        starts.unref();
       },
       terminate: () =>
         (terminated ??= new Promise<void>((resolve) => {

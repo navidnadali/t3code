@@ -1,9 +1,15 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import type { OrchestrationV2DomainEvent, ProviderReplayTranscript } from "@t3tools/contracts";
+import {
+  OrchestrationV2ThreadDetailSnapshot,
+  type OrchestrationV2DomainEvent,
+  type ProviderReplayTranscript,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
@@ -21,6 +27,8 @@ import {
   type OrchestratorV2ProviderReplayHarness,
 } from "./ProviderReplayHarness.ts";
 import { materializeReplayTranscriptRuntimeInstructions } from "./ReplayRuntimeInstructions.ts";
+import { encodeThreadSnapshotBody } from "../threadSnapshotBody.ts";
+import { projectThreadProjectionForWire } from "../WireProjection.ts";
 
 // Each driver's fixtures run from its own <Provider>ReplayFixtures.integration.test.ts,
 // so a focused run loads one adapter. A fixture for a driver missing here would
@@ -151,6 +159,18 @@ const runFixtureProvider = Effect.fn("runOrchestratorReplayFixture")(function* <
   ).pipe(provideDeterministicTestRuntime);
   input.driver.assertOutput(result, transcript);
   assertProviderNativeSubagentRootTurns(result);
+  for (const [threadId, projection] of result.projections) {
+    const snapshot = { snapshotSequence: 0, projection: projectThreadProjectionForWire(projection) };
+    const body = yield* encodeThreadSnapshotBody(snapshot).pipe(Effect.flatMap(Stream.runCollect));
+    assert.isTrue(
+      Buffer.concat([...body]).equals(
+        Buffer.from(
+          JSON.stringify(Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot)(snapshot)),
+        ),
+      ),
+      `${scenario.name}: the ${threadId} snapshot body must be JSON.stringify of its encoding`,
+    );
+  }
   const expectedAbsentWorkspacePaths = input.driver.expectedAbsentWorkspacePaths;
   if (expectedAbsentWorkspacePaths !== undefined) {
     yield* Effect.gen(function* () {

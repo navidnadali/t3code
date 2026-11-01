@@ -1,4 +1,5 @@
 import * as NodeWorkerThreads from "node:worker_threads";
+import * as NodeZlib from "node:zlib";
 
 import * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
@@ -16,7 +17,7 @@ import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
-import { embeddedProviderIoWorkerSource } from "./embeddedProviderIoWorker.ts";
+import { embeddedProviderIoWorkerBrotli } from "./embeddedProviderIoWorker.ts";
 import type {
   ProviderIoMainMessage,
   ProviderIoStage,
@@ -143,15 +144,18 @@ const describeMessageType = (message: unknown) =>
 
 const reasonOf = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
+// Inflated per worker, so a server whose pool is off never holds the source.
 const spawnWorker = () =>
-  embeddedProviderIoWorkerSource === undefined
+  embeddedProviderIoWorkerBrotli === undefined
     ? new NodeWorkerThreads.Worker(new URL("./providerIoWorker.ts", import.meta.url), {
         name: "t3-provider-io",
       })
-    : new NodeWorkerThreads.Worker(embeddedProviderIoWorkerSource, {
-        eval: true,
-        name: "t3-provider-io",
-      });
+    : new NodeWorkerThreads.Worker(
+        NodeZlib.brotliDecompressSync(
+          Buffer.from(embeddedProviderIoWorkerBrotli, "base64"),
+        ).toString("utf8"),
+        { eval: true, name: "t3-provider-io" },
+      );
 
 // Cloning a view copies its whole backing buffer, so only a chunk that owns its buffer is cloned;
 // any other is copied once and the copy transferred.

@@ -578,6 +578,59 @@ describe("WorkerChildProcessSpawner", () => {
   );
 
   it.live.skipIf(!workerPlatform)(
+    "a command retried as its spawner process stops keeps the server alive until it finishes",
+    () =>
+      Effect.gen(function* () {
+        // A fresh Node process: nothing but the retried command may keep it alive.
+        const script = `
+          import * as NodeServices from "@effect/platform-node/NodeServices";
+          import * as Effect from "effect/Effect";
+          import * as Layer from "effect/Layer";
+          import * as Logger from "effect/Logger";
+          import * as ChildProcess from "effect/process/ChildProcess";
+          import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
+          const loading = new MessageChannel();
+          loading.port1.on("message", () => {});
+          const W = await import(process.argv[1]);
+          loading.port1.close();
+          const source = W.spawnerProcessSource.replace(
+            'case "spawn":',
+            'case "spawn": if (message.args.includes("stop-spawner")) process.exit(70);',
+          );
+          await Effect.runPromise(
+            Effect.gen(function* () {
+              const spawner = yield* W.makeProcessSpawner(yield* ChildProcessSpawner, { source });
+              yield* Effect.exit(
+                spawner.spawn(ChildProcess.make(process.execPath, ["-e", "1", "stop-spawner"])).pipe(Effect.scoped),
+              );
+              process.stdout.write(
+                yield* spawner.string(ChildProcess.make(process.execPath, ["-e", "process.stdout.write('retried')"])),
+              );
+            }).pipe(
+              Effect.scoped,
+              Effect.provide(Layer.merge(NodeServices.layer, Logger.layer([], { mergeWithExisting: false }))),
+            ),
+          );`;
+        const server = NodeChildProcess.spawn(
+          process.execPath,
+          [
+            "--input-type=module",
+            "-e",
+            script,
+            `${import.meta.dirname}/workerChildProcessSpawner.ts`,
+          ],
+          { cwd: `${import.meta.dirname}/../..`, stdio: ["ignore", "pipe", "ignore"] },
+        );
+        let stdout = "";
+        server.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+        const code = yield* Effect.callback<number | null>((resume) => {
+          server.on("close", (code) => resume(Effect.succeed(code)));
+        });
+        expect({ code, stdout }).toEqual({ code: 0, stdout: "retried" });
+      }),
+  );
+
+  it.live.skipIf(!workerPlatform)(
     "closing the spawner process kills the children it still runs and ends the spawner",
     () =>
       Effect.gen(function* () {

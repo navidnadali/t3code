@@ -10,6 +10,7 @@ import * as NodeSqlite from "node:sqlite";
 
 import { describe, expect, it, onTestFinished } from "vite-plus/test";
 
+import { BUILD_MIGRATION_HEAD } from "../../apps/server/src/persistence/databaseMigrationHead.ts";
 import {
   contentFindings,
   emptyCounts,
@@ -1259,7 +1260,7 @@ describe("server on a fixture", () => {
     synth(database, "0.05");
     const events = count(database, `SELECT COUNT(*) AS n FROM orchestration_events`);
     const booted = await boot(database);
-    expect([booted.status, booted.migration]).toEqual([200, 76]);
+    expect([booted.status, booted.migration]).toEqual([200, BUILD_MIGRATION_HEAD]);
     expect(Object.values(recoveryCounts(booted.log))).toEqual([0, 0, 0, 0, 0]);
     expect(count(booted.copy, `SELECT COUNT(*) AS n FROM orchestration_events`)).toBe(events);
   });

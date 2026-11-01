@@ -1218,12 +1218,13 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     executeGit(operation, cwd, args, { allowNonZeroExit: true }),
   );
 
-  // Commands that read only config reuse their result while the config is unchanged.
+  // Commands that read only config reuse their result while the config is unchanged. A reused result
+  // is shared by every caller, so it takes no options that would change how Git runs.
   const executeConfigGit = (
     operation: string,
     cwd: string,
     args: readonly string[],
-    options: ExecuteGitOptions = {},
+    options: Pick<ExecuteGitOptions, "allowNonZeroExit" | "fallbackErrorDetail"> = {},
   ): Effect.Effect<GitVcsDriver.ExecuteGitResult, GitCommandError> =>
     configSnapshots.read(cwd).pipe(
       Effect.flatMap((snapshot) =>

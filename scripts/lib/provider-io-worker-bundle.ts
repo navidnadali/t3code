@@ -56,9 +56,18 @@ const guard = (code: string) => `"use strict";
   for (const name of ["module", "require", "exports", "__filename", "__dirname"]) delete globalThis[name];
   for (const name of ["dlopen", "binding", "_linkedBinding"]) process[name] = () => refuse("process." + name);
   process.getBuiltinModule = load;
-  ((require, module, exports, __filename, __dirname) => {
-${code}
-  })(load, { exports: {} }, {}, "", "");
+  // Compiled in the global scope, so not even a direct eval in the bundle reaches these bindings.
+  const run = new Function(
+    "require",
+    "module",
+    "exports",
+    "__filename",
+    "__dirname",
+    ${JSON.stringify(`"use strict";
+${code}`)},
+  );
+  const exported = { exports: {} };
+  run.call(exported.exports, load, exported, exported.exports, "", "");
 }
 `;
 

@@ -1509,6 +1509,14 @@ const parentRecordsNarrowToOneChild = Effect.gen(function* () {
   assert.deepEqual(yield* narrowedTo(child), narrowed);
 });
 
+// Both drop indexes and corrupt rows, so each gets its own database.
+it.effect("record reads narrow a parent to one child's tasks and transfers", () =>
+  parentRecordsNarrowToOneChild.pipe(Effect.provide(layerTest)),
+);
+it.effect("reads message ordinals through their index and orders messages as without it", () =>
+  messageOrdinalsReadThroughTheirIndex.pipe(Effect.provide(layerTest)),
+);
+
 const assertProjectScopedShells = Effect.fn("assertProjectScopedShells")(function* (
   suffix: string,
 ) {
@@ -1997,14 +2005,6 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
   it.effect("record reads select subagents by id", () => subagentRecordsSelectById);
-  it.effect(
-    "record reads narrow a parent to one child's tasks and transfers",
-    () => parentRecordsNarrowToOneChild,
-  );
-  it.effect(
-    "reads message ordinals through their index and orders messages as without it",
-    () => messageOrdinalsReadThroughTheirIndex,
-  );
   it.effect(
     "command reads skip finished leaf nodes of finished runs",
     () => commandReadsSkipSettledLeafNodes,

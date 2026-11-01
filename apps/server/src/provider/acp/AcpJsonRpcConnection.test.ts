@@ -1452,24 +1452,78 @@ describe("AcpSessionRuntime", () => {
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("sends a request whose started record fails and fails it with that defect", () =>
-    Effect.gen(function* () {
-      const appendFailure = new Error("native log append failed");
-      const records: Array<ReturnType<typeof recordRequest>> = [];
-      const run = yield* promptThenCancel({
-        cancelBehavior: "interrupt",
-        workers: 0,
-        requestLogger: (event) =>
-          isPromptStarted(event)
-            ? Effect.die(appendFailure)
-            : Effect.sync(() => {
+  it.effect.each(["dies", "throws"] as const)(
+    "sends a request whose started record %s and fails it with that defect",
+    (failure) =>
+      Effect.gen(function* () {
+        const appendFailure = new Error("native log append failed");
+        const records: Array<ReturnType<typeof recordRequest>> = [];
+        const run = yield* promptThenCancel({
+          cancelBehavior: "interrupt",
+          workers: 0,
+          requestLogger: (event) => {
+            if (!isPromptStarted(event)) {
+              return Effect.sync(() => {
                 records.push(recordRequest(event));
+              });
+            }
+            if (failure === "throws") throw appendFailure;
+            return Effect.die(appendFailure);
+          },
+        });
+        expect(run.promptExit).toEqual(Exit.die(appendFailure));
+        expect(records.some(({ method }) => method === "session/prompt")).toBe(false);
+        expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("writes a held-back backlog of request records and returns every call", () =>
+    Effect.gen(function* () {
+      const requests = 1000;
+      const held = yield* Deferred.make<void>();
+      const allReplied = yield* Deferred.make<void>();
+      let replies = 0;
+      let environmentRecords = 0;
+      const written: Array<string> = [];
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        protocolLogging: {
+          logIncoming: true,
+          logger: (event) => {
+            if (!isIncomingReply(event, '"inherited"')) return Effect.void;
+            replies += String(event.payload).split('"inherited"').length - 1;
+            return replies < requests
+              ? Effect.void
+              : Effect.forkDetach(Deferred.succeed(allReplied, undefined)).pipe(Effect.asVoid);
+          },
+        },
+        // The first request's started record holds every later record back.
+        requestLogger: (event) =>
+          (event.method === "_test/environment" && environmentRecords++ === 0
+            ? Deferred.await(held)
+            : Effect.void
+          ).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                written.push(`${event.method} ${event.status}`);
               }),
+            ),
+          ),
       });
-      expect(run.promptExit).toEqual(Exit.die(appendFailure));
-      expect(records.some(({ method }) => method === "session/prompt")).toBe(false);
-      expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
-    }).pipe(Effect.provide(NodeServices.layer)),
+      yield* runtime.start();
+      const calls = yield* Effect.forEach(
+        Array.from({ length: requests }, () => runtime.request("_test/environment", {})),
+        (request) => request,
+        { concurrency: "unbounded" },
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(allReplied);
+      yield* Deferred.succeed(held, undefined);
+
+      expect(yield* Fiber.join(calls)).toHaveLength(requests);
+      expect(written.filter((record) => record.startsWith("_test/environment"))).toHaveLength(
+        2 * requests,
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("closes without waiting for a native request record that never completes", () =>

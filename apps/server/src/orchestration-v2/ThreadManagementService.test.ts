@@ -16,23 +16,33 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Option from "effect/Option";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 
 import { AgentScope } from "@t3tools/shared/AgentScope";
 
 import * as ServerSettings from "../serverSettings.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as EventSink from "./EventSink.ts";
+import * as EventStore from "./EventStore.ts";
+import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -768,4 +778,115 @@ it.effect("Force stop refuses once a newer run has started, before killing anyth
     expect(error.reason).toBe("superseded");
     expect(killed).toBe(false);
   }),
+);
+
+it.effect("hydrates a legacy transcript on the writer, then reads the projection on a reader", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "thread-management-legacy-" });
+    const layerStores = EventSink.layer.pipe(
+      Layer.provideMerge(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+      Layer.provideMerge(SqlitePersistence.layerFromPath(path.join(directory, "statev2.sqlite"))),
+    );
+    const layerOrchestrator = Layer.unwrap(
+      Effect.gen(function* () {
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        return Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadProjection: (threadId) =>
+            projections
+              .getThreadProjection(threadId)
+              .pipe(
+                Effect.mapError(
+                  (cause) => new Orchestrator.OrchestratorProjectionError({ threadId, cause }),
+                ),
+              ),
+        });
+      }),
+    );
+    const layerTest = ThreadManagementService.layerWithLegacyImporter.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(layerOrchestrator),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(CommandReceiptStore.layer),
+      Layer.provideMerge(LegacyV1ThreadImporter.layer),
+      Layer.provideMerge(layerStores),
+    );
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const threadId = ThreadId.make("thread:thread-management:legacy");
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, scripts_json, created_at, updated_at
+        ) VALUES (
+          'project:legacy', 'Legacy project', '/tmp/legacy', '[]',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, created_at, updated_at
+        ) VALUES (
+          ${threadId}, 'project:legacy', 'Legacy thread',
+          '{"instanceId":"codex","model":"gpt-5.4"}', 'full-access', 'default',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_thread_messages (
+          message_id, thread_id, role, text, is_streaming, created_at, updated_at
+        ) VALUES
+          ('message:legacy:old', ${threadId}, 'user', 'Old question', 0,
+            '2026-01-01T01:00:00.000Z', '2026-01-01T01:00:00.000Z'),
+          ('message:legacy:latest', ${threadId}, 'user', 'Latest question', 0,
+            '2026-01-02T01:00:00.000Z', '2026-01-02T01:00:00.000Z')
+      `;
+      yield* importer.reconcileShells;
+      const shell = yield* projections.getThreadProjection(threadId);
+      expect(shell.messages.map((message) => message.text)).toEqual(["Latest question"]);
+
+      const statements: Array<{ readonly query: string; readonly span: Tracer.Span }> = [];
+      const hydrated = yield* threads.getThreadProjection(threadId).pipe(
+        Effect.provideService(Statement.CurrentTransformer, (statement, _sql, _fiber, span) => {
+          statements.push({ query: statement.compile()[0], span });
+          return Effect.succeed(statement);
+        }),
+        Effect.provideService(Statement.SpanPropagationEnabled, true),
+      );
+      expect(hydrated.messages.map((message) => message.text)).toEqual([
+        "Old question",
+        "Latest question",
+      ]);
+      const lineage = (span: Tracer.Span) => {
+        const spans = [span];
+        let parent = Option.getOrUndefined(span.parent);
+        while (parent?._tag === "Span") {
+          spans.push(parent);
+          parent = Option.getOrUndefined(parent.parent);
+        }
+        return spans;
+      };
+      const connections = (matches: (query: string, spans: Array<Tracer.Span>) => boolean) => [
+        ...new Set(
+          statements
+            .filter(({ query, span }) => matches(query, lineage(span)))
+            .map(({ span }) =>
+              lineage(span)
+                .find((candidate) => candidate.attributes.has("db.connection"))
+                ?.attributes.get("db.connection"),
+            ),
+        ),
+      ];
+      expect(connections((query) => /^\s*(INSERT|UPDATE)\b/.test(query))).toEqual(["writer"]);
+      expect(
+        connections((_query, spans) =>
+          spans.some((span) => span.name === "ProjectionStore.readProjection"),
+        ),
+      ).toEqual(["reader"]);
+    }).pipe(Effect.provide(layerTest));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

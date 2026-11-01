@@ -1094,6 +1094,7 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
         decoded.push(line);
         return decode(line);
       }),
+    failure: Effect.never,
   });
 
   it.effect("decodes long lines off-thread, short lines and batches on main, in stdout order", () =>
@@ -1189,35 +1190,60 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
       }),
   );
 
-  it.effect("ends the connection with the offload's error when its worker fails", () =>
-    Effect.gen(function* () {
-      const { stdio, input, output } = yield* makeInMemoryStdio();
-      const termination = yield* Deferred.make<AcpError.AcpError>();
-      const workerStopped = new AcpError.AcpTransportError({
-        operation: "read-input-stream",
-        cause: new Error("Provider I/O worker stopped."),
-      });
-      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
-        stdio,
-        serverRequestMethods: new Set(),
-        lineOffload: { minChars: 200, decode: () => Effect.fail(workerStopped) },
-        onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
-      });
-      const pending = yield* transport
-        .request("x/test", { hello: "world" })
-        .pipe(Effect.forkScoped);
-      yield* Queue.take(output);
+  it.effect.each(["while it decodes a line", "before stdout closes", "after stdout closes"])(
+    "ends the connection with the offload's error when its worker dies %s",
+    (when) =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const termination = yield* Deferred.make<AcpError.AcpError>();
+        const died = yield* Deferred.make<never, AcpError.AcpError>();
+        const classifying = yield* Deferred.make<void>();
+        const exited = yield* Deferred.make<AcpError.AcpError>();
+        const workerStopped = new AcpError.AcpTransportError({
+          operation: "read-input-stream",
+          cause: new Error("Provider I/O worker stopped."),
+        });
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(),
+          terminationError: Deferred.succeed(classifying, undefined).pipe(
+            Effect.andThen(Deferred.await(exited)),
+          ),
+          lineOffload: {
+            minChars: 200,
+            decode: () => Deferred.await(died),
+            failure: Deferred.await(died),
+          },
+          onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+        });
+        const pending = yield* transport
+          .request("x/test", { hello: "world" })
+          .pipe(Effect.forkScoped);
+        yield* Queue.take(output);
 
-      yield* Queue.offer(input, encoder.encode(`${update(long)}\n`));
+        // The pool kills the agent when the worker dies, which closes stdout.
+        const processExited = new AcpError.AcpProcessExitedError({ code: 143 });
+        if (when === "while it decodes a line") {
+          yield* Queue.offer(input, encoder.encode(`${update(long)}\n`));
+          yield* Deferred.fail(died, workerStopped);
+        } else if (when === "before stdout closes") {
+          yield* Deferred.fail(died, workerStopped);
+          yield* Queue.end(input);
+        } else {
+          yield* Queue.end(input);
+          yield* Deferred.await(classifying);
+          yield* Deferred.fail(died, workerStopped);
+        }
+        yield* Deferred.succeed(exited, processExited);
 
-      assert.strictEqual(yield* Deferred.await(termination), workerStopped);
-      const failure = yield* Fiber.join(pending).pipe(
-        Effect.match({
-          onFailure: (error) => error,
-          onSuccess: () => assert.fail("Expected the pending request to fail"),
-        }),
-      );
-      assert.strictEqual(failure, workerStopped);
-    }),
+        assert.strictEqual(yield* Deferred.await(termination), workerStopped);
+        const failure = yield* Fiber.join(pending).pipe(
+          Effect.match({
+            onFailure: (error) => error,
+            onSuccess: () => assert.fail("Expected the pending request to fail"),
+          }),
+        );
+        assert.strictEqual(failure, workerStopped);
+      }),
   );
 });

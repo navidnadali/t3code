@@ -844,6 +844,7 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
             Effect.sync(() => {
               written.push(payload);
             }),
+          failure: Effect.never,
         },
         onNotification: (notification) =>
           Effect.suspend(() => {
@@ -901,6 +902,7 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
           minChars: 64,
           decode: (line) => Effect.succeed(CodexOffload.decodeOffloadedLine(line)),
           writeLog: () => Effect.die("no log entries expected"),
+          failure: Effect.never,
         },
         onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
       });
@@ -917,36 +919,58 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
     }),
   );
 
-  it.effect("ends the protocol with the offload's error when its worker fails", () =>
-    Effect.gen(function* () {
-      const { stdio, input, output } = yield* makeInMemoryStdio();
-      const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
-      const workerStopped = new CodexError.CodexAppServerTransportError({
-        operation: "read-input-stream",
-        cause: new Error("Provider I/O worker stopped."),
-      });
-      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
-        stdio,
-        lineOffload: {
-          minChars: 64,
-          decode: () => Effect.fail(workerStopped),
-          writeLog: () => Effect.void,
-        },
-        onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
-      });
-      const pending = yield* transport.request("thread/read", {}).pipe(Effect.forkScoped);
-      yield* Queue.take(output);
+  it.effect.each(["while it decodes a line", "before stdout closes", "after stdout closes"])(
+    "ends the protocol with the offload's error when its worker dies %s",
+    (when) =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+        const died = yield* Deferred.make<never, CodexError.CodexAppServerError>();
+        const classifying = yield* Deferred.make<void>();
+        const exited = yield* Deferred.make<CodexError.CodexAppServerError>();
+        const workerStopped = new CodexError.CodexAppServerTransportError({
+          operation: "read-input-stream",
+          cause: new Error("Provider I/O worker stopped."),
+        });
+        const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          terminationError: Deferred.succeed(classifying, undefined).pipe(
+            Effect.andThen(Deferred.await(exited)),
+          ),
+          lineOffload: {
+            minChars: 64,
+            decode: () => Deferred.await(died),
+            writeLog: () => Effect.void,
+            failure: Deferred.await(died),
+          },
+          onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+        });
+        const pending = yield* transport.request("thread/read", {}).pipe(Effect.forkScoped);
+        yield* Queue.take(output);
 
-      yield* Queue.offer(input, encoder.encode(`${longLine}\n`));
+        // The pool kills the process when the worker dies, which closes stdout.
+        const processExited = new CodexError.CodexAppServerProcessExitedError({ code: 143 });
+        if (when === "while it decodes a line") {
+          yield* Queue.offer(input, encoder.encode(`${longLine}\n`));
+          yield* Deferred.fail(died, workerStopped);
+        } else if (when === "before stdout closes") {
+          yield* Deferred.fail(died, workerStopped);
+          yield* Queue.end(input);
+        } else {
+          yield* Queue.end(input);
+          yield* Deferred.await(classifying);
+          yield* Deferred.fail(died, workerStopped);
+        }
+        yield* Deferred.succeed(exited, processExited);
 
-      assert.strictEqual(yield* Deferred.await(termination), workerStopped);
-      const failure = yield* Fiber.join(pending).pipe(
-        Effect.match({
-          onFailure: (error) => error,
-          onSuccess: () => assert.fail("Expected the pending request to fail"),
-        }),
-      );
-      assert.strictEqual(failure, workerStopped);
-    }),
+        assert.strictEqual(yield* Deferred.await(termination), workerStopped);
+        const failure = yield* Fiber.join(pending).pipe(
+          Effect.match({
+            onFailure: (error) => error,
+            onSuccess: () => assert.fail("Expected the pending request to fail"),
+          }),
+        );
+        assert.strictEqual(failure, workerStopped);
+      }),
   );
 });

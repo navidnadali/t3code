@@ -339,14 +339,25 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
       params: { threadId: "t", turnId: "u", itemId: "i", delta },
     })}\n`;
 
+  // Killing the child closes its stdout; its exit status is known from then on.
   const codexSession = (
     offloads: ReturnType<typeof ProviderIoOffloads.make>,
-    kill: Effect.Effect<void>,
+    killed: Deferred.Deferred<void>,
   ) =>
     Effect.gen(function* () {
       const { input, stdio } = yield* makeStdio;
-      const lineOffload = Option.getOrThrow(yield* offloads.codex.open({ kill }));
-      const client = yield* CodexClient.make(stdio, { lineOffload });
+      const lineOffload = Option.getOrThrow(
+        yield* offloads.codex.open({
+          kill: Deferred.succeed(killed, undefined).pipe(Effect.andThen(Queue.end(input))),
+        }),
+      );
+      const client = yield* CodexClient.make(
+        stdio,
+        { lineOffload },
+        Deferred.await(killed).pipe(
+          Effect.as(new CodexError.CodexAppServerProcessExitedError({ code: 143 })),
+        ),
+      );
       const deltas = yield* Queue.unbounded<unknown>();
       yield* client.handleServerNotification("item/agentMessage/delta", (params) =>
         Queue.offer(deltas, params).pipe(Effect.asVoid),
@@ -365,14 +376,13 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
         const killed = yield* Deferred.make<void>();
 
         yield* Effect.gen(function* () {
-          const session = yield* codexSession(offloads, Deferred.succeed(killed, undefined));
+          const session = yield* codexSession(offloads, killed);
           yield* session.send("before");
           assert.deepInclude(yield* Queue.take(session.deltas), { delta: "before" });
 
           const worker = workers.started[startedBefore]!;
           yield* Effect.promise(() => worker.terminate());
           yield* Deferred.await(killed);
-          yield* session.send("after");
 
           const error = yield* session.client.awaitTermination.pipe(Effect.flip);
           assert.instanceOf(error, CodexError.CodexAppServerTransportError);
@@ -383,7 +393,7 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
 
         // The next session restarts the worker.
         yield* Effect.gen(function* () {
-          const session = yield* codexSession(offloads, Effect.void);
+          const session = yield* codexSession(offloads, yield* Deferred.make<void>());
           yield* session.send("next");
           assert.deepInclude(yield* Queue.take(session.deltas), { delta: "next" });
         }).pipe(Effect.scoped);
@@ -405,15 +415,25 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
             update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
           },
         })}\n`;
-      const acpSession = (kill: Effect.Effect<void>) =>
+      const acpSession = (killed: Deferred.Deferred<void>) =>
         Effect.gen(function* () {
           const { input, stdio } = yield* makeStdio;
-          const lineOffload = Option.getOrThrow(yield* offloads.acp.open({ kill }));
+          const lineOffload = Option.getOrThrow(
+            yield* offloads.acp.open({
+              kill: Deferred.succeed(killed, undefined).pipe(Effect.andThen(Queue.end(input))),
+            }),
+          );
           const terminated = yield* Deferred.make<AcpError.AcpError>();
-          const client = yield* AcpClient.make(stdio, {
-            lineOffload,
-            onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
-          });
+          const client = yield* AcpClient.make(
+            stdio,
+            {
+              lineOffload,
+              onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+            },
+            Deferred.await(killed).pipe(
+              Effect.as(new AcpError.AcpProcessExitedError({ code: 143 })),
+            ),
+          );
           const updates = yield* Queue.unbounded<unknown>();
           yield* client.handleSessionUpdate((params) =>
             Queue.offer(updates, params).pipe(Effect.asVoid),
@@ -424,13 +444,12 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
       const killed = yield* Deferred.make<void>();
 
       yield* Effect.gen(function* () {
-        const session = yield* acpSession(Deferred.succeed(killed, undefined));
+        const session = yield* acpSession(killed);
         yield* session.send("before");
         assert.deepInclude(yield* Queue.take(session.updates), { sessionId: "s" });
 
         yield* Effect.promise(() => workers.started[startedBefore]!.terminate());
         yield* Deferred.await(killed);
-        yield* session.send("after");
 
         const error = yield* Deferred.await(session.terminated);
         assert.instanceOf(error, AcpError.AcpTransportError);
@@ -440,7 +459,7 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
       }).pipe(Effect.scoped);
 
       yield* Effect.gen(function* () {
-        const session = yield* acpSession(Effect.void);
+        const session = yield* acpSession(yield* Deferred.make<void>());
         yield* session.send("next");
         assert.deepInclude(yield* Queue.take(session.updates), { sessionId: "s" });
       }).pipe(Effect.scoped);

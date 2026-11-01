@@ -109,8 +109,8 @@ Kept as written (`fixture/content.ts`):
 | Structural tables             | `effect_sql_migrations`, `orchestration_v2_projection_metadata` and `orchestration_v2_projection_turn_item_counts`, whole                                                                                      |
 
 A value under a credential-named key (`password`, `token`, `secret`, `api_key`, `auth`, …) keeps only a known
-literal. Under a credential-holding ancestor (`credentials`, `auth`, `token`, `secret`, `cookie`, `pin`, …; not
-`author`, token counts or a bare `pass`) nothing is kept but literals and timestamps, ids included, and JSON
+literal. Under a credential-holding ancestor (`credentials`, `auth`, `token`, `secret`, `cookie`, `pass`, `pin`, …; not
+`author` or token counts and usage) nothing is kept but literals and timestamps, ids included, and JSON
 numbers become 0 (a PIN, an OTP); numbers under such a key itself are zeroed too, and the check reports any left
 (`credential-number`). Object keys shaped like tokens (an unprefixed run of 16+ letters and digits mixed like
 noise) are rewritten; camelCase names, MCP tool names and vendor-prefixed ids (`toolu_…`) stay. The pattern layer

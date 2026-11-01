@@ -77,6 +77,7 @@ describe("blanking pass memory", () => {
     const db = new NodeSqlite.DatabaseSync(NodePath.join(directory, "edge.sqlite"));
     db.exec(`CREATE TABLE notes (title TEXT)`);
     const insert = db.prepare(`INSERT INTO notes (rowid, title) VALUES (?, ?)`);
+    insert.setReadBigInts(true);
     for (const rowid of [-(2n ** 63n), -1n, 0n, 1n, 2n ** 63n - 1n])
       insert.run(rowid, "Title kept?");
     const pass = blankTables(db, ["notes"], "blank", { rows: 2, bytes: 1_000_000 });

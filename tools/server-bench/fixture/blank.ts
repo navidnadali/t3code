@@ -96,22 +96,31 @@ export const blankTables = function* (
       db.exec("COMMIT");
       yield { table, rows: total, bytes: 0, done: total, total, tableBytes: 0 };
     } else {
-      const select = db.prepare(
-        `SELECT rowid, ${columns.map(quote).join(", ")} FROM ${quote(table)}
-         WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-      );
-      select.setReturnArrays(true);
-      select.setReadBigInts(true);
+      // The first batch starts at the smallest rowid itself (`>=`), every later one after the last.
+      const query = (from: string) =>
+        db.prepare(
+          `SELECT rowid, ${columns.map(quote).join(", ")} FROM ${quote(table)}
+           WHERE rowid ${from} ? ORDER BY rowid LIMIT ?`,
+        );
+      const first = query(">=");
+      const next = query(">");
+      for (const select of [first, next]) {
+        select.setReturnArrays(true);
+        select.setReadBigInts(true);
+      }
       const update = db.prepare(
         `UPDATE ${quote(table)} SET ${columns.map((column) => `${quote(column)} = ?`).join(", ")}
          WHERE rowid = ?`,
       );
+      // run() reports the last insert rowid, which can lie past 2^53.
+      update.setReadBigInts(true);
       let after = SMALLEST_ROWID;
       let done = 0;
       let tableBytes = 0;
       for (;;) {
         const batch: Array<Array<unknown> | undefined> = [];
         let bytes = 0;
+        const select = done === 0 ? first : next;
         for (const row of select.iterate(after, limits.rows) as Iterable<Array<unknown>>) {
           batch.push(row);
           for (let index = 1; index < row.length; index++) bytes += sizeOf(row[index]);

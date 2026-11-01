@@ -32,7 +32,7 @@ import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import {
   ClaudeAgentSdkQueryRunner,
-  type ClaudeAgentSdkQueryRunnerError,
+  ClaudeAgentSdkQueryRunnerError,
   type ClaudeAgentSdkQueryOpenInput,
   type ClaudeAgentSdkQuerySession,
   layerQueryRunner,
@@ -48,7 +48,12 @@ import {
   ClaudeAgentSdkWorkerPool,
   claudeAgentSdkStageOptions,
   layerClaudeAgentSdkWorkerPool,
+  startClaudeQueryInWorker,
 } from "./ClaudeAgentSdkWorkerQuery.ts";
+import type {
+  ClaudeAgentSdkWorkerEvent,
+  ClaudeAgentSdkWorkerRequest,
+} from "../../provider/io/claudeAgentSdkStage.ts";
 
 const workers = vi.hoisted(() => ({
   started: new Array<NodeWorkerThreads.Worker>(),
@@ -789,11 +794,12 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
-  // A callback's arguments without its abort signal, which each run makes anew.
+  // A callback's arguments without its abort signal, which each run makes anew, and its options' keys
+  // in order (the SDK puts the signal first).
   const recordCall = (calls: Array<unknown>, args: ReadonlyArray<unknown>) => {
     const { signal, ...options } = args.at(-1) as { readonly signal: AbortSignal };
     assert.instanceOf(signal, AbortSignal);
-    calls.push([...args.slice(0, -1), options]);
+    calls.push([...args.slice(0, -1), options, Object.keys(args.at(-1) as object)]);
     return signal;
   };
 
@@ -893,6 +899,20 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       throw new TypeError("Cannot read the approval.");
     }),
     permissionCase("rejects with a string", () => Promise.reject("plain refusal")),
+    // The SDK writes an Error's message as its error field, whatever its type.
+    permissionCase("throws an Error whose message is a number", () =>
+      Promise.reject(Object.assign(new Error(), { message: 42 })),
+    ),
+    permissionCase("throws an Error without a message", () =>
+      Promise.reject(Object.assign(new Error(), { message: undefined })),
+    ),
+    permissionCase("throws an Error whose message has toJSON", () =>
+      Promise.reject(Object.assign(new Error(), { message: new KeyedJson() })),
+    ),
+    // In-thread the SDK cannot write this error, so the CLI gets no response.
+    permissionCase("throws an Error whose message JSON cannot write", () =>
+      Promise.reject(Object.assign(new Error(), { message: 1n })),
+    ),
     // Each of these clones without error but not as the SDK's JSON writes it.
     permissionCase("answers with values JSON converts", () =>
       Promise.resolve({
@@ -1547,6 +1567,88 @@ describe("Claude Agent SDK worker wiring", () => {
       for (const env of [{ T3CODE_PROVIDER_IO_WORKERS: "2" }, {}]) {
         assert.deepStrictEqual(yield* runWired(env), { stages: [], last: "result" });
       }
+    }),
+  );
+});
+
+// A pool whose session takes calls and notifications in place, so a test can raise any worker event.
+const scriptedPool = () => {
+  const notified: Array<ClaudeAgentSdkWorkerRequest> = [];
+  const waiters: Array<() => void> = [];
+  let raise: ((event: ClaudeAgentSdkWorkerEvent) => void) | undefined;
+  const pool: ProviderIoWorkerPool.ProviderIoWorkerPool["Service"] = {
+    open: (input) =>
+      Effect.sync(() => {
+        raise = input.onEvent as (event: ClaudeAgentSdkWorkerEvent) => void;
+        return Option.some({
+          write: () => Effect.void,
+          end: Effect.void,
+          output: Stream.never,
+          call: () => Effect.succeed(undefined as never),
+          notify: (request: ClaudeAgentSdkWorkerRequest) => {
+            notified.push(request);
+            for (const wake of waiters.splice(0)) wake();
+            return true;
+          },
+        } as never);
+      }),
+  };
+  const notifiedOf = (type: ClaudeAgentSdkWorkerRequest["type"]) =>
+    new Promise<ReadonlyArray<ClaudeAgentSdkWorkerRequest>>((resolve) => {
+      const check = () => {
+        const matching = notified.filter((request) => request.type === type);
+        if (matching.length > 0) resolve(matching);
+        else waiters.push(check);
+      };
+      check();
+    });
+  return { pool, raise: (event: ClaudeAgentSdkWorkerEvent) => raise?.(event), notifiedOf };
+};
+
+const startScripted = (callbacks: Parameters<typeof startClaudeQueryInWorker>[0]["callbacks"]) =>
+  Effect.gen(function* () {
+    const scripted = scriptedPool();
+    yield* startClaudeQueryInWorker({
+      pool: scripted.pool,
+      stageOptions: { options: {}, callbacks: ["canUseTool"] },
+      callbacks,
+      prompt: (async function* () {})(),
+      spawn: () => {
+        throw new Error("No CLI in this test.");
+      },
+      toError: (cause, method) => new ClaudeAgentSdkQueryRunnerError({ cause, method }),
+    });
+    return scripted;
+  });
+
+describe("startClaudeQueryInWorker callbacks", () => {
+  it.effect("answers a malformed callback request with an error instead of throwing", () =>
+    Effect.gen(function* () {
+      const scripted = yield* startScripted({ canUseTool: vi.fn() });
+      assert.doesNotThrow(() =>
+        scripted.raise({
+          type: "callback",
+          id: 0,
+          after: 0,
+          call: { name: "canUseTool" } as never,
+        }),
+      );
+      const [answer] = yield* Effect.promise(() => scripted.notifiedOf("callbackError"));
+      assert.deepInclude(answer, { type: "callbackError", id: 0 });
+    }),
+  );
+
+  it.effect("ignores a callback request whose id is already running", () =>
+    Effect.gen(function* () {
+      const canUseTool = vi.fn(() => new Promise<never>(() => {}));
+      const scripted = yield* startScripted({ canUseTool });
+      const call = {
+        name: "canUseTool",
+        args: ["Bash", { command: "ls" }, { toolUseID: "toolu-1" }],
+      } as const;
+      scripted.raise({ type: "callback", id: 7, after: 0, call: call as never });
+      scripted.raise({ type: "callback", id: 7, after: 0, call: call as never });
+      assert.strictEqual(canUseTool.mock.calls.length, 1);
     }),
   );
 });

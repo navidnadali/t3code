@@ -32,6 +32,8 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as References from "effect/References";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlError from "effect/sql/SqlError";
 import * as Stream from "effect/Stream";
@@ -2477,6 +2479,7 @@ const ingestBatchOfNodes = (input: {
         providerInstanceId: modelSelection.instanceId,
         threadId,
       });
+      const logs: Array<ReadonlyArray<unknown>> = [];
       const exit = yield* ingestor
         .ingestNormalizedBatch({
           events: input.nodes(threadId, now).map((node) => ({
@@ -2486,12 +2489,29 @@ const ingestBatchOfNodes = (input: {
             event: { type: "node.updated", driver: CODEX_DRIVER, node },
           })),
         })
-        .pipe(Effect.exit);
+        .pipe(
+          Effect.exit,
+          Effect.provide(
+            Logger.layer(
+              [
+                Logger.make(({ logLevel, message }) => {
+                  logs.push([logLevel, ...(message as ReadonlyArray<unknown>)]);
+                }),
+              ],
+              { mergeWithExisting: false },
+            ),
+          ),
+          Effect.provideService(References.MinimumLogLevel, "Debug"),
+        );
       const log = yield* eventStore.read({ afterSequence: 1 }).pipe(Stream.runCollect);
       return {
         exit,
         writes,
         sequencesAfterFailedBatch,
+        providerSessionId,
+        batchFailureLogs: logs.filter(
+          ([, message]) => message === "orchestration-v2.provider-event-batch-write-failed",
+        ),
         logged: Array.from(log).map((stored) =>
           stored.event.type === "node.updated"
             ? `${stored.sequence}:${stored.event.payload.id.split(":").at(-1)}:${stored.event.payload.status}`
@@ -2531,7 +2551,14 @@ it.effect.each([false, true])(
   "rolls back a batch that fails part-way and writes its events again one by one (defect: %s)",
   (defect) =>
     Effect.gen(function* () {
-      const { exit, writes, logged, sequencesAfterFailedBatch } = yield* ingestBatchOfNodes({
+      const {
+        exit,
+        writes,
+        logged,
+        sequencesAfterFailedBatch,
+        providerSessionId,
+        batchFailureLogs,
+      } = yield* ingestBatchOfNodes({
         nodes: (threadId, now) => ["a", "b", "c"].map((name) => batchNode(threadId, name, now)),
         fail: { node: "c", alone: false, defect },
       });
@@ -2539,6 +2566,19 @@ it.effect.each([false, true])(
       assert.deepEqual(sequencesAfterFailedBatch, [1]);
       assert.deepEqual(logged, ["2:a:waiting", "3:b:waiting", "4:c:waiting"]);
       assert.deepEqual(writes, { single: 3, batched: 1 });
+      // The retry succeeded, so nothing else reports it: Warn names the cause's tag, never its values.
+      const [warning, debug, ...rest] = batchFailureLogs;
+      assert.deepEqual(warning, [
+        "Warn",
+        "orchestration-v2.provider-event-batch-write-failed",
+        { providerSessionId, eventCount: 3, errorTag: "EventSinkWriteError" },
+      ]);
+      assert.strictEqual(debug?.[0], "Debug");
+      assert.instanceOf(
+        (debug?.[2] as { readonly cause?: unknown } | undefined)?.cause,
+        EventSink.EventSinkWriteError,
+      );
+      assert.isEmpty(rest);
     }),
 );
 

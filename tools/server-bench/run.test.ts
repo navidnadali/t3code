@@ -5,7 +5,16 @@ import * as NodePath from "node:path";
 
 import { describe, expect, it } from "vite-plus/test";
 
-import { benchEnvHash, fixtureInfo, readDriverResult, runOrder, traceRequired } from "./run.ts";
+import {
+  benchEnvHash,
+  driverHash,
+  fakesHash,
+  fixtureInfo,
+  readDriverResult,
+  runOrder,
+  traceRequired,
+  transcriptsHash,
+} from "./run.ts";
 
 const withTempDir = async (run: (directory: string) => Promise<void>) => {
   const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "server-bench-run-"));
@@ -194,6 +203,108 @@ describe("fixtureInfo", () => {
 
       expect(info).toMatchObject({ kind: "dir", bytes: 10 });
       expect(info.sha256).toMatch(/^[0-9a-f]{64}$/);
+    });
+  });
+});
+
+const write = (path: string, content: string) => {
+  NodeFS.mkdirSync(NodePath.dirname(path), { recursive: true });
+  NodeFS.writeFileSync(path, content);
+};
+
+describe("workload fingerprint", () => {
+  it("covers the local modules the driver imports outside its module directory", async () => {
+    await withTempDir(async (bench) => {
+      const driver = NodePath.join(bench, "driver.ts");
+      write(driver, 'import { plan } from "./providers.ts";\nimport { a } from "./driver/a.ts";\n');
+      write(NodePath.join(bench, "driver", "a.ts"), 'export { b } from "../shared/b.ts";\n');
+      write(NodePath.join(bench, "shared", "b.ts"), "export const b = 1;\n");
+      write(NodePath.join(bench, "providers.ts"), "export const plan = 1;\n");
+      write(NodePath.join(bench, "unrelated.ts"), "export const c = 1;\n");
+      const first = await driverHash(driver);
+
+      write(NodePath.join(bench, "unrelated.ts"), "export const c = 2;\n");
+      expect(await driverHash(driver)).toBe(first);
+      write(NodePath.join(bench, "providers.ts"), "export const plan = 2;\n");
+      const second = await driverHash(driver);
+      expect(second).not.toBe(first);
+      write(NodePath.join(bench, "shared", "b.ts"), "export const b = 2;\n");
+      expect(await driverHash(driver)).not.toBe(second);
+    });
+  });
+
+  it("covers the fakes, their shared code and what they import from the server", async () => {
+    await withTempDir(async (root) => {
+      const bench = NodePath.join(root, "tools", "server-bench");
+      write(NodePath.join(bench, "fake-claude", "claude"), "#!/bin/sh\n");
+      write(NodePath.join(bench, "fake-claude", "claude.mjs"), "export {};\n");
+      write(
+        NodePath.join(bench, "fake-codex", "codex.mjs"),
+        'import "../fake-common/replay.mjs";\n',
+      );
+      write(
+        NodePath.join(bench, "fake-acp", "acp-agent.mjs"),
+        'import { parse } from "../../../apps/server/scripts/replay.ts";\n',
+      );
+      write(NodePath.join(bench, "fake-acp", "transcripts", "large.mjs"), "export {};\n");
+      write(NodePath.join(bench, "fake-acp", "README.md"), "docs\n");
+      write(NodePath.join(bench, "fake-acp", "acp-agent.test.mjs"), "test\n");
+      write(NodePath.join(bench, "fake-common", "replay.mjs"), "export {};\n");
+      write(NodePath.join(root, "apps", "server", "scripts", "replay.ts"), "export {};\n");
+      const hashes = [await fakesHash(bench)];
+      const edit = async (path: string, changes: boolean) => {
+        write(path, `${NodeFS.readFileSync(path, "utf8")}// edited\n`);
+        const hash = await fakesHash(bench);
+        expect(hashes.includes(hash)).toBe(!changes);
+        hashes.push(hash);
+      };
+
+      await edit(NodePath.join(bench, "fake-acp", "README.md"), false);
+      await edit(NodePath.join(bench, "fake-acp", "acp-agent.test.mjs"), false);
+      await edit(NodePath.join(bench, "fake-claude", "claude"), true);
+      await edit(NodePath.join(bench, "fake-codex", "codex.mjs"), true);
+      await edit(NodePath.join(bench, "fake-acp", "transcripts", "large.mjs"), true);
+      await edit(NodePath.join(bench, "fake-common", "replay.mjs"), true);
+      await edit(NodePath.join(root, "apps", "server", "scripts", "replay.ts"), true);
+    });
+  });
+
+  it("covers the recorded transcripts and the absolute ones the settings name", async () => {
+    await withTempDir(async (root) => {
+      const fixtures = NodePath.join(root, "replay-fixtures");
+      write(NodePath.join(fixtures, "todo_list", "registry_transcript.ndjson"), "{}\n");
+      write(NodePath.join(fixtures, "todo_list", "input.ts"), "export {};\n");
+      const own = NodePath.join(root, "own", "claude.ndjson");
+      write(own, "{}\n");
+      const viaEnv = NodePath.join(root, "own", "codex.ndjson");
+      write(viaEnv, "{}\n");
+      const template = NodePath.join(root, "template");
+      write(
+        NodePath.join(template, "userdata", "settings.json"),
+        JSON.stringify({
+          providerInstances: {
+            claudeBench: {
+              environment: [{ name: "BENCH_TRANSCRIPT", value: `todo_list:2,${own}:3` }],
+            },
+          },
+        }),
+      );
+      const work = NodePath.join(root, "work");
+      NodeFS.mkdirSync(work);
+      const fixture = await fixtureInfo(template, work);
+      const env = { BENCH_CODEX_TRANSCRIPT: viaEnv, BENCH_SPEED: "1" };
+      const first = await transcriptsHash(env, fixture, fixtures);
+
+      write(NodePath.join(fixtures, "todo_list", "input.ts"), "export const changed = 1;\n");
+      expect(await transcriptsHash(env, fixture, fixtures)).toBe(first);
+      write(NodePath.join(fixtures, "todo_list", "registry_transcript.ndjson"), "{}\n{}\n");
+      const second = await transcriptsHash(env, fixture, fixtures);
+      expect(second).not.toBe(first);
+      write(own, "{}\n{}\n");
+      const third = await transcriptsHash(env, fixture, fixtures);
+      expect(third).not.toBe(second);
+      write(viaEnv, "{}\n{}\n");
+      expect(await transcriptsHash(env, fixture, fixtures)).not.toBe(third);
     });
   });
 });

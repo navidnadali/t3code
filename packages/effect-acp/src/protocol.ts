@@ -102,6 +102,10 @@ export interface AcpLineOffload {
 // Reads queued and not yet handled, at most; past this, stdout is not read further. A replay
 // burst queues ~230 one-line reads; fewer than ~33 drain the pipeline and delay delivery.
 const READ_AHEAD_LIMIT = 256;
+// Raw bytes of those reads, at most (a larger read takes all of it); whichever bound comes first
+// stops reading, so the backlog stays in the pipe. Behind a stalled line pending reads hold 2.3-5.2x
+// their bytes in heap and buffers: 9.6-21 MiB at this budget, 37-83 MiB with 256 reads alone.
+const READ_AHEAD_BYTES = 4 * 1024 * 1024;
 
 // A worker call's outcome, kept so that a failure surfaces at its line, as it would in-thread.
 type OffloadOutcome = Exit.Exit<AcpOffload.OffloadedLine, AcpError.AcpError>;
@@ -792,9 +796,11 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     offload: AcpLineOffload,
     split: (bytes: Uint8Array) => ReadonlyArray<string>,
   ) => {
-    // Reads queued and not yet handled, and a slot for each, released once it is handled.
+    // Reads queued and not yet handled, and a slot and their bytes for each, released once it is
+    // handled; reading waits for whichever runs out first, so stdout backs up into the pipe.
     let pending = 0;
     const slots = Semaphore.makeUnsafe(READ_AHEAD_LIMIT);
+    const budget = Semaphore.makeUnsafe(READ_AHEAD_BYTES);
     return Stream.unwrap(
       Effect.gen(function* () {
         const reads = yield* Queue.unbounded<
@@ -802,6 +808,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             readonly data: Uint8Array;
             readonly lines: ReadonlyArray<string>;
             readonly offloaded: Fiber.Fiber<ReadonlyArray<OffloadOutcome>> | undefined;
+            readonly bytes: number;
           },
           PlatformError.PlatformError | AcpError.AcpError | Cause.Done
         >();
@@ -817,7 +824,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
                   decodeOffloadedLines(offload, lines, noOffloadedLines),
                 );
               }
+              // A read larger than the budget takes all of it.
+              const bytes = Math.min(data.byteLength, READ_AHEAD_BYTES);
               yield* Semaphore.take(slots, 1);
+              yield* Semaphore.take(budget, bytes);
               pending += 1;
               const offloaded =
                 long.length === 0
@@ -834,7 +844,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
                         ),
                       { concurrency: "unbounded" },
                     ).pipe(Effect.forkScoped);
-              yield* Queue.offer(reads, { data, lines, offloaded });
+              yield* Queue.offer(reads, { data, lines, offloaded, bytes });
             }),
           ),
           Effect.matchCauseEffect({
@@ -846,7 +856,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         return Stream.fromQueue(reads);
       }),
     ).pipe(
-      Stream.runForEach(({ data, lines, offloaded }) =>
+      Stream.runForEach(({ data, lines, offloaded, bytes }) =>
         (offloaded === undefined ? Effect.succeed([]) : Fiber.join(offloaded)).pipe(
           Effect.flatMap((results) => {
             const next = results[Symbol.iterator]();
@@ -855,7 +865,9 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           Effect.tap(() =>
             Effect.suspend(() => {
               pending -= 1;
-              return Semaphore.release(slots, 1);
+              return Semaphore.release(slots, 1).pipe(
+                Effect.andThen(Semaphore.release(budget, bytes)),
+              );
             }),
           ),
         ),

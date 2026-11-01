@@ -24,6 +24,10 @@ const MAX_BUFFERED_RAW_MESSAGES = 32;
 // Reads queued and not yet handled with a line offload, at most; past this, stdout waits.
 // Fewer than ~33 drain the pipeline in a burst of one-line reads and delay delivery.
 const READ_AHEAD_LIMIT = 256;
+// Raw bytes of those reads, at most (a larger read takes all of it); whichever bound comes first
+// stops reading, so the backlog stays in the pipe. Behind a stalled line pending reads hold 2.3-5.2x
+// their bytes in heap and buffers: 9.6-21 MiB at this budget, 37-83 MiB with 256 reads alone.
+const READ_AHEAD_BYTES = 4 * 1024 * 1024;
 // A worker call's outcome, kept so that a failure surfaces at its line, as it would in-thread.
 type OffloadOutcome = Exit.Exit<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
 const noOffloadedLines: Iterator<OffloadOutcome> = [][Symbol.iterator]();
@@ -496,14 +500,18 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       timing?.record("framing", read.framingMs, read.chunk.byteLength);
     });
 
+    let droppedAfterTermination = false;
+
     // A read with no long line is handled where it arrives, as in-thread, unless reads before it
     // are still pending. A read with long lines sends them to the worker at once and waits in a
     // queue that a second fiber handles in order, so the next reads arrive at their own pace
     // instead of each waiting a round trip; one whose lines are back is handled at once.
     const readAhead = (offload: CodexAppServerLineOffload) => {
-      // Reads queued and not yet handled, and a slot for each, released once it is handled.
+      // Reads queued and not yet handled, and a slot and their bytes for each, released once it is
+      // handled; reading waits for whichever runs out first, so stdout backs up into the pipe.
       let pending = 0;
       const slots = Semaphore.makeUnsafe(READ_AHEAD_LIMIT);
+      const budget = Semaphore.makeUnsafe(READ_AHEAD_BYTES);
       return Stream.unwrap(
         Effect.gen(function* () {
           const reads = yield* Queue.unbounded<
@@ -512,11 +520,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
               readonly lines: CodexWire.FramedLines;
               readonly framingMs: number;
               readonly offloaded: Fiber.Fiber<ReadonlyArray<OffloadOutcome>> | undefined;
+              readonly bytes: number;
             },
             PlatformError.PlatformError | CodexError.CodexAppServerError | Cause.Done<void>
           >();
           yield* options.stdio.stdin.pipe(
-            // As in-thread, termination stops stdout at its next read; reads taken are all handled.
+            // As in-thread, termination stops stdout at its next read.
             Stream.interruptWhen(Deferred.await(terminationSignal)),
             Stream.runForEachWhile(
               Effect.fnUntraced(function* (chunk) {
@@ -531,7 +540,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                 if (long.length === 0 && pending === 0) {
                   yield* handleRead(offload, read, noOffloadedLines);
                 } else {
+                  // A read larger than the budget takes all of it.
+                  const bytes = Math.min(chunk.byteLength, READ_AHEAD_BYTES);
                   yield* Semaphore.take(slots, 1);
+                  yield* Semaphore.take(budget, bytes);
                   pending += 1;
                   const offloaded =
                     long.length === 0
@@ -541,7 +553,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                           (line) => Effect.exit(decodeOffloaded(offload, line)),
                           { concurrency: "unbounded" },
                         ).pipe(Effect.forkScoped);
-                  yield* Queue.offer(reads, { ...read, offloaded });
+                  yield* Queue.offer(reads, { ...read, offloaded, bytes });
                 }
                 // In-thread the read stops at an oversized line.
                 return !lines.exceeded;
@@ -556,13 +568,24 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           return Stream.fromQueue(reads);
         }),
       ).pipe(
-        Stream.runForEach(({ offloaded, ...read }) =>
-          (offloaded === undefined ? Effect.succeed([]) : Fiber.join(offloaded)).pipe(
-            Effect.flatMap((results) => handleRead(offload, read, results[Symbol.iterator]())),
+        Stream.runForEach(({ offloaded, bytes, ...read }) =>
+          Deferred.isDone(terminationSignal).pipe(
+            Effect.flatMap((terminated) => {
+              // In-thread a read not begun by termination is never read, so it is dropped unlogged.
+              if (terminated) {
+                droppedAfterTermination = true;
+                return Effect.void;
+              }
+              return (offloaded === undefined ? Effect.succeed([]) : Fiber.join(offloaded)).pipe(
+                Effect.flatMap((results) => handleRead(offload, read, results[Symbol.iterator]())),
+              );
+            }),
             Effect.tap(() =>
               Effect.suspend(() => {
                 pending -= 1;
-                return Semaphore.release(slots, 1);
+                return Semaphore.release(slots, 1).pipe(
+                  Effect.andThen(Semaphore.release(budget, bytes)),
+                );
               }),
             ),
           ),
@@ -597,7 +620,11 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             Effect.succeed(normalizeIncomingError(error, "read-input-stream")),
           ),
         onSuccess: () =>
-          Effect.sync(() => framer.end()).pipe(
+          Effect.sync(() => {
+            const tail = framer.end();
+            // A dropped read's bytes end it; in-thread would log the last handled read's part.
+            return droppedAfterTermination ? "" : tail;
+          }).pipe(
             Effect.flatMap(handleLine),
             Effect.matchEffect({
               onFailure: (error) => handleTermination(() => Effect.succeed(error)),

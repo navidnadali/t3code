@@ -131,15 +131,14 @@ const callbackOf = (
   return callbacks.hooks?.[event]?.[matcher]?.hooks[index];
 };
 
-// The SDK writes an answer as JSON, and canUseTool's spread with its tool use id. Cloning keeps
-// what JSON converts or drops (toJSON, a Buffer, a function), so only plain data crosses as is.
-const wireAnswer = (call: ClaudeAgentSdkCallbackCall, value: unknown): unknown => {
-  if (isPlainData(value)) return value;
-  const text = JSON.stringify(
-    call.name === "canUseTool" && value !== null ? { ...(value as object) } : value,
+// The answer as the SDK writes it to the CLI (canUseTool's with its tool use id): cloning the value
+// instead would keep what JSON converts (toJSON, a Buffer) and fail on what JSON reads (a Proxy).
+const answerJson = (call: ClaudeAgentSdkCallbackCall, value: unknown): string | undefined =>
+  JSON.stringify(
+    call.name === "canUseTool" && value !== null
+      ? { ...(value as object), toolUseID: call.args[2].toolUseID }
+      : value,
   );
-  return text === undefined ? undefined : JSON.parse(text);
-};
 
 // What the SDK sends the CLI for a callback that throws.
 const sdkErrorText = (error: unknown) => {
@@ -333,14 +332,14 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     void Promise.resolve(result).then(
       (value) => {
         if (!callbacks.delete(id)) return;
-        let answer: unknown;
+        let json: string | undefined;
         try {
-          answer = wireAnswer(call, value);
+          json = answerJson(call, value);
         } catch (error) {
           fail(error);
           return;
         }
-        session?.notify({ type: "callbackResult", id, result: answer });
+        session?.notify({ type: "callbackResult", id, json });
       },
       (error: unknown) => {
         if (callbacks.delete(id)) fail(error);

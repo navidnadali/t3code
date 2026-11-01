@@ -105,7 +105,8 @@ export type ClaudeAgentSdkWorkerRequest =
       readonly signal: NodeJS.Signals | null;
     }
   | { readonly type: "error"; readonly error: ClaudeAgentSdkProcessError }
-  | { readonly type: "callbackResult"; readonly id: number; readonly result: unknown }
+  // The answer as JSON text, undefined when JSON drops it.
+  | { readonly type: "callbackResult"; readonly id: number; readonly json: string | undefined }
   // The text the SDK sends the CLI for a callback that threw.
   | { readonly type: "callbackError"; readonly id: number; readonly text: string };
 
@@ -318,8 +319,9 @@ const makeCallbackRelay = (signal: Signal, read: () => number) => {
     const callback = pending.get(request.id);
     if (callback === undefined) return;
     pending.delete(request.id);
-    if (request.type === "callbackResult") callback.resolve(request.result);
-    else callback.reject(new Error(request.text));
+    if (request.type === "callbackResult") {
+      callback.resolve(request.json === undefined ? undefined : JSON.parse(request.json));
+    } else callback.reject(new Error(request.text));
   };
 
   // Only after the query closed: the SDK sends nothing for a callback that settles then.

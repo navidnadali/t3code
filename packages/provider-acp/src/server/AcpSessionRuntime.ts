@@ -2623,18 +2623,26 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
               } satisfies EffectAcpSchema.PromptRequest;
               const completed = yield* Deferred.make<void>();
               const queued = yield* Deferred.make<void>();
-              const fiber = yield* runLoggedRequest(
-                "session/prompt",
-                requestPayload,
-                acp.agent
-                  .prompt(requestPayload)
-                  .pipe(
-                    Effect.provideService(EffectAcpProtocol.AcpOutgoingQueued, queued),
-                    Effect.ensuring(Deferred.succeed(queued, undefined)),
+              // The prompt goes out only once active, so a cancel issued as it goes out waits for it.
+              const registered = yield* Deferred.make<void>();
+              const fiber = yield* Deferred.await(registered).pipe(
+                Effect.andThen(
+                  runLoggedRequest(
+                    "session/prompt",
+                    requestPayload,
+                    acp.agent
+                      .prompt(requestPayload)
+                      .pipe(
+                        Effect.provideService(EffectAcpProtocol.AcpOutgoingQueued, queued),
+                        Effect.ensuring(Deferred.succeed(queued, undefined)),
+                      ),
                   ),
-              ).pipe(Effect.forkIn(runtimeScope, { startImmediately: true }));
+                ),
+                Effect.forkIn(runtimeScope, { startImmediately: true }),
+              );
               const active = { fiber, completed, queued } satisfies AcpActivePrompt;
               yield* Ref.set(activePromptRef, Option.some(active));
+              yield* Deferred.succeed(registered, undefined);
               return active;
             }).pipe(notificationSemaphore.withPermit),
           ),

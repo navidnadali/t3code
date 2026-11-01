@@ -1181,6 +1181,40 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
     }),
   );
 
+  it.effect("routes a batch with more messages than a call takes arguments", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const decoded = yield* Deferred.make<number>();
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        logIncoming: true,
+        logger: (event) =>
+          event.stage === "decoded" && event.direction === "incoming"
+            ? Deferred.succeed(decoded, (event.payload as ReadonlyArray<unknown>).length).pipe(
+                Effect.asVoid,
+              )
+            : Effect.void,
+        lineOffload: makeOffload([]),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+
+      const count = 200_000;
+      const batch = Array.from(
+        { length: count },
+        (_, id) => `{"jsonrpc":"2.0","id":${id},"result":null}`,
+      );
+      yield* Queue.offer(input, encoder.encode(`[${batch.join(",")}]\n`));
+
+      const outcome = yield* Effect.raceFirst(
+        Deferred.await(decoded),
+        Deferred.await(terminated).pipe(Effect.map((error) => error._tag)),
+      );
+      assert.strictEqual(outcome, count);
+    }),
+  );
+
   it.effect("decodes a line on main when the offload hands it back", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();

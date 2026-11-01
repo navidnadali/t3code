@@ -11,7 +11,9 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
+import * as References from "effect/References";
 import * as Scope from "effect/Scope";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
@@ -1562,6 +1564,68 @@ describe("AcpSessionRuntime", () => {
           "_test/environment failed",
         ]);
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "writes an in-flight request's failed record from a slow logger when the runtime closes",
+    () => {
+      const warnings: Array<unknown> = [];
+      return Effect.gen(function* () {
+        const runtimeScope = yield* Scope.make();
+        const agentStopped = yield* Deferred.make<void>();
+        const written: Array<string> = [];
+        const runtime = yield* AcpSessionRuntime.make({
+          ...mockRuntimeOptions,
+          spawn: { ...mockRuntimeOptions.spawn, env: { T3_ACP_HANG_PROMPT_FOREVER: "1" } },
+          interruptPromptOnCancel: false,
+          // The failed record's append ends just after the runtime has stopped its agent.
+          requestLogger: (event) =>
+            (event.method === "session/prompt" && event.status === "failed"
+              ? Deferred.await(agentStopped).pipe(Effect.andThen(Effect.yieldNow))
+              : Effect.void
+            ).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  written.push(`${event.method} ${event.status}`);
+                }),
+              ),
+            ),
+        }).pipe(
+          Effect.provideService(Scope.Scope, runtimeScope),
+          Effect.provideService(AgentScope, {
+            ...AgentScope.defaultValue(),
+            wrap: ({ command, args }) =>
+              Effect.succeed({ command, args, unit: "t3code-acp-test.scope" }),
+            stop: () => Deferred.succeed(agentStopped, undefined).pipe(Effect.asVoid),
+          }),
+        );
+        yield* runtime.start();
+        const dispatched = yield* Deferred.make<void>();
+        const prompt = yield* runtime
+          .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(dispatched);
+
+        yield* Scope.close(runtimeScope, Exit.void);
+        expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+        expect(written.filter((record) => record.startsWith("session/prompt"))).toEqual([
+          "session/prompt started",
+          "session/prompt failed",
+        ]);
+        expect(warnings).toEqual([]);
+      }).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ logLevel, message, fiber }) => {
+              if (logLevel === "Warn") {
+                warnings.push([message, fiber.getRef(References.CurrentLogAnnotations)]);
+              }
+            }),
+          ]),
+        ),
+        Effect.provide(NodeServices.layer),
+      );
+    },
   );
 
   it.effect("closes without waiting for a native request record that never completes", () =>

@@ -167,17 +167,29 @@ const keyed = (text: string) =>
 
 const blankText = (text: string) => fillText(text, keyed(text) % SEEDS);
 
-/** Filler syllables, one letter per UTF-8 byte of the key: always a valid identifier. */
-const blankKey = (key: string) => {
-  const next = mulberry32(keyed(key));
-  let out = "";
-  for (let bytes = Buffer.byteLength(key, "utf8"); bytes > 0; bytes -= 2) {
+/** Key filler: a five-syllable seed, then syllables it fixes, to `length` letters (at least 10). */
+const keyFiller = (seed: number, length: number) => {
+  const next = mulberry32(seed ^ 0x2545f491);
+  let out = syllablesOf(seed).join("");
+  while (out.length < length) {
     out +=
-      bytes === 1
+      length - out.length === 1
         ? FINALS[Math.floor(next() * FINALS.length)]
         : SYLLABLES[Math.floor(next() * SYLLABLES.length)];
   }
   return out;
+};
+
+/** One letter per UTF-8 byte of the key (at least 10, so keys stay distinct): a valid identifier. */
+const blankKey = (key: string) =>
+  keyFiller(keyed(key) % SEEDS, Math.max(Buffer.byteLength(key, "utf8"), SEED_SYLLABLES * 2));
+
+/** True for exactly what `blankKey` writes: its seed is read back and the rest regenerated. */
+const isBlankedKey = (key: string) => {
+  if (key.length < SEED_SYLLABLES * 2) return false;
+  const head = key.slice(0, SEED_SYLLABLES * 2);
+  const seed = seedOf(`${head.slice(0, 4)} ${head.slice(4, 8)} ${head.slice(8)}`);
+  return seed >= 0 && keyFiller(seed, key.length) === key;
 };
 
 /** Every string literal and enum value the contracts declare: the values enum fields can take. */
@@ -274,16 +286,13 @@ const keptFindings = (value: string, kept: Kept, key: string | null): Array<stri
   return findings;
 };
 
-/** What `blankKey` writes: filler syllables and at most one final consonant. */
-const BLANKED_KEY = /^(?:[bdfglmnprsvz][aeiou])*[nrsl]?$/;
+/** The allowlist for an original key: an identifier the pattern layer does not flag. */
+const keepsKey = (key: string) =>
+  IDENTIFIER.test(key) && scanDecoded(key, { entropy: false }).length === 0;
 
-/** Identifiers stay unless flagged; anything else must be a rewritten key. */
+/** At check time a key is an allowlisted identifier or, regenerated from its seed, key filler. */
 const keyFindings = (key: string) =>
-  IDENTIFIER.test(key)
-    ? scanDecoded(key, { entropy: false })
-    : BLANKED_KEY.test(key)
-      ? []
-      : ["key"];
+  IDENTIFIER.test(key) ? scanDecoded(key, { entropy: false }) : isBlankedKey(key) ? [] : ["key"];
 
 /** `blank` (default): filler for all but the allowlist. `redact`: the pattern layer alone. */
 export type ContentMode = "blank" | "redact";
@@ -340,7 +349,7 @@ export const rewriteContent = (
       text,
       (decoded, where) => {
         if (where.role === "value") return rewriteContent(decoded, where.key, mode, counts);
-        if (keyFindings(decoded).length === 0) return decoded;
+        if (keepsKey(decoded)) return decoded;
         keysChanged = true;
         counts.keys++;
         return blankKey(decoded);

@@ -556,6 +556,15 @@ function refNameMatches(ref: string): ReadonlyArray<string> {
   ];
 }
 
+// The refs `rev-parse --symbolic-full-name <branch>@{upstream}` reads for remote-tracking ref `ref`:
+// Git shortens it to <remote>/<branch>, or remotes/<remote>/<branch> when that is ambiguous, and
+// resolves the short name again; any other match of either makes the output empty.
+function upstreamLookupRefs(ref: string): ReadonlyArray<string> {
+  const remotesForm = ref.slice("refs/".length);
+  const shortForm = remotesForm.slice("remotes/".length);
+  return [...new Set([shortForm, remotesForm, ref].flatMap(refNameMatches))];
+}
+
 // The remote-tracking ref branch.<name>.merge maps to, when the config leaves one reading: a single
 // merge branch and a remote with a URL and a single `refs/heads/*:refs/remotes/<x>/*` refspec.
 function configuredUpstreamRef(snapshot: GitConfigSnapshot, branch: string): string | null {
@@ -1890,7 +1899,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       (result) =>
         configured !== null &&
         (result === undefined || (result.exitCode === 0 && result.stdout === `${configured}\n`))
-          ? refNameMatches(configured)
+          ? upstreamLookupRefs(configured)
           : null,
       executeGit("GitVcsDriver.resolveTrackedRemoteBaseRef", cwd, args, {
         allowNonZeroExit: true,

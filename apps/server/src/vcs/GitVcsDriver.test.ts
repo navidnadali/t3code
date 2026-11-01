@@ -594,42 +594,55 @@ it.effect("reads a boolean the way git config --bool does", () =>
     const git = (args: ReadonlyArray<string>) =>
       driver.execute({ operation: "config-bool-test", cwd, args, allowNonZeroExit: true });
     yield* git(["init", "-q"]);
-    const cases: ReadonlyArray<readonly [value: string | null, parsed: boolean]> = [
-      [null, true],
-      ["", true],
-      ["true", true],
-      ["TRUE", true],
-      ["Yes", true],
-      ["on", true],
-      ["false", true],
-      ["No", true],
-      ["OFF", true],
-      ["0", true],
-      ["1", true],
-      ["2", true],
-      ["123456789", true],
-      ["1234567890", false],
-      ["007", false],
-      ["08", false],
-      ["0x1", false],
-      ["1k", false],
-      ["-1", false],
-      ['" 1"', false],
-      ["maybe", false],
+    // Each case: the key's values in order, and whether gitConfigBool answers without Git.
+    const cases: ReadonlyArray<readonly [values: ReadonlyArray<string | null>, parsed: boolean]> = [
+      [[null], true],
+      [[""], true],
+      [["true"], true],
+      [["TRUE"], true],
+      [["Yes"], true],
+      [["on"], true],
+      [["false"], true],
+      [["No"], true],
+      [["OFF"], true],
+      [["0"], true],
+      [["1"], true],
+      [["2"], true],
+      [["123456789"], true],
+      [["1234567890"], false],
+      [["007"], false],
+      [["08"], false],
+      [["0x1"], false],
+      [["1k"], false],
+      [["-1"], false],
+      [['" 1"'], false],
+      [["maybe"], false],
+      [["yes", "off"], true],
+      [["maybe", "true"], false],
+      [["0x1", "false"], false],
     ];
     const include = path.join(cwd, "flags.inc");
     yield* fileSystem.writeFileString(
       include,
-      `[t3]\n${cases.map(([value], index) => (value === null ? `\tflag${index}\n` : `\tflag${index} = ${value}\n`)).join("")}`,
+      `[t3]\n${cases
+        .flatMap(([values], index) =>
+          values.map((value) =>
+            value === null ? `\tflag${index}\n` : `\tflag${index} = ${value}\n`,
+          ),
+        )
+        .join("")}`,
     );
     yield* git(["config", "include.path", include]);
     const listed = parseGitConfigList(
       (yield* git(["config", "--list", "--show-origin", "-z"])).stdout,
     );
-    const values = new Map((listed ?? []).map((entry) => [entry.key, entry.value]));
+    const valueLists = new Map<string, Array<string | null>>();
+    for (const { key, value } of listed ?? []) {
+      valueLists.set(key, [...(valueLists.get(key) ?? []), value]);
+    }
     const keys = [...cases.keys(), cases.length].map((index) => `t3.Flag${index}`);
 
-    const parsed = keys.map((key) => gitConfigBool(values, key));
+    const parsed = keys.map((key) => gitConfigBool(valueLists, key));
 
     const printed = yield* Effect.forEach(keys, (key) =>
       git(["config", "--bool", key]).pipe(Effect.map(({ stdout }) => stdout.trim() === "true")),

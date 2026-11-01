@@ -66,22 +66,28 @@ const GIT_BOOLEAN_WORDS = new Map([
   ["off", false],
 ]);
 
-/**
- * Whether `git config --bool <key>` prints "true"; null for an integer beyond plain decimals or an
- * invalid value, which Git parses (or rejects) itself.
- */
-export const gitConfigBool = (
-  values: ReadonlyMap<string, string | null>,
-  key: string,
-): boolean | null => {
-  const canonicalKey = canonicalGitConfigKey(key);
-  if (!values.has(canonicalKey)) return false;
-  const value = values.get(canonicalKey) ?? null;
+const gitBoolean = (value: string | null): boolean | null => {
   if (value === null) return true;
   if (value === "") return false;
   const word = GIT_BOOLEAN_WORDS.get(lowerAscii(value));
   if (word !== undefined) return word;
   return /^(?:0|[1-9][0-9]{0,8})$/.test(value) ? value !== "0" : null;
+};
+
+/**
+ * Whether `git config --bool <key>` prints "true": Git parses every value of the key and prints the
+ * last. Null when one is an integer beyond plain decimals or invalid, which Git parses (or rejects).
+ */
+export const gitConfigBool = (
+  valueLists: ReadonlyMap<string, ReadonlyArray<string | null>>,
+  key: string,
+): boolean | null => {
+  let parsed: boolean | null = false;
+  for (const value of valueLists.get(canonicalGitConfigKey(key)) ?? []) {
+    parsed = gitBoolean(value);
+    if (parsed === null) return null;
+  }
+  return parsed;
 };
 
 const INCLUDE_CONDITION_PREFIXES = ["gitdir:", "gitdir/i:", "hasconfig:remote.*.url:"] as const;
@@ -291,10 +297,12 @@ const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
 const REF_RESULTS_CAPACITY = 256;
 const REPOSITORY_PATH_COUNT = 10;
 const REUSED_RESULTS_CAPACITY = 64;
-// Ref names whose loose file Git's files backend keeps at <common dir>/<name>.
+// Ref names whose loose file Git's files backend keeps at <common dir>/<name>: refs shared by every
+// worktree, under refs/ or (like `<remote>/<branch>` when Git resolves a short name) outside it.
 const isLooseRefName = (name: string) =>
-  name.startsWith("refs/") &&
-  !/^refs\/(?:worktree|bisect|rewritten)\//.test(name) &&
+  (name.startsWith("refs/")
+    ? !/^refs\/(?:worktree|bisect|rewritten)\//.test(name)
+    : name.includes("/") && !/^(?:main-worktree|worktrees)\//.test(name)) &&
   !/[\0-\x20\x7f~^:?*[\\]|\.\.|@\{|\.$/.test(name) &&
   name
     .split("/")
@@ -621,62 +629,71 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     return yield* read(cwd);
   });
 
+  // The refs' loose files (kind entry), packed-refs, and reftable, which must stay absent: Git takes
+  // extensions from the repository's own config file, not from the merged config the snapshot holds.
   const refDependencies = (
     commonDir: string,
     names: ReadonlyArray<string>,
   ): ReadonlyArray<GitConfigDependency> => [
     ...names.map((name) => ({ path: path.join(commonDir, name), kind: "entry" as const })),
     { path: path.join(commonDir, "packed-refs"), kind: "content" },
+    { path: path.join(commonDir, "reftable"), kind: "presence" },
   ];
 
   /**
    * Runs a command whose result depends only on the snapshot and on some refs, once per state of
    * their loose files and packed-refs. `refs` names those refs before the run (called without a
-   * result) or from its result; null means the result cannot be reused.
+   * result) or from its result; null means the result cannot be reused. Untraced like read: it runs
+   * for every ref probe, and the Git command it may run keeps its own span.
    */
-  const runWithRefs = <E>(
+  const runWithRefs = Effect.fnUntraced(function* (
     snapshot: GitConfigSnapshot | null,
     args: ReadonlyArray<string>,
     refs: (result?: GitVcsDriver.ExecuteGitResult) => ReadonlyArray<string> | null,
-    run: Effect.Effect<GitVcsDriver.ExecuteGitResult, E>,
-  ): Effect.Effect<GitVcsDriver.ExecuteGitResult, E> => {
+    run: Effect.Effect<GitVcsDriver.ExecuteGitResult, GitCommandError>,
+  ) {
     const commonDir = snapshot?.commonDir ?? null;
-    if (snapshot === null || commonDir === null) return run;
+    if (snapshot === null || commonDir === null) return yield* run;
     const key = args.join("\0");
-    return Effect.gen(function* () {
-      const cached = snapshot.refResults.get(key);
-      const known = refs();
-      const dependencies =
-        cached?.dependencies ?? (known === null ? [] : refDependencies(commonDir, known));
-      const fingerprint = (yield* fingerprintDependencies(dependencies)).join("\n");
-      if (cached !== undefined && cached.fingerprint === fingerprint) return cached.result;
-      const result = yield* run;
-      const names = isReusableResult(result) ? refs(result) : null;
-      const needed = names?.every(isLooseRefName) ? refDependencies(commonDir, names) : null;
-      // A symbolic ref's result depends on its target, which is not tracked.
-      const symbolic =
-        needed !== null &&
-        (yield* Effect.promise(() =>
-          Promise.all(needed.slice(0, -1).map((dependency) => readsSymbolicRef(dependency.path))),
-        )).some(Boolean);
-      if (needed === null || symbolic) {
-        snapshot.refResults.delete(key);
-        return result;
-      }
-      const statedFirst =
-        needed.length === dependencies.length &&
-        needed.every((dependency, index) => dependency.path === dependencies[index]!.path);
-      if (!snapshot.refResults.has(key) && snapshot.refResults.size >= REF_RESULTS_CAPACITY) {
-        snapshot.refResults.delete(snapshot.refResults.keys().next().value!);
-      }
-      snapshot.refResults.set(key, {
-        dependencies: needed,
-        fingerprint: statedFirst ? fingerprint : null,
-        result,
-      });
+    const cached = snapshot.refResults.get(key);
+    const known = refs();
+    const dependencies =
+      cached?.dependencies ?? (known === null ? [] : refDependencies(commonDir, known));
+    const fingerprints = yield* fingerprintDependencies(dependencies);
+    const fingerprint = fingerprints.join("\n");
+    if (cached !== undefined && cached.fingerprint === fingerprint) return cached.result;
+    const result = yield* run;
+    const names = isReusableResult(result) ? refs(result) : null;
+    const needed = names?.every(isLooseRefName) ? refDependencies(commonDir, names) : null;
+    // A symbolic ref's result depends on its target, which is not tracked.
+    const symbolic =
+      needed !== null &&
+      (yield* Effect.promise(() =>
+        Promise.all(
+          needed
+            .filter((dependency) => dependency.kind === "entry")
+            .map((dependency) => readsSymbolicRef(dependency.path)),
+        ),
+      )).some(Boolean);
+    const statedFirst =
+      needed !== null &&
+      needed.length === dependencies.length &&
+      needed.every((dependency, index) => dependency.path === dependencies[index]!.path);
+    const reftable = statedFirst && !fingerprints.at(-1)!.startsWith("!");
+    if (needed === null || symbolic || reftable) {
+      snapshot.refResults.delete(key);
       return result;
+    }
+    if (!snapshot.refResults.has(key) && snapshot.refResults.size >= REF_RESULTS_CAPACITY) {
+      snapshot.refResults.delete(snapshot.refResults.keys().next().value!);
+    }
+    snapshot.refResults.set(key, {
+      dependencies: needed,
+      fingerprint: statedFirst ? fingerprint : null,
+      result,
     });
-  };
+    return result;
+  });
 
   return { read, peek, runWithRefs };
 });

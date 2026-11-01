@@ -928,7 +928,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       yield* Effect.gen(function* () {
         const snapshot = yield* configSnapshots.read(input.cwd);
         let sparseCheckout =
-          snapshot === null ? null : gitConfigBool(snapshot.values, "core.sparseCheckout");
+          snapshot === null ? null : gitConfigBool(snapshot.valueLists, "core.sparseCheckout");
         if (sparseCheckout === null) {
           const sparseConfig = yield* execute({
             operation,

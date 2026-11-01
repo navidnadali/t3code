@@ -90,16 +90,16 @@ JSON is judged by its column name the same way.
 
 Kept as written (`fixture/content.ts`):
 
-| Kept                          | When                                                                                                                                                                                      |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Known literals                | the whole string is a string literal or enum value declared in `@t3tools/contracts` (≤ 64 chars)                                                                                          |
-| Timestamps                    | ISO 8601 date or date-time                                                                                                                                                                |
-| Ids                           | key `id`/`ids`/`uuid`, `…Id`/`…Ids`, `…_id`/`…_ids`; value without whitespace, ≤ 4096 chars                                                                                               |
-| `type`/`kind`/`status`/`role` | key is one of these or ends in one (`event_type`, `itemKind`); value `[A-Za-z][A-Za-z0-9_.:/-]{0,63}`                                                                                     |
-| Model and provider names      | key ends in `model`/`provider`/`driver` (also `…Name`, `…Slug`); value without spaces, ≤ 128                                                                                              |
-| Git hashes                    | key ends in `sha`/`hash`/`oid`/`commit`/`revision`; value 7–64 hex digits                                                                                                                 |
-| Object keys                   | identifiers `[A-Za-z_$@][A-Za-z0-9_$@.:-]{0,63}` the pattern layer does not flag; any other key becomes key filler: a seed and the syllables it fixes, one letter per byte (at least ten) |
-| Structural tables             | `effect_sql_migrations` and `orchestration_v2_projection_metadata`, whole                                                                                                                 |
+| Kept                          | When                                                                                                                                                                                                           |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Known literals                | the whole string is a string literal or enum value declared in `@t3tools/contracts` (≤ 64 chars)                                                                                                               |
+| Timestamps                    | ISO 8601 date or date-time                                                                                                                                                                                     |
+| Ids                           | key `id`/`ids`/`uuid`, `…Id`/`…Ids`, `…_id`/`…_ids`; value without whitespace, ≤ 4096 chars                                                                                                                    |
+| `type`/`kind`/`status`/`role` | key is one of these or ends in one (`event_type`, `itemKind`); value `[A-Za-z][A-Za-z0-9_.:/-]{0,63}`                                                                                                          |
+| Model and provider names      | key ends in `model`/`provider`/`driver` (also `…Name`, `…Slug`); value without spaces, ≤ 128                                                                                                                   |
+| Git hashes                    | key ends in `sha`/`hash`/`oid`/`commit`/`revision`; value 7–64 hex digits                                                                                                                                      |
+| Object keys                   | identifiers `[A-Za-z_$@][A-Za-z0-9_$@.:-]{0,63}` the pattern layer does not flag; any other key becomes key filler: a seed and the letters it fixes, a `.` every eighth character, one per byte (at least ten) |
+| Structural tables             | `effect_sql_migrations` and `orchestration_v2_projection_metadata`, whole                                                                                                                                      |
 
 A value under a credential-named key (`password`, `token`, `secret`, `api_key`, `auth`, …) keeps only a known
 literal. The pattern layer (`fixture/secrets.ts`) still reads every kept value and key, and a kept value it flags

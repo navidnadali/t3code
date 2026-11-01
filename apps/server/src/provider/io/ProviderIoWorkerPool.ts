@@ -97,11 +97,13 @@ const HANDSHAKE_TIMEOUT = Duration.seconds(10);
 const DEFAULT_HIGH_WATER_MARK = 1024 * 1024;
 
 interface SessionHandle {
+  readonly stage: string;
   readonly deliver: (outputs: ReadonlyArray<unknown>, bytes: number) => void;
   readonly finish: (failure?: { readonly error: unknown }) => void;
   readonly event: (event: unknown) => void;
   readonly reply: (call: number, ok: boolean, value: unknown) => void;
   readonly failStage: (cause: unknown) => void;
+  readonly failOnMain: (cause: unknown) => void;
   readonly failWorker: (error: ProviderIoWorkerError, kill: boolean) => void;
 }
 
@@ -229,22 +231,38 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     }
     const session = slot.sessions.get(message.session);
     if (session === undefined) return;
-    switch (message.type) {
-      case "output":
-        session.deliver(message.outputs, message.bytes);
-        return;
-      case "end":
-        session.finish(message.failed === true ? { error: message.error } : undefined);
-        return;
-      case "event":
-        session.event(message.event);
-        return;
-      case "fail":
-        session.failStage(message.error);
-        return;
-      case "reply":
-        session.reply(message.call, message.ok, message.value);
-        return;
+    // Nothing catches a throw out of the listener: it would end the server and every session.
+    try {
+      switch (message.type) {
+        case "output":
+          session.deliver(message.outputs, message.bytes);
+          return;
+        case "end":
+          session.finish(message.failed === true ? { error: message.error } : undefined);
+          return;
+        case "event":
+          session.event(message.event);
+          return;
+        case "fail":
+          session.failStage(message.error);
+          return;
+        case "reply":
+          session.reply(message.call, message.ok, message.value);
+          return;
+      }
+    } catch (cause) {
+      runFork(
+        Effect.logWarning("Provider I/O session failed handling a worker message", {
+          stage: session.stage,
+          type: message.type,
+          errorTag: errorTag(cause),
+        }),
+      );
+      try {
+        session.failOnMain(cause);
+      } catch {
+        // The session's own failure hooks threw as well; the server still goes on.
+      }
     }
   };
 
@@ -453,6 +471,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     });
     if (opened !== undefined) return yield* Effect.fail(opened);
     slot.sessions.set(id, {
+      stage: input.stage.name,
       deliver: (outputs, bytes) => {
         if (failure !== undefined || closed) return;
         if (Arr.isReadonlyArrayNonEmpty(outputs)) {
@@ -501,6 +520,9 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       },
       failStage: (cause) =>
         fail(new ProviderIoStageError({ stage: input.stage.name, cause }), false),
+      // The worker still runs the stage, so main can no longer trust what it says of the child.
+      failOnMain: (cause) =>
+        fail(new ProviderIoStageError({ stage: input.stage.name, cause }), true),
       failWorker: fail,
     });
     if (slot.sessions.size === 1) slot.worker.ref();

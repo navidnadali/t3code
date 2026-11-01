@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off globalDateInEffect:off globalTimers:off -- Mirrors NodeChildProcessSpawner: Node streams, and its exit poll on host timers.
 import * as PlatformNodeSink from "@effect/platform-node-shared/NodeSink";
 import * as PlatformNodeStream from "@effect/platform-node-shared/NodeStream";
+import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Config from "effect/Config";
 import * as Deferred from "effect/Deferred";
@@ -292,7 +293,9 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
         // detached: false leads no group, and once exited its PID may belong to another process.
         if (child.detached || running) {
           try {
-            process.kill(child.detached ? -child.pid : child.pid, "SIGKILL");
+            if (child.detached) signalProcessGroup(child.pid, "SIGKILL");
+            // As signalProcessGroup checks: kill(0) would signal this server's own group.
+            else if (child.pid > 1) process.kill(child.pid, "SIGKILL");
           } catch {
             // Already gone.
           }
@@ -642,7 +645,7 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
     if (child.killedOnStop) return false;
     if (!Deferred.isDoneUnsafe(child.exitSignal)) return true;
     try {
-      process.kill(-child.pid!, 0);
+      signalProcessGroup(child.pid!, 0);
       return true;
     } catch {
       return false;
@@ -656,7 +659,7 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
   ) =>
     Effect.try({
       try: () => {
-        process.kill(-child.pid!, signal);
+        signalProcessGroup(child.pid!, signal);
       },
       catch: (error) => toPlatformError("kill", toError(error), command),
     });
@@ -766,7 +769,7 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
     child.exitListeners.add((code) => {
       if (code !== 0 && Predicate.isNotNull(code)) {
         try {
-          process.kill(-child.pid!, command.options.killSignal ?? "SIGTERM");
+          signalProcessGroup(child.pid!, command.options.killSignal ?? "SIGTERM");
         } catch {
           // Best-effort cleanup, as NodeChildProcessSpawner does.
         }

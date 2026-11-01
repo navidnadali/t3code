@@ -2371,3 +2371,181 @@ it.effect.each([
     assert.isEmpty(persisted);
   }).pipe(Effect.provide(layerFailingWrites(errors))),
 );
+
+const batchNode = (
+  threadId: OrchestrationV2ExecutionNode["threadId"],
+  name: string,
+  now: DateTime.Utc,
+): OrchestrationV2ExecutionNode => {
+  const id = NodeId.make(`${threadId}:${name}`);
+  return {
+    id,
+    threadId,
+    runId: null,
+    parentNodeId: null,
+    rootNodeId: id,
+    kind: "approval_request",
+    status: "waiting",
+    countsForRun: false,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    runtimeRequestId: null,
+    checkpointScopeId: null,
+    startedAt: now,
+    completedAt: null,
+  };
+};
+
+/**
+ * Counts the ingestor's sink writes. The first batch fails right after normalizing `fail.node`;
+ * with `alone`, writing that node on its own fails too.
+ */
+const ingestBatchOfNodes = (input: {
+  readonly nodes: (
+    threadId: OrchestrationV2ExecutionNode["threadId"],
+    now: DateTime.Utc,
+  ) => ReadonlyArray<OrchestrationV2ExecutionNode>;
+  readonly fail?: { readonly node: string; readonly alone: boolean };
+}) =>
+  Effect.gen(function* () {
+    const writes = { single: 0, batched: 0 };
+    const sequencesAfterFailedBatch: Array<number> = [];
+    const includesFailingNode = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
+      events.some(
+        (event) =>
+          event.type === "node.updated" && event.payload.id.endsWith(`:${input.fail?.node}`),
+      );
+    const observedSink = Layer.effect(
+      EventSink.EventSinkV2,
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const eventStore = yield* EventStore.EventStoreV2;
+        let failBatch = input.fail !== undefined;
+        return EventSink.EventSinkV2.of({
+          ...eventSink,
+          write: (request) =>
+            Effect.suspend(() => {
+              writes.single++;
+              return input.fail?.alone === true && includesFailingNode(request.events)
+                ? Effect.fail(constraintFailure)
+                : eventSink.write(request);
+            }),
+          writeSteps: (request) =>
+            Effect.suspend(() => {
+              writes.batched++;
+              if (!failBatch) return eventSink.writeSteps(request);
+              failBatch = false;
+              return eventSink
+                .writeSteps({
+                  ...request,
+                  steps: request.steps.map((step) =>
+                    step.pipe(
+                      Effect.tap((events) =>
+                        includesFailingNode(events) ? Effect.fail(constraintFailure) : Effect.void,
+                      ),
+                    ),
+                  ),
+                })
+                .pipe(
+                  Effect.tapError(() =>
+                    eventStore.latestSequence().pipe(
+                      Effect.map((sequence) => sequencesAfterFailedBatch.push(sequence)),
+                      Effect.orDie,
+                    ),
+                  ),
+                );
+            }),
+        });
+      }),
+    ).pipe(Layer.provide(Layer.mergeAll(layerTestEventSink, layerTestStores)));
+
+    return yield* Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const eventStore = yield* EventStore.EventStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      yield* eventSink.write({ events: [threadEvent] });
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const exit = yield* ingestor
+        .ingestNormalizedBatch({
+          events: input.nodes(threadId, now).map((node) => ({
+            providerSessionId,
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+            event: { type: "node.updated", driver: CODEX_DRIVER, node },
+          })),
+        })
+        .pipe(Effect.exit);
+      const log = yield* eventStore.read({ afterSequence: 1 }).pipe(Stream.runCollect);
+      return {
+        exit,
+        writes,
+        sequencesAfterFailedBatch,
+        logged: Array.from(log).map((stored) =>
+          stored.event.type === "node.updated"
+            ? `${stored.sequence}:${stored.event.payload.id.split(":").at(-1)}:${stored.event.payload.status}`
+            : `${stored.sequence}:${stored.event.type}`,
+        ),
+      };
+    }).pipe(Effect.provide(makeLayerTest(observedSink)));
+  });
+
+it.effect("writes a run of provider events in one transaction, each as it would be alone", () =>
+  Effect.gen(function* () {
+    const { exit, writes, logged } = yield* ingestBatchOfNodes({
+      nodes: (threadId, now) => {
+        const a = batchNode(threadId, "a", now);
+        return [
+          a,
+          { ...a },
+          batchNode(threadId, "b", now),
+          { ...a, status: "completed", completedAt: now },
+        ];
+      },
+    });
+    assert.isTrue(Exit.isSuccess(exit));
+    if (Exit.isSuccess(exit)) {
+      assert.deepEqual(
+        exit.value.map((stored) => stored.length),
+        [1, 0, 1, 1],
+      );
+    }
+    // The repeated node reads the first one inside the same transaction and is skipped.
+    assert.deepEqual(logged, ["2:a:waiting", "3:b:waiting", "4:a:completed"]);
+    assert.deepEqual(writes, { single: 0, batched: 1 });
+  }),
+);
+
+it.effect("rolls back a batch that fails part-way and writes its events again one by one", () =>
+  Effect.gen(function* () {
+    const { exit, writes, logged, sequencesAfterFailedBatch } = yield* ingestBatchOfNodes({
+      nodes: (threadId, now) => ["a", "b", "c"].map((name) => batchNode(threadId, name, now)),
+      fail: { node: "c", alone: false },
+    });
+    assert.isTrue(Exit.isSuccess(exit));
+    assert.deepEqual(sequencesAfterFailedBatch, [1]);
+    assert.deepEqual(logged, ["2:a:waiting", "3:b:waiting", "4:c:waiting"]);
+    assert.deepEqual(writes, { single: 3, batched: 1 });
+  }),
+);
+
+it.effect("fails a batch at the event that fails alone, after writing the events before it", () =>
+  Effect.gen(function* () {
+    const { exit, writes, logged, sequencesAfterFailedBatch } = yield* ingestBatchOfNodes({
+      nodes: (threadId, now) => ["a", "b", "c"].map((name) => batchNode(threadId, name, now)),
+      fail: { node: "b", alone: true },
+    });
+    const failure = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+    assert.instanceOf(failure, ProviderEventIngestor.ProviderEventPublishError);
+    assert.deepEqual(sequencesAfterFailedBatch, [1]);
+    assert.deepEqual(logged, ["2:a:waiting"]);
+    assert.deepEqual(writes, { single: 2, batched: 1 });
+  }),
+);

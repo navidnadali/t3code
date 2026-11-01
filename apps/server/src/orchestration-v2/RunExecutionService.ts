@@ -610,6 +610,7 @@ export const layer: Layer.Layer<
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+    const providerEventBatchLimit = yield* ProviderEventIngestor.ProviderEventBatchLimit;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const mcpAppModelContext = yield* McpAppModelContext.McpAppModelContext;
     const previewAgentActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
@@ -1293,8 +1294,29 @@ export const layer: Layer.Layer<
         // Ends once the root turn and the children it drives settle. Background commands such
         // as a dev server keep this consumer alive afterwards and must not pin preview focus.
         const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
+        // Events that writing can defer until the end of what was queued, up to the batch limit;
+        // they are written before anything that reads or orders against them.
+        const deferredIngest: Array<ProviderEventIngestor.ProviderEventIngestInput> = [];
+        const flushDeferredIngest = (queued: number) =>
+          Effect.suspend(() =>
+            deferredIngest.length === 0
+              ? Effect.void
+              : providerEventIngestor
+                  .ingestNormalizedBatch({ events: deferredIngest.splice(0), queued })
+                  .pipe(Effect.asVoid),
+          );
         const providerEventFiber = yield* eventSubscription.events.pipe(
-          Stream.mapEffect((event) =>
+          Stream.chunks,
+          Stream.flatMap((events) =>
+            Stream.fromIterable(
+              events.map((event, index) => ({
+                event,
+                queued: events.length,
+                lastQueued: index === events.length - 1,
+              })),
+            ),
+          ),
+          Stream.mapEffect(({ event, queued, lastQueued }) =>
             Effect.gen(function* () {
               const previous = yield* Ref.get(eventRouting);
               const [accepted, routing] = routeProviderEvent(event, routeIdentity, previous);
@@ -1371,12 +1393,15 @@ export const layer: Layer.Layer<
                   (current) => new Set([...current].filter((id) => !detached.itemIds.has(id))),
                 );
               }
-              return { event, accepted };
+              return { event, accepted, queued, lastQueued };
             }),
           ),
-          Stream.tap(({ event, accepted }) =>
+          Stream.tap(({ event, accepted, queued, lastQueued }) =>
             Effect.gen(function* () {
-              if (!accepted) return;
+              if (!accepted) {
+                if (lastQueued) yield* flushDeferredIngest(queued);
+                return;
+              }
               if (
                 event.type === "provider_turn.updated" &&
                 event.providerTurn.runAttemptId === input.attempt.id &&
@@ -1394,7 +1419,7 @@ export const layer: Layer.Layer<
                 const isRootProviderThreadUpdate =
                   event.type === "provider_thread.updated" &&
                   event.providerThread.id === input.providerThread.id;
-                const storedEvents = yield* providerEventIngestor.ingestNormalized({
+                const ingestInput = {
                   analyticsContext: {
                     modelSelection: input.modelSelection,
                     runtimeMode: input.runtimePolicy.runtimeMode,
@@ -1429,8 +1454,21 @@ export const layer: Layer.Layer<
                           },
                         }
                     : {}),
-                });
-                storedEventCount = storedEvents.length;
+                };
+                if (
+                  providerEventBatchLimit > 1 &&
+                  !isRootProviderThreadUpdate &&
+                  ProviderEventIngestor.canIngestInBatch(ingestInput)
+                ) {
+                  deferredIngest.push(ingestInput);
+                  if (deferredIngest.length >= providerEventBatchLimit) {
+                    yield* flushDeferredIngest(queued);
+                  }
+                } else {
+                  yield* flushDeferredIngest(queued);
+                  storedEventCount = (yield* providerEventIngestor.ingestNormalized(ingestInput))
+                    .length;
+                }
                 if (
                   isRootProviderThreadUpdate &&
                   rootTerminalAlreadySeen &&
@@ -1445,6 +1483,7 @@ export const layer: Layer.Layer<
                 event.turnItem.streaming &&
                 !reservedHeldTurnItemIds.has(event.turnItem.id)
               ) {
+                yield* flushDeferredIngest(queued);
                 yield* turnItemPositions.allocate({
                   threadId: event.turnItem.threadId,
                   turnItemId: event.turnItem.id,
@@ -1466,6 +1505,7 @@ export const layer: Layer.Layer<
                 );
               }
               if (event.type === "turn.terminal") {
+                yield* flushDeferredIngest(queued);
                 yield* Ref.set(terminalEvent, event);
                 yield* Ref.set(rootTerminalSeen, true);
                 yield* finalizeRootRun(event);
@@ -1478,6 +1518,7 @@ export const layer: Layer.Layer<
                 }
               }
               yield* trackChildLifecycle(event, deliveredEvent !== null);
+              if (lastQueued) yield* flushDeferredIngest(queued);
             }),
           ),
           // Also after events this run does not accept, such as a child handed to another run.
@@ -1486,7 +1527,11 @@ export const layer: Layer.Layer<
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
             }),
           ),
-          Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
+          Stream.takeUntilEffect(({ queued }) =>
+            shouldStopProviderEventIngestion.pipe(
+              Effect.tap((stop) => (stop ? flushDeferredIngest(queued) : Effect.void)),
+            ),
+          ),
           Stream.runDrain,
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>

@@ -34,6 +34,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
@@ -2985,6 +2986,69 @@ it.effect.each([
   }),
 );
 
+it.effect.each([
+  { limit: 1, writes: Array.from({ length: 22 }, () => 1), queued: [] },
+  { limit: 8, writes: [1, 8, 8, 4, 1], queued: [1, 21, 21, 21] },
+])(
+  "writes a provider event backlog in order, exactly once, $limit event(s) per write at most",
+  ({ limit, writes: expectedWrites, queued: expectedQueued }) =>
+    Effect.gen(function* () {
+      const key = `backlog-${limit}`;
+      const ids = backgroundScenarioIds(key);
+      const providerEvents = yield* Queue.unbounded<
+        ProviderAdapter.ProviderAdapterV2Event,
+        Cause.Done
+      >();
+      const items = Array.from({ length: 21 }, (_, index) =>
+        backgroundTurnItemEvent(
+          ids,
+          "dynamic_tool",
+          "completed",
+          index + 1,
+          TurnItemId.make(`turn-item:${key}:${index}`),
+        ),
+      );
+      const terminal = rootTerminalEvent(ids, "completed");
+      const writes: Array<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>> = [];
+      const queued: Array<number | undefined> = [];
+      const writing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      // The first write holds the writer until everything else has queued behind it.
+      const write = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+        Effect.gen(function* () {
+          writes.push(events);
+          if (writes.length === 1) {
+            yield* Deferred.succeed(writing, undefined);
+            yield* Deferred.await(release);
+          }
+        });
+      yield* Queue.offer(providerEvents, items[0]!);
+      yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        providerEventBatchLimit: limit,
+        events: () => Stream.fromQueue(providerEvents),
+        ingestNormalized: (input) => write([input.event]).pipe(Effect.as([])),
+        ingestNormalizedBatch: (input) =>
+          Effect.sync(() => queued.push(input.queued)).pipe(
+            Effect.andThen(write(input.events.map((event) => event.event))),
+            Effect.as(input.events.map(() => [])),
+          ),
+        afterStart: () =>
+          Deferred.await(writing).pipe(
+            Effect.andThen(Queue.offerAll(providerEvents, [...items.slice(1), terminal])),
+            Effect.andThen(Deferred.succeed(release, undefined)),
+          ),
+      });
+      assert.deepEqual(writes.flat(), [...items, terminal]);
+      assert.deepEqual(
+        writes.map((events) => events.length),
+        expectedWrites,
+      );
+      assert.deepEqual(queued, expectedQueued);
+    }),
+);
+
 it.effect("fails the run when its event stream ends without a root terminal", () =>
   Effect.gen(function* () {
     const { observed, finalEvents } = yield* captureRootRunTermination({
@@ -3073,6 +3137,8 @@ function captureRootRunTermination(input: {
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
+  readonly ingestNormalizedBatch?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalizedBatch"];
+  readonly providerEventBatchLimit?: number;
   readonly beforeTerminalWrite?: (
     request: Parameters<EventSink.EventSinkV2["Service"]["writeIfRunCurrent"]>[0],
   ) => Effect.Effect<boolean, EventSink.EventSinkV2Error>;
@@ -3154,7 +3220,14 @@ function captureRootRunTermination(input: {
           IdAllocator.layer,
           Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
             ingestNormalized: input.ingestNormalized ?? (() => Effect.succeed([])),
+            ...(input.ingestNormalizedBatch === undefined
+              ? {}
+              : { ingestNormalizedBatch: input.ingestNormalizedBatch }),
           }),
+          Layer.succeed(
+            ProviderEventIngestor.ProviderEventBatchLimit,
+            input.providerEventBatchLimit ?? 1,
+          ),
           ServerSettings.layerTest(),
           Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
             refresh: () => Effect.void,

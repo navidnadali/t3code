@@ -819,7 +819,7 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
         Effect.provideService(SpawnExecutableResolution, (command) =>
           command === "git" ? options.gitOnPath : files.has(command) ? command : undefined,
         ),
-        Effect.provideService(XcodeGitLocation, () => {
+        Effect.provideService(XcodeGitLocation, async () => {
           host.xcrunCalls += 1;
           return host.xcrunGit;
         }),
@@ -863,6 +863,16 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
         expect(yield* Fiber.joinAll([first, second])).toEqual([XCODE_GIT, XCODE_GIT]);
         expect(xcrunCalls).toBe(1);
       }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
+    );
+
+    it.effect("the xcrun lookup resolves nothing when xcrun is missing or fails", () =>
+      Effect.gen(function* () {
+        const locate = yield* XcodeGitLocation;
+        const located = yield* Effect.promise(() =>
+          locate({ PATH: "/usr/bin:/bin", DEVELOPER_DIR: "/nonexistent/t3-developer-dir" }),
+        );
+        expect(located).toBeUndefined();
+      }),
     );
 
     it.effect("keeps git when PATH has another git or the host is not macOS", () =>

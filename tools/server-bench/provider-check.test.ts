@@ -153,6 +153,32 @@ describe("provider check runs", () => {
     expect(failureCause(SERVER_LOG, "mcp:00000000-0000-4000-8000-000000000000")).toBeNull();
   });
 
+  it("reads the causes this server build logs, verbatim", () => {
+    // Entries copied unchanged from the fault runs' server.log; a new log format shows up here.
+    const log = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "provider-check.server-log.txt"),
+      "utf8",
+    );
+
+    expect(failureCause(log, "mcp:407ac761-5ea4-4809-b09f-886c22d680cc")).toBe(
+      "CodexAppServerProcessExitedError: Codex App Server process exited with code 1",
+    );
+    expect(failureCause(log, "mcp:45b0f4b3-7ac0-44a1-be2e-28a3765d0b7f")).toBe(
+      "AcpProcessExitedError: ACP process exited with code 1",
+    );
+  });
+
+  it("falls back to the last error line it finds for a thread when the format is new", () => {
+    const log = [
+      '{"level":"warn","msg":"turn failed","threadId":"mcp:5f0c1d2e-0000-4000-8000-000000000001"}',
+      '{"level":"warn","error":"AcpProcessExitedError: ACP process exited with code 3","threadId":"mcp:5f0c1d2e-0000-4000-8000-000000000001"}',
+    ].join("\n");
+
+    expect(failureCause(log, "mcp:5f0c1d2e-0000-4000-8000-000000000001")).toContain(
+      "AcpProcessExitedError: ACP process exited with code 3",
+    );
+  });
+
   it("ends a run it cannot start with a failed result, replacing an old one", () => {
     const run = runCheck(["--project", "/nonexistent/project", "--codex-sessions", "1"]);
 

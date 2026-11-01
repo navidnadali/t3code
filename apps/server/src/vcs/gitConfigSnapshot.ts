@@ -163,6 +163,8 @@ const CONFIG_ENVIRONMENT_NAMES = [
   "GIT_CEILING_DIRECTORIES",
   "GIT_DISCOVERY_ACROSS_FILESYSTEM",
   "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 ] as const;
 const MAX_CONFIG_ENVIRONMENT_ENTRIES = 1_000;
 
@@ -227,6 +229,8 @@ const fingerprintDependencies = (dependencies: ReadonlyArray<GitConfigDependency
 
 export interface GitConfigSnapshot {
   readonly values: ReadonlyMap<string, string | null>;
+  // Every value of each key, in Git's order.
+  readonly valueLists: ReadonlyMap<string, ReadonlyArray<string | null>>;
   // Results of commands that read only config, valid while the snapshot is.
   readonly results: Map<string, GitVcsDriver.ExecuteGitResult>;
   // What `git rev-parse --git-path index` prints in the directory.
@@ -430,10 +434,12 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       directory = parent;
     }
     dependencies.push({ path: path.join(toplevel, ".git"), kind: "identity" });
-    // HEAD's content too: Git takes a directory whose HEAD is invalid for no repository.
+    // HEAD's content too: Git takes a directory whose HEAD is invalid for no repository. The
+    // alternates decide which objects a ref may point to.
     dependencies.push(
       { path: head, kind: "content" },
       { path: objects, kind: "presence" },
+      { path: path.join(objects, "info", "alternates"), kind: "content" },
       { path: refs, kind: "presence" },
     );
     const files = [
@@ -464,11 +470,18 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     }
     for (const file of files) dependencies.push({ path: file, kind: "content" });
     const values = new Map<string, string | null>();
-    for (const entry of entries ?? []) values.set(entry.key, entry.value);
+    const valueLists = new Map<string, Array<string | null>>();
+    for (const entry of entries ?? []) {
+      values.set(entry.key, entry.value);
+      const list = valueLists.get(entry.key);
+      if (list === undefined) valueLists.set(entry.key, [entry.value]);
+      else list.push(entry.value);
+    }
     const refStorage = values.get("extensions.refstorage");
     return {
       dependencies,
       values: snapshotSupported ? values : null,
+      valueLists,
       indexPath,
       // Refs live in the common directory, the one `--git-path refs` names.
       commonDir: refStorage === undefined || refStorage === "files" ? path.dirname(refs) : null,
@@ -513,6 +526,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
                 ? null
                 : {
                     values: state.values,
+                    valueLists: state.valueLists,
                     results: new Map(),
                     indexPath: state.indexPath,
                     commonDir: state.commonDir,

@@ -47,6 +47,7 @@ import {
   gitConfigGetOutput,
   makeGitConfigSnapshots,
   runWithGitConfigSnapshot,
+  type GitConfigSnapshot,
 } from "./gitConfigSnapshot.ts";
 import { explicitBareRepositoryEnv, gitConfigEnv } from "./VcsProcess.ts";
 import { removeLinkedWorktree } from "./worktreeRemoval.ts";
@@ -542,11 +543,9 @@ function parseDefaultBranchFromRemoteHeadRef(value: string, remoteName: string):
   return refName.length > 0 ? refName : null;
 }
 
-// The refs `rev-parse --symbolic-full-name <branch>@{upstream}` read: the ref it printed, and the
-// refs that would also match that name (Git's rev-parse rules) and make it ambiguous.
-function upstreamResultRefs(result: GitVcsDriver.ExecuteGitResult): ReadonlyArray<string> | null {
-  const ref = result.stdout.endsWith("\n") ? result.stdout.slice(0, -1) : "";
-  if (result.exitCode !== 0 || !ref.startsWith("refs/") || ref.includes("\n")) return null;
+// A full ref name and the names that would also match it (Git's rev-parse rules) and make it
+// ambiguous.
+function refNameMatches(ref: string): ReadonlyArray<string> {
   return [
     ref,
     `refs/${ref}`,
@@ -555,6 +554,23 @@ function upstreamResultRefs(result: GitVcsDriver.ExecuteGitResult): ReadonlyArra
     `refs/remotes/${ref}`,
     `refs/remotes/${ref}/HEAD`,
   ];
+}
+
+// The remote-tracking ref branch.<name>.merge maps to, when the config leaves one reading: a single
+// merge branch and a remote with a URL and a single `refs/heads/*:refs/remotes/<x>/*` refspec.
+function configuredUpstreamRef(snapshot: GitConfigSnapshot, branch: string): string | null {
+  const list = (key: string) => snapshot.valueLists.get(key) ?? [];
+  const merges = list(`branch.${branch}.merge`);
+  const remote = snapshot.values.get(`branch.${branch}.remote`);
+  if (merges.length !== 1 || !merges[0]?.startsWith("refs/heads/") || !remote || remote === ".") {
+    return null;
+  }
+  const fetches = list(`remote.${remote}.fetch`);
+  const tracking = /^\+?refs\/heads\/\*:(refs\/remotes\/[^*]+\/)\*$/.exec(fetches[0] ?? "");
+  if (fetches.length !== 1 || tracking === null || !snapshot.values.get(`remote.${remote}.url`)) {
+    return null;
+  }
+  return `${tracking[1]}${merges[0].slice("refs/heads/".length)}`;
 }
 
 function isMissingGitCwdError(error: GitCommandError): boolean {
@@ -1864,14 +1880,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const snapshot = yield* configSnapshots.read(cwd);
     // Git takes the upstream from branch.<name>.merge and fails without it.
     if (snapshot !== null && !snapshot.values.has(`branch.${refName}.merge`)) return null;
+    // Reused only while Git prints the ref the config names, so no symbolic ref was followed.
+    const configured = snapshot === null ? null : configuredUpstreamRef(snapshot, refName);
     const args = ["rev-parse", "--symbolic-full-name", `${refName}@{upstream}`];
     const upstream = yield* configSnapshots.runWithRefs(
       snapshot,
       args,
       (result) =>
-        result === undefined || snapshot?.values.get(`branch.${refName}.remote`) === "."
-          ? null
-          : upstreamResultRefs(result),
+        configured !== null &&
+        (result === undefined || (result.exitCode === 0 && result.stdout === `${configured}\n`))
+          ? refNameMatches(configured)
+          : null,
       executeGit("GitVcsDriver.resolveTrackedRemoteBaseRef", cwd, args, {
         allowNonZeroExit: true,
       }),

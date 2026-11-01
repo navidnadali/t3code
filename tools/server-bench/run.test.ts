@@ -329,21 +329,32 @@ describe("workload fingerprint", () => {
     });
   });
 
-  it("refuses a script launcher outside fake-* dirs, whose code it cannot fingerprint", async () => {
+  it("refuses a launcher outside fake-* dirs whose code it cannot fingerprint", async () => {
     await withTempDir(async (root) => {
       const harness = NodePath.join(root, "harness", "tools", "server-bench");
       const wrapper = NodePath.join(root, "wrappers", "claude");
       write(wrapper, '#!/bin/sh\nexec node "$(dirname "$0")/claude.mjs" "$@"\n');
       write(NodePath.join(root, "wrappers", "claude.mjs"), "export {};\n");
-      const template = NodePath.join(root, "template");
-      write(
-        NodePath.join(template, "userdata", "settings.json"),
-        JSON.stringify({ providerInstances: { claudeBench: { config: { binaryPath: wrapper } } } }),
-      );
+      const agent = NodePath.join(root, "agents", "agent.cjs");
+      write(agent, 'require("./lib.cjs");\n');
+      write(NodePath.join(root, "agents", "lib.cjs"), "\n");
+      const node = NodePath.join(root, "bin", "node");
+      write(node, "\u007fELF executable\n");
       const work = NodePath.join(root, "work");
       NodeFS.mkdirSync(work);
-      const fixture = await fixtureInfo(template, work);
-      await expect(launchersHash(fixture, harness)).rejects.toThrow(/script outside a fake-\*/);
+      for (const [index, config] of [
+        { binaryPath: wrapper },
+        { commandPath: node, commandArgs: [agent] },
+        { binaryPath: NodePath.join(root, "wrappers", "claude.mjs") },
+      ].entries()) {
+        const template = NodePath.join(root, `template-${index}`);
+        write(
+          NodePath.join(template, "userdata", "settings.json"),
+          JSON.stringify({ providerInstances: { bench: { config } } }),
+        );
+        const fixture = await fixtureInfo(template, work);
+        await expect(launchersHash(fixture, harness)).rejects.toThrow(/outside a fake-\*/);
+      }
     });
   });
 

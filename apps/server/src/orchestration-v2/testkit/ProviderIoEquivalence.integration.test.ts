@@ -8,6 +8,7 @@ import {
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { materializeReplayTranscriptWorkspace } from "@t3tools/provider-testing/replayTranscript";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -409,10 +410,7 @@ const replayHarness =
     } satisfies OrchestratorV2ProviderReplayHarness<Transcript, Error>);
 
 const decodeClaudeSettings = Schema.decodeEffect(ClaudeSettings);
-const FAKE_CLAUDE = new URL(
-  "../../../../../tools/server-bench/fake-claude/claude",
-  import.meta.url,
-);
+const FAKE_CLAUDE_DIR = new URL("../../../../../tools/server-bench/fake-claude/", import.meta.url);
 
 // The real Claude adapter and Agent SDK `query()` read a CLI's stream-json: P1-003's fake CLI
 // playing the fixture's recorded turns with fresh ids.
@@ -423,7 +421,11 @@ const claudeWireHarness = (services: Layer.Layer<ProviderIoServices>, input: Rep
     const stateDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-fake-claude-state-" });
     const homeDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-fake-claude-home-" });
     const transcriptPath = yield* path.fromFileUrl(input.driver.transcriptFile).pipe(Effect.orDie);
-    const binaryPath = yield* path.fromFileUrl(FAKE_CLAUDE).pipe(Effect.orDie);
+    // The `claude` launcher is a POSIX shell script; on Windows the SDK runs the `.mjs` entry with node.
+    const launcher = (yield* HostProcess.Platform) === "win32" ? "claude.mjs" : "claude";
+    const binaryPath = yield* path
+      .fromFileUrl(new URL(launcher, FAKE_CLAUDE_DIR))
+      .pipe(Effect.orDie);
     const layerRunner = ClaudeAdapterV2.layerQueryRunner.pipe(
       Layer.provide(Layer.mergeAll(PortScanner.layerTest, services, NodeServices.layer)),
     );

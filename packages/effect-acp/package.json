@@ -31,6 +31,10 @@
       "types": "./src/wire.ts",
       "import": "./src/wire.ts"
     },
+    "./offload": {
+      "types": "./src/offload.ts",
+      "import": "./src/offload.ts"
+    },
     "./errors": {
       "types": "./src/errors.ts",
       "import": "./src/errors.ts"

@@ -112,6 +112,8 @@ export class ServerConfig extends Context.Service<
     readonly sqliteReaderCacheSizeMb?: number | undefined;
     readonly sqliteMmapSizeMb?: number | undefined;
     readonly providerIoWorkers?: number | undefined;
+    readonly providerIoCodexOffloadMinChars?: number | undefined;
+    readonly providerIoAcpOffloadMinChars?: number | undefined;
     readonly providerIoClaudeSdk?: boolean | undefined;
   }
 >()("t3/config/ServerConfig") {

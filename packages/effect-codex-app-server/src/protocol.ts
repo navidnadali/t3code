@@ -457,14 +457,15 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           let start = 0;
           let framingMs = 0;
           let chunkBytes = 0;
-          let segmentStartedAt = timing?.now() ?? 0;
+          let segmentStartedAt = timing === undefined ? 0 : timing.now();
           while (start < chunk.length) {
             const newline = chunk.indexOf("\n", start);
             const fragment = chunk.slice(start, newline === -1 ? chunk.length : newline);
             // decodeText holds back split UTF-8 sequences, so fragment byte sums are exact.
             const fragmentBytes = Buffer.byteLength(fragment, "utf8");
             remainderBytes += fragmentBytes;
-            chunkBytes += newline === -1 ? fragmentBytes : fragmentBytes + 1;
+            if (timing !== undefined)
+              chunkBytes += newline === -1 ? fragmentBytes : fragmentBytes + 1;
             if (remainderBytes > maxIncomingMessageBytes) {
               remainder.length = 0;
               return yield* new CodexError.CodexAppServerTransportError({

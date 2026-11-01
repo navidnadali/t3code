@@ -127,12 +127,19 @@ const encodeWireMessage = (
 
 const decodeWireMessage = (
   line: string,
-): Effect.Effect<unknown, CodexError.CodexAppServerProtocolParseError> =>
-  decodeJsonString(line).pipe(
-    Effect.mapError((cause) =>
-      CodexError.CodexAppServerProtocolParseError.fromSchemaError("decode-wire-message", cause),
-    ),
-  );
+): Effect.Effect<unknown, CodexError.CodexAppServerProtocolParseError> => {
+  // The schema runs this same JSON.parse; it is only needed to build the error.
+  try {
+    const message: unknown = JSON.parse(line);
+    return Effect.succeed(message);
+  } catch {
+    return decodeJsonString(line).pipe(
+      Effect.mapError((cause) =>
+        CodexError.CodexAppServerProtocolParseError.fromSchemaError("decode-wire-message", cause),
+      ),
+    );
+  }
+};
 
 const normalizeIncomingError = (
   error: unknown,

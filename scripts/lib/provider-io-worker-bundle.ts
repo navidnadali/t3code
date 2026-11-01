@@ -36,14 +36,18 @@ const guard = (code: string) => `"use strict";
       }),
     ],
   ]);
+  // A REPL context holds the real Module class; the inspector can reach the main thread.
+  const refused = new Set(["node:repl", "node:inspector", "node:inspector/promises"]);
+  const allowed = (id) =>
+    typeof id === "string" && NodeModule.isBuiltin(id) && !refused.has(prefixed(id));
   load = (id) => {
-    if (typeof id !== "string" || !NodeModule.isBuiltin(id)) return refuse(String(id));
+    if (!allowed(id)) return refuse(String(id));
     return facades.get(prefixed(id)) ?? builtin(prefixed(id));
   };
   // The load hook also stops a recovered Module class (a REPL context has one) loading a file.
   NodeModule.registerHooks({
     resolve: (specifier, context, nextResolve) =>
-      typeof specifier === "string" && NodeModule.isBuiltin(specifier) && !facades.has(prefixed(specifier))
+      allowed(specifier) && !facades.has(prefixed(specifier))
         ? nextResolve(specifier, context)
         : refuse(String(specifier)),
     load: (url, context, nextLoad) =>

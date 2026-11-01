@@ -58,10 +58,13 @@ const openLineSession = Effect.fnUntraced(function* <Options, Reply, E>(
   },
 ) {
   const failed = yield* Deferred.make<never, E>();
-  const session = yield* pool.open({
-    ...input,
-    kill: Deferred.await(failed).pipe(Effect.ignore, Effect.andThen(input.kill)),
-  });
+  // Opening fails only for options that do not clone; these stages take plain data.
+  const session = yield* pool
+    .open({
+      ...input,
+      kill: Deferred.await(failed).pipe(Effect.ignore, Effect.andThen(input.kill)),
+    })
+    .pipe(Effect.orDie);
   if (Option.isNone(session)) return Option.none();
   yield* session.value.output.pipe(
     Stream.runDrain,

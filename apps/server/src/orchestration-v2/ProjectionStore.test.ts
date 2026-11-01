@@ -48,8 +48,35 @@ import {
   THREAD_HISTORY_TURN_SNAPSHOT_ROW_LIMIT,
 } from "./threadHistoryPaging.ts";
 
+/** Every applied event leaves the maintained turn-item counts equal to a COUNT(*) of the items. */
+const layerProjectionStoreCheckingCounts = Layer.effect(
+  ProjectionStore.ProjectionStoreV2,
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const assertCountsExact = Effect.gen(function* () {
+      assert.deepEqual(
+        yield* sql`
+          SELECT thread_id, run_id, item_count
+          FROM orchestration_v2_projection_turn_item_counts
+          ORDER BY thread_id, run_id
+        `,
+        yield* sql`
+          SELECT thread_id, COALESCE(run_id, '') AS run_id, COUNT(*) AS item_count
+          FROM orchestration_v2_projection_turn_items
+          GROUP BY thread_id, run_id
+          ORDER BY thread_id, run_id
+        `,
+      );
+    }).pipe(Effect.orDie);
+    return ProjectionStore.ProjectionStoreV2.of({
+      ...store,
+      apply: (event) => store.apply(event).pipe(Effect.tap(() => assertCountsExact)),
+    });
+  }),
+).pipe(Layer.provide(ProjectionStore.layer));
 const layerTest = Layer.mergeAll(
-  ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
+  layerProjectionStoreCheckingCounts.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
   SqlitePersistence.layerMemory,
 );
 const modelSelection = {
@@ -5242,6 +5269,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.equal(targetShell.itemCount, 0);
       assert.equal(targetShell.visibleItemCount, 4);
       assert.equal(targetProjection.visibleTurnItems.length, 4);
+      const targetThreadShell = yield* projectionStore.getThreadShell(targetThreadId);
+      assert.equal(targetThreadShell?.itemCount, 0);
+      assert.equal(targetThreadShell?.visibleItemCount, 4);
+      assert.equal((yield* projectionStore.getThreadShell(sourceThreadId))?.itemCount, 3);
 
       const sideChatShell = shell.threads.find((thread) => thread.id === sideChatThreadId);
       assert.equal(sideChatShell?.visibleItemCount, 0);

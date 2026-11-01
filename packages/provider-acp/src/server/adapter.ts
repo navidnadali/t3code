@@ -2143,11 +2143,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             ...(nativeLogging?.requestLogger === undefined
               ? {}
               : { requestLogger: nativeLogging.requestLogger }),
-            protocolLogging: nativeLogging?.protocolLogging ?? {
-              logIncoming: true,
-              logOutgoing: true,
-              logger: () => Effect.void,
-            },
+            protocolLogging: nativeLogging?.protocolLogging ?? {},
           };
         };
         let runtimeScope: Scope.Closeable | undefined;

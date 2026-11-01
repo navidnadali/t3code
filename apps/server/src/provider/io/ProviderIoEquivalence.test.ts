@@ -116,13 +116,16 @@ const stageCase = <Options, Output>(
   name,
   run: (pool) =>
     Effect.gen(function* () {
-      const opened = yield* pool.open({
-        stage,
-        options,
-        onFailure: (error) => error,
-        kill: Effect.void,
-        ...(highWaterMark === undefined ? {} : { highWaterMark }),
-      });
+      // Opening fails only for options that do not clone; these are plain data.
+      const opened = yield* pool
+        .open({
+          stage,
+          options,
+          onFailure: (error) => error,
+          kill: Effect.void,
+          ...(highWaterMark === undefined ? {} : { highWaterMark }),
+        })
+        .pipe(Effect.orDie);
       if (Option.isNone(opened))
         return { run: runInThread(stage, options, chunks), onWorker: false };
       const session = opened.value;

@@ -513,6 +513,8 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             PlatformError.PlatformError | CodexError.CodexAppServerError | Cause.Done<void>
           >(READ_AHEAD_LIMIT);
           yield* options.stdio.stdin.pipe(
+            // As in-thread, termination stops stdout at its next read; reads taken are all handled.
+            Stream.interruptWhen(Deferred.await(terminationSignal)),
             Stream.runForEachWhile(
               Effect.fnUntraced(function* (chunk) {
                 const startedAt = timing === undefined ? 0 : timing.now();
@@ -550,7 +552,6 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           return Stream.fromQueue(reads);
         }),
       ).pipe(
-        Stream.interruptWhen(Deferred.await(terminationSignal)),
         Stream.runForEach(({ offloaded, ...read }) =>
           (offloaded === undefined ? Effect.succeed([]) : Fiber.join(offloaded)).pipe(
             Effect.flatMap((results) => handleRead(offload, read, results[Symbol.iterator]())),

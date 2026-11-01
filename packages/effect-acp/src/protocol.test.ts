@@ -1181,6 +1181,53 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
     }),
   );
 
+  // Chunks pulled together are handled with no yield between them, so a fiber the first message
+  // starts runs only after the last; an offload must not let it in earlier.
+  it.effect("handles chunks read together in one burst, off-thread lines included", () =>
+    Effect.gen(function* () {
+      const run = (lineOffload: AcpProtocol.AcpLineOffload | undefined) =>
+        Effect.gen(function* () {
+          const scope = yield* Effect.scope;
+          const { stdio } = yield* makeInMemoryStdio();
+          const seen: Array<string> = [];
+          const done = yield* Deferred.make<void>();
+          const chunks = ["a", "b", "c"].map((text) => encoder.encode(`${update(text + long)}\n`));
+          yield* AcpProtocol.makeAcpPatchedProtocol({
+            stdio: { ...stdio, stdin: Stream.make(...chunks) },
+            serverRequestMethods: new Set(),
+            ...(lineOffload === undefined ? {} : { lineOffload }),
+            onNotification: (notification) =>
+              Effect.gen(function* () {
+                const update = notification.params as {
+                  readonly update: { readonly content: { readonly text: string } };
+                };
+                const text = update.update.content.text.slice(0, 1);
+                seen.push(text);
+                if (text === "a") {
+                  yield* Effect.sync(() => seen.push("other fiber")).pipe(
+                    Effect.andThen(Deferred.succeed(done, undefined)),
+                    Effect.forkIn(scope),
+                  );
+                }
+              }),
+          });
+          yield* Deferred.await(done);
+          return seen;
+        }).pipe(Effect.scoped);
+
+      const inThread = yield* run(undefined);
+      assert.deepEqual(inThread, ["a", "b", "c", "other fiber"]);
+      // A worker answers later, as each decode here does after a yield.
+      const decode = AcpOffload.makeOffloadedLineDecoder();
+      const offloaded = yield* run({
+        minChars: 200,
+        decode: (line) => Effect.yieldNow.pipe(Effect.as(decode(line))),
+        failure: Effect.never,
+      });
+      assert.deepEqual(offloaded, inThread);
+    }),
+  );
+
   it.effect("routes a batch with more messages than a call takes arguments", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();

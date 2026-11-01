@@ -932,6 +932,50 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
     }),
   );
 
+  // Chunks pulled together are handled with no yield between them, so a fiber the first message
+  // starts runs only after the last; an offload must not let it in earlier.
+  it.effect("handles chunks read together in one burst, off-thread lines included", () =>
+    Effect.gen(function* () {
+      const run = (lineOffload: CodexProtocol.CodexAppServerLineOffload | undefined) =>
+        Effect.gen(function* () {
+          const scope = yield* Effect.scope;
+          const { stdio } = yield* makeInMemoryStdio();
+          const seen: Array<string> = [];
+          const done = yield* Deferred.make<void>();
+          const chunks = ["x/a", "x/b", "x/c"].map((method) =>
+            encoder.encode(`${JSON.stringify({ method, params: longParams })}\n`),
+          );
+          yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+            stdio: Stdio.make({ ...stdio, stdin: Stream.make(...chunks) }),
+            ...(lineOffload === undefined ? {} : { lineOffload }),
+            onNotification: (notification) =>
+              Effect.gen(function* () {
+                seen.push(notification.method);
+                if (notification.method === "x/a") {
+                  yield* Effect.sync(() => seen.push("other fiber")).pipe(
+                    Effect.andThen(Deferred.succeed(done, undefined)),
+                    Effect.forkIn(scope),
+                  );
+                }
+              }),
+          });
+          yield* Deferred.await(done);
+          return seen;
+        }).pipe(Effect.scoped);
+
+      const inThread = yield* run(undefined);
+      assert.deepEqual(inThread, ["x/a", "x/b", "x/c", "other fiber"]);
+      // A worker answers later, as each decode here does after a yield.
+      const offloaded = yield* run({
+        minChars: 64,
+        decode: (line) => Effect.yieldNow.pipe(Effect.as(CodexOffload.decodeOffloadedLine(line))),
+        writeLog: () => Effect.void,
+        failure: Effect.never,
+      });
+      assert.deepEqual(offloaded, inThread);
+    }),
+  );
+
   it.effect("handles a line the offload hands back exactly as an in-thread line", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();

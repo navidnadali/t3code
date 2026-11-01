@@ -30,6 +30,8 @@ import { CLAUDE_AGENT_SDK_STAGE } from "../../provider/io/claudeAgentSdkProtocol
 import * as ProviderIoOffloads from "../../provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "../../provider/io/ProviderIoWorkerPool.ts";
 import { AcpRegistryOrchestratorReplayHarness } from "../Adapters/AcpRegistryAdapterV2.testkit.ts";
+import { FxOrchestratorReplayHarness } from "../Adapters/FxAdapterV2.testkit.ts";
+import { GrokOrchestratorReplayHarness } from "../Adapters/GrokAdapterV2.testkit.ts";
 import * as ClaudeAdapterV2 from "../Adapters/ClaudeAdapterV2.ts";
 import { layerClaudeAgentSdkWorkerPool } from "../Adapters/ClaudeAgentSdkWorkerQuery.ts";
 import { CodexOrchestratorReplayHarness } from "../Adapters/CodexAdapterV2.testkit.ts";
@@ -90,6 +92,8 @@ interface AdapterRow {
   readonly offload: "pending" | "required";
   /** The pool stage that takes this provider's output. */
   readonly stage: string;
+  /** False where the provider's replay writes no native log, so there are no lines to compare. */
+  readonly logs: boolean;
   readonly fixtures?: ReadonlySet<string>;
   /** Compared with 0 workers. */
   readonly modes: ReadonlyArray<WorkerMode>;
@@ -289,6 +293,7 @@ const adapterRow = <
   readonly path: string;
   readonly offload: AdapterRow["offload"];
   readonly stage: string;
+  readonly logs?: false;
   readonly fixtures?: ReadonlySet<string>;
   readonly modes: AdapterRow["modes"];
   readonly freshIds?: boolean;
@@ -313,6 +318,7 @@ const adapterRow = <
   path: row.path,
   offload: row.offload,
   stage: row.stage,
+  logs: row.logs !== false,
   ...(row.fixtures === undefined ? {} : { fixtures: row.fixtures }),
   modes: row.modes,
   capture: (input, mode) =>
@@ -600,6 +606,25 @@ const ROWS: ReadonlyArray<AdapterRow> = [
     harness: replayHarness(AcpRegistryOrchestratorReplayHarness),
   }),
   adapterRow({
+    driver: "grok",
+    path: "replay",
+    // Grok and Fx are ACP agents too; Grok's wake handling is sensitive to delivery order.
+    offload: "required",
+    stage: "acp",
+    logs: false,
+    modes: LINE_OFFLOAD_MODES,
+    harness: replayHarness(GrokOrchestratorReplayHarness),
+  }),
+  adapterRow({
+    driver: "fx",
+    path: "replay",
+    offload: "required",
+    stage: "acp",
+    logs: false,
+    modes: LINE_OFFLOAD_MODES,
+    harness: replayHarness(FxOrchestratorReplayHarness),
+  }),
+  adapterRow({
     driver: "claudeAgent",
     path: "wire (fake CLI)",
     // P1-027 runs the Agent SDK on the workers (T3CODE_PROVIDER_IO_CLAUDE_SDK).
@@ -635,7 +660,7 @@ describe("provider I/O at 0 and 2 workers", () => {
         const inThread = yield* row.capture(input, { name: "0 workers", workers: 0 });
         assert.deepEqual(inThread.pool, {});
         assert.isNotEmpty(inThread.capture.adapterEvents.flat());
-        assert.isNotEmpty(Object.keys(inThread.capture.logLines));
+        if (row.logs) assert.isNotEmpty(Object.keys(inThread.capture.logLines));
         assert.isNotEmpty(Object.keys(inThread.capture.sinkWrites));
         for (const mode of row.modes) {
           const onWorkers = yield* row.capture(input, mode);

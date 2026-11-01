@@ -8,7 +8,6 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
-import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 
 import type * as GitVcsDriver from "./GitVcsDriver.ts";
@@ -194,6 +193,10 @@ export interface GitConfigDependency {
 
 const dependencyKey = (dependency: GitConfigDependency) => `${dependency.kind}:${dependency.path}`;
 
+// Git replaces config files by rename, which changes the inode. An in-place edit of the same size can
+// go unseen when it lands within the filesystem's timestamp granularity (Linux stamps from a coarse
+// clock, ~4 ms) or behind NFS attribute caching. Ownership counts only on the read directory and the
+// found `.git`, so a chown elsewhere that trips safe.directory is not seen.
 const statFingerprint = (dependency: GitConfigDependency) =>
   new Promise<string>((resolve) => {
     try {
@@ -226,6 +229,24 @@ const statFingerprint = (dependency: GitConfigDependency) =>
 
 const fingerprintDependencies = (dependencies: ReadonlyArray<GitConfigDependency>) =>
   Effect.promise(() => Promise.all(dependencies.map(statFingerprint)));
+
+const fileIdentity = (path: string) =>
+  new Promise<string | null>((resolve) => {
+    try {
+      NodeFS.stat(path, { bigint: true }, (error, stats) =>
+        resolve(error ? null : `${stats.dev}:${stats.ino}`),
+      );
+    } catch {
+      resolve(null);
+    }
+  });
+
+const isSameFile = (left: string, right: string) =>
+  Effect.promise(() => Promise.all([fileIdentity(left), fileIdentity(right)])).pipe(
+    Effect.map(
+      ([leftIdentity, rightIdentity]) => leftIdentity !== null && leftIdentity === rightIdentity,
+    ),
+  );
 
 export interface GitConfigSnapshot {
   readonly values: ReadonlyMap<string, string | null>;
@@ -267,7 +288,8 @@ const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
 const CONFIG_SNAPSHOT_LOAD_ATTEMPTS = 3;
 const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
 const REF_RESULTS_CAPACITY = 256;
-const REPOSITORY_PATH_COUNT = 11;
+const REPOSITORY_PATH_COUNT = 10;
+const REUSED_RESULTS_CAPACITY = 64;
 // Ref names whose loose file Git's files backend keeps at <common dir>/<name>.
 const isLooseRefName = (name: string) =>
   name.startsWith("refs/") &&
@@ -318,6 +340,7 @@ const REPOSITORY_PATH_ARGS = [
   "objects",
   "--git-path",
   "refs",
+  "--show-prefix",
 ] as const;
 
 /**
@@ -351,7 +374,10 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
   };
 
   // The global and system files depend only on the environment and the Git build.
-  const readConfigFileLocations = Effect.fnUntraced(function* (cwd: string, environment: string) {
+  const readConfigFileLocations = Effect.fn("GitVcsDriver.configSnapshot.configFiles")(function* (
+    cwd: string,
+    environment: string,
+  ) {
     const known = configFileLocations.get(environment);
     if (known !== undefined) return known;
     const [globalResult, systemResult] = yield* Effect.all(
@@ -386,9 +412,12 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       supported = false;
       return null;
     }
-    const [indexPath = "", ...paths] = lines.slice(0, -1);
+    const [indexPath = "", ...rest] = lines;
+    const paths = rest.slice(0, REPOSITORY_PATH_COUNT);
+    const prefix = rest[REPOSITORY_PATH_COUNT];
     if (
-      paths.length !== REPOSITORY_PATH_COUNT - 1 ||
+      lines.length !== REPOSITORY_PATH_COUNT + 3 ||
+      prefix === undefined ||
       lines.at(-1) !== "" ||
       indexPath.length === 0 ||
       !paths.every((line) => line.length > 0 && path.isAbsolute(line))
@@ -397,7 +426,8 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     }
     const [toplevel, , config, configWorktree, commondir, remotes, branches, head, objects, refs] =
       paths as [string, string, string, string, string, string, string, string, string, string];
-    const [locations, listResult, physicalCwd, remoteFiles, branchFiles] = yield* Effect.all(
+    const segments = prefix.split("/").filter((segment) => segment.length > 0);
+    const [locations, listResult, remoteFiles, branchFiles, insideTopLevel] = yield* Effect.all(
       [
         readConfigFileLocations(cwd, environment),
         runGit("GitVcsDriver.configSnapshot.list", cwd, [
@@ -406,37 +436,33 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
           "--show-origin",
           "-z",
         ]),
-        fileSystem.realPath(cwd).pipe(Effect.option),
         listDirectory(remotes),
         listDirectory(branches),
+        isSameFile(cwd, path.join(toplevel, ...segments)),
       ],
       { concurrency: "unbounded" },
     );
-    if (locations === null || Option.isNone(physicalCwd)) return null;
+    // A directory outside the work tree (GIT_WORK_TREE elsewhere) has no prefix to walk.
+    if (locations === null || !insideTopLevel) return null;
 
     // Discovery: the directory, what would make Git stop below the top level (a `.git`, or HEAD of a
-    // bare repository), the `.git` it found, and what keeps that a repository.
+    // bare repository), the `.git` it found, and what keeps that a repository. The prefix comes from
+    // Git, cased as on disk like the top level, whatever case the directory was given in; the physical
+    // path keeps it, and the index path Git prints from it, current.
     const dependencies: GitConfigDependency[] = [
       { path: cwd, kind: "identity" },
       { path: cwd, kind: "physical" },
     ];
-    for (let directory = physicalCwd.value; ;) {
-      const relative = path.relative(toplevel, directory);
-      if (relative === "") break;
-      const parent = path.dirname(directory);
-      if (relative === ".." || relative.startsWith(`..${path.sep}`) || parent === directory) {
-        return null;
-      }
+    for (let depth = segments.length; depth > 0; depth--) {
+      const directory = path.join(toplevel, ...segments.slice(0, depth));
       dependencies.push(
         { path: path.join(directory, ".git"), kind: "absent" },
         { path: path.join(directory, "HEAD"), kind: "absent" },
       );
-      directory = parent;
     }
-    dependencies.push({ path: path.join(toplevel, ".git"), kind: "identity" });
-    // HEAD's content too: Git takes a directory whose HEAD is invalid for no repository. The
-    // alternates decide which objects a ref may point to.
+    // The alternates decide which objects a ref may point to.
     dependencies.push(
+      { path: path.join(toplevel, ".git"), kind: "identity" },
       { path: head, kind: "content" },
       { path: objects, kind: "presence" },
       { path: path.join(objects, "info", "alternates"), kind: "content" },
@@ -565,7 +591,10 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     return false;
   };
 
-  /** The current snapshot for `cwd`, or null when this read must run Git. */
+  /**
+   * The current snapshot for `cwd`, or null when this read must run Git. Untraced: it runs on every
+   * config read, several per status refresh; loads keep their spans.
+   */
   const read = Effect.fnUntraced(function* (cwd: string) {
     if (!supported) return null;
     if (!(yield* Cache.has(snapshots, cwd)) && !isReadAgain(cwd)) return null;
@@ -575,7 +604,9 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     reloadDependencies.set(cwd, cached.dependencies);
     yield* Cache.invalidateWhen(snapshots, cwd, (current) => current === cached);
     // Whatever replaces the stale entry loaded after this read began, so it needs no check.
-    return (yield* Cache.get(snapshots, cwd))?.snapshot ?? null;
+    const reloaded = yield* Cache.get(snapshots, cwd);
+    reloadDependencies.delete(cwd);
+    return reloaded?.snapshot ?? null;
   });
 
   // Like read, but a directory without a snapshot stays without one (a non-repository polled for status).
@@ -660,7 +691,12 @@ export const runWithGitConfigSnapshot = (
   return run.pipe(
     Effect.tap((result) =>
       Effect.sync(() => {
-        if (isReusableResult(result)) snapshot.results.set(key, result);
+        if (isReusableResult(result)) {
+          if (snapshot.results.size >= REUSED_RESULTS_CAPACITY) {
+            snapshot.results.delete(snapshot.results.keys().next().value!);
+          }
+          snapshot.results.set(key, result);
+        }
       }),
     ),
   );

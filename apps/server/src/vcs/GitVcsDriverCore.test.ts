@@ -333,6 +333,11 @@ it.effect("invalidates origin remote cache when a driver mutation adds origin", 
   }).pipe(Effect.provide(layerTest)),
 );
 
+const caseInsensitiveFileSystem = (() => {
+  const directory = NodeOS.tmpdir();
+  return directory !== directory.toUpperCase() && NodeFS.existsSync(directory.toUpperCase());
+})();
+
 const makeCountingDriver = Effect.gen(function* () {
   const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
   const spawned: Array<ReadonlyArray<string>> = [];
@@ -576,6 +581,23 @@ describe("config reads", () => {
       after: null,
       reused: true,
     },
+    ...(["garbage", ""] as const).map((head): ConfigChange => ({
+      name: `a nested repository's HEAD becoming ${head ? "invalid" : "empty"}`,
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          const sub = NodePath.join(cwd, "sub");
+          yield* git(cwd, ["config", "t3.value", "parent"]);
+          yield* git(cwd, ["init", "-q", "sub"]);
+          yield* git(sub, ["config", "t3.value", "child"]);
+          return sub;
+        }),
+      change: (_cwd, sub) =>
+        Effect.sync(() => NodeFS.writeFileSync(NodePath.join(sub, ".git", "HEAD"), head)),
+      read: readValue("t3.value"),
+      before: "child",
+      after: "parent",
+      reused: true,
+    })),
     {
       name: "a relative include",
       setup: (cwd) =>
@@ -622,6 +644,63 @@ describe("config reads", () => {
         yield* change.change(cwd, readCwd);
 
         assert.equal(yield* change.read(driver, readCwd), change.after);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.skipIf(!caseInsensitiveFileSystem)(
+    "reuses config read through a differently cased path",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { driver, spawned } = yield* makeCountingDriver;
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          yield* git(cwd, ["config", "t3.value", "first"]);
+          const typed = NodePath.join(NodePath.dirname(cwd), NodePath.basename(cwd).toUpperCase());
+          assert.equal(yield* driver.readConfigValue(typed, "t3.value"), "first");
+          assert.equal(yield* driver.readConfigValue(typed, "t3.value"), "first");
+          spawned.length = 0;
+          assert.equal(yield* driver.readConfigValue(typed, "t3.value"), "first");
+          assert.deepStrictEqual(spawned, []);
+
+          yield* git(cwd, ["config", "t3.value", "second"]);
+
+          assert.equal(yield* driver.readConfigValue(typed, "t3.value"), "second");
+        }),
+      ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("sees a repository initialised below a directory outside GIT_WORK_TREE", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["config", "t3.value", "parent"]);
+        const sub = NodePath.join(cwd, "sub");
+        NodeFS.mkdirSync(sub);
+        const workTree = yield* makeTmpDir("git-work-tree-");
+        const readWithWorkTree = Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const previous = process.env.GIT_WORK_TREE;
+            process.env.GIT_WORK_TREE = workTree;
+            return previous;
+          }),
+          () => driver.readConfigValue(sub, "t3.value"),
+          (previous) =>
+            Effect.sync(() => {
+              if (previous === undefined) delete process.env.GIT_WORK_TREE;
+              else process.env.GIT_WORK_TREE = previous;
+            }),
+        );
+        assert.equal(yield* readWithWorkTree, "parent");
+        assert.equal(yield* readWithWorkTree, "parent");
+
+        yield* git(cwd, ["init", "-q", "sub"]);
+        yield* git(sub, ["config", "t3.value", "nested"]);
+
+        assert.equal(yield* readWithWorkTree, "nested");
       }),
     ).pipe(Effect.provide(layerTest)),
   );

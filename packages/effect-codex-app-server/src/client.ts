@@ -174,14 +174,13 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
   const dispatchNotification = (
     notification: CodexProtocol.CodexAppServerIncomingNotification,
   ): Effect.Effect<void, never> => {
-    const decoded = CodexWire.decodeServerNotificationParams(
-      notification.method,
-      notification.params,
-    );
+    const schema = CodexWire.serverNotificationParamsSchema(notification.method);
     const handlers = notificationHandlers.get(notification.method) ?? [];
 
-    if (decoded) {
-      return Effect.fromResult(decoded).pipe(
+    if (schema) {
+      return Effect.fromResult(
+        CodexWire.decodeNotificationPayload(notification.method, schema, notification.params),
+      ).pipe(
         Effect.tapError(warnUndecodableNotification),
         Effect.flatMap((decoded) =>
           Effect.forEach(handlers, (handler) => handler(decoded), { discard: true }),

@@ -86,16 +86,20 @@ it("decodes wire lines and notification params without an Effect runtime", () =>
     assert.equal(malformed.failure.operation, "decode-wire-message");
   }
 
+  const method = "item/agentMessage/delta";
+  const schema = CodexWire.serverNotificationParamsSchema(method);
+  assert.isDefined(schema);
+  assert.isUndefined(CodexWire.serverNotificationParamsSchema("x/unknown"));
+  if (schema === undefined) return;
   const delta = { threadId: "t", turnId: "u", itemId: "i", delta: "d" };
   assert.deepEqual(
-    CodexWire.decodeServerNotificationParams("item/agentMessage/delta", delta),
+    CodexWire.decodeNotificationPayload(method, schema, delta),
     Result.succeed(delta),
   );
-  const invalid = CodexWire.decodeServerNotificationParams("item/agentMessage/delta", {});
-  assert.isTrue(invalid !== undefined && Result.isFailure(invalid));
-  if (invalid !== undefined && Result.isFailure(invalid)) {
+  const invalid = CodexWire.decodeNotificationPayload(method, schema, {});
+  assert.isTrue(Result.isFailure(invalid));
+  if (Result.isFailure(invalid)) {
     assert.equal(invalid.failure.operation, "decode-notification-payload");
-    assert.equal(invalid.failure.method, "item/agentMessage/delta");
+    assert.equal(invalid.failure.method, method);
   }
-  assert.isUndefined(CodexWire.decodeServerNotificationParams("x/unknown", delta));
 });

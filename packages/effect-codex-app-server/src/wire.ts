@@ -104,7 +104,7 @@ export function isIncomingResponse(value: unknown): value is typeof JsonRpcRespo
   return isJsonRpcResponseEnvelope(value);
 }
 
-const decodeNotificationPayload = <A, I>(
+export const decodeNotificationPayload = <A, I>(
   method: string,
   schema: Schema.Codec<A, I>,
   raw: unknown,
@@ -117,14 +117,7 @@ const decodeNotificationPayload = <A, I>(
     ),
   );
 
-/** `undefined` when the method has no generated params schema. */
-export const decodeServerNotificationParams = (
-  method: string,
-  params: unknown,
-): Result.Result<unknown, CodexError.CodexAppServerProtocolParseError> | undefined => {
-  const schema =
-    method in CodexRpc.SERVER_NOTIFICATION_PARAMS
-      ? CodexRpc.SERVER_NOTIFICATION_PARAMS[method as CodexRpc.ServerNotificationMethod]
-      : undefined;
-  return schema ? decodeNotificationPayload(method, schema, params) : undefined;
-};
+export const serverNotificationParamsSchema = (method: string) =>
+  method in CodexRpc.SERVER_NOTIFICATION_PARAMS
+    ? CodexRpc.SERVER_NOTIFICATION_PARAMS[method as CodexRpc.ServerNotificationMethod]
+    : undefined;

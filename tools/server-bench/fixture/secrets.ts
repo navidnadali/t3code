@@ -176,11 +176,18 @@ const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 const withoutAnsi = (text: string) =>
   text.includes("\x1b") ? text.replace(ANSI, (code) => " ".repeat(code.length)) : text;
 
+/**
+ * A literal every token pattern's match contains: text without one cannot match any of them, so
+ * one pass here spares the 24 per-pattern passes over the text that holds none (most text).
+ */
+const TOKEN_HINT =
+  /-----BEGIN|gh[pousr]_|github_pat_|glpat-|sk-|AKIA|ASIA|AIza|ya29\.|xox|xapp-|hooks\.slack\.com\/services\/|ATATT|k_live_|npm_|hf_|SG\.|key-|tfe_|eyJ|[Bb]earer|[Bb]asic|:\/\//;
+
 /** Credential kinds found in one decoded string. */
 export const scanDecoded = (raw: string, options: DecodedScan): Array<string> => {
   const text = withoutAnsi(raw);
   const hits = new Set<string>();
-  for (const { name, pattern, confirm } of TOKEN_PATTERNS) {
+  for (const { name, pattern, confirm } of TOKEN_HINT.test(text) ? TOKEN_PATTERNS : []) {
     for (const match of text.matchAll(pattern)) {
       if (confirm === undefined || confirm(match)) {
         hits.add(name);
@@ -216,7 +223,7 @@ export const redactDecoded = (raw: string, options: DecodedScan): string => {
     const at = match.lastIndexOf(secret);
     return match.slice(0, at) + mask(secret) + match.slice(at + secret.length);
   };
-  for (const { pattern, confirm } of TOKEN_PATTERNS) {
+  for (const { pattern, confirm } of TOKEN_HINT.test(text) ? TOKEN_PATTERNS : []) {
     out = out.replace(pattern, (match: string, ...rest: Array<unknown>) => {
       if (confirm !== undefined) {
         const groups = rest.at(-1);
@@ -301,13 +308,28 @@ const ESCAPES =
 
 /** Token formats in the raw file bytes (free pages and indexes included), in overlapping chunks. */
 export const scanFileBytes = (path: string, chunkBytes = 8 << 20): Map<string, number> => {
+  const steps = scanFileBytesSteps(path, chunkBytes);
+  let step = steps.next();
+  while (step.done !== true) step = steps.next();
+  return step.value;
+};
+
+/** The same scan, yielding after each chunk so a long scan can hand back control (signals). */
+export const scanFileBytesSteps = function* (
+  path: string,
+  chunkBytes = 8 << 20,
+): Generator<void, Map<string, number>> {
   const hits = new Map<string, number>();
   const overlap = 4096;
   const buffer = Buffer.alloc(chunkBytes + overlap);
   const handle = NodeFS.openSync(path, "r");
+  // Per pattern, the file offset where its last counted match starts: a match seen again in the
+  // next window (carried over, or grown by the bytes after it) has the same start.
+  const lastStart = new Map<string, number>();
   try {
     let tail = 0;
     let position = 0;
+    let base = 0;
     for (;;) {
       const read = NodeFS.readSync(handle, buffer, tail, chunkBytes, position);
       if (read === 0) break;
@@ -317,8 +339,10 @@ export const scanFileBytes = (path: string, chunkBytes = 8 << 20): Map<string, n
         .toString("latin1", 0, length)
         .replace(ESCAPES, (escape) => " ".repeat(escape.length));
       const count = (name: string, match: RegExpMatchArray) => {
-        // A match ending inside the carried tail was counted with the previous chunk.
-        if ((match.index ?? 0) + match[0].length > tail) hits.set(name, (hits.get(name) ?? 0) + 1);
+        const start = base + (match.index ?? 0);
+        if (start <= (lastStart.get(name) ?? -1)) return;
+        lastStart.set(name, start);
+        hits.set(name, (hits.get(name) ?? 0) + 1);
       };
       for (const { name, pattern, confirm } of TOKEN_PATTERNS) {
         for (const match of text.matchAll(pattern)) {
@@ -327,7 +351,9 @@ export const scanFileBytes = (path: string, chunkBytes = 8 << 20): Map<string, n
       }
       const keep = Math.min(overlap, length);
       buffer.copy(buffer, 0, length - keep, length);
+      base += length - keep;
       tail = keep;
+      yield;
     }
   } finally {
     NodeFS.closeSync(handle);

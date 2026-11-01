@@ -60,7 +60,10 @@ vi.mock("node:worker_threads", async (importOriginal) => {
 
 const withReaderClient = <A, E>(
   use: (sql: SqlClient.SqlClient) => Effect.Effect<A, E, SqlClient.SqlClient>,
-  config: Pick<SqliteClient.SqliteClientConfig, "readerPoolSize"> = {},
+  config: Pick<
+    SqliteClient.SqliteClientConfig,
+    "readerPoolSize" | "cacheSizeMb" | "readerCacheSizeMb" | "mmapSizeMb"
+  > = {},
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -444,6 +447,99 @@ it.effect("fails a read-only transaction whose reader stops, then starts a new r
       assert.equal(startedWorkers.length, startedBefore + 2);
     }),
   ),
+);
+
+const pageCacheAndMap = (sql: SqlClient.SqlClient) =>
+  Effect.gen(function* () {
+    const [cache] = yield* sql<{ readonly cache_size: number }>`PRAGMA cache_size`;
+    const [mmap] = yield* sql<{ readonly mmap_size: number }>`PRAGMA mmap_size`;
+    return { cacheSize: cache?.cache_size, mmapSize: mmap?.mmap_size };
+  });
+
+it.effect.each([
+  {
+    tuning: "configured",
+    config: { cacheSizeMb: 64, readerCacheSizeMb: 8, mmapSizeMb: 16 },
+    writer: { cacheSize: -64 * 1024, mmapSize: 16 * 1024 * 1024 },
+    reader: { cacheSize: -8 * 1024, mmapSize: 16 * 1024 * 1024 },
+  },
+  {
+    tuning: "default",
+    config: {},
+    writer: { cacheSize: -2000, mmapSize: 0 },
+    reader: { cacheSize: -2000, mmapSize: 0 },
+  },
+])(
+  "gives the writer and every reader, restarted ones too, the $tuning page cache and memory map",
+  ({ config, writer, reader }) =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          assert.deepEqual(yield* pageCacheAndMap(sql), writer);
+          const startedBefore = startedWorkers.length;
+          // Each open read transaction holds its reader, so four of them start the whole pool.
+          const release = yield* Deferred.make<void>();
+          const transactions = yield* Effect.forEach([0, 1, 2, 3], () =>
+            Effect.gen(function* () {
+              const opened = yield* Deferred.make<void>();
+              const fiber = yield* sql
+                .withTransaction(
+                  pageCacheAndMap(sql).pipe(
+                    Effect.tap(() => Deferred.succeed(opened, undefined)),
+                    Effect.tap(() => Deferred.await(release)),
+                  ),
+                )
+                .pipe(SqliteClient.readOnly, Effect.forkChild);
+              return { opened, fiber };
+            }),
+          );
+          yield* Effect.forEach(transactions, ({ opened }) => Deferred.await(opened));
+          yield* Deferred.succeed(release, undefined);
+          assert.deepEqual(yield* Fiber.joinAll(transactions.map(({ fiber }) => fiber)), [
+            reader,
+            reader,
+            reader,
+            reader,
+          ]);
+          const pool = startedWorkers.slice(startedBefore);
+          assert.equal(pool.length, 4);
+
+          for (const worker of pool) yield* Effect.promise(() => worker.terminate());
+          assert.deepEqual(
+            yield* sql.withTransaction(pageCacheAndMap(sql)).pipe(SqliteClient.readOnly),
+            reader,
+          );
+          assert.equal(startedWorkers.length, startedBefore + 5);
+        }),
+      config,
+    ),
+);
+
+it.effect.each([
+  { setting: "a negative page cache", config: { cacheSizeMb: -1 }, name: "cacheSizeMb" },
+  {
+    setting: "a fractional reader page cache",
+    config: { readerCacheSizeMb: 1.5 },
+    name: "readerCacheSizeMb",
+  },
+  {
+    setting: "a page cache past SQLite's 32-bit KiB count",
+    config: { cacheSizeMb: SqliteClient.SQLITE_MAX_CACHE_SIZE_MB + 1 },
+    name: "cacheSizeMb",
+  },
+  {
+    setting: "a memory map SQLite would clamp",
+    config: { mmapSizeMb: SqliteClient.SQLITE_MAX_MMAP_SIZE_MB + 1 },
+    name: "mmapSizeMb",
+  },
+])("refuses $setting before opening the database", ({ config, name }) =>
+  Effect.gen(function* () {
+    const exit = yield* Effect.exit(
+      Effect.provide(Effect.void, SqliteClient.layer({ filename: ":memory:", ...config })),
+    );
+    assert(Exit.isFailure(exit));
+    assert.include(String(Cause.squash(exit.cause)), `SQLite ${name} must be an integer from 0 to`);
+  }),
 );
 
 const withFileClient = <A, E>(

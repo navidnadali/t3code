@@ -3301,6 +3301,37 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
       const rebuilt = yield* maintenance.rebuild;
       assert.isTrue(rebuilt.valid);
       assert.lengthOf((yield* projectionStore.getThreadProjection(threadId)).turnItems, 151);
+
+      const strayThreadId = ThreadId.make("thread:foundation-many-items:stray-count");
+      yield* sql`
+        UPDATE orchestration_v2_projection_turn_item_counts
+        SET item_count = item_count + 1
+        WHERE thread_id = ${threadId}
+      `;
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
+        VALUES (${strayThreadId}, '', 2)
+      `;
+      assert.equal((yield* projectionStore.getThreadShell(threadId))?.itemCount, 152);
+      const drifted = yield* maintenance.verify;
+      assert.isFalse(drifted.valid);
+      assert.deepEqual(drifted.turnItemCountDriftThreadIds, [threadId, strayThreadId]);
+
+      assert.isTrue((yield* maintenance.rebuild).valid);
+      assert.equal((yield* projectionStore.getThreadShell(threadId))?.itemCount, 151);
+      assert.deepEqual(
+        yield* sql`
+          SELECT thread_id, run_id, item_count
+          FROM orchestration_v2_projection_turn_item_counts
+          ORDER BY thread_id, run_id
+        `,
+        yield* sql`
+          SELECT thread_id, COALESCE(run_id, '') AS run_id, COUNT(*) AS item_count
+          FROM orchestration_v2_projection_turn_items
+          GROUP BY thread_id, run_id
+          ORDER BY thread_id, run_id
+        `,
+      );
     }),
   );
 });

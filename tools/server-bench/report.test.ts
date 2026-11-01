@@ -187,6 +187,46 @@ describe("renderComparison", () => {
     }
   });
 
+  it("shows each call type's completed calls, and its errors and unfinished calls when any", () => {
+    const censored = result("censored", 0.5, {
+      metrics: {
+        ...metrics(0.5),
+        driver: {
+          calls: {
+            "http.environment": { count: 600, errors: 0, unfinished: 0, p50_ms: 520, p95_ms: 4400 },
+            "mcp.t3_project_list": { count: 1, errors: 2, unfinished: 99, p50_ms: 4, p95_ms: 4 },
+          },
+        },
+      },
+    });
+    const markdown = renderComparison(before, censored);
+
+    expect(line(markdown, "Client `mcp.t3_project_list` completed")).toBe(
+      "| Client `mcp.t3_project_list` completed | 120 | 1 | -119 (-99%) |",
+    );
+    expect(line(markdown, "Client `mcp.t3_project_list` errors")).toBe(
+      "| Client `mcp.t3_project_list` errors | n/a | 2 | n/a |",
+    );
+    expect(line(markdown, "Client `mcp.t3_project_list` unfinished")).toBe(
+      "| Client `mcp.t3_project_list` unfinished | n/a | 99 | n/a |",
+    );
+    expect(line(markdown, "Client `http.environment` completed")).toBe(
+      "| Client `http.environment` completed | 600 | 600 | 0 (0.0%) |",
+    );
+    expect(line(markdown, "Client `http.environment` errors")).toBeUndefined();
+    expect(line(markdown, "Client `http.environment` unfinished")).toBeUndefined();
+
+    const oneRunCensored = result("one-run", 0.5, {
+      spread: {
+        min: metrics(0.5),
+        max: { driver: { calls: { "http.environment": { unfinished: 3 } } } },
+      },
+    });
+    expect(tableRows([before, oneRunCensored]).map((row) => row.label)).toContain(
+      "Client `http.environment` unfinished",
+    );
+  });
+
   it("marks rows without trace or gauge data n/a, never 0", () => {
     const missing = result("no-trace", 0.5, {
       metrics: { ...metrics(0.5), trace: null, spans: null, sql: null, otlp: { elu_mean: null } },

@@ -237,8 +237,7 @@ export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput)
     );
     yield* Console.log(`Wrote ${events} events; compacting into ${destination}...`);
     pinWallClock(scratch, now);
-    owned.file(destination);
-    yield* compactInto(scratch, destination);
+    yield* compactInto(scratch, destination, owned);
 
     const db = new NodeSqlite.DatabaseSync(destination, { readOnly: true });
     let actual: Shape;

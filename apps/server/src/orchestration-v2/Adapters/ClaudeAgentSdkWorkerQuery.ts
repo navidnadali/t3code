@@ -268,6 +268,10 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     | undefined;
   let child: ClaudeSpawnedProcess | undefined;
   let childDone = false;
+  // Main or the worker's SDK has sent SIGKILL: nothing is left to wait for.
+  let killSent = false;
+  // The pool is closing: a spawn that arrives now would outlive it.
+  let poolClosing = false;
   let outputDone = false;
   let released = false;
   // Like the SDK's cleanup: no callback starts after it, and the ones running are aborted.
@@ -294,6 +298,11 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     runFork(Scope.close(scope, Exit.void));
   };
 
+  const killChild = (target: ClaudeSpawnedProcess) => {
+    killSent = true;
+    target.kill("SIGKILL");
+  };
+
   // What the SDK's close would do when its session can no longer run it.
   let closeRequested = false;
   let stopping = false;
@@ -308,10 +317,31 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
         if (childDone) return;
         target.kill("SIGTERM");
         yield* Effect.sleep(CLOSE_KILL_AFTER);
-        if (!childDone) target.kill("SIGKILL");
+        if (!childDone) killChild(target);
       }),
     );
   };
+  // What the SDK's exit handler and close would still do once its worker is gone, awaited: the pool
+  // closes as the server stops, and nothing on main runs after that.
+  const stopChildNow = Effect.suspend(() => {
+    poolClosing = true;
+    cleanUp();
+    const target = child;
+    if (target === undefined || childDone || killSent) return Effect.void;
+    target.stdin.end();
+    target.kill("SIGTERM");
+    return Effect.callback<void>((resume) => {
+      if (childDone) return resume(Effect.void);
+      const onExit = () => resume(Effect.void);
+      target.once("exit", onExit);
+      return Effect.sync(() => target.off("exit", onExit));
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: CLOSE_KILL_AFTER,
+        orElse: () => Effect.sync(() => killChild(target)),
+      }),
+    );
+  });
   const isClose = (frame: Uint8Array | ClaudeAgentSdkWorkerRequest) =>
     !(frame instanceof Uint8Array) && frame.type === "close";
 
@@ -355,7 +385,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   };
 
   const spawnChild = (event: Extract<ClaudeAgentSdkWorkerEvent, { readonly type: "spawn" }>) => {
-    if (child !== undefined || released) return;
+    if (child !== undefined || released || poolClosing) return;
     let spawned: ClaudeSpawnedProcess;
     try {
       // The SDK passes cwd even when it is undefined.
@@ -465,6 +495,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
         if (event.signal !== undefined && !CLI_SIGNALS.has(event.signal)) {
           throw new TypeError("The provider I/O worker sent an unknown signal for the CLI.");
         }
+        if (event.signal === "SIGKILL") killSent = true;
         child?.kill(event.signal);
         return;
       case "abort":
@@ -489,9 +520,10 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       onFailure: (error: WorkerSessionError) => error,
       kill: Effect.sync(() => {
         cleanUp();
-        if (child !== undefined && !childDone) child.kill("SIGKILL");
+        if (child !== undefined && !childDone) killChild(child);
       }),
       killAfterEnd: true,
+      onPoolClose: stopChildNow,
       onEvent,
       // A failed session drops the worker's stdin end and kills, so a requested close is main's.
       onSessionFailure: () => {

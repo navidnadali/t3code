@@ -6,6 +6,7 @@ import {
   ShellWatcher,
   Subscriber,
   timed,
+  withArchivedThreads,
   type RunContext,
   type ThreadShell,
 } from "./clients.ts";
@@ -277,5 +278,39 @@ describe("Subscriber", () => {
       subscriber.stop();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("withArchivedThreads", () => {
+  it("adds the archive the shell endpoint leaves out, keeping the active threads apart", async () => {
+    const calls: Array<string> = [];
+    const archived = shell({
+      id: "archived-1",
+      itemCount: 900,
+      archivedAt: "2026-10-01T00:00:00Z",
+    });
+    const socket = {
+      call: async (tag: string) => {
+        calls.push(tag);
+        // thread-1 was archived after the active snapshot was read: it stays an active thread.
+        return {
+          schemaVersion: 1,
+          snapshotSequence: 9,
+          projects: [],
+          threads: [archived, shell({})],
+        };
+      },
+    } as unknown as RpcSocket;
+
+    const merged = await withArchivedThreads(
+      { snapshotSequence: 7, threads: [shell({})], archivedThreads: [], projects: [] },
+      socket,
+      1000,
+    );
+
+    expect(calls).toEqual(["orchestration.getArchivedShellSnapshot"]);
+    expect(merged.snapshotSequence).toBe(7);
+    expect(merged.threads.map((thread) => thread.id)).toEqual(["thread-1"]);
+    expect(merged.archivedThreads?.map((thread) => thread.id)).toEqual(["archived-1"]);
   });
 });

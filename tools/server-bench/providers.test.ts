@@ -73,13 +73,16 @@ describe("history mode", () => {
         { ...PRIMARY, sessions: 1 },
       ),
     );
-    const thread = (instanceId: string) => ({ id: instanceId, modelSelection: { instanceId } });
+    const thread = (instanceId: string, model: string) => ({
+      id: instanceId,
+      modelSelection: { instanceId, model },
+    });
     const { assignments, switches } = historyAssignments(plan, [
-      thread("codex"),
-      thread("claudeBench"),
-      thread("acpBench"),
-      thread("claudeAgent"),
-      thread("spare"),
+      thread("codex", "gpt-6.1-sol"),
+      thread("claudeBench", "claude-sonnet-4-6"),
+      thread("acpBench", "bench-replay"),
+      thread("claudeAgent", "claude-sonnet-4-6"),
+      thread("spare", "claude-sonnet-4-6"),
     ]);
 
     expect(
@@ -95,7 +98,30 @@ describe("history mode", () => {
       ["codexBench", "claudeAgent", true],
     ]);
     expect(switches).toEqual({ codexBench: 2 });
-    expect(() => historyAssignments(plan, [thread("codex")])).toThrow(/4 sessions/);
+    expect(() => historyAssignments(plan, [thread("codex", "gpt-6.1-sol")])).toThrow(/4 sessions/);
+  });
+
+  it("moves a seeded thread on its planned instance to the planned model", () => {
+    const plan = planSessions(
+      parseProviderLoad({ "codex-sessions": "2" }, { ...PRIMARY, sessions: 0 }),
+    );
+    const { assignments, switches, modelSwitches } = historyAssignments(plan, [
+      { id: "sol", modelSelection: { instanceId: "codexBench", model: "gpt-6.1-sol" } },
+      { id: "luna", modelSelection: { instanceId: "codexBench", model: "gpt-6-luna" } },
+    ]);
+
+    expect(
+      assignments.map(({ session, thread, switchProvider }) => [
+        `${session.instanceId}/${session.model}`,
+        thread.id,
+        switchProvider,
+      ]),
+    ).toEqual([
+      ["codexBench/gpt-6-luna", "sol", true],
+      ["codexBench/gpt-6-luna", "luna", false],
+    ]);
+    expect(switches).toEqual({});
+    expect(modelSwitches).toEqual({ codexBench: 1 });
   });
 });
 

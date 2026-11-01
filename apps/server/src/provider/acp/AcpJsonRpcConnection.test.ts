@@ -17,6 +17,7 @@ import * as Option from "effect/Option";
 import * as References from "effect/References";
 import * as Scope from "effect/Scope";
 import * as Result from "effect/Result";
+import * as Scheduler from "effect/Scheduler";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/process";
 import { describe, expect } from "vite-plus/test";
@@ -80,12 +81,27 @@ const recordsByRequest = (records: ReadonlyArray<ReturnType<typeof recordRequest
   return byRequest;
 };
 
+const isOutgoingPrompt = (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
+  event.direction === "outgoing" &&
+  event.stage === "decoded" &&
+  typeof event.payload === "object" &&
+  event.payload !== null &&
+  Reflect.get(event.payload, "tag") === "session/prompt";
+
 // Prompts, cancels as soon as the prompt is dispatched, and returns what the agent received in order.
+// holdPrompt slows the prompt on its way out: its outgoing protocol log record waits until the agent
+// has answered a later request, or its fiber yields every few operations. Its cancel comes on
+// dispatch, once the prompt is pending, or from inside that log record.
 const promptThenCancel = (input: {
   readonly cancelBehavior: "interrupt" | "wait-for-prompt";
+  readonly interruptPromptOnCancel?: boolean;
   readonly workers: number;
   readonly requestLogger: NonNullable<AcpSessionRuntime.AcpSessionRuntimeOptions["requestLogger"]>;
   readonly releaseLog?: Effect.Effect<void>;
+  readonly holdPrompt?: {
+    readonly in: "protocol-log" | "scheduler";
+    readonly cancelOn: "dispatch" | "call" | "log";
+  };
 }) =>
   Effect.gen(function* () {
     const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "acp-runtime-"));
@@ -94,6 +110,8 @@ const promptThenCancel = (input: {
     );
     const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
     const environmentReplied = yield* Deferred.make<void>();
+    const environmentLogging = onEnvironmentReply(environmentReplied);
+    let finishing = false;
     let offloadedLines = 0;
     const offloads =
       input.workers === 0
@@ -102,6 +120,20 @@ const promptThenCancel = (input: {
             codex: 0,
             acp: 0,
           }).acp;
+    const promptLogged = yield* Deferred.make<void>();
+    const promptReleased = yield* Deferred.make<void>();
+    const harnessScope = yield* Scope.Scope;
+    const runtimeMade = yield* Deferred.make<AcpSessionRuntime.AcpSessionRuntime["Service"]>();
+    const cancelledFromLog = yield* Deferred.make<Fiber.Fiber<void, EffectAcpErrors.AcpError>>();
+    const cancelFromLog =
+      input.holdPrompt?.cancelOn === "log"
+        ? Deferred.await(runtimeMade).pipe(
+            Effect.flatMap((made) =>
+              made.cancel.pipe(Effect.forkIn(harnessScope, { startImmediately: true })),
+            ),
+            Effect.flatMap((fiber) => Deferred.succeed(cancelledFromLog, fiber)),
+          )
+        : Effect.void;
     const runtime = yield* AcpSessionRuntime.make({
       ...mockRuntimeOptions,
       spawn: {
@@ -112,8 +144,21 @@ const promptThenCancel = (input: {
         },
       },
       cancelBehavior: input.cancelBehavior,
-      interruptPromptOnCancel: false,
-      protocolLogging: onEnvironmentReply(environmentReplied),
+      interruptPromptOnCancel: input.interruptPromptOnCancel ?? false,
+      protocolLogging: {
+        logIncoming: true,
+        logOutgoing: input.holdPrompt?.in === "protocol-log",
+        logger: (event) =>
+          isOutgoingPrompt(event)
+            ? cancelFromLog.pipe(
+                Effect.andThen(Deferred.succeed(promptLogged, undefined)),
+                Effect.andThen(Deferred.await(promptReleased)),
+              )
+            : // Only the reply to the final round trip, not to holdPrompt's.
+              finishing
+              ? environmentLogging.logger(event)
+              : Effect.void,
+      },
       requestLogger: input.requestLogger,
     }).pipe(
       Effect.provideService(AcpSessionRuntime.AcpLineOffloads, {
@@ -133,8 +178,11 @@ const promptThenCancel = (input: {
               ),
       }),
     );
+    yield* Deferred.succeed(runtimeMade, runtime);
     const releaseLog = input.releaseLog ?? Effect.void;
-    yield* Effect.addFinalizer(() => releaseLog);
+    yield* Effect.addFinalizer(() =>
+      releaseLog.pipe(Effect.andThen(Deferred.succeed(promptReleased, undefined))),
+    );
     const cancelReceived = yield* Deferred.make<void>();
     yield* runtime.getEvents().pipe(
       Stream.runForEach((event) => {
@@ -152,10 +200,36 @@ const promptThenCancel = (input: {
     const dispatched = yield* Deferred.make<void>();
     const prompt = yield* runtime
       .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
-      .pipe(Effect.forkChild);
-    yield* Deferred.await(dispatched);
-    const cancel = yield* runtime.cancel.pipe(Effect.forkChild({ startImmediately: true }));
+      .pipe(
+        input.holdPrompt?.in === "scheduler"
+          ? Effect.provideService(Scheduler.MaxOpsBeforeYield, 3)
+          : (effect) => effect,
+        Effect.forkChild,
+      );
+    let cancel: Fiber.Fiber<void, EffectAcpErrors.AcpError>;
+    if (input.holdPrompt === undefined) {
+      yield* Deferred.await(dispatched);
+      cancel = yield* runtime.cancel.pipe(Effect.forkChild({ startImmediately: true }));
+    } else {
+      if (input.holdPrompt.in === "protocol-log") yield* Deferred.await(promptLogged);
+      // A round trip: whatever was queued before it reaches the agent first.
+      const roundTrip = runtime.request("_test/environment", {});
+      if (input.holdPrompt.cancelOn === "dispatch") {
+        cancel = yield* Deferred.await(dispatched).pipe(
+          Effect.andThen(runtime.cancel),
+          Effect.forkChild({ startImmediately: true }),
+        );
+      } else if (input.holdPrompt.cancelOn === "log") {
+        cancel = yield* Deferred.await(cancelledFromLog);
+      } else {
+        yield* roundTrip;
+        cancel = yield* runtime.cancel.pipe(Effect.forkChild({ startImmediately: true }));
+      }
+      yield* roundTrip;
+      yield* Deferred.succeed(promptReleased, undefined);
+    }
     yield* Deferred.await(cancelReceived);
+    finishing = true;
     // Not awaited: their records can queue behind a slow one. The agent answers the second
     // only after reading every earlier line.
     const finish = yield* runtime.request("_test/finish-cancel", {}).pipe(Effect.forkChild);
@@ -1453,6 +1527,170 @@ describe("AcpSessionRuntime", () => {
         );
         expect(slow.offloadedLines > 0).toBe(workers > 0);
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each(
+    (["interrupt", "wait-for-prompt"] as const).flatMap((cancelBehavior) =>
+      [0, 2].flatMap((workers) =>
+        (
+          [
+            { in: "protocol-log", cancelOn: "dispatch" },
+            { in: "protocol-log", cancelOn: "call" },
+            { in: "protocol-log", cancelOn: "log" },
+            { in: "scheduler", cancelOn: "dispatch" },
+          ] as const
+        ).map((holdPrompt) => ({ cancelBehavior, workers, holdPrompt })),
+      ),
+    ),
+  )(
+    "writes session/prompt before a cancel issued while the prompt is held in the $holdPrompt.in ($cancelBehavior, $workers workers, cancel on $holdPrompt.cancelOn)",
+    ({ cancelBehavior, workers, holdPrompt }) =>
+      Effect.gen(function* () {
+        const records: Array<ReturnType<typeof recordRequest>> = [];
+        const run = yield* promptThenCancel({
+          cancelBehavior,
+          workers,
+          holdPrompt,
+          requestLogger: (event) =>
+            Effect.sync(() => {
+              records.push(recordRequest(event));
+            }),
+        });
+        expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
+        expect(
+          recordsByRequest(records)
+            .get("session/prompt")
+            ?.map(({ status }) => status),
+        ).toEqual(["started", "succeeded"]);
+        expect(run.promptExit).toEqual(
+          Exit.succeed({ stopReason: "cancelled", _meta: { nativeCancel: true } }),
+        );
+        expect(run.offloadedLines > 0).toBe(workers > 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each([0, 2])(
+    "sends session/cancel for an interrupted prompt whose started record is still appending (%i workers)",
+    (workers) =>
+      Effect.gen(function* () {
+        const appended = yield* Deferred.make<void>();
+        const appendCut = yield* Deferred.make<void>();
+        const records: Array<ReturnType<typeof recordRequest>> = [];
+        const run = yield* promptThenCancel({
+          cancelBehavior: "interrupt",
+          interruptPromptOnCancel: true,
+          workers,
+          requestLogger: (event) =>
+            Effect.sync(() => {
+              records.push(recordRequest(event));
+            }).pipe(
+              Effect.andThen(
+                isPromptStarted(event)
+                  ? Deferred.await(appended).pipe(
+                      Effect.onInterrupt(() => Deferred.succeed(appendCut, undefined)),
+                    )
+                  : Effect.void,
+              ),
+            ),
+          releaseLog: Deferred.succeed(appended, undefined).pipe(Effect.asVoid),
+        });
+        expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
+        expect(run.promptExit).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+        // The ordered record chain keeps the started record and writes the failed one after it;
+        // the cancel waited for neither.
+        expect(yield* Deferred.isDone(appendCut)).toBe(false);
+        expect(
+          recordsByRequest(records)
+            .get("session/prompt")
+            ?.map(({ status }) => status),
+        ).toEqual(["started", "failed"]);
+        expect(run.offloadedLines > 0).toBe(workers > 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("closes a runtime while its prompt's started record is still appending", () =>
+    Effect.gen(function* () {
+      const scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const appended = yield* Deferred.make<void>();
+      const appendCut = yield* Deferred.make<void>();
+      yield* Effect.addFinalizer(() => Deferred.succeed(appended, undefined));
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        spawn: {
+          ...mockRuntimeOptions.spawn,
+          env: { T3_ACP_COMPLETE_FIRST_PROMPT_ON_CANCEL: "1" },
+        },
+        requestLogger: (event) =>
+          isPromptStarted(event)
+            ? Deferred.await(appended).pipe(
+                Effect.onInterrupt(() => Deferred.succeed(appendCut, undefined)),
+              )
+            : Effect.void,
+      }).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* runtime.start();
+      const dispatched = yield* Deferred.make<void>();
+      const prompt = yield* runtime
+        .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(dispatched);
+      const closing = yield* Scope.close(scope, Exit.void).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.await(appendCut);
+      yield* Fiber.join(closing);
+      expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("ends a prompt whose runtime closes before the prompt is queued", () =>
+    Effect.gen(function* () {
+      const testScope = yield* Scope.Scope;
+      const scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const closing = yield* Deferred.make<Fiber.Fiber<void>>();
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        // The runtime closes as the prompt's started record is taken, before the prompt is sent.
+        requestLogger: (event) =>
+          isPromptStarted(event)
+            ? Scope.close(scope, Exit.void).pipe(
+                Effect.forkIn(testScope, { startImmediately: true }),
+                Effect.flatMap((fiber) => Deferred.succeed(closing, fiber)),
+                Effect.asVoid,
+                Effect.provideService(Scheduler.MaxOpsBeforeYield, Number.POSITIVE_INFINITY),
+              )
+            : Effect.void,
+      }).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* runtime.start();
+      const dispatched = yield* Deferred.make<void>();
+      // Yielding every few operations, the prompt's fiber is in the runtime scope before it sends.
+      const prompt = yield* runtime
+        .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
+        .pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 3), Effect.forkChild);
+      yield* Fiber.join(yield* Deferred.await(closing));
+      expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+      expect(yield* Deferred.isDone(dispatched)).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("fails a prompt whose started logger throws", () =>
+    Effect.gen(function* () {
+      const loggerFailure = new Error("native logger threw");
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        requestLogger: (event) => {
+          if (isPromptStarted(event)) throw loggerFailure;
+          return Effect.void;
+        },
+      });
+      yield* runtime.start();
+      expect(
+        yield* runtime.prompt({ prompt: [{ type: "text", text: "first" }] }).pipe(Effect.exit),
+      ).toEqual(Exit.die(loggerFailure));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect.each(["dies", "throws"] as const)(

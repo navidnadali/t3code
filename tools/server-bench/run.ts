@@ -34,9 +34,10 @@ export const HELP = `Usage:
 Per ref: restore the pristine fixture into a fresh base dir, start the server, sample it at 1 Hz
 (collect.ts), run the load driver, stop the server, read the trace. --runs rounds, counterbalanced
 (A B, B A, A B ...). An attempt is invalid when the server fails or exits, the driver fails, or,
-unless T3CODE_TRACE_MIN_LEVEL is Warn or above, the trace does not cover the window
-(trace_missing / trace_coverage / trace_stale / trace_rotated_during_read); it is retried in its
-own slot up to --retries times, so the order holds. Then <out>/<label>.result.json (median of the
+unless T3CODE_TRACE_MIN_LEVEL is Warn or above or T3CODE_TRACE_TIMING_ENABLED is false (untimed
+spans; span metrics are then n/a), the trace does not cover the window (trace_missing /
+trace_coverage / trace_stale / trace_rotated_during_read); it is retried in its own slot up to
+--retries times, so the order holds. Then <out>/<label>.result.json (median of the
 valid runs, min/max spread, the attempt order, every attempt's detail) and, with two or more refs,
 <out>/compare.md (the first ref against each other one, via report.ts; a refused comparison
 exits 2).
@@ -58,7 +59,8 @@ Refs
 Fixture (restored for every run with a reflink copy where the filesystem supports it)
   --fixture <file>         a checkpointed statev2.sqlite (VACUUM INTO output; a non-empty -wal next
                            to it is refused), copied to <base>/userdata/statev2.sqlite.
-  --fixture <dir>          a whole base-dir template (userdata/statev2.sqlite, settings.json ...).
+  --fixture <dir>          a whole base-dir template (userdata/statev2.sqlite, settings.json ...);
+                           regular files and directories only (a symlink is refused).
   --fixture none           an empty database (smoke only).
   The fixture's sha256 (cached by path, size and mtime in <work>/fixture-hashes.json) is recorded.
 
@@ -70,10 +72,19 @@ Load
   --server-pid <pid> --warmup <n>s --window <n>s [--sessions N] [--subscribers N] [--pollers N]
   [driver args], with T3_BENCH_TOKEN (a bearer token from the server's bootstrap grant) in its
   environment. It writes <out>/driver.json: { status: "ok"|"failed", failure?: { reason },
-  timeline: { window: <ISO> }, windowSeconds, calls: { <type>: { count, errors, p50, p95, p99,
-  max } }, counters: { "events.thread": { perSecond }, ... }, knobs }; status "failed", a
+  timeline: { window: <ISO> }, windowSeconds, calls: { <type>: { count, errors, unfinished, p50,
+  p95, p99, max } }, counters: { "events.thread": { perSecond }, ... }, knobs }; status "failed", a
   driver.failed marker or no file marks the run invalid. Without a window in it, the run uses
   [driver start + warmup, + window].
+  The workload fingerprint hashes the driver (its file, module directory and the local modules
+  they import), the fake providers (fake-*/ and what they import) and the transcripts they replay
+  (the server's recorded replay fixtures, and every absolute BENCH_*TRANSCRIPT path in the server
+  env or the fixture's settings.json), and launchers_sha256 what the fixture's settings.json runs
+  (enabled instances' binaryPath, commandPath, absolute commandArgs, e.g. from providers.ts
+  --claude-launcher): a launcher in this harness's fake-*/ adds its path, one in another
+  checkout's fake-*/ that checkout's fakes and recorded replay fixtures, a native executable (ELF,
+  Mach-O, PE) its file; anything else (a script, JavaScript, data) is refused, as what it runs
+  cannot be hashed.
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -136,8 +147,14 @@ const TRACE_PROBLEMS = new Set([
   "trace_stale",
   "trace_rotated_during_read",
 ]);
-/** Below Warn the server writes spans continuously, so a trace problem voids the attempt. */
+/** The values the server's Config.Boolean reads as false. */
+const FALSE_LITERALS = new Set(["false", "no", "off", "0", "n"]);
+/**
+ * Below Warn the server writes timed spans continuously, so a trace problem voids the attempt.
+ * With timing off its spans carry no times and no window can be read from them.
+ */
 export const traceRequired = (env: Readonly<Record<string, string>>) =>
+  !FALSE_LITERALS.has(env.T3CODE_TRACE_TIMING_ENABLED ?? "true") &&
   !["warn", "error", "fatal", "none"].includes(
     (env.T3CODE_TRACE_MIN_LEVEL ?? "Info").trim().toLowerCase(),
   );
@@ -203,30 +220,228 @@ async function filesHash(paths: ReadonlyArray<string>): Promise<string> {
   return hash.digest("hex");
 }
 
-/** The driver file and, when present, its module directory (driver.ts + driver/). */
-async function driverHash(path: string): Promise<string> {
+const isFile = (path: string) =>
+  NodeFS.statSync(path, { throwIfNoEntry: false })?.isFile() === true;
+
+/** Relative specifiers of static, re-export, side-effect and literal dynamic imports and requires. */
+const LOCAL_IMPORT = /(?:\bfrom|\bimport|\brequire)\s*\(?\s*["'](\.{1,2}\/[^"'\n]+)["']/g;
+
+/** `entries` and the local modules they import, transitively; absolute paths, sorted. */
+function withLocalImports(entries: ReadonlyArray<string>): Array<string> {
+  const seen = new Set<string>();
+  const pending = [...entries];
+  for (let file = pending.pop(); file !== undefined; file = pending.pop()) {
+    if (seen.has(file) || !isFile(file)) continue;
+    seen.add(file);
+    for (const match of NodeFS.readFileSync(file, "utf8").matchAll(LOCAL_IMPORT)) {
+      pending.push(NodePath.resolve(NodePath.dirname(file), match[1]!));
+    }
+  }
+  return [...seen].toSorted();
+}
+
+/**
+ * The driver file, its module directory when present (driver.ts + driver/), and the local modules
+ * they import from elsewhere (driver.ts imports providers.ts).
+ */
+export async function driverHash(path: string): Promise<string> {
   const hash = NodeCrypto.createHash("sha256");
   hash.update(`${NodePath.basename(path)}\0${await sha256File(path)}\n`);
+  const covered = new Set([path]);
   const modules = path.replace(/\.[cm]?[jt]s$/, "");
   if (modules !== path && NodeFS.existsSync(modules) && NodeFS.statSync(modules).isDirectory()) {
     const files = (NodeFS.readdirSync(modules, { recursive: true }) as Array<string>)
       .filter((relative) => NodeFS.statSync(NodePath.join(modules, relative)).isFile())
       .toSorted();
     for (const relative of files) {
+      covered.add(NodePath.join(modules, relative));
       hash.update(`${relative}\0${await sha256File(NodePath.join(modules, relative))}\n`);
     }
+  }
+  for (const file of withLocalImports([...covered])) {
+    if (covered.has(file)) continue;
+    hash.update(`${NodePath.relative(NodePath.dirname(path), file)}\0${await sha256File(file)}\n`);
   }
   return hash.digest("hex");
 }
 
-interface FixtureInfo {
+const FAKE_DIRS = ["fake-claude", "fake-codex", "fake-acp", "fake-common"];
+
+/**
+ * The replaying fake providers: their directories' files but tests and READMEs (launchers, code,
+ * generated transcripts), and the local modules they import from elsewhere.
+ */
+export async function fakesHash(benchDir: string): Promise<string> {
+  const files = FAKE_DIRS.flatMap((dir) => {
+    const root = NodePath.join(benchDir, dir);
+    if (!NodeFS.existsSync(root)) return [];
+    return (NodeFS.readdirSync(root, { recursive: true }) as Array<string>)
+      .map((relative) => NodePath.join(root, relative))
+      .filter((file) => isFile(file) && !/\.test\.[cm]?[jt]s$|\.md$/.test(file));
+  });
+  const hash = NodeCrypto.createHash("sha256");
+  for (const file of withLocalImports(files)) {
+    hash.update(`${NodePath.relative(benchDir, file)}\0${await sha256File(file)}\n`);
+  }
+  return hash.digest("hex");
+}
+
+const RECORDINGS = "apps/server/src/orchestration-v2/testkit/fixtures";
+const REPLAY_FIXTURES = NodePath.join(repoRoot, RECORDINGS);
+const TRANSCRIPT_VAR = /^BENCH_\w*TRANSCRIPT$/;
+
+/** The provider instances of a directory fixture's settings.json; none for other fixtures. */
+function settingsInstances(fixture: FixtureInfo): Array<Record<string, unknown>> {
+  const settings =
+    fixture.kind === "dir" ? NodePath.join(fixture.path!, "userdata", "settings.json") : null;
+  if (settings === null || !isFile(settings)) return [];
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = recordOf(JSON.parse(NodeFS.readFileSync(settings, "utf8")));
+  } catch (error) {
+    throw new Error(`${settings}: ${error instanceof Error ? error.message : String(error)}`, {
+      cause: error,
+    });
+  }
+  return Object.values(recordOf(parsed.providerInstances)).map(recordOf);
+}
+
+/** The BENCH_*TRANSCRIPT values of `env` and of the instances in a directory fixture's settings. */
+function transcriptSettings(
+  env: Readonly<Record<string, string>>,
+  fixture: FixtureInfo,
+): Array<string> {
+  const values = Object.entries(env)
+    .filter(([name]) => TRANSCRIPT_VAR.test(name))
+    .map(([, value]) => value);
+  for (const instance of settingsInstances(fixture)) {
+    const environment = instance.environment;
+    for (const entry of Array.isArray(environment) ? environment.map(recordOf) : []) {
+      if (typeof entry.name === "string" && TRANSCRIPT_VAR.test(entry.name)) {
+        if (typeof entry.value === "string") values.push(entry.value);
+      }
+    }
+  }
+  return values;
+}
+
+/** Adds the `*.ndjson` recordings under `fixturesDir` (the fakes load them by name) to `hash`. */
+async function hashRecordings(hash: NodeCrypto.Hash, fixturesDir: string): Promise<void> {
+  const recorded = NodeFS.existsSync(fixturesDir)
+    ? (NodeFS.readdirSync(fixturesDir, { recursive: true }) as Array<string>)
+        .filter((relative) => relative.endsWith(".ndjson"))
+        .toSorted()
+    : [];
+  for (const relative of recorded) {
+    hash.update(`${relative}\0${await sha256File(NodePath.join(fixturesDir, relative))}\n`);
+  }
+}
+
+/**
+ * The transcripts the fakes replay: every recording they load by name (the `*.ndjson` of the
+ * server's replay fixtures) and each absolute path a BENCH_*TRANSCRIPT mix names, in the server
+ * environment or the fixture's settings. Generated transcripts belong to fakesHash.
+ */
+export async function transcriptsHash(
+  env: Readonly<Record<string, string>>,
+  fixture: FixtureInfo,
+  fixturesDir: string,
+): Promise<string> {
+  const hash = NodeCrypto.createHash("sha256");
+  await hashRecordings(hash, fixturesDir);
+  const named = new Set<string>();
+  for (const mix of transcriptSettings(env, fixture)) {
+    for (const entry of mix.split(",")) {
+      const name = entry.trim().replace(/:\d+$/, "").trim();
+      if (NodePath.isAbsolute(name)) named.add(name);
+    }
+  }
+  for (const path of [...named].toSorted()) {
+    hash.update(`${path}\0${isFile(path) ? await sha256File(path) : "missing"}\n`);
+  }
+  return hash.digest("hex");
+}
+
+// ELF, Mach-O (both byte orders, 32/64-bit, universal) and PE: a self-contained executable.
+const NATIVE_MAGIC = ["7f454c46", "feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe"];
+
+const isNativeExecutable = (path: string) => {
+  const head = Buffer.alloc(4);
+  const fd = NodeFS.openSync(path, "r");
+  try {
+    const read = NodeFS.readSync(fd, head, 0, 4, 0);
+    const hex = head.subarray(0, read).toString("hex");
+    return NATIVE_MAGIC.includes(hex) || hex.startsWith("4d5a");
+  } finally {
+    NodeFS.closeSync(fd);
+  }
+};
+
+const realPath = (path: string) => {
+  try {
+    return NodeFS.realpathSync(path);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * The absolute binaryPath, commandPath and commandArgs of the fixture settings' enabled instances:
+ * one in this harness's fake-* dirs adds its path (fakes_sha256 has it), one in another
+ * checkout's adds that checkout's fakes and recordings, a native executable its file; anything
+ * else is refused.
+ */
+export async function launchersHash(fixture: FixtureInfo, benchDir: string): Promise<string> {
+  const launchers = new Set<string>();
+  for (const instance of settingsInstances(fixture)) {
+    const config = recordOf(instance.config);
+    // A disabled instance runs nothing (providers.ts settings keeps built-ins' config, disabled).
+    if (instance.enabled === false || config.enabled === false) continue;
+    const args = Array.isArray(config.commandArgs) ? config.commandArgs : [];
+    for (const value of [config.binaryPath, config.commandPath, ...args]) {
+      if (typeof value === "string" && NodePath.isAbsolute(value)) launchers.add(value);
+    }
+  }
+  const harness = realPath(benchDir);
+  const checkouts = new Map<string, string>();
+  const checkoutHash = async (checkout: string) => {
+    if (!checkouts.has(checkout)) {
+      const recordings = NodeCrypto.createHash("sha256");
+      await hashRecordings(recordings, NodePath.resolve(checkout, "../..", RECORDINGS));
+      checkouts.set(checkout, `${await fakesHash(checkout)}+${recordings.digest("hex")}`);
+    }
+    return checkouts.get(checkout)!;
+  };
+  const hash = NodeCrypto.createHash("sha256");
+  for (const launcher of [...launchers].toSorted()) {
+    const real = realPath(launcher);
+    let content: string;
+    if (real === null || !isFile(real)) {
+      content = "not a file";
+    } else if (FAKE_DIRS.includes(NodePath.basename(NodePath.dirname(real)))) {
+      const checkout = NodePath.dirname(NodePath.dirname(real));
+      content =
+        checkout === harness ? "harness" : `checkout ${checkout} ${await checkoutHash(checkout)}`;
+    } else if (!isNativeExecutable(real)) {
+      throw new Error(
+        `${launcher} (fixture settings) is outside a fake-* directory and not a native executable: what it runs cannot be fingerprinted; move it into a fake-* directory`,
+      );
+    } else {
+      content = await sha256File(real);
+    }
+    hash.update(`${launcher}\0${content}\n`);
+  }
+  return hash.digest("hex");
+}
+
+export interface FixtureInfo {
   readonly kind: "file" | "dir" | "empty";
   readonly path: string | null;
   readonly sha256: string;
   readonly bytes: number | null;
 }
 
-async function fixtureInfo(spec: string, workDir: string): Promise<FixtureInfo> {
+export async function fixtureInfo(spec: string, workDir: string): Promise<FixtureInfo> {
   if (spec === "none") return { kind: "empty", path: null, sha256: "empty", bytes: 0 };
   const path = NodeFS.realpathSync(spec);
   const cachePath = NodePath.join(workDir, "fixture-hashes.json");
@@ -246,9 +461,20 @@ async function fixtureInfo(spec: string, workDir: string): Promise<FixtureInfo> 
   };
   let info: FixtureInfo;
   if (NodeFS.statSync(path).isDirectory()) {
-    const files = (NodeFS.readdirSync(path, { recursive: true }) as Array<string>)
-      .filter((relative) => NodeFS.statSync(NodePath.join(path, relative)).isFile())
-      .toSorted();
+    const files: Array<string> = [];
+    for (const relative of (
+      NodeFS.readdirSync(path, { recursive: true }) as Array<string>
+    ).toSorted()) {
+      const stat = NodeFS.lstatSync(NodePath.join(path, relative));
+      if (stat.isDirectory()) continue;
+      // A copied link would let the server write into its target, outside the run's base dir.
+      if (!stat.isFile()) {
+        throw new Error(
+          `fixture ${path} has a ${stat.isSymbolicLink() ? "symlink" : "special file"} at ${relative}; a template holds only regular files and directories`,
+        );
+      }
+      files.push(relative);
+    }
     const hash = NodeCrypto.createHash("sha256");
     let bytes = 0;
     for (const relative of files) {
@@ -410,6 +636,8 @@ function prepareTarget(spec: string, workDir: string, buildCmd: string): Omit<Ta
 export interface CallStats {
   readonly count: number | null;
   readonly errors: number | null;
+  /** Calls still running when the driver's grace period ended; latencies leave them out. */
+  readonly unfinished: number | null;
   readonly per_s: number | null;
   readonly p50_ms: number | null;
   readonly p95_ms: number | null;
@@ -453,6 +681,7 @@ export function readDriverResult(raw: unknown): DriverSummary {
     calls[type] = {
       count: finiteOrNull(entry.count),
       errors: finiteOrNull(entry.errors),
+      unfinished: finiteOrNull(entry.unfinished),
       per_s: finiteOrNull(entry.perSecond),
       p50_ms: finiteOrNull(entry.p50),
       p95_ms: finiteOrNull(entry.p95),
@@ -945,6 +1174,12 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
     ...(values["driver-arg"] ?? []),
   ];
   const driverSha = await driverHash(driverPath);
+  const fakesSha = await fakesHash(harnessDir);
+  const launchersSha = await launchersHash(fixture, harnessDir);
+  const transcriptsSha = new Map<string, string>();
+  for (const target of targets) {
+    transcriptsSha.set(target.label, await transcriptsHash(target.env, fixture, REPLAY_FIXTURES));
+  }
   const options: RunOptions = {
     fixture,
     workDir,
@@ -1029,6 +1264,9 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
         workload: {
           driver: NodePath.basename(driverPath),
           driver_sha256: driverSha,
+          fakes_sha256: fakesSha,
+          transcripts_sha256: transcriptsSha.get(target.label),
+          launchers_sha256: launchersSha,
           warmup_s: warmupS,
           window_s: windowS,
           driver_args: driverArgs,

@@ -7,8 +7,9 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeSqlite from "node:sqlite";
+import * as NodeURL from "node:url";
 
-import { afterAll, describe, expect, it, onTestFinished } from "vite-plus/test";
+import { afterAll, describe, expect, it, onTestFinished, vi } from "vite-plus/test";
 
 import { BUILD_MIGRATION_HEAD } from "../../apps/server/src/persistence/databaseMigrationHead.ts";
 import {
@@ -23,7 +24,14 @@ import { extendedFindings, extendedMayMatch } from "./fixture/extended.ts";
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { TOKEN_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
-import { ShapeError, measureShape, parseShape, quantile, shapeRows } from "./fixture/shape.ts";
+import {
+  type Shape,
+  ShapeError,
+  measureShape,
+  parseShape,
+  quantile,
+  shapeRows,
+} from "./fixture/shape.ts";
 
 const ROOT = NodePath.resolve(import.meta.dirname, "..", "..");
 const FIXTURE = NodePath.join(import.meta.dirname, "fixture.ts");
@@ -71,8 +79,12 @@ const SAMPLES: Record<string, string> = {
   "basic-auth": `Basic ${Buffer.from("bench:hunter2hunter2").toString("base64")}`,
 };
 
-const run = (args: ReadonlyArray<string>, env: NodeJS.ProcessEnv = {}) =>
-  NodeChildProcess.spawnSync(process.execPath, [FIXTURE, ...args], {
+const run = (
+  args: ReadonlyArray<string>,
+  env: NodeJS.ProcessEnv = {},
+  nodeArgs: ReadonlyArray<string> = [],
+) =>
+  NodeChildProcess.spawnSync(process.execPath, [...nodeArgs, FIXTURE, ...args], {
     cwd: ROOT,
     env: { ...process.env, ...env },
     encoding: "utf8",
@@ -92,6 +104,49 @@ const synth = (destination: string, scale: string, seed = "1", report?: string) 
   ]);
   expect(result.stderr).toBe("");
   expect(result.status).toBe(0);
+};
+
+/** The two commands that write a database, each missing only its destination. */
+const writers = (source: string) => [
+  ["sanitise", source],
+  ["synth", "--like", EXAMPLE, "--scale", "0.02", "--seed", "1"],
+];
+
+// Preloaded into the CLI: hooks the first exclusive create of the destination. `race` makes
+// another run's database and WAL appear there just before it; `fail` lets it succeed, then makes
+// the file non-empty, so the VACUUM INTO that follows fails.
+const OPEN_HOOK = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const { destination, mode } = JSON.parse(process.env.FIXTURE_OPEN_HOOK);
+const openSync = fs.openSync;
+let fired = false;
+fs.openSync = (path, flags, ...rest) => {
+  if (fired || path !== destination || flags !== "wx") return openSync(path, flags, ...rest);
+  fired = true;
+  if (mode === "race") {
+    fs.writeFileSync(destination, "another run's database");
+    fs.writeFileSync(destination + "-wal", "another run's WAL");
+    return openSync(path, flags, ...rest);
+  }
+  const fd = openSync(path, flags, ...rest);
+  fs.writeSync(fd, "not empty");
+  return fd;
+};
+syncBuiltinESMExports();
+`;
+
+const runWithOpenHook = (
+  args: ReadonlyArray<string>,
+  destination: string,
+  mode: "race" | "fail",
+) => {
+  const hook = NodePath.join(scratch("open-hook"), "hook.mjs");
+  NodeFS.writeFileSync(hook, OPEN_HOOK);
+  return run(args, { FIXTURE_OPEN_HOOK: JSON.stringify({ destination, mode }) }, [
+    "--import",
+    NodeURL.pathToFileURL(hook).href,
+  ]);
 };
 
 // One synthetic database at scale 0.25 for every test that seeds and sanitises: each test
@@ -959,6 +1014,68 @@ describe("planSynth", () => {
     );
   });
 
+  // Fixtures are compared by hash across commits: a change to a seed's plan must show up here.
+  // Without checkpoint items, the standalone checkpoints spread over every native run.
+  it("plans what it always planned for a seed, with or without checkpoint items", () => {
+    const withoutCheckpointItems: Shape = {
+      ...example,
+      mix: {
+        ...example.mix,
+        turnItemTypes: Object.fromEntries(
+          Object.entries(example.mix?.turnItemTypes ?? {}).filter(
+            ([type]) => type !== "checkpoint",
+          ),
+        ),
+      },
+    };
+    const digest = (shape: Shape) =>
+      NodeCrypto.createHash("sha256")
+        .update(JSON.stringify(planSynth(shape, 0.2, 7)))
+        .digest("hex");
+    const runs = planSynth(withoutCheckpointItems, 0.2, 7).threads.flatMap((thread) => thread.runs);
+    expect({
+      checkpointItems: runs.filter((run) => run.items.includes("checkpoint")).length,
+      runsWithCheckpoints: runs.filter((run) => run.checkpoints > 0).length,
+      digests: [digest(example), digest(withoutCheckpointItems)],
+    }).toEqual({
+      checkpointItems: 0,
+      runsWithCheckpoints: 144,
+      digests: [
+        "7d15a24ee774384698dec573806090667615b956dcf33f36cb7e2aee9ce4ca76",
+        "9cc15e2401df124c59295df2c2a4c3e41b266ebd132e09c9de7d80e5a9478bea",
+      ],
+    });
+  });
+
+  // Every element the planner copies with Array.from is counted: planning a checkpoint-free shape
+  // once summed every thread for each run (runs × threads), far above a linear bound here.
+  it("plans a checkpoint-free shape in work linear in its threads and runs", () => {
+    const withoutCheckpointItems: Shape = {
+      ...example,
+      mix: {
+        ...example.mix,
+        turnItemTypes: Object.fromEntries(
+          Object.entries(example.mix?.turnItemTypes ?? {}).filter(
+            ([type]) => type !== "checkpoint",
+          ),
+        ),
+      },
+    };
+    const from = vi.spyOn(Array, "from");
+    let copied = 0;
+    let plan: ReturnType<typeof planSynth>;
+    try {
+      plan = planSynth(withoutCheckpointItems, 1, 7);
+      for (const [values] of from.mock.calls) {
+        copied += (values as ArrayLike<unknown> | null | undefined)?.length ?? 0;
+      }
+    } finally {
+      from.mockRestore();
+    }
+    const runs = plan.threads.reduce((count, thread) => count + thread.runs.length, 0);
+    expect(copied).toBeLessThanOrEqual(10 * (plan.threads.length + runs));
+  });
+
   it("deals and apportions exact totals", () => {
     const spreader = new Spreader(7, 3);
     expect([spreader.take(), spreader.take(), spreader.take()]).toEqual([2, 2, 3]);
@@ -1009,6 +1126,48 @@ describe("fixture CLI", () => {
     expect(refused.status).toBe(2);
     expect(NodeFS.readFileSync(live).equals(before)).toBe(true);
     expect(NodeFS.existsSync(NodePath.join(work, "out.sqlite"))).toBe(false);
+  });
+
+  // The guard checks the destination long before the exclusive create: another run can take it.
+  it("sanitise and synth never remove a destination another run created after their guard", () => {
+    const source = NodePath.join(scratch("race-source"), "empty.sqlite");
+    new NodeSqlite.DatabaseSync(source).close();
+    const outcomes = writers(source).map((args) => {
+      const directory = NodeFS.realpathSync(scratch("race"));
+      const destination = NodePath.join(directory, "out.sqlite");
+      const result = runWithOpenHook([...args, destination], destination, "race");
+      return {
+        status: result.status,
+        eexist: result.stderr.includes("EEXIST"),
+        files: NodeFS.readdirSync(directory)
+          .toSorted()
+          .map((name) => [name, NodeFS.readFileSync(NodePath.join(directory, name), "utf8")]),
+      };
+    });
+    const kept = {
+      status: 1,
+      eexist: true,
+      files: [
+        ["out.sqlite", "another run's database"],
+        ["out.sqlite-wal", "another run's WAL"],
+      ],
+    };
+    expect(outcomes).toEqual([kept, kept]);
+  });
+
+  it("sanitise and synth remove a destination they created when compacting into it fails", () => {
+    const source = NodePath.join(scratch("fail-source"), "empty.sqlite");
+    new NodeSqlite.DatabaseSync(source).close();
+    const outcomes = writers(source).map((args) => {
+      const directory = NodeFS.realpathSync(scratch("fail"));
+      const destination = NodePath.join(directory, "out.sqlite");
+      const result = runWithOpenHook([...args, destination], destination, "fail");
+      return { status: result.status, files: NodeFS.readdirSync(directory) };
+    });
+    expect(outcomes).toEqual([
+      { status: 1, files: [] },
+      { status: 1, files: [] },
+    ]);
   });
 
   // The bench compares fixtures by hash: the same shape and seed must give the same bytes.

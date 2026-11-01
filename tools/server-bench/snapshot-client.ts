@@ -193,6 +193,8 @@ export function fetchOnce(
     const finish = (outcome: Outcome, error?: string) => {
       if (settled) return;
       settled = true;
+      // Unread, the arrived body sits in the response's buffer.
+      if (options.read === "none" && response !== undefined) wireBytes = response.readableLength;
       clearTimeout(timer);
       stop?.removeEventListener("abort", leave);
       request.destroy();
@@ -215,7 +217,6 @@ export function fetchOnce(
     // Leaving with the body unread still counts as complete when all of it had arrived.
     const leave = () => {
       if (response === undefined) return finish("aborted_before_headers");
-      if (options.read === "none") wireBytes = response.readableLength;
       finish(response.complete ? "complete" : "aborted_during_body");
     };
     const request = (url.protocol === "https:" ? NodeHttps : NodeHttp).get(

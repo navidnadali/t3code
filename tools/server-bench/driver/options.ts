@@ -73,6 +73,22 @@ export interface DriverOptions {
   readonly stopSessions: boolean;
 }
 
+export const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate", "access:write"];
+const SETTINGS_SCOPES = ["settings:write", "providers:manage"];
+
+/**
+ * The scopes `granted` lacks: the driver's own, and the settings scopes when it updates an
+ * instance's settings (each bench instance's state directory, MCP credentials).
+ */
+export function missingScopes(
+  granted: ReadonlyArray<string>,
+  { updatesInstances }: { readonly updatesInstances: boolean },
+): ReadonlyArray<string> {
+  return [...REQUIRED_SCOPES, ...(updatesInstances ? SETTINGS_SCOPES : [])].filter(
+    (scope) => !granted.includes(scope),
+  );
+}
+
 export class UsageError extends Error {
   override readonly name = "UsageError";
   /** `--help`: print the usage and exit cleanly. */
@@ -155,9 +171,11 @@ Before any session opens it sets each planned bench instance's BENCH_STATE_DIR t
 owner-only <out>/fake-state/<instance> (and fails when that is not empty), so runs restoring the
 same settings replay the same plan; fakeStateDirectories names them.
 The bearer token comes from T3_BENCH_TOKEN or --token-file; it needs the scopes
-orchestration:read, orchestration:operate and access:write, e.g.
+orchestration:read, orchestration:operate and access:write, and settings:write and
+providers:manage whenever a planned instance has a settings entry (every bench instance), e.g.
   t3 auth session issue --base-dir <scratch> --token-only \\
-    --scope orchestration:read --scope orchestration:operate --scope access:write
+    --scope orchestration:read --scope orchestration:operate --scope access:write \\
+    --scope settings:write --scope providers:manage
 
   --mode history|fresh      history (default): sessions continue, and readers read, seeded
                             threads picked to match the fixture's turn-item distribution;
@@ -183,8 +201,8 @@ ${PROVIDER_LOAD_USAGE}
   --session-mcp-credentials DIR
                             use the credentials providers write here (one JSON file per session:
                             {"url": …, "authorization": …}); the driver sets the provider
-                            instance's BENCH_MCP_CREDENTIALS_DIR to DIR (the token then also
-                            needs settings:write and providers:manage). Without it each session
+                            instance's BENCH_MCP_CREDENTIALS_DIR to DIR (the token then needs
+                            settings:write and providers:manage). Without it each session
                             signs in as its own MCP client
   --switch-interval DUR     subscribers move to another thread this often; 0 holds (default 30s)
   --turn-gap DUR            pause between a session's turns (default 1s)

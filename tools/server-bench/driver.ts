@@ -13,7 +13,13 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodePerfHooks from "node:perf_hooks";
 
-import { type DriverOptions, parseDriverOptions, USAGE, UsageError } from "./driver/options.ts";
+import {
+  type DriverOptions,
+  missingScopes,
+  parseDriverOptions,
+  USAGE,
+  UsageError,
+} from "./driver/options.ts";
 import {
   CallError,
   classifyFetchError,
@@ -56,7 +62,6 @@ import {
 const RESULT_FILE = "driver.json";
 const FAILED_MARKER = "driver.failed";
 const SCHEMA_VERSION = 1;
-const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate", "access:write"];
 const LOOP_DELAY_RESOLUTION_MS = 10;
 /** P1-003's fake Claude CLI writes each session's MCP credential into this directory. */
 const CREDENTIALS_ENV = "BENCH_MCP_CREDENTIALS_DIR";
@@ -255,6 +260,7 @@ class BenchRun implements RunContext {
   private sessionCallersAtWindowStart = 0;
   private providerSetup: { readonly credentialsEnvironment?: Record<string, string> } = {};
   private fakeStateDirectories: Record<string, string> = {};
+  private grantedScopes: ReadonlyArray<string> = [];
   /** The sockets sessions send commands and follow their threads on, a few sessions each. */
   private readonly sessionSockets: Array<RpcSocket> = [];
   private readonly startedAtEpochMs = Date.now();
@@ -427,13 +433,19 @@ class BenchRun implements RunContext {
       if (problem !== null) throw new FatalError(`provider instance "${instanceId}" ${problem}`);
     }
     const instances = config.settings.providerInstances ?? {};
+    const benchInstances = instanceIds.filter((instanceId) => instances[instanceId] !== undefined);
+    const missing = missingScopes(this.grantedScopes, {
+      updatesInstances: benchInstances.length > 0,
+    });
+    if (missing.length > 0) {
+      throw new FatalError(
+        `The bench token lacks ${missing.join(", ")}: the driver sets the BENCH_STATE_DIR of ${benchInstances.join(", ")}`,
+      );
+    }
     let stateDirectories: Record<string, string>;
     try {
       // Every run's fakes claim their sessions' ordinals afresh, whatever settings it restored.
-      stateDirectories = prepareFakeState(
-        options.out,
-        instanceIds.filter((instanceId) => instances[instanceId] !== undefined),
-      );
+      stateDirectories = prepareFakeState(options.out, benchInstances);
     } catch (error) {
       throw new FatalError(error instanceof Error ? error.message : String(error));
     }
@@ -483,15 +495,12 @@ class BenchRun implements RunContext {
       scopes?: ReadonlyArray<string>;
       permissions?: ReadonlyArray<string>;
     }>(this.http, "/api/auth/session");
-    const required = [
-      ...REQUIRED_SCOPES,
-      ...(this.options.sessionMcpCredentials === null
-        ? []
-        : ["settings:write", "providers:manage"]),
-    ];
     // `permissions` lists every grant; `scopes` folds some of them into their parents.
     const granted = session.value.permissions ?? session.value.scopes ?? [];
-    const missing = required.filter((scope) => !granted.includes(scope));
+    this.grantedScopes = granted;
+    const missing = missingScopes(granted, {
+      updatesInstances: this.options.sessionMcpCredentials !== null,
+    });
     if (!session.value.authenticated || missing.length > 0) {
       throw new FatalError(
         `The bench token is not accepted or lacks scopes: ${missing.join(", ") || "unauthenticated"}`,

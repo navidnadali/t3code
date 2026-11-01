@@ -1093,6 +1093,31 @@ describe("ref and index reads", () => {
       after: "main - +0",
       reused: false,
     },
+    ...(symlinksSupported
+      ? [
+          {
+            name: "a symlinked branch losing its target",
+            setup: (cwd: string) =>
+              git(cwd, ["branch", "real"]).pipe(
+                Effect.andThen(
+                  git(cwd, [
+                    "-c",
+                    "core.preferSymlinkRefs=true",
+                    "symbolic-ref",
+                    "refs/heads/master",
+                    "refs/heads/real",
+                  ]),
+                ),
+                Effect.as(cwd),
+              ),
+            change: (cwd: string) =>
+              git(cwd, ["update-ref", "-d", "refs/heads/real"]).pipe(Effect.asVoid),
+            before: "main master +0",
+            after: "main - +0",
+            reused: false,
+          },
+        ]
+      : []),
     {
       name: "an upstream config change",
       setup: (cwd) =>

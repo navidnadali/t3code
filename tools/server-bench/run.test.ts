@@ -28,6 +28,7 @@ describe("readDriverResult", () => {
         "mcp.t3_project_list": {
           count: 290,
           errors: 1,
+          unfinished: 0,
           perSecond: 0.97,
           p50: 950,
           p95: 9800,
@@ -54,6 +55,7 @@ describe("readDriverResult", () => {
         "mcp.t3_project_list": {
           count: 290,
           errors: 1,
+          unfinished: 0,
           per_s: 0.97,
           p50_ms: 950,
           p95_ms: 9800,
@@ -78,6 +80,37 @@ describe("readDriverResult", () => {
     expect(summary.window).toBeNull();
     expect(summary.thread_events_per_s).toBeNull();
     expect(summary.calls).toBeNull();
+  });
+
+  it("keeps the calls still running when the grace period ended", () => {
+    const summary = readDriverResult({
+      status: "ok",
+      timeline: { window: "2026-10-31T21:01:00.000Z" },
+      windowSeconds: 10,
+      calls: {
+        "mcp.t3_thread_read": {
+          count: 1,
+          errors: 0,
+          unfinished: 99,
+          perSecond: 10,
+          p50: 4,
+          p95: 4,
+          p99: 4,
+          max: 4,
+        },
+      },
+    });
+
+    expect(summary.calls?.["mcp.t3_thread_read"]).toEqual({
+      count: 1,
+      errors: 0,
+      unfinished: 99,
+      per_s: 10,
+      p50_ms: 4,
+      p95_ms: 4,
+      p99_ms: 4,
+      max_ms: 4,
+    });
   });
 });
 

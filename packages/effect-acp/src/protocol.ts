@@ -23,6 +23,7 @@ import type * as AcpSchemaV1 from "./_generated/schema-v1.gen.ts";
 import { CLIENT_METHODS } from "./_generated/meta.gen.ts";
 import * as AcpError from "./errors.ts";
 import { isolateNotificationHandler, timeStage, timeSync } from "./_internal/shared.ts";
+import type * as AcpOffload from "./offload.ts";
 import * as AcpWire from "./wire.ts";
 const isAcpError = Schema.is(AcpError.AcpError);
 
@@ -82,8 +83,18 @@ export interface AcpStdio extends Omit<Stdio.Stdio, "stdin"> {
   readonly stdin: Stream.Stream<Uint8Array, PlatformError.PlatformError | AcpError.AcpError>;
 }
 
+/** Decodes long incoming lines off the main thread. */
+export interface AcpLineOffload {
+  /** Lines at least this many characters long go off-thread; shorter ones cost less in-thread. */
+  readonly minChars: number;
+  readonly decode: (line: string) => Effect.Effect<AcpOffload.OffloadedLine, AcpError.AcpError>;
+  /** Fails when the offload stops working (its worker died); that error then ends the connection. */
+  readonly failure: Effect.Effect<never, AcpError.AcpError>;
+}
+
 export interface AcpPatchedProtocolOptions {
   readonly stdio: AcpStdio;
+  readonly lineOffload?: AcpLineOffload;
   readonly terminationError?: Effect.Effect<AcpError.AcpError>;
   readonly serverRequestMethods: ReadonlySet<string>;
   readonly logIncoming?: boolean;
@@ -183,6 +194,8 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const timing = options.stageTiming;
   const onNotification = options.onNotification;
   const parser = AcpWire.makeStrictNdJsonRpcParser(timing);
+  const lineOffload = options.lineOffload;
+  const splitLines = lineOffload === undefined ? undefined : AcpWire.makeLineSplitter();
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
   const notificationQueue = yield* Queue.sliding<AcpIncomingNotification>(
@@ -382,6 +395,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       }),
     }).pipe(Effect.asVoid);
 
+  const offloadFailure = lineOffload?.failure;
   const handleTermination = (classify: () => Effect.Effect<AcpError.AcpError>) =>
     Ref.modify(terminationHandled, (handled) => {
       if (handled) {
@@ -390,7 +404,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       return [
         Effect.gen(function* () {
           yield* Queue.offer(disconnects, 0);
-          const error = yield* classify();
+          // A dead offload kills the agent, so its error explains the input end that follows.
+          const error = yield* offloadFailure === undefined
+            ? classify()
+            : Effect.raceFirst(Effect.flip(offloadFailure), classify());
           yield* Deferred.fail(terminationFailure, error);
           yield* failAllExtPending(error);
           yield* emitClientProtocolError(error);
@@ -401,6 +418,13 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         true,
       ] as const;
     }).pipe(Effect.flatten);
+
+  if (offloadFailure !== undefined) {
+    yield* offloadFailure.pipe(
+      Effect.catch((error) => handleTermination(() => Effect.succeed(error))),
+      Effect.forkScoped,
+    );
+  }
 
   const respondWithSuccess = (requestId: AcpError.AcpRequestId, value: unknown) =>
     offerOutgoing({
@@ -650,6 +674,32 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const logIncomingDecoded = (messages: ReadonlyArray<unknown>) =>
     logProtocol({ direction: "incoming", stage: "decoded", payload: messages });
 
+  // Short lines and batches decode with main's parser, so a failure is still the chunk's first.
+  const decodeOffloadedChunk = Effect.fnUntraced(function* (
+    offload: AcpLineOffload,
+    split: (bytes: Uint8Array) => ReadonlyArray<string>,
+    data: Uint8Array,
+  ) {
+    const messages: Array<AcpWire.WireMessage> = [];
+    for (const line of split(data)) {
+      if (line.length < offload.minChars || AcpWire.isBatchLine(line)) {
+        messages.push(...(yield* Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`))));
+        continue;
+      }
+      const decoded = yield* offload.decode(line);
+      if (decoded._tag === "Failed") {
+        return yield* new AcpError.AcpProtocolParseError({
+          operation: "decode-wire-message",
+          cause: decoded.cause,
+        });
+      }
+      messages.push(
+        ...(yield* Effect.fromResult(AcpWire.normalizeOffloadedMessages(decoded.messages))),
+      );
+    }
+    return messages;
+  });
+
   yield* options.stdio.stdin.pipe(
     Stream.runForEach((data) =>
       (!options.logIncoming
@@ -658,7 +708,11 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           ? logIncomingRaw(data)
           : timeSync(timing, "logShape", () => logIncomingRaw(data))
       ).pipe(
-        Effect.flatMap(() => Effect.fromResult(AcpWire.decodeWireChunk(parser, data))),
+        Effect.flatMap(() =>
+          lineOffload === undefined || splitLines === undefined
+            ? Effect.fromResult(AcpWire.decodeWireChunk(parser, data))
+            : decodeOffloadedChunk(lineOffload, splitLines, data),
+        ),
         Effect.tap((messages) =>
           timing === undefined
             ? logIncomingDecoded(messages)

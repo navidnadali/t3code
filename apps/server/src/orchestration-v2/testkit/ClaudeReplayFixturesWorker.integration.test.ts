@@ -102,10 +102,29 @@ const byWriter = (
   >;
   const state = (event: { readonly type: string; readonly payload: unknown }) =>
     JSON.stringify([event.type, event.payload]);
+  // Turn-item ordinals come from one counter in arrival order across writers: compare their rank.
+  const ranked = (written: ReadonlyArray<{ readonly type: string; readonly payload: unknown }>) => {
+    const ordinalOf = (event: { readonly type: string; readonly payload: unknown }) =>
+      event.type === "turn-item.updated"
+        ? (event.payload as { readonly ordinal?: unknown }).ordinal
+        : undefined;
+    const ordinals = [
+      ...new Set(written.map(ordinalOf).filter((ordinal) => typeof ordinal === "number")),
+    ].toSorted((left, right) => left - right);
+    return written.map((event) => {
+      const ordinal = ordinalOf(event);
+      if (typeof ordinal !== "number") return event;
+      const payload = {
+        ...(event.payload as object),
+        ordinal: `rank ${ordinals.indexOf(ordinal)}`,
+      };
+      return { ...event, payload };
+    });
+  };
   return Object.keys(grouped)
     .toSorted()
     .map((writer) => {
-      const written = grouped[writer]!;
+      const written = ranked(grouped[writer]!);
       const changes = written
         .filter((event, index) => index === 0 || state(event) !== state(written[index - 1]!))
         .map((event) => JSON.stringify(event));

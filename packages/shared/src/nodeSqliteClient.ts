@@ -1206,22 +1206,30 @@ const make = Effect.fn("makeWithDatabase")(function* (
           }),
       }).pipe(Effect.orDie),
     );
-    // Started after the close finalizer, so the worker stops before the writer closes.
-    const checkpoint =
-      options.checkpointWorker && isFileDatabase
-        ? yield* startCheckpointWorker(options.filename, db)
-        : undefined;
-    // After the checkpoint worker's start, whose first statement makes the writer wait for another
-    // process's lock: a page cache size reads the schema, which needs that lock.
     if (writerPragmas !== "") {
+      // A page cache size reads the schema, so it waits for another process's lock as the open
+      // does; the wait set before (none, just after opening) is restored for the caller.
       yield* Effect.try({
-        try: () => db.exec(writerPragmas),
+        try: () => {
+          const previous = Number(db.prepare("PRAGMA busy_timeout").get()?.timeout ?? 0);
+          db.exec("PRAGMA busy_timeout = 5000;");
+          try {
+            db.exec(writerPragmas);
+          } finally {
+            db.exec(`PRAGMA busy_timeout = ${previous};`);
+          }
+        },
         catch: (cause) =>
           new SqlError({
             reason: classifyError(cause, "Failed to configure database", "configure"),
           }),
       });
     }
+    // Started after the close finalizer, so the worker stops before the writer closes.
+    const checkpoint =
+      options.checkpointWorker && isFileDatabase
+        ? yield* startCheckpointWorker(options.filename, db)
+        : undefined;
 
     const statementReaderCache = new WeakMap<NodeSqlite.StatementSync, boolean>();
     interface CheckpointClassification {

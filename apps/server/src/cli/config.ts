@@ -6,6 +6,7 @@ import {
 } from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
+import { SQLITE_MAX_READER_POOL_SIZE } from "@t3tools/shared/nodeSqliteClient";
 import { DesktopBackendBootstrap, PortSchema } from "@t3tools/contracts";
 import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
@@ -172,6 +173,10 @@ const EnvServerConfig = Config.all({
     Config.map(Option.getOrUndefined),
   ),
   lan: Config.Boolean("T3CODE_LAN").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  sqliteReaderPoolSize: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: SQLITE_MAX_READER_POOL_SIZE })),
+    "T3CODE_SQLITE_READER_POOL",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -519,6 +524,9 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logWebSocketEvents,
     tailscaleServeEnabled,
     tailscaleServePort,
+    ...(env.sqliteReaderPoolSize === undefined
+      ? {}
+      : { sqliteReaderPoolSize: env.sqliteReaderPoolSize }),
   };
 
   return config;

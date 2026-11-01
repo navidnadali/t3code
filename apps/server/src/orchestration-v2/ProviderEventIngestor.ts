@@ -40,6 +40,10 @@ import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import {
+  ProviderIoStageTiming,
+  timeProviderIoStage,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import { makeProviderFailureTurnItem } from "@t3tools/provider-core/server/failure";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { stripUnservedToolOutputImageBytes } from "./toolOutputImageBytes.ts";
@@ -383,6 +387,7 @@ export const layer: Layer.Layer<
     const agentScope = yield* AgentScope;
     const instances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
     const scope = yield* Effect.scope;
+    const stageTiming = yield* ProviderIoStageTiming;
     const completedTurnAnalytics = new Set<string>();
 
     const makeDomainEvent =
@@ -999,6 +1004,13 @@ export const layer: Layer.Layer<
                 input.event.type === "app_thread.created"
                   ? threadCommands.withLock(input.event.appThread.id, effect)
                   : effect,
+            ),
+          (effect, input) =>
+            timeProviderIoStage(
+              stageTiming?.forProvider(input.event.driver),
+              "ingest",
+              0,
+              () => effect,
             ),
         ),
     });

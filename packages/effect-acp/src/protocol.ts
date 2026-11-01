@@ -22,13 +22,23 @@ import * as AcpSchema from "./schema.ts";
 import * as AcpSchemaV1 from "./_generated/schema-v1.gen.ts";
 import { CLIENT_METHODS } from "./_generated/meta.gen.ts";
 import * as AcpError from "./errors.ts";
-import { isolateNotificationHandler } from "./_internal/shared.ts";
+import { isolateNotificationHandler, timeStage, timeSync } from "./_internal/shared.ts";
 const isAcpError = Schema.is(AcpError.AcpError);
 
 export interface AcpProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
   readonly stage: "raw" | "decoded" | "decode_failed";
   readonly payload: unknown;
+}
+
+/** Optional main-thread timing of incoming frames; unset costs nothing. */
+export interface AcpStageTiming {
+  readonly now: () => number;
+  readonly record: (
+    stage: "framing" | "json" | "decode" | "logShape" | "adapter",
+    elapsedMs: number,
+    bytes: number,
+  ) => void;
 }
 
 export interface AcpRequestContext {
@@ -78,6 +88,7 @@ export interface AcpPatchedProtocolOptions {
   readonly logIncoming?: boolean;
   readonly logOutgoing?: boolean;
   readonly logger?: (event: AcpProtocolLogEvent) => Effect.Effect<void, never>;
+  readonly stageTiming?: AcpStageTiming;
   readonly onIncomingRequest?: (
     requestId: string,
     method: string,
@@ -163,16 +174,29 @@ const decodeElicitationComplete = Schema.decodeUnknownEffect(
 const parserFactory = RpcSerialization.ndJsonRpc();
 // ndJsonRpc skips lines that are not JSON. A malformed agent line has to end the
 // session, so frames are split here and each one goes through the strict codec.
-const makeStrictNdJsonRpcParser = () => {
+const makeStrictNdJsonRpcParser = (timing: AcpStageTiming | undefined) => {
   const codec = RpcSerialization.jsonRpc().makeUnsafe();
   const decoder = new TextDecoder();
   let buffer = "";
   return {
     decode: (bytes: Uint8Array | string): ReadonlyArray<unknown> => {
+      const startedAt = timing?.now() ?? 0;
       buffer += typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
-      return lines.flatMap((line) => codec.decode(line));
+      if (timing === undefined) return lines.flatMap((line) => codec.decode(line));
+      timing.record(
+        "framing",
+        timing.now() - startedAt,
+        typeof bytes === "string" ? Buffer.byteLength(bytes, "utf8") : bytes.byteLength,
+      );
+      return lines.flatMap((line) => {
+        const lineBytes = Buffer.byteLength(line, "utf8");
+        const lineStartedAt = timing.now();
+        const messages = codec.decode(line);
+        timing.record("json", timing.now() - lineStartedAt, lineBytes);
+        return messages;
+      });
     },
     encode: (response: Parameters<typeof codec.encode>[0]) => {
       const encoded = codec.encode(response);
@@ -239,7 +263,9 @@ function normalizeAcpJsonRpcError(
 export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(function* (
   options: AcpPatchedProtocolOptions,
 ): Effect.fn.Return<AcpPatchedProtocol, never, Scope.Scope> {
-  const parser = makeStrictNdJsonRpcParser();
+  const timing = options.stageTiming;
+  const onNotification = options.onNotification;
+  const parser = makeStrictNdJsonRpcParser(timing);
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
   const notificationQueue = yield* Queue.sliding<AcpIncomingNotification>(
@@ -419,8 +445,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       Effect.andThen(
         // A failing or dying handler must not stop the reader, or every later
         // message on the connection goes unanswered.
-        options.onNotification
-          ? isolateNotificationHandler(options.onNotification(notification))
+        onNotification
+          ? isolateNotificationHandler(
+              timeStage(timing, "adapter", 0, () => onNotification(notification)),
+            )
           : Effect.void,
       ),
       Effect.asVoid,
@@ -556,7 +584,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const handleRequestEncoded = (message: RpcMessage.RequestEncoded) => {
     if (message.id === "") {
       if (message.tag === CLIENT_METHODS.session_update) {
-        return decodeSessionUpdate(message.payload).pipe(
+        return timeStage(timing, "decode", 0, () => decodeSessionUpdate(message.payload)).pipe(
           Effect.matchEffect({
             onFailure: dropUndecodableNotification(CLIENT_METHODS.session_update),
             onSuccess: (params) =>
@@ -696,15 +724,22 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     }
   };
 
+  const logIncomingRaw = (data: Uint8Array | string) =>
+    logProtocol({
+      direction: "incoming",
+      stage: "raw",
+      payload: typeof data === "string" ? data : new TextDecoder().decode(data),
+    });
+  const logIncomingDecoded = (messages: ReadonlyArray<unknown>) =>
+    logProtocol({ direction: "incoming", stage: "decoded", payload: messages });
+
   yield* options.stdio.stdin.pipe(
     Stream.runForEach((data) =>
-      (options.logIncoming
-        ? logProtocol({
-            direction: "incoming",
-            stage: "raw",
-            payload: typeof data === "string" ? data : new TextDecoder().decode(data),
-          })
-        : Effect.void
+      (!options.logIncoming
+        ? Effect.void
+        : timing === undefined
+          ? logIncomingRaw(data)
+          : timeSync(timing, "logShape", () => logIncomingRaw(data))
       ).pipe(
         Effect.flatMap(() =>
           Effect.try({
@@ -722,11 +757,9 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           }),
         ),
         Effect.tap((messages) =>
-          logProtocol({
-            direction: "incoming",
-            stage: "decoded",
-            payload: messages,
-          }),
+          timing === undefined
+            ? logIncomingDecoded(messages)
+            : timeSync(timing, "logShape", () => logIncomingDecoded(messages)),
         ),
         Effect.tapErrorTag("AcpProtocolParseError", (error) =>
           logProtocol({

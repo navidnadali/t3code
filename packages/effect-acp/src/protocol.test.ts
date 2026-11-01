@@ -156,14 +156,29 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       const warnings: Array<unknown> = [];
       let terminated = false;
       let transformCalls = 0;
+      // The logger shapes for 3 ticks and writes for 11; log shaping must see only the 3.
+      let clock = 0;
+      const stages: Record<string, { count: number; elapsedMs: number; bytes: number }> = {};
       const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
         stdio,
         serverRequestMethods: new Set(),
+        stageTiming: {
+          now: () => clock,
+          record: (stage, elapsedMs, bytes) => {
+            const totals = (stages[stage] ??= { count: 0, elapsedMs: 0, bytes: 0 });
+            totals.count += 1;
+            totals.elapsedMs += elapsedMs;
+            totals.bytes += bytes;
+          },
+        },
         logIncoming: true,
-        logger: (event) =>
-          Effect.sync(() => {
+        logger: (event) => {
+          clock += 3;
+          return Effect.sync(() => {
+            clock += 11;
             events.push(event);
-          }),
+          });
+        },
         transformSessionUpdate: (notification) => {
           transformCalls += 1;
           return notification;
@@ -188,13 +203,14 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         Effect.forkScoped,
       );
 
-      const send = (params: unknown) =>
-        Queue.offer(
-          input,
-          encoder.encode(
-            `${encodeUnknownJsonString({ jsonrpc: "2.0", method: "session/update", params })}\n`,
-          ),
+      let sentBytes = 0;
+      const send = (params: unknown) => {
+        const frame = encoder.encode(
+          `${encodeUnknownJsonString({ jsonrpc: "2.0", method: "session/update", params })}\n`,
         );
+        sentBytes += frame.byteLength;
+        return Queue.offer(input, frame);
+      };
       const malformed = {
         sessionId: "session-1",
         update: { sessionUpdate: "usage_update", cost: { amount: 1, currency: secret } },
@@ -232,6 +248,12 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         issueSummary: expect.stringContaining("update.used missing"),
       });
       assert.notInclude(encodeUnknownJsonString({ decodeFailed, warnings }), secret);
+      assert.deepEqual(stages, {
+        logShape: { count: 6, elapsedMs: 18, bytes: 0 },
+        framing: { count: 3, elapsedMs: 0, bytes: sentBytes },
+        json: { count: 3, elapsedMs: 0, bytes: sentBytes - 3 },
+        decode: { count: 3, elapsedMs: 0, bytes: 0 },
+      });
     }),
   );
 

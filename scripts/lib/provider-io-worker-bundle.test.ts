@@ -64,6 +64,28 @@ it.effect("rejects a worker whose dynamic import does not resolve", () =>
   }),
 );
 
+it.effect("rejects a worker whose static import does not resolve", () =>
+  Effect.gen(function* () {
+    assert.include(
+      yield* rejection('import * as Missing from "p1-024-not-a-package";\nconsole.log(Missing);\n'),
+      "p1-024-not-a-package",
+    );
+  }),
+);
+
+// ajv (in the Claude Agent SDK) carries loader text as data and compiles validators at run time.
+it.effect("builds a worker whose code holds loader text as data and compiles code", () =>
+  Effect.gen(function* () {
+    const code = yield* buildHost(
+      'import * as NodeWorkerThreads from "node:worker_threads";\n' +
+        'const generated = "require(\\"ajv/dist/runtime/uri\\").default";\n' +
+        'const compile = new Function("x", "return x");\n' +
+        "NodeWorkerThreads.parentPort?.postMessage([generated, compile(1)]);\n",
+    );
+    assert.include(code, "ajv/dist/runtime/uri");
+  }),
+);
+
 it.effect("rejects a worker that requires or imports a computed name", () =>
   Effect.gen(function* () {
     const name = 'const name = ["p1-024", "pkg"].join("-");\n';
@@ -147,6 +169,9 @@ it.effect("refuses at run time a load the build could not see", () =>
         "const global = globalThis as any;\n" +
         "const code = (function () {}).constructor as any;\n" +
         "const attempts = [\n" +
+        '  () => require(name(dir, "/planted.cjs")),\n' +
+        '  () => (require as any).call(null, dir + "/planted.cjs"),\n' +
+        '  () => import(name("file://", dir, "/planted.mjs")).then((m: any) => m.default),\n' +
         '  () => (module as any)[name("re", "quire")](dir + "/planted.cjs"),\n' +
         '  () => global[name("re", "quire")](dir + "/planted.cjs"),\n' +
         '  () => global[name("re", "quire")]("node:module")[name("create", "Require")](dir + "/")("./planted.cjs"),\n' +
@@ -165,6 +190,9 @@ it.effect("refuses at run time a load the build could not see", () =>
       });
       worker.once("error", (error) => resume(Effect.succeed(String(error))));
     });
-    assert.deepEqual(results, ["refused", "refused", "refused", "refused", "refused"]);
+    assert.deepEqual(
+      results,
+      Array.from({ length: 8 }, () => "refused"),
+    );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

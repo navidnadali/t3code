@@ -78,7 +78,7 @@ const make = Effect.gen(function* () {
 
   // One committed-events consumer for every shell subscriber. Events coalesce per aggregate
   // while a batch is read, so memory is bounded by the aggregates that changed, not by events.
-  const run = Effect.fn("ShellDeltaHub.run")(function* (input: {
+  const run = Effect.fnUntraced(function* (input: {
     readonly committed: PubSub.Subscription<ApplicationStoredEvent>;
     readonly output: PubSub.PubSub<ReadonlyArray<VersionedShellDelta>>;
   }) {
@@ -117,12 +117,15 @@ const make = Effect.gen(function* () {
         items.map((item) => ({ item, version: versions.stamp(item, now) })),
       );
     });
-    yield* drain.pipe(Effect.forkScoped);
-    while (true) {
-      yield* Queue.take(ready);
-      yield* Effect.sleep(SHELL_DELTA_BATCH_WINDOW);
-      yield* project();
-    }
+    const projectBatches = Effect.gen(function* () {
+      while (true) {
+        yield* Queue.take(ready);
+        yield* Effect.sleep(SHELL_DELTA_BATCH_WINDOW);
+        yield* project();
+      }
+    });
+    // Either side failing fails the hub, so no subscriber waits on a dead consumer.
+    yield* Effect.all([drain, projectBatches], { concurrency: "unbounded", discard: true });
   });
 
   const start = Effect.gen(function* () {

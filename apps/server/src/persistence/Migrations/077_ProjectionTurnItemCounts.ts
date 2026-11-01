@@ -1,6 +1,8 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import { recountTurnItems } from "../../orchestration-v2/turnItemCounts.ts";
+
 /**
  * Turn items per thread and run, so a shell reads one row per run instead of counting every item.
  * Triggers keep it exact on every write; INSERT OR REPLACE would skip the delete trigger (recursive
@@ -10,6 +12,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
+  // The triggers below write here: drop them before this table, or every turn-item insert fails.
   yield* sql`
     CREATE TABLE IF NOT EXISTS orchestration_v2_projection_turn_item_counts (
       thread_id TEXT NOT NULL,
@@ -18,6 +21,8 @@ export default Effect.gen(function* () {
       PRIMARY KEY (thread_id, run_id)
     ) WITHOUT ROWID
   `;
+  // A migration that rebuilds the turn-item table (create, copy, drop, rename) drops these
+  // triggers with it; this migration must run after such a rebuild, or the rebuild recreate them.
   yield* sql`
     CREATE TRIGGER IF NOT EXISTS orchestration_v2_turn_item_counts_insert
     AFTER INSERT ON orchestration_v2_projection_turn_items
@@ -53,16 +58,5 @@ export default Effect.gen(function* () {
     END
   `;
 
-  yield* sql`DELETE FROM orchestration_v2_projection_turn_item_counts`;
-  // Group in the (thread_id, run_id) index's order, then fold NULL runs into ''.
-  yield* sql`
-    INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
-    SELECT thread_id, COALESCE(run_id, ''), SUM(item_count)
-    FROM (
-      SELECT thread_id, run_id, COUNT(*) AS item_count
-      FROM orchestration_v2_projection_turn_items
-      GROUP BY thread_id, run_id
-    )
-    GROUP BY thread_id, COALESCE(run_id, '')
-  `;
+  yield* recountTurnItems(sql);
 });

@@ -53,10 +53,13 @@ server does it, so the fixture keeps its production scale and a boot writes noth
    sanitiser is the reference): remote delegated completions lose their pending delivery, subagent completion
    deliveries are disposed, messages still streaming are final, a finished app-owned subagent child gets its
    task's result (`[bench fixture] Result withheld…`) and a consumed `subagent_result` transfer to its parent,
-   and the task, its node and the parent's mirrored item end as the child's run did. What the restart recovery
-   leaves open on purpose is then closed: pending runtime requests (answerable by a message) expire, and nodes,
-   provider turns, items and subagents still pending, running or waiting outside a held queued run are
-   cancelled. A v1 transcript the importer cannot copy is marked imported (the server retries it every start).
+   and the task, its node and the parent's mirrored item end as the child's run did; a task delegated to another
+   machine gets a result and `stoppedThere` (its follower would resume it). What the restart recovery leaves open
+   and the runtime recovery query still lists is then closed: pending runtime requests (answerable by a message)
+   expire with the nodes they hold, and open tool and subagent items, run-less subagent root turns,
+   provider-native subagents, live provider threads and sessions are cancelled or stopped. Rows no boot would
+   touch keep their state.
+   A v1 transcript the importer cannot copy is marked imported (the server retries it every start).
 5. Through the server's event sink (one `thread.metadata-updated` per thread, `updatedAt` kept): automatic
    settlement off on every thread the settle sweep could pick (no settle event, hook or `git`), pull request
    links and the branch cleared (the pull request sync and branch discovery read the host and `git`), snoozes
@@ -147,7 +150,7 @@ Three independent gates, on every value of every table:
   no credential-named column is non-null.
 
 And nothing a server would run on start: recovery threads (runtime, subagent results, delegated completions),
-startable queued runs, settlement candidates, usage-limit recovery and snoozes, pending subagent deliveries,
+startable queued runs, settlement candidates, usage-limit recovery and snoozes, open remote delegations, pending subagent deliveries,
 streaming messages, live v1 sessions, scheduled tasks, outbox, launch workflows, peer links, sessions, pairing
 links, provider runtime, auto-pull, pull request watches, links or branches, and pending v1 shell and transcript
 imports (`runnable`). Anything planted after sanitising, a token in an id or prose in a message, fails it.

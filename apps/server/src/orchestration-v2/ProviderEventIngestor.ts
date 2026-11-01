@@ -317,8 +317,6 @@ export interface ProviderEventIngestorV2Shape {
    */
   readonly ingestNormalizedBatch: (input: {
     readonly events: ReadonlyArray<ProviderEventIngestInput>;
-    /** How many events were queued for the caller when it took these, recorded on the span. */
-    readonly queued?: number;
   }) => Effect.Effect<
     ReadonlyArray<ReadonlyArray<OrchestrationV2StoredEvent>>,
     ProviderEventIngestorV2Error
@@ -328,7 +326,6 @@ export interface ProviderEventIngestorV2Shape {
 // Their normalization reads only through the write transaction, and nothing after the write
 // takes a lock or can fail, so a rolled-back batch can be written again event by event.
 const BATCHABLE_EVENT_TYPES = new Set<ProviderAdapter.ProviderAdapterV2Event["type"]>([
-  "provider_session.updated",
   "provider_turn.updated",
   "node.updated",
   "message.updated",
@@ -873,11 +870,8 @@ export const layer: Layer.Layer<
 
     const ingestNormalizedBatch: ProviderEventIngestorV2Shape["ingestNormalizedBatch"] = Effect.fn(
       "ProviderEventIngestor.ingestNormalizedBatch",
-    )(function* ({ events, queued }) {
-      yield* Effect.annotateCurrentSpan({
-        "orchestration_v2.ingest.batch_events": events.length,
-        ...(queued === undefined ? {} : { "orchestration_v2.ingest.queued": queued }),
-      });
+    )(function* ({ events }) {
+      yield* Effect.annotateCurrentSpan({ "orchestration_v2.ingest.batch_events": events.length });
       const stored: Array<ReadonlyArray<OrchestrationV2StoredEvent>> = [];
       let start = 0;
       while (start < events.length) {

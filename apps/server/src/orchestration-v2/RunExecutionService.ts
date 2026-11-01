@@ -105,6 +105,9 @@ const NATIVE_SUBAGENT_TURN_ORIGIN: ProviderEventIngestor.ProviderTurnOrigin = {
   subagent: true,
 };
 
+// Smaller takes mean the run keeps up; this keeps the backlog span off the per-event path.
+const PROVIDER_EVENT_BACKLOG_SPAN_MIN = 32;
+
 const backgroundCapableTurnItemTypes: ReadonlySet<OrchestrationV2TurnItem["type"]> = new Set([
   "command_execution",
   "dynamic_tool",
@@ -1325,27 +1328,36 @@ export const layer: Layer.Layer<
         // they are written before anything that reads or orders against them.
         const deferredIngest: Array<ProviderEventIngestor.ProviderEventIngestInput> = [];
         let deferredBytes = 0;
-        const flushDeferredIngest = (queued: number) =>
-          Effect.suspend(() => {
-            deferredBytes = 0;
-            return deferredIngest.length === 0
-              ? Effect.void
-              : providerEventIngestor
-                  .ingestNormalizedBatch({ events: deferredIngest.splice(0), queued })
-                  .pipe(Effect.asVoid);
-          });
+        const flushDeferredIngest = Effect.suspend(() => {
+          deferredBytes = 0;
+          const events = deferredIngest.splice(0);
+          return events.length === 0
+            ? Effect.void
+            : events.length === 1
+              ? providerEventIngestor.ingestNormalized(events[0]!).pipe(Effect.asVoid)
+              : providerEventIngestor.ingestNormalizedBatch({ events }).pipe(Effect.asVoid);
+        });
         const providerEventFiber = yield* eventSubscription.events.pipe(
           Stream.chunks,
+          // A take holds everything that was queued for this run, so its size is the backlog.
+          Stream.tap((events) =>
+            events.length < PROVIDER_EVENT_BACKLOG_SPAN_MIN
+              ? Effect.void
+              : Effect.void.pipe(
+                  Effect.withSpan("RunExecutionService.providerEventBacklog", {
+                    attributes: {
+                      "orchestration_v2.run_id": input.run.id,
+                      "orchestration_v2.ingest.queued": events.length,
+                    },
+                  }),
+                ),
+          ),
           Stream.flatMap((events) =>
             Stream.fromIterable(
-              events.map((event, index) => ({
-                event,
-                queued: events.length,
-                lastQueued: index === events.length - 1,
-              })),
+              events.map((event, index) => ({ event, lastQueued: index === events.length - 1 })),
             ),
           ),
-          Stream.mapEffect(({ event, queued, lastQueued }) =>
+          Stream.mapEffect(({ event, lastQueued }) =>
             Effect.gen(function* () {
               const previous = yield* Ref.get(eventRouting);
               const [accepted, routing] = routeProviderEvent(event, routeIdentity, previous);
@@ -1355,7 +1367,7 @@ export const layer: Layer.Layer<
                 routing.rootProviderTurnId !== previous.rootProviderTurnId ||
                 routing.rootTurnEnded !== previous.rootTurnEnded
               ) {
-                yield* flushDeferredIngest(queued);
+                yield* flushDeferredIngest;
               }
               yield* Ref.set(eventRouting, routing);
               if (
@@ -1430,13 +1442,13 @@ export const layer: Layer.Layer<
                   (current) => new Set([...current].filter((id) => !detached.itemIds.has(id))),
                 );
               }
-              return { event, accepted, queued, lastQueued };
+              return { event, accepted, lastQueued };
             }),
           ),
-          Stream.tap(({ event, accepted, queued, lastQueued }) =>
+          Stream.tap(({ event, accepted, lastQueued }) =>
             Effect.gen(function* () {
               if (!accepted) {
-                if (lastQueued) yield* flushDeferredIngest(queued);
+                if (lastQueued) yield* flushDeferredIngest;
                 return;
               }
               if (
@@ -1505,7 +1517,6 @@ export const layer: Layer.Layer<
                 // tracking only ever reflects committed events.
                 if (
                   providerEventBatching.maxEvents > 1 &&
-                  !isRootProviderThreadUpdate &&
                   lifecycleUpdates.length === 0 &&
                   ProviderEventIngestor.canIngestInBatch(deliveredEvent)
                 ) {
@@ -1516,10 +1527,10 @@ export const layer: Layer.Layer<
                     deferredIngest.length >= providerEventBatching.maxEvents ||
                     deferredBytes >= providerEventBatching.maxBytes
                   ) {
-                    yield* flushDeferredIngest(queued);
+                    yield* flushDeferredIngest;
                   }
                 } else {
-                  yield* flushDeferredIngest(queued);
+                  yield* flushDeferredIngest;
                   storedEventCount = (yield* providerEventIngestor.ingestNormalized(ingestInput))
                     .length;
                 }
@@ -1537,7 +1548,7 @@ export const layer: Layer.Layer<
                 event.turnItem.streaming &&
                 !reservedHeldTurnItemIds.has(event.turnItem.id)
               ) {
-                yield* flushDeferredIngest(queued);
+                yield* flushDeferredIngest;
                 yield* turnItemPositions.allocate({
                   threadId: event.turnItem.threadId,
                   turnItemId: event.turnItem.id,
@@ -1559,7 +1570,7 @@ export const layer: Layer.Layer<
                 );
               }
               if (event.type === "turn.terminal") {
-                yield* flushDeferredIngest(queued);
+                yield* flushDeferredIngest;
                 yield* Ref.set(terminalEvent, event);
                 yield* Ref.set(rootTerminalSeen, true);
                 yield* finalizeRootRun(event);
@@ -1572,7 +1583,7 @@ export const layer: Layer.Layer<
                 }
               }
               yield* Effect.all(lifecycleUpdates, { discard: true });
-              if (lastQueued) yield* flushDeferredIngest(queued);
+              if (lastQueued) yield* flushDeferredIngest;
             }),
           ),
           // Also after events this run does not accept, such as a child handed to another run.
@@ -1581,9 +1592,9 @@ export const layer: Layer.Layer<
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
             }),
           ),
-          Stream.takeUntilEffect(({ queued }) =>
+          Stream.takeUntilEffect(() =>
             shouldStopProviderEventIngestion.pipe(
-              Effect.tap((stop) => (stop ? flushDeferredIngest(queued) : Effect.void)),
+              Effect.tap((stop) => (stop ? flushDeferredIngest : Effect.void)),
             ),
           ),
           Stream.runDrain,

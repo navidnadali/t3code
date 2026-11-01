@@ -287,9 +287,6 @@ describe("workload fingerprint", () => {
         "apps/server/src/orchestration-v2/testkit/fixtures/simple/claude_transcript.ndjson",
       );
       write(recording, "{}\n");
-      const agent = NodePath.join(root, "agents", "agent.mjs");
-      write(agent, 'import "./lib.mjs";\n');
-      write(NodePath.join(root, "agents", "lib.mjs"), "export {};\n");
       const node = NodePath.join(root, "bin", "node");
       write(node, "\u007fELF executable\n");
       const template = NodePath.join(root, "template");
@@ -301,7 +298,7 @@ describe("workload fingerprint", () => {
               config: { binaryPath: NodePath.join(otherBench, "fake-claude", "claude") },
             },
             codexBench: { config: { binaryPath: NodePath.join(harness, "fake-codex", "codex") } },
-            acpBench: { config: { commandPath: node, commandArgs: ["--no-warnings", agent] } },
+            acpBench: { config: { commandPath: node, commandArgs: ["--no-warnings"] } },
             codex: { enabled: false },
           },
         }),
@@ -323,8 +320,6 @@ describe("workload fingerprint", () => {
       await edit(NodePath.join(otherBench, "fake-claude", "claude.mjs"), true);
       await edit(NodePath.join(other, "apps", "server", "scripts", "replay.ts"), true);
       await edit(recording, true);
-      await edit(agent, true);
-      await edit(NodePath.join(root, "agents", "lib.mjs"), true);
       await edit(node, true);
     });
   });

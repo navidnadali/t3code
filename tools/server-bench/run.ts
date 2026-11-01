@@ -82,8 +82,8 @@ Load
   env or the fixture's settings.json), and launchers_sha256 what the fixture's settings.json runs
   (binaryPath, commandPath, absolute commandArgs, e.g. from providers.ts --claude-launcher): a
   launcher in this harness's fake-*/ adds its path, one in another checkout's fake-*/ that
-  checkout's fakes and recorded replay fixtures, a JavaScript one its file and local imports, an
-  executable its file; a script (#!) anywhere else is refused, as what it runs cannot be hashed.
+  checkout's fakes and recorded replay fixtures, an executable its file; a script (#!, or
+  JavaScript) anywhere else is refused, as what it runs cannot be hashed.
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -222,8 +222,8 @@ async function filesHash(paths: ReadonlyArray<string>): Promise<string> {
 const isFile = (path: string) =>
   NodeFS.statSync(path, { throwIfNoEntry: false })?.isFile() === true;
 
-/** Relative specifiers of static, re-export, side-effect and literal dynamic imports. */
-const LOCAL_IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*["'](\.{1,2}\/[^"'\n]+)["']/g;
+/** Relative specifiers of static, re-export, side-effect and literal dynamic imports and requires. */
+const LOCAL_IMPORT = /(?:\bfrom|\bimport|\brequire)\s*\(?\s*["'](\.{1,2}\/[^"'\n]+)["']/g;
 
 /** `entries` and the local modules they import, transitively; absolute paths, sorted. */
 function withLocalImports(entries: ReadonlyArray<string>): Array<string> {
@@ -383,7 +383,7 @@ const realPath = (path: string) => {
 /**
  * The absolute binaryPath, commandPath and commandArgs of the fixture settings' instances: one in
  * this harness's fake-* dirs adds its path (fakes_sha256 has it), one in another checkout's adds
- * that checkout's fakes and recordings, any other its file and, for JavaScript, its local imports.
+ * that checkout's fakes and recordings, an executable its file; any other script is refused.
  */
 export async function launchersHash(fixture: FixtureInfo, benchDir: string): Promise<string> {
   const launchers = new Set<string>();
@@ -414,19 +414,12 @@ export async function launchersHash(fixture: FixtureInfo, benchDir: string): Pro
       const checkout = NodePath.dirname(NodePath.dirname(real));
       content =
         checkout === harness ? "harness" : `checkout ${checkout} ${await checkoutHash(checkout)}`;
+    } else if (/\.[cm]?[jt]sx?$/.test(real) || isScript(real)) {
+      throw new Error(
+        `${launcher} (fixture settings) is a script outside a fake-* directory: what it runs cannot be fingerprinted; move it into a fake-* directory`,
+      );
     } else {
-      const javascript = /\.[cm]?[jt]sx?$/.test(real);
-      if (!javascript && isScript(real)) {
-        throw new Error(
-          `${launcher} (fixture settings) is a script outside a fake-* directory: what it runs cannot be fingerprinted; move it into a fake-* directory`,
-        );
-      }
-      const files = javascript ? withLocalImports([real]) : [real];
-      const parts: Array<string> = [];
-      for (const file of files) {
-        parts.push(`${NodePath.relative(NodePath.dirname(real), file)}=${await sha256File(file)}`);
-      }
-      content = parts.join(" ");
+      content = await sha256File(real);
     }
     hash.update(`${launcher}\0${content}\n`);
   }

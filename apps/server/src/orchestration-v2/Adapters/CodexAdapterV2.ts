@@ -1456,8 +1456,9 @@ function redactCodexProtocolValue(value: unknown): unknown {
       if (!Object.prototype.propertyIsEnumerable.call(value, index)) return redacted;
       if (redacted[index] !== value[index]) return redacted;
     }
+    // Own keys must be just the indices and length, as on the copy.
     return Object.getPrototypeOf(value) === Array.prototype &&
-      Object.keys(value).length === value.length
+      Object.getOwnPropertyNames(value).length === value.length + 1
       ? value
       : redacted;
   }
@@ -1493,8 +1494,7 @@ function redactCodexProtocolValue(value: unknown): unknown {
     key,
     isSensitiveCodexProtocolKey(key) ? "[REDACTED]" : redactCodexProtocolValue(nested),
   ]);
-  const prototype: unknown = Object.getPrototypeOf(value);
-  return (prototype === Object.prototype || prototype === null) &&
+  return Object.getPrototypeOf(value) === Object.prototype &&
     redacted.every(([, nested], index) => nested === entries[index]?.[1]) &&
     Object.getOwnPropertyNames(value).length === entries.length
     ? value

@@ -132,11 +132,8 @@ export function layer(input: {
                         : {
                             log: {
                               providerSessionId: openInput.providerSessionId,
-                              writeSerialized: (payload) =>
-                                writeSerialized(
-                                  { stream: "native", payload },
-                                  openInput.threadId,
-                                ).pipe(Effect.ignore),
+                              writeSerialized: (record) =>
+                                writeSerialized(record, openInput.threadId).pipe(Effect.ignore),
                             },
                           }),
                     }),

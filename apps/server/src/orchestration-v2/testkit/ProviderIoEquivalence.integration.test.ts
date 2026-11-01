@@ -343,15 +343,17 @@ const adapterRow = <
       const layerConfig = Layer.effect(
         ServerConfig.ServerConfig,
         makeReplayServerConfig(input.fixtureName).pipe(
-          Effect.map((config) =>
-            offloadMinChars === undefined
-              ? config
+          // The knobs as the server reads them: offloads open only with workers configured.
+          Effect.map((config) => ({
+            ...config,
+            providerIoWorkers: mode.workers,
+            ...(offloadMinChars === undefined
+              ? {}
               : {
-                  ...config,
                   providerIoCodexOffloadMinChars: offloadMinChars,
                   providerIoAcpOffloadMinChars: offloadMinChars,
-                },
-          ),
+                }),
+          })),
           Effect.orDie,
         ),
       ).pipe(Layer.provide(NodeServices.layer));
@@ -498,7 +500,7 @@ const ROWS: ReadonlyArray<AdapterRow> = [
     driver: "codex",
     path: "replay",
     // P1-025 moves long Codex stdout lines onto the workers.
-    offload: "pending",
+    offload: "required",
     stage: "codex-app-server",
     modes: LINE_OFFLOAD_MODES,
     harness: replayHarness(CodexOrchestratorReplayHarness),
@@ -509,7 +511,7 @@ const ROWS: ReadonlyArray<AdapterRow> = [
     driver: "acpRegistry",
     path: "replay",
     // P1-025 moves long ACP stdout lines onto the workers.
-    offload: "pending",
+    offload: "required",
     stage: "acp",
     modes: LINE_OFFLOAD_MODES,
     harness: replayHarness(AcpRegistryOrchestratorReplayHarness),

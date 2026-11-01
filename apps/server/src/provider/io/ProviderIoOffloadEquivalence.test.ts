@@ -142,8 +142,7 @@ const runCodex = (
               kill: Effect.void,
               log: {
                 providerSessionId,
-                writeSerialized: (payload) =>
-                  native.writeSerialized!({ stream: "native", payload }, threadId),
+                writeSerialized: (record) => native.writeSerialized!(record, threadId),
               },
             }),
           );

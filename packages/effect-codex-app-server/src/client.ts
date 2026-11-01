@@ -27,6 +27,7 @@ export interface CodexAppServerClientOptions {
     event: CodexProtocol.CodexAppServerProtocolLogEvent,
   ) => Effect.Effect<void, never>;
   readonly stageTiming?: CodexProtocol.CodexAppServerStageTiming;
+  readonly lineOffload?: CodexProtocol.CodexAppServerLineOffload;
 }
 
 interface CodexAppServerClientRaw {
@@ -231,6 +232,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
     ...(options.stageTiming ? { stageTiming: options.stageTiming } : {}),
+    ...(options.lineOffload ? { lineOffload: options.lineOffload } : {}),
     onNotification: dispatchNotification,
     onRequest: dispatchRequest,
     onTermination: (error) => Deferred.fail(termination, error).pipe(Effect.asVoid),

@@ -1091,4 +1091,42 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
       expect(String(error)).toContain('at ["T3CODE_PROVIDER_IO_CLAUDE_SDK"]');
     }),
   );
+
+  it.effect(
+    "reads the line lengths provider I/O workers parse from and refuses negative ones",
+    () =>
+      Effect.gen(function* () {
+        const baseDir = yield* FileSystem.FileSystem.pipe(
+          Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-provider-io-" })),
+        );
+        const resolve = (env: Record<string, string>) =>
+          resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+            Effect.map((config) => [
+              config.providerIoCodexOffloadMinChars,
+              config.providerIoAcpOffloadMinChars,
+            ]),
+            Effect.provide(
+              Layer.mergeAll(
+                ConfigProvider.layer(ConfigProvider.fromEnv({ env })),
+                NetService.layer,
+              ),
+            ),
+          );
+
+        expect(yield* resolve({})).toEqual([undefined, undefined]);
+        expect(
+          yield* resolve({
+            T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS: "0",
+            T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS: "65536",
+          }),
+        ).toEqual([0, 65536]);
+        for (const name of [
+          "T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS",
+          "T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS",
+        ]) {
+          const error = String(yield* resolve({ [name]: "-1" }).pipe(Effect.flip));
+          expect(error).toContain(`at ["${name}"]`);
+        }
+      }),
+  );
 });

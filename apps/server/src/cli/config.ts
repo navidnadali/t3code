@@ -213,6 +213,14 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  providerIoCodexOffloadMinChars: Config.schema(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    "T3CODE_PROVIDER_IO_CODEX_OFFLOAD_MIN_CHARS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  providerIoAcpOffloadMinChars: Config.schema(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    "T3CODE_PROVIDER_IO_ACP_OFFLOAD_MIN_CHARS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -571,6 +579,12 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     ...(env.providerIoClaudeSdk === undefined
       ? {}
       : { providerIoClaudeSdk: env.providerIoClaudeSdk }),
+    ...(env.providerIoCodexOffloadMinChars === undefined
+      ? {}
+      : { providerIoCodexOffloadMinChars: env.providerIoCodexOffloadMinChars }),
+    ...(env.providerIoAcpOffloadMinChars === undefined
+      ? {}
+      : { providerIoAcpOffloadMinChars: env.providerIoAcpOffloadMinChars }),
   };
 
   return config;

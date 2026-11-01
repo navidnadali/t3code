@@ -6,6 +6,15 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { runMigrations } from "../Migrations.ts";
 import TurnItemMessageOrdinalIndex from "./078_TurnItemMessageOrdinalIndex.ts";
 
+// Upstream's statement, which the fork's (below) must answer the same over JSON payloads.
+const upstreamOrdinalsOf = (threadId: string) => `
+  SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
+  FROM orchestration_v2_projection_turn_items NOT INDEXED
+  WHERE thread_id = '${threadId}' AND type IN ('user_message', 'assistant_message')
+  GROUP BY json_extract(payload_json, '$.messageId')
+  ORDER BY message_id
+`;
+
 const ordinalsOf = (threadId: string, from: string) => `
   SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
   FROM ${from}
@@ -74,8 +83,7 @@ it.effect(
         { message_id: "m2", ordinal: 2 },
         { message_id: "m3", ordinal: 5 },
       ];
-      const unindexed = "orchestration_v2_projection_turn_items NOT INDEXED";
-      assert.deepEqual(yield* sql.unsafe(ordinalsOf("thread-a", unindexed)), expected);
+      assert.deepEqual(yield* sql.unsafe(upstreamOrdinalsOf("thread-a")), expected);
 
       assert.deepEqual(
         (yield* runMigrations()).map(([id]) => id),
@@ -92,16 +100,12 @@ it.effect(
       assert.deepEqual(yield* runMigrations(), []);
 
       const indexed = "orchestration_v2_projection_turn_items";
-      assert.include(
-        (yield* sql.unsafe<{ readonly detail: string }>(
-          `EXPLAIN QUERY PLAN ${ordinalsOf("thread-a", indexed)}`,
-        ))[0]?.detail,
-        "USING INDEX orchestration_v2_projection_turn_items_message_ordinal_idx",
-      );
+      yield* usesTheIndex(ordinalsOf("thread-a", indexed));
       assert.deepEqual(yield* sql.unsafe(ordinalsOf("thread-a", indexed)), expected);
-      assert.deepEqual(yield* sql.unsafe(ordinalsOf("thread-b", indexed)), [
-        { message_id: "m1", ordinal: 1 },
-      ]);
+      assert.deepEqual(
+        yield* sql.unsafe(ordinalsOf("thread-b", indexed)),
+        yield* sql.unsafe(upstreamOrdinalsOf("thread-b")),
+      );
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );
 

@@ -3595,14 +3595,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ORDER BY rowid ASC
           `,
         ]);
-        // Migration 78 indexes exactly this expression and type list: changing either, even the
-        // IN order, silently drops the index. ProjectionStore.test.ts asserts the plan.
+        // Migration 78 indexes exactly this expression, type list and json_valid term: changing
+        // any, even the IN order, silently drops the index. ProjectionStore.test.ts asserts the plan.
         const messageOrdinalRows =
           fields !== undefined && fields.includes("messages") && messageRows.length > 1
             ? yield* sql<{ readonly message_id: string; readonly ordinal: number }>`
             SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
             FROM orchestration_v2_projection_turn_items
             WHERE thread_id = ${threadId} AND type IN ('user_message', 'assistant_message')
+              AND json_valid(payload_json)
             GROUP BY json_extract(payload_json, '$.messageId')
           `
             : [];

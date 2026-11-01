@@ -1158,10 +1158,17 @@ describe("WorkerChildProcessSpawner", () => {
           expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(onSpawnerProcess);
         }
         // A value it does not know keeps today's spawner and says so, rather than stopping the server.
-        expect(yield* outcome({ [spawner]: "childs" })).toEqual({
+        const unknown = {
           ...unset,
           errors: [expect.stringContaining(`${spawner}=\\"childs\\"`)],
-        });
+        };
+        expect(yield* outcome({ [spawner]: "childs" })).toEqual(unknown);
+        // Only an unset spawner knob defers to the worker knob.
+        expect(yield* outcome({ [worker]: "true", [spawner]: "childs" })).toEqual(unknown);
+        for (const value of ["default", "0", "false"]) {
+          expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(unset);
+        }
+        expect(yield* outcome({ [worker]: "true", [spawner]: "" })).toEqual(onWorker);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

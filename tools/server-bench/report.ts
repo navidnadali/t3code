@@ -9,11 +9,12 @@ compare  Prints one markdown table: the median of the valid runs per metric, its
          runs, and after − before. It refuses (exit 2) results that differ in, or lack, any of:
          base SHA; fixture hash; trace sampling (T3CODE_TRACE_MIN_LEVEL,
          T3CODE_TRACE_SQL_MIN_DURATION_MS, T3CODE_TRACE_TIMING_ENABLED, OTLP export interval);
-         workload (driver files, its arguments, the BENCH_* load knobs); host (hostname
-         fingerprint, CPU model); Node version; harness (git SHA and the harness files' hash);
-         server entry (built dist vs source) and the server/driver CPU pinning. Server knobs may
-         differ (that is what a knob A/B measures); the ones that do, and any other run setting
-         that differs, are listed under the table.
+         workload (driver files and their local imports, its arguments, the BENCH_* load knobs,
+         the fake providers and the transcripts they replay); host (hostname fingerprint, CPU
+         model); Node version; harness (git SHA and the harness files' hash); server entry (built
+         dist vs source) and the server/driver CPU pinning. Server knobs may differ (that is what
+         a knob A/B measures); the ones that do, and any other run setting that differs, are
+         listed under the table.
 show     The same table for one result.
 
 Each client call type has p50, p95 and completed-call rows, plus errors and unfinished (still

@@ -76,6 +76,10 @@ Load
   p95, p99, max } }, counters: { "events.thread": { perSecond }, ... }, knobs }; status "failed", a
   driver.failed marker or no file marks the run invalid. Without a window in it, the run uses
   [driver start + warmup, + window].
+  The workload fingerprint hashes the driver (its file, module directory and the local modules
+  they import), the fake providers (fake-*/ and what they import) and the transcripts they replay
+  (the server's recorded replay fixtures, and every absolute BENCH_*TRANSCRIPT path in the server
+  env or the fixture's settings.json).
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -211,23 +215,139 @@ async function filesHash(paths: ReadonlyArray<string>): Promise<string> {
   return hash.digest("hex");
 }
 
-/** The driver file and, when present, its module directory (driver.ts + driver/). */
-async function driverHash(path: string): Promise<string> {
+const isFile = (path: string) =>
+  NodeFS.statSync(path, { throwIfNoEntry: false })?.isFile() === true;
+
+/** Relative specifiers of static, re-export, side-effect and literal dynamic imports. */
+const LOCAL_IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*["'](\.{1,2}\/[^"'\n]+)["']/g;
+
+/** `entries` and the local modules they import, transitively; absolute paths, sorted. */
+function withLocalImports(entries: ReadonlyArray<string>): Array<string> {
+  const seen = new Set<string>();
+  const pending = [...entries];
+  for (let file = pending.pop(); file !== undefined; file = pending.pop()) {
+    if (seen.has(file) || !isFile(file)) continue;
+    seen.add(file);
+    for (const match of NodeFS.readFileSync(file, "utf8").matchAll(LOCAL_IMPORT)) {
+      pending.push(NodePath.resolve(NodePath.dirname(file), match[1]!));
+    }
+  }
+  return [...seen].toSorted();
+}
+
+/**
+ * The driver file, its module directory when present (driver.ts + driver/), and the local modules
+ * they import from elsewhere (driver.ts imports providers.ts).
+ */
+export async function driverHash(path: string): Promise<string> {
   const hash = NodeCrypto.createHash("sha256");
   hash.update(`${NodePath.basename(path)}\0${await sha256File(path)}\n`);
+  const covered = new Set([path]);
   const modules = path.replace(/\.[cm]?[jt]s$/, "");
   if (modules !== path && NodeFS.existsSync(modules) && NodeFS.statSync(modules).isDirectory()) {
     const files = (NodeFS.readdirSync(modules, { recursive: true }) as Array<string>)
       .filter((relative) => NodeFS.statSync(NodePath.join(modules, relative)).isFile())
       .toSorted();
     for (const relative of files) {
+      covered.add(NodePath.join(modules, relative));
       hash.update(`${relative}\0${await sha256File(NodePath.join(modules, relative))}\n`);
     }
+  }
+  for (const file of withLocalImports([...covered])) {
+    if (covered.has(file)) continue;
+    hash.update(`${NodePath.relative(NodePath.dirname(path), file)}\0${await sha256File(file)}\n`);
   }
   return hash.digest("hex");
 }
 
-interface FixtureInfo {
+const FAKE_DIRS = ["fake-claude", "fake-codex", "fake-acp", "fake-common"];
+
+/**
+ * The replaying fake providers: their directories' files but tests and READMEs (launchers, code,
+ * generated transcripts), and the local modules they import from elsewhere.
+ */
+export async function fakesHash(benchDir: string): Promise<string> {
+  const files = FAKE_DIRS.flatMap((dir) => {
+    const root = NodePath.join(benchDir, dir);
+    if (!NodeFS.existsSync(root)) return [];
+    return (NodeFS.readdirSync(root, { recursive: true }) as Array<string>)
+      .map((relative) => NodePath.join(root, relative))
+      .filter((file) => isFile(file) && !/\.test\.[cm]?[jt]s$|\.md$/.test(file));
+  });
+  const hash = NodeCrypto.createHash("sha256");
+  for (const file of withLocalImports(files)) {
+    hash.update(`${NodePath.relative(benchDir, file)}\0${await sha256File(file)}\n`);
+  }
+  return hash.digest("hex");
+}
+
+const REPLAY_FIXTURES = NodePath.join(
+  repoRoot,
+  "apps/server/src/orchestration-v2/testkit/fixtures",
+);
+const TRANSCRIPT_VAR = /^BENCH_\w*TRANSCRIPT$/;
+
+/** The BENCH_*TRANSCRIPT values of `env` and of the instances in a directory fixture's settings. */
+function transcriptSettings(
+  env: Readonly<Record<string, string>>,
+  fixture: FixtureInfo,
+): Array<string> {
+  const values = Object.entries(env)
+    .filter(([name]) => TRANSCRIPT_VAR.test(name))
+    .map(([, value]) => value);
+  const settings =
+    fixture.kind === "dir" ? NodePath.join(fixture.path!, "userdata", "settings.json") : null;
+  if (settings === null || !isFile(settings)) return values;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = recordOf(JSON.parse(NodeFS.readFileSync(settings, "utf8")));
+  } catch (error) {
+    throw new Error(`${settings}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  for (const instance of Object.values(recordOf(parsed.providerInstances))) {
+    const environment = recordOf(instance).environment;
+    for (const entry of Array.isArray(environment) ? environment.map(recordOf) : []) {
+      if (typeof entry.name === "string" && TRANSCRIPT_VAR.test(entry.name)) {
+        if (typeof entry.value === "string") values.push(entry.value);
+      }
+    }
+  }
+  return values;
+}
+
+/**
+ * The transcripts the fakes replay: every recording they load by name (the `*.ndjson` of the
+ * server's replay fixtures) and each absolute path a BENCH_*TRANSCRIPT mix names, in the server
+ * environment or the fixture's settings. Generated transcripts belong to fakesHash.
+ */
+export async function transcriptsHash(
+  env: Readonly<Record<string, string>>,
+  fixture: FixtureInfo,
+  fixturesDir: string,
+): Promise<string> {
+  const hash = NodeCrypto.createHash("sha256");
+  const recorded = NodeFS.existsSync(fixturesDir)
+    ? (NodeFS.readdirSync(fixturesDir, { recursive: true }) as Array<string>)
+        .filter((relative) => relative.endsWith(".ndjson"))
+        .toSorted()
+    : [];
+  for (const relative of recorded) {
+    hash.update(`${relative}\0${await sha256File(NodePath.join(fixturesDir, relative))}\n`);
+  }
+  const named = new Set<string>();
+  for (const mix of transcriptSettings(env, fixture)) {
+    for (const entry of mix.split(",")) {
+      const name = entry.trim().replace(/:\d+$/, "").trim();
+      if (NodePath.isAbsolute(name)) named.add(name);
+    }
+  }
+  for (const path of [...named].toSorted()) {
+    hash.update(`${path}\0${isFile(path) ? await sha256File(path) : "missing"}\n`);
+  }
+  return hash.digest("hex");
+}
+
+export interface FixtureInfo {
   readonly kind: "file" | "dir" | "empty";
   readonly path: string | null;
   readonly sha256: string;
@@ -967,6 +1087,11 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
     ...(values["driver-arg"] ?? []),
   ];
   const driverSha = await driverHash(driverPath);
+  const fakesSha = await fakesHash(harnessDir);
+  const transcriptsSha = new Map<string, string>();
+  for (const target of targets) {
+    transcriptsSha.set(target.label, await transcriptsHash(target.env, fixture, REPLAY_FIXTURES));
+  }
   const options: RunOptions = {
     fixture,
     workDir,
@@ -1051,6 +1176,8 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
         workload: {
           driver: NodePath.basename(driverPath),
           driver_sha256: driverSha,
+          fakes_sha256: fakesSha,
+          transcripts_sha256: transcriptsSha.get(target.label),
           warmup_s: warmupS,
           window_s: windowS,
           driver_args: driverArgs,

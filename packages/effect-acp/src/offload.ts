@@ -7,7 +7,9 @@ type WireMessage = RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded;
 /** One line decoded off the main thread; main finishes it with `normalizeOffloadedMessages`. */
 export type OffloadedLine =
   | { readonly _tag: "Decoded"; readonly messages: ReadonlyArray<WireMessage> }
-  | { readonly _tag: "Failed"; readonly cause: unknown };
+  | { readonly _tag: "Failed"; readonly cause: unknown }
+  /** Main decodes the line itself, as it does a short one. */
+  | { readonly _tag: "InThread" };
 
 /** Decodes single lines with the strict parser's codec; never a batch line (main keeps those). */
 export const makeOffloadedLineDecoder = () => {

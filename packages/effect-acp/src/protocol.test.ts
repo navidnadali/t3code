@@ -1145,6 +1145,37 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
     }),
   );
 
+  it.effect("decodes a line on main when the offload hands it back", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const offloaded: Array<string> = [];
+      const routed = yield* Deferred.make<unknown>();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        lineOffload: {
+          minChars: 200,
+          decode: (line) =>
+            Effect.sync(() => {
+              offloaded.push(line);
+              return { _tag: "InThread" } as const;
+            }),
+          failure: Effect.never,
+        },
+        onNotification: (notification) =>
+          Deferred.succeed(routed, notification.params).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${update(long)}\n`));
+
+      assert.deepEqual(yield* Deferred.await(routed), {
+        sessionId: "session-1",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: long } },
+      });
+      assert.deepEqual(offloaded, [update(long)]);
+    }),
+  );
+
   it.effect.each(["main", "offload"])(
     "fails the chunk and routes none of it when a line fails to decode on %s",
     (where) =>

@@ -681,12 +681,18 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     data: Uint8Array,
   ) {
     const messages: Array<AcpWire.WireMessage> = [];
+    const decodeHere = (line: string) =>
+      Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`));
     for (const line of split(data)) {
       if (line.length < offload.minChars || AcpWire.isBatchLine(line)) {
-        messages.push(...(yield* Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`))));
+        messages.push(...(yield* decodeHere(line)));
         continue;
       }
       const decoded = yield* offload.decode(line);
+      if (decoded._tag === "InThread") {
+        messages.push(...(yield* decodeHere(line)));
+        continue;
+      }
       if (decoded._tag === "Failed") {
         return yield* new AcpError.AcpProtocolParseError({
           operation: "decode-wire-message",

@@ -1080,18 +1080,14 @@ export const layerQueryRunner: Layer.Layer<
               ),
             })),
           );
-          const stageOptions =
-            workerPool &&
-            claudeAgentSdkStageOptions(options, mcpServers, {
-              hook: subagentDeviceInstructions,
-              context: T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
-            });
+          const stageOptions = workerPool && claudeAgentSdkStageOptions(options, mcpServers);
           const startQuery =
             workerPool === undefined || stageOptions === undefined
               ? startInThread
               : startClaudeQueryInWorker({
                   pool: workerPool,
                   stageOptions,
+                  callbacks: options,
                   prompt,
                   spawn: spawnClaudeCodeProcess,
                   toError: queryRunnerError,

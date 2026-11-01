@@ -1,6 +1,7 @@
 import type * as NodeWorkerThreads from "node:worker_threads";
 
 import {
+  type CanUseTool,
   InMemorySessionStore,
   type McpServerConfig,
   type Options as ClaudeQueryOptions,
@@ -672,50 +673,510 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
-  it.effect("refuses callbacks main must answer, without hanging the turn", () =>
+  // A callback's arguments without its abort signal, which each run makes anew.
+  const recordCall = (calls: Array<unknown>, args: ReadonlyArray<unknown>) => {
+    const { signal, ...options } = args.at(-1) as { readonly signal: AbortSignal };
+    assert.instanceOf(signal, AbortSignal);
+    calls.push([...args.slice(0, -1), options]);
+    return signal;
+  };
+
+  const permissionRequest = (toolUseId: string) => ({
+    subtype: "can_use_tool",
+    tool_name: "Bash",
+    input: { command: `echo ${toolUseId}` },
+    tool_use_id: toolUseId,
+    permission_suggestions: [
+      {
+        type: "addRules",
+        rules: [{ toolName: "Bash", ruleContent: "echo:*" }],
+        behavior: "allow",
+        destination: "session",
+      },
+    ],
+    decision_reason: "Bash asks",
+    title: "Run echo",
+  });
+  const elicitationRequest = (message: string) => ({
+    subtype: "elicitation",
+    mcp_server_name: "t3-code",
+    message,
+    requested_schema: { type: "object", properties: { choice: { type: "string" } } },
+  });
+  const dialogRequest = (toolUseId: string) => ({
+    subtype: "request_user_dialog",
+    dialog_kind: "resume_return",
+    payload: { sessionAgeMinutes: 90 },
+    tool_use_id: toolUseId,
+  });
+  const hookRequest = (callbackId: string, toolUseId: string) => ({
+    subtype: "hook_callback",
+    callback_id: callbackId,
+    input: { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" } },
+    tool_use_id: toolUseId,
+  });
+
+  const PROBE = "toolu-probe";
+  type Record_ = (args: ReadonlyArray<unknown>) => AbortSignal;
+  type Callbacks = Pick<
+    ClaudeQueryOptions,
+    "canUseTool" | "onElicitation" | "onUserDialog" | "hooks"
+  >;
+
+  const permissionCase = (
+    label: string,
+    answer: () => ReturnType<CanUseTool>,
+  ): readonly [string, (record: Record_) => Callbacks, ReadonlyArray<Record<string, unknown>>] => [
+    `canUseTool ${label}`,
+    (record) => ({
+      canUseTool: (...args) => {
+        record(args);
+        return args[2].toolUseID === PROBE
+          ? Promise.resolve({ behavior: "allow", updatedInput: { probed: true } })
+          : answer();
+      },
+    }),
+    [permissionRequest("toolu-case"), permissionRequest(PROBE)],
+  ];
+
+  // Each case's request, then a probe the same callback answers: the SDK writes the probe's
+  // response after the first one's, so awaiting it shows whether the first answer was written.
+  const callbackCases: ReadonlyArray<
+    readonly [string, (record: Record_) => Callbacks, ReadonlyArray<Record<string, unknown>>]
+  > = [
+    permissionCase("approves", () =>
+      Promise.resolve({ behavior: "allow", updatedInput: { command: "echo approved" } }),
+    ),
+    permissionCase("denies", () =>
+      Promise.resolve({ behavior: "deny", message: "Not this one.", interrupt: true }),
+    ),
+    permissionCase("answers null", () => Promise.resolve(null as never)),
+    permissionCase("throws an Error", () =>
+      Promise.reject(new Error("The approval store is unavailable.")),
+    ),
+    permissionCase("throws synchronously", () => {
+      throw new TypeError("Cannot read the approval.");
+    }),
+    permissionCase("rejects with a string", () => Promise.reject("plain refusal")),
+    [
+      "onElicitation accepts",
+      (record) => ({
+        onElicitation: async (...args) => {
+          record(args);
+          return args[0].message === PROBE
+            ? { action: "decline" }
+            : { action: "accept", content: { choice: "a" } };
+        },
+      }),
+      [elicitationRequest("Pick one"), elicitationRequest(PROBE)],
+    ],
+    [
+      "onElicitation answers null",
+      (record) => ({
+        onElicitation: async (...args) => {
+          record(args);
+          return args[0].message === PROBE ? { action: "decline" } : (null as never);
+        },
+      }),
+      [elicitationRequest("Pick one"), elicitationRequest(PROBE)],
+    ],
+    [
+      "onElicitation throws",
+      (record) => ({
+        onElicitation: async (...args) => {
+          record(args);
+          if (args[0].message === PROBE) return { action: "decline" };
+          throw new Error("The elicitation card is gone.");
+        },
+      }),
+      [elicitationRequest("Pick one"), elicitationRequest(PROBE)],
+    ],
+    [
+      "onUserDialog completes",
+      (record) => ({
+        onUserDialog: async (...args) => {
+          record(args);
+          return args[0].toolUseID === PROBE
+            ? { behavior: "cancelled" }
+            : { behavior: "completed", result: "continue" };
+        },
+      }),
+      [dialogRequest("toolu-case"), dialogRequest(PROBE)],
+    ],
+    [
+      "onUserDialog throws",
+      (record) => ({
+        onUserDialog: async (...args) => {
+          record(args);
+          if (args[0].toolUseID === PROBE) return { behavior: "cancelled" };
+          throw new Error("No dialog for this session.");
+        },
+      }),
+      [dialogRequest("toolu-case"), dialogRequest(PROBE)],
+    ],
+    [
+      "a PreToolUse hook, in its matcher with its timeout",
+      (record) => ({
+        hooks: {
+          PreToolUse: [
+            {
+              matcher: "Bash",
+              timeout: 5,
+              hooks: [
+                async (...args) => {
+                  record(args);
+                  return { decision: "block", reason: `blocked ${args[1]}` };
+                },
+                async (...args) => {
+                  record(args);
+                  return { continue: true };
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      [hookRequest("hook_0", "toolu-case"), hookRequest("hook_1", PROBE)],
+    ],
+    [
+      "a hook that throws",
+      (record) => ({
+        hooks: {
+          SubagentStart: [
+            {
+              hooks: [
+                async (...args) => {
+                  record(args);
+                  throw new Error("The hook failed.");
+                },
+                async (...args) => {
+                  record(args);
+                  return {};
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      [hookRequest("hook_0", "toolu-case"), hookRequest("hook_1", PROBE)],
+    ],
+  ];
+
+  it.effect.each(callbackCases)(
+    "relays %s to main and returns its answer as in-thread",
+    ([, callbacks, requests]) =>
+      Effect.gen(function* () {
+        const run = (mode: Mode) =>
+          withRunner(mode, ({ runner, recorded }) =>
+            Effect.gen(function* () {
+              const calls: Array<unknown> = [];
+              const cli = new FakeClaudeCli();
+              const session = yield* runner.open(
+                openInput(
+                  cli,
+                  callbacks((args) => recordCall(calls, args)),
+                ),
+              );
+              const sent = requests.map((request) => cli.request(request));
+              yield* Effect.promise(() => sent.at(-1)!);
+              yield* session.close;
+              yield* Effect.promise(() => cli.stdinEnded);
+              return { calls, frames: normalizedFrames(cli.frames), recorded };
+            }),
+          );
+        const inThread = yield* run("thread");
+        const inWorker = yield* run("worker");
+
+        assert.deepStrictEqual(inWorker.recorded.opens, [true]);
+        assert.include(inWorker.recorded.requests, "callbackResult");
+        assert.lengthOf(inThread.calls, 2);
+        assert.deepStrictEqual(inWorker.calls, inThread.calls);
+        assert.deepStrictEqual(inWorker.frames, inThread.frames);
+      }),
+  );
+
+  // Answers once its request is cancelled, recording whether its signal said so.
+  const answerOnAbort =
+    (called: PromiseWithResolvers<void>, aborted: Array<boolean>): CanUseTool =>
+    (_toolName, _input, { signal }) => {
+      called.resolve();
+      return new Promise((resolve) =>
+        signal.addEventListener(
+          "abort",
+          () => {
+            aborted.push(signal.aborted);
+            resolve({ behavior: "deny", message: "Cancelled." });
+          },
+          { once: true },
+        ),
+      );
+    };
+
+  it.effect("carries the CLI's cancel of a callback to main, whose answer still goes back", () =>
+    Effect.gen(function* () {
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner, recorded }) =>
+          Effect.gen(function* () {
+            const called = Promise.withResolvers<void>();
+            const aborted: Array<boolean> = [];
+            const cli = new FakeClaudeCli();
+            const session = yield* runner.open(
+              openInput(cli, { canUseTool: answerOnAbort(called, aborted) }),
+            );
+            const answered = cli.request(permissionRequest("toolu-cancelled"));
+            yield* Effect.promise(() => called.promise);
+            cli.write({ type: "control_cancel_request", request_id: "cli-0" });
+            yield* Effect.promise(() => answered);
+            yield* session.close;
+            yield* Effect.promise(() => cli.stdinEnded);
+            return { aborted, frames: normalizedFrames(cli.frames), recorded };
+          }),
+        );
+      const inThread = yield* run("thread");
+      const inWorker = yield* run("worker");
+
+      assert.include(inWorker.recorded.requests, "callbackResult");
+      assert.deepStrictEqual(inThread.aborted, [true]);
+      assert.deepStrictEqual(inWorker.aborted, inThread.aborted);
+      assert.deepStrictEqual(inWorker.frames, inThread.frames);
+      assert.deepInclude(
+        inWorker.frames.map((frame) => (frame as { readonly response?: unknown }).response),
+        {
+          subtype: "success",
+          request_id: "request-1",
+          response: { behavior: "deny", message: "Cancelled.", toolUseID: "toolu-cancelled" },
+        },
+      );
+    }),
+  );
+
+  it.effect("aborts a callback main is running when the query closes, as in-thread", () =>
+    Effect.gen(function* () {
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner }) =>
+          Effect.gen(function* () {
+            const called = Promise.withResolvers<void>();
+            const aborted: Array<boolean> = [];
+            const cli = new FakeClaudeCli();
+            const session = yield* runner.open(
+              openInput(cli, { canUseTool: answerOnAbort(called, aborted) }),
+            );
+            void cli.request(permissionRequest("toolu-closed"));
+            yield* Effect.promise(() => called.promise);
+            yield* session.close;
+            const abortedAtClose = [...aborted];
+            yield* Effect.promise(() => cli.stdinEnded);
+            return { abortedAtClose, frames: normalizedFrames(cli.frames) };
+          }),
+        );
+      const inThread = yield* run("thread");
+      const inWorker = yield* run("worker");
+
+      assert.deepStrictEqual(inThread.abortedAtClose, [true]);
+      assert.deepStrictEqual(inWorker.abortedAtClose, inThread.abortedAtClose);
+      assert.deepStrictEqual(inWorker.frames, inThread.frames);
+      assert.notInclude(
+        inWorker.frames.map((frame) => frame.type),
+        "control_response",
+      );
+    }),
+  );
+
+  it.effect("answers concurrent callbacks from several sessions, each with its own answer", () =>
+    Effect.gen(function* () {
+      const SESSIONS = 3;
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner, recorded }) =>
+          Effect.gen(function* () {
+            const allPending = Promise.withResolvers<void>();
+            let pending = 0;
+            const opened = yield* Effect.forEach(
+              Array.from({ length: SESSIONS }, (_, index) => index),
+              (index) =>
+                Effect.gen(function* () {
+                  const cli = new FakeClaudeCli();
+                  const session = yield* runner.open(
+                    openInput(cli, {
+                      canUseTool: async (_toolName, input) => {
+                        pending += 1;
+                        if (pending === SESSIONS * 2) allPending.resolve();
+                        await allPending.promise;
+                        return { behavior: "allow", updatedInput: { ...input, session: index } };
+                      },
+                    }),
+                  );
+                  return { cli, session };
+                }),
+            );
+            const responses = yield* Effect.promise(() =>
+              Promise.all(
+                opened.map(({ cli }) =>
+                  Promise.all([
+                    cli.request(permissionRequest("toolu-a")),
+                    cli.request(permissionRequest("toolu-b")),
+                  ]),
+                ),
+              ),
+            );
+            yield* Effect.forEach(opened, ({ session }) => session.close, { discard: true });
+            return {
+              responses: responses.map((answers) => answers.map(({ response }) => response)),
+              recorded,
+            };
+          }),
+        );
+      const inThread = yield* run("thread");
+      const inWorker = yield* run("worker");
+
+      assert.deepStrictEqual(inWorker.recorded.opens, Array(SESSIONS).fill(true));
+      assert.deepStrictEqual(inWorker.responses, inThread.responses);
+      assert.deepStrictEqual(
+        inWorker.responses,
+        Array.from({ length: SESSIONS }, (_, session) =>
+          ["toolu-a", "toolu-b"].map((toolUseID) => ({
+            behavior: "allow",
+            updatedInput: { command: `echo ${toolUseID}`, session },
+            toolUseID,
+          })),
+        ),
+      );
+    }),
+  );
+
+  it.effect("fails the turn, kills the CLI and aborts main's callback when the worker dies", () =>
+    Effect.gen(function* () {
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner }) =>
+          Effect.gen(function* () {
+            const called = Promise.withResolvers<void>();
+            const aborted: Array<boolean> = [];
+            const cli = new FakeClaudeCli({
+              onUser: (_message, cli) => {
+                streamThenWait.onUser?.(_message, cli);
+                void cli.request(permissionRequest("toolu-pending"));
+              },
+            });
+            const session = yield* runner.open(
+              openInput(cli, { canUseTool: answerOnAbort(called, aborted) }),
+            );
+            yield* session.offer(prompt("Ask, then lose the worker."));
+            const turn = yield* session.messages.pipe(Stream.runCollect, Effect.forkChild);
+            yield* Effect.promise(() => called.promise);
+            if (mode === "worker") {
+              yield* Effect.promise(() =>
+                Promise.all(workers.started.map((worker) => worker.terminate())),
+              );
+            } else {
+              cli.exit(1, null);
+            }
+            const error = yield* Fiber.join(turn).pipe(Effect.flip);
+            return { error, aborted, kills: cli.kills };
+          }),
+        );
+      const inThread = yield* run("thread");
+      workers.started.length = 0;
+      const inWorker = yield* run("worker");
+
+      assert.deepStrictEqual(inThread.aborted, [true]);
+      assert.deepStrictEqual(inWorker.aborted, inThread.aborted);
+      assert.strictEqual(inWorker.error._tag, "ClaudeAgentSdkQueryRunnerError");
+      assert.strictEqual(inWorker.error.method, inThread.error.method);
+      assert.strictEqual(
+        (inWorker.error.cause as { readonly _tag: string })._tag,
+        "ProviderIoWorkerError",
+      );
+      assert.deepStrictEqual(inWorker.kills, ["SIGKILL"]);
+    }),
+  );
+
+  const streamThenAsk =
+    (deltas: number): NonNullable<FakeClaudeCliOptions["onUser"]> =>
+    (_message, cli) => {
+      for (let delta = 0; delta < deltas; delta++) {
+        cli.write({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: `delta ${delta} ` },
+          },
+          parent_tool_use_id: null,
+          session_id: SESSION_ID,
+          uuid: `delta-${delta}`,
+        });
+      }
+      void cli.request(permissionRequest("toolu-ordered"));
+    };
+
+  it.effect("starts a callback once the consumer has handled the messages read before it", () =>
+    Effect.gen(function* () {
+      const run = (mode: Mode, requestsInOwnRead: boolean) =>
+        withRunner(mode, ({ runner }) =>
+          Effect.gen(function* () {
+            let handled = 0;
+            const handledAtCallback: Array<number> = [];
+            const answered = Promise.withResolvers<void>();
+            const cli = new FakeClaudeCli({
+              pipeLatency: true,
+              requestsInOwnRead,
+              onUser: streamThenAsk(32),
+            });
+            const session = yield* runner.open(
+              openInput(cli, {
+                canUseTool: async () => {
+                  handledAtCallback.push(handled);
+                  answered.resolve();
+                  return { behavior: "allow", updatedInput: {} };
+                },
+              }),
+            );
+            yield* session.messages.pipe(
+              Stream.runForEach(() => Effect.sync(() => (handled += 1))),
+              Effect.forkChild,
+            );
+            yield* session.offer(prompt("Stream, then ask."));
+            yield* Effect.promise(() => answered.promise);
+            yield* session.close;
+            return handledAtCallback;
+          }),
+        );
+      // In-thread, only a request in its own read comes after the consumer has had the frames.
+      const inThread = yield* run("thread", true);
+      const inWorker = yield* run("worker", false);
+      const inWorkerOwnRead = yield* run("worker", true);
+
+      assert.deepStrictEqual(inThread, [32]);
+      assert.deepStrictEqual(inWorker, inThread);
+      assert.deepStrictEqual(inWorkerOwnRead, inThread);
+    }),
+  );
+
+  it.effect("starts a callback at once while nothing consumes the messages yet", () =>
     withRunner("worker", ({ runner }) =>
       Effect.gen(function* () {
-        const canUseTool = vi.fn();
-        const onElicitation = vi.fn();
-        const onUserDialog = vi.fn();
-        const cli = new FakeClaudeCli();
-        yield* runner.open(openInput(cli, { canUseTool, onElicitation, onUserDialog }));
-        const permission = yield* Effect.promise(() =>
-          cli.request({
-            subtype: "can_use_tool",
-            tool_name: "Bash",
-            input: { command: "ls" },
-            tool_use_id: "toolu-1",
+        const calls: Array<unknown> = [];
+        const cli = new FakeClaudeCli({ pipeLatency: true, onUser: streamThenAsk(3) });
+        const session = yield* runner.open(
+          openInput(cli, {
+            canUseTool: async (...args) => {
+              recordCall(calls, args);
+              return { behavior: "allow", updatedInput: {} };
+            },
           }),
         );
-        const elicitation = yield* Effect.promise(() =>
-          cli.request({
-            subtype: "elicitation",
-            mcp_server_name: "t3-code",
-            message: "Pick one",
-            requested_schema: { type: "object", properties: {} },
-          }),
+        yield* session.offer(prompt("Ask before anyone reads."));
+        const answer = yield* Effect.promise(() =>
+          cli.waitFor((frame) => frame.type === "control_response"),
         );
-        const dialog = yield* Effect.promise(() =>
-          cli.request({
-            subtype: "request_user_dialog",
-            dialog_kind: "resume_return",
-            payload: {},
-          }),
-        );
-
-        assert.strictEqual(permission.subtype, "success");
-        assert.deepInclude(permission.response as object, { behavior: "deny" });
-        assert.deepInclude(elicitation.response as object, { action: "decline" });
-        assert.deepStrictEqual(dialog.response, { behavior: "cancelled" });
-        for (const callback of [canUseTool, onElicitation, onUserDialog]) {
-          assert.strictEqual(callback.mock.calls.length, 0);
-        }
+        assert.lengthOf(calls, 1);
+        assert.deepInclude(answer.response as object, { subtype: "success" });
+        const messages = yield* session.messages.pipe(Stream.take(3), Stream.runCollect);
+        assert.lengthOf(messages, 3);
       }),
     ),
   );
 
-  it.effect("answers T3's SubagentStart hook in the worker as in-thread", () =>
+  it.effect("relays T3's SubagentStart hook to main and answers it as in-thread", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>
         withRunner(mode, ({ runner, recorded }) =>
@@ -760,6 +1221,7 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       const inWorker = yield* run("worker");
 
       assert.deepStrictEqual(inWorker.recorded.opens, [true]);
+      assert.include(inWorker.recorded.requests, "callbackResult");
       assert.deepStrictEqual(inWorker.answer, {
         ...inThread.answer,
         request_id: inWorker.answer.request_id,
@@ -779,10 +1241,9 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
 
 describe("claudeAgentSdkStageOptions", () => {
   const hook = () => Promise.resolve({});
-  const subagentStart = { hook, context: "device tools" };
   const base = { model: "claude-sonnet-4-6", pathToClaudeCodeExecutable: "claude" };
 
-  it("passes data, refuses main's callbacks and carries T3's SubagentStart context", () => {
+  it("passes data, and the callbacks and hook shape main keeps", () => {
     assert.deepStrictEqual(
       claudeAgentSdkStageOptions(
         {
@@ -791,17 +1252,27 @@ describe("claudeAgentSdkStageOptions", () => {
           onUserDialog: vi.fn(),
           spawnClaudeCodeProcess: vi.fn(),
           stderr: vi.fn(),
-          hooks: { SubagentStart: [{ hooks: [hook] }] },
+          hooks: {
+            SubagentStart: [{ hooks: [hook] }],
+            PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: [hook, vi.fn()] }, { hooks: [] }],
+          },
         },
         { "t3-code": { type: "http", url: "http://localhost:3773/mcp" } },
-        subagentStart,
       ),
       {
         options: base,
-        refuse: ["canUseTool", "onUserDialog"],
-        subagentStartContext: "device tools",
+        callbacks: ["canUseTool", "onUserDialog"],
+        hooks: {
+          SubagentStart: [{ hooks: 1 }],
+          PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: 2 }, { hooks: 0 }],
+        },
       },
     );
+    assert.deepStrictEqual(claudeAgentSdkStageOptions({ ...base, hooks: {} }, undefined), {
+      options: base,
+      callbacks: [],
+      hooks: {},
+    });
   });
 
   it("keeps a query in-thread when the worker could not run it the same way", () => {
@@ -810,12 +1281,13 @@ describe("claudeAgentSdkStageOptions", () => {
     > = [
       [{ model: "claude-sonnet-4-6" }, undefined],
       [{ ...base, abortController: new AbortController() }, undefined],
-      [{ ...base, hooks: { SubagentStart: [{ hooks: [vi.fn()] }] } }, undefined],
+      [{ ...base, hooks: { SubagentStart: [{ hooks: ["context" as never] }] } }, undefined],
+      [{ ...base, hooks: { SubagentStart: undefined as never } }, undefined],
+      [{ ...base, hooks: { SubagentStart: [null as never] } }, undefined],
       [
-        { ...base, hooks: { SubagentStart: [{ hooks: [hook] }], Stop: [{ hooks: [hook] }] } },
+        { ...base, hooks: { SubagentStart: [{ hooks: [hook], matcher: new Map() as never }] } },
         undefined,
       ],
-      [{ ...base, hooks: { SubagentStart: [{ hooks: [hook], timeout: 5 }] } }, undefined],
       [{ ...base, includeHookEvents: vi.fn() as never }, undefined],
       [base, { local: { type: "sdk", name: "local", instance: {} as never } }],
       [{ ...base, sessionStore: { load: vi.fn(), append: vi.fn() } as never }, undefined],
@@ -823,7 +1295,7 @@ describe("claudeAgentSdkStageOptions", () => {
       [{ ...base, settings: { env: new Map() } as never }, undefined],
     ];
     for (const [options, mcpServers] of cases) {
-      assert.isUndefined(claudeAgentSdkStageOptions(options, mcpServers, subagentStart));
+      assert.isUndefined(claudeAgentSdkStageOptions(options, mcpServers));
     }
   });
 });

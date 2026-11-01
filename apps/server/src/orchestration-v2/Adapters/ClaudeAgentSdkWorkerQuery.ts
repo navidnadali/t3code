@@ -1,5 +1,4 @@
 import type {
-  HookCallback,
   McpServerConfig,
   Options as ClaudeQueryOptions,
   Query as ClaudeQuery,
@@ -8,6 +7,7 @@ import type {
   SpawnedProcess as ClaudeSpawnedProcess,
   SpawnOptions as ClaudeSpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
+import * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -17,9 +17,11 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import {
+  type ClaudeAgentSdkCallbackCall,
   type ClaudeAgentSdkStageOptions,
   type ClaudeAgentSdkWorkerCallback,
   type ClaudeAgentSdkWorkerEvent,
+  type ClaudeAgentSdkWorkerHooks,
   type ClaudeAgentSdkWorkerRequest,
   claudeAgentSdkStage,
   toClaudeAgentSdkProcessError,
@@ -55,16 +57,21 @@ export interface StartedClaudeQuery<E> {
   readonly messages: Stream.Stream<SDKMessage, E>;
 }
 
+/** The callbacks main runs for the worker's SDK. */
+export type ClaudeAgentSdkMainCallbacks = Pick<
+  ClaudeQueryOptions,
+  ClaudeAgentSdkWorkerCallback | "hooks"
+>;
+
 /**
  * The worker's share of the query options, or undefined when the query must stay in-thread: an
- * abort controller, hooks other than T3's SubagentStart context, options that are not plain data
- * (a session store, an in-process MCP server), or no CLI path (the worker cannot find the SDK's
- * bundled CLI the way main does).
+ * abort controller, options that are not plain data (a session store, an in-process MCP server,
+ * a hook that is not a function), or no CLI path (the worker cannot find the SDK's bundled CLI
+ * the way main does). Main's callbacks and hooks stay on main; the worker relays their calls.
  */
 export function claudeAgentSdkStageOptions(
   options: ClaudeQueryOptions,
   mcpServers: Record<string, McpServerConfig> | undefined,
-  subagentStart: { readonly hook: HookCallback; readonly context: string },
 ): ClaudeAgentSdkStageOptions | undefined {
   const {
     abortController,
@@ -82,32 +89,56 @@ export function claudeAgentSdkStageOptions(
   }
   if (Object.values(mcpServers ?? {}).some((server) => server.type === "sdk")) return undefined;
   if (!isPlainData(data) || !isPlainData(mcpServers)) return undefined;
-  let subagentStartContext: string | undefined;
-  if (hooks !== undefined) {
-    const [matcher, ...otherMatchers] = hooks.SubagentStart ?? [];
-    if (
-      Object.keys(hooks).length !== 1 ||
-      matcher === undefined ||
-      otherMatchers.length > 0 ||
-      matcher.matcher !== undefined ||
-      matcher.timeout !== undefined ||
-      matcher.hooks.length !== 1 ||
-      matcher.hooks[0] !== subagentStart.hook
-    ) {
-      return undefined;
-    }
-    subagentStartContext = subagentStart.context;
-  }
-  const refuse: Array<ClaudeAgentSdkWorkerCallback> = [];
-  if (canUseTool !== undefined) refuse.push("canUseTool");
-  if (onElicitation !== undefined) refuse.push("onElicitation");
-  if (onUserDialog !== undefined) refuse.push("onUserDialog");
+  const hookShape = hooks === undefined ? undefined : hooksShape(hooks);
+  if (hookShape === null) return undefined;
+  const callbacks: Array<ClaudeAgentSdkWorkerCallback> = [];
+  if (canUseTool !== undefined) callbacks.push("canUseTool");
+  if (onElicitation !== undefined) callbacks.push("onElicitation");
+  if (onUserDialog !== undefined) callbacks.push("onUserDialog");
   return {
     options: data,
-    refuse,
-    ...(subagentStartContext === undefined ? {} : { subagentStartContext }),
+    callbacks,
+    ...(hookShape === undefined ? {} : { hooks: hookShape }),
   };
 }
+
+// Null when a matcher is not plain data besides its hooks, or a hook is not a function.
+const hooksShape = (
+  hooks: NonNullable<ClaudeQueryOptions["hooks"]>,
+): ClaudeAgentSdkWorkerHooks | null => {
+  const shape: Record<string, ClaudeAgentSdkWorkerHooks[keyof ClaudeAgentSdkWorkerHooks]> = {};
+  for (const [event, matchers] of Object.entries(hooks)) {
+    if (!Array.isArray(matchers)) return null;
+    const matcherShapes = [];
+    for (const matcher of matchers as ReadonlyArray<unknown>) {
+      if (typeof matcher !== "object" || matcher === null) return null;
+      const { hooks: callbacks, ...rest } = matcher as { readonly hooks?: unknown };
+      if (!Array.isArray(callbacks) || !isPlainData(rest)) return null;
+      if (!callbacks.every((callback) => typeof callback === "function")) return null;
+      matcherShapes.push({ ...rest, hooks: callbacks.length });
+    }
+    shape[event] = matcherShapes;
+  }
+  return shape;
+};
+
+const callbackOf = (
+  callbacks: ClaudeAgentSdkMainCallbacks,
+  call: ClaudeAgentSdkCallbackCall,
+): ((...args: ReadonlyArray<never>) => unknown) | undefined => {
+  if (call.name !== "hook") return callbacks[call.name];
+  const [event, matcher, index] = call.hook;
+  return callbacks.hooks?.[event]?.[matcher]?.hooks[index];
+};
+
+// What the SDK sends the CLI for a callback that throws.
+const sdkErrorText = (error: unknown) => {
+  try {
+    return error instanceof Error ? String(error.message) : String(error);
+  } catch {
+    return Object.prototype.toString.call(error);
+  }
+};
 
 // What structured cloning carries over unchanged: no functions, class instances or cycles.
 const isPlainData = (value: unknown, ancestors = new Set<object>()): boolean => {
@@ -139,6 +170,7 @@ const STDOUT_BUFFER_BYTES = 1024 * 1024;
 export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   readonly pool: ProviderIoWorkerPool["Service"];
   readonly stageOptions: ClaudeAgentSdkStageOptions;
+  readonly callbacks: ClaudeAgentSdkMainCallbacks;
   readonly prompt: AsyncIterable<SDKUserMessage>;
   readonly spawn: (options: ClaudeSpawnOptions) => ClaudeSpawnedProcess;
   readonly toError: (cause: unknown, method: string) => E;
@@ -149,7 +181,13 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   const scope = yield* Scope.make();
   // @effect-diagnostics-next-line abortControllerInEffect:off - Node aborts the CLI it spawned with this signal.
   const abort = new AbortController();
-  const refused = new Set<ClaudeAgentSdkWorkerCallback>();
+  // Main's side of each callback the worker's SDK is waiting on, by the worker's id.
+  const callbacks = new Map<number, AbortController>();
+  // Callbacks waiting for the consumer to finish the messages the SDK read before raising them.
+  const due: Array<{ readonly after: number; readonly start: () => void }> = [];
+  let handed = 0;
+  let consuming = false;
+  let consumerIdle = false;
   const frames: Array<Uint8Array | ClaudeAgentSdkWorkerRequest> = [];
   let session:
     | ProviderIoSession<SDKMessage, WorkerSessionError, ClaudeAgentSdkWorkerRequest, unknown>
@@ -158,15 +196,26 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   let childDone = false;
   let outputDone = false;
   let released = false;
+  // Like the SDK's cleanup: no callback starts after it, and the ones running are aborted.
+  let cleanedUp = false;
   let promptIterator: AsyncIterator<SDKUserMessage> | undefined;
   let bufferedBytes = 0;
   let paused = false;
   let pumping = false;
 
+  const cleanUp = () => {
+    cleanedUp = true;
+    due.length = 0;
+    const running = [...callbacks.values()];
+    callbacks.clear();
+    for (const controller of running) controller.abort();
+  };
+
   // The worker's SDK may still kill the CLI after its output ends, so the session lasts until both.
   const release = () => {
     if (released || !outputDone || (child !== undefined && !childDone)) return;
     released = true;
+    cleanUp();
     void promptIterator?.return?.();
     runFork(Scope.close(scope, Exit.void));
   };
@@ -255,6 +304,59 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     });
   };
 
+  const answer = (
+    reply: Extract<ClaudeAgentSdkWorkerRequest, { readonly type: "callbackResult" }>,
+  ) => {
+    try {
+      session?.notify(reply);
+    } catch {
+      // The SDK writes the answer as JSON, which drops what cloning refuses (such as functions).
+      let result: unknown;
+      try {
+        result = JSON.parse(JSON.stringify(reply.result));
+      } catch (error) {
+        session?.notify({ type: "callbackError", id: reply.id, text: sdkErrorText(error) });
+        return;
+      }
+      session?.notify({ ...reply, result });
+    }
+  };
+
+  // A cancelled callback still answers, as in-thread.
+  const runCallback = (id: number, call: ClaudeAgentSdkCallbackCall) => {
+    const controller = callbacks.get(id);
+    if (controller === undefined) return;
+    const options = { ...call.args.at(-1), signal: controller.signal };
+    const args: Array<unknown> = [...call.args.slice(0, -1), options];
+    let result: unknown;
+    try {
+      const callback = callbackOf(input.callbacks, call);
+      if (callback === undefined) throw new Error(`${call.name} callback is not provided.`);
+      result = callback(...(args as Array<never>));
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    void Promise.resolve(result).then(
+      (value) => {
+        if (callbacks.delete(id)) answer({ type: "callbackResult", id, result: value });
+      },
+      (error: unknown) => {
+        if (callbacks.delete(id)) {
+          session?.notify({ type: "callbackError", id, text: sdkErrorText(error) });
+        }
+      },
+    );
+  };
+
+  // Before the consumer's first pull nothing orders a callback, as in-thread.
+  const startDue = () => {
+    for (let next = due[0]; next !== undefined; next = due[0]) {
+      if (consuming && next.after > handed) return;
+      due.shift();
+      next.start();
+    }
+  };
+
   const onEvent = (event: ClaudeAgentSdkWorkerEvent) => {
     switch (event.type) {
       case "spawn":
@@ -272,14 +374,14 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       case "abort":
         abort.abort();
         return;
-      case "refused":
-        if (refused.has(event.callback)) return;
-        refused.add(event.callback);
-        runFork(
-          Effect.logWarning("Claude provider I/O worker refused a callback", {
-            callback: event.callback,
-          }),
-        );
+      case "callback":
+        if (cleanedUp) return;
+        callbacks.set(event.id, new AbortController());
+        due.push({ after: event.after, start: () => runCallback(event.id, event.call) });
+        if (consumerIdle || !consuming) startDue();
+        return;
+      case "callbackAbort":
+        callbacks.get(event.id)?.abort();
         return;
     }
   };
@@ -290,6 +392,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       options: input.stageOptions,
       onFailure: (error: WorkerSessionError) => error,
       kill: Effect.sync(() => {
+        cleanUp();
         if (child !== undefined && !childDone) child.kill("SIGKILL");
       }),
       killAfterEnd: true,
@@ -352,17 +455,56 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     // In-thread, frames the SDK has not read when it closes never reach a waiting reader.
     close: () => {
       if (released) return;
+      cleanUp();
       workerSession.cutOutput();
       workerSession.notify({ type: "close" });
     },
-    [Symbol.asyncDispose]: () => runPromise(settle({ type: "asyncDispose" })),
+    [Symbol.asyncDispose]: () => {
+      cleanUp();
+      return runPromise(settle({ type: "asyncDispose" }));
+    },
   };
+
+  // In-thread, the consumer races the SDK through the messages read before a callback. Here the
+  // callback starts once the consumer has handled them all (as in-thread when the request comes in
+  // its own read): at once when it waits for output, else at its next pull, with output split there.
+  const ordered = Stream.transformPull(workerSession.output, (pull) =>
+    Effect.sync(() => {
+      let chunk: ReadonlyArray<SDKMessage> = [];
+      let offset = 0;
+      const waitForOutput = Effect.suspend(() => {
+        consumerIdle = true;
+        return pull;
+      }).pipe(Effect.ensuring(Effect.sync(() => (consumerIdle = false))));
+      return Effect.gen(function* () {
+        consuming = true;
+        while (true) {
+          startDue();
+          if (offset === chunk.length) {
+            chunk = yield* waitForOutput;
+            offset = 0;
+            continue;
+          }
+          const next = due[0];
+          const end =
+            next === undefined
+              ? chunk.length
+              : Math.min(chunk.length, offset + next.after - handed);
+          const taken = offset === 0 && end === chunk.length ? chunk : chunk.slice(offset, end);
+          offset = end;
+          handed += taken.length;
+          if (Arr.isReadonlyArrayNonEmpty(taken)) return taken;
+        }
+      });
+    }),
+  );
 
   // Ending the in-thread stream returns the SDK's iterator, which closes the query: idle at once,
   // in the background while a read is pending.
-  const messages = workerSession.output.pipe(
+  const messages = ordered.pipe(
     Stream.mapError((error) => input.toError(workerCause(error), "fromAsyncIterable")),
     Stream.onExit((exit) => {
+      cleanUp();
       if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)) {
         if (!released) workerSession.notify({ type: "return" });
         return finishOutput;

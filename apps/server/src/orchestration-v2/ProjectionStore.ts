@@ -4424,13 +4424,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               SELECT payload_json FROM orchestration_v2_projection_run_attempts
               WHERE thread_id = ${threadId} ORDER BY run_id ASC, attempt_ordinal ASC
             `;
-            // The checkpoint scope read below needs the run's root node decoded.
-            const nodes = yield* sql<PayloadRow>`
+            const nodeRows = yield* sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_nodes
               -- Look up the root node by key, not every node in the thread.
               INDEXED BY sqlite_autoindex_orchestration_v2_projection_nodes_1
               WHERE thread_id = ${threadId} AND node_id IN (SELECT json_extract(payload_json, '$.rootNodeId') FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId} AND run_id = ${runId}) ORDER BY node_id ASC
-            `.pipe(Effect.flatMap(decodeRows(decodeNodePayload, threadId)));
+            `;
+            // The scope read needs the root node now; a decode failure is reported in its turn below.
+            const nodes = yield* decodeRows(
+              decodeNodePayload,
+              threadId,
+            )(nodeRows).pipe(Effect.result);
             const subagentRows = yield* sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_subagents
               WHERE thread_id = ${threadId} AND status NOT IN ('interrupted','failed','cancelled') ORDER BY subagent_id ASC
@@ -4445,7 +4449,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             `;
             const checkpointScopeRows = yield* sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_checkpoint_scopes
-              WHERE thread_id = ${threadId} AND scope_id IN ${sql.in(nodes.flatMap((node) => (node.checkpointScopeId === null ? [] : [node.checkpointScopeId])))} ORDER BY ordinal_within_parent ASC, scope_id ASC
+              WHERE thread_id = ${threadId} AND scope_id IN ${sql.in(Result.getOrElse(nodes, () => []).flatMap((node) => (node.checkpointScopeId === null ? [] : [node.checkpointScopeId])))} ORDER BY ordinal_within_parent ASC, scope_id ASC
             `;
             const contextHandoffRows = yield* sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_context_handoffs
@@ -4508,6 +4512,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             Effect.all({
               runs: decodeRows(decodeRunPayload, threadId)(rows.runRows),
               attempts: decodeRows(decodeRunAttemptPayload, threadId)(rows.attemptRows),
+              nodes: Effect.fromResult(rows.nodes),
               subagents: decodeRows(decodeSubagentPayload, threadId)(rows.subagentRows),
               providerThreads: decodeRows(
                 decodeProviderThreadPayload,
@@ -4544,7 +4549,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 thread: rows.thread,
                 runs: decoded.runs,
                 attempts: decoded.attempts,
-                nodes: rows.nodes,
+                nodes: decoded.nodes,
                 subagents: decoded.subagents,
                 providerSessions: decoded.providerSessions,
                 providerThreads: decoded.providerThreads,

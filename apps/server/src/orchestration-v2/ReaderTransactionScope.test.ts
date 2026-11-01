@@ -26,6 +26,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import type * as Tracer from "effect/Tracer";
@@ -803,4 +804,30 @@ it.effect.each(consistencyCases)(
         assert.deepStrictEqual(during, before);
       }),
     ),
+);
+
+const isReadError = Schema.is(ProjectionStore.ProjectionStoreReadError);
+
+// The run's root node is decoded early for its checkpoint scope, yet a bad run row still wins.
+it.effect("reports the turn start context's first undecodable row in its old order", () =>
+  withFileStore(
+    "reader-scope-order-",
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("order", 0);
+      yield* sql`UPDATE orchestration_v2_projection_runs
+        SET payload_json = ${JSON.stringify({ rootNodeId: "node:order:fork:root" })}
+        WHERE run_id = ${fixture.forkRunId}`;
+      yield* sql`UPDATE orchestration_v2_projection_nodes SET payload_json = 'not json'
+        WHERE node_id = 'node:order:fork:root'`;
+      const error = yield* Effect.flip(store.getTurnStartContext(fixture.fork, fixture.forkRunId));
+      let cause: unknown = error;
+      while (isReadError(cause)) cause = cause.cause;
+      assert.strictEqual(
+        (cause as { readonly message?: string }).message,
+        'Missing key\n  at ["id"]',
+      );
+    }),
+  ),
 );

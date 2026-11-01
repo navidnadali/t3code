@@ -161,7 +161,7 @@ it.effect("refuses at run time a load the build could not see", () =>
     // Every name is computed at run time, so only the worker's own guard can refuse these.
     const source = yield* embeddedSource(
       'import * as NodeModule from "node:module";\n' +
-        'import * as NodeRepl from "node:repl";\n' +
+        'import * as NodeFS from "node:fs";\n' +
         'import * as NodeStream from "node:stream";\n' +
         'import * as NodeURL from "node:url";\n' +
         'import * as NodeWorkerThreads from "node:worker_threads";\n' +
@@ -202,18 +202,29 @@ it.effect("refuses at run time a load the build could not see", () =>
         "  () => viaModule((NodeModule as any).Module, planted),\n" +
         "  () => (NodeModule as any).registerHooks({ resolve: () => undefined }),\n" +
         '  () => import(name("node:", "module")).then((m: any) => viaModule(m.Module, planted)),\n' +
-        // A built-in that hands out the real Module class: loading through it must still fail.
-        "  () => {\n" +
+        // Built-ins that hand out the real Module class or reach the main thread are refused.
+        '  () => import(name("node:", "repl")).then((NodeRepl: any) => {\n' +
         "    const session = NodeRepl.start({\n" +
         "      input: new NodeStream.PassThrough(),\n" +
         "      output: new NodeStream.PassThrough(),\n" +
         "    });\n" +
-        "    try {\n" +
-        "      return viaModule(session.context.module.constructor, planted);\n" +
-        "    } finally {\n" +
-        "      session.close();\n" +
-        "    }\n" +
-        "  },\n" +
+        "    const Module = session.context.module.constructor;\n" +
+        "    session.close();\n" +
+        "    Module.registerHooks({\n" +
+        "      resolve: (specifier: string, context: unknown, next: any) =>\n" +
+        '        specifier === "p1-024-repl"\n' +
+        '          ? { url: NodeURL.pathToFileURL(planted).href, format: "commonjs", shortCircuit: true }\n' +
+        "          : next(specifier, context),\n" +
+        "      load: (url: string, context: unknown, next: any) =>\n" +
+        '        url.endsWith("/planted.cjs")\n' +
+        '          ? { format: "commonjs", source: NodeFS.readFileSync(planted, "utf8"), shortCircuit: true }\n' +
+        "          : next(url, context),\n" +
+        "    });\n" +
+        '    return import(name("p1-024-", "repl")).then((m: any) => m.default);\n' +
+        "  }),\n" +
+        '  () => (process as any).getBuiltinModule(name("re", "pl")).start,\n' +
+        '  () => import(name("node:", "inspector")).then((m: any) => m.Session),\n' +
+        '  () => (process as any).getBuiltinModule(name("inspector", "/promises")).Session,\n' +
         "];\n" +
         "void Promise.all(attempts.map(async (attempt) => {\n" +
         "  try {\n" +
@@ -225,7 +236,7 @@ it.effect("refuses at run time a load the build could not see", () =>
     const results = yield* runEmbedded(source, dir);
     assert.deepEqual(
       results,
-      Array.from({ length: 17 }, () => "refused"),
+      Array.from({ length: 20 }, () => "refused"),
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

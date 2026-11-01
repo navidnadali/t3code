@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 
 import {
+  boundProviderEventForLogging,
   formatEventNdjsonLine,
   serializedRecordProblem,
   serializeEventNdjsonRecord,
@@ -39,4 +40,21 @@ it("serializes provider log records without an Effect runtime", () => {
     formatEventNdjsonLine("2026-11-01T00:00:00.000Z", "orchestration", '{"id":1}'),
     '[2026-11-01T00:00:00.000Z] ORCH: {"id":1}\n',
   );
+});
+
+it("serializes a record the same whether or not its event was bounded on this thread", () => {
+  const fields = (count: number) => ({
+    params: Object.fromEntries(Array.from({ length: count }, (_, index) => [`k${index}`, 0])),
+  });
+  const sparse = (length: number) => ({ list: new Array(length), last: 0 });
+  const events = [fields(1_021), fields(1_022), sparse(1_021), sparse(1_022), { id: "small" }];
+  for (const event of events) {
+    const bounded = { kind: "protocol", event: boundProviderEventForLogging(event) };
+    // A copy, as a worker receives it: nothing was bounded on its thread.
+    const copied = { kind: "protocol", event: structuredClone(bounded.event) };
+    assert.deepEqual(
+      serializeEventNdjsonRecord("native", bounded),
+      serializeEventNdjsonRecord("native", copied),
+    );
+  }
 });

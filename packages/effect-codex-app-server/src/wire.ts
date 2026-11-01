@@ -67,10 +67,17 @@ const decodeJsonString = Schema.decodeUnknownResult(Schema.fromJsonString(Schema
 
 export const decodeWireLine = (
   line: string,
-): Result.Result<unknown, CodexError.CodexAppServerProtocolParseError> =>
-  Result.mapError(decodeJsonString(line), (cause) =>
-    CodexError.CodexAppServerProtocolParseError.fromSchemaError("decode-wire-message", cause),
-  );
+): Result.Result<unknown, CodexError.CodexAppServerProtocolParseError> => {
+  // The schema runs this same JSON.parse; it is only needed to build the error.
+  try {
+    const message: unknown = JSON.parse(line);
+    return Result.succeed(message);
+  } catch {
+    return Result.mapError(decodeJsonString(line), (cause) =>
+      CodexError.CodexAppServerProtocolParseError.fromSchemaError("decode-wire-message", cause),
+    );
+  }
+};
 
 export const decodeFailedLogPayload = (error: CodexError.CodexAppServerProtocolParseError) => ({
   operation: error.operation,

@@ -193,9 +193,22 @@ function summarizeProviderEvent(event: unknown): unknown {
   }
 }
 
-export function boundProviderEventForLogging(event: unknown): unknown {
+interface RecordUsage {
+  readonly characters: number;
+  readonly fields: number;
+  // Arrays are rejected by length before their items are counted, so this can exceed `fields`.
+  readonly requiredFields: number;
+  readonly depth: number;
+}
+
+// Events the adapters bounded whole, so the record that wraps one does not walk it again.
+const fittingEventUsage = new WeakMap<object, RecordUsage>();
+
+function measureProviderEvent(event: unknown, reuseFitting: boolean): RecordUsage | undefined {
   let remainingCharacters = MAX_RECORD_CHARACTERS;
   let remainingFields = MAX_RECORD_FIELDS;
+  let requiredFields = 0;
+  let depthReached = 0;
   const ancestors = new WeakSet<object>();
   const fits = (value: unknown, depth: number): boolean => {
     if (typeof value === "string") {
@@ -204,7 +217,23 @@ export function boundProviderEventForLogging(event: unknown): unknown {
     }
     if (typeof value !== "object" || value === null) return true;
     if (depth > MAX_RECORD_DEPTH || ancestors.has(value)) return false;
-    if (Array.isArray(value) && value.length > remainingFields) return false;
+    const usedFields = MAX_RECORD_FIELDS - remainingFields;
+    const known = reuseFitting ? fittingEventUsage.get(value) : undefined;
+    if (known !== undefined) {
+      if (depth + known.depth > MAX_RECORD_DEPTH || remainingFields < known.requiredFields) {
+        return false;
+      }
+      requiredFields = Math.max(requiredFields, usedFields + known.requiredFields);
+      depthReached = Math.max(depthReached, depth + known.depth);
+      remainingFields -= known.fields;
+      remainingCharacters -= known.characters;
+      return remainingCharacters >= 0;
+    }
+    if (depth > depthReached) depthReached = depth;
+    if (Array.isArray(value)) {
+      if (value.length > remainingFields) return false;
+      requiredFields = Math.max(requiredFields, usedFields + value.length);
+    }
     ancestors.add(value);
     for (const key in value) {
       if (!Object.hasOwn(value, key)) continue;
@@ -221,9 +250,24 @@ export function boundProviderEventForLogging(event: unknown): unknown {
     return true;
   };
   try {
-    if (fits(event, 0)) return event;
-  } catch {}
-  return summarizeProviderEvent(event);
+    if (!fits(event, 0)) return undefined;
+  } catch {
+    return undefined;
+  }
+  const fields = MAX_RECORD_FIELDS - remainingFields;
+  return {
+    characters: MAX_RECORD_CHARACTERS - remainingCharacters,
+    fields,
+    requiredFields: Math.max(requiredFields, fields),
+    depth: depthReached,
+  };
+}
+
+export function boundProviderEventForLogging(event: unknown): unknown {
+  const usage = measureProviderEvent(event, false);
+  if (usage === undefined) return summarizeProviderEvent(event);
+  if (typeof event === "object" && event !== null) fittingEventUsage.set(event, usage);
+  return event;
 }
 
 const serialize = (stream: EventNdjsonStream, event: unknown): SerializedEventNdjsonRecord => {
@@ -238,7 +282,10 @@ export function serializeEventNdjsonRecord(
   event: unknown,
 ): SerializedEventNdjsonRecord {
   if (!shouldPersistProviderEvent(stream, event)) return skipped;
-  const record = serialize(stream, boundProviderEventForLogging(event));
+  const record = serialize(
+    stream,
+    measureProviderEvent(event, true) === undefined ? summarizeProviderEvent(event) : event,
+  );
   // Escaping can expand strings beyond their input size.
   if (record._tag === "Serialized" && Buffer.byteLength(record.payload) > MAX_RECORD_CHARACTERS) {
     return serialize(stream, summarizeProviderEvent(event));

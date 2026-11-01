@@ -72,14 +72,12 @@ type Container = ReadonlyArray<Json> | { readonly [key: string]: Json };
 const isContainer = (value: Json): value is Container =>
   typeof value === "object" && value !== null;
 
-const childrenOf = (container: Container): ReadonlyArray<Json> =>
-  Array.isArray(container) ? container : Object.values(container);
+// Deeper values are written level by level: JSON.stringify recurses, and deep enough it throws.
+// Kept low so the lookahead below stays cheap on deeply nested values.
+const MAX_NATIVE_DEPTH = 128;
 
-// Deeper values are written level by level: JSON.stringify recurses, and a deep enough one throws.
-const MAX_NATIVE_DEPTH = 1_000;
-
-// Whether to write it level by level: about its JSON length (escapes can add more) exceeds a chunk,
-// or it nests too deep for JSON.stringify. Stops as soon as either holds, so it costs a chunk at most.
+// Lookahead: whether its JSON is about longer than a chunk (escapes can add more) or nests too
+// deep for one JSON.stringify. Stops as soon as either holds, so it costs a chunk at most.
 const tooLargeForOneString = (root: Json) => {
   let budget = CHUNK_CHARS;
   const pending: Array<readonly [Json, number]> = [[root, 0]];
@@ -88,50 +86,20 @@ const tooLargeForOneString = (root: Json) => {
     if (typeof value === "string") budget -= value.length + 2;
     else if (!isContainer(value)) budget -= 8;
     else if (depth >= MAX_NATIVE_DEPTH) return true;
-    else {
-      const keys = Array.isArray(value) ? [] : Object.keys(value);
-      const children = childrenOf(value);
-      budget -= children.length + 2;
-      for (let index = 0; index < children.length && budget >= 0; index++) {
-        budget -= (keys[index]?.length ?? 0) + 2;
-        pending.push([children[index]!, depth + 1]);
+    else if (Array.isArray(value)) {
+      // Every element costs at least its comma, so a longer array is over budget already.
+      if ((budget -= value.length + 2) >= 0) {
+        for (const element of value) pending.push([element, depth + 1]);
+      }
+    } else {
+      budget -= 2;
+      for (const key in value) {
+        if ((budget -= key.length + 3) < 0) break;
+        pending.push([(value as Readonly<Record<string, Json>>)[key]!, depth + 1]);
       }
     }
   }
   return budget < 0;
-};
-
-// Each container's JSON length (before escapes, capped just above a chunk) and nesting height, in
-// one post-order pass.
-const containerSizes = (root: Container) => {
-  const sizes = new Map<Container, { readonly length: number; readonly height: number }>();
-  const stack = [{ container: root, children: childrenOf(root), index: 0 }];
-  while (stack.length > 0) {
-    const frame = stack.at(-1)!;
-    const child = frame.children[frame.index];
-    if (child !== undefined && isContainer(child) && !sizes.has(child)) {
-      stack.push({ container: child, children: childrenOf(child), index: 0 });
-      continue;
-    }
-    if (frame.index++ < frame.children.length) continue;
-    stack.pop();
-    let length = 2 + frame.children.length;
-    let height = 1;
-    if (!Array.isArray(frame.container)) {
-      for (const key of Object.keys(frame.container)) length += key.length + 2;
-    }
-    for (const value of frame.children) {
-      if (typeof value === "string") length += value.length + 2;
-      else if (!isContainer(value)) length += 8;
-      else {
-        const size = sizes.get(value)!;
-        length += size.length;
-        height = Math.max(height, size.height + 1);
-      }
-    }
-    sizes.set(frame.container, { length: Math.min(length, CHUNK_CHARS + 1), height });
-  }
-  return sizes;
 };
 
 // Never between the halves of a surrogate pair: apart, each half encodes differently.
@@ -155,9 +123,6 @@ function* stringParts(text: string): Generator<string> {
   yield '"';
 }
 
-const isOneString = ({ length, height }: { readonly length: number; readonly height: number }) =>
-  length <= CHUNK_CHARS && height <= MAX_NATIVE_DEPTH;
-
 /** JSON.stringify of a JSON value in parts of about a chunk or less, without recursion. */
 function* jsonParts(root: Json): Generator<string> {
   if (!tooLargeForOneString(root)) {
@@ -168,38 +133,42 @@ function* jsonParts(root: Json): Generator<string> {
     yield* stringParts(root as string);
     return;
   }
-  const sizes = containerSizes(root);
+  // Only the open containers are held: each with its keys, if an object, and the next index.
   const stack: Array<{
     readonly container: Container;
     readonly keys: ReadonlyArray<string> | undefined;
-    readonly children: ReadonlyArray<Json>;
     index: number;
   }> = [];
   let next: Json | undefined = root;
   while (true) {
     if (next !== undefined) {
       if (typeof next === "string") yield* stringParts(next);
-      else if (!isContainer(next) || isOneString(sizes.get(next)!)) yield JSON.stringify(next);
-      else {
+      else if (!isContainer(next) || (next !== root && !tooLargeForOneString(next))) {
+        yield JSON.stringify(next);
+      } else {
         const keys = Array.isArray(next) ? undefined : Object.keys(next);
         yield keys === undefined ? "[" : "{";
-        stack.push({ container: next, keys, children: childrenOf(next), index: 0 });
+        stack.push({ container: next, keys, index: 0 });
       }
       next = undefined;
     }
     const frame = stack.at(-1);
     if (frame === undefined) return;
-    if (frame.index === frame.children.length) {
+    const { container, keys } = frame;
+    if (frame.index === (keys ?? (container as ReadonlyArray<Json>)).length) {
       stack.pop();
-      yield frame.keys === undefined ? "]" : "}";
+      yield keys === undefined ? "]" : "}";
       continue;
     }
     if (frame.index > 0) yield ",";
-    if (frame.keys !== undefined) {
-      yield* stringParts(frame.keys[frame.index]!);
+    if (keys === undefined) next = (container as ReadonlyArray<Json>)[frame.index]!;
+    else {
+      const key = keys[frame.index]!;
+      yield* stringParts(key);
       yield ":";
+      next = (container as Readonly<Record<string, Json>>)[key]!;
     }
-    next = frame.children[frame.index++]!;
+    frame.index++;
   }
 }
 

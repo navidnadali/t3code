@@ -876,6 +876,31 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
       }),
     );
 
+    it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+      "the xcrun lookup settles at its deadline when a descendant keeps stdout open",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-xcrun-" });
+          const descendantPid = path.join(directory, "descendant.pid");
+          const xcrun = path.join(directory, "xcrun");
+          yield* fs.writeFileString(
+            xcrun,
+            `#!/bin/sh\nsleep 600 &\necho $! > '${descendantPid}'\necho /fake/git\n`,
+          );
+          yield* fs.chmod(xcrun, 0o755);
+          const stopDescendant = fs.readFileString(descendantPid).pipe(
+            Effect.flatMap((pid) => Effect.sync(() => process.kill(Number(pid.trim())))),
+            Effect.ignore,
+          );
+          const located = yield* Effect.promise(() =>
+            locateXcodeGitWithXcrun({ PATH: "/usr/bin:/bin" }, { xcrun, timeoutMs: 200 }),
+          ).pipe(Effect.ensuring(stopDescendant));
+          expect(located).toBeUndefined();
+        }).pipe(Effect.scoped),
+    );
+
     it.effect("keeps git when PATH has another git or the host is not macOS", () =>
       Effect.gen(function* () {
         const homebrew = setup({ gitOnPath: "/opt/homebrew/bin/git", xcrunGit: XCODE_GIT });

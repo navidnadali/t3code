@@ -177,29 +177,56 @@ describe("WorkerChildProcessSpawner", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live.skipIf(!workerPlatform)("kills the children of a worker that stops", () =>
+  it.live.skipIf(!workerPlatform)(
+    "kills the children of a worker that stops, without waiting on them",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        // The worker throws on the first stdin write, after the child is running.
+        const workerSource = WorkerChildProcessSpawner.spawnWorkerSource.replace(
+          'case "stdin":',
+          'case "stdin": throw new Error("worker crashed");',
+        );
+        expect(workerSource).not.toBe(WorkerChildProcessSpawner.spawnWorkerSource);
+        for (const detached of [true, false]) {
+          const workerSpawner = yield* WorkerChildProcessSpawner.make(nodeSpawner, {
+            workerSource,
+          });
+          const kill = vi.spyOn(process, "kill");
+          yield* Effect.gen(function* () {
+            const handle = yield* workerSpawner.spawn(
+              node("process.stdin.resume(); setInterval(() => {}, 1000)", { detached }),
+            );
+            yield* Stream.run(Stream.make(new Uint8Array([1])), handle.stdin).pipe(Effect.ignore);
+            const error = yield* Effect.flip(handle.exitCode);
+            expect(summarizeError(error).causeMessage).toContain("SIGKILL");
+            expect(yield* handle.isRunning).toBe(false);
+            expect(kill).toHaveBeenCalledWith(detached ? -handle.pid : handle.pid, "SIGKILL");
+            // Only the stopped worker could reap the child, and Linux signals a zombie's group as
+            // if it were alive: simulate that, and expect no wait on it.
+            const realKill = process.kill.bind(process);
+            kill.mockImplementation((pid, signal) =>
+              pid === -handle.pid && (signal === 0 || signal === "SIGTERM")
+                ? true
+                : realKill(pid, signal),
+            );
+            yield* handle.kill();
+            expect(kill).not.toHaveBeenCalledWith(-handle.pid, 0);
+          }).pipe(Effect.scoped, Effect.ensuring(Effect.sync(() => kill.mockRestore())));
+        }
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("runs the command on the fallback spawner when the worker cannot start", () =>
     Effect.gen(function* () {
-      const nodeSpawner = yield* ChildProcessSpawner;
-      // The worker throws on the first stdin write, after the child is running.
-      const workerSource = WorkerChildProcessSpawner.spawnWorkerSource.replace(
-        'case "stdin":',
-        'case "stdin": throw new Error("worker crashed");',
-      );
-      expect(workerSource).not.toBe(WorkerChildProcessSpawner.spawnWorkerSource);
-      for (const detached of [true, false]) {
-        const workerSpawner = yield* WorkerChildProcessSpawner.make(nodeSpawner, { workerSource });
-        const kill = vi.spyOn(process, "kill");
-        yield* Effect.gen(function* () {
-          const handle = yield* workerSpawner.spawn(
-            node("process.stdin.resume(); setInterval(() => {}, 1000)", { detached }),
-          );
-          yield* Stream.run(Stream.make(new Uint8Array([1])), handle.stdin).pipe(Effect.ignore);
-          const error = yield* Effect.flip(handle.exitCode);
-          expect(summarizeError(error).causeMessage).toContain("SIGKILL");
-          expect(yield* handle.isRunning).toBe(false);
-          expect(kill).toHaveBeenCalledWith(detached ? -handle.pid : handle.pid, "SIGKILL");
-        }).pipe(Effect.scoped, Effect.ensuring(Effect.sync(() => kill.mockRestore())));
-      }
+      const { calls, spawner } = yield* recordingSpawner;
+      // Node rejects a non-string eval source synchronously, like any failed construction.
+      const workerSpawner = yield* WorkerChildProcessSpawner.make(spawner, {
+        workerSource: 0 as unknown as string,
+      });
+      const command = node("process.stdout.write('fallback')");
+      expect((yield* collect(workerSpawner, command)).stdout).toBe("fallback");
+      expect(calls).toEqual([command]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

@@ -1533,6 +1533,45 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
+  it.effect("runs the hooks the query opened with, as the SDK captures them at initialize", () =>
+    Effect.gen(function* () {
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner }) =>
+          Effect.gen(function* () {
+            const ran: Array<string> = [];
+            const matcher: HookCallbackMatcher = {
+              matcher: "Bash",
+              hooks: [
+                async () => {
+                  ran.push("opened with");
+                  return { continue: true };
+                },
+              ],
+            };
+            const hooks: NonNullable<ClaudeQueryOptions["hooks"]> = { PreToolUse: [matcher] };
+            const cli = new FakeClaudeCli();
+            const session = yield* runner.open(openInput(cli, { hooks }));
+            // Neither replacing a matcher's hook nor the event's matchers reaches the open query.
+            matcher.hooks[0] = async () => {
+              ran.push("replaced");
+              return { continue: false };
+            };
+            hooks.PreToolUse = [];
+            const answer = yield* Effect.promise(() =>
+              cli.request(hookRequest("hook_0", "toolu-replaced")),
+            );
+            yield* session.close;
+            return { ran, answer: answer.response };
+          }),
+        );
+      const inThread = yield* run("thread");
+      const inWorker = yield* run("worker");
+
+      assert.deepStrictEqual(inThread.ran, ["opened with"]);
+      assert.deepStrictEqual(inWorker, inThread);
+    }),
+  );
+
   it.effect("relays T3's SubagentStart hook to main and answers it as in-thread", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>

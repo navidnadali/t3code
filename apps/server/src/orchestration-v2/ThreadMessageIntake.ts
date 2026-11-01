@@ -63,19 +63,17 @@ const withGuestAttachments = Effect.fn("ThreadMessageIntake.withGuestAttachments
 ) {
   if (command.guestMessageId === undefined) return command;
   const threads = yield* ThreadManagement.ThreadManagementService;
-  // Only the thread record is needed; the window keeps the read small.
-  const { projection } = yield* threads
-    .getThreadSnapshotWindow(command.threadId, { rowLimit: 1 })
-    .pipe(
-      Effect.mapError(
-        (cause) =>
-          new AttachmentClaims.AttachmentClaimError({
-            message: "Failed to read the guest message.",
-            cause,
-          }),
-      ),
-    );
-  const message = projection.thread.guestShare?.messages.find(
+  // Only the thread record is needed; reading it alone never waits behind a large decode.
+  const { thread } = yield* threads.getThreadRecords(command.threadId, []).pipe(
+    Effect.mapError(
+      (cause) =>
+        new AttachmentClaims.AttachmentClaimError({
+          message: "Failed to read the guest message.",
+          cause,
+        }),
+    ),
+  );
+  const message = thread.guestShare?.messages.find(
     (candidate) => candidate.id === command.guestMessageId && candidate.status === "pending",
   );
   return { ...command, attachments: message?.attachments ?? [] };

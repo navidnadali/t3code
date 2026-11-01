@@ -89,6 +89,8 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
+import type * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import type * as Statement from "effect/sql/Statement";
 
@@ -378,6 +380,17 @@ export type ProjectionRecordField = Exclude<
   keyof OrchestrationV2ThreadProjection,
   "thread" | "updatedAt" | "visibleTurnItems"
 >;
+// Tables that grow with a thread's items and text; records that read one hold a large row set.
+const HISTORY_RECORD_FIELDS: ReadonlySet<ProjectionRecordField> = new Set([
+  "turnItems",
+  "nodes",
+  "messages",
+  "subagents",
+  "plans",
+  "contextHandoffs",
+  "contextTransfers",
+]);
+
 export type ProjectionRecords<K extends ProjectionRecordField> = Pick<
   OrchestrationV2ThreadProjection,
   "thread" | K
@@ -7299,20 +7312,52 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       (...args: Args): Effect.Effect<A, E, R> =>
         method(...args).pipe(NodeSqliteClient.readOnly);
 
-    // These reads decode after their transaction, so a permit, not the reader slot, caps how
-    // many hold rows at once. A read inside a transaction keeps that transaction's connection.
-    const decodeOnReader =
+    // Reads of a thread's history, whole or a page, hold a reader permit from before their
+    // transaction until decoded, so the pool size bounds those row sets. Reads whose rows the history
+    // does not multiply (thread row, shells, bookkeeping at a few KB per run) take none and never
+    // wait behind a large decode. A read inside a transaction keeps that transaction's connection.
+    const permitsToTake = Effect.serviceOption(sql.transactionService).pipe(
+      Effect.map((transaction) => (Option.isNone(transaction) ? readerPermits : undefined)),
+    );
+    const historyOnReader =
       <Args extends ReadonlyArray<unknown>, A, E, R>(
         method: (...args: Args) => Effect.Effect<A, E, R>,
       ) =>
       (...args: Args): Effect.Effect<A, E, R> =>
-        Effect.serviceOption(sql.transactionService).pipe(
-          Effect.flatMap((transaction) =>
-            readerPermits === undefined || Option.isSome(transaction)
-              ? method(...args)
-              : readerPermits.withPermits(1)(method(...args)),
+        permitsToTake.pipe(
+          Effect.flatMap((permits) =>
+            permits === undefined ? method(...args) : permits.withPermits(1)(method(...args)),
           ),
           NodeSqliteClient.readOnly,
+        );
+    // Takes a permit for the current scope. Only the wait is interruptible: the take and its
+    // release finalizer happen together, so an interruption cannot keep a permit.
+    const takePermitScoped = (permits: Semaphore.Semaphore) =>
+      Effect.uninterruptibleMask((restore) => {
+        const attempt: Effect.Effect<void, never, Scope.Scope> = permits
+          .takeIfAvailable(1)
+          .pipe(
+            Effect.flatMap((taken) =>
+              taken
+                ? Effect.addFinalizer(() => permits.release(1))
+                : restore(permits.withPermits(1)(Effect.void)).pipe(Effect.andThen(attempt)),
+            ),
+          );
+        return attempt;
+      });
+    // The same for a stream, holding the permit until the stream ends.
+    const historyStreamOnReader =
+      <Args extends ReadonlyArray<unknown>, A, E, R>(
+        method: (...args: Args) => Stream.Stream<A, E, R>,
+      ) =>
+      (...args: Args): Stream.Stream<A, E, R> =>
+        Stream.unwrap(
+          permitsToTake.pipe(
+            Effect.flatMap((permits) =>
+              permits === undefined ? Effect.void : takePermitScoped(permits),
+            ),
+            Effect.as(method(...args)),
+          ),
         );
 
     return {
@@ -7323,14 +7368,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       listActiveShellIndex: readOnReader(listActiveShellIndex),
       readShellSnapshot: readOnReader(readShellSnapshot),
       listOlderSettledThreads: readOnReader(listOlderSettledThreads),
-      getThreadShell: decodeOnReader(getThreadShell),
+      getThreadShell: readOnReader(getThreadShell),
       findGuestShareThreadId: readOnReader(findGuestShareThreadId),
       getThread: readOnReader(getThread),
-      getSettlementCandidates: decodeOnReader(getSettlementCandidates),
+      getSettlementCandidates: readOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
       getOpenRemoteDelegatedTasks: getOpenRemoteDelegatedTasks.pipe(NodeSqliteClient.readOnly),
-      getThreadProjection: decodeOnReader((threadId: ThreadId) =>
+      getThreadProjection: historyOnReader((threadId: ThreadId) =>
         sql.withTransaction(readFullProjectionRows(threadId, new Set())).pipe(
           Effect.flatMap(decodeFullProjection),
           Effect.mapError((cause) =>
@@ -7340,8 +7385,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ),
         ),
       ),
-      getTurnStartContext: decodeOnReader(getTurnStartContext),
-      getTurnStartHistory: readOnReader(getTurnStartHistory),
+      getTurnStartContext: historyOnReader(getTurnStartContext),
+      getTurnStartHistory: historyOnReader(getTurnStartHistory),
       getRuntimeRecoveryProjection: readOnReader(getRuntimeRecoveryProjection),
       getRunningTurnContext: readOnReader(getRunningTurnContext),
       getThreadProviderContext: readOnReader(getThreadProviderContext),
@@ -7360,7 +7405,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getNextTurnItemOrdinal: readOnReader(getNextTurnItemOrdinal),
       getTurnItem: readOnReader(getTurnItem),
       getThreadRecords: (threadId, fields, filter) =>
-        decodeOnReader(getThreadRecords)(threadId, fields, filter),
+        (fields.some((field) => HISTORY_RECORD_FIELDS.has(field)) ? historyOnReader : readOnReader)(
+          getThreadRecords,
+        )(threadId, fields, filter),
       getRuntimeRequest: readOnReader(getRuntimeRequest),
       getPlan: readOnReader(getPlan),
       getProviderControlContext: readOnReader(getProviderControlContext),
@@ -7368,12 +7415,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getLimitRecoveryWakeAt: readOnReader(getLimitRecoveryWakeAt),
       getRecoveryThreadIds: readOnReader(getRecoveryThreadIds),
       getUnreadableThreadIds: readOnReader(getUnreadableThreadIds),
-      getThreadSnapshot: decodeOnReader(getThreadSnapshot),
-      getThreadSnapshotWindow: readOnReader(getThreadSnapshotWindow),
-      getTimelinePage: readOnReader(getTimelinePage),
-      getThreadHistoryPage: readOnReader(getThreadHistoryPage),
-      searchThread: readOnReader(searchThread),
-      searchThreadStream,
+      getThreadSnapshot: historyOnReader(getThreadSnapshot),
+      getThreadSnapshotWindow: historyOnReader(getThreadSnapshotWindow),
+      getTimelinePage: historyOnReader(getTimelinePage),
+      getThreadHistoryPage: historyOnReader(getThreadHistoryPage),
+      searchThread: historyOnReader(searchThread),
+      searchThreadStream: historyStreamOnReader(searchThreadStream),
       getThreadAttachmentIds: readOnReader(getThreadAttachmentIds),
     } satisfies ProjectionStoreV2Shape;
   }),

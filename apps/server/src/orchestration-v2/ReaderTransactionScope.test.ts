@@ -27,14 +27,19 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
+import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
+
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { encodeThreadHistoryCursor } from "./threadHistoryPaging.ts";
 
 const providerInstanceId = ProviderInstanceId.make("codex");
 const providerDriver = ProviderDriverKind.make("codex");
@@ -44,9 +49,22 @@ const modelSelection = {
 } satisfies ModelSelection;
 const at = (second: number) => DateTime.makeUnsafe(Date.UTC(2026, 0, 1, 0, 0, second));
 
-const layerFile = (filename: string, readerPoolSize?: number) =>
+const layerFile = (
+  filename: string,
+  readerPoolSize?: number,
+  readerPermits?: Semaphore.Semaphore,
+) =>
   EventSink.layer.pipe(
-    Layer.provideMerge(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+    Layer.provideMerge(
+      Layer.merge(
+        EventStore.layer,
+        readerPermits === undefined
+          ? ProjectionStore.layer
+          : ProjectionStore.layer.pipe(
+              Layer.provide(Layer.succeed(NodeSqliteClient.ReaderPermits, readerPermits)),
+            ),
+      ),
+    ),
     Layer.provideMerge(
       SqlitePersistence.layerFromPath(
         filename,
@@ -66,13 +84,16 @@ const withFileStore = <A, E>(
     | SqlClient.SqlClient
   >,
   readerPoolSize?: number,
+  readerPermits?: Semaphore.Semaphore,
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const directory = yield* fs.makeTempDirectoryScoped({ prefix });
     return yield* body.pipe(
-      Effect.provide(layerFile(path.join(directory, "statev2.sqlite"), readerPoolSize)),
+      Effect.provide(
+        layerFile(path.join(directory, "statev2.sqlite"), readerPoolSize, readerPermits),
+      ),
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
@@ -505,6 +526,8 @@ interface ReadCase {
   ) => Effect.Effect<unknown, ProjectionStore.ProjectionStoreV2Error>;
   /** Statements in the one reader transaction, whatever the size of the thread. */
   readonly statements: number;
+  /** Holds a thread's history, so it takes a reader permit. */
+  readonly permit: boolean;
   /** A row the read decodes, made undecodable. */
   readonly corrupt: (sql: SqlClient.SqlClient, fixture: Fixture) => Statement.Statement<unknown>;
   readonly error: string;
@@ -530,6 +553,7 @@ const readCases: ReadonlyArray<ReadCase> = [
     name: "thread projection",
     read: (store, fixture) => store.getThreadProjection(fixture.fork),
     statements: 32,
+    permit: true,
     corrupt: corruptRows.forkToolItem,
     error: "ProjectionStoreReadError",
   },
@@ -537,6 +561,7 @@ const readCases: ReadonlyArray<ReadCase> = [
     name: "thread snapshot",
     read: (store, fixture) => store.getThreadSnapshot(fixture.fork),
     statements: 33,
+    permit: true,
     corrupt: corruptRows.forkToolItem,
     error: "ProjectionStoreReadError",
   },
@@ -550,6 +575,7 @@ const readCases: ReadonlyArray<ReadCase> = [
         "turnItems",
       ]),
     statements: 6,
+    permit: true,
     corrupt: corruptRows.subagent,
     error: "ProjectionStoreReadError",
   },
@@ -557,6 +583,7 @@ const readCases: ReadonlyArray<ReadCase> = [
     name: "turn start context",
     read: (store, fixture) => store.getTurnStartContext(fixture.fork, fixture.forkRunId),
     statements: 14,
+    permit: true,
     corrupt: corruptRows.subagent,
     error: "ProjectionStoreReadError",
   },
@@ -564,6 +591,7 @@ const readCases: ReadonlyArray<ReadCase> = [
     name: "thread shell",
     read: (store, fixture) => store.getThreadShell(fixture.fork),
     statements: 7,
+    permit: false,
     corrupt: corruptRows.sourceThread,
     error: "ProjectionStoreReadError",
   },
@@ -571,6 +599,7 @@ const readCases: ReadonlyArray<ReadCase> = [
     name: "settlement candidates",
     read: (store, fixture) => store.getSettlementCandidates(fixture.fork),
     statements: 3,
+    permit: false,
     corrupt: corruptRows.forkThread,
     error: "ProjectionStoreSetupError",
   },
@@ -849,7 +878,7 @@ const isDecodeSpan = (span: Tracer.AnySpan) =>
   span._tag === "Span" && span.name.startsWith("ProjectionStore.decode");
 
 // A read holds rows from its first statement until its outermost decode span ends.
-it.effect.each(readCases)(
+it.effect.each(readCases.filter((readCase) => readCase.permit))(
   "lets no more $name reads hold rows at once than the pool has readers",
   (readCase) =>
     withFileStore(
@@ -911,7 +940,7 @@ it.effect("reads inside a write transaction without waiting for a reader permit"
       const fixture = yield* writeFixture("permit-tx", 2);
       const holding = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
-      const holder = yield* store.getThreadRecords(fixture.fork, ["runs"]).pipe(
+      const holder = yield* store.getThreadRecords(fixture.fork, ["runs", "turnItems"]).pipe(
         Effect.provideService(Statement.CurrentTransformer, (statement) =>
           Deferred.succeed(holding, undefined).pipe(
             Effect.andThen(Deferred.await(release)),
@@ -922,10 +951,211 @@ it.effect("reads inside a write transaction without waiting for a reader permit"
       );
       yield* Deferred.await(holding);
       // The only permit is taken; this read has the writer and must not wait for it.
-      const inside = yield* sql.withTransaction(store.getThreadRecords(fixture.fork, ["runs"]));
+      const inside = yield* sql.withTransaction(
+        store.getThreadRecords(fixture.fork, ["runs", "turnItems"]),
+      );
       yield* Deferred.succeed(release, undefined);
       assert.deepStrictEqual(yield* Fiber.join(holder), inside);
     }),
     1,
   ),
+);
+
+// Reader permits all held, as by large decodes: a read that asks for one fails instead of waiting.
+const heldReaderPermits = () => {
+  const semaphore = Semaphore.makeUnsafe(2);
+  const waited = Effect.die(new Error("waited for a reader permit"));
+  return Effect.as(
+    semaphore.take(2),
+    new Proxy(semaphore, {
+      get: (target, key, receiver) =>
+        key === "withPermits"
+          ? (permits: number) =>
+              <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+                target
+                  .withPermitsIfAvailable(permits)(effect)
+                  .pipe(
+                    Effect.flatMap(Option.match({ onNone: () => waited, onSome: Effect.succeed })),
+                  )
+          : key === "take"
+            ? (permits: number) =>
+                target
+                  .takeIfAvailable(permits)
+                  .pipe(Effect.flatMap((taken) => (taken ? Effect.succeed(permits) : waited)))
+            : Reflect.get(target, key, receiver),
+    }),
+  );
+};
+
+interface PermitCase {
+  readonly name: string;
+  readonly read: (
+    store: Store,
+    fixture: Fixture,
+  ) => Effect.Effect<unknown, ProjectionStore.ProjectionStoreV2Error>;
+}
+
+const smallReads: ReadonlyArray<PermitCase> = [
+  { name: "thread shell", read: (store, fixture) => store.getThreadShell(fixture.fork) },
+  {
+    name: "thread's settlement candidates",
+    read: (store, fixture) => store.getSettlementCandidates(fixture.fork),
+  },
+  { name: "settlement sweep", read: (store) => store.getSettlementCandidates() },
+  { name: "thread record", read: (store, fixture) => store.getThreadRecords(fixture.fork, []) },
+  {
+    name: "run records",
+    read: (store, fixture) => store.getThreadRecords(fixture.fork, ["runs", "attempts"]),
+  },
+];
+
+const largeReads: ReadonlyArray<PermitCase> = [
+  ...readCases.filter((readCase) => readCase.permit),
+  {
+    name: "thread snapshot window",
+    read: (store, fixture) => store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
+  },
+  {
+    name: "timeline page",
+    read: (store, fixture) => store.getTimelinePage(fixture.fork, { limit: 50 }),
+  },
+  {
+    name: "history page",
+    read: (store, fixture) =>
+      store.getThreadHistoryPage(
+        fixture.fork,
+        encodeThreadHistoryCursor({
+          snapshotSequence: 0,
+          sourceThreadId: fixture.fork,
+          sourceItemId: TurnItemId.make("item:held:fork:10"),
+          position: 10,
+        }),
+      ),
+  },
+  {
+    name: "turn-start history",
+    read: (store, fixture) => store.getTurnStartHistory(fixture.fork),
+  },
+  {
+    name: "thread search",
+    read: (store, fixture) => store.searchThread({ threadId: fixture.fork, query: "fork" }),
+  },
+  {
+    name: "streamed thread search",
+    read: (store, fixture) =>
+      Stream.runCollect(store.searchThreadStream({ threadId: fixture.fork, query: "fork" })),
+  },
+];
+
+const withHeldPermits = <A>(
+  prefix: string,
+  body: (store: Store, fixture: Fixture) => Effect.Effect<A>,
+) =>
+  Effect.gen(function* () {
+    const permits = yield* heldReaderPermits();
+    return yield* withFileStore(
+      prefix,
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        return yield* body(store, yield* writeFixture("held", 20));
+      }),
+      2,
+      permits,
+    );
+  });
+
+it.effect.each(smallReads)(
+  "completes a $name read while large reads hold every reader permit",
+  (permitCase) =>
+    withHeldPermits("reader-scope-small-", (store, fixture) =>
+      Effect.exit(permitCase.read(store, fixture)),
+    ).pipe(Effect.map((exit) => assert.isTrue(Exit.isSuccess(exit), String(exit)))),
+);
+
+it.effect.each(largeReads)("waits for a reader permit for a $name read", (permitCase) =>
+  withHeldPermits("reader-scope-large-", (store, fixture) =>
+    Effect.exit(permitCase.read(store, fixture)),
+  ).pipe(
+    Effect.map((exit) =>
+      assert.include(
+        String(Exit.isFailure(exit) ? exit.cause : exit),
+        "waited for a reader permit",
+      ),
+    ),
+  ),
+);
+
+it.effect("gives back a streamed search's reader permit however the stream ends", () =>
+  withFileStore(
+    "reader-scope-search-permit-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("search-permit", 2);
+      const search = store.searchThreadStream({ threadId: fixture.fork, query: "fork" });
+      yield* Effect.exit(Stream.runCollect(search));
+      yield* Effect.exit(Stream.runHead(search));
+      // The pool has one permit; a kept one would leave this read waiting.
+      const snapshot = yield* store.getThreadSnapshot(fixture.fork);
+      assert.strictEqual(snapshot.projection.thread.id, fixture.fork);
+    }),
+    1,
+  ),
+);
+
+it.effect("gives back a streamed search's reader permit when interrupted as it takes it", () =>
+  Effect.gen(function* () {
+    const semaphore = Semaphore.makeUnsafe(1);
+    const taken = yield* Deferred.make<void>();
+    // Once a permit is taken, let the test interrupt the search before it goes on.
+    const pauseAfter = <A>(effect: Effect.Effect<A>) =>
+      effect.pipe(
+        Effect.tap(() => Deferred.succeed(taken, undefined)),
+        Effect.tap(() => Effect.yieldNow),
+      );
+    const permits = new Proxy(semaphore, {
+      get: (target, key, receiver) =>
+        key === "take"
+          ? (count: number) => pauseAfter(target.take(count))
+          : key === "takeIfAvailable"
+            ? (count: number) => pauseAfter(target.takeIfAvailable(count))
+            : Reflect.get(target, key, receiver),
+    });
+    yield* withFileStore(
+      "reader-scope-search-interrupt-",
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const fixture = yield* writeFixture("search-interrupt", 2);
+        const search = yield* Stream.runCollect(
+          store.searchThreadStream({ threadId: fixture.fork, query: "fork" }),
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(taken);
+        yield* Fiber.interrupt(search);
+      }),
+      1,
+      permits,
+    );
+    assert.isTrue(yield* semaphore.takeIfAvailable(1));
+  }),
+);
+
+it.effect("lets a streamed search waiting for a reader permit be interrupted", () =>
+  Effect.gen(function* () {
+    const permits = Semaphore.makeUnsafe(1);
+    yield* permits.take(1);
+    yield* withFileStore(
+      "reader-scope-search-wait-",
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const fixture = yield* writeFixture("search-wait", 2);
+        const search = yield* Stream.runCollect(
+          store.searchThreadStream({ threadId: fixture.fork, query: "fork" }),
+        ).pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Fiber.interrupt(search);
+      }),
+      1,
+      permits,
+    );
+    yield* permits.release(1);
+    assert.isTrue(yield* permits.takeIfAvailable(1));
+  }),
 );

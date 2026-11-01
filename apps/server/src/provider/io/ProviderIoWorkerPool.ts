@@ -12,7 +12,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
-import type * as Scope from "effect/Scope";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { errorTag } from "@t3tools/shared/observability";
@@ -570,29 +570,30 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     Reply = never,
   >(input: ProviderIoOpenInput<Options, Output, E, Request, Reply>) {
     if (options.workers === 0) return Option.none();
-    // Only a session keeps its slot reserved; a failed, empty or interrupted open frees it at once.
+    // The open runs in its own scope, kept only when it returns a session: a failed, empty or
+    // interrupted open releases its reservation and any session at once.
+    const scope = yield* Scope.fork(yield* Effect.scope);
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const reserved = yield* reserve;
         if (Option.isNone(reserved)) return Option.none();
         const slot = reserved.value;
-        const unreserve = Effect.sync(() => {
-          slot.load -= 1;
-        });
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            slot.load -= 1;
+          }),
+        );
         const ready = yield* restore(Deferred.await(slot.handshake)).pipe(
           Effect.match({ onFailure: () => false, onSuccess: () => true }),
-          Effect.onInterrupt(() => unreserve),
         );
-        const session = ready
-          ? yield* makeSession(slot, input).pipe(Effect.onError(() => unreserve))
-          : Option.none();
-        if (Option.isNone(session)) {
-          yield* unreserve;
-          return session;
-        }
-        yield* Effect.addFinalizer(() => unreserve);
-        return session;
+        if (!ready) return Option.none();
+        return yield* makeSession(slot, input);
       }),
+    ).pipe(
+      Scope.provide(scope),
+      Effect.onExit((exit) =>
+        Exit.isSuccess(exit) && Option.isSome(exit.value) ? Effect.void : Scope.close(scope, exit),
+      ),
     );
   });
 

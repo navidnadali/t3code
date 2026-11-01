@@ -11,8 +11,9 @@ import { Rolldown } from "vite-plus/pack";
 const isLoaderName = (name: string) =>
   /require$/i.test(name) || name === "_load" || name === "dlopen";
 
-const findNonBuiltinLoads = (code: string): ReadonlyArray<string> => {
+const findLoads = (code: string) => {
   const found = new Set<string>();
+  const builtins = new Set<string>();
   const allowed = new Set<ts.Node>();
   const source = ts.createSourceFile(
     "worker.cjs",
@@ -27,6 +28,8 @@ const findNonBuiltinLoads = (code: string): ReadonlyArray<string> => {
       found.add(`${kind} of a computed name`);
     } else if (!NodeModule.isBuiltin(argument.text)) {
       found.add(`${kind} of "${argument.text}"`);
+    } else {
+      builtins.add(argument.text);
     }
   };
   const visit = (node: ts.Node): void => {
@@ -60,8 +63,35 @@ const findNonBuiltinLoads = (code: string): ReadonlyArray<string> => {
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return [...found].sort();
+  return { problems: [...found].sort(), builtins: [...builtins].sort() };
 };
+
+// Static checks cannot see computed names (`module[key]`), so the worker also runs with a
+// `require`, `module` and `process` that reach only the built-ins found above, and
+// worker_threads only as its own port: nothing can load a file from the working directory.
+const guard = (code: string, builtins: ReadonlyArray<string>) => `"use strict";
+{
+  const threads = require("node:worker_threads");
+  const port = Object.freeze({
+    parentPort: threads.parentPort,
+    workerData: threads.workerData,
+    threadId: threads.threadId,
+    isMainThread: threads.isMainThread,
+  });
+  const allowed = new Map(
+    ${JSON.stringify(builtins)}.map((id) => [id, /^(node:)?worker_threads$/.test(id) ? port : require(id)]),
+  );
+  const refuse = (what) => {
+    throw new Error("The provider I/O worker may load only the built-ins it was built with, not " + what + ".");
+  };
+  const load = (id) => (typeof id === "string" && allowed.has(id) ? allowed.get(id) : refuse(String(id)));
+  for (const name of ["dlopen", "binding", "_linkedBinding"]) process[name] = () => refuse("process." + name);
+  process.getBuiltinModule = load;
+  ((require, module, exports, __filename, __dirname) => {
+${code}
+  })(load, { exports: {} }, {}, "", "");
+}
+`;
 
 // An `eval` worker resolves any other module from the server's working directory.
 const bundleProviderIoWorker = async (entry: string) => {
@@ -77,19 +107,20 @@ const bundleProviderIoWorker = async (entry: string) => {
     },
   });
   const chunk = output[0];
+  const loads = findLoads(chunk.code);
   const problems = [
     ...unresolved,
     ...[...chunk.imports, ...chunk.dynamicImports]
       .filter((specifier) => !NodeModule.isBuiltin(specifier))
       .map((specifier) => `an external import of "${specifier}"`),
-    ...findNonBuiltinLoads(chunk.code),
+    ...loads.problems,
   ];
   if (problems.length > 0) {
     throw new Error(
       `The provider I/O worker bundle may load only Node built-ins:\n${problems.join("\n")}`,
     );
   }
-  return chunk.code;
+  return guard(chunk.code, loads.builtins);
 };
 
 const realpathOrSelf = (path: string) => {

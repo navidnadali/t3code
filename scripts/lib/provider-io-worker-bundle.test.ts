@@ -147,7 +147,9 @@ const runEmbedded = (source: string, workerData?: unknown) =>
     worker.once("error", (error) => resume(Effect.succeed(`worker error: ${String(error)}`)));
   });
 
-it.effect("refuses at run time a load the build could not see", () =>
+// Threat model: bundled code must not resolve or load a module from the server's directory, and
+// must not reach the process-level escapes below. This is not a sandbox for hostile code.
+it.effect("refuses every route by which bundled code could load code from outside the bundle", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -177,6 +179,15 @@ it.effect("refuses at run time a load the build could not see", () =>
         "  return loaded.exports;\n" +
         "};\n" +
         'const globalModule = () => global[name("mod", "ule")].constructor;\n' +
+        // Only the guard's own refusal counts; any other error means the call went through.
+        "const guarded = (run: () => unknown) => () => {\n" +
+        "  try {\n" +
+        "    return run();\n" +
+        "  } catch (error) {\n" +
+        '    if (String((error as Error).message).includes("provider I/O worker")) throw error;\n' +
+        "    return `went through: ${(error as any).code ?? error}`;\n" +
+        "  }\n" +
+        "};\n" +
         "const attempts = [\n" +
         '  () => require(name(dir, "/planted.cjs")),\n' +
         "  () => (require as any).call(null, planted),\n" +
@@ -231,6 +242,15 @@ it.effect("refuses at run time a load the build could not see", () =>
         '  () => eval(name("Node", "Module")).registerHooks,\n' +
         '  () => eval(name("buil", "tin"))(name("node:", "module")).Module,\n' +
         '  () => eval(name("thr", "eads")).Worker,\n' +
+        // Process-level escapes: a signal to this process starts main's inspector, execve
+        // replaces the process, and ffi and sqlite extensions load native code.
+        "  guarded(() => process.kill(process.pid, 0)),\n" +
+        "  guarded(() => process.kill(0, 0)),\n" +
+        '  guarded(() => (process as any).execve("/nonexistent-p1-024")),\n' +
+        '  () => import(name("node:", "ffi")),\n' +
+        '  () => (process as any).getBuiltinModule(name("ff", "i")),\n' +
+        '  () => import(name("node:", "sqlite")).then((m: any) => m.DatabaseSync),\n' +
+        '  () => (process as any).getBuiltinModule(name("sq", "lite")).DatabaseSync,\n' +
         "];\n" +
         "void Promise.all(attempts.map(async (attempt) => {\n" +
         "  try {\n" +
@@ -242,7 +262,7 @@ it.effect("refuses at run time a load the build could not see", () =>
     const results = yield* runEmbedded(source, dir);
     assert.deepEqual(
       results,
-      Array.from({ length: 23 }, () => "refused"),
+      Array.from({ length: 30 }, () => "refused"),
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
@@ -259,6 +279,19 @@ it.effect("lets the worker use any built-in, however a bundled module names it",
       { "dep.cjs": 'module.exports = require("os").EOL;\n' },
     );
     assert.deepEqual(yield* runEmbedded(source), [true, "function"]);
+  }),
+);
+
+it.effect("runs the bundle as CommonJS would, with readable stack frames", () =>
+  Effect.gen(function* () {
+    const source = yield* embeddedSource(
+      'import * as NodeWorkerThreads from "node:worker_threads";\n' +
+        'const exportsFirst = eval("arguments[0] === exports && arguments[1] === require");\n' +
+        'NodeWorkerThreads.parentPort?.postMessage([exportsFirst, new Error("frame").stack]);\n',
+    );
+    const [exportsFirst, stack] = (yield* runEmbedded(source)) as [boolean, string];
+    assert.isTrue(exportsFirst);
+    assert.include(stack, "t3-provider-io-worker.js");
   }),
 );
 

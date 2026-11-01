@@ -1346,25 +1346,42 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
   const logRequest = (event: AcpSessionRequestLogEvent) =>
     options.requestLogger ? options.requestLogger(event) : Effect.void;
 
+  // The request is sent while its started record may still be appending, so a slow log cannot
+  // let a later request (an interrupt's session/cancel) reach the agent first. The outcome is
+  // logged after the started record, and a started record that fails fails the request.
   const runLoggedRequest = <A>(
     method: string,
     payload: unknown,
     effect: Effect.Effect<A, EffectAcpErrors.AcpError>,
   ): Effect.Effect<A, EffectAcpErrors.AcpError> =>
-    logRequest({ method, payload, status: "started" }).pipe(
-      Effect.flatMap(() =>
-        (options.onStderr ? Effect.raceFirst(effect, Deferred.await(stderrFailure)) : effect).pipe(
-          Effect.catch((error) =>
-            enrichProcessExitWithStderr(error).pipe(Effect.flatMap(Effect.fail)),
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const started = yield* logRequest({ method, payload, status: "started" }).pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const exit = yield* restore(
+          (options.onStderr
+            ? Effect.raceFirst(effect, Deferred.await(stderrFailure))
+            : effect
+          ).pipe(
+            Effect.catch((error) =>
+              enrichProcessExitWithStderr(error).pipe(Effect.flatMap(Effect.fail)),
+            ),
           ),
-          Effect.tap((result) =>
-            logRequest({
-              method,
-              payload,
-              status: "succeeded",
-              result,
-            }),
+        ).pipe(Effect.exit);
+        yield* Fiber.join(started);
+        return yield* restore(
+          exit.pipe(
+            Effect.tap((result) =>
+              logRequest({
+                method,
+                payload,
+                status: "succeeded",
+                result,
+              }),
+            ),
           ),
+        ).pipe(
           Effect.onError((cause) =>
             logRequest({
               method,
@@ -1373,8 +1390,8 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
               cause,
             }),
           ),
-        ),
-      ),
+        );
+      }),
     );
 
   const spawnCommand =
@@ -2587,11 +2604,12 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
                 ...payload,
               } satisfies EffectAcpSchema.PromptRequest;
               const completed = yield* Deferred.make<void>();
+              // Started at once, so the prompt is queued to the agent before it counts as dispatched.
               const fiber = yield* runLoggedRequest(
                 "session/prompt",
                 requestPayload,
                 acp.agent.prompt(requestPayload),
-              ).pipe(Effect.forkIn(runtimeScope));
+              ).pipe(Effect.forkIn(runtimeScope, { startImmediately: true }));
               const active = { fiber, completed } satisfies AcpActivePrompt;
               yield* Ref.set(activePromptRef, Option.some(active));
               if (promptOptions?.dispatched) {

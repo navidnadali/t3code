@@ -116,10 +116,13 @@ index ordered by update time.
 A projection read that orders messages by their first user or assistant turn item groups those
 items by `$.messageId` through a partial index on that expression (migration 78), so it does not
 parse every message item's payload; the index's expression and `WHERE` must stay identical to the
-query's. Migration 78 scans the turn-item table once on first start. Rolling back to a build
+query's. Migration 78 scans the turn-item table once on first start, and fails (so the server
+does not start) if a message item's payload is not valid JSON. Each message-item write re-parses
+the old and new payload for the index, so its cost grows with the payload. Rolling back to a build
 without it can delete its `effect_sql_migrations` row and keep the index, which writes keep
 current; `DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx` removes it.
-Finalizing a delegated task reads only that child's tasks and result transfers from the parent.
+Finalizing a delegated task reads only that child's tasks, and the transfers it sent to the
+parent, from the parent.
 
 Command palette results keep live VCS and linked pull-request queries leased to the visible
 viewport, including a small overscan region. Cached badges remain available while leases are

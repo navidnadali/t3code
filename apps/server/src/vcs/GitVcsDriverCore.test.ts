@@ -338,34 +338,35 @@ const caseInsensitiveFileSystem = (() => {
   return directory !== directory.toUpperCase() && NodeFS.existsSync(directory.toUpperCase());
 })();
 
-describe("config reads", () => {
-  const makeCountingDriver = Effect.gen(function* () {
-    const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const spawned: Array<ReadonlyArray<string>> = [];
-    const spawner = ChildProcessSpawner.make((command) => {
-      if (ChildProcess.isStandardCommand(command)) spawned.push(command.args);
-      return delegate.spawn(command);
-    });
-    const driver = yield* makeGitVcsDriverCore().pipe(
-      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-    );
-    return { driver, spawned };
+const makeCountingDriver = Effect.gen(function* () {
+  const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const spawned: Array<ReadonlyArray<string>> = [];
+  const spawner = ChildProcessSpawner.make((command) => {
+    if (ChildProcess.isStandardCommand(command)) spawned.push(command.args);
+    return delegate.spawn(command);
   });
+  const driver = yield* makeGitVcsDriverCore().pipe(
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+  );
+  return { driver, spawned };
+});
+// The config GitManager's local status refresh reads after statusDetailsLocal.
+const refreshStatus = (driver: GitVcsDriver.GitVcsDriver["Service"], cwd: string) =>
+  Effect.gen(function* () {
+    const details = yield* driver.statusDetailsLocal(cwd, {
+      includeDivergence: false,
+      includeBranchChanges: true,
+    });
+    const remoteName = yield* driver.readConfigValue(cwd, `branch.${details.branch}.remote`);
+    const remoteUrl =
+      (yield* driver.readConfigValue(cwd, `remote.${remoteName ?? "origin"}.url`)) ??
+      (yield* driver.readConfigValue(cwd, "remote.origin.url"));
+    return { details, remoteName, remoteUrl };
+  });
+
+describe("config reads", () => {
   const readsOnlyConfig = (args: ReadonlyArray<string>) =>
     args[0] === "config" || args[0] === "remote" || args[0] === "var";
-  // The config GitManager's local status refresh reads after statusDetailsLocal.
-  const refreshStatus = (driver: GitVcsDriver.GitVcsDriver["Service"], cwd: string) =>
-    Effect.gen(function* () {
-      const details = yield* driver.statusDetailsLocal(cwd, {
-        includeDivergence: false,
-        includeBranchChanges: true,
-      });
-      const remoteName = yield* driver.readConfigValue(cwd, `branch.${details.branch}.remote`);
-      const remoteUrl =
-        (yield* driver.readConfigValue(cwd, `remote.${remoteName ?? "origin"}.url`)) ??
-        (yield* driver.readConfigValue(cwd, "remote.origin.url"));
-      return { details, remoteName, remoteUrl };
-    });
 
   it.effect("runs no config reads on a refresh while the config is unchanged", () =>
     Effect.scoped(
@@ -818,6 +819,527 @@ describe("config reads", () => {
 
         assert.equal(yield* driver.readConfigValue(cwd, "t3.value"), "second");
         assert.deepStrictEqual(spawned, [["config", "--get", "t3.value"]]);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+});
+
+describe("ref and index reads", () => {
+  type TestServices = GitVcsDriver.GitVcsDriver | FileSystem.FileSystem | Path.Path;
+  type TestError = GitCommandError | PlatformError.PlatformError;
+  // The index path, upstream and base-branch probes of a status refresh.
+  const probesRefs = (args: ReadonlyArray<string>) =>
+    (args[0] === "rev-parse" && args[1] === "--git-path" && args.length === 3) ||
+    (args[0] === "rev-parse" && args.at(-1)!.endsWith("@{upstream}")) ||
+    args[0] === "show-ref";
+  const subcommand = (args: ReadonlyArray<string>) => {
+    let index = 0;
+    while (args[index] === "-c") index += 2;
+    while (args[index]?.startsWith("--")) index++;
+    return args[index];
+  };
+  const summarise = ({ details }: Effect.Success<ReturnType<typeof refreshStatus>>) =>
+    `${details.branch} ${details.branchChanges?.baseRef ?? "-"} +${details.branchChanges?.insertions}`;
+  const initMain = (cwd: string) =>
+    initRepoWithCommit(cwd).pipe(Effect.andThen(git(cwd, ["branch", "-M", "main"])));
+  const addRemote = (cwd: string, name: string, branches: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const remote = yield* makeTmpDir("git-vcs-driver-remote-");
+      yield* git(remote, ["init", "-q", "--bare"]);
+      yield* git(cwd, ["remote", "add", name, remote]);
+      yield* git(cwd, ["push", "-q", "-u", name, ...branches]);
+    });
+  const addOrigin = (cwd: string, branches: ReadonlyArray<string>) =>
+    addRemote(cwd, "origin", branches);
+  // main tracks up/trunk; without it the base falls back to origin/main.
+  const trackUpTrunk = (cwd: string) =>
+    Effect.gen(function* () {
+      yield* addOrigin(cwd, ["main"]);
+      yield* git(cwd, ["branch", "trunk"]);
+      yield* addRemote(cwd, "up", ["trunk"]);
+      yield* git(cwd, ["branch", "-q", "--set-upstream-to=up/trunk", "main"]);
+      return cwd;
+    });
+
+  it.effect("runs only the status and diff commands on a refresh while refs are unchanged", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initMain(cwd);
+        yield* writeTextFile(cwd, "README.md", "# edited\n");
+        yield* writeTextFile(cwd, "untracked.txt", "new\n");
+        const first = yield* refreshStatus(driver, cwd);
+        yield* refreshStatus(driver, cwd);
+        spawned.length = 0;
+
+        const warm = yield* refreshStatus(driver, cwd);
+
+        assert.deepStrictEqual(warm, first);
+        assert.equal(summarise(warm), "main - +2");
+        assert.deepStrictEqual(spawned.map(subcommand).toSorted(), [
+          "add",
+          "diff",
+          "diff",
+          "diff-index",
+          "ls-files",
+          "status",
+          "update-index",
+        ]);
+        const cold = yield* makeCountingDriver;
+        assert.deepStrictEqual(yield* refreshStatus(cold.driver, cwd), warm);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("reuses the resolved upstream while its refs and config are unchanged", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initMain(cwd);
+        yield* addOrigin(cwd, ["main"]);
+        const first = yield* refreshStatus(driver, cwd);
+        yield* refreshStatus(driver, cwd);
+        spawned.length = 0;
+
+        const warm = yield* refreshStatus(driver, cwd);
+
+        assert.deepStrictEqual(warm, first);
+        assert.equal(summarise(warm), "main origin/main +0");
+        assert.deepStrictEqual(spawned.filter(probesRefs), []);
+        const cold = yield* makeCountingDriver;
+        assert.deepStrictEqual(yield* refreshStatus(cold.driver, cwd), warm);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "reads the index path again after the directory moves behind a symbolic link",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { driver } = yield* makeCountingDriver;
+          const sandbox = yield* makeTmpDir();
+          const repository = NodePath.join(sandbox, "outer", "inner", "repo");
+          const cwd = NodePath.join(repository, "a");
+          NodeFS.mkdirSync(cwd, { recursive: true });
+          yield* initMain(repository);
+          for (let refresh = 0; refresh < 3; refresh++) {
+            assert.equal((yield* driver.statusDetailsLocal(cwd)).branch, "main");
+          }
+
+          // Git now prints ../../../.git/index, which the status check resolves from the link.
+          const moved = NodePath.join(repository, "x", "y", "a");
+          NodeFS.mkdirSync(NodePath.dirname(moved), { recursive: true });
+          NodeFS.renameSync(cwd, moved);
+          NodeFS.symlinkSync(moved, cwd);
+          NodeFS.mkdirSync(NodePath.join(sandbox, "outer", ".git"));
+          NodeFS.writeFileSync(NodePath.join(sandbox, "outer", ".git", "index.lock"), "");
+
+          const status = yield* driver.statusDetailsLocal(cwd).pipe(Effect.flip);
+          assert.include(status.detail, "index is locked");
+        }),
+      ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("reads the index path again when GIT_INDEX_FILE changes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initMain(cwd);
+        for (let refresh = 0; refresh < 3; refresh++) {
+          assert.equal((yield* driver.statusDetailsLocal(cwd)).branch, "main");
+        }
+        const index = NodePath.join(yield* makeTmpDir("git-index-"), "index");
+        NodeFS.copyFileSync(NodePath.join(cwd, ".git", "index"), index);
+        NodeFS.writeFileSync(`${index}.lock`, "");
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            process.env.GIT_INDEX_FILE = index;
+          }),
+          () => Effect.sync(() => delete process.env.GIT_INDEX_FILE),
+        );
+
+        const status = yield* driver.statusDetailsLocal(cwd).pipe(Effect.flip);
+        assert.include(status.detail, "index is locked");
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["emptied", "corrupt"] as const)(
+    "reads the index path again after HEAD is %s",
+    (state) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { driver } = yield* makeCountingDriver;
+          const cwd = yield* makeTmpDir();
+          yield* initMain(cwd);
+          for (let refresh = 0; refresh < 3; refresh++) {
+            assert.equal((yield* driver.statusDetailsLocal(cwd)).branch, "main");
+          }
+          NodeFS.writeFileSync(NodePath.join(cwd, ".git", "index.lock"), "");
+          NodeFS.writeFileSync(
+            NodePath.join(cwd, ".git", "HEAD"),
+            state === "emptied" ? "" : "not a ref\n",
+          );
+
+          const status = yield* driver.statusDetailsLocal(cwd);
+
+          assert.isFalse(status.isRepo);
+          const cold = yield* makeCountingDriver;
+          assert.deepStrictEqual(yield* cold.driver.statusDetailsLocal(cwd), status);
+        }),
+      ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["GIT_OBJECT_DIRECTORY", "alternates"] as const)(
+    "reads a ref again when its object store changes (%s)",
+    (change) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { driver, spawned } = yield* makeCountingDriver;
+          const source = yield* makeTmpDir();
+          yield* initMain(source);
+          const cwd = NodePath.join(yield* makeTmpDir(), "clone");
+          yield* git(source, ["clone", "-q", "--shared", source, cwd]);
+          const exists = driver.remoteBranchExists({ cwd, remoteName: "origin", refName: "main" });
+          assert.isTrue(yield* exists);
+          assert.isTrue(yield* exists);
+          spawned.length = 0;
+          assert.isTrue(yield* exists);
+          assert.deepStrictEqual(spawned, []);
+
+          if (change === "alternates") {
+            NodeFS.writeFileSync(NodePath.join(cwd, ".git", "objects", "info", "alternates"), "");
+          } else {
+            const objects = yield* makeTmpDir("git-objects-");
+            yield* Effect.acquireRelease(
+              Effect.sync(() => {
+                process.env.GIT_OBJECT_DIRECTORY = objects;
+              }),
+              () => Effect.sync(() => delete process.env.GIT_OBJECT_DIRECTORY),
+            );
+          }
+
+          assert.isFalse(yield* exists);
+          const cold = yield* makeCountingDriver;
+          assert.isFalse(
+            yield* cold.driver.remoteBranchExists({ cwd, remoteName: "origin", refName: "main" }),
+          );
+        }),
+      ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("does not reuse ref results when the refs are not loose files", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        const init = yield* driver.execute({
+          operation: "GitVcsDriver.test.git",
+          cwd,
+          args: ["init", "-q", "--ref-format=reftable"],
+          allowNonZeroExit: true,
+        });
+        // Git before 2.45 cannot create a reftable repository.
+        if (init.exitCode !== 0) return;
+        yield* git(cwd, [
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@test.com",
+          "commit",
+          "-q",
+          "--allow-empty",
+          "-m",
+          "initial",
+        ]);
+        // Git takes extensions from the repository's own config file only, not from includes.
+        const include = NodePath.join(yield* makeTmpDir("git-include-"), "storage.inc");
+        NodeFS.writeFileSync(include, "[extensions]\n\trefStorage = files\n");
+        yield* git(cwd, ["config", "include.path", include]);
+        yield* git(cwd, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        const exists = driver.remoteBranchExists({ cwd, remoteName: "origin", refName: "main" });
+        assert.isTrue(yield* exists);
+        assert.isTrue(yield* exists);
+        spawned.length = 0;
+        assert.isTrue(yield* exists);
+        assert.isTrue(spawned.some((args) => args[0] === "show-ref"));
+
+        yield* git(cwd, ["update-ref", "-d", "refs/remotes/origin/main"]);
+
+        assert.isFalse(yield* exists);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
+  interface RefChange {
+    readonly name: string;
+    // Prepares the repository at `cwd` and returns the directory to refresh.
+    readonly setup: (cwd: string) => Effect.Effect<string, TestError, Scope.Scope | TestServices>;
+    readonly change: (cwd: string) => Effect.Effect<void, TestError, TestServices>;
+    readonly before: string;
+    readonly after: string;
+    // False when a probe's result cannot be reused, so every refresh runs it.
+    readonly reused: boolean;
+  }
+  const changes: ReadonlyArray<RefChange> = [
+    {
+      name: "a branch created as a loose ref",
+      setup: Effect.succeed,
+      change: (cwd) => git(cwd, ["branch", "master"]).pipe(Effect.asVoid),
+      before: "main - +0",
+      after: "main master +0",
+      reused: true,
+    },
+    {
+      name: "a loose ref written without Git",
+      setup: Effect.succeed,
+      change: (cwd) =>
+        git(cwd, ["rev-parse", "HEAD"]).pipe(
+          Effect.map((sha) =>
+            NodeFS.writeFileSync(NodePath.join(cwd, ".git", "refs", "heads", "master"), `${sha}\n`),
+          ),
+        ),
+      before: "main - +0",
+      after: "main master +0",
+      reused: true,
+    },
+    {
+      name: "a packed branch deleted",
+      setup: (cwd) =>
+        git(cwd, ["branch", "master"]).pipe(
+          Effect.andThen(git(cwd, ["pack-refs", "--all"])),
+          Effect.as(cwd),
+        ),
+      change: (cwd) => git(cwd, ["update-ref", "-d", "refs/heads/master"]).pipe(Effect.asVoid),
+      before: "main master +0",
+      after: "main - +0",
+      reused: true,
+    },
+    {
+      name: "a branch switch",
+      setup: (cwd) => git(cwd, ["branch", "master"]).pipe(Effect.as(cwd)),
+      change: (cwd) => git(cwd, ["checkout", "-q", "-b", "feature"]).pipe(Effect.asVoid),
+      before: "main master +0",
+      after: "feature main +0",
+      reused: true,
+    },
+    {
+      name: "a detached HEAD",
+      setup: (cwd) => git(cwd, ["branch", "master"]).pipe(Effect.as(cwd)),
+      change: (cwd) => git(cwd, ["checkout", "-q", "--detach"]).pipe(Effect.asVoid),
+      before: "main master +0",
+      after: "null - +0",
+      reused: true,
+    },
+    {
+      name: "a symbolic branch losing its target",
+      setup: (cwd) =>
+        git(cwd, ["branch", "real"]).pipe(
+          Effect.andThen(git(cwd, ["symbolic-ref", "refs/heads/master", "refs/heads/real"])),
+          Effect.as(cwd),
+        ),
+      change: (cwd) => git(cwd, ["update-ref", "-d", "refs/heads/real"]).pipe(Effect.asVoid),
+      before: "main master +0",
+      after: "main - +0",
+      reused: false,
+    },
+    ...(symlinksSupported
+      ? [
+          {
+            name: "a symlinked branch losing its target",
+            setup: (cwd: string) =>
+              git(cwd, ["branch", "real"]).pipe(
+                Effect.andThen(
+                  git(cwd, [
+                    "-c",
+                    "core.preferSymlinkRefs=true",
+                    "symbolic-ref",
+                    "refs/heads/master",
+                    "refs/heads/real",
+                  ]),
+                ),
+                Effect.as(cwd),
+              ),
+            change: (cwd: string) =>
+              git(cwd, ["update-ref", "-d", "refs/heads/real"]).pipe(Effect.asVoid),
+            before: "main master +0",
+            after: "main - +0",
+            reused: false,
+          },
+        ]
+      : []),
+    {
+      name: "an upstream config change",
+      setup: (cwd) =>
+        git(cwd, ["branch", "other"]).pipe(
+          Effect.andThen(addOrigin(cwd, ["main", "other"])),
+          Effect.as(cwd),
+        ),
+      change: (cwd) =>
+        git(cwd, ["branch", "-q", "--set-upstream-to=origin/other"]).pipe(Effect.asVoid),
+      before: "main origin/main +0",
+      after: "main origin/other +0",
+      reused: true,
+    },
+    {
+      name: "a symbolic upstream retargeted",
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          yield* git(cwd, ["branch", "old"]);
+          yield* git(cwd, ["branch", "new"]);
+          yield* addOrigin(cwd, ["main", "old", "new"]);
+          yield* git(cwd, ["symbolic-ref", "refs/remotes/origin/main", "refs/remotes/origin/old"]);
+          return cwd;
+        }),
+      change: (cwd) =>
+        git(cwd, ["symbolic-ref", "refs/remotes/origin/main", "refs/remotes/origin/new"]).pipe(
+          Effect.asVoid,
+        ),
+      before: "main origin/old +0",
+      after: "main origin/new +0",
+      reused: false,
+    },
+    {
+      name: "tags that make the upstream's short name ambiguous",
+      setup: trackUpTrunk,
+      change: (cwd) =>
+        git(cwd, ["tag", "up/trunk"]).pipe(
+          Effect.andThen(git(cwd, ["tag", "remotes/up/trunk"])),
+          Effect.asVoid,
+        ),
+      before: "main up/trunk +0",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
+      name: "branches that make the upstream's short name ambiguous",
+      setup: trackUpTrunk,
+      change: (cwd) =>
+        git(cwd, ["branch", "up/trunk"]).pipe(
+          Effect.andThen(git(cwd, ["branch", "remotes/up/trunk"])),
+          Effect.asVoid,
+        ),
+      before: "main up/trunk +0",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
+      name: "a root ref file that makes the upstream's short name ambiguous",
+      setup: trackUpTrunk,
+      change: (cwd) =>
+        Effect.gen(function* () {
+          const sha = yield* git(cwd, ["rev-parse", "HEAD"]);
+          NodeFS.mkdirSync(NodePath.join(cwd, ".git", "up"));
+          NodeFS.writeFileSync(NodePath.join(cwd, ".git", "up", "trunk"), `${sha}\n`);
+          yield* git(cwd, ["branch", "remotes/up/trunk"]);
+        }),
+      before: "main up/trunk +0",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
+      name: "a root ref file alone that makes the upstream's short name ambiguous",
+      setup: (cwd) =>
+        trackUpTrunk(cwd).pipe(Effect.tap(() => git(cwd, ["branch", "remotes/up/trunk"]))),
+      change: (cwd) =>
+        git(cwd, ["rev-parse", "HEAD"]).pipe(
+          Effect.map((sha) => {
+            NodeFS.mkdirSync(NodePath.join(cwd, ".git", "up"));
+            NodeFS.writeFileSync(NodePath.join(cwd, ".git", "up", "trunk"), `${sha}\n`);
+          }),
+        ),
+      before: "main up/trunk +0",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
+      name: "a branch that makes an upstream ending in HEAD ambiguous",
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          yield* addOrigin(cwd, ["main"]);
+          yield* git(cwd, ["branch", "topic/HEAD"]);
+          yield* addRemote(cwd, "up", ["topic/HEAD"]);
+          yield* git(cwd, ["branch", "-q", "--set-upstream-to=up/topic/HEAD", "main"]);
+          // Git shortens refs/remotes/up/topic/HEAD to up/topic while nothing else answers to it.
+          yield* git(cwd, ["tag", "up/topic/HEAD"]);
+          yield* git(cwd, ["tag", "remotes/up/topic/HEAD"]);
+          yield* git(cwd, ["symbolic-ref", "refs/heads/up/topic", "refs/heads/real"]);
+          return cwd;
+        }),
+      change: (cwd) => git(cwd, ["branch", "real"]).pipe(Effect.asVoid),
+      before: "main up/topic/HEAD +0",
+      after: "main origin/main +0",
+      reused: false,
+    },
+    {
+      name: "a deleted upstream ref",
+      setup: (cwd) => addOrigin(cwd, ["main"]).pipe(Effect.as(cwd)),
+      change: (cwd) =>
+        git(cwd, ["update-ref", "-d", "refs/remotes/origin/main"]).pipe(Effect.asVoid),
+      before: "main origin/main +0",
+      after: "main - +0",
+      reused: true,
+    },
+    {
+      name: "a fetch that moves the upstream",
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          yield* addOrigin(cwd, ["main"]);
+          yield* writeTextFile(cwd, "README.md", "# local\n");
+          yield* git(cwd, ["commit", "-q", "-am", "local"]);
+          return cwd;
+        }),
+      change: (cwd) =>
+        Effect.gen(function* () {
+          const tracked = yield* git(cwd, ["rev-parse", "refs/remotes/origin/main"]);
+          // Pushing to the URL, not the remote name, leaves the remote-tracking ref for the fetch.
+          yield* git(cwd, ["push", "-q", yield* git(cwd, ["remote", "get-url", "origin"]), "main"]);
+          assert.equal(yield* git(cwd, ["rev-parse", "refs/remotes/origin/main"]), tracked);
+          yield* git(cwd, ["fetch", "-q", "origin"]);
+        }),
+      before: "main origin/main +1",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
+      name: "a branch created beside a linked worktree",
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          yield* git(cwd, ["branch", "-M", "trunk"]);
+          const worktree = NodePath.join(yield* makeTmpDir("git-worktrees-"), "linked");
+          yield* git(cwd, ["worktree", "add", "-q", "-b", "feature", worktree]);
+          return worktree;
+        }),
+      change: (cwd) => git(cwd, ["branch", "master"]).pipe(Effect.asVoid),
+      before: "feature - +0",
+      after: "feature master +0",
+      reused: true,
+    },
+  ];
+
+  it.effect.each(changes)("sees $name on the next refresh", (change) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initMain(cwd);
+        const readCwd = yield* change.setup(cwd);
+        assert.equal(summarise(yield* refreshStatus(driver, readCwd)), change.before);
+        yield* refreshStatus(driver, readCwd);
+        spawned.length = 0;
+        assert.equal(summarise(yield* refreshStatus(driver, readCwd)), change.before);
+        assert.equal(spawned.filter(probesRefs).length === 0, change.reused);
+
+        yield* change.change(cwd);
+
+        const after = yield* refreshStatus(driver, readCwd);
+        assert.equal(summarise(after), change.after);
+        const cold = yield* makeCountingDriver;
+        assert.deepStrictEqual(yield* refreshStatus(cold.driver, readCwd), after);
       }),
     ).pipe(Effect.provide(layerTest)),
   );

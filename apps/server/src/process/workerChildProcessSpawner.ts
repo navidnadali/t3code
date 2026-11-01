@@ -3,6 +3,7 @@ import * as PlatformNodeSink from "@effect/platform-node-shared/NodeSink";
 import * as PlatformNodeStream from "@effect/platform-node-shared/NodeStream";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -172,6 +173,12 @@ const makeRemoteHost = (options: {
   readonly closedMessage: string;
   /** Stops in a row, with no command started in between, after which the host stays down. */
   readonly restarts: number;
+  /** Stops within a rolling window after which the host stays down, started commands or not. */
+  readonly restartWindow?: {
+    readonly restarts: number;
+    readonly windowMillis: number;
+    readonly nowMillis: () => number;
+  };
   readonly onStop?: (cause: unknown, restarting: boolean) => void;
 }) => {
   let transport: Transport | undefined;
@@ -180,6 +187,7 @@ const makeRemoteHost = (options: {
   let down = false;
   let closing = false;
   let stopsInARow = 0;
+  const recentStops: Array<number> = [];
   let nextId = 1;
   let nextSeq = 1;
   let holding = 0;
@@ -230,7 +238,16 @@ const makeRemoteHost = (options: {
     generation = undefined;
     failure = cause;
     stopsInARow += 1;
-    const restarting = !closing && stopsInARow <= options.restarts;
+    const window = options.restartWindow;
+    if (window !== undefined) {
+      const now = window.nowMillis();
+      recentStops.push(now);
+      while (recentStops[0]! <= now - window.windowMillis) recentStops.shift();
+    }
+    const restarting =
+      !closing &&
+      stopsInARow <= options.restarts &&
+      (window === undefined || recentStops.length <= window.restarts);
     if (!restarting) down = true;
     if (!closing) options.onStop?.(cause, restarting);
     const error = new Error(options.stoppedMessage, { cause });
@@ -993,7 +1010,8 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
 /**
  * Starts child processes from a small spawner process, so the server itself never forks: on
  * Linux, Node forks and copies the page tables of the whole server for every command. A spawner
- * that stops is restarted once; if it stops again before starting a command, commands fail.
+ * that stops is restarted; one that stops again before starting a command, or more than
+ * `spawnerRestartLimit` times in its window, stays down and commands fail until the server restarts.
  */
 export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   fallback: ChildProcessSpawner["Service"],
@@ -1008,18 +1026,23 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
     ...(options.source === undefined ? {} : { source: options.source }),
   });
   const runLog = Effect.runSyncExitWith(yield* Effect.context<never>());
+  const clock = yield* Clock.Clock;
   const host = makeRemoteHost({
     open: openSpawnerProcess(launch),
     windowBytes,
     stoppedMessage: SPAWNER_STOPPED_MESSAGE,
     closedMessage: "process spawner closed",
     restarts: 1,
+    restartWindow: {
+      ...spawnerRestartLimit,
+      nowMillis: () => Number(clock.monotonicTimeNanosUnsafe() / 1_000_000n),
+    },
     onStop: (cause, restarting) => {
       runLog(
         restarting
           ? Effect.logWarning("Process spawner stopped; the next command restarts it", cause)
           : Effect.logError(
-              "Process spawner stopped again without starting a command; commands fail until the server restarts",
+              `Process spawner stopped again before starting a command, or more than ${spawnerRestartLimit.restarts} times in ${spawnerRestartLimit.windowMillis / 60_000} minutes; commands fail until the server restarts`,
               cause,
             ),
       );

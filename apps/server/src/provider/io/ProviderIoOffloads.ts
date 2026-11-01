@@ -65,6 +65,8 @@ const openLineSession = Effect.fnUntraced(function* <Options, Reply, E>(
     kill: Deferred.await(watched).pipe(Effect.andThen(input.kill)),
   });
   if (Option.isNone(session)) return Option.none();
+  // Also on close: the scope can close before the watch below has started.
+  yield* Effect.addFinalizer(() => Deferred.succeed(watched, undefined));
   yield* session.value.output.pipe(
     Stream.runDrain,
     Effect.catch((error) => Deferred.fail(failed, error)),

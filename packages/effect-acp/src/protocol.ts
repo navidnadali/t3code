@@ -708,9 +708,9 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         yield* decodeHere(line);
         continue;
       }
-      const decoded = yield* timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () =>
-        offload.decode(line),
-      );
+      const decoded = yield* timing === undefined
+        ? offload.decode(line)
+        : timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () => offload.decode(line));
       if (decoded._tag === "InThread") {
         yield* decodeHere(line);
         continue;

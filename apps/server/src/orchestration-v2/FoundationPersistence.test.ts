@@ -394,7 +394,7 @@ it.effect("paces scheduled compaction while preserving retention state and fixed
 );
 
 it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
-  it.effect("projects oversized tool bodies before both replay and live RPC retention", () =>
+  it.effect("projects oversized tool bodies once before replay and live RPC retention", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const sink = yield* EventSink.EventSinkV2;
@@ -437,17 +437,25 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             },
           ],
         });
-        const pull = yield* Stream.toPull(
-          sink.stream({
-            threadId: thread.id,
-            afterSequence: created!.sequence,
-            bounded: true,
-          }),
-        );
+        const subscribe = () =>
+          Stream.toPull(
+            sink.stream({
+              threadId: thread.id,
+              afterSequence: created!.sequence,
+              bounded: true,
+            }),
+          );
+        const pull = yield* subscribe();
+        const other = yield* subscribe();
         const replay = yield* pull;
         assert.lengthOf(replay, 1);
+        assert.lengthOf(yield* other, 1);
         assert.equal(replay[0]!.event.type, "turn-item.updated");
         assert.isBelow(Buffer.byteLength(yield* encodeJson(replay)), 4_000);
+        const stringify = yield* Effect.acquireRelease(
+          Effect.sync(() => vi.spyOn(JSON, "stringify")),
+          (spy) => Effect.sync(() => spy.mockRestore()),
+        );
         const [completed] = yield* sink.write({
           events: [
             {
@@ -460,9 +468,16 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           ],
         });
         const live = yield* pull;
+        const otherLive = yield* other;
         assert.deepEqual(
           live.map((stored) => stored.sequence),
           [completed!.sequence],
+        );
+        // Both subscribers get one shared projection, so the live budget sizes it once.
+        assert.strictEqual(otherLive[0], live[0]);
+        assert.lengthOf(
+          stringify.mock.calls.filter(([value]) => value === live[0] || value === otherLive[0]),
+          1,
         );
         assert.isBelow(Buffer.byteLength(yield* encodeJson(live)), 4_000);
         for (const stored of [...replay, ...live]) {
@@ -3560,6 +3575,225 @@ it.effect("loads a shell snapshot while the writer connection is occupied", () =
       yield* Fiber.join(writer);
       assert.deepEqual(snapshot.threads, []);
     }).pipe(Effect.provide(projectionLayer));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+const layerFileEventSink = (filename: string) =>
+  EventSink.layer.pipe(
+    Layer.provideMerge(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+    Layer.provideMerge(SqlitePersistence.layerFromPath(filename)),
+  );
+
+function toolItemEvent(
+  thread: OrchestrationV2AppThread,
+  index: number,
+  now: DateTime.Utc,
+): OrchestrationV2DomainEvent {
+  return {
+    id: EventId.make(`event:${thread.id}:tool:${index}`),
+    type: "turn-item.updated",
+    threadId: thread.id,
+    occurredAt: now,
+    payload: {
+      id: TurnItemId.make(`tool:${thread.id}:${index}`),
+      type: "dynamic_tool",
+      threadId: thread.id,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: index,
+      status: "completed",
+      title: null,
+      toolName: `tool-${index}`,
+      input: { index },
+      output: { index },
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+    },
+  };
+}
+
+const spanLineage = (span: Tracer.Span): ReadonlyArray<Tracer.Span> => {
+  const lineage = [span];
+  let parent = Option.getOrUndefined(span.parent);
+  while (parent?._tag === "Span") {
+    lineage.push(parent);
+    parent = Option.getOrUndefined(parent.parent);
+  }
+  return lineage;
+};
+// A statement inside a transaction reports its connection on the transaction span.
+const statementConnection = (span: Tracer.Span) =>
+  spanLineage(span)
+    .find((candidate) => candidate.attributes.has("db.connection"))
+    ?.attributes.get("db.connection");
+const statementTransaction = (span: Tracer.Span) =>
+  spanLineage(span).find((candidate) => candidate.name === "sql.transaction");
+
+const observeProjectionStatements =
+  (spans: Array<Tracer.Span>): Statement.Transformer =>
+  (statement, _sql, _fiber, span) => {
+    const [query] = statement.compile();
+    if (query.includes("orchestration_v2_projection_")) spans.push(span);
+    return Effect.succeed(statement);
+  };
+
+it.effect("reads a thread projection in one reader transaction while the writer is held", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "thread-projection-reader-" });
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const thread = makeThread(ThreadId.make("thread:projection-reader"), now);
+      yield* sink.write({
+        events: [
+          threadCreatedEvent({ id: "event:projection-reader:created", thread, now }),
+          toolItemEvent(thread, 1, now),
+        ],
+      });
+      const spans: Array<Tracer.Span> = [];
+      const projection = yield* projections
+        .getThreadProjection(thread.id)
+        .pipe(
+          Effect.provideService(Statement.CurrentTransformer, observeProjectionStatements(spans)),
+          Effect.provideService(Statement.SpanPropagationEnabled, true),
+        );
+      assert.lengthOf(projection.turnItems, 1);
+      assert.isAbove(spans.length, 1);
+      assert.deepEqual([...new Set(spans.map(statementConnection))], ["reader"]);
+      const transactions = [...new Set(spans.map(statementTransaction))];
+      assert.lengthOf(transactions, 1);
+      assert.isDefined(transactions[0]);
+
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writer = yield* sql
+        .withTransaction(
+          sql`SELECT 1`.pipe(
+            Effect.andThen(Deferred.succeed(held, undefined)),
+            Effect.andThen(Deferred.await(release)),
+          ),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(held);
+      const whileHeld = yield* projections.getThreadProjection(thread.id);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(writer);
+      assert.deepStrictEqual(whileHeld, projection);
+    }).pipe(Effect.provide(layerFileEventSink(path.join(directory, "statev2.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reads a thread projection from one snapshot while events commit", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "thread-projection-snapshot-" });
+    yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const thread = makeThread(ThreadId.make("thread:projection-snapshot"), now);
+      yield* sink.write({
+        events: [
+          threadCreatedEvent({ id: "event:projection-snapshot:created", thread, now }),
+          toolItemEvent(thread, 1, now),
+        ],
+      });
+      const before = yield* projections.getThreadProjection(thread.id);
+      const paused = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      // The thread row is already read when the turn-item query starts.
+      const pauseBeforeTurnItems: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          const [query] = statement.compile();
+          if (
+            query.includes("FROM orchestration_v2_projection_turn_items") &&
+            (yield* Deferred.succeed(paused, undefined))
+          ) {
+            yield* Deferred.await(resume);
+          }
+          return statement;
+        });
+      const reading = yield* projections
+        .getThreadProjection(thread.id)
+        .pipe(
+          Effect.provideService(Statement.CurrentTransformer, pauseBeforeTurnItems),
+          Effect.forkChild,
+        );
+      yield* Deferred.await(paused);
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("event:projection-snapshot:renamed"),
+            type: "thread.metadata-updated",
+            threadId: thread.id,
+            occurredAt: now,
+            payload: { ...thread, title: "Renamed while reading" },
+          },
+          toolItemEvent(thread, 2, now),
+        ],
+      });
+      yield* Deferred.succeed(resume, undefined);
+      const after = yield* projections.getThreadProjection(thread.id);
+      assert.equal(after.thread.title, "Renamed while reading");
+      assert.lengthOf(after.turnItems, 2);
+      const during = yield* Fiber.join(reading);
+      assert.deepEqual([during.thread.title, during.turnItems.length], [thread.title, 1]);
+      assert.deepStrictEqual(during, before);
+    }).pipe(Effect.provide(layerFileEventSink(path.join(directory, "statev2.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reads uncommitted projection rows inside a write transaction on the writer", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "thread-projection-writer-" });
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const thread = makeThread(ThreadId.make("thread:projection-writer"), now);
+      yield* sink.write({
+        events: [
+          threadCreatedEvent({ id: "event:projection-writer:created", thread, now }),
+          toolItemEvent(thread, 1, now),
+        ],
+      });
+      const spans: Array<Tracer.Span> = [];
+      let inside: OrchestrationV2ThreadProjection | undefined;
+      const rollback = yield* sql
+        .withTransaction(
+          projections.apply(toolItemEvent(thread, 2, now)).pipe(
+            Effect.andThen(projections.getThreadProjection(thread.id)),
+            Effect.tap((projection) =>
+              Effect.sync(() => {
+                inside = projection;
+              }),
+            ),
+            Effect.andThen(Effect.fail("rollback" as const)),
+          ),
+        )
+        .pipe(
+          Effect.provideService(Statement.CurrentTransformer, observeProjectionStatements(spans)),
+          Effect.provideService(Statement.SpanPropagationEnabled, true),
+          Effect.flip,
+        );
+      assert.equal(rollback, "rollback");
+      assert.lengthOf(inside?.turnItems ?? [], 2);
+      assert.deepEqual([...new Set(spans.map(statementConnection))], ["writer"]);
+      assert.lengthOf((yield* projections.getThreadProjection(thread.id)).turnItems, 1);
+    }).pipe(Effect.provide(layerFileEventSink(path.join(directory, "statev2.sqlite"))));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 

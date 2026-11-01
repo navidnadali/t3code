@@ -356,6 +356,47 @@ describe("workload fingerprint", () => {
     });
   });
 
+  it("covers the contents of a directory a launcher runs", async () => {
+    await withTempDir(async (root) => {
+      const harness = NodePath.join(root, "harness", "tools", "server-bench");
+      const node = NodePath.join(root, "bin", "node");
+      write(node, "\u007fELF executable\n");
+      // node runs a directory's package entry.
+      const agent = NodePath.join(root, "agent");
+      write(NodePath.join(agent, "package.json"), '{"main":"index.js"}\n');
+      write(NodePath.join(agent, "index.js"), 'require("./lib/run.js");\n');
+      write(NodePath.join(agent, "lib", "run.js"), "\n");
+      const template = NodePath.join(root, "template");
+      write(
+        NodePath.join(template, "userdata", "settings.json"),
+        JSON.stringify({
+          providerInstances: { acpBench: { config: { commandPath: node, commandArgs: [agent] } } },
+        }),
+      );
+      const work = NodePath.join(root, "work");
+      NodeFS.mkdirSync(work);
+      const fixture = await fixtureInfo(template, work);
+      const hashes = [await launchersHash(fixture, harness)];
+      const changed = async (change: () => void) => {
+        change();
+        const hash = await launchersHash(fixture, harness);
+        expect(hashes).not.toContain(hash);
+        hashes.push(hash);
+      };
+
+      await changed(() => write(NodePath.join(agent, "lib", "run.js"), "// edited\n"));
+      await changed(() => write(NodePath.join(agent, "index.js"), 'require("./lib/run.js"); //\n'));
+      await changed(() => write(NodePath.join(agent, "lib", "extra.js"), "\n"));
+      await changed(() =>
+        NodeFS.renameSync(
+          NodePath.join(agent, "lib", "extra.js"),
+          NodePath.join(agent, "extra.js"),
+        ),
+      );
+      expect(await launchersHash(fixture, harness)).toBe(hashes.at(-1));
+    });
+  });
+
   it("ignores the launchers of disabled instances", async () => {
     await withTempDir(async (root) => {
       const harness = NodePath.join(root, "harness", "tools", "server-bench");

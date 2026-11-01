@@ -2999,14 +2999,23 @@ it.effect.each([
         ProviderAdapter.ProviderAdapterV2Event,
         Cause.Done
       >();
-      const items = Array.from({ length: 21 }, (_, index) =>
-        backgroundTurnItemEvent(
-          ids,
-          "dynamic_tool",
-          "completed",
-          index + 1,
-          TurnItemId.make(`turn-item:${key}:${index}`),
-        ),
+      const items = Array.from(
+        { length: 21 },
+        (_, index): ProviderAdapter.ProviderAdapterV2Event =>
+          ({
+            type: "turn_item.updated",
+            driver,
+            turnItem: {
+              id: TurnItemId.make(`turn-item:${key}:${index}`),
+              threadId: ids.threadId,
+              runId: ids.runId,
+              providerTurnId: ids.rootProviderTurnId,
+              ordinal: index + 1,
+              type: "assistant_message",
+              status: "completed",
+              streaming: false,
+            },
+          }) as ProviderAdapter.ProviderAdapterV2Event,
       );
       const terminal = rootTerminalEvent(ids, "completed");
       const writes: Array<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>> = [];
@@ -3046,6 +3055,46 @@ it.effect.each([
         expectedWrites,
       );
       assert.deepEqual(queued, expectedQueued);
+    }),
+);
+
+it.effect.each([1, 8])(
+  "closes a child whose completion failed to write, writing at most %i event(s) at once",
+  (limit) =>
+    Effect.gen(function* () {
+      const key = `child-close-failed-${limit}`;
+      const ids = backgroundScenarioIds(key);
+      const node = (status: "running" | "completed") =>
+        ({
+          type: "node.updated",
+          driver,
+          node: { ...makeRunOwnedSubagentNodeFixture({ ids, status: "running" }), status },
+        }) as const;
+      const { finalEvents } = yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        providerEventBatchLimit: limit,
+        events: () => Stream.make(node("running"), node("completed")),
+        ingestNormalized: (input) =>
+          input.event.type === "node.updated" && input.event.node.status === "completed"
+            ? Effect.fail(
+                new ProviderEventIngestor.ProviderEventPublishError({
+                  providerSessionId: ProviderSessionId.make(`session:${key}`),
+                  eventCount: 1,
+                }),
+              )
+            : Effect.succeed([]),
+        ingestNormalizedBatch: (input) =>
+          Effect.die(`a tracked child event was batched: ${input.events.length}`),
+      });
+      const closed = finalEvents.find(
+        (event) => event.type === "node.updated" && event.payload.id === ids.subagentNodeId,
+      );
+      assert.isDefined(closed);
+      assert.notEqual(
+        closed?.type === "node.updated" ? closed.payload.status : undefined,
+        "running",
+      );
     }),
 );
 

@@ -10,6 +10,7 @@ import {
   driverHash,
   fakesHash,
   fixtureInfo,
+  launchersHash,
   readDriverResult,
   runOrder,
   traceRequired,
@@ -266,6 +267,65 @@ describe("workload fingerprint", () => {
       await edit(NodePath.join(bench, "fake-acp", "transcripts", "large.mjs"), true);
       await edit(NodePath.join(bench, "fake-common", "replay.mjs"), true);
       await edit(NodePath.join(root, "apps", "server", "scripts", "replay.ts"), true);
+    });
+  });
+
+  it("covers the launchers the fixture's settings run from another checkout or elsewhere", async () => {
+    await withTempDir(async (root) => {
+      const harness = NodePath.join(root, "harness", "tools", "server-bench");
+      write(NodePath.join(harness, "fake-codex", "codex"), "#!/bin/sh\n");
+      const other = NodePath.join(root, "other");
+      const otherBench = NodePath.join(other, "tools", "server-bench");
+      write(NodePath.join(otherBench, "fake-claude", "claude"), "#!/bin/sh\n");
+      write(
+        NodePath.join(otherBench, "fake-claude", "claude.mjs"),
+        'import "../../../apps/server/scripts/replay.ts";\n',
+      );
+      write(NodePath.join(other, "apps", "server", "scripts", "replay.ts"), "export {};\n");
+      const recording = NodePath.join(
+        other,
+        "apps/server/src/orchestration-v2/testkit/fixtures/simple/claude_transcript.ndjson",
+      );
+      write(recording, "{}\n");
+      const agent = NodePath.join(root, "agents", "agent.mjs");
+      write(agent, 'import "./lib.mjs";\n');
+      write(NodePath.join(root, "agents", "lib.mjs"), "export {};\n");
+      const node = NodePath.join(root, "bin", "node");
+      write(node, "#!/bin/sh\n");
+      const template = NodePath.join(root, "template");
+      write(
+        NodePath.join(template, "userdata", "settings.json"),
+        JSON.stringify({
+          providerInstances: {
+            claudeBench: {
+              config: { binaryPath: NodePath.join(otherBench, "fake-claude", "claude") },
+            },
+            codexBench: { config: { binaryPath: NodePath.join(harness, "fake-codex", "codex") } },
+            acpBench: { config: { commandPath: node, commandArgs: ["--no-warnings", agent] } },
+            codex: { enabled: false },
+          },
+        }),
+      );
+      const work = NodePath.join(root, "work");
+      NodeFS.mkdirSync(work);
+      const fixture = await fixtureInfo(template, work);
+      const hashes = [await launchersHash(fixture, harness)];
+      const edit = async (path: string, changes: boolean) => {
+        write(path, `${NodeFS.readFileSync(path, "utf8")}// edited\n`);
+        const hash = await launchersHash(fixture, harness);
+        expect(hashes.includes(hash)).toBe(!changes);
+        hashes.push(hash);
+      };
+
+      // The harness's own fakes are fakes_sha256's; here only their path counts.
+      await edit(NodePath.join(harness, "fake-codex", "codex"), false);
+      await edit(NodePath.join(otherBench, "fake-claude", "claude"), true);
+      await edit(NodePath.join(otherBench, "fake-claude", "claude.mjs"), true);
+      await edit(NodePath.join(other, "apps", "server", "scripts", "replay.ts"), true);
+      await edit(recording, true);
+      await edit(agent, true);
+      await edit(NodePath.join(root, "agents", "lib.mjs"), true);
+      await edit(node, true);
     });
   });
 

@@ -785,32 +785,6 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     ),
   );
 
-  it.effect("kills a CLI that ignores SIGTERM before the pool's close returns", () =>
-    Effect.gen(function* () {
-      const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
-      const signalled = yield* Deferred.make<void>();
-      const kill = cli.kill.bind(cli);
-      cli.kill = (signal) => {
-        const sent = kill(signal);
-        if (cli.kills.length === 2) Deferred.doneUnsafe(signalled, Effect.void);
-        return sent;
-      };
-      const run = yield* withRunner("worker", ({ runner }) =>
-        Effect.gen(function* () {
-          const session = yield* runner.open(openInput(cli));
-          yield* session.close;
-          // The worker's SDK sends SIGTERM before the messages end; its SIGKILL is still due.
-          yield* Stream.runDrain(session.messages);
-          assert.deepStrictEqual(cli.kills, ["SIGTERM"]);
-        }),
-      ).pipe(Effect.forkChild);
-      yield* Deferred.await(signalled);
-      yield* TestClock.adjust("5 seconds");
-      yield* Fiber.join(run);
-      assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGTERM", "SIGKILL"]);
-    }),
-  );
-
   it.effect("stops a CLI whose query is closing before the pool's close returns", () =>
     Effect.gen(function* () {
       const cli = new FakeClaudeCli({ exitOnStdinEnd: false });
@@ -1823,6 +1797,20 @@ describe("startClaudeQueryInWorker callbacks", () => {
       );
       const [answer] = yield* Effect.promise(() => scripted.notifiedOf("callbackError"));
       assert.deepInclude(answer, { type: "callbackError", id: 0 });
+    }),
+  );
+
+  it.effect("kills a CLI that ignores SIGTERM before its pool's close returns", () =>
+    Effect.gen(function* () {
+      const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+      const scripted = yield* startScripted({}, cli.spawn);
+      scripted.raise({ type: "spawn", command: "claude", args: [], cwd: undefined, env: {} });
+      const closing = yield* Effect.forkChild(scripted.closePool);
+      yield* Effect.promise(() => cli.waitForKill("SIGTERM"));
+      yield* TestClock.adjust("5 seconds");
+      yield* Fiber.join(closing);
+      yield* Effect.promise(() => cli.stdinEnded);
+      assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGKILL"]);
     }),
   );
 

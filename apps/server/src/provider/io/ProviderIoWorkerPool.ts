@@ -53,7 +53,7 @@ export interface ProviderIoSession<Output, E, Request = never, Reply = never> {
   readonly end: Effect.Effect<void, E>;
   readonly output: Stream.Stream<Output, E>;
   readonly call: (request: Request) => Effect.Effect<Reply, E>;
-  /** A call nobody waits on, queued like `call`; false when the session takes no more. */
+  /** A call nobody waits on, queued like `call`; false once the session failed, closed or ended. */
   readonly notify: (request: Request) => boolean;
 }
 
@@ -74,6 +74,8 @@ export interface ProviderIoOpenInput<
   readonly killAfterEnd?: boolean;
   /** Receives the stage's events on main as they arrive, ahead of queued outputs. */
   readonly onEvent?: (event: Event) => void;
+  /** Runs once when the session fails, after which main hears nothing more from its stage. */
+  readonly onSessionFailure?: () => void;
   readonly highWaterMark?: number;
 }
 
@@ -431,6 +433,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       if (failure !== undefined || closed) return;
       const mapped = input.onFailure(error);
       failure = { error: mapped };
+      input.onSessionFailure?.();
       for (const resume of calls.values()) resume(Effect.fail(mapped));
       calls.clear();
       for (const waiter of waiters.splice(0)) waiter.fail(Effect.fail(mapped));
@@ -602,7 +605,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       // Queued like a call, after the writes waiting for credit; a request that cannot be cloned
       // fails the session, since nobody waits on it to hear.
       notify: (request) => {
-        if (failure !== undefined || closed || slot.stopped) return false;
+        if (failure !== undefined || closed || ending !== undefined || slot.stopped) return false;
         schedule({
           bytes: 0,
           admit: () => {

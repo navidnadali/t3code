@@ -99,8 +99,9 @@ export interface AcpLineOffload {
   readonly failure: Effect.Effect<never, AcpError.AcpError>;
 }
 
-// Reads queued and not yet handled, at most; past this, stdout is not read further.
-const READ_AHEAD_LIMIT = 16;
+// Reads queued and not yet handled, at most; past this, stdout is not read further. A replay
+// burst queues ~230 one-line reads; fewer than ~33 drain the pipeline and delay delivery.
+const READ_AHEAD_LIMIT = 256;
 
 // A worker call's outcome, kept so that a failure surfaces at its line, as it would in-thread.
 type OffloadOutcome = Exit.Exit<AcpOffload.OffloadedLine, AcpError.AcpError>;

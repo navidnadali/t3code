@@ -22,7 +22,8 @@ const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
 const MAX_BUFFERED_RAW_MESSAGES = 32;
 // Reads queued and not yet handled with a line offload, at most; past this, stdout waits.
-const READ_AHEAD_LIMIT = 16;
+// Fewer than ~33 drain the pipeline in a burst of one-line reads and delay delivery.
+const READ_AHEAD_LIMIT = 256;
 // A worker call's outcome, kept so that a failure surfaces at its line, as it would in-thread.
 type OffloadOutcome = Exit.Exit<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
 const noOffloadedLines: Iterator<OffloadOutcome> = [][Symbol.iterator]();

@@ -977,18 +977,18 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
     }),
   );
 
-  it.effect("keeps at most 16 reads pending behind lines still off-thread", () =>
+  it.effect("keeps at most 256 reads pending behind lines still off-thread", () =>
     Effect.gen(function* () {
       const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
       const { stdio } = yield* makeInMemoryStdio();
       const routed: Array<string> = [];
       const releases = [yield* Deferred.make<void>(), yield* Deferred.make<void>()];
       const allRouted = yield* Deferred.make<void>();
-      const count = 64;
+      const count = 300;
       let calls = 0;
       let pulls = 0;
       // Every fiber that can run does, until it waits; no clock involved.
-      const settle = Effect.forEach(Array.from({ length: 64 }), () => Effect.yieldNow, {
+      const settle = Effect.forEach(Array.from({ length: 2048 }), () => Effect.yieldNow, {
         discard: true,
       });
       yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
@@ -1030,18 +1030,19 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
       for (let index = 0; index < count; index++) {
         yield* Queue.offer(input, encoder.encode(`${shortLine(`x/${index}`)}\n`));
       }
-      // 16 reads pending, one more waiting for a slot and one the termination watch
+      // 256 reads pending, one more waiting for a slot and one the termination watch
       // (`Stream.interruptWhen`) pulls ahead, as in-thread; none overtakes the long lines.
       yield* settle;
       assert.deepEqual(routed, []);
-      assert.isAtMost(pulls, 18);
+      assert.isAtLeast(pulls, 256);
+      assert.isAtMost(pulls, 258);
       assert.isAbove(yield* Queue.size(input), 0);
 
       // One read handled frees one slot, also while the second long line is still on the worker.
       yield* Deferred.succeed(releases[0]!, undefined);
       yield* settle;
       assert.deepEqual(routed, ["item/agentMessage/delta"]);
-      assert.isAtMost(pulls, 19);
+      assert.isAtMost(pulls, 259);
 
       yield* Deferred.succeed(releases[1]!, undefined);
       yield* Deferred.await(allRouted);

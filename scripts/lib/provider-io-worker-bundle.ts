@@ -5,9 +5,15 @@ import * as NodePath from "node:path";
 import ts from "typescript-legacy";
 import { Rolldown } from "vite-plus/pack";
 
-// Calls that load a module at run time; any name ending in `require` covers `__require`.
+// Names that load code at run time (`require`, `__require`, `createRequire`, `Module._load`,
+// `process.dlopen`). Only a direct call on a literal built-in may use one; any other reference
+// (`module["require"]`, `require.call`, an alias) could load from the working directory.
+const isLoaderName = (name: string) =>
+  /require$/i.test(name) || name === "_load" || name === "dlopen";
+
 const findNonBuiltinLoads = (code: string): ReadonlyArray<string> => {
   const found = new Set<string>();
+  const allowed = new Set<ts.Node>();
   const source = ts.createSourceFile(
     "worker.cjs",
     code,
@@ -15,28 +21,41 @@ const findNonBuiltinLoads = (code: string): ReadonlyArray<string> => {
     false,
     ts.ScriptKind.JS,
   );
+  const checkLoad = (kind: string, call: ts.CallExpression) => {
+    const [argument] = call.arguments;
+    if (argument === undefined || !ts.isStringLiteralLike(argument)) {
+      found.add(`${kind} of a computed name`);
+    } else if (!NodeModule.isBuiltin(argument.text)) {
+      found.add(`${kind} of "${argument.text}"`);
+    }
+  };
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) {
       const callee = node.expression;
+      if (callee.kind === ts.SyntaxKind.ImportKeyword) checkLoad("import()", node);
       const name = ts.isIdentifier(callee)
-        ? callee.text
+        ? callee
         : ts.isPropertyAccessExpression(callee)
-          ? callee.name.text
+          ? callee.name
           : undefined;
-      const kind =
-        callee.kind === ts.SyntaxKind.ImportKeyword
-          ? "import()"
-          : name !== undefined && name.endsWith("require")
-            ? `${name}()`
-            : undefined;
-      if (kind !== undefined) {
-        const [argument] = node.arguments;
-        if (argument === undefined || !ts.isStringLiteralLike(argument)) {
-          found.add(`${kind} of a computed name`);
-        } else if (!NodeModule.isBuiltin(argument.text)) {
-          found.add(`${kind} of "${argument.text}"`);
-        }
+      if (name !== undefined && isLoaderName(name.text)) {
+        allowed.add(name);
+        checkLoad(`${name.text}()`, node);
       }
+      if (ts.isIdentifier(callee) && (callee.text === "eval" || callee.text === "Function")) {
+        found.add(`${callee.text}() of run-time code`);
+      }
+    } else if (ts.isNewExpression(node)) {
+      if (ts.isIdentifier(node.expression) && node.expression.text === "Function") {
+        found.add("new Function() of run-time code");
+      }
+    } else if (ts.isElementAccessExpression(node)) {
+      const key = node.argumentExpression;
+      if (ts.isStringLiteralLike(key) && isLoaderName(key.text)) {
+        found.add(`a computed reference to ${key.text}`);
+      }
+    } else if (ts.isIdentifier(node) && isLoaderName(node.text) && !allowed.has(node)) {
+      found.add(`a reference to ${node.text} other than a call`);
     }
     ts.forEachChild(node, visit);
   };

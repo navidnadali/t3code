@@ -328,7 +328,10 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     let nextCallId = 0;
     let outstanding = 0;
     let failure: { readonly error: E } | undefined;
-    let ended = false;
+    // Once accepted, the end of input is sent even if its caller stops waiting for it.
+    let ending:
+      | { sent: boolean; readonly waiting: Set<(effect: Effect.Effect<void, E>) => void> }
+      | undefined;
     let finished = false;
     let closed = false;
 
@@ -474,14 +477,50 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     const session: ProviderIoSession<Output, E, Request, Reply> = {
       write: (chunk) =>
         Effect.suspend(() => {
-          if (ended) return Effect.die(new Error("Provider I/O session input already ended."));
+          if (ending !== undefined) {
+            return Effect.die(new Error("Provider I/O session input already ended."));
+          }
           if (chunk.byteLength === 0) return Effect.void;
           return whenAdmitted(chunk.byteLength, () => send(chunk));
         }),
-      end: Effect.suspend(() => {
-        if (ended) return Effect.void;
-        ended = true;
-        return whenAdmitted(0, () => post({ type: "eof", session: id }));
+      end: Effect.callback<void, E>((resume) => {
+        if (failure !== undefined) {
+          resume(Effect.fail(failure.error));
+          return;
+        }
+        if (closed) {
+          resume(Effect.interrupt);
+          return;
+        }
+        if (ending === undefined) {
+          const state = {
+            sent: false,
+            waiting: new Set<(effect: Effect.Effect<void, E>) => void>(),
+          };
+          ending = state;
+          const settle = (effect: Effect.Effect<void, E>) => {
+            for (const waiter of state.waiting) waiter(effect);
+            state.waiting.clear();
+          };
+          schedule({
+            bytes: 0,
+            admit: () => {
+              post({ type: "eof", session: id });
+              state.sent = true;
+              settle(Effect.void);
+            },
+            fail: settle,
+          });
+        }
+        if (ending.sent) {
+          resume(Effect.void);
+          return;
+        }
+        const waiting = ending.waiting;
+        waiting.add(resume);
+        return Effect.sync(() => {
+          waiting.delete(resume);
+        });
       }),
       output: Stream.fromQueue(queue).pipe(
         Stream.mapArray((batches) => {
@@ -531,18 +570,30 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     Reply = never,
   >(input: ProviderIoOpenInput<Options, Output, E, Request, Reply>) {
     if (options.workers === 0) return Option.none();
-    const reserved = yield* Effect.acquireRelease(reserve, (slot) =>
-      Effect.sync(() => {
-        if (Option.isSome(slot)) slot.value.load -= 1;
+    // Only a session keeps its slot reserved; a failed, empty or interrupted open frees it at once.
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const reserved = yield* reserve;
+        if (Option.isNone(reserved)) return Option.none();
+        const slot = reserved.value;
+        const unreserve = Effect.sync(() => {
+          slot.load -= 1;
+        });
+        const ready = yield* restore(Deferred.await(slot.handshake)).pipe(
+          Effect.match({ onFailure: () => false, onSuccess: () => true }),
+          Effect.onInterrupt(() => unreserve),
+        );
+        const session = ready
+          ? yield* makeSession(slot, input).pipe(Effect.onError(() => unreserve))
+          : Option.none();
+        if (Option.isNone(session)) {
+          yield* unreserve;
+          return session;
+        }
+        yield* Effect.addFinalizer(() => unreserve);
+        return session;
       }),
     );
-    if (Option.isNone(reserved)) return Option.none();
-    const slot = reserved.value;
-    const ready = yield* Deferred.await(slot.handshake).pipe(
-      Effect.match({ onFailure: () => false, onSuccess: () => true }),
-    );
-    if (!ready) return Option.none();
-    return yield* makeSession(slot, input);
   });
 
   yield* Effect.addFinalizer(() =>

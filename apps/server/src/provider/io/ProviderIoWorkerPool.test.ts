@@ -769,13 +769,14 @@ it.effect("sends the end of input even when the caller stops waiting for it", ()
     Effect.gen(function* () {
       const session = yield* openEcho(pool, "t", { highWaterMark: 4 });
       const id = workers.opened.at(-1);
+      const worker = workers.started.at(-1)!;
       yield* session.write(bytes("full"));
       const write = yield* Effect.forkChild(session.write(bytes("next")), {
         startImmediately: true,
       });
       const end = yield* Effect.forkChild(session.end, { startImmediately: true });
       yield* Fiber.interrupt(end);
-      workers.started.at(-1)!.emit("message", {
+      worker.emit("message", {
         type: "output",
         session: id,
         outputs: [],
@@ -783,7 +784,9 @@ it.effect("sends the end of input even when the caller stops waiting for it", ()
       });
       yield* Fiber.join(write);
       yield* session.end;
-      const sent = workers.posted.filter((message) => message.session === id);
+      const sent = workers.posted.filter(
+        (message) => message.worker === worker && message.session === id,
+      );
       assert.deepEqual(
         sent.map((message) => message.type),
         ["open", "bytes", "bytes", "eof"],

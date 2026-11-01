@@ -12,7 +12,7 @@ import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
 
 import * as CodexError from "./errors.ts";
-import { JsonRpcId, JsonRpcResponseEnvelope } from "./_internal/shared.ts";
+import { JsonRpcId, JsonRpcResponseEnvelope, timeStage } from "./_internal/shared.ts";
 const isJsonRpcId = Schema.is(JsonRpcId);
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
@@ -25,6 +25,16 @@ export interface CodexAppServerProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
   readonly stage: "raw" | "decoded" | "decode_failed";
   readonly payload: unknown;
+}
+
+/** Optional main-thread timing of incoming frames; unset costs nothing. */
+export interface CodexAppServerStageTiming {
+  readonly now: () => number;
+  readonly record: (
+    stage: "framing" | "json" | "decode" | "adapter",
+    elapsedMs: number,
+    bytes: number,
+  ) => void;
 }
 
 export interface CodexAppServerIncomingNotification {
@@ -46,6 +56,7 @@ export interface CodexAppServerPatchedProtocolOptions {
   // Test override; production uses MAX_INCOMING_MESSAGE_BYTES.
   readonly maxIncomingMessageBytes?: number;
   readonly logger?: (event: CodexAppServerProtocolLogEvent) => Effect.Effect<void, never>;
+  readonly stageTiming?: CodexAppServerStageTiming;
   readonly onNotification?: (
     notification: CodexAppServerIncomingNotification,
   ) => Effect.Effect<void, never>;
@@ -178,6 +189,22 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const pending = yield* Ref.make(new Map<string, CodexAppServerPendingRequest>());
     const nextRequestId = yield* Ref.make(1);
     const maxIncomingMessageBytes = options.maxIncomingMessageBytes ?? MAX_INCOMING_MESSAGE_BYTES;
+    const timing = options.stageTiming;
+    // A stream batch is decoded before its chunks are framed; queue each chunk's decode time.
+    const textDecodeMs: Array<number> = [];
+    const decodeText =
+      timing === undefined
+        ? Stream.decodeText()
+        : <E, R>(bytes: Stream.Stream<Uint8Array, E, R>) =>
+            Stream.suspend(() => {
+              const decoder = new TextDecoder();
+              return Stream.map(bytes, (chunk) => {
+                const startedAt = timing.now();
+                const text = decoder.decode(chunk, { stream: true });
+                textDecodeMs.push(timing.now() - startedAt);
+                return text;
+              });
+            });
     const remainder: Array<string> = [];
     let remainderBytes = 0;
     const terminationHandled = yield* Ref.make(false);
@@ -395,7 +422,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         stage: "raw",
         payload: line,
       }).pipe(
-        Effect.flatMap(() => decodeWireMessage(line)),
+        Effect.flatMap(() =>
+          timing === undefined
+            ? decodeWireMessage(line)
+            : timeStage(timing, "json", Buffer.byteLength(line, "utf8"), () =>
+                decodeWireMessage(line),
+              ),
+        ),
         Effect.tap((decoded) =>
           logProtocol({
             direction: "incoming",
@@ -425,15 +458,20 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
 
     yield* options.stdio.stdin.pipe(
       Stream.interruptWhen(Deferred.await(terminationSignal)),
-      Stream.decodeText(),
+      decodeText,
       Stream.runForEach(
         Effect.fnUntraced(function* (chunk) {
           let start = 0;
+          let framingMs = 0;
+          let chunkBytes = 0;
+          let segmentStartedAt = timing?.now() ?? 0;
           while (start < chunk.length) {
             const newline = chunk.indexOf("\n", start);
             const fragment = chunk.slice(start, newline === -1 ? chunk.length : newline);
             // decodeText holds back split UTF-8 sequences, so fragment byte sums are exact.
-            remainderBytes += Buffer.byteLength(fragment, "utf8");
+            const fragmentBytes = Buffer.byteLength(fragment, "utf8");
+            remainderBytes += fragmentBytes;
+            chunkBytes += newline === -1 ? fragmentBytes : fragmentBytes + 1;
             if (remainderBytes > maxIncomingMessageBytes) {
               remainder.length = 0;
               return yield* new CodexError.CodexAppServerTransportError({
@@ -446,8 +484,17 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             const line = remainder.join("").replace(/\r$/, "");
             remainder.length = 0;
             remainderBytes = 0;
+            if (timing !== undefined) framingMs += timing.now() - segmentStartedAt;
             yield* handleLine(line);
+            if (timing !== undefined) segmentStartedAt = timing.now();
             start = newline + 1;
+          }
+          if (timing !== undefined) {
+            timing.record(
+              "framing",
+              (textDecodeMs.shift() ?? 0) + framingMs + timing.now() - segmentStartedAt,
+              chunkBytes,
+            );
           }
         }),
       ),

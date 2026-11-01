@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 
 import type { ThreadId } from "@t3tools/contracts";
 import type * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import { ProviderIoStageTiming } from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import { makeAsyncRotatingFileSink } from "@t3tools/shared/logging";
 import { errorTag } from "@t3tools/shared/observability";
 import * as Clock from "effect/Clock";
@@ -388,6 +389,15 @@ export function boundProviderEventForLogging(event: unknown): unknown {
   return event;
 }
 
+function loggedProvider(event: unknown): string {
+  if (typeof event !== "object" || event === null) return "unknown";
+  const nested = Reflect.get(event, "event");
+  const provider =
+    Reflect.get(event, "provider") ??
+    (typeof nested === "object" && nested !== null ? Reflect.get(nested, "provider") : undefined);
+  return typeof provider === "string" ? provider : "unknown";
+}
+
 export const writeBatchedMessages = Effect.fnUntraced(function* (
   sink: AsyncFileSink,
   records: ReadonlyArray<PendingRecord>,
@@ -645,6 +655,7 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
 > {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const stageTiming = yield* ProviderIoStageTiming;
   const resolved = yield* resolveOptions(options);
   const directory = NodePath.dirname(filePath);
   const filePrefix = providerLogPrefix(filePath);
@@ -757,6 +768,7 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
     if (existing) return existing;
 
     const write = Effect.fnUntraced(function* (event: unknown, threadId: ThreadId | null) {
+      const startedAt = stageTiming?.now() ?? 0;
       if (!shouldPersistProviderEvent(stream, event)) return;
       let payload = yield* serializeEvent(
         measureProviderEvent(event, true) === undefined ? summarizeProviderEvent(event) : event,
@@ -771,6 +783,9 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
       const observedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
       const line = `[${observedAt}] ${resolveStreamLabel(stream)}: ${payload}\n`;
       const bytes = Buffer.byteLength(line);
+      stageTiming
+        ?.forProvider(loggedProvider(event))
+        .record("logSerialize", stageTiming.now() - startedAt, bytes);
       const action = yield* SynchronizedRef.modifyEffect(stateRef, (state) => {
         if (state.closed) {
           return Effect.succeed([{ flush: false }, state] as const);

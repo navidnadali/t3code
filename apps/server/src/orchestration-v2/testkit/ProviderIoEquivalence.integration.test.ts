@@ -574,12 +574,17 @@ const ACP_REAL_LOG_STORE_FIXTURES = new Set([
   "turn_interrupt",
 ]);
 
-// With these chunkings the fast wake's checkpoint lands on either run even in-thread (1 in 4 runs
-// of 0 workers against 0 workers), so this table, which runs each mode once, leaves it out.
+// These race even in-thread against in-thread, so this table, which runs each mode once, leaves
+// them out: the fast wake's checkpoint lands on either run (1 in 4 runs), and the blocked
+// command's approval request is or is not written as completed (1 in 12).
+const GROK_RACY_IN_THREAD = new Set([
+  "grok_background_bash_fast_wake",
+  "grok_auto_blocked_command",
+]);
 const GROK_FIXTURES = new Set(
   ORCHESTRATOR_REPLAY_FIXTURES.filter(
     (fixture) =>
-      fixture.name !== "grok_background_bash_fast_wake" &&
+      !GROK_RACY_IN_THREAD.has(fixture.name) &&
       fixture.providers.some((provider) => provider.driver === "grok"),
   ).map((fixture) => fixture.name),
 );

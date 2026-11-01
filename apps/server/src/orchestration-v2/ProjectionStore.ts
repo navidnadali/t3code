@@ -7312,10 +7312,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       (...args: Args): Effect.Effect<A, E, R> =>
         method(...args).pipe(NodeSqliteClient.readOnly);
 
-    // Reads of a thread's history, whole or a page, hold a reader permit from before their
-    // transaction until decoded, so the pool size bounds those row sets. Reads whose rows the history
-    // does not multiply (thread row, shells, bookkeeping at a few KB per run) take none and never
-    // wait behind a large decode. A read inside a transaction keeps that transaction's connection.
+    // Reads of a thread's history, whole or a page, hold a reader permit (one fewer than the
+    // readers) from before their transaction until decoded. Reads whose rows the history does not
+    // multiply (thread row, shells, bookkeeping at a few KB per run) take none and find a free
+    // reader. A read inside a transaction keeps that transaction's connection.
     const permitsToTake = Effect.serviceOption(sql.transactionService).pipe(
       Effect.map((transaction) => (Option.isNone(transaction) ? readerPermits : undefined)),
     );

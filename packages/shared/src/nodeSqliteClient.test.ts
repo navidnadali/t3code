@@ -369,12 +369,14 @@ const assertPermits = (expected: number) =>
     assert.deepEqual([Option.isSome(all), Option.isSome(more)], [true, false]);
   });
 
+// One reader is always left for reads that take no permit, unless there is only one.
 it.effect.each([
   { setting: "1", size: 1, permits: 1 },
-  { setting: "3", size: 3, permits: 3 },
-  { setting: "unset", size: undefined, permits: 4 },
-])("gives one reader permit per reader when the pool size is $setting", ({ size, permits }) =>
-  withReaderClient(() => assertPermits(permits), { readerPoolSize: size }),
+  { setting: "3", size: 3, permits: 2 },
+  { setting: "unset", size: undefined, permits: 3 },
+])(
+  "gives one reader permit fewer than the readers when the pool size is $setting",
+  ({ size, permits }) => withReaderClient(() => assertPermits(permits), { readerPoolSize: size }),
 );
 
 it.effect("gives one reader permit without reader workers", () =>

@@ -26,6 +26,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -879,7 +880,7 @@ const isDecodeSpan = (span: Tracer.AnySpan) =>
 
 // A read holds rows from its first statement until its outermost decode span ends.
 it.effect.each(readCases.filter((readCase) => readCase.permit))(
-  "lets no more $name reads hold rows at once than the pool has readers",
+  "lets no more $name reads hold rows at once than one fewer than the readers",
   (readCase) =>
     withFileStore(
       "reader-scope-permits-",
@@ -927,7 +928,7 @@ it.effect.each(readCases.filter((readCase) => readCase.permit))(
         assert.strictEqual(holding, 0);
         assert.isAtMost(mostHolding, 2);
       }),
-      2,
+      3,
     ),
 );
 
@@ -1158,4 +1159,80 @@ it.effect("lets a streamed search waiting for a reader permit be interrupted", (
     yield* permits.release(1);
     assert.isTrue(yield* permits.takeIfAvailable(1));
   }),
+);
+
+// History reads paused at their first statement, each holding a reader permit and a reader.
+const holdHistoryReads = (store: Store, fixture: Fixture, count: number) =>
+  Effect.gen(function* () {
+    const arrived = yield* Queue.unbounded<void>();
+    const release = yield* Deferred.make<void>();
+    const reads = yield* Effect.forEach(Array.from({ length: count }), () =>
+      Effect.suspend(() => {
+        let paused = false;
+        return store
+          .getThreadSnapshot(fixture.fork)
+          .pipe(
+            Effect.provideService(Statement.CurrentTransformer, (statement) =>
+              paused
+                ? Effect.succeed(statement)
+                : Queue.offer(arrived, undefined).pipe(
+                    Effect.andThen(Effect.sync(() => (paused = true))),
+                    Effect.andThen(Deferred.await(release)),
+                    Effect.as(statement),
+                  ),
+            ),
+          );
+      }).pipe(Effect.forkChild),
+    );
+    return { arrived, release, reads };
+  });
+
+it.effect("leaves a reader for other reads while history reads hold every permit", () =>
+  withFileStore(
+    "reader-scope-free-reader-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("free-reader", 2);
+      // Two readers, so one permit: one history read holds a reader, the other waits.
+      const held = yield* holdHistoryReads(store, fixture, 2);
+      yield* Queue.take(held.arrived);
+      const shell = yield* store.getThreadShell(fixture.fork);
+      assert.strictEqual(shell?.id, fixture.fork);
+      assert.strictEqual(yield* Queue.size(held.arrived), 0);
+      yield* Deferred.succeed(held.release, undefined);
+      yield* Queue.take(held.arrived);
+      yield* Effect.forEach(held.reads, Fiber.join);
+    }),
+    2,
+  ),
+);
+
+// With one reader there is one permit, and its holder can take the reader other reads need.
+it.effect("makes other reads wait for the only reader behind a history read", () =>
+  withFileStore(
+    "reader-scope-one-reader-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("one-reader", 2);
+      const held = yield* holdHistoryReads(store, fixture, 1);
+      yield* Queue.take(held.arrived);
+      let released = false;
+      let startedAfterRelease: boolean | undefined;
+      const shell = yield* store.getThreadShell(fixture.fork).pipe(
+        Effect.provideService(Statement.CurrentTransformer, (statement) =>
+          Effect.sync(() => {
+            startedAfterRelease ??= released;
+            return statement;
+          }),
+        ),
+        Effect.forkChild({ startImmediately: true }),
+      );
+      released = true;
+      yield* Deferred.succeed(held.release, undefined);
+      assert.strictEqual((yield* Fiber.join(shell))?.id, fixture.fork);
+      assert.isTrue(startedAfterRelease);
+      yield* Effect.forEach(held.reads, Fiber.join);
+    }),
+    1,
+  ),
 );

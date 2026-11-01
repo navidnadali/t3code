@@ -333,6 +333,11 @@ it.effect("invalidates origin remote cache when a driver mutation adds origin", 
   }).pipe(Effect.provide(layerTest)),
 );
 
+const caseInsensitiveFileSystem = (() => {
+  const directory = NodeOS.tmpdir();
+  return directory !== directory.toUpperCase() && NodeFS.existsSync(directory.toUpperCase());
+})();
+
 describe("config reads", () => {
   const makeCountingDriver = Effect.gen(function* () {
     const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -575,6 +580,23 @@ describe("config reads", () => {
       after: null,
       reused: true,
     },
+    ...(["garbage", ""] as const).map((head): ConfigChange => ({
+      name: `a nested repository's HEAD becoming ${head ? "invalid" : "empty"}`,
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          const sub = NodePath.join(cwd, "sub");
+          yield* git(cwd, ["config", "t3.value", "parent"]);
+          yield* git(cwd, ["init", "-q", "sub"]);
+          yield* git(sub, ["config", "t3.value", "child"]);
+          return sub;
+        }),
+      change: (_cwd, sub) =>
+        Effect.sync(() => NodeFS.writeFileSync(NodePath.join(sub, ".git", "HEAD"), head)),
+      read: readValue("t3.value"),
+      before: "child",
+      after: "parent",
+      reused: true,
+    })),
     {
       name: "a relative include",
       setup: (cwd) =>
@@ -623,6 +645,29 @@ describe("config reads", () => {
         assert.equal(yield* change.read(driver, readCwd), change.after);
       }),
     ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.skipIf(!caseInsensitiveFileSystem)(
+    "reuses config read through a differently cased path",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { driver, spawned } = yield* makeCountingDriver;
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          yield* git(cwd, ["config", "t3.value", "first"]);
+          const typed = NodePath.join(NodePath.dirname(cwd), NodePath.basename(cwd).toUpperCase());
+          assert.equal(yield* driver.readConfigValue(typed, "t3.value"), "first");
+          assert.equal(yield* driver.readConfigValue(typed, "t3.value"), "first");
+          spawned.length = 0;
+          assert.equal(yield* driver.readConfigValue(typed, "t3.value"), "first");
+          assert.deepStrictEqual(spawned, []);
+
+          yield* git(cwd, ["config", "t3.value", "second"]);
+
+          assert.equal(yield* driver.readConfigValue(typed, "t3.value"), "second");
+        }),
+      ).pipe(Effect.provide(layerTest)),
   );
 
   it.effect("reads what git config --get and git remote read", () =>

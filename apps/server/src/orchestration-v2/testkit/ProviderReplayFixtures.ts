@@ -60,6 +60,10 @@ export const readReplayFixtureTranscript = Effect.fn("readOrchestratorReplayTran
   return yield* readProviderReplayTranscript(file);
 }, Effect.provide(NodeServices.layer));
 
+// What HttpApiBuilder sends for the snapshot endpoint's schema: the body every client reads.
+const encodedSnapshotJson = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
+  JSON.stringify(Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot)(snapshot));
+
 function normalizeTestError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));
 }
@@ -163,11 +167,7 @@ const runFixtureProvider = Effect.fn("runOrchestratorReplayFixture")(function* <
     const snapshot = { snapshotSequence: 0, projection: projectThreadProjectionForWire(projection) };
     const body = yield* encodeThreadSnapshotBody(snapshot).pipe(Effect.flatMap(Stream.runCollect));
     assert.isTrue(
-      Buffer.concat([...body]).equals(
-        Buffer.from(
-          JSON.stringify(Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot)(snapshot)),
-        ),
-      ),
+      Buffer.concat([...body]).equals(Buffer.from(encodedSnapshotJson(snapshot))),
       `${scenario.name}: the ${threadId} snapshot body must be JSON.stringify of its encoding`,
     );
   }

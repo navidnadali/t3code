@@ -265,6 +265,9 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
   }),
 );
 
+const encodedSnapshotJson = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
+  JSON.stringify(Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot)(snapshot));
+
 it.effect("serves the full snapshot as the JSON its schema encodes, with the same errors", () =>
   Effect.gen(function* () {
     const { services, eventSink, handler } = yield* serveOrchestrationHttp(() => true);
@@ -294,12 +297,10 @@ it.effect("serves the full snapshot as the JSON its schema encodes, with the sam
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe("application/json");
     expect(yield* Effect.promise(() => response.text())).toBe(
-      JSON.stringify(
-        Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot)({
-          snapshotSequence: snapshot.snapshotSequence,
-          projection: projectThreadProjectionForWire(snapshot.projection),
-        }),
-      ),
+      encodedSnapshotJson({
+        snapshotSequence: snapshot.snapshotSequence,
+        projection: projectThreadProjectionForWire(snapshot.projection),
+      }),
     );
 
     const missing = yield* read(handler, ThreadId.make("missing"));

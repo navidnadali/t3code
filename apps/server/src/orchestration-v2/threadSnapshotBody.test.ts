@@ -273,7 +273,7 @@ const seed = Effect.gen(function* () {
   for (const event of events) yield* projections.apply(event);
 });
 
-const seededStore = (events: Effect.Effect<void, never, ProjectionStore.ProjectionStoreV2>) =>
+const seededStore = <E>(events: Effect.Effect<void, E, ProjectionStore.ProjectionStoreV2>) =>
   Layer.effectDiscard(events).pipe(
     Layer.provideMerge(ProjectionStore.layer),
     Layer.provideMerge(SqlitePersistence.layerMemory),

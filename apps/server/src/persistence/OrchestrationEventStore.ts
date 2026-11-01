@@ -112,6 +112,8 @@ export class OrchestrationEventStore extends Context.Service<
       readonly afterSequence?: number;
       readonly project: (event: ApplicationStoredEvent) => A;
       readonly filter?: (event: ApplicationStoredEvent) => boolean;
+      /** Keep only the newest waiting live event per key (see `replayAndBufferProjectedLiveEvents`). */
+      readonly coalesceKey?: (event: A) => string;
     }) => Stream.Stream<A, OrchestrationEventStoreError>;
   }
 >()("t3/persistence/OrchestrationEventStore") {}
@@ -722,6 +724,7 @@ const makeEventStore = Effect.gen(function* () {
         afterSequence: input.afterSequence ?? 0,
         project: input.project,
         ...(input.filter === undefined ? {} : { filter: input.filter }),
+        ...(input.coalesceKey === undefined ? {} : { coalesceKey: input.coalesceKey }),
         replay: (throughSequence) =>
           catchUpApplicationEvents({
             afterSequence: input?.afterSequence ?? 0,

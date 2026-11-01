@@ -706,7 +706,7 @@ it.effect.each(["coalesced", "distinct"] as const)(
           })
           .pipe(
             Stream.provideService(Statement.CurrentTransformer, blockHighWater),
-            Stream.take(3),
+            Stream.takeUntil((item) => item.sequence === lastSequence),
             Stream.runCollect,
             Effect.result,
             Effect.forkScoped,
@@ -729,15 +729,18 @@ it.effect.each(["coalesced", "distinct"] as const)(
         const result = yield* Fiber.join(reader);
         assert.equal(result._tag, "Success");
         if (result._tag === "Success") {
+          const delivered = result.success.flatMap((item) =>
+            "aggregateKind" in item ? [[item.aggregateId, item.sequence] as const] : [],
+          );
+          // The last event may land in a second pull; either way only the newest per key arrives.
+          assert.isAtMost(delivered.length, 2 * projectIds.length);
+          assert.isTrue(
+            delivered.every(([, sequence], index) => index === 0 || sequence > delivered[index - 1]![1]),
+          );
+          const newestByProject = new Map(delivered);
           assert.deepEqual(
-            result.success.map((item) =>
-              "aggregateKind" in item ? [item.aggregateId, item.sequence] : [],
-            ),
-            [
-              [projectIds[0], lastSequence - 2],
-              [projectIds[1], lastSequence - 1],
-              [projectIds[2], lastSequence],
-            ],
+            projectIds.map((projectId) => newestByProject.get(projectId)),
+            [lastSequence - 2, lastSequence - 1, lastSequence],
           );
         }
       }),

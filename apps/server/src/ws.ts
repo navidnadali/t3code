@@ -131,6 +131,7 @@ import {
   dedupeShellEnrichment,
   loadOlderSettledThreadsPage,
   loadShellSnapshotParts,
+  shellApplicationEventKey,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemFromThreadShell,
   shellStreamItemsFromInitialSnapshot,
@@ -1133,6 +1134,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
             afterSequence,
             project: toShellApplicationEvent,
             filter: filterSubagentTranscript,
+            coalesceKey: shellApplicationEventKey,
           }),
         ),
       );

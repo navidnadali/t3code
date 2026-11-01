@@ -10,8 +10,10 @@ import type {
 import * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -26,10 +28,11 @@ import {
   claudeAgentSdkStage,
   toClaudeAgentSdkProcessError,
 } from "../../provider/io/claudeAgentSdkStage.ts";
-import type {
-  ProviderIoSession,
-  ProviderIoStageError,
-  ProviderIoWorkerError,
+import * as ServerConfig from "../../config.ts";
+import {
+  type ProviderIoSession,
+  type ProviderIoStageError,
+  type ProviderIoWorkerError,
   ProviderIoWorkerPool,
 } from "../../provider/io/ProviderIoWorkerPool.ts";
 
@@ -37,6 +40,16 @@ import type {
 export const ClaudeAgentSdkWorkerPool = Context.Reference<
   ProviderIoWorkerPool["Service"] | undefined
 >("t3/orchestration-v2/Adapters/ClaudeAgentSdkWorkerPool", { defaultValue: () => undefined });
+
+/** The server's pool for Claude queries, when T3CODE_PROVIDER_IO_CLAUDE_SDK opts in. */
+export const layerClaudeAgentSdkWorkerPool = Layer.effect(
+  ClaudeAgentSdkWorkerPool,
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    if (config.providerIoClaudeSdk !== true) return undefined;
+    return yield* ProviderIoWorkerPool;
+  }),
+);
 
 /** What the query runner calls on a query, whether the SDK runs here or in a worker. */
 export type ClaudeQueryControl = Pick<
@@ -170,12 +183,17 @@ const workerCause = (error: WorkerSessionError): unknown =>
 
 // Read from the CLI ahead of the worker, before the pipe is paused.
 const STDOUT_BUFFER_BYTES = 1024 * 1024;
+// The SDK's close: end the CLI's input, SIGTERM after this grace, SIGKILL after the second wait.
+const CLOSE_GRACE = Duration.seconds(2);
+const CLOSE_KILL_AFTER = Duration.seconds(5);
+// The SDK's own error for a call once its transport has closed.
+const QUERY_ENDED = "ProcessTransport is not ready for writing";
 
 /**
- * Runs `query()` on a provider I/O worker, or returns none when the pool is off. Main keeps the
- * CLI: it spawns it with `spawn` (the in-thread spawn hook), feeds its stdout to the worker in
- * order with its exit and errors, and writes, ends and kills it as the worker's SDK asks.
+ * Runs `query()` on a provider I/O worker (none when the pool is off); main spawns and owns the CLI.
+ * Called uninterruptibly like in-thread `query()`, so it can wait out the pool's 10 s handshake.
  */
+// Untraced: the runner's open span already covers it.
 export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   readonly pool: ProviderIoWorkerPool["Service"];
   readonly stageOptions: ClaudeAgentSdkStageOptions;
@@ -229,6 +247,24 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     runFork(Scope.close(scope, Exit.void));
   };
 
+  // What the SDK's close would do when its session can no longer run it.
+  const stopChild = () => {
+    const target = child;
+    if (target === undefined || childDone) return;
+    target.stdin.end();
+    runFork(
+      Effect.gen(function* () {
+        yield* Effect.sleep(CLOSE_GRACE);
+        if (childDone) return;
+        target.kill("SIGTERM");
+        yield* Effect.sleep(CLOSE_KILL_AFTER);
+        if (!childDone) target.kill("SIGKILL");
+      }),
+    );
+  };
+  const isClose = (frame: Uint8Array | ClaudeAgentSdkWorkerRequest) =>
+    !(frame instanceof Uint8Array) && frame.type === "close";
+
   const pump: Effect.Effect<void> = Effect.gen(function* () {
     const target = session;
     if (target === undefined) return;
@@ -236,7 +272,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       const frame = frames.shift();
       if (frame === undefined) return;
       if (!(frame instanceof Uint8Array)) {
-        target.notify(frame);
+        if (!target.notify(frame) && isClose(frame)) stopChild();
         continue;
       }
       bufferedBytes -= frame.byteLength;
@@ -250,8 +286,10 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     // A failed session drops what is left; its output reports the failure.
     Effect.catchCause(() =>
       Effect.sync(() => {
+        const closing = frames.some(isClose);
         frames.length = 0;
         bufferedBytes = 0;
+        if (closing) stopChild();
       }),
     ),
     Effect.ensuring(Effect.sync(() => (pumping = false))),
@@ -423,16 +461,17 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
         if (next.done === true) break;
         if (!released) workerSession.notify({ type: "prompt", message: next.value });
       }
-    } finally {
-      if (!released) workerSession.notify({ type: "promptEnd" });
+    } catch {
+      // The prompt queue ends by interruption only; either way the worker's prompts end here.
     }
+    if (!released) workerSession.notify({ type: "promptEnd" });
   })();
 
   // A reply resumes its caller at once, but outputs wake the consumer through the scheduler; yielding
   // lets the consumer take the frames that came before the reply first, as it would in-thread.
   const request = <A>(message: ClaudeAgentSdkWorkerRequest): Promise<A> =>
     released
-      ? Promise.reject(new Error("The Claude query has ended."))
+      ? Promise.reject(new Error(QUERY_ENDED))
       : runPromise(workerSession.call(message).pipe(Effect.onExit(() => Effect.yieldNow))).then(
           (value) => value as A,
           (error: WorkerSessionError) => Promise.reject(workerCause(error)),
@@ -451,12 +490,11 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     stopTask: (taskId) => request({ type: "stopTask", taskId }),
     backgroundTasks: (toolUseId) => request({ type: "backgroundTasks", toolUseId }),
     interrupt: () => request({ type: "interrupt" }),
-    // In-thread, frames the SDK has not read when it closes never reach a waiting reader.
+    // After the stdout main has read, so the worker's SDK closes where in-thread it would have.
     close: () => {
       if (released) return;
       cleanUp();
-      workerSession.cutOutput();
-      workerSession.notify({ type: "close" });
+      enqueue({ type: "close" });
     },
     [Symbol.asyncDispose]: () => {
       cleanUp();

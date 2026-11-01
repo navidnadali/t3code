@@ -3,6 +3,7 @@ import "vite-plus/test/config";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
+import * as NodeZlib from "node:zlib";
 import { defineConfig, mergeConfig } from "vite-plus";
 import { Rolldown } from "vite-plus/pack";
 
@@ -92,7 +93,12 @@ const providerIoWorkerBundle = {
         `The provider I/O worker bundle requires non-built-ins: ${external.join(", ")}`,
       );
     }
-    return `export const embeddedProviderIoWorkerSource = ${JSON.stringify(chunk.code)};`;
+    // Compressed, the bundle (2 MB with the Claude Agent SDK, partly two-byte text) costs a server with
+    // the pool off a short ASCII string instead.
+    const compressed = NodeZlib.brotliCompressSync(chunk.code, {
+      params: { [NodeZlib.constants.BROTLI_PARAM_QUALITY]: 11 },
+    });
+    return `export const embeddedProviderIoWorkerBrotli = ${JSON.stringify(compressed.toString("base64"))};`;
   },
 };
 

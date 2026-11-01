@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { OrchestrationV2StoredEvent } from "@t3tools/contracts";
+import type { OrchestrationV2DomainEvent, OrchestrationV2StoredEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
@@ -18,9 +18,9 @@ const PERMISSION_FIXTURES = new Set([
   "tool_call_restricted_granular",
 ]);
 
-// Timing races outside the SDK, which the worker's extra hop tips the other way (adapter events still
-// match exactly): two orchestration writers that both write without a command interleave their
-// stored events differently, and a frame the CLI sends after the turn's result races teardown.
+// Races outside the SDK that the worker's extra hop tips the other way (adapter events match): two
+// commandless writers interleave differently, and a frame sent after the result reaches the adapter
+// a round trip later, after teardown stopped the reader.
 const INTERLEAVED_WRITERS = new Set(["claude_background_subagent_lifecycle"]);
 const TRAILING_FRAME_RACE = new Set(["claude_compact_after_peer_turn"]);
 
@@ -67,28 +67,51 @@ const comparable = (
   return normalize(JSON.parse(JSON.stringify(value)));
 };
 
-// Writers that run independently (provider ingestion, each command) interleave by timing in-thread
-// too, so each one's own sequence is what must match; their ids are random, so only their shape is.
+// Each writer's own sequence must match: independent writers interleave by timing in-thread too.
+// Known in-thread race: an interrupt's effect and ingestion both record a stopped run, so those
+// records are compared per thread whoever wrote them, and an update repeating the last state is
+// dropped (the thread's unchanged state may be written once more).
+const INTERRUPTION_RECORDS = new Set([
+  "run-attempt.updated",
+  "run.updated",
+  "node.updated",
+  "turn-item.updated",
+]);
+const recordsInterruption = (commandId: string | null, event: OrchestrationV2DomainEvent) =>
+  (commandId === null || commandId.includes(":provider-turn.interrupt:")) &&
+  INTERRUPTION_RECORDS.has(event.type) &&
+  (event.payload as { readonly status?: unknown }).status === "interrupted";
+
 const byWriter = (
   stored: ReadonlyArray<OrchestrationV2StoredEvent>,
   options: { readonly ordered: boolean },
 ) => {
   const writers = new Map<string, Array<unknown>>();
-  for (const { commandId, event } of stored) {
-    const writer = `${commandId ?? "provider"}|${event.threadId}`;
+  const add = (writer: string, event: unknown) =>
     writers.set(writer, [...(writers.get(writer) ?? []), event]);
+  for (const { commandId, event } of stored) {
+    if (recordsInterruption(commandId, event)) {
+      add(`interruption|${event.threadId}`, { ...event, id: "<recorded by either writer>" });
+    } else {
+      add(`${commandId ?? "provider"}|${event.threadId}`, event);
+    }
   }
   const grouped = comparable(Object.fromEntries(writers), { numberUuids: false }) as Record<
     string,
-    unknown
+    ReadonlyArray<{ readonly type: string; readonly payload: unknown }>
   >;
+  const state = (event: { readonly type: string; readonly payload: unknown }) =>
+    JSON.stringify([event.type, event.payload]);
   return Object.keys(grouped)
     .toSorted()
     .map((writer) => {
-      const events = grouped[writer] as ReadonlyArray<unknown>;
+      const written = grouped[writer]!;
+      const changes = written
+        .filter((event, index) => index === 0 || state(event) !== state(written[index - 1]!))
+        .map((event) => JSON.stringify(event));
       return [
         writer,
-        options.ordered ? events : events.map((event) => JSON.stringify(event)).toSorted(),
+        options.ordered && !writer.startsWith("interruption|") ? changes : changes.toSorted(),
       ];
     });
 };

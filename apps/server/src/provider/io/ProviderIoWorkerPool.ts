@@ -1,4 +1,5 @@
 import * as NodeWorkerThreads from "node:worker_threads";
+import * as NodeZlib from "node:zlib";
 
 import * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
@@ -16,7 +17,7 @@ import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
-import { embeddedProviderIoWorkerSource } from "./embeddedProviderIoWorker.ts";
+import { embeddedProviderIoWorkerBrotli } from "./embeddedProviderIoWorker.ts";
 import type {
   ProviderIoMainMessage,
   ProviderIoStage,
@@ -47,10 +48,8 @@ export interface ProviderIoSession<Output, E, Request = never, Reply = never> {
   readonly end: Effect.Effect<void, E>;
   readonly output: Stream.Stream<Output, E>;
   readonly call: (request: Request) => Effect.Effect<Reply, E>;
-  /** A call whose reply nobody waits for; ordered like `call`. */
-  readonly notify: (request: Request) => void;
-  /** Ends the output after the outputs main holds now; later ones are dropped (their credit returned). */
-  readonly cutOutput: () => void;
+  /** A call whose reply nobody waits for; ordered like `call`. False when the session can take none. */
+  readonly notify: (request: Request) => boolean;
 }
 
 export interface ProviderIoOpenInput<
@@ -145,15 +144,18 @@ const describeMessageType = (message: unknown) =>
 
 const reasonOf = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
+// Inflated per worker, so a server whose pool is off never holds the source.
 const spawnWorker = () =>
-  embeddedProviderIoWorkerSource === undefined
+  embeddedProviderIoWorkerBrotli === undefined
     ? new NodeWorkerThreads.Worker(new URL("./providerIoWorker.ts", import.meta.url), {
         name: "t3-provider-io",
       })
-    : new NodeWorkerThreads.Worker(embeddedProviderIoWorkerSource, {
-        eval: true,
-        name: "t3-provider-io",
-      });
+    : new NodeWorkerThreads.Worker(
+        NodeZlib.brotliDecompressSync(
+          Buffer.from(embeddedProviderIoWorkerBrotli, "base64"),
+        ).toString("utf8"),
+        { eval: true, name: "t3-provider-io" },
+      );
 
 // Cloning a view copies its whole backing buffer, so only a chunk that owns its buffer is cloned;
 // any other is copied once and the copy transferred.
@@ -346,7 +348,6 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     let failure: { readonly error: E } | undefined;
     let ended = false;
     let finished = false;
-    let cut = false;
     let closed = false;
 
     const post = (message: ProviderIoMainMessage, transfer?: ReadonlyArray<ArrayBuffer>) => {
@@ -423,7 +424,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     slot.sessions.set(id, {
       deliver: (outputs, bytes) => {
         if (failure !== undefined || closed) return;
-        if (!cut && Arr.isReadonlyArrayNonEmpty(outputs)) {
+        if (Arr.isReadonlyArrayNonEmpty(outputs)) {
           Queue.offerUnsafe(queue, {
             outputs: outputs as Arr.NonEmptyReadonlyArray<Output>,
             bytes,
@@ -525,13 +526,9 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
           });
         }),
       notify: (request) => {
-        if (failure === undefined && !closed) post({ type: "notify", session: id, request });
-      },
-      cutOutput: () => {
-        if (failure !== undefined || closed || finished) return;
-        finished = true;
-        cut = true;
-        Queue.endUnsafe(queue);
+        if (failure !== undefined || closed || slot.stopped) return false;
+        post({ type: "notify", session: id, request });
+        return true;
       },
     };
     return Option.some(session);

@@ -52,7 +52,7 @@ import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as ResetCreditCoordinator from "./provider/resetCreditCoordinator.ts";
 import * as EventNdjsonLogger from "./provider/EventNdjsonLogger.ts";
 import * as ProviderIoWorkerPool from "./provider/io/ProviderIoWorkerPool.ts";
-import { ClaudeAgentSdkWorkerPool } from "./orchestration-v2/Adapters/ClaudeAgentSdkWorkerQuery.ts";
+import { layerClaudeAgentSdkWorkerPool } from "./orchestration-v2/Adapters/ClaudeAgentSdkWorkerQuery.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderIoStageTiming from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -653,16 +653,6 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
       CodexInstallation.CodexInstallation.layer,
     ),
   ),
-);
-
-// Claude queries use the provider I/O pool only when T3CODE_PROVIDER_IO_CLAUDE_SDK opts in.
-const layerClaudeAgentSdkWorkerPool = Layer.effect(
-  ClaudeAgentSdkWorkerPool,
-  Effect.gen(function* () {
-    const config = yield* ServerConfig.ServerConfig;
-    if (config.providerIoClaudeSdk !== true) return undefined;
-    return yield* ProviderIoWorkerPool.ProviderIoWorkerPool;
-  }),
 );
 
 const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(

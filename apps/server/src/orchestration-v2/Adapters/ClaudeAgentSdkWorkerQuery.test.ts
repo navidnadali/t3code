@@ -12,9 +12,12 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import * as NetService from "@t3tools/shared/Net";
 import { ProviderEventLoggers } from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as Deferred from "effect/Deferred";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -24,6 +27,8 @@ import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
 import * as ProviderIoWorkerPool from "../../provider/io/ProviderIoWorkerPool.ts";
+import { resolveServerConfig } from "../../cli/config.ts";
+import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import {
   ClaudeAgentSdkQueryRunner,
@@ -42,9 +47,18 @@ import {
 import {
   ClaudeAgentSdkWorkerPool,
   claudeAgentSdkStageOptions,
+  layerClaudeAgentSdkWorkerPool,
 } from "./ClaudeAgentSdkWorkerQuery.ts";
 
-const workers = vi.hoisted(() => ({ started: new Array<NodeWorkerThreads.Worker>() }));
+const workers = vi.hoisted(() => ({
+  started: new Array<NodeWorkerThreads.Worker>(),
+  opened: new Array<{
+    readonly worker: NodeWorkerThreads.Worker;
+    readonly session: number;
+    readonly stage: unknown;
+  }>(),
+  onBytes: undefined as ((chunk: Uint8Array) => void) | undefined,
+}));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
@@ -52,6 +66,16 @@ vi.mock("node:worker_threads", async (importOriginal) => {
     constructor(...args: ConstructorParameters<typeof actual.Worker>) {
       super(...args);
       workers.started.push(this);
+    }
+    override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      const [message] = args as [
+        { readonly type?: unknown; readonly session?: unknown; readonly stage?: unknown },
+      ];
+      if (message.type === "open" && typeof message.session === "number") {
+        workers.opened.push({ worker: this, session: message.session, stage: message.stage });
+      }
+      if (message.type === "bytes") workers.onBytes?.((message as { chunk: Uint8Array }).chunk);
+      super.postMessage(...args);
     }
   }
   return { ...actual, Worker: RecordedWorker };
@@ -83,7 +107,7 @@ const recordingPool = (
           },
           notify: (request) => {
             recorded.requests.push((request as { readonly type: string }).type);
-            session.notify(request);
+            return session.notify(request);
           },
         }));
       }),
@@ -597,40 +621,132 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
-  it.effect("drops the frames still on their way when the query closes, as in-thread", () =>
+  const resultFrame = (uuid: string, text: string) => ({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+    result: text,
+    session_id: SESSION_ID,
+    total_cost_usd: 0,
+    usage: { input_tokens: 1, output_tokens: 1 },
+    modelUsage: {},
+    permission_denials: [],
+    uuid,
+  });
+
+  // Main has posted the bytes holding `marker` to the worker.
+  const postedToWorker = (marker: string) =>
+    Effect.callback<void>((resume) => {
+      workers.onBytes = (chunk) => {
+        if (!Buffer.from(chunk).includes(marker)) return;
+        workers.onBytes = undefined;
+        resume(Effect.void);
+      };
+    });
+
+  it.effect(
+    "delivers the frames read before the query closes and none sent after, as in-thread",
+    () =>
+      Effect.gen(function* () {
+        const run = (mode: Mode) =>
+          withRunner(mode, ({ runner }) =>
+            Effect.gen(function* () {
+              const cli = new FakeClaudeCli(streamThenWait);
+              const session = yield* runner.open(openInput(cli));
+              yield* session.offer(prompt("Stream until closed."));
+              const streamed = yield* Deferred.make<void>();
+              const handedOver = yield* Deferred.make<void>();
+              const turn = yield* session.messages.pipe(
+                Stream.tap((message) =>
+                  !("uuid" in message)
+                    ? Effect.void
+                    : String(message.uuid) === "delta-15"
+                      ? Deferred.succeed(streamed, undefined)
+                      : String(message.uuid) === "result-read"
+                        ? Deferred.succeed(handedOver, undefined)
+                        : Effect.void,
+                ),
+                Stream.runCollect,
+                Effect.forkChild,
+              );
+              yield* Deferred.await(streamed);
+              // Read before the close: in-thread the SDK hands it to the reader, on a worker main sends it there.
+              const read =
+                mode === "worker"
+                  ? yield* Effect.forkChild(postedToWorker("result-read"), {
+                      startImmediately: true,
+                    })
+                  : undefined;
+              cli.write(resultFrame("result-read", "x".repeat(2 * 1024 * 1024)));
+              yield* read === undefined ? Deferred.await(handedOver) : Fiber.join(read);
+              yield* session.close;
+              cli.write(resultFrame("result-after-close", "late"));
+              const messages = yield* Fiber.join(turn);
+              return messages.map((message) => ("uuid" in message ? message.uuid : message.type));
+            }),
+          );
+        const inThread = yield* run("thread");
+        const inWorker = yield* run("worker");
+
+        assert.deepStrictEqual(inThread, [
+          ...Array.from({ length: 16 }, (_, delta) => `delta-${delta}`),
+          "result-read",
+        ]);
+        assert.deepStrictEqual(inWorker, inThread);
+      }),
+  );
+
+  it.effect("stops the CLI when a query closes after its worker session failed", () =>
+    withRunner("worker", ({ runner }) =>
+      Effect.gen(function* () {
+        const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+        const openedBefore = workers.opened.length;
+        const session = yield* runner.open(openInput(cli));
+        const messages = yield* Stream.runDrain(session.messages).pipe(
+          Effect.flip,
+          Effect.forkChild,
+        );
+        const [opened] = workers.opened.slice(openedBefore);
+        assert.isDefined(opened);
+        // What main hears when the stage throws on the worker.
+        opened.worker.emit("message", {
+          type: "fail",
+          session: opened.session,
+          error: new Error("injected stage failure"),
+        });
+        const error = yield* Fiber.join(messages);
+        assert.strictEqual(error.method, "fromAsyncIterable");
+        yield* session.close;
+        yield* Effect.promise(() => cli.stdinEnded);
+        yield* TestClock.adjust("2 seconds");
+        yield* Effect.promise(() => cli.waitForKill("SIGTERM"));
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.promise(() => cli.waitForKill("SIGKILL"));
+        assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGKILL"]);
+      }),
+    ),
+  );
+
+  it.effect("fails a control call after the query ended with the in-thread error", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>
         withRunner(mode, ({ runner }) =>
           Effect.gen(function* () {
-            const cli = new FakeClaudeCli(streamThenWait);
+            const cli = new FakeClaudeCli();
             const session = yield* runner.open(openInput(cli));
-            yield* session.offer(prompt("Stream until closed."));
-            const turn = yield* streamUntilDelta(session, "delta-15");
-            // The reader is waiting for its next frame; this one is still being read when it closes.
-            cli.write({
-              type: "result",
-              subtype: "success",
-              is_error: false,
-              duration_ms: 1,
-              duration_api_ms: 1,
-              num_turns: 1,
-              result: "x".repeat(2 * 1024 * 1024),
-              session_id: SESSION_ID,
-              total_cost_usd: 0,
-              usage: { input_tokens: 1, output_tokens: 1 },
-              modelUsage: {},
-              permission_denials: [],
-              uuid: "result-in-flight",
-            });
             yield* session.close;
-            const messages = yield* Fiber.join(turn);
-            return messages.map((message) => message.type);
+            yield* Stream.runDrain(session.messages);
+            yield* Effect.promise(() => cli.stdinEnded);
+            const error = yield* Effect.flip(session.setModel("claude-opus-4-1"));
+            return { method: error.method, message: (error.cause as Error).message };
           }),
         );
       const inThread = yield* run("thread");
       const inWorker = yield* run("worker");
 
-      assert.deepStrictEqual(inThread, Array(16).fill("stream_event"));
       assert.deepStrictEqual(inWorker, inThread);
     }),
   );
@@ -1311,6 +1427,79 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
         ).hookSpecificOutput.hookEventName,
         "SubagentStart",
       );
+    }),
+  );
+});
+
+// The server's own wiring, from the environment to the session the runner opens.
+const runWired = (env: Record<string, string>) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const baseDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-wiring-" });
+    const config = yield* resolveServerConfig(
+      {
+        mode: Option.some("desktop" as const),
+        port: Option.some(4888),
+        host: Option.none<string>(),
+        baseDir: Option.some(baseDir),
+        cwd: Option.none<string>(),
+        devUrl: Option.none<URL>(),
+        noBrowser: Option.none<boolean>(),
+        bootstrapFd: Option.none<number>(),
+        autoBootstrapProjectFromCwd: Option.none<boolean>(),
+        logWebSocketEvents: Option.none<boolean>(),
+        tailscaleServeEnabled: Option.none<boolean>(),
+        tailscaleServePort: Option.none<number>(),
+        lan: Option.none<boolean>(),
+      },
+      Option.none(),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+      ),
+    );
+    const runnerLayer = layerQueryRunner.pipe(
+      Layer.provide(
+        layerClaudeAgentSdkWorkerPool.pipe(
+          Layer.provideMerge(ProviderIoWorkerPool.layer),
+          Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+        ),
+      ),
+      Layer.provide(PortScanner.layerTest),
+      Layer.provide(
+        Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
+      ),
+      Layer.provide(NodeServices.layer),
+    );
+    const openedBefore = workers.opened.length;
+    const messages = yield* Effect.gen(function* () {
+      const runner = yield* ClaudeAgentSdkQueryRunner;
+      const cli = new FakeClaudeCli({ onUser: playOnPrompt });
+      const session = yield* runner.open(openInput(cli));
+      yield* session.offer(prompt("Run the tool."));
+      return yield* takeTurn(session);
+    }).pipe(Effect.provide(runnerLayer));
+    return {
+      stages: workers.opened.slice(openedBefore).map((opened) => opened.stage),
+      last: messages.at(-1)?.type,
+    };
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+describe("Claude Agent SDK worker wiring", () => {
+  it.effect("runs Claude queries on a worker when the environment opts in", () =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual(
+        yield* runWired({ T3CODE_PROVIDER_IO_WORKERS: "2", T3CODE_PROVIDER_IO_CLAUDE_SDK: "1" }),
+        { stages: ["claude-agent-sdk.query"], last: "result" },
+      );
+    }),
+  );
+
+  it.effect("keeps them in-thread with workers but no Claude opt-in, and with neither", () =>
+    Effect.gen(function* () {
+      for (const env of [{ T3CODE_PROVIDER_IO_WORKERS: "2" }, {}]) {
+        assert.deepStrictEqual(yield* runWired(env), { stages: [], last: "result" });
+      }
     }),
   );
 });

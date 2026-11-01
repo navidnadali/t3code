@@ -14,7 +14,7 @@ export interface ProviderIoStage<Options, Output, Request = never, Reply = never
 export interface ProviderIoStageHost<Output, Event> {
   /** Emits an output outside `push`; it is batched with the others. */
   readonly emit: (output: Output) => void;
-  /** Sends an event to main at once, ahead of batched outputs. */
+  /** Sends an event to main after the outputs emitted before it, ahead of later ones. */
   readonly signal: (event: Event) => void;
   /** Ends the output after what was emitted before (failing it with `error` when given); calls go on. */
   readonly finish: (...error: [] | [unknown]) => void;

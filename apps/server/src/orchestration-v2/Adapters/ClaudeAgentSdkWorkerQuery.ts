@@ -1,4 +1,6 @@
 import type {
+  HookCallback,
+  HookCallbackMatcher,
   McpServerConfig,
   Options as ClaudeQueryOptions,
   Query as ClaudeQuery,
@@ -76,16 +78,21 @@ export type ClaudeAgentSdkMainCallbacks = Pick<
   ClaudeAgentSdkWorkerCallback | "hooks"
 >;
 
+export interface ClaudeAgentSdkWorkerSetup {
+  readonly stageOptions: ClaudeAgentSdkStageOptions;
+  /** Main's callbacks and hook functions as they are now, as the SDK captures them at initialize. */
+  readonly callbacks: ClaudeAgentSdkMainCallbacks;
+}
+
 /**
- * The worker's share of the query options, or undefined when the query must stay in-thread: an
- * abort controller, options that are not plain data (a session store, an in-process MCP server,
- * a hook that is not a function), or no CLI path (the worker cannot find the SDK's bundled CLI
- * the way main does). Main's callbacks and hooks stay on main; the worker relays their calls.
+ * The worker's share of the query options and main's callbacks, or undefined to stay in-thread: an
+ * abort controller, options that are not plain data (a session store, an in-process MCP server, a
+ * hook that is not a function), or no CLI path (the worker cannot find the SDK's CLI as main does).
  */
-export function claudeAgentSdkStageOptions(
+export function claudeAgentSdkWorkerSetup(
   options: ClaudeQueryOptions,
   mcpServers: Record<string, McpServerConfig> | undefined,
-): ClaudeAgentSdkStageOptions | undefined {
+): ClaudeAgentSdkWorkerSetup | undefined {
   const {
     abortController,
     canUseTool,
@@ -102,28 +109,42 @@ export function claudeAgentSdkStageOptions(
   }
   if (Object.values(mcpServers ?? {}).some((server) => server.type === "sdk")) return undefined;
   if (!isPlainData(data) || !isPlainData(mcpServers)) return undefined;
-  const hookShape = hooks === undefined ? undefined : hooksShape(hooks);
-  if (hookShape === null) return undefined;
-  const callbacks: Array<ClaudeAgentSdkWorkerCallback> = [];
-  if (canUseTool !== undefined) callbacks.push("canUseTool");
-  if (onElicitation !== undefined) callbacks.push("onElicitation");
-  if (onUserDialog !== undefined) callbacks.push("onUserDialog");
+  const read = hooks === undefined ? undefined : readHooks(hooks);
+  if (read === null) return undefined;
+  const names: Array<ClaudeAgentSdkWorkerCallback> = [];
+  if (canUseTool !== undefined) names.push("canUseTool");
+  if (onElicitation !== undefined) names.push("onElicitation");
+  if (onUserDialog !== undefined) names.push("onUserDialog");
   return {
-    options: data,
-    callbacks,
-    ...(hookShape === undefined ? {} : { hooks: hookShape }),
+    stageOptions: {
+      options: data,
+      callbacks: names,
+      ...(read === undefined ? {} : { hooks: read.shape }),
+    },
+    callbacks: {
+      ...(canUseTool === undefined ? {} : { canUseTool }),
+      ...(onElicitation === undefined ? {} : { onElicitation }),
+      ...(onUserDialog === undefined ? {} : { onUserDialog }),
+      ...(read === undefined ? {} : { hooks: read.functions }),
+    },
   };
 }
 
-// The fields the SDK reads from each matcher, read as it does (getters and all); null when a matcher's
-// hooks are not functions or its matcher or timeout is not plain data.
-const hooksShape = (
+// The fields the SDK reads from each matcher, read once as it does (getters and all): their shape for
+// the worker and a copy of the hook functions for main. Null when a matcher's hooks are not functions
+// or its matcher or timeout is not plain data.
+const readHooks = (
   hooks: NonNullable<ClaudeQueryOptions["hooks"]>,
-): ClaudeAgentSdkWorkerHooks | null => {
+): {
+  readonly shape: ClaudeAgentSdkWorkerHooks;
+  readonly functions: NonNullable<ClaudeQueryOptions["hooks"]>;
+} | null => {
   const shape: Record<string, ClaudeAgentSdkWorkerHooks[keyof ClaudeAgentSdkWorkerHooks]> = {};
+  const functions: Record<string, Array<HookCallbackMatcher>> = {};
   for (const [event, matchers] of Object.entries(hooks)) {
     if (!Array.isArray(matchers)) return null;
     const matcherShapes = [];
+    const matcherFunctions: Array<HookCallbackMatcher> = [];
     for (const matcher of matchers as ReadonlyArray<unknown>) {
       if (typeof matcher !== "object" || matcher === null) return null;
       const { hooks: callbacks, matcher: pattern, timeout } = matcher as Record<string, unknown>;
@@ -134,10 +155,12 @@ const hooksShape = (
         ...(timeout === undefined ? {} : { timeout: timeout as number }),
         hooks: callbacks.length,
       });
+      matcherFunctions.push({ hooks: [...(callbacks as Array<HookCallback>)] });
     }
     shape[event] = matcherShapes;
+    functions[event] = matcherFunctions;
   }
-  return shape;
+  return { shape, functions };
 };
 
 const callbackOf = (

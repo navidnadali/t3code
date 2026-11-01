@@ -48,7 +48,7 @@ import {
 } from "./ClaudeAgentSdkFakeCli.testkit.ts";
 import {
   ClaudeAgentSdkWorkerPool,
-  claudeAgentSdkStageOptions,
+  claudeAgentSdkWorkerSetup,
   layerClaudeAgentSdkWorkerPool,
   startClaudeQueryInWorker,
 } from "./ClaudeAgentSdkWorkerQuery.ts";
@@ -1533,6 +1533,45 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
+  it.effect("runs the hooks the query opened with, as the SDK captures them at initialize", () =>
+    Effect.gen(function* () {
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner }) =>
+          Effect.gen(function* () {
+            const ran: Array<string> = [];
+            const matcher: HookCallbackMatcher = {
+              matcher: "Bash",
+              hooks: [
+                async () => {
+                  ran.push("opened with");
+                  return { continue: true };
+                },
+              ],
+            };
+            const hooks: NonNullable<ClaudeQueryOptions["hooks"]> = { PreToolUse: [matcher] };
+            const cli = new FakeClaudeCli();
+            const session = yield* runner.open(openInput(cli, { hooks }));
+            // Neither replacing a matcher's hook nor the event's matchers reaches the open query.
+            matcher.hooks[0] = async () => {
+              ran.push("replaced");
+              return { continue: false };
+            };
+            hooks.PreToolUse = [];
+            const answer = yield* Effect.promise(() =>
+              cli.request(hookRequest("hook_0", "toolu-replaced")),
+            );
+            yield* session.close;
+            return { ran, answer: answer.response };
+          }),
+        );
+      const inThread = yield* run("thread");
+      const inWorker = yield* run("worker");
+
+      assert.deepStrictEqual(inThread.ran, ["opened with"]);
+      assert.deepStrictEqual(inWorker, inThread);
+    }),
+  );
+
   it.effect("relays T3's SubagentStart hook to main and answers it as in-thread", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>
@@ -1751,35 +1790,46 @@ describe("startClaudeQueryInWorker callbacks", () => {
   );
 });
 
-describe("claudeAgentSdkStageOptions", () => {
+describe("claudeAgentSdkWorkerSetup", () => {
   const hook = () => Promise.resolve({});
   const base = { model: "claude-sonnet-4-6", pathToClaudeCodeExecutable: "claude" };
 
-  it("passes data, and the callbacks and hook shape main keeps", () => {
-    assert.deepStrictEqual(
-      claudeAgentSdkStageOptions(
-        {
-          ...base,
-          canUseTool: vi.fn(),
-          onUserDialog: vi.fn(),
-          spawnClaudeCodeProcess: vi.fn(),
-          stderr: vi.fn(),
-          hooks: {
-            SubagentStart: [{ hooks: [hook] }],
-            PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: [hook, vi.fn()] }, { hooks: [] }],
-          },
-        },
-        { "t3-code": { type: "http", url: "http://localhost:3773/mcp" } },
-      ),
+  it("passes data and the hook shape to the worker, and keeps main's callbacks as they are now", () => {
+    const canUseTool = vi.fn();
+    const onUserDialog = vi.fn();
+    const otherHook = vi.fn();
+    const preToolUseHooks = [hook, otherHook];
+    const setup = claudeAgentSdkWorkerSetup(
       {
-        options: base,
-        callbacks: ["canUseTool", "onUserDialog"],
+        ...base,
+        canUseTool,
+        onUserDialog,
+        spawnClaudeCodeProcess: vi.fn(),
+        stderr: vi.fn(),
         hooks: {
-          SubagentStart: [{ hooks: 1 }],
-          PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: 2 }, { hooks: 0 }],
+          SubagentStart: [{ hooks: [hook] }],
+          PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: preToolUseHooks }, { hooks: [] }],
         },
       },
+      { "t3-code": { type: "http", url: "http://localhost:3773/mcp" } },
     );
+    assert.deepStrictEqual(setup?.stageOptions, {
+      options: base,
+      callbacks: ["canUseTool", "onUserDialog"],
+      hooks: {
+        SubagentStart: [{ hooks: 1 }],
+        PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: 2 }, { hooks: 0 }],
+      },
+    });
+    assert.deepStrictEqual(setup?.callbacks, {
+      canUseTool,
+      onUserDialog,
+      hooks: {
+        SubagentStart: [{ hooks: [hook] }],
+        PreToolUse: [{ hooks: [hook, otherHook] }, { hooks: [] }],
+      },
+    });
+    assert.notStrictEqual(setup?.callbacks.hooks?.PreToolUse?.[0]?.hooks, preToolUseHooks);
     const getterMatcher = Object.defineProperties(
       {},
       {
@@ -1789,18 +1839,22 @@ describe("claudeAgentSdkStageOptions", () => {
       },
     ) as HookCallbackMatcher;
     assert.deepStrictEqual(
-      claudeAgentSdkStageOptions({ ...base, hooks: { PreToolUse: [getterMatcher] } }, undefined),
+      claudeAgentSdkWorkerSetup({ ...base, hooks: { PreToolUse: [getterMatcher] } }, undefined)
+        ?.stageOptions,
       {
         options: base,
         callbacks: [],
         hooks: { PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: 1 }] },
       },
     );
-    assert.deepStrictEqual(claudeAgentSdkStageOptions({ ...base, hooks: {} }, undefined), {
-      options: base,
-      callbacks: [],
-      hooks: {},
-    });
+    assert.deepStrictEqual(
+      claudeAgentSdkWorkerSetup({ ...base, hooks: {} }, undefined)?.stageOptions,
+      {
+        options: base,
+        callbacks: [],
+        hooks: {},
+      },
+    );
   });
 
   it("keeps a query in-thread when the worker could not run it the same way", () => {
@@ -1823,7 +1877,7 @@ describe("claudeAgentSdkStageOptions", () => {
       [{ ...base, settings: { env: new Map() } as never }, undefined],
     ];
     for (const [options, mcpServers] of cases) {
-      assert.isUndefined(claudeAgentSdkStageOptions(options, mcpServers));
+      assert.isUndefined(claudeAgentSdkWorkerSetup(options, mcpServers));
     }
   });
 });

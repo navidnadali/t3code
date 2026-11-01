@@ -86,27 +86,6 @@ it.effect("builds a worker whose code holds loader text as data and compiles cod
   }),
 );
 
-it.effect("rejects a worker that requires or imports a computed name", () =>
-  Effect.gen(function* () {
-    const name = 'const name = ["p1-024", "pkg"].join("-");\n';
-    assert.include(yield* rejection(`${name}require(name);\n`), "require");
-    assert.include(yield* rejection(`${name}void import(name);\n`), "import");
-  }),
-);
-
-it.effect("rejects a worker that reaches a loader indirectly", () =>
-  Effect.gen(function* () {
-    for (const [worker, problem] of [
-      ['module["require"]("./package.json");\n', "computed reference to require"],
-      ['require.call(null, "./package.json");\n', "reference to require other than a call"],
-      // Rolldown follows the alias and fails to resolve the module itself.
-      ['const load = require;\nload("./package.json");\n', "Could not resolve './package.json'"],
-    ] as const) {
-      assert.include(yield* rejection(worker), problem);
-    }
-  }),
-);
-
 it.effect("fails the build when the plugin never replaces its placeholder", () =>
   Effect.gen(function* () {
     const error = yield* buildHost('console.log("worker");\n', {

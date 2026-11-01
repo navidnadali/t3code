@@ -93,6 +93,8 @@ const SESSION_ID = "11111111-2222-4333-8444-555555555555";
 interface Recorded {
   readonly opens: Array<boolean>;
   readonly requests: Array<string>;
+  /** Called with each event's type as it reaches main. */
+  onEvent?: (type: string) => void;
 }
 
 // Records what crosses to the worker, so a test can tell the worker ran the query.
@@ -101,22 +103,30 @@ const recordingPool = (
   recorded: Recorded,
 ): ProviderIoWorkerPool.ProviderIoWorkerPool["Service"] => ({
   open: (input) =>
-    pool.open(input).pipe(
-      Effect.map((opened) => {
-        recorded.opens.push(Option.isSome(opened));
-        return Option.map(opened, (session) => ({
-          ...session,
-          call: (request) => {
-            recorded.requests.push((request as { readonly type: string }).type);
-            return session.call(request);
-          },
-          notify: (request) => {
-            recorded.requests.push((request as { readonly type: string }).type);
-            return session.notify(request);
-          },
-        }));
-      }),
-    ),
+    pool
+      .open({
+        ...input,
+        onEvent: (event) => {
+          input.onEvent?.(event);
+          recorded.onEvent?.((event as { readonly type: string }).type);
+        },
+      })
+      .pipe(
+        Effect.map((opened) => {
+          recorded.opens.push(Option.isSome(opened));
+          return Option.map(opened, (session) => ({
+            ...session,
+            call: (request) => {
+              recorded.requests.push((request as { readonly type: string }).type);
+              return session.call(request);
+            },
+            notify: (request) => {
+              recorded.requests.push((request as { readonly type: string }).type);
+              return session.notify(request);
+            },
+          }));
+        }),
+      ),
 });
 
 interface Harness {
@@ -1433,6 +1443,58 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
         assert.lengthOf(messages, 3);
       }),
     ),
+  );
+
+  // Known limit of the ordering, and why the consumer must never wait on a callback's result: on a
+  // worker a callback starts only when the consumer asks for more, so a consumer that waits on it
+  // would deadlock where in-thread it would not.
+  it.effect("starts a callback only when a busy consumer asks for more, unlike in-thread", () =>
+    Effect.gen(function* () {
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner, recorded }) =>
+          Effect.gen(function* () {
+            const consumerBusy = Promise.withResolvers<void>();
+            const callbackArrived = Promise.withResolvers<void>();
+            const called = Promise.withResolvers<void>();
+            const releaseConsumer = yield* Deferred.make<void>();
+            let callbackStarted = false;
+            recorded.onEvent = (type) => {
+              if (type === "callback") callbackArrived.resolve();
+            };
+            const cli = new FakeClaudeCli({ pipeLatency: true, onUser: streamThenAsk(1) });
+            const session = yield* runner.open(
+              openInput(cli, {
+                canUseTool: async () => {
+                  callbackStarted = true;
+                  called.resolve();
+                  return { behavior: "allow", updatedInput: {} };
+                },
+              }),
+            );
+            yield* session.messages.pipe(
+              Stream.runForEach(() =>
+                Effect.sync(() => consumerBusy.resolve()).pipe(
+                  Effect.andThen(Deferred.await(releaseConsumer)),
+                ),
+              ),
+              Effect.forkChild,
+            );
+            yield* session.offer(prompt("Stream one frame, then ask."));
+            yield* Effect.promise(() => consumerBusy.promise);
+            // In-thread the callback runs while the consumer is busy; on a worker it has arrived but waits.
+            if (mode === "thread") yield* Effect.promise(() => called.promise);
+            else yield* Effect.promise(() => callbackArrived.promise);
+            const startedWhileBusy = callbackStarted;
+            yield* Deferred.succeed(releaseConsumer, undefined);
+            yield* Effect.promise(() => called.promise);
+            yield* session.close;
+            return startedWhileBusy;
+          }),
+        );
+
+      assert.isTrue(yield* run("thread"));
+      assert.isFalse(yield* run("worker"));
+    }),
   );
 
   it.effect("relays T3's SubagentStart hook to main and answers it as in-thread", () =>

@@ -107,8 +107,9 @@ export type ClaudeAgentSdkWorkerRequest =
   | { readonly type: "error"; readonly error: ClaudeAgentSdkProcessError }
   // The SDK's response field for the answer as JSON (`{"response":…}`), undefined for a null answer.
   | { readonly type: "callbackResult"; readonly id: number; readonly json: string | undefined }
-  // The text the SDK sends the CLI for a callback that threw.
-  | { readonly type: "callbackError"; readonly id: number; readonly text: string };
+  // The SDK's error field for a callback that threw as JSON (`{"error":…}`), undefined when the SDK
+  // could not write it.
+  | { readonly type: "callbackError"; readonly id: number; readonly json: string | undefined };
 
 export type ClaudeAgentSdkWorkerEvent =
   | {
@@ -320,7 +321,18 @@ const makeCallbackRelay = (signal: Signal, read: () => number) => {
     if (callback === undefined) return;
     pending.delete(request.id);
     if (request.type === "callbackError") {
-      callback.reject(new Error(request.text));
+      // The SDK writes an Error's message as its error field, so this one writes main's, or fails to.
+      const { json } = request;
+      const error = new Error();
+      Object.defineProperty(error, "message", {
+        value: {
+          toJSON: () => {
+            if (json === undefined) throw new TypeError("The callback's error cannot be written.");
+            return (JSON.parse(json) as { readonly error?: unknown }).error;
+          },
+        },
+      });
+      callback.reject(error);
       return;
     }
     if (request.json === undefined) {

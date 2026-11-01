@@ -156,12 +156,14 @@ const answerJson = (call: ClaudeAgentSdkCallbackCall, value: unknown): string | 
   return JSON.stringify({ response });
 };
 
-// What the SDK sends the CLI for a callback that throws.
-const sdkErrorText = (error: unknown) => {
+// The SDK's error field for a callback that throws, as it writes it (an Error's message whatever its
+// type, else the error as a string), or undefined when it cannot and sends nothing. In-thread, a
+// rejection whose string form throws is also an unhandled rejection in the SDK; here it is not.
+const errorJson = (error: unknown): string | undefined => {
   try {
-    return error instanceof Error ? String(error.message) : String(error);
+    return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   } catch {
-    return Object.prototype.toString.call(error);
+    return undefined;
   }
 };
 
@@ -354,14 +356,15 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     });
   };
 
-  // A cancelled callback still answers, as in-thread.
+  // A cancelled callback still answers, as in-thread. Nothing here may throw into the pool's handler.
   const runCallback = (id: number, call: ClaudeAgentSdkCallbackCall) => {
     const controller = callbacks.get(id);
     if (controller === undefined) return;
-    const options = { ...call.args.at(-1), signal: controller.signal };
-    const args: Array<unknown> = [...call.args.slice(0, -1), options];
     let result: unknown;
     try {
+      // The SDK puts the signal first.
+      const options = { signal: controller.signal, ...call.args.at(-1) };
+      const args: Array<unknown> = [...call.args.slice(0, -1), options];
       const callback = callbackOf(input.callbacks, call);
       if (callback === undefined) throw new Error(`${call.name} callback is not provided.`);
       result = callback(...(args as Array<never>));
@@ -369,7 +372,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       result = Promise.reject(error);
     }
     const fail = (error: unknown) =>
-      session?.notify({ type: "callbackError", id, text: sdkErrorText(error) });
+      session?.notify({ type: "callbackError", id, json: errorJson(error) });
     void Promise.resolve(result).then(
       (value) => {
         if (!callbacks.delete(id)) return;
@@ -415,7 +418,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
         abort.abort();
         return;
       case "callback":
-        if (cleanedUp) return;
+        if (cleanedUp || callbacks.has(event.id)) return;
         callbacks.set(event.id, new AbortController());
         due.push({ after: event.after, start: () => runCallback(event.id, event.call) });
         if (consumerIdle || !consuming) startDue();
@@ -493,7 +496,9 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     stopTask: (taskId) => request({ type: "stopTask", taskId }),
     backgroundTasks: (toolUseId) => request({ type: "backgroundTasks", toolUseId }),
     interrupt: () => request({ type: "interrupt" }),
-    // After the stdout main has read, so the worker's SDK closes where in-thread it would have.
+    // After the stdout main has read, so the worker's SDK closes where in-thread it would have. A
+    // control request the SDK reads in the same tick as an in-thread close may still start its
+    // callback there; here a callback raised after close never starts.
     close: () => {
       if (released) return;
       cleanUp();
@@ -505,9 +510,10 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     },
   };
 
-  // In-thread, the consumer races the SDK through the messages read before a callback. Here the
-  // callback starts once the consumer has handled them all (as in-thread when the request comes in
-  // its own read): at once when it waits for output, else at its next pull, with output split there.
+  // A callback starts once the consumer has handled the messages read before it (the in-thread order
+  // when the request comes in its own read), output split there. Invariant: the message consumer must
+  // never wait on a callback's result, or this deadlocks. A cancel that comes before the start leaves
+  // the callback starting with an aborted signal, where in-thread it was running.
   const ordered = Stream.transformPull(workerSession.output, (pull) =>
     Effect.sync(() => {
       let chunk: ReadonlyArray<SDKMessage> = [];

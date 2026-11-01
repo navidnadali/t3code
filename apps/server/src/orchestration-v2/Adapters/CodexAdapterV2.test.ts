@@ -346,6 +346,8 @@ describe("CodexAdapterV2 native protocol logging", () => {
       class Usage {
         readonly total = 20;
       }
+      const sparse: Array<number> = [];
+      sparse[1] = 1;
 
       yield* protocolLogger({
         direction: "outgoing",
@@ -353,9 +355,10 @@ describe("CodexAdapterV2 native protocol logging", () => {
         payload: {
           method: "thread/event",
           params: {
-            at: new Date(0),
+            endpoint: new URL("https://example.test/"),
             usage: new Usage(),
             tagged: Object.assign([1, 2], { note: "extra" }),
+            sparse: Object.assign(sparse, { note: "extra" }),
           },
         },
       });
@@ -365,9 +368,13 @@ describe("CodexAdapterV2 native protocol logging", () => {
         Object(Reflect.get(Object(Reflect.get(Object(writes[0]), "event")), "payload")),
         "params",
       );
-      assert.deepEqual(params, { at: {}, usage: { total: 20 }, tagged: [1, 2] });
-      assert.equal(Object.getPrototypeOf(Reflect.get(Object(params), "usage")), Object.prototype);
-      assert.deepEqual(Object.keys(Object(Reflect.get(Object(params), "tagged"))), ["0", "1"]);
+      assert.deepEqual(Object.keys(Object(params)), ["endpoint", "usage", "tagged", "sparse"]);
+      const logged = (key: string): unknown => Reflect.get(Object(params), key);
+      assert.deepEqual(logged("endpoint"), {});
+      assert.deepEqual(logged("usage"), { total: 20 });
+      assert.equal(Object.getPrototypeOf(logged("usage")), Object.prototype);
+      assert.deepEqual(Object.keys(Object(logged("tagged"))), ["0", "1"]);
+      assert.deepEqual(Object.keys(Object(logged("sparse"))), ["1"]);
     }),
   );
 });

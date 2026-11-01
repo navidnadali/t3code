@@ -1037,27 +1037,46 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   );
 });
 
+const processSpawnerChoices: Record<string, "default" | "worker" | "child"> = {
+  "": "default",
+  default: "default",
+  "0": "default",
+  false: "default",
+  worker: "worker",
+  child: "child",
+  "1": "child",
+  true: "child",
+};
+
 /**
- * Replaces the ambient ChildProcessSpawner: T3CODE_PROCESS_SPAWNER=child starts commands from a
- * spawner process, else T3CODE_VCS_SPAWN_WORKER=true from a worker thread; unset keeps it. Both
- * spawn real processes, so an injected (fake) spawner then only sees the command shapes they do not run.
+ * Replaces the ambient ChildProcessSpawner: T3CODE_PROCESS_SPAWNER=child (or 1/true) starts commands
+ * from a spawner process, =worker (or T3CODE_VCS_SPAWN_WORKER=true) from a worker thread; unset keeps
+ * it. Both spawn real processes, so an injected (fake) spawner then only sees the command shapes they
+ * do not run. A spawner value it does not know is logged and keeps the default, not the server down.
  */
 export const layerFromConfig = Layer.effect(
   ChildProcessSpawner,
   Effect.gen(function* () {
     const fallback = yield* ChildProcessSpawner;
     const platform = yield* HostProcess.Platform;
-    const spawner = yield* Config.Literals(["default", "child"], PROCESS_SPAWNER_ENV).pipe(
-      Config.withDefault("default"),
+    const value = yield* Config.String(PROCESS_SPAWNER_ENV).pipe(
+      Config.withDefault(""),
       Effect.orDie,
     );
+    let spawner = processSpawnerChoices[value.trim().toLowerCase()];
+    if (spawner === undefined) {
+      yield* Effect.logError(
+        `${PROCESS_SPAWNER_ENV}="${value}" is not child, worker or default (or 1/0); using the default spawner`,
+      );
+      spawner = "default";
+    }
     const worker = yield* Config.Boolean(VCS_SPAWN_WORKER_ENV).pipe(
       Config.withDefault(false),
       Effect.orDie,
     );
     if (platform === "win32") return fallback;
     if (spawner === "child") return yield* makeProcessSpawner(fallback);
-    if (!worker) return fallback;
+    if (spawner === "default" && !worker) return fallback;
     return yield* make(fallback);
   }),
 );

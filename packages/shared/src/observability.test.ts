@@ -1,6 +1,7 @@
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -8,10 +9,12 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as References from "effect/References";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 
 import {
@@ -22,6 +25,7 @@ import {
   makeTraceSink,
   type EffectTraceRecord,
   type TraceRecord,
+  type TraceSink,
   OtlpHeadersFromString,
   truncateTraceAttributes,
   processServiceInstanceId,
@@ -71,7 +75,7 @@ const TraceRecordLine = Schema.Struct({
 
 const decodeTraceRecordLine = Schema.decodeUnknownSync(Schema.fromJsonString(TraceRecordLine));
 
-const makeRecord = (name: string, suffix = ""): TraceRecord => ({
+const makeRecord = (name: string, suffix = ""): EffectTraceRecord => ({
   type: "effect-span",
   name,
   traceId: `trace-${name}-${suffix}`,
@@ -187,6 +191,133 @@ describe("observability", () => {
             sampled ? [{ _tag: "Success" }] : [],
           );
         }
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "summarises fast successful SQL spans per name each minute and writes every other span",
+    () =>
+      Effect.gen(function* () {
+        const written: Array<TraceRecord> = [];
+        const sink: TraceSink = {
+          filePath: "unused",
+          push: (record) => {
+            written.push(record);
+          },
+          flush: Effect.void,
+          close: () => Effect.void,
+        };
+        const makeTracer = (sqlMinDurationMs: number) =>
+          makeLocalFileTracer({
+            filePath: "unused",
+            maxBytes: 1024,
+            maxFiles: 1,
+            batchWindowMs: 10_000,
+            sink,
+            sqlMinDurationMs,
+          });
+        const nanos = (ms: number) => BigInt(Math.round(ms * 1_000_000));
+        const runSpan = (
+          tracer: Tracer.Tracer,
+          name: string,
+          startMs: number,
+          durationMs: number,
+          options: {
+            readonly exit?: Exit.Exit<unknown, unknown>;
+            readonly lockWaitMs?: number;
+            readonly log?: boolean;
+          } = {},
+        ) => {
+          const span = tracer.span({
+            name,
+            parent: Option.none(),
+            annotations: Context.empty(),
+            links: [],
+            startTime: nanos(startMs),
+            kind: "client",
+            root: false,
+            sampled: true,
+          });
+          if (options.lockWaitMs !== undefined) {
+            span.attribute("db.lock_wait_ms", options.lockWaitMs);
+          }
+          if (options.log) span.event("slow plan", nanos(startMs), { "effect.logLevel": "WARN" });
+          span.end(nanos(startMs + durationMs), options.exit ?? Exit.void);
+        };
+        const describeWritten = () =>
+          written.splice(0).map((record) =>
+            record.type === "span-summary"
+              ? { ...record }
+              : {
+                  name: record.name,
+                  durationMs: record.durationMs,
+                  exit: record.type === "effect-span" ? record.exit._tag : undefined,
+                },
+          );
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const tracer = yield* makeTracer(2);
+            runSpan(tracer, "sqlite", 10, 0.5, { lockWaitMs: 0 });
+            runSpan(tracer, "sqlite", 20, 1.5);
+            runSpan(tracer, "sql.transaction", 30, 1, { lockWaitMs: 0.003 });
+            runSpan(tracer, "sqlite", 40, 2);
+            runSpan(tracer, "sqlite", 50, 0.5, { exit: Exit.fail("SQLITE_BUSY") });
+            runSpan(tracer, "sqlite", 60, 0.5, { exit: Exit.interrupt(1) });
+            runSpan(tracer, "sqlite", 70, 0.5, { lockWaitMs: 0.4 });
+            runSpan(tracer, "sql.transaction", 80, 0.5, { log: true });
+            runSpan(tracer, "ProjectionStore.getThreadShell", 90, 0.25);
+            assert.deepStrictEqual(describeWritten(), [
+              { name: "sqlite", durationMs: 2, exit: "Success" },
+              { name: "sqlite", durationMs: 0.5, exit: "Failure" },
+              { name: "sqlite", durationMs: 0.5, exit: "Interrupted" },
+              { name: "sqlite", durationMs: 0.5, exit: "Success" },
+              { name: "sql.transaction", durationMs: 0.5, exit: "Success" },
+              { name: "ProjectionStore.getThreadShell", durationMs: 0.25, exit: "Success" },
+            ]);
+
+            yield* TestClock.adjust("1 minute");
+            assert.deepStrictEqual(describeWritten(), [
+              {
+                type: "span-summary",
+                name: "sqlite",
+                thresholdMs: 2,
+                count: 2,
+                totalDurationMs: 2,
+                maxDurationMs: 1.5,
+                startTimeUnixNano: String(nanos(10)),
+                endTimeUnixNano: String(nanos(21.5)),
+              },
+              {
+                type: "span-summary",
+                name: "sql.transaction",
+                thresholdMs: 2,
+                count: 1,
+                totalDurationMs: 1,
+                maxDurationMs: 1,
+                startTimeUnixNano: String(nanos(30)),
+                endTimeUnixNano: String(nanos(31)),
+              },
+            ]);
+
+            yield* TestClock.adjust("1 minute");
+            assert.deepStrictEqual(describeWritten(), []);
+            runSpan(tracer, "sqlite", 200, 0.25);
+          }),
+        );
+        assert.deepStrictEqual(
+          describeWritten().map((record) => ["count" in record ? record.count : 0, record.name]),
+          [[1, "sqlite"]],
+        );
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            runSpan(yield* makeTracer(0), "sqlite", 300, 0.25);
+          }),
+        );
+        assert.deepStrictEqual(describeWritten(), [
+          { name: "sqlite", durationMs: 0.25, exit: "Success" },
+        ]);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 

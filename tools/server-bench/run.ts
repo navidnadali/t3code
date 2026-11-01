@@ -79,7 +79,10 @@ Load
   The workload fingerprint hashes the driver (its file, module directory and the local modules
   they import), the fake providers (fake-*/ and what they import) and the transcripts they replay
   (the server's recorded replay fixtures, and every absolute BENCH_*TRANSCRIPT path in the server
-  env or the fixture's settings.json).
+  env or the fixture's settings.json), and launchers_sha256 what the fixture's settings.json runs
+  (binaryPath, commandPath, absolute commandArgs, e.g. from providers.ts --claude-launcher): a
+  launcher in this harness's fake-*/ adds its path, one in another checkout's fake-*/ that
+  checkout's fakes and recorded replay fixtures, any other its file and its local imports.
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -281,11 +284,25 @@ export async function fakesHash(benchDir: string): Promise<string> {
   return hash.digest("hex");
 }
 
-const REPLAY_FIXTURES = NodePath.join(
-  repoRoot,
-  "apps/server/src/orchestration-v2/testkit/fixtures",
-);
+const RECORDINGS = "apps/server/src/orchestration-v2/testkit/fixtures";
+const REPLAY_FIXTURES = NodePath.join(repoRoot, RECORDINGS);
 const TRANSCRIPT_VAR = /^BENCH_\w*TRANSCRIPT$/;
+
+/** The provider instances of a directory fixture's settings.json; none for other fixtures. */
+function settingsInstances(fixture: FixtureInfo): Array<Record<string, unknown>> {
+  const settings =
+    fixture.kind === "dir" ? NodePath.join(fixture.path!, "userdata", "settings.json") : null;
+  if (settings === null || !isFile(settings)) return [];
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = recordOf(JSON.parse(NodeFS.readFileSync(settings, "utf8")));
+  } catch (error) {
+    throw new Error(`${settings}: ${error instanceof Error ? error.message : String(error)}`, {
+      cause: error,
+    });
+  }
+  return Object.values(recordOf(parsed.providerInstances)).map(recordOf);
+}
 
 /** The BENCH_*TRANSCRIPT values of `env` and of the instances in a directory fixture's settings. */
 function transcriptSettings(
@@ -295,17 +312,8 @@ function transcriptSettings(
   const values = Object.entries(env)
     .filter(([name]) => TRANSCRIPT_VAR.test(name))
     .map(([, value]) => value);
-  const settings =
-    fixture.kind === "dir" ? NodePath.join(fixture.path!, "userdata", "settings.json") : null;
-  if (settings === null || !isFile(settings)) return values;
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = recordOf(JSON.parse(NodeFS.readFileSync(settings, "utf8")));
-  } catch (error) {
-    throw new Error(`${settings}: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  for (const instance of Object.values(recordOf(parsed.providerInstances))) {
-    const environment = recordOf(instance).environment;
+  for (const instance of settingsInstances(fixture)) {
+    const environment = instance.environment;
     for (const entry of Array.isArray(environment) ? environment.map(recordOf) : []) {
       if (typeof entry.name === "string" && TRANSCRIPT_VAR.test(entry.name)) {
         if (typeof entry.value === "string") values.push(entry.value);
@@ -313,6 +321,18 @@ function transcriptSettings(
     }
   }
   return values;
+}
+
+/** Adds the `*.ndjson` recordings under `fixturesDir` (the fakes load them by name) to `hash`. */
+async function hashRecordings(hash: NodeCrypto.Hash, fixturesDir: string): Promise<void> {
+  const recorded = NodeFS.existsSync(fixturesDir)
+    ? (NodeFS.readdirSync(fixturesDir, { recursive: true }) as Array<string>)
+        .filter((relative) => relative.endsWith(".ndjson"))
+        .toSorted()
+    : [];
+  for (const relative of recorded) {
+    hash.update(`${relative}\0${await sha256File(NodePath.join(fixturesDir, relative))}\n`);
+  }
 }
 
 /**
@@ -326,14 +346,7 @@ export async function transcriptsHash(
   fixturesDir: string,
 ): Promise<string> {
   const hash = NodeCrypto.createHash("sha256");
-  const recorded = NodeFS.existsSync(fixturesDir)
-    ? (NodeFS.readdirSync(fixturesDir, { recursive: true }) as Array<string>)
-        .filter((relative) => relative.endsWith(".ndjson"))
-        .toSorted()
-    : [];
-  for (const relative of recorded) {
-    hash.update(`${relative}\0${await sha256File(NodePath.join(fixturesDir, relative))}\n`);
-  }
+  await hashRecordings(hash, fixturesDir);
   const named = new Set<string>();
   for (const mix of transcriptSettings(env, fixture)) {
     for (const entry of mix.split(",")) {
@@ -343,6 +356,61 @@ export async function transcriptsHash(
   }
   for (const path of [...named].toSorted()) {
     hash.update(`${path}\0${isFile(path) ? await sha256File(path) : "missing"}\n`);
+  }
+  return hash.digest("hex");
+}
+
+const realPath = (path: string) => {
+  try {
+    return NodeFS.realpathSync(path);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * The absolute binaryPath, commandPath and commandArgs of the fixture settings' instances: one in
+ * this harness's fake-* dirs adds its path (fakes_sha256 has it), one in another checkout's adds
+ * that checkout's fakes and recordings, any other its file and, for JavaScript, its local imports.
+ */
+export async function launchersHash(fixture: FixtureInfo, benchDir: string): Promise<string> {
+  const launchers = new Set<string>();
+  for (const instance of settingsInstances(fixture)) {
+    const config = recordOf(instance.config);
+    const args = Array.isArray(config.commandArgs) ? config.commandArgs : [];
+    for (const value of [config.binaryPath, config.commandPath, ...args]) {
+      if (typeof value === "string" && NodePath.isAbsolute(value)) launchers.add(value);
+    }
+  }
+  const harness = realPath(benchDir);
+  const checkouts = new Map<string, string>();
+  const checkoutHash = async (checkout: string) => {
+    if (!checkouts.has(checkout)) {
+      const recordings = NodeCrypto.createHash("sha256");
+      await hashRecordings(recordings, NodePath.resolve(checkout, "../..", RECORDINGS));
+      checkouts.set(checkout, `${await fakesHash(checkout)}+${recordings.digest("hex")}`);
+    }
+    return checkouts.get(checkout)!;
+  };
+  const hash = NodeCrypto.createHash("sha256");
+  for (const launcher of [...launchers].toSorted()) {
+    const real = realPath(launcher);
+    let content: string;
+    if (real === null || !isFile(real)) {
+      content = "not a file";
+    } else if (FAKE_DIRS.includes(NodePath.basename(NodePath.dirname(real)))) {
+      const checkout = NodePath.dirname(NodePath.dirname(real));
+      content =
+        checkout === harness ? "harness" : `checkout ${checkout} ${await checkoutHash(checkout)}`;
+    } else {
+      const files = /\.[cm]?[jt]sx?$/.test(real) ? withLocalImports([real]) : [real];
+      const parts: Array<string> = [];
+      for (const file of files) {
+        parts.push(`${NodePath.relative(NodePath.dirname(real), file)}=${await sha256File(file)}`);
+      }
+      content = parts.join(" ");
+    }
+    hash.update(`${launcher}\0${content}\n`);
   }
   return hash.digest("hex");
 }
@@ -1088,6 +1156,7 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
   ];
   const driverSha = await driverHash(driverPath);
   const fakesSha = await fakesHash(harnessDir);
+  const launchersSha = await launchersHash(fixture, harnessDir);
   const transcriptsSha = new Map<string, string>();
   for (const target of targets) {
     transcriptsSha.set(target.label, await transcriptsHash(target.env, fixture, REPLAY_FIXTURES));
@@ -1178,6 +1247,7 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
           driver_sha256: driverSha,
           fakes_sha256: fakesSha,
           transcripts_sha256: transcriptsSha.get(target.label),
+          launchers_sha256: launchersSha,
           warmup_s: warmupS,
           window_s: windowS,
           driver_args: driverArgs,

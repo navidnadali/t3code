@@ -291,7 +291,7 @@ describe("workload fingerprint", () => {
       write(agent, 'import "./lib.mjs";\n');
       write(NodePath.join(root, "agents", "lib.mjs"), "export {};\n");
       const node = NodePath.join(root, "bin", "node");
-      write(node, "#!/bin/sh\n");
+      write(node, "\u007fELF executable\n");
       const template = NodePath.join(root, "template");
       write(
         NodePath.join(template, "userdata", "settings.json"),

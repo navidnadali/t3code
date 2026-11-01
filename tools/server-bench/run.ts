@@ -82,7 +82,8 @@ Load
   env or the fixture's settings.json), and launchers_sha256 what the fixture's settings.json runs
   (binaryPath, commandPath, absolute commandArgs, e.g. from providers.ts --claude-launcher): a
   launcher in this harness's fake-*/ adds its path, one in another checkout's fake-*/ that
-  checkout's fakes and recorded replay fixtures, any other its file and its local imports.
+  checkout's fakes and recorded replay fixtures, a JavaScript one its file and local imports, an
+  executable its file; a script (#!) anywhere else is refused, as what it runs cannot be hashed.
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -360,6 +361,17 @@ export async function transcriptsHash(
   return hash.digest("hex");
 }
 
+/** A text file the kernel runs through an interpreter (#!), unlike a self-contained executable. */
+const isScript = (path: string) => {
+  const head = Buffer.alloc(2);
+  const fd = NodeFS.openSync(path, "r");
+  try {
+    return NodeFS.readSync(fd, head, 0, 2, 0) === 2 && head.toString("latin1") === "#!";
+  } finally {
+    NodeFS.closeSync(fd);
+  }
+};
+
 const realPath = (path: string) => {
   try {
     return NodeFS.realpathSync(path);
@@ -403,7 +415,13 @@ export async function launchersHash(fixture: FixtureInfo, benchDir: string): Pro
       content =
         checkout === harness ? "harness" : `checkout ${checkout} ${await checkoutHash(checkout)}`;
     } else {
-      const files = /\.[cm]?[jt]sx?$/.test(real) ? withLocalImports([real]) : [real];
+      const javascript = /\.[cm]?[jt]sx?$/.test(real);
+      if (!javascript && isScript(real)) {
+        throw new Error(
+          `${launcher} (fixture settings) is a script outside a fake-* directory: what it runs cannot be fingerprinted; move it into a fake-* directory`,
+        );
+      }
+      const files = javascript ? withLocalImports([real]) : [real];
       const parts: Array<string> = [];
       for (const file of files) {
         parts.push(`${NodePath.relative(NodePath.dirname(real), file)}=${await sha256File(file)}`);

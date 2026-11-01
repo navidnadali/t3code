@@ -83,8 +83,8 @@ Load
   (enabled instances' binaryPath, commandPath, absolute commandArgs, e.g. from providers.ts
   --claude-launcher): a launcher in this harness's fake-*/ adds its path, one in another
   checkout's fake-*/ that checkout's fakes and recorded replay fixtures, a native executable (ELF,
-  Mach-O, PE) its file; anything else (a script, JavaScript, data) is refused, as what it runs
-  cannot be hashed.
+  Mach-O, PE) its file, a directory (e.g. an agent node runs) every file under it; anything else
+  (a script, JavaScript, data) is refused, as what it runs cannot be hashed.
 
 Server
   --server-env K=V         every ref; --ref-env <label>:K=V one ref (wins). The fake claude's BENCH_*
@@ -377,6 +377,31 @@ const isNativeExecutable = (path: string) => {
   }
 };
 
+/** Every file under `root` (links followed, a cycle cut) by sorted relative path, with its bytes. */
+async function directoryHash(root: string): Promise<string> {
+  const hash = NodeCrypto.createHash("sha256");
+  const ancestors = new Set<string>();
+  const walk = async (directory: string, prefix: string): Promise<void> => {
+    const real = NodeFS.realpathSync(directory);
+    if (ancestors.has(real)) {
+      hash.update(`${prefix}\0cycle\n`);
+      return;
+    }
+    ancestors.add(real);
+    for (const name of NodeFS.readdirSync(directory).toSorted()) {
+      const path = NodePath.join(directory, name);
+      const relative = prefix === "" ? name : `${prefix}/${name}`;
+      const stat = NodeFS.statSync(path, { throwIfNoEntry: false });
+      if (stat === undefined) hash.update(`${relative}\0missing\n`);
+      else if (stat.isDirectory()) await walk(path, relative);
+      else if (stat.isFile()) hash.update(`${relative}\0${await sha256File(path)}\n`);
+    }
+    ancestors.delete(real);
+  };
+  await walk(root, "");
+  return hash.digest("hex");
+}
+
 const realPath = (path: string) => {
   try {
     return NodeFS.realpathSync(path);
@@ -388,8 +413,8 @@ const realPath = (path: string) => {
 /**
  * The absolute binaryPath, commandPath and commandArgs of the fixture settings' enabled instances:
  * one in this harness's fake-* dirs adds its path (fakes_sha256 has it), one in another
- * checkout's adds that checkout's fakes and recordings, a native executable its file; anything
- * else is refused.
+ * checkout's adds that checkout's fakes and recordings, a native executable its file, a
+ * directory every file under it; anything else is refused.
  */
 export async function launchersHash(fixture: FixtureInfo, benchDir: string): Promise<string> {
   const launchers = new Set<string>();
@@ -416,7 +441,9 @@ export async function launchersHash(fixture: FixtureInfo, benchDir: string): Pro
   for (const launcher of [...launchers].toSorted()) {
     const real = realPath(launcher);
     let content: string;
-    if (real === null || !isFile(real)) {
+    if (real !== null && NodeFS.statSync(real).isDirectory()) {
+      content = `directory ${await directoryHash(real)}`;
+    } else if (real === null || !isFile(real)) {
       content = "not a file";
     } else if (FAKE_DIRS.includes(NodePath.basename(NodePath.dirname(real)))) {
       const checkout = NodePath.dirname(NodePath.dirname(real));

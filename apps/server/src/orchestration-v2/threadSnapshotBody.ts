@@ -72,30 +72,29 @@ const hasToJson = (value: object) =>
   typeof (value as { readonly toJSON?: unknown }).toJSON === "function";
 
 // About the JSON length of a value already through toJSON (escapes can add more); it stops early.
+// Any toJSON but DateTime's counts as large, so the writer calls it once, member by member.
 const exceedsChunk = (value: unknown) => {
   let budget = CHUNK_CHARS;
-  const visit = (current: unknown, key: string, throughToJson: boolean): boolean => {
+  const visit = (current: unknown, throughToJson: boolean): boolean => {
     if (typeof current === "string") return (budget -= current.length + 2) < 0;
     if (current === null || typeof current !== "object") return (budget -= 8) < 0;
     if (!throughToJson && hasToJson(current)) {
-      return DateTime.isDateTime(current)
-        ? (budget -= 32) < 0
-        : visit((current as { readonly toJSON: (key: string) => unknown }).toJSON(key), key, true);
+      return !DateTime.isDateTime(current) || (budget -= 32) < 0;
     }
     for (const member in current) {
       budget -= member.length + 4;
       const next = (current as Readonly<Record<string, unknown>>)[member];
-      if (budget < 0 || visit(next, member, false)) return true;
+      if (budget < 0 || visit(next, false)) return true;
     }
     return (budget -= 2) < 0;
   };
-  return visit(value, "", true);
+  return visit(value, true);
 };
 
-// Only a real String box (thisStringValue) is unwrapped by JSON.stringify.
-const hasStringData = (value: object) => {
+// The internal slot check JSON.stringify uses to unwrap a box, whatever the box's own properties.
+const isBoxOf = (value: object, valueOf: () => unknown) => {
   try {
-    String.prototype.valueOf.call(value);
+    valueOf.call(value);
     return true;
   } catch {
     return false;
@@ -125,8 +124,14 @@ function* jsonParts(value: unknown): Generator<string> {
     yield '"';
   } else if (value === null || typeof value !== "object") {
     yield JSON.stringify(value);
-  } else if (hasStringData(value)) {
+  } else if (isBoxOf(value, String.prototype.valueOf)) {
     yield* jsonParts(String(value));
+  } else if (isBoxOf(value, Number.prototype.valueOf)) {
+    yield JSON.stringify(Number(value));
+  } else if (isBoxOf(value, Boolean.prototype.valueOf)) {
+    yield JSON.stringify(Boolean.prototype.valueOf.call(value));
+  } else if (isBoxOf(value, BigInt.prototype.valueOf)) {
+    yield JSON.stringify(BigInt.prototype.valueOf.call(value));
   } else if (Array.isArray(value)) {
     yield* arrayParts([value]);
   } else {

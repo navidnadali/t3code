@@ -327,16 +327,18 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
     }),
   );
 
-  it.effect("keeps chunks bounded for large answers, keys and non-callable toJSON keys", () =>
+  it.effect("keeps chunks bounded for large answers, keys, toJSON results and boxes", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const { snapshotSequence, projection } = yield* projections.getThreadSnapshot(FORK);
       const at = DateTime.makeUnsafe("2026-10-01T00:00:00.000Z");
-      const snapshot = {
+      const ignored = { text: TEXT.repeat(40_000) };
+      // Each answer set hides a large value from a size estimate in its own way. Built per
+      // serialization: a toJSON that counts its calls must be called once, as JSON.stringify does.
+      const snapshot = () => ({
         snapshotSequence,
         projection: {
           ...projectThreadProjectionForWire(projection),
-          // Each answer set holds a different way to hide a large value from a size estimate.
           runtimeRequests: [
             { reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) } },
             { [TEXT.repeat(40_000)]: 0 },
@@ -354,6 +356,19 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
               nested: { toJSON: () => ({ toJSON: () => "inner", text: TEXT }) },
               large: TEXT.repeat(40_000),
             },
+            {
+              counted: {
+                calls: 0,
+                toJSON() {
+                  return this.calls++ === 0 ? "first" : TEXT.repeat(40_000);
+                },
+              },
+            },
+            {
+              string: Object.assign(Object("s"), ignored),
+              number: Object.assign(Object(42), ignored),
+              boolean: Object.assign(Object(true), ignored),
+            },
           ].map((answers, index) => ({
             id: RuntimeRequestId.make(`runtime-request:snapshot-body:${index}`),
             nodeId: NodeId.make(`node:${parentRun}`),
@@ -367,9 +382,9 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
             answers,
           })),
         },
-      };
-      const streamed = yield* streamedBody(snapshot);
-      assert.isTrue(streamed.bytes.equals(referenceBody(snapshot)));
+      });
+      const streamed = yield* streamedBody(snapshot());
+      assert.isTrue(streamed.bytes.equals(referenceBody(snapshot())));
       assert.isAtMost(streamed.largestChunk, 1024 * 1024);
     }),
   );

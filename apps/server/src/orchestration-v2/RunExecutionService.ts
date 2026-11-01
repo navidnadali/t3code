@@ -1510,7 +1510,7 @@ export const layer: Layer.Layer<
                   ProviderEventIngestor.canIngestInBatch(deliveredEvent)
                 ) {
                   deferredIngest.push(ingestInput);
-                  // UTF-16 length: close enough for a budget, without encoding the event.
+                  // @effect-diagnostics-next-line preferSchemaOverJson:off - a size estimate for the budget, not a codec.
                   deferredBytes += JSON.stringify(deliveredEvent).length;
                   if (
                     deferredIngest.length >= providerEventBatching.maxEvents ||

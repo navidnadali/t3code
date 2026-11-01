@@ -193,7 +193,9 @@ export const layer = HttpApiBuilder.group(
                 projection: snapshot.projection,
               }).pipe(
                 // The same defect, and the same empty 500, as a failed response encoding.
-                Effect.catch((cause) => Effect.die(new HttpApiSchemaError({ kind: "Body", cause }))),
+                Effect.catch((cause) =>
+                  Effect.die(new HttpApiSchemaError({ kind: "Body", cause })),
+                ),
               ),
             ),
             traceLocalHandlerWork,

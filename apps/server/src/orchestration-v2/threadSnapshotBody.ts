@@ -84,6 +84,12 @@ const exceedsChunk = (value: unknown) => {
   return visit(value);
 };
 
+// JSON.stringify unwraps boxed primitives, so a value whose valueOf is primitive is written whole.
+const isPrimitiveLike = (value: object) => {
+  const valueOf = (value as { readonly valueOf?: unknown }).valueOf;
+  return typeof valueOf === "function" && typeof valueOf.call(value) !== "object";
+};
+
 // Never between the halves of a surrogate pair: apart, each half encodes differently.
 const sliceEnd = (text: string, start: number) => {
   const end = Math.min(start + CHUNK_CHARS, text.length);
@@ -97,19 +103,13 @@ function* jsonParts(value: unknown): Generator<string> {
     yield JSON.stringify(value);
   } else if (typeof value === "string") {
     yield '"';
-    for (let start = 0; start < value.length; ) {
+    for (let start = 0; start < value.length;) {
       const end = sliceEnd(value, start);
       yield JSON.stringify(value.slice(start, end)).slice(1, -1);
       start = end;
     }
     yield '"';
-  } else if (
-    value === null ||
-    typeof value !== "object" ||
-    value instanceof String ||
-    value instanceof Number ||
-    value instanceof Boolean
-  ) {
+  } else if (value === null || typeof value !== "object" || isPrimitiveLike(value)) {
     yield JSON.stringify(value);
   } else if (Array.isArray(value)) {
     yield* arrayParts([value]);
@@ -190,7 +190,8 @@ export const encodeThreadSnapshotBody = Effect.fn("ThreadSnapshotBody.encode")(f
               encode,
             )
           : ((yield* encode(batch)) as ReadonlyArray<unknown>);
-      if (key === "turnItems") batch.forEach((item, index) => encodedItems.set(item, encoded[index]));
+      if (key === "turnItems")
+        batch.forEach((item, index) => encodedItems.set(item, encoded[index]));
       batches.push(encoded);
       yield* Effect.yieldNow;
     }

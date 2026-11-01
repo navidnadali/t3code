@@ -44,11 +44,9 @@ const ITEMS = 1_200;
 // Escapes, a lone surrogate, astral and two-byte text: every JSON.stringify string rule.
 const TEXT = 'quote " slash \\ tab \t nl \n nul \u0000 lone \ud800 astral 𝄞 界';
 
+const encodeSnapshot = Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot);
 const referenceBody = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
-  Buffer.from(
-    JSON.stringify(Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot)(snapshot)),
-    "utf8",
-  );
+  Buffer.from(JSON.stringify(encodeSnapshot(snapshot)), "utf8");
 
 const streamedBody = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
   encodeThreadSnapshotBody(snapshot).pipe(
@@ -287,7 +285,10 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       for (const threadId of [PARENT, FORK]) {
         const { snapshotSequence, projection } = yield* projections.getThreadSnapshot(threadId);
-        const snapshot = { snapshotSequence, projection: projectThreadProjectionForWire(projection) };
+        const snapshot = {
+          snapshotSequence,
+          projection: projectThreadProjectionForWire(projection),
+        };
         const streamed = yield* streamedBody(snapshot);
         assert.isTrue(streamed.bytes.equals(referenceBody(snapshot)));
         if (threadId === PARENT) {
@@ -313,7 +314,10 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
         snapshotSequence,
         projection: {
           ...wire,
-          turnItems: [{ ...first!, status: "unknown" } as unknown as OrchestrationV2TurnItem, ...rest],
+          turnItems: [
+            { ...first!, status: "unknown" } as unknown as OrchestrationV2TurnItem,
+            ...rest,
+          ],
         },
       };
       assert.throws(() => referenceBody(invalid));
@@ -344,9 +348,7 @@ it.live("ends the request when its client leaves mid-body, compressed or not", (
         disableListenLog: true,
         disableLogger: true,
         middleware: (app) =>
-          HttpMiddleware.compression()(
-            Effect.onExit(app, (exit) => Queue.offer(exits, exit)),
-          ),
+          HttpMiddleware.compression()(Effect.onExit(app, (exit) => Queue.offer(exits, exit))),
       }).pipe(
         Layer.provide(NodeHttpServer.layer(() => server, { port: 0 })),
         Layer.provide(NodeHttpPlatform.layer),

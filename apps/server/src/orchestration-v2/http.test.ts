@@ -265,8 +265,9 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
   }),
 );
 
+const encodeSnapshot = Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot);
 const encodedSnapshotJson = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
-  JSON.stringify(Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot)(snapshot));
+  JSON.stringify(encodeSnapshot(snapshot));
 
 it.effect("serves the full snapshot as the JSON its schema encodes, with the same errors", () =>
   Effect.gen(function* () {
@@ -329,7 +330,10 @@ it.effect("serves the full snapshot as the JSON its schema encodes, with the sam
           ...snapshot,
           projection: {
             ...snapshot.projection,
-            turnItems: [{ ...first!, status: "unknown" } as unknown as OrchestrationV2TurnItem, ...rest],
+            turnItems: [
+              { ...first!, status: "unknown" } as unknown as OrchestrationV2TurnItem,
+              ...rest,
+            ],
           },
         }),
     );

@@ -19,6 +19,7 @@ const start = (message) => {
     post({ t: "throw", id, error: errorFields(error) });
     return;
   }
+  if (child.pid !== undefined) started(id, child.pid);
   const entry = { child, detached: message.options.detached === true, inflight: [0, 0], paused: [false, false] };
   children.set(id, entry);
   child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));
@@ -95,6 +96,7 @@ const { parentPort, workerData } = require("node:worker_threads");
 const { spawn } = require("node:child_process");
 const windowBytes = workerData.windowBytes;
 const post = (message, transfer) => parentPort.postMessage(message, transfer);
+const started = () => {};
 ${spawnProtocolSource}
 parentPort.on("message", onMessage);
 `;
@@ -107,8 +109,15 @@ export const spawnerProcessSource = `
 "use strict";
 const { spawn } = require("node:child_process");
 const windowBytes = Number(process.argv[process.argv.length - 1]);
+// A reply racing the server's disconnect must not crash the spawner before it kills its children.
 const post = (message) => {
-  if (process.connected) process.send(message);
+  if (process.connected) process.send(message, () => {});
+};
+// Written at once, before any reply, so the server can kill this child even if the spawner dies.
+const started = (id, pid) => {
+  try {
+    require("node:fs").writeSync(1, id + " " + pid + "\\n");
+  } catch {}
 };
 ${spawnProtocolSource}
 process.title = "t3-process-spawner";

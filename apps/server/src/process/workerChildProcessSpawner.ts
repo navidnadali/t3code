@@ -26,6 +26,7 @@ import {
   ProcessId,
 } from "effect/process/ChildProcessSpawner";
 import * as NodeChildProcess from "node:child_process";
+import type * as NodeNet from "node:net";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 
@@ -55,7 +56,7 @@ interface SerializedError {
 }
 
 type WorkerMessage =
-  | { readonly t: "spawn"; readonly id: number; readonly pid: number }
+  | { readonly t: "spawn" | "started"; readonly id: number; readonly pid: number }
   | {
       readonly t: "error" | "throw" | "stdin-error";
       readonly id: number;
@@ -231,9 +232,8 @@ const makeRemoteHost = (options: {
     for (const { child } of stoppedEntries) child.stopError = error;
     for (const entry of stoppedEntries) {
       const { child } = entry;
-      if (!entry.spawned) {
-        entry.callbacks.onError(error);
-      } else if (child.pid !== undefined) {
+      // A child whose start the transport reported but never acknowledged is killed too.
+      if (child.pid !== undefined) {
         const running = !Deferred.isDoneUnsafe(child.exitSignal);
         // Descendants can outlive an exited leader in its group; a child spawned with
         // detached: false leads no group, and once exited its PID may belong to another process.
@@ -251,6 +251,7 @@ const makeRemoteHost = (options: {
         child.killedOnStop = true;
         if (running) completeExit(entry, null, "SIGKILL");
       }
+      if (!entry.spawned) entry.callbacks.onError(error);
       for (const [index, stream] of [child.stdout, child.stderr].entries()) {
         if (!child.ended[index]) stream.destroy(error);
       }
@@ -274,6 +275,9 @@ const makeRemoteHost = (options: {
     if (entry === undefined) return;
     const { child } = entry;
     switch (message.t) {
+      case "started":
+        child.pid ??= message.pid;
+        return;
       case "spawn":
         stopsInARow = 0;
         entry.spawned = true;
@@ -529,7 +533,8 @@ export const spawnerProcessLaunch = (input: {
       ? ["__process-spawner", String(input.windowBytes)]
       : ["-e", input.source ?? spawnerProcessSource, String(input.windowBytes)],
     options: {
-      stdio: ["ignore", "ignore", "inherit", "ipc"],
+      // Its stdout reports each child's PID as soon as it starts.
+      stdio: ["ignore", "pipe", "inherit", "ipc"],
       serialization: "advanced",
       // Its own process group: signals for the server's group, such as Ctrl-C, pass it by.
       detached: true,
@@ -552,16 +557,50 @@ const openSpawnerProcess =
       spawner.on("exit", settle);
       spawner.on("error", settle);
     });
-    spawner.on("message", events.onMessage);
-    spawner.on("error", events.onStop);
-    spawner.on("exit", (code, signal) =>
-      events.onStop(new Error(`The process spawner exited with ${signal ?? `code ${code}`}`)),
-    );
     let closing = false;
+    let exitCause: Error | undefined;
+    let channelOpen = true;
+    let startsOpen = true;
+    // Stops once every reply and start report the spawner wrote before it died has been read.
+    const stopWhenDrained = () => {
+      if (exitCause !== undefined && !channelOpen && !startsOpen) events.onStop(exitCause);
+    };
+    let partial = "";
+    const starts = spawner.stdout as NodeNet.Socket;
+    starts.setEncoding("utf8");
+    starts.on("data", (chunk: string) => {
+      const lines = (partial + chunk).split("\n");
+      partial = lines.pop() ?? "";
+      for (const line of lines) {
+        const [id, pid] = line.split(" ").map(Number);
+        if (Number.isSafeInteger(id) && Number.isSafeInteger(pid)) {
+          events.onMessage({ t: "started", id: id!, pid: pid! });
+        }
+      }
+    });
+    starts.on("close", () => {
+      startsOpen = false;
+      stopWhenDrained();
+    });
+    starts.unref();
+    spawner.on("message", events.onMessage);
+    spawner.on("error", (error) => {
+      if (hasExited()) events.onStop(error);
+      else if (!closing) spawner.kill("SIGKILL");
+    });
+    spawner.on("exit", (code, signal) => {
+      const cause = new Error(`The process spawner exited with ${signal ?? `code ${code}`}`);
+      exitCause = cause;
+      stopWhenDrained();
+      // A descendant still holding one of its pipes must not delay the stop for long.
+      setTimeout(() => events.onStop(cause), spawnerCloseGraceMillis).unref();
+    });
     // A spawner that closed its channel can no longer answer; one this host disconnects kills
     // its children first, including those whose start it has not reported yet.
     spawner.on("disconnect", () => {
+      channelOpen = false;
       if (!closing && !hasExited()) spawner.kill("SIGKILL");
+      stopWhenDrained();
     });
     spawner.unref();
     spawner.channel?.unref();

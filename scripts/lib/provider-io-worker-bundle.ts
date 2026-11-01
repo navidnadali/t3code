@@ -4,28 +4,50 @@ import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import { Rolldown } from "vite-plus/pack";
 
-// The build sees only the imports Rolldown resolved; computed names (`globalThis[key]`) and code
-// built from strings are invisible to it. So the worker resolves its few built-ins first and then
-// registers a loader hook that refuses every later `require`, `import()` and `createRequire`.
-// Process-level loaders are disabled too, and worker_threads is visible only as its own port.
-const guard = (code: string, builtins: ReadonlyArray<string>) => `"use strict";
+// The build sees only what Rolldown resolved, so the worker guards its loaders itself: any
+// built-in, lazily and however prefixed (`node:module` and `worker_threads` only as facades), a
+// resolver hook refusing everything else, and the eval wrapper's globals deleted so the real
+// `Module` class is unreachable.
+const guard = (code: string) => `"use strict";
 {
-  const NodeModule = require("node:module");
-  const threads = require("node:worker_threads");
-  const port = Object.freeze({
-    parentPort: threads.parentPort,
-    workerData: threads.workerData,
-    threadId: threads.threadId,
-    isMainThread: threads.isMainThread,
-  });
-  const allowed = new Map(
-    ${JSON.stringify(builtins)}.map((id) => [id, /^(node:)?worker_threads$/.test(id) ? port : require(id)]),
-  );
+  const builtin = require;
+  const NodeModule = builtin("node:module");
+  const threads = builtin("node:worker_threads");
   const refuse = (what) => {
-    throw new Error("The provider I/O worker may load only the built-ins it was built with, not " + what + ".");
+    throw new Error("The provider I/O worker may load only Node built-ins, not " + what + ".");
   };
-  const load = (id) => (typeof id === "string" && allowed.has(id) ? allowed.get(id) : refuse(String(id)));
-  NodeModule.registerHooks({ resolve: (specifier) => refuse(String(specifier)) });
+  const prefixed = (id) => (id.startsWith("node:") ? id : "node:" + id);
+  let load;
+  const facades = new Map([
+    [
+      "node:module",
+      Object.freeze({
+        builtinModules: NodeModule.builtinModules,
+        isBuiltin: NodeModule.isBuiltin,
+        createRequire: () => load,
+      }),
+    ],
+    [
+      "node:worker_threads",
+      Object.freeze({
+        parentPort: threads.parentPort,
+        workerData: threads.workerData,
+        threadId: threads.threadId,
+        isMainThread: threads.isMainThread,
+      }),
+    ],
+  ]);
+  load = (id) => {
+    if (typeof id !== "string" || !NodeModule.isBuiltin(id)) return refuse(String(id));
+    return facades.get(prefixed(id)) ?? builtin(prefixed(id));
+  };
+  NodeModule.registerHooks({
+    resolve: (specifier, context, nextResolve) =>
+      typeof specifier === "string" && NodeModule.isBuiltin(specifier) && !facades.has(prefixed(specifier))
+        ? nextResolve(specifier, context)
+        : refuse(String(specifier)),
+  });
+  for (const name of ["module", "require", "exports", "__filename", "__dirname"]) delete globalThis[name];
   for (const name of ["dlopen", "binding", "_linkedBinding"]) process[name] = () => refuse("process." + name);
   process.getBuiltinModule = load;
   ((require, module, exports, __filename, __dirname) => {
@@ -61,7 +83,7 @@ const bundleProviderIoWorker = async (entry: string) => {
       `The provider I/O worker bundle may load only Node built-ins:\n${problems.join("\n")}`,
     );
   }
-  return guard(chunk.code, imports.sort());
+  return guard(chunk.code);
 };
 
 const realpathOrSelf = (path: string) => {

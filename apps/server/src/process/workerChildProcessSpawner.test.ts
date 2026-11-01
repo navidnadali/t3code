@@ -937,12 +937,13 @@ describe("WorkerChildProcessSpawner", () => {
   );
 
   it.live(
-    `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} and ${WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV}=child move VCS commands off the main spawner, results and errors unchanged`,
+    `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} and ${WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV} move VCS commands off the main spawner, results and errors unchanged`,
     () =>
       Effect.gen(function* () {
         const outcome = (knobs: Record<string, string>) =>
           Effect.gen(function* () {
             const { calls, spawner } = yield* recordingSpawner;
+            const { logs, layer: logLayer } = capturedLogs();
             // As in server.ts, a shared ProcessRunner is provided outside VcsProcess too.
             const layer = Layer.mergeAll(VcsProcess.layer, GitVcsDriver.layer).pipe(
               Layer.provide(ProcessRunner.layer),
@@ -951,6 +952,7 @@ describe("WorkerChildProcessSpawner", () => {
               ),
               Layer.provide(Layer.succeed(ChildProcessSpawner, spawner)),
               Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(knobs))),
+              Layer.provideMerge(logLayer),
             );
             return yield* Effect.gen(function* () {
               const vcs = yield* VcsProcess.VcsProcess;
@@ -981,6 +983,12 @@ describe("WorkerChildProcessSpawner", () => {
                   args: ["--version"],
                 }),
               );
+              const parent = yield* vcs.run({
+                operation: "test.worker-spawner",
+                command: process.execPath,
+                args: ["-e", "process.stdout.write(String(process.ppid))"],
+                cwd: process.cwd(),
+              });
               return {
                 version: {
                   exitCode: version.exitCode,
@@ -998,7 +1006,11 @@ describe("WorkerChildProcessSpawner", () => {
                   detail: missingCwd.detail,
                   cause: summarizeError(missingCwd.cause as PlatformError.PlatformError),
                 },
+                spawnedBy: Number(parent.stdout) === process.pid ? "server" : "spawner process",
                 mainSpawns: calls.length,
+                errors: logs
+                  .filter(({ level }) => level === "Error")
+                  .map(({ message }) => JSON.stringify(message)),
               };
             }).pipe(Effect.provide(layer));
           });
@@ -1006,16 +1018,29 @@ describe("WorkerChildProcessSpawner", () => {
         const { VCS_SPAWN_WORKER_ENV: worker, PROCESS_SPAWNER_ENV: spawner } =
           WorkerChildProcessSpawner;
         const unset = yield* outcome({});
-        expect(unset.mainSpawns).toBe(4);
+        expect(unset).toMatchObject({ mainSpawns: 5, spawnedBy: "server", errors: [] });
         expect(unset.missing.tag).toBe("VcsProcessSpawnError");
         expect(unset.missingCwd).toMatchObject({
           tag: "GitCommandError",
           cause: { reason: "NotFound" },
         });
-        expect(yield* outcome({ [worker]: "false", [spawner]: "default" })).toEqual(unset);
-        const offMain = { ...unset, mainSpawns: workerPlatform ? 0 : 4 };
-        expect(yield* outcome({ [worker]: "true" })).toEqual(offMain);
-        expect(yield* outcome({ [spawner]: "child" })).toEqual(offMain);
+        for (const value of ["default", "0", "false", "", " Default "]) {
+          expect(yield* outcome({ [worker]: "false", [spawner]: value })).toEqual(unset);
+        }
+        const onWorker = { ...unset, mainSpawns: workerPlatform ? 0 : 5 };
+        expect(yield* outcome({ [worker]: "true" })).toEqual(onWorker);
+        expect(yield* outcome({ [spawner]: "worker" })).toEqual(onWorker);
+        const onSpawnerProcess = workerPlatform
+          ? { ...onWorker, spawnedBy: "spawner process" }
+          : onWorker;
+        for (const value of ["child", "Child", " CHILD ", "1", "true"]) {
+          expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(onSpawnerProcess);
+        }
+        // A value it does not know keeps today's spawner and says so, rather than stopping the server.
+        expect(yield* outcome({ [spawner]: "childs" })).toEqual({
+          ...unset,
+          errors: [expect.stringContaining(`${spawner}=\\"childs\\"`)],
+        });
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

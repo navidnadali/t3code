@@ -1350,7 +1350,8 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
 
   // The request is sent while its started record may still be appending, so a slow log cannot
   // let a later request (an interrupt's session/cancel) reach the agent first. The outcome is
-  // logged after the started record, and a started record that fails fails the request.
+  // logged after the started record, and a started record that fails fails the request. An
+  // interrupt does not wait for a pending started record: it cuts it, and no outcome follows.
   const runLoggedRequest = <A>(
     method: string,
     payload: unknown,
@@ -1371,6 +1372,10 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
             ),
           ),
         ).pipe(Effect.exit);
+        yield* restore(Fiber.await(started)).pipe(
+          Effect.onInterrupt(() => Fiber.interrupt(started)),
+          Effect.exit,
+        );
         yield* Fiber.join(started);
         return yield* restore(
           exit.pipe(

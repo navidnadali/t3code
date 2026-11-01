@@ -12,7 +12,7 @@ import { type ContentMode, contentFindings } from "./content.ts";
 import { undecodableRows } from "./decode.ts";
 import { extendedFindings } from "./extended.ts";
 import { createExclusive, fillExclusive, privateScratchDirectory, withSidecars } from "./guards.ts";
-import { CREDENTIAL_COLUMN, scanDecoded, scanFileBytes } from "./secrets.ts";
+import { CREDENTIAL_COLUMN, scanDecoded, scanFileBytesSteps } from "./secrets.ts";
 import {
   compactEvents,
   database,
@@ -758,7 +758,9 @@ export const checkFixture = Effect.fn("fixture.check")(function* (path: string, 
     extendedHits,
     notBlanked: tables.notBlanked,
     credentialColumns: tables.credentialColumns,
-    rawHits: Object.fromEntries(scanFileBytes(path)),
+    rawHits: Object.fromEntries(
+      yield* runSteps(scanFileBytesSteps(path), "The raw-byte scan failed"),
+    ),
     runnable: { ...runnable },
   } satisfies FixtureCheck;
 });

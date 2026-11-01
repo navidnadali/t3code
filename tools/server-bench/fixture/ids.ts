@@ -1,7 +1,11 @@
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/** Credential words random base62 can spell; the pattern layer would read them as names. */
-const CREDENTIAL_WORD = /auth|token|secret|passw|pwd|credential|api_?key|access_?key/i;
+/**
+ * Words either pattern layer reads as a credential name (case-insensitive, so `DSN`, `PASS` and
+ * `Key` too): random base62 spelling one, followed by `:` in a composite id, reads as assignment.
+ */
+const CREDENTIAL_WORD =
+  /auth|token|secret|pass|pwd|dsn|credential|key|cookie|session|private|webhook/i;
 
 /**
  * A Claude-style native id (`toolu_01…`, `msg_01…`): 14 random base62 characters, drawn again

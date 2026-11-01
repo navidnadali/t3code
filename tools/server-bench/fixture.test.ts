@@ -24,7 +24,14 @@ import { extendedFindings, extendedMayMatch } from "./fixture/extended.ts";
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { TOKEN_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
-import { ShapeError, measureShape, parseShape, quantile, shapeRows } from "./fixture/shape.ts";
+import {
+  type Shape,
+  ShapeError,
+  measureShape,
+  parseShape,
+  quantile,
+  shapeRows,
+} from "./fixture/shape.ts";
 
 const ROOT = NodePath.resolve(import.meta.dirname, "..", "..");
 const FIXTURE = NodePath.join(import.meta.dirname, "fixture.ts");
@@ -1005,6 +1012,39 @@ describe("planSynth", () => {
     expect(JSON.stringify(planSynth(example, 0.2, 7))).not.toBe(
       JSON.stringify(planSynth(example, 0.2, 8)),
     );
+  });
+
+  // Fixtures are compared by hash across commits: a change to a seed's plan must show up here.
+  // Without checkpoint items, the standalone checkpoints spread over every native run.
+  it("plans what it always planned for a seed, with or without checkpoint items", () => {
+    const withoutCheckpointItems: Shape = {
+      ...example,
+      mix: {
+        ...example.mix,
+        turnItemTypes: Object.fromEntries(
+          Object.entries(example.mix?.turnItemTypes ?? {}).filter(
+            ([type]) => type !== "checkpoint",
+          ),
+        ),
+      },
+    };
+    const digest = (shape: Shape) =>
+      NodeCrypto.createHash("sha256")
+        .update(JSON.stringify(planSynth(shape, 0.2, 7)))
+        .digest("hex");
+    const runs = planSynth(withoutCheckpointItems, 0.2, 7).threads.flatMap((thread) => thread.runs);
+    expect({
+      checkpointItems: runs.filter((run) => run.items.includes("checkpoint")).length,
+      runsWithCheckpoints: runs.filter((run) => run.checkpoints > 0).length,
+      digests: [digest(example), digest(withoutCheckpointItems)],
+    }).toEqual({
+      checkpointItems: 0,
+      runsWithCheckpoints: 144,
+      digests: [
+        "7d15a24ee774384698dec573806090667615b956dcf33f36cb7e2aee9ce4ca76",
+        "9cc15e2401df124c59295df2c2a4c3e41b266ebd132e09c9de7d80e5a9478bea",
+      ],
+    });
   });
 
   it("deals and apportions exact totals", () => {

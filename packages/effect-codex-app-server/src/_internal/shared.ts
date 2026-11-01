@@ -5,6 +5,11 @@ import * as CodexError from "../errors.ts";
 import type { CodexAppServerStageTiming } from "../protocol.ts";
 
 export const JsonRpcId = Schema.Union([Schema.Number, Schema.String]);
+export const isJsonRpcId = Schema.is(JsonRpcId);
+
+export function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
 const JsonRpcError = Schema.Struct({
   code: Schema.Number,
@@ -59,21 +64,6 @@ export const encodeOptionalPayload = <A, I>(
     ),
   );
 };
-
-export const decodeNotificationPayload = <A, I>(
-  method: string,
-  schema: Schema.Codec<A, I> | undefined,
-  raw: unknown,
-): Effect.Effect<A, CodexError.CodexAppServerProtocolParseError> =>
-  decodeOptionalPayload(method, schema, raw).pipe(
-    Effect.mapError((error) =>
-      CodexError.CodexAppServerProtocolParseError.fromRequestError(
-        "decode-notification-payload",
-        method,
-        error,
-      ),
-    ),
-  );
 
 export const runHandler = Effect.fnUntraced(function* <A, B>(
   handler: ((payload: A) => Effect.Effect<B, CodexError.CodexAppServerError>) | undefined,

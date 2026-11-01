@@ -161,6 +161,8 @@ it.effect("refuses at run time a load the build could not see", () =>
     // Every name is computed at run time, so only the worker's own guard can refuse these.
     const source = yield* embeddedSource(
       'import * as NodeModule from "node:module";\n' +
+        'import * as NodeRepl from "node:repl";\n' +
+        'import * as NodeStream from "node:stream";\n' +
         'import * as NodeURL from "node:url";\n' +
         'import * as NodeWorkerThreads from "node:worker_threads";\n' +
         "const dir = NodeWorkerThreads.workerData as string;\n" +
@@ -200,6 +202,18 @@ it.effect("refuses at run time a load the build could not see", () =>
         "  () => viaModule((NodeModule as any).Module, planted),\n" +
         "  () => (NodeModule as any).registerHooks({ resolve: () => undefined }),\n" +
         '  () => import(name("node:", "module")).then((m: any) => viaModule(m.Module, planted)),\n' +
+        // A built-in that hands out the real Module class: loading through it must still fail.
+        "  () => {\n" +
+        "    const session = NodeRepl.start({\n" +
+        "      input: new NodeStream.PassThrough(),\n" +
+        "      output: new NodeStream.PassThrough(),\n" +
+        "    });\n" +
+        "    try {\n" +
+        "      return viaModule(session.context.module.constructor, planted);\n" +
+        "    } finally {\n" +
+        "      session.close();\n" +
+        "    }\n" +
+        "  },\n" +
         "];\n" +
         "void Promise.all(attempts.map(async (attempt) => {\n" +
         "  try {\n" +
@@ -211,7 +225,7 @@ it.effect("refuses at run time a load the build could not see", () =>
     const results = yield* runEmbedded(source, dir);
     assert.deepEqual(
       results,
-      Array.from({ length: 16 }, () => "refused"),
+      Array.from({ length: 17 }, () => "refused"),
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

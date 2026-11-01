@@ -374,7 +374,9 @@ export const make = Effect.gen(function* () {
   return VcsProcess.of({ run });
 });
 
+// Fresh: the server shares a ProcessRunner built on the main-thread spawner, which would
+// otherwise be reused here and bypass the worker spawner.
 export const layer = Layer.effect(VcsProcess, make).pipe(
-  Layer.provide(ProcessRunner.layer),
+  Layer.provide(Layer.fresh(ProcessRunner.layer)),
   Layer.provide(WorkerChildProcessSpawner.layerFromConfig),
 );

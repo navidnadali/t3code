@@ -32,7 +32,7 @@ const processGroupGraceMillis = 1_000;
 const processGroupPollIntervalMillis = 10;
 
 // Inline worker source also runs in bundles and single-executable builds without module files.
-const spawnWorkerSource = `
+export const spawnWorkerSource = `
 "use strict";
 const { parentPort, workerData } = require("node:worker_threads");
 const { spawn } = require("node:child_process");
@@ -276,7 +276,12 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
         try {
           process.kill(-child.pid, "SIGKILL");
         } catch {
-          // The group may already be gone.
+          // A child spawned with detached: false leads no process group.
+          try {
+            process.kill(child.pid, "SIGKILL");
+          } catch {
+            // Already gone.
+          }
         }
         completeExit(entry, null, "SIGKILL");
       }

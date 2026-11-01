@@ -20,7 +20,10 @@ import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
-import * as EventNdjsonLogger from "../../provider/EventNdjsonLogger.ts";
+import {
+  serializedRecordProblem,
+  serializeEventNdjsonRecord,
+} from "../../provider/EventNdjsonRecord.ts";
 import * as ProviderIoOffloads from "../../provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "../../provider/io/ProviderIoWorkerPool.ts";
 import { AcpRegistryOrchestratorReplayHarness } from "../Adapters/AcpRegistryAdapterV2.testkit.ts";
@@ -90,7 +93,6 @@ interface AdapterRow {
 }
 
 const ISO_TIMESTAMP = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/gu;
-const LOG_LINE = /^\[[^\]]*\] ([A-Z]+): (.*)$/u;
 const UUID_V4 = /[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gu;
 const ANY_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/giu;
 const API_ID = /\b(?:msg|toolu|srvtoolu|req)_[A-Za-z0-9]{8,}/gu;
@@ -280,10 +282,35 @@ const adapterRow = <
       const logDir = yield* fileSystem.makeTempDirectoryScoped({
         prefix: "t3-provider-io-equivalence-",
       });
-      const store = yield* EventNdjsonLogger.makeEventNdjsonLogStore(
-        path.join(logDir, "events.log"),
-        { batchWindowMs: 0 },
-      );
+      // The native log as the store accepts it, appended synchronously: a slower append would
+      // delay ACP requests (logged before they are sent) and race them against interrupts.
+      const logLines: Array<LogLine> = [];
+      const native: ProviderEventLoggers.EventNdjsonLogger = {
+        filePath: path.join(logDir, "events.log"),
+        write: (event, threadId) =>
+          Effect.sync(() => {
+            const record = serializeEventNdjsonRecord("native", event);
+            if (record._tag === "Skipped") return;
+            logLines.push({
+              file: String(threadId),
+              stream: "native",
+              record:
+                record._tag === "Serialized"
+                  ? JSON.parse(record.payload)
+                  : { failed: record.error.message },
+            });
+          }),
+        writeSerialized: (record, threadId) =>
+          Effect.sync(() => {
+            const problem = serializedRecordProblem("native", record);
+            logLines.push({
+              file: String(threadId),
+              stream: record.stream,
+              record: problem === undefined ? JSON.parse(record.payload) : { refused: problem },
+            });
+          }),
+        close: () => Effect.void,
+      };
       const pool = yield* ProviderIoWorkerPool.make({ workers: mode.workers });
       const use: Record<string, { sessions: number; calls: number }> = {};
       const layerPool = Layer.succeed(
@@ -327,7 +354,7 @@ const adapterRow = <
       const services = yield* Layer.build(
         Layer.mergeAll(
           Layer.succeed(ProviderEventLoggers.ProviderEventLoggers, {
-            native: store.logger("native"),
+            native,
             canonical: undefined,
           }),
           layerPool,
@@ -357,17 +384,6 @@ const adapterRow = <
           ? {}
           : { materializeWorkspace: row.materializeWorkspace }),
       }).pipe(Effect.provide(services));
-      yield* store.close();
-      const logLines: Array<LogLine> = [];
-      for (const file of (yield* fileSystem.readDirectory(logDir)).toSorted()) {
-        const contents = yield* fileSystem.readFileString(path.join(logDir, file));
-        for (const line of contents.split("\n")) {
-          if (line.length === 0) continue;
-          const [, stream, payload] = LOG_LINE.exec(line) ?? [];
-          assert.isDefined(payload, `log line format: ${line}`);
-          logLines.push({ file, stream, record: JSON.parse(payload) });
-        }
-      }
       const capture = normalize(
         { adapterEvents, logLines, sinkWrites: result.storedEvents },
         path.dirname(logDir),

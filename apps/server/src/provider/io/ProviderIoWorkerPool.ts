@@ -53,7 +53,7 @@ export interface ProviderIoSession<Output, E, Request = never, Reply = never> {
   readonly end: Effect.Effect<void, E>;
   readonly output: Stream.Stream<Output, E>;
   readonly call: (request: Request) => Effect.Effect<Reply, E>;
-  /** A call whose reply nobody waits for; ordered like `call`. False when the session can take none. */
+  /** A call nobody waits on, queued like `call`; false when the session takes no more. */
   readonly notify: (request: Request) => boolean;
 }
 
@@ -599,9 +599,21 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
             calls.delete(call);
           });
         }),
+      // Queued like a call, after the writes waiting for credit; a request that cannot be cloned
+      // fails the session, since nobody waits on it to hear.
       notify: (request) => {
         if (failure !== undefined || closed || slot.stopped) return false;
-        post({ type: "notify", session: id, request });
+        schedule({
+          bytes: 0,
+          admit: () => {
+            try {
+              post({ type: "notify", session: id, request });
+            } catch (cause) {
+              fail(new ProviderIoStageError({ stage: input.stage.name, cause }), false);
+            }
+          },
+          fail: () => {},
+        });
         return true;
       },
     };

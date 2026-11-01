@@ -5,9 +5,8 @@ import * as NodePath from "node:path";
 import { Rolldown } from "vite-plus/pack";
 
 // The build sees only what Rolldown resolved, so the worker guards its loaders itself: any
-// built-in, lazily and however prefixed (`node:module` and `worker_threads` only as facades), a
-// resolver hook refusing everything else, and the eval wrapper's globals deleted so the real
-// `Module` class is unreachable.
+// built-in, lazily and however prefixed (`node:module` and `worker_threads` only as facades),
+// loader hooks that resolve and load nothing else, and the eval wrapper's globals deleted.
 const guard = (code: string) => `"use strict";
 {
   const builtin = require;
@@ -41,11 +40,14 @@ const guard = (code: string) => `"use strict";
     if (typeof id !== "string" || !NodeModule.isBuiltin(id)) return refuse(String(id));
     return facades.get(prefixed(id)) ?? builtin(prefixed(id));
   };
+  // The load hook also stops a recovered Module class (a REPL context has one) loading a file.
   NodeModule.registerHooks({
     resolve: (specifier, context, nextResolve) =>
       typeof specifier === "string" && NodeModule.isBuiltin(specifier) && !facades.has(prefixed(specifier))
         ? nextResolve(specifier, context)
         : refuse(String(specifier)),
+    load: (url, context, nextLoad) =>
+      typeof url === "string" && url.startsWith("node:") ? nextLoad(url, context) : refuse(String(url)),
   });
   for (const name of ["module", "require", "exports", "__filename", "__dirname"]) delete globalThis[name];
   for (const name of ["dlopen", "binding", "_linkedBinding"]) process[name] = () => refuse("process." + name);

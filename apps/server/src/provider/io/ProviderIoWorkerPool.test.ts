@@ -817,3 +817,20 @@ it.effect("releases an open's worker reservation as soon as the open fails", () 
     }),
   ),
 );
+
+it.effect("releases everything an interrupted open had taken, wherever it stopped", () =>
+  withPool({ workers: 2 }, (pool, started) =>
+    Effect.gen(function* () {
+      const [first] = workers.started.slice(-started());
+      yield* openEcho(pool, "ready").pipe(Effect.scoped);
+      for (let ops = 3; ops <= OP_BOUNDARIES; ops++) {
+        // Interrupted opens stay in this long-lived scope; nothing of theirs may outlive them.
+        const opening = yield* forkParkedAfter(ops, openEchoOption(pool));
+        yield* Fiber.interrupt(opening);
+        yield* openEcho(pool, "next").pipe(Effect.scoped);
+        const lastOpen = workers.posted.filter((message) => message.type === "open").at(-1);
+        assert.equal(lastOpen?.worker, first);
+      }
+    }),
+  ),
+);

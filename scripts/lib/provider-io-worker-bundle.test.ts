@@ -1,3 +1,6 @@
+import * as NodeURL from "node:url";
+import * as NodeWorkerThreads from "node:worker_threads";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -89,4 +92,74 @@ it.effect("fails the build when the plugin never replaces its placeholder", () =
     }).pipe(Effect.flip);
     assert.include(String(error.cause), "placeholder");
   }),
+);
+
+// Builds the worker through the plugin and returns the embedded source a server would run.
+const embeddedSource = (worker: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-io-embedded-" });
+    yield* fs.writeFileString(path.join(dir, "worker.ts"), worker);
+    yield* fs.writeFileString(path.join(dir, "placeholder.ts"), placeholderSource);
+    yield* fs.writeFileString(
+      path.join(dir, "host.ts"),
+      'import * as Placeholder from "./placeholder.ts";\n' +
+        "export const source = (Placeholder as unknown as { loadEmbeddedProviderIoWorkerSource: () => string }).loadEmbeddedProviderIoWorkerSource();\n",
+    );
+    const { output } = yield* Effect.promise(() =>
+      Rolldown.build({
+        input: path.join(dir, "host.ts"),
+        platform: "node",
+        write: false,
+        logLevel: "silent",
+        plugins: [
+          providerIoWorkerBundle({
+            entry: path.join(dir, "worker.ts"),
+            placeholder: path.join(dir, "placeholder.ts"),
+          }),
+        ],
+      }),
+    );
+    yield* fs.writeFileString(path.join(dir, "host.mjs"), output[0].code);
+    const host = yield* Effect.promise(
+      () =>
+        import(NodeURL.pathToFileURL(path.join(dir, "host.mjs")).href) as Promise<{
+          readonly source: string;
+        }>,
+    );
+    return host.source;
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+it.effect("refuses at run time a load the build could not see", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-io-planted-" });
+    const planted = path.join(dir, "planted.cjs");
+    yield* fs.writeFileString(planted, 'module.exports = "PLANTED";\n');
+    const source = yield* embeddedSource(
+      'import * as NodeWorkerThreads from "node:worker_threads";\n' +
+        "const planted = NodeWorkerThreads.workerData as string;\n" +
+        'const key = ["re", "quire"].join("");\n' +
+        'const builtin = ["getBuiltin", "Module"].join("");\n' +
+        'const create = ["create", "Require"].join("");\n' +
+        "const attempts = [\n" +
+        "  () => (module as any)[key](planted),\n" +
+        '  () => (process as any)[builtin]("module")[create](planted)(planted),\n' +
+        "];\n" +
+        "NodeWorkerThreads.parentPort?.postMessage(attempts.map((attempt) => {\n" +
+        '  try { return attempt(); } catch { return "refused"; }\n' +
+        "}));\n",
+    );
+    const results = yield* Effect.callback<unknown>((resume) => {
+      const worker = new NodeWorkerThreads.Worker(source, { eval: true, workerData: planted });
+      worker.once("message", (message) => {
+        void worker.terminate();
+        resume(Effect.succeed(message));
+      });
+      worker.once("error", (error) => resume(Effect.succeed(String(error))));
+    });
+    assert.deepEqual(results, ["refused", "refused"]);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

@@ -36,32 +36,90 @@ const decodeTraceSpanLine = Schema.decodeUnknownOption(
   ),
 );
 
+const decodeSpanSummaryLine = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("span-summary"),
+      name: Schema.String,
+      thresholdMs: Schema.Finite,
+      count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+      maxDurationMs: Schema.Finite,
+      startTimeUnixNano: Schema.FiniteFromString,
+      endTimeUnixNano: Schema.FiniteFromString,
+    }),
+  ),
+);
+
+/** A percentile that falls among summarised spans is known only to be under their threshold. */
+type TraceLatency = number | { readonly underMs: number };
+
 export function makeTraceSpanSummary(sinceMs = -Infinity) {
-  const byName = new Map<string, { durations: number[]; interrupted: number; failures: number }>();
+  const byName = new Map<
+    string,
+    {
+      durations: number[];
+      interrupted: number;
+      failures: number;
+      summarised: number;
+      summarisedMaxMs: number;
+      summarisedUnderMs: number;
+    }
+  >();
   let spanCount = 0;
   let skippedLineCount = 0;
   let firstEndMs = Infinity;
   let lastEndMs = -Infinity;
 
+  const statsInWindow = (
+    name: string,
+    endTimeUnixNano: number,
+    startTimeUnixNano = endTimeUnixNano,
+  ) => {
+    const endMs = endTimeUnixNano / 1_000_000;
+    // The report prints end times as dates, so skip ones outside the Date range.
+    if (Option.isNone(DateTime.make(endMs))) {
+      skippedLineCount += 1;
+      return undefined;
+    }
+    if (endMs < sinceMs) return undefined;
+
+    // A summary's spans ended from its start on; its whole count is kept, so is its whole interval.
+    const startMs = Math.min(startTimeUnixNano / 1_000_000, endMs);
+    firstEndMs = Math.min(firstEndMs, Option.isSome(DateTime.make(startMs)) ? startMs : endMs);
+    lastEndMs = Math.max(lastEndMs, endMs);
+    const stats = byName.get(name) ?? {
+      durations: [],
+      interrupted: 0,
+      failures: 0,
+      summarised: 0,
+      summarisedMaxMs: -Infinity,
+      summarisedUnderMs: 0,
+    };
+    byName.set(name, stats);
+    return stats;
+  };
+
   const addLine = (line: string) => {
     if (line.trim().length === 0) return;
     const span = Option.getOrUndefined(decodeTraceSpanLine(line));
     if (span === undefined) {
-      skippedLineCount += 1;
+      const summary = Option.getOrUndefined(decodeSpanSummaryLine(line));
+      if (summary === undefined) {
+        skippedLineCount += 1;
+        return;
+      }
+      const stats = statsInWindow(summary.name, summary.endTimeUnixNano, summary.startTimeUnixNano);
+      if (stats === undefined) return;
+      spanCount += summary.count;
+      stats.summarised += summary.count;
+      stats.summarisedMaxMs = Math.max(stats.summarisedMaxMs, summary.maxDurationMs);
+      stats.summarisedUnderMs = Math.max(stats.summarisedUnderMs, summary.thresholdMs);
       return;
     }
-    const endMs = span.endTimeUnixNano / 1_000_000;
-    // The report prints end times as dates, so skip ones outside the Date range.
-    if (Option.isNone(DateTime.make(endMs))) {
-      skippedLineCount += 1;
-      return;
-    }
-    if (endMs < sinceMs) return;
+    const stats = statsInWindow(span.name, span.endTimeUnixNano);
+    if (stats === undefined) return;
 
     spanCount += 1;
-    firstEndMs = Math.min(firstEndMs, endMs);
-    lastEndMs = Math.max(lastEndMs, endMs);
-    const stats = byName.get(span.name) ?? { durations: [], interrupted: 0, failures: 0 };
     stats.durations.push(span.durationMs);
     if (
       span.exit?._tag === "Interrupted" ||
@@ -71,22 +129,29 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
       stats.interrupted += 1;
     }
     if (span.exit?._tag === "Failure" || span.status?.code === "2") stats.failures += 1;
-    byName.set(span.name, stats);
   };
 
   const finish = () => {
     const minutes = (lastEndMs - firstEndMs) / 60_000;
     const spans = [...byName]
-      .map(([name, { durations, interrupted, failures }]) => {
+      .map(([name, stats]) => {
+        const { durations, interrupted, failures, summarised } = stats;
         const sorted = durations.toSorted((left, right) => left - right);
-        const percentile = (p: number) => sorted[Math.ceil(p * sorted.length) - 1]!;
+        const count = sorted.length + summarised;
+        // Summarised spans sort before every written span at or above their threshold.
+        const percentile = (p: number): TraceLatency => {
+          const written = sorted[Math.ceil(p * count) - 1 - summarised];
+          return summarised > 0 && (written === undefined || written < stats.summarisedUnderMs)
+            ? { underMs: stats.summarisedUnderMs }
+            : written!;
+        };
         return {
           name,
-          count: sorted.length,
-          perMinute: minutes > 0 ? sorted.length / minutes : undefined,
+          count,
+          perMinute: minutes > 0 ? count / minutes : undefined,
           p50Ms: percentile(0.5),
           p90Ms: percentile(0.9),
-          maxMs: sorted[sorted.length - 1]!,
+          maxMs: Math.max(sorted.at(-1) ?? -Infinity, stats.summarisedMaxMs),
           interrupted,
           failures,
         };
@@ -101,6 +166,9 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
 
 const formatMs = (ms: number) =>
   ms < 1_000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 100) / 10}s`;
+
+const formatLatency = (latency: TraceLatency) =>
+  typeof latency === "number" ? formatMs(latency) : `<${latency.underMs}ms`;
 
 function formatTraceSummary(
   summary: ReturnType<ReturnType<typeof makeTraceSpanSummary>["finish"]>,
@@ -117,8 +185,8 @@ function formatTraceSummary(
         : span.perMinute < 0.1
           ? "<0.1"
           : span.perMinute.toFixed(1),
-      formatMs(span.p50Ms),
-      formatMs(span.p90Ms),
+      formatLatency(span.p50Ms),
+      formatLatency(span.p90Ms),
       formatMs(span.maxMs),
       String(span.interrupted),
       String(span.failures),

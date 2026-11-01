@@ -122,7 +122,19 @@ export interface OtlpTraceRecord extends BaseTraceRecord {
     | undefined;
 }
 
-export type TraceRecord = EffectTraceRecord | OtlpTraceRecord;
+/** Spans counted instead of written; the times bound the counted spans. */
+export interface SpanSummaryTraceRecord {
+  readonly type: "span-summary";
+  readonly name: string;
+  readonly thresholdMs: number;
+  readonly count: number;
+  readonly totalDurationMs: number;
+  readonly maxDurationMs: number;
+  readonly startTimeUnixNano: string;
+  readonly endTimeUnixNano: string;
+}
+
+export type TraceRecord = EffectTraceRecord | OtlpTraceRecord | SpanSummaryTraceRecord;
 
 function isStructuralTag(value: unknown): value is string {
   return (
@@ -179,6 +191,8 @@ export interface TraceSink {
 export interface LocalFileTracerOptions extends TraceSinkOptions {
   readonly delegate?: Tracer.Tracer;
   readonly sink?: TraceSink;
+  /** Above 0, fast successful SQL spans are summarised per name instead of written. */
+  readonly sqlMinDurationMs?: number;
 }
 
 type OtlpSpan = OtlpTracer.ScopeSpan["spans"][number];
@@ -403,6 +417,80 @@ function spanToTraceRecord(span: SerializableSpan): EffectTraceRecord {
   };
 }
 
+const SQL_SPAN_NAMES: ReadonlySet<string> = new Set(["sqlite", "sql.transaction"]);
+
+/** Statement and transaction spans from `effect/sql`, the ones `sqlMinDurationMs` summarises. */
+export const isSqlSpanName = (name: string): boolean => SQL_SPAN_NAMES.has(name);
+
+// Taking a free connection measures up to tens of microseconds; a longer wait means the span queued.
+const SQL_LOCK_WAIT_FLOOR_MS = 0.1;
+const SQL_SPAN_SUMMARY_INTERVAL = "1 minute";
+
+interface SpanTally {
+  count: number;
+  totalDurationMs: number;
+  maxDurationMs: number;
+  startTime: bigint;
+  endTime: bigint;
+}
+
+function makeSqlSpanSummary(thresholdMs: number) {
+  const tallies = new Map<string, SpanTally>();
+  return {
+    /** False when the span must be written: slow, failed, lock-waited, or carrying a log. */
+    summarise(span: SerializableSpan): boolean {
+      if (!SQL_SPAN_NAMES.has(span.name) || span.status._tag !== "Ended") return false;
+      const { startTime, endTime, exit } = span.status;
+      if (!ExitRuntime.isSuccess(exit)) return false;
+      const durationMs = Number(endTime - startTime) / 1_000_000;
+      if (durationMs >= thresholdMs) return false;
+      const lockWaitMs = span.attributes.get("db.lock_wait_ms");
+      if (
+        lockWaitMs !== undefined &&
+        !(typeof lockWaitMs === "number" && lockWaitMs < SQL_LOCK_WAIT_FLOOR_MS)
+      ) {
+        return false;
+      }
+      if (span.events.some(([, , attributes]) => attributes["effect.logLevel"] !== undefined)) {
+        return false;
+      }
+      const tally = tallies.get(span.name);
+      if (tally === undefined) {
+        tallies.set(span.name, {
+          count: 1,
+          totalDurationMs: durationMs,
+          maxDurationMs: durationMs,
+          startTime,
+          endTime,
+        });
+        return true;
+      }
+      tally.count++;
+      tally.totalDurationMs += durationMs;
+      tally.maxDurationMs = Math.max(tally.maxDurationMs, durationMs);
+      if (startTime < tally.startTime) tally.startTime = startTime;
+      if (endTime > tally.endTime) tally.endTime = endTime;
+      return true;
+    },
+    drain(): Array<SpanSummaryTraceRecord> {
+      const records = Array.from(tallies, ([name, tally]): SpanSummaryTraceRecord => ({
+        type: "span-summary",
+        name,
+        thresholdMs,
+        count: tally.count,
+        totalDurationMs: tally.totalDurationMs,
+        maxDurationMs: tally.maxDurationMs,
+        startTimeUnixNano: String(tally.startTime),
+        endTimeUnixNano: String(tally.endTime),
+      }));
+      tallies.clear();
+      return records;
+    },
+  };
+}
+
+type SqlSpanSummary = ReturnType<typeof makeSqlSpanSummary>;
+
 // WebSocket tickets and their DPoP proofs ride in URL queries and stay valid after the request.
 const URL_CREDENTIAL_PARAMS = /(^|[?&"\s])(wsTicket|dpop)=[^&#"\\\s]*/g;
 
@@ -581,14 +669,17 @@ class LocalFileSpan implements Tracer.Span {
   events: Array<[name: string, startTime: bigint, attributes: Record<string, unknown>]>;
   private readonly delegate: Tracer.Span;
   private readonly push: (record: EffectTraceRecord) => void;
+  private readonly sqlSummary: SqlSpanSummary | undefined;
 
   constructor(
     options: Parameters<Tracer.Tracer["span"]>[0],
     delegate: Tracer.Span,
     push: (record: EffectTraceRecord) => void,
+    sqlSummary: SqlSpanSummary | undefined,
   ) {
     this.delegate = delegate;
     this.push = push;
+    this.sqlSummary = sqlSummary;
     this.name = delegate.name;
     this.spanId = delegate.spanId;
     this.traceId = delegate.traceId;
@@ -616,7 +707,7 @@ class LocalFileSpan implements Tracer.Span {
     };
     this.delegate.end(endTime, redactExitCredentials(traceExit));
 
-    if (this.sampled) {
+    if (this.sampled && !this.sqlSummary?.summarise(this)) {
       this.push(spanToTraceRecord(this));
     }
   }
@@ -665,9 +756,23 @@ export const makeLocalFileTracer = Effect.fn("makeLocalFileTracer")(function* (
       span: (spanOptions) => new Tracer.NativeSpan(spanOptions),
     });
 
+  const sqlSummary =
+    options.sqlMinDurationMs !== undefined && options.sqlMinDurationMs > 0
+      ? makeSqlSpanSummary(options.sqlMinDurationMs)
+      : undefined;
+  if (sqlSummary !== undefined) {
+    const writeSummary = Effect.sync(() => {
+      for (const record of sqlSummary.drain()) sink.push(record);
+    });
+    yield* Effect.addFinalizer(() => writeSummary);
+    yield* Effect.forkScoped(
+      Effect.sleep(SQL_SPAN_SUMMARY_INTERVAL).pipe(Effect.andThen(writeSummary), Effect.forever),
+    );
+  }
+
   return Tracer.make({
     span(spanOptions) {
-      return new LocalFileSpan(spanOptions, delegate.span(spanOptions), sink.push);
+      return new LocalFileSpan(spanOptions, delegate.span(spanOptions), sink.push, sqlSummary);
     },
     ...(delegate.context ? { context: delegate.context } : {}),
   });

@@ -65,7 +65,10 @@ describe("ProviderIoStageTiming", () => {
         timeProviderIoStage(undefined, "decode", 10, () => work),
         work,
       );
-      yield* timeProviderIoStage(timer, "decode", 10, eagerWork);
+      // Built where it is called, as when timing is off, so a throwing constructor fails the same way.
+      const timed = timeProviderIoStage(timer, "decode", 10, eagerWork);
+      assert.strictEqual(clock.now(), 2);
+      yield* timed;
       yield* timeProviderIoStage(timer, "decode", 6, () =>
         work.pipe(Effect.andThen(Effect.fail("bad payload"))),
       ).pipe(Effect.ignore);
@@ -76,18 +79,22 @@ describe("ProviderIoStageTiming", () => {
     }),
   );
 
-  it("times log shaping without changing the logger when off", () => {
+  it("times log shaping of incoming events only, without changing the logger when off", () => {
     const clock = makeClock();
     const recorder = makeProviderIoStageRecorder(clock.now);
-    const logger = (event: number) => {
-      clock.advance(event);
-      return `write ${event}`;
+    const logger = (event: {
+      readonly direction: "incoming" | "outgoing";
+      readonly cost: number;
+    }) => {
+      clock.advance(event.cost);
+      return `write ${event.cost}`;
     };
 
     assert.strictEqual(timeProviderIoLogShape(undefined, logger), logger);
     const timed = timeProviderIoLogShape(recorder.forProvider("codex"), logger);
-    assert.strictEqual(timed(2), "write 2");
-    assert.strictEqual(timed(3), "write 3");
+    assert.strictEqual(timed({ direction: "incoming", cost: 2 }), "write 2");
+    assert.strictEqual(timed({ direction: "outgoing", cost: 7 }), "write 7");
+    assert.strictEqual(timed({ direction: "incoming", cost: 3 }), "write 3");
     assert.deepStrictEqual(recorder.drain(), [
       { provider: "codex", stage: "logShape", count: 2, totalMs: 5, maxMs: 3, bytes: 0 },
     ]);

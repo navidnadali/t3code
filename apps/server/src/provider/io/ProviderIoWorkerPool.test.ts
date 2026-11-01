@@ -504,6 +504,36 @@ it.effect("returns a silent chunk's credit at once, even when it shares a batch 
   ),
 );
 
+it.effect("copies a Buffer view for the worker and leaves the caller's buffer intact", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const session = Option.getOrThrow(
+        yield* pool.open({
+          stage: linesStage,
+          options: undefined,
+          onFailure: toCodexError,
+          kill: Effect.void,
+          highWaterMark: 4,
+        }),
+      );
+      const pooled = Buffer.from("e\n");
+      const backing = Buffer.alloc(64);
+      backing.write("f\n", 8);
+      const view = backing.subarray(8, 10);
+
+      yield* session.write(bytes("abcd"));
+      // The window is full, so the worker's credit for the silent chunk admits this write.
+      yield* session.write(pooled);
+      yield* session.write(view);
+      yield* session.end;
+      assert.deepEqual(yield* Stream.runCollect(session.output), ["abcde", "f"]);
+      assert.equal(pooled.toString(), "e\n");
+      assert.equal(backing.byteLength, 64);
+      assert.equal(view.toString(), "f\n");
+    }),
+  ),
+);
+
 it.effect("rejects a credit that is not a byte count without touching the window", () =>
   withLogLines((lines) =>
     withPool({ workers: 1, mode: "inert" }, (pool) =>

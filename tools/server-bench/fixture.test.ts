@@ -1011,6 +1011,17 @@ describe("fixture CLI", () => {
     expect(NodeFS.existsSync(NodePath.join(work, "out.sqlite"))).toBe(false);
   });
 
+  // The bench compares fixtures by hash: the same shape and seed must give the same bytes.
+  it("synth writes the same bytes for the same shape and seed", () => {
+    const directory = scratch("reproducible");
+    const hashes = ["a", "b"].map((name) => {
+      const path = NodePath.join(directory, `${name}.sqlite`);
+      synth(path, "0.05", "3");
+      return NodeCrypto.createHash("sha256").update(NodeFS.readFileSync(path)).digest("hex");
+    });
+    expect(hashes[0]).toBe(hashes[1]);
+  });
+
   it("synth builds the example within 10 % of its size and every table's rows at scale 1", () => {
     const directory = scratch("synth");
     const report = NodePath.join(directory, "report.json");

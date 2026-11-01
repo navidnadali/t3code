@@ -15,6 +15,7 @@ import {
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   type OrchestrationProjectShell,
   type ServerConfig,
@@ -839,6 +840,253 @@ it.live("a shell subscriber outlives a live burst larger than its buffer while i
     // Coalesced before the shell reads, not one shell per event.
     assert.isBelow(updates.length, 3 * 4);
     assert.isTrue(updates.every(([, sequence], index) => index === 0 || sequence > updates[index - 1]![1]));
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live("a shell subscriber whose live buffer still overflows gets a fresh snapshot and stays live", () =>
+  Effect.gen(function* () {
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const now = "2026-11-01T00:00:00.000Z";
+    const seedThreadId = ThreadId.make("thread:resync-seed");
+    const [row] = yield* sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        'shell-resync:0', 'thread', ${seedThreadId}, 0, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:shell-resync", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+    const [stored] = yield* store
+      .readApplicationEvents({ afterSequence: row!.sequence - 1, throughSequence: row!.sequence })
+      .pipe(Stream.runCollect);
+    if (stored === undefined || !("event" in stored)) return yield* Effect.die("Expected a thread event");
+    // Every event touches a different thread, so coalescing cannot absorb the burst: the
+    // buffer overflows while the shell reads wait. The subscriber must then get an
+    // authoritative snapshot and keep receiving live events after it.
+    const burst = 2 * LIVE_STREAM_MAX_ITEMS + 2;
+    const lastSequence = row!.sequence + burst;
+    const events = Array.from({ length: burst }, (_, index) => ({
+      ...stored,
+      sequence: row!.sequence + index + 1,
+      event: { ...stored.event, threadId: ThreadId.make(`thread:resync-${index}`) },
+    }));
+    const afterResync = { ...stored, sequence: lastSequence + 1, event: { ...stored.event, threadId: seedThreadId } };
+    const overflowLogged = yield* Deferred.make<void>();
+    const overflowLogger = Logger.make(({ message }) => {
+      if (String(message).includes("live event buffer is full")) {
+        Deferred.doneUnsafe(overflowLogged, Effect.void);
+      }
+    });
+    let highWaterReads = 0;
+    let snapshotLoads = 0;
+    const publishOnLiveSubscription: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      if (!query.includes("FROM orchestration_events") || !query.includes("MAX(sequence)")) {
+        return Effect.succeed(statement);
+      }
+      highWaterReads += 1;
+      // 1: initial snapshot, 2: first live tail (publish the burst), 3: the resync snapshot,
+      // 4: the live tail after it (publish one more event).
+      if (highWaterReads === 2) return store.publishCommitted(events).pipe(Effect.as(statement));
+      if (highWaterReads === 4) return store.publishCommitted([afterResync]).pipe(Effect.as(statement));
+      return Effect.succeed(statement);
+    };
+    const shell = (threadId: ThreadId, sequence: number) =>
+      ({
+        id: threadId,
+        projectId: "project",
+        archivedAt: null,
+        title: `Shell at ${sequence}`,
+        status: "completed",
+        activityRunStatus: null,
+        pendingRuntimeRequest: null,
+        pendingBackgroundTasks: [],
+        settledOverride: null,
+        settledAt: null,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      }) as unknown as OrchestrationV2ThreadShell;
+    const items = yield* subscribeOrchestrationV2Shell({ requestCompletionMarker: true }).pipe(
+      Effect.flatMap((stream) =>
+        stream.pipe(
+          Stream.takeUntil(
+            (item) => item.kind === "thread.updated" && item.sequence === afterResync.sequence,
+          ),
+          Stream.runCollect,
+        ),
+      ),
+      Effect.provideService(Statement.CurrentTransformer, publishOnLiveSubscription),
+      Effect.provide(Logger.layer([overflowLogger], { mergeWithExisting: true })),
+      Effect.provideService(ThreadManagement.ThreadManagementService, {
+        listActiveShellIndex: () => Effect.succeed([]),
+        readShellSnapshot: () =>
+          Effect.sync(() => {
+            snapshotLoads += 1;
+            return Effect.succeed({
+              schemaVersion: 1,
+              snapshotSequence: 0,
+              threads: [shell(seedThreadId, snapshotLoads)],
+              archivedThreads: [],
+            });
+          }),
+        listActiveSubagentThreadIds: () => Effect.succeed([]),
+        getThreadShellForEvent: (input: { readonly threadId: ThreadId; readonly sequence: number }) =>
+          Deferred.await(overflowLogged).pipe(Effect.as(shell(input.threadId, input.sequence))),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+      Effect.provideService(ProjectStore.ProjectStoreV2, {
+        listShells: () => Effect.succeed([]),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+      Effect.provideService(ProjectService.ProjectService, {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"]),
+      Effect.provideServiceEffect(
+        ProjectEnrichment.ProjectEnrichmentService,
+        PubSub.unbounded().pipe(
+          Effect.map(
+            (changes) =>
+              ({
+                subscribeChanges: PubSub.subscribe(changes),
+              }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+          ),
+        ),
+      ),
+    );
+    const kinds = items.map((item) => item.kind);
+    // Initial snapshot, synchronized, (burst items that made it through), the resync snapshot, then live again.
+    assert.equal(kinds[0], "snapshot");
+    assert.equal(kinds[1], "synchronized");
+    const snapshots = items.filter((item) => item.kind === "snapshot");
+    assert.equal(snapshots.length, 2);
+    assert.equal(snapshotLoads, 2);
+    const resyncAt = items.lastIndexOf(snapshots[1]!);
+    assert.isTrue(items.slice(resyncAt + 1).every((item) => item.kind === "thread.updated"));
+    assert.deepEqual(items.at(-1), {
+      kind: "thread.updated",
+      sequence: afterResync.sequence,
+      location: "active",
+      thread: shell(seedThreadId, afterResync.sequence),
+    });
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live("a thread subscriber whose live buffer overflows gets a fresh snapshot and stays live", () =>
+  Effect.gen(function* () {
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const now = "2026-11-01T00:00:00.000Z";
+    const threadId = ThreadId.make("thread:thread-resync");
+    const [row] = yield* sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        'thread-resync:0', 'thread', ${threadId}, 0, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:thread-resync", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+    const [stored] = yield* store
+      .readApplicationEvents({ afterSequence: row!.sequence - 1, throughSequence: row!.sequence })
+      .pipe(Stream.runCollect);
+    if (stored === undefined || !("event" in stored)) return yield* Effect.die("Expected a thread event");
+    // Nothing pulls while more events than the live buffer holds arrive for this thread (they
+    // cannot coalesce). Instead of ending, the stream must send a fresh snapshot and go on live.
+    const burst = LIVE_STREAM_MAX_ITEMS + 1;
+    const events = Array.from({ length: burst }, (_, index) => ({
+      ...stored,
+      sequence: row!.sequence + index + 1,
+    }));
+    const afterResync = { ...stored, sequence: row!.sequence + burst + 1 };
+    const overflowLogged = yield* Deferred.make<void>();
+    const overflowLogger = Logger.make(({ message }) => {
+      if (String(message).includes("live event buffer is full")) {
+        Deferred.doneUnsafe(overflowLogged, Effect.void);
+      }
+    });
+    // The live tail reads the high-water mark right after subscribing: publish there, so the
+    // burst (first tail) and the follow-up event (tail after the resync) sit behind a subscription.
+    let highWaterReads = 0;
+    const publishOnLiveSubscription: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      if (!query.includes("FROM orchestration_events") || !query.includes("MAX(sequence)")) {
+        return Effect.succeed(statement);
+      }
+      highWaterReads += 1;
+      if (highWaterReads === 1) return store.publishCommitted(events).pipe(Effect.as(statement));
+      if (highWaterReads === 2) return store.publishCommitted([afterResync]).pipe(Effect.as(statement));
+      return Effect.succeed(statement);
+    };
+    let snapshotLoads = 0;
+    const projection = (title: string) =>
+      ({
+        thread: {
+          id: threadId,
+          projectId: ProjectId.make("project"),
+          title,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          deletedAt: null,
+        },
+        runs: [],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        providerSessions: [],
+        providerThreads: [],
+        providerTurns: [],
+        runtimeRequests: [],
+        messages: [],
+        plans: [],
+        turnItems: [],
+        checkpointScopes: [],
+        checkpoints: [],
+        contextHandoffs: [],
+        contextTransfers: [],
+        visibleTurnItems: [],
+        updatedAt: now,
+      }) as unknown as OrchestrationV2ThreadProjection;
+    const items = yield* subscribeOrchestrationV2Thread({ threadId, requestCompletionMarker: true }).pipe(
+      Effect.flatMap((stream) =>
+        stream.pipe(
+          Stream.takeUntil(
+            (item) => item.kind === "event" && item.sequence === afterResync.sequence,
+          ),
+          Stream.runCollect,
+        ),
+      ),
+      Effect.provideService(Statement.CurrentTransformer, publishOnLiveSubscription),
+      Effect.provide(Logger.layer([overflowLogger], { mergeWithExisting: true })),
+      Effect.provideService(ThreadManagement.ThreadManagementService, {
+        ensureLegacyTranscript: () => Effect.void,
+        getThreadSnapshot: () =>
+          Effect.sync(() => {
+            snapshotLoads += 1;
+            return { snapshotSequence: row!.sequence, projection: projection(`Snapshot ${snapshotLoads}`) };
+          }),
+        streamStoredEventsFrom: (input: { readonly afterSequence?: number }) =>
+          store.streamApplicationEvents({ afterSequence: input.afterSequence ?? 0 }).pipe(
+            Stream.filter((event): event is OrchestrationV2StoredEvent => "event" in event),
+            // Nothing pulls the live tail until the burst has overflowed its buffer.
+            Stream.tap(() => Deferred.await(overflowLogged)),
+          ),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+    );
+    const kinds = items.map((item) => item.kind);
+    assert.deepEqual(kinds.slice(0, 2), ["snapshot", "synchronized"]);
+    const snapshots = items.filter((item) => item.kind === "snapshot");
+    assert.equal(snapshots.length, 2);
+    assert.equal(snapshotLoads, 2);
+    assert.equal(
+      snapshots[1]!.kind === "snapshot" ? snapshots[1]!.projection.thread.title : null,
+      "Snapshot 2",
+    );
+    assert.deepEqual(kinds.slice(items.lastIndexOf(snapshots[1]!)), ["snapshot", "event"]);
+    const last = items.at(-1);
+    assert.equal(last?.kind === "event" ? last.sequence : null, afterResync.sequence);
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 

@@ -390,11 +390,12 @@ describe("config reads", () => {
   );
 
   type TestServices = GitVcsDriver.GitVcsDriver | FileSystem.FileSystem | Path.Path;
+  type TestError = GitCommandError | PlatformError.PlatformError;
   interface ConfigChange {
     readonly name: string;
     // Prepares the repository at `cwd` and returns the directory to read from.
-    readonly setup: (cwd: string) => Effect.Effect<string, unknown, Scope.Scope | TestServices>;
-    readonly change: (cwd: string, readCwd: string) => Effect.Effect<void, unknown, TestServices>;
+    readonly setup: (cwd: string) => Effect.Effect<string, TestError, Scope.Scope | TestServices>;
+    readonly change: (cwd: string, readCwd: string) => Effect.Effect<void, TestError, TestServices>;
     readonly read: (
       driver: GitVcsDriver.GitVcsDriver["Service"],
       cwd: string,
@@ -527,6 +528,51 @@ describe("config reads", () => {
       read: readValue("t3.value"),
       before: "first",
       after: "second",
+      reused: true,
+    },
+    {
+      name: "a repository initialised in the subdirectory read from",
+      setup: (cwd) =>
+        git(cwd, ["config", "t3.value", "parent"]).pipe(
+          Effect.map(() => NodeFS.mkdirSync(NodePath.join(cwd, "sub"))),
+          Effect.as(NodePath.join(cwd, "sub")),
+        ),
+      change: (cwd, sub) =>
+        git(cwd, ["init", "-q", "sub"]).pipe(
+          Effect.andThen(git(sub, ["config", "t3.value", "nested"])),
+          Effect.asVoid,
+        ),
+      read: readValue("t3.value"),
+      before: "parent",
+      after: "nested",
+      reused: true,
+    },
+    {
+      name: "a half-initialised repository in the subdirectory read from completing",
+      setup: (cwd) =>
+        git(cwd, ["config", "t3.value", "parent"]).pipe(
+          Effect.map(() =>
+            NodeFS.mkdirSync(NodePath.join(cwd, "sub", ".git"), { recursive: true }),
+          ),
+          Effect.as(NodePath.join(cwd, "sub")),
+        ),
+      change: (cwd, sub) =>
+        git(cwd, ["init", "-q", "sub"]).pipe(
+          Effect.andThen(git(sub, ["config", "t3.value", "nested"])),
+          Effect.asVoid,
+        ),
+      read: readValue("t3.value"),
+      before: "parent",
+      after: "nested",
+      reused: false,
+    },
+    {
+      name: "the repository losing its HEAD",
+      setup: (cwd) => git(cwd, ["config", "t3.value", "first"]).pipe(Effect.as(cwd)),
+      change: (cwd) => Effect.sync(() => NodeFS.rmSync(NodePath.join(cwd, ".git", "HEAD"))),
+      read: readValue("t3.value"),
+      before: "first",
+      after: null,
       reused: true,
     },
     {

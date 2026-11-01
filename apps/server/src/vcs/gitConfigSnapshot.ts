@@ -138,12 +138,14 @@ const CONFIG_ENVIRONMENT_NAMES = [
 ] as const;
 const MAX_CONFIG_ENVIRONMENT_ENTRIES = 1_000;
 
-// The environment that chooses which config Git reads; null when `GIT_CONFIG` names the only file.
+// The environment that chooses which config Git reads; null when `GIT_CONFIG` names the only file
+// or there are more `GIT_CONFIG_KEY_<n>` overrides than the signature takes.
 export const gitConfigEnvironmentSignature = (env: NodeJS.ProcessEnv): string | null => {
   if (env.GIT_CONFIG !== undefined) return null;
   const parts: Array<string | null> = CONFIG_ENVIRONMENT_NAMES.map((name) => env[name] ?? null);
   const count = Number.parseInt(env.GIT_CONFIG_COUNT ?? "", 10);
-  for (let index = 0; index < Math.min(count, MAX_CONFIG_ENVIRONMENT_ENTRIES); index++) {
+  if (count > MAX_CONFIG_ENVIRONMENT_ENTRIES) return null;
+  for (let index = 0; index < count; index++) {
     parts.push(env[`GIT_CONFIG_KEY_${index}`] ?? null, env[`GIT_CONFIG_VALUE_${index}`] ?? null);
   }
   return JSON.stringify(parts);
@@ -151,12 +153,15 @@ export const gitConfigEnvironmentSignature = (env: NodeJS.ProcessEnv): string | 
 
 export interface GitConfigDependency {
   readonly path: string;
-  // Directories that only need to keep their identity, such as `.git`, which Git rewrites often.
-  readonly identity: boolean;
+  /**
+   * content: any change. identity: a directory's identity (a file's content), for the `.git` Git
+   * rewrites often. presence: whether it exists. absent: the snapshot holds only while it is missing,
+   * for the markers that would make Git find another repository on the way up.
+   */
+  readonly kind: "content" | "identity" | "presence" | "absent";
 }
 
-const dependencyKey = (dependency: GitConfigDependency) =>
-  `${dependency.identity ? "i" : "c"}${dependency.path}`;
+const dependencyKey = (dependency: GitConfigDependency) => `${dependency.kind}:${dependency.path}`;
 
 const statFingerprint = (dependency: GitConfigDependency) =>
   new Promise<string>((resolve) => {
@@ -166,9 +171,13 @@ const statFingerprint = (dependency: GitConfigDependency) =>
           resolve(`!${error.code ?? "error"}`);
           return;
         }
+        if (dependency.kind === "presence" || dependency.kind === "absent") {
+          resolve(stats.isDirectory() ? "directory" : "file");
+          return;
+        }
         const identity = `${stats.dev}:${stats.ino}:${stats.mode}:${stats.uid}`;
         resolve(
-          dependency.identity && stats.isDirectory()
+          dependency.kind === "identity" && stats.isDirectory()
             ? identity
             : `${identity}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`,
         );
@@ -205,6 +214,7 @@ const CONFIG_SNAPSHOT_CACHE_CAPACITY = 2_048;
 const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
 const CONFIG_SNAPSHOT_LOAD_ATTEMPTS = 3;
 const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
+const REPOSITORY_PATH_COUNT = 10;
 const REPOSITORY_PATH_ARGS = [
   "rev-parse",
   "--path-format=absolute",
@@ -220,6 +230,12 @@ const REPOSITORY_PATH_ARGS = [
   "remotes",
   "--git-path",
   "branches",
+  "--git-path",
+  "HEAD",
+  "--git-path",
+  "objects",
+  "--git-path",
+  "refs",
 ] as const;
 
 /**
@@ -288,22 +304,16 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       supported = false;
       return null;
     }
+    const paths = lines.slice(0, -1);
     if (
-      lines.length !== 8 ||
-      lines[7] !== "" ||
-      !lines.slice(0, 7).every((line) => line.length > 0 && path.isAbsolute(line))
+      paths.length !== REPOSITORY_PATH_COUNT ||
+      lines.at(-1) !== "" ||
+      !paths.every((line) => line.length > 0 && path.isAbsolute(line))
     ) {
       return null;
     }
-    const [toplevel, , config, configWorktree, commondir, remotes, branches] = lines as [
-      string,
-      string,
-      string,
-      string,
-      string,
-      string,
-      string,
-    ];
+    const [toplevel, , config, configWorktree, commondir, remotes, branches, ...markers] =
+      paths as [string, string, string, string, string, string, string, ...string[]];
     const [locations, listResult, physicalCwd, remoteFiles, branchFiles] = yield* Effect.all(
       [
         readConfigFileLocations(cwd, environment),
@@ -321,18 +331,24 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     );
     if (locations === null || Option.isNone(physicalCwd)) return null;
 
-    // Discovery: the directory itself and the `.git` Git looks for on the way up to the top level.
-    const dependencies: GitConfigDependency[] = [{ path: cwd, identity: true }];
+    // Discovery: the directory, what would make Git stop below the top level (a `.git`, or HEAD of a
+    // bare repository), the `.git` it found, and what keeps that a repository.
+    const dependencies: GitConfigDependency[] = [{ path: cwd, kind: "identity" }];
     for (let directory = physicalCwd.value; ;) {
-      dependencies.push({ path: path.join(directory, ".git"), identity: true });
       const relative = path.relative(toplevel, directory);
       if (relative === "") break;
       const parent = path.dirname(directory);
       if (relative === ".." || relative.startsWith(`..${path.sep}`) || parent === directory) {
         return null;
       }
+      dependencies.push(
+        { path: path.join(directory, ".git"), kind: "absent" },
+        { path: path.join(directory, "HEAD"), kind: "absent" },
+      );
       directory = parent;
     }
+    dependencies.push({ path: path.join(toplevel, ".git"), kind: "identity" });
+    for (const marker of markers) dependencies.push({ path: marker, kind: "presence" });
     const files = [
       config,
       configWorktree,
@@ -359,7 +375,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       files.push(...listed.paths);
       snapshotSupported &&= listed.supported;
     }
-    for (const file of files) dependencies.push({ path: file, identity: false });
+    for (const file of files) dependencies.push({ path: file, kind: "content" });
     const values = new Map<string, string | null>();
     for (const entry of entries ?? []) values.set(entry.key, entry.value);
     return { dependencies, values: snapshotSupported ? values : null };
@@ -387,13 +403,21 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
           ),
         ].map(([, dependency]) => dependency);
         if (unique.every((dependency) => fingerprintByKey.has(dependencyKey(dependency)))) {
+          const fingerprint = unique.map((dependency) =>
+            fingerprintByKey.get(dependencyKey(dependency))!,
+          );
+          const discovered = unique.every(
+            (dependency, index) =>
+              dependency.kind !== "absent" || fingerprint[index]!.startsWith("!"),
+          );
           return {
             environment,
             dependencies: unique,
-            fingerprint: unique
-              .map((dependency) => fingerprintByKey.get(dependencyKey(dependency)))
-              .join("\n"),
-            snapshot: state.values === null ? null : { values: state.values, results: new Map() },
+            fingerprint: fingerprint.join("\n"),
+            snapshot:
+              state.values === null || !discovered
+                ? null
+                : { values: state.values, results: new Map() },
           } satisfies CachedGitConfigSnapshot;
         }
         // Something was read before it was stat'ed; stat it and read again.

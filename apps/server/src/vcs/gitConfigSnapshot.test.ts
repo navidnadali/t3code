@@ -137,5 +137,6 @@ describe("gitConfigEnvironmentSignature", () => {
       gitConfigEnvironmentSignature({ ...base, HOME: "/home/other" }),
     );
     assert.isNull(gitConfigEnvironmentSignature({ ...base, GIT_CONFIG: "/tmp/only" }));
+    assert.isNull(gitConfigEnvironmentSignature({ ...base, GIT_CONFIG_COUNT: "1001" }));
   });
 });

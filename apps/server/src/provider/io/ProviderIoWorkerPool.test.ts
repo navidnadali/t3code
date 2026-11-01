@@ -598,6 +598,37 @@ it.effect("admits an end queued behind a write whose fiber was interrupted", () 
   ),
 );
 
+it.effect("runs a notification only after the writes waiting for credit before it", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = Option.getOrThrow(
+        yield* pool.open({
+          stage: asyncStage,
+          options: undefined,
+          onFailure: toCodexError,
+          kill: Effect.void,
+          highWaterMark: 4,
+          onEvent: (event) => {
+            events.push(event);
+          },
+        }),
+      );
+      yield* session.write(bytes("full"));
+      const write = yield* Effect.forkChild(session.write(bytes("emit-then-signal")), {
+        startImmediately: true,
+      });
+      assert.isTrue(session.notify("signal"));
+      const pull = yield* Stream.toPull(session.output);
+      assert.equal((yield* pull)[0], "late:full");
+      yield* Fiber.join(write);
+      // The chunk's event comes before the notification's: the worker saw the chunk first.
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["signalled-in-push", "event"]);
+    }),
+  ),
+);
+
 it.effect("runs a call only after the writes waiting for credit before it", () =>
   withPool({ workers: 1 }, (pool) =>
     Effect.gen(function* () {

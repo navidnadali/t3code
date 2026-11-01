@@ -1160,6 +1160,19 @@ describe("content blanking", () => {
     ]);
     // A key past the identifier limit is rewritten whatever its letters; planted back, it fails.
     const long = "mypasswordis".repeat(8);
+    // Letters filler could have written are still rewritten when the original key is not allowed.
+    const fillerShaped = "banana".repeat(16);
+    const reshaped = Object.keys(
+      JSON.parse(
+        rewriteContent(JSON.stringify({ [fillerShaped]: "x" }), null, "blank", emptyCounts()),
+      ),
+    );
+    expect(reshaped[0] === fillerShaped).toBe(false);
+    const plantedBack: Array<string> = [];
+    contentFindings(JSON.stringify({ [fillerShaped]: "vamoa" }), null, "blank", (kind) =>
+      plantedBack.push(kind),
+    );
+    expect(plantedBack).toEqual(["key"]);
     const rewritten = Object.keys(
       JSON.parse(rewriteContent(JSON.stringify({ [long]: "x" }), null, "blank", emptyCounts())),
     );
@@ -1171,7 +1184,8 @@ describe("content blanking", () => {
     expect(findings).toEqual(["key"]);
     const env = out.env as Record<string, string>;
     expect(Object.keys(env)[0]).toBe("DB_PASSWORD");
-    expect(Object.keys(env)[1]).toMatch(/^[a-z]{8}$/);
+    // A rewritten key has at least ten letters, so keys of one object stay distinct.
+    expect(Object.keys(env)[1]).toMatch(/^[a-z]{10}$/);
     expect(Object.values(env).every(isFiller)).toBe(true);
     // A credential-named key keeps no value P1-002's check could read; an id under one is blanked.
     expect([isFiller(out.token as string), isFiller(out.tokenId as string)]).toEqual([true, true]);

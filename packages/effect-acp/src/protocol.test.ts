@@ -1,5 +1,6 @@
 import * as Path from "effect/Path";
 import * as AcpError from "./errors.ts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -13,6 +14,7 @@ import * as Sink from "effect/Sink";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
@@ -1173,7 +1175,8 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
       yield* Queue.offer(input, chunk);
       yield* Deferred.await(routed);
 
-      assert.deepEqual(recorded, [
+      // Long lines go to the worker before short ones decode on main, so only the set is fixed.
+      assert.deepEqual(recorded.toSorted(), [
         ["framing", chunk.byteLength],
         ["json", update("short").length],
         ["offload", update(long).length],
@@ -1225,6 +1228,58 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
         failure: Effect.never,
       });
       assert.deepEqual(offloaded, inThread);
+    }),
+  );
+
+  it.effect("reads only a bounded number of reads ahead of a line still off-thread", () =>
+    Effect.gen(function* () {
+      const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+      const { stdio } = yield* makeInMemoryStdio();
+      const routed: Array<string> = [];
+      const offloaded = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const allRouted = yield* Deferred.make<void>();
+      const count = 64;
+      const decode = AcpOffload.makeOffloadedLineDecoder();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        // One read per pull, as a pipe delivers them.
+        stdio: { ...stdio, stdin: Stream.fromEffectRepeat(Queue.take(input)) },
+        serverRequestMethods: new Set(),
+        lineOffload: {
+          minChars: 200,
+          decode: (line) =>
+            Deferred.succeed(offloaded, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(decode(line)),
+            ),
+          failure: Effect.never,
+        },
+        onNotification: (notification) =>
+          Effect.suspend(() => {
+            routed.push(notification.method);
+            return routed.length === count + 1
+              ? Deferred.succeed(allRouted, undefined)
+              : Effect.void;
+          }).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${update(long)}\n`));
+      yield* Deferred.await(offloaded);
+      for (let index = 0; index < count; index++) {
+        yield* Queue.offer(input, encoder.encode(`${extNotification(`x/${index}`)}\n`));
+      }
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      // Stdout waits once enough reads are pending behind the long line, and none overtakes it.
+      assert.isAbove(yield* Queue.size(input), 0);
+      assert.deepEqual(routed, []);
+
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(allRouted);
+      assert.deepEqual(routed, [
+        "session/update",
+        ...Array.from({ length: count }, (_, index) => `x/${index}`),
+      ]);
     }),
   );
 
@@ -1329,12 +1384,56 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
         assert.instanceOf(error, AcpError.AcpProtocolParseError);
         assert.equal(error.operation, "decode-wire-message");
         assert.instanceOf(error.cause, SyntaxError);
-        assert.deepEqual(offloaded, where === "main" ? [] : [badLong]);
+        // The chunk's first bad line is the one reported, wherever it decoded.
+        const firstBad = where === "main" ? '{"jsonrpc":' : badLong;
+        const expected = Result.try(() => JSON.parse(firstBad));
+        assert.isTrue(Result.isFailure(expected));
+        if (Result.isFailure(expected)) {
+          assert.equal(
+            (error.cause as SyntaxError).message,
+            (expected.failure as SyntaxError).message,
+          );
+        }
+        assert.deepEqual(offloaded, [badLong]);
         assert.deepEqual(routed, []);
         assert.deepEqual(
           logged.map(({ stage }) => stage),
           ["raw", "decode_failed"],
         );
+      }),
+  );
+
+  it.effect.each(["before", "after"] as const)(
+    "fails the chunk with its first failure in line order when a worker call fails %s a bad line",
+    (where) =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const termination = yield* Deferred.make<AcpError.AcpError>();
+        const callFailed = new AcpError.AcpTransportError({
+          operation: "read-input-stream",
+          cause: new Error("Provider I/O call failed."),
+        });
+        yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(),
+          lineOffload: {
+            minChars: 200,
+            decode: () => Effect.fail(callFailed),
+            failure: Effect.never,
+          },
+          onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+        });
+
+        const lines =
+          where === "before" ? [update(long), '{"jsonrpc":'] : ['{"jsonrpc":', update(long)];
+        yield* Queue.offer(input, encoder.encode(`${lines.join("\n")}\n`));
+
+        const error = yield* Deferred.await(termination);
+        if (where === "before") {
+          assert.strictEqual(error, callFailed);
+        } else {
+          assert.instanceOf(error, AcpError.AcpProtocolParseError);
+        }
       }),
   );
 

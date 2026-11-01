@@ -198,13 +198,14 @@ const normalize = (
   tmpRoot: string,
   freshIds: boolean,
 ): Capture => {
-  // Either separator (Windows), repeated where a path sits inside an escaped JSON string.
+  // Either separator (Windows), repeated where a path sits inside an escaped JSON string; a
+  // backtick ends a name too (tool titles quote paths in backticks).
   const separator = String.raw`[\\/]+`;
   const tmpDirectory = new RegExp(
     `(?:${separator}private)?${tmpRoot
       .split(/[\\/]+/u)
       .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
-      .join(separator)}${separator}([^\\\\/\\s"']+)`,
+      .join(separator)}${separator}([^\\\\/\\s"'\`]+)`,
     "gu",
   );
   const tmpNames = new Map<string, string>();
@@ -573,6 +574,16 @@ const ACP_REAL_LOG_STORE_FIXTURES = new Set([
   "turn_interrupt",
 ]);
 
+// With these chunkings the fast wake's checkpoint lands on either run even in-thread (1 in 4 runs
+// of 0 workers against 0 workers), so this table, which runs each mode once, leaves it out.
+const GROK_FIXTURES = new Set(
+  ORCHESTRATOR_REPLAY_FIXTURES.filter(
+    (fixture) =>
+      fixture.name !== "grok_background_bash_fast_wake" &&
+      fixture.providers.some((provider) => provider.driver === "grok"),
+  ).map((fixture) => fixture.name),
+);
+
 const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "codex",
@@ -613,6 +624,7 @@ const ROWS: ReadonlyArray<AdapterRow> = [
     stage: "acp",
     logs: false,
     modes: LINE_OFFLOAD_MODES,
+    fixtures: GROK_FIXTURES,
     harness: replayHarness(GrokOrchestratorReplayHarness),
   }),
   adapterRow({

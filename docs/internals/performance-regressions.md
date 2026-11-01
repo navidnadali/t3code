@@ -101,9 +101,11 @@ sessions. The orchestrator still validates the current thread before applying se
 
 Read receipts use `ProjectionStore.getThread` to load only canonical thread metadata. A visit
 advances `lastVisitedAt` monotonically without changing `updatedAt` or decoding history. Shell
-queries use a covering thread/run index for item counts and a partial index for nonterminal
-background items, including idle items. Latest user-message reads use an index ordered by update
-time.
+queries read item counts from `orchestration_v2_projection_turn_item_counts`, one row per thread
+and run that triggers on the turn-item table keep exact (`ProjectionMaintenance.verify` checks
+them, `rebuild` recounts them), so a shell read never counts a thread's items. A partial index
+covers nonterminal background items, including idle items. Latest user-message reads use an index
+ordered by update time.
 
 Command palette results keep live VCS and linked pull-request queries leased to the visible
 viewport, including a small overscan region. Cached badges remain available while leases are

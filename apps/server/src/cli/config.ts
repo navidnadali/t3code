@@ -32,6 +32,7 @@ import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import { DEFAULT_SLOW_SPAN_THRESHOLD_MS } from "../diagnostics/TraceDiagnostics.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
+import { PROVIDER_IO_MAX_WORKERS } from "../provider/io/ProviderIoWorkerPool.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 
 const modeFlag = Flag.Literals("mode", ServerConfig.RuntimeMode.literals).pipe(
@@ -204,6 +205,10 @@ const EnvServerConfig = Config.all({
     SQLITE_MAX_CACHE_SIZE_MB,
   ),
   sqliteMmapSizeMb: sqliteMebibytesConfig("T3CODE_SQLITE_MMAP_MB", SQLITE_MAX_MMAP_SIZE_MB),
+  providerIoWorkers: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: PROVIDER_IO_MAX_WORKERS })),
+    "T3CODE_PROVIDER_IO_WORKERS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -558,6 +563,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     sqliteCacheSizeMb: env.sqliteCacheSizeMb,
     sqliteReaderCacheSizeMb: env.sqliteReaderCacheSizeMb,
     sqliteMmapSizeMb: env.sqliteMmapSizeMb,
+    ...(env.providerIoWorkers === undefined ? {} : { providerIoWorkers: env.providerIoWorkers }),
   };
 
   return config;

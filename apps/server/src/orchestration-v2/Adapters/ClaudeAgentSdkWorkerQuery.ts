@@ -163,13 +163,25 @@ const readHooks = (
   return { shape, functions };
 };
 
+// Own properties only, so a name or index from the worker never reaches an inherited one.
 const callbackOf = (
   callbacks: ClaudeAgentSdkMainCallbacks,
   call: ClaudeAgentSdkCallbackCall,
 ): ((...args: ReadonlyArray<never>) => unknown) | undefined => {
-  if (call.name !== "hook") return callbacks[call.name];
-  const [event, matcher, index] = call.hook;
-  return callbacks.hooks?.[event]?.[matcher]?.hooks[index];
+  const path: ReadonlyArray<PropertyKey> =
+    call.name === "hook"
+      ? ["hooks", call.hook[0], call.hook[1], "hooks", call.hook[2]]
+      : [call.name];
+  const callback = path.reduce<unknown>(
+    (container, key) =>
+      typeof container === "object" && container !== null && Object.hasOwn(container, key)
+        ? (container as Record<PropertyKey, unknown>)[key]
+        : undefined,
+    callbacks,
+  );
+  return typeof callback === "function"
+    ? (callback as (...args: ReadonlyArray<never>) => unknown)
+    : undefined;
 };
 
 // The SDK's response field for the answer, as it writes it to the CLI (canUseTool's spread with its
@@ -395,8 +407,9 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     if (controller === undefined) return;
     let result: unknown;
     try {
-      // The SDK puts the signal first.
+      // The SDK puts the signal first; one the worker relays must not replace main's.
       const options = { signal: controller.signal, ...call.args.at(-1) };
+      options.signal = controller.signal;
       const args: Array<unknown> = [...call.args.slice(0, -1), options];
       const callback = callbackOf(input.callbacks, call);
       if (callback === undefined) throw new Error(`${call.name} callback is not provided.`);

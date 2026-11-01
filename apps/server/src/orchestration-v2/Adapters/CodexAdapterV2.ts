@@ -1453,7 +1453,8 @@ function redactCodexProtocolValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     const redacted = value.map(redactCodexProtocolValue);
     for (let index = 0; index < value.length; index += 1) {
-      if (!Object.hasOwn(value, index) || redacted[index] !== value[index]) return redacted;
+      if (!Object.prototype.propertyIsEnumerable.call(value, index)) return redacted;
+      if (redacted[index] !== value[index]) return redacted;
     }
     return Object.getPrototypeOf(value) === Array.prototype &&
       Object.keys(value).length === value.length

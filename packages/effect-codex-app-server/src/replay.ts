@@ -127,6 +127,11 @@ export interface CodexAppServerReplayState {
   readonly failure: CodexAppServerReplayError | null;
 }
 
+export interface CodexAppServerReplayInbound {
+  /** Splits one encoded inbound frame (its LF included) into the chunks the client reads. */
+  readonly split: (frame: Uint8Array) => ReadonlyArray<Uint8Array>;
+}
+
 export interface CodexAppServerReplayDriver {
   readonly transcript: CodexAppServerReplayTranscript;
   readonly state: Ref.Ref<CodexAppServerReplayState>;
@@ -353,8 +358,13 @@ function replayTransportError(
 
 export function layerReplay(
   transcript: CodexAppServerReplayTranscript,
+  options: CodexClient.CodexAppServerClientOptions = {},
+  inbound?: CodexAppServerReplayInbound,
 ): Layer.Layer<CodexClient.CodexAppServerClient, CodexAppServerReplayError> {
-  return Layer.effect(CodexClient.CodexAppServerClient, makeReplayClient(transcript));
+  return Layer.effect(
+    CodexClient.CodexAppServerClient,
+    makeReplayClient(transcript, options, inbound),
+  );
 }
 
 export const makeReplayDriver = Effect.fn("effect-codex-app-server/replay.makeReplayDriver")(
@@ -372,16 +382,22 @@ export const makeReplayDriver = Effect.fn("effect-codex-app-server/replay.makeRe
 
 export function layerReplayWithDriver(
   driver: CodexAppServerReplayDriver,
+  options: CodexClient.CodexAppServerClientOptions = {},
+  inbound?: CodexAppServerReplayInbound,
 ): Layer.Layer<CodexClient.CodexAppServerClient, CodexAppServerReplayError> {
-  return Layer.effect(CodexClient.CodexAppServerClient, makeReplayClientWithState(driver));
+  return Layer.effect(
+    CodexClient.CodexAppServerClient,
+    makeReplayClientWithState(driver, options, inbound),
+  );
 }
 
 const makeReplayClient = Effect.fn("effect-codex-app-server/replay.makeReplayClient")(function* (
   transcript: CodexAppServerReplayTranscript,
   options: CodexClient.CodexAppServerClientOptions = {},
+  inbound?: CodexAppServerReplayInbound,
 ) {
   const driver = yield* makeReplayDriver(transcript);
-  return yield* makeReplayClientWithState(driver, options);
+  return yield* makeReplayClientWithState(driver, options, inbound);
 });
 
 const makeReplayClientWithState = Effect.fn(
@@ -389,6 +405,7 @@ const makeReplayClientWithState = Effect.fn(
 )(function* (
   driver: CodexAppServerReplayDriver,
   options: CodexClient.CodexAppServerClientOptions = {},
+  inbound?: CodexAppServerReplayInbound,
 ) {
   const transcript = driver.transcript;
   const ignoredThreadConfigKeys = recorderThreadConfigKeys(transcript);
@@ -422,7 +439,8 @@ const makeReplayClientWithState = Effect.fn(
         if (entry.afterMs !== undefined && entry.afterMs > 0) {
           yield* Effect.sleep(Duration.millis(entry.afterMs));
         }
-        yield* Queue.offer(input, encodeInboundFrame(entry.frame));
+        const frame = encodeInboundFrame(entry.frame);
+        for (const chunk of inbound?.split(frame) ?? [frame]) yield* Queue.offer(input, chunk);
         yield* Ref.update(state, (latest) => ({ ...latest, cursor: latest.cursor + 1 }));
         continue;
       }

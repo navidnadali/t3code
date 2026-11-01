@@ -1,15 +1,19 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import type { ThreadId } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "@t3tools/provider-acp-registry/settings";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import type { ProviderReplayGate } from "@t3tools/provider-testing/replayGate";
 import type { OrchestratorV2ProviderReplayHarness } from "../testkit/ProviderReplayHarness.ts";
@@ -53,11 +57,24 @@ function layerAcpRegistryProviderAdapterRegistryReplay(
       const scriptPath = yield* path
         .fromFileUrl(new URL("../../../scripts/acp-replay-agent.ts", import.meta.url))
         .pipe(Effect.orDie);
+      // Like the real driver, replays write native logs when the native event logger is provided.
+      const loggers = yield* Effect.serviceOption(ProviderEventLoggers.ProviderEventLoggers);
+      const makeNativeLogger = yield* makeAcpNativeLoggerFactory();
       const adapter = yield* makeAcpRegistryAdapterV2({
         instanceId: ACP_REGISTRY_DEFAULT_INSTANCE_ID,
         settings: REPLAY_SETTINGS,
         environment: {},
         selfInvocation: yield* resolveSelfInvocation(),
+        ...(Option.isSome(loggers)
+          ? {
+              nativeLogging: (threadId: ThreadId) =>
+                makeNativeLogger({
+                  nativeEventLogger: loggers.value.native,
+                  provider: ACP_REGISTRY_PROVIDER,
+                  threadId,
+                }),
+            }
+          : {}),
         makeRuntime: makeAcpReplayRuntime({
           transcript,
           statusPath,

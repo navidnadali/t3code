@@ -34,6 +34,21 @@ export interface ProviderIoStageRecorder {
   readonly drain: () => ReadonlyArray<ProviderIoStageSummary>;
 }
 
+/** Timed under their own name: the built-in drivers and the ACP default; any other is `other`. */
+export const PROVIDER_IO_STAGE_PROVIDERS: ReadonlySet<string> = new Set([
+  "codex",
+  "claudeAgent",
+  "cursor",
+  "grok",
+  "fx",
+  "opencode",
+  "antigravity",
+  "pi",
+  "muse",
+  "acpRegistry",
+  "acp",
+]);
+
 interface StageTotals {
   count: number;
   totalMs: number;
@@ -48,7 +63,8 @@ export function makeProviderIoStageRecorder(now: () => number): ProviderIoStageR
   >();
   return {
     now,
-    forProvider: (provider) => {
+    forProvider: (name) => {
+      const provider = PROVIDER_IO_STAGE_PROVIDERS.has(name) ? name : "other";
       const existing = providers.get(provider);
       if (existing !== undefined) return existing.timer;
       const stages = new Map<ProviderIoStage, StageTotals>();

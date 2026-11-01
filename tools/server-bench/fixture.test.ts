@@ -333,8 +333,88 @@ const seedPendingWork = (path: string) => {
     `INSERT INTO projection_thread_sessions (thread_id, status, provider_name, updated_at)
      VALUES (?, 'running', 'claudeAgent', ?)`,
   ).run(kept, at);
+  // A real usage-limit failure: the latest run failed on a usage_limit error item of its root node.
+  const limitedRun = db
+    .prepare(
+      `SELECT run_id AS id, json_extract(payload_json, '$.rootNodeId') AS root
+         FROM orchestration_v2_projection_runs WHERE thread_id = ? ORDER BY ordinal DESC LIMIT 1`,
+    )
+    .get(limited) as { id: string; root: string };
+  const ended = "2027-01-01T00:00:00.000Z";
+  db.prepare(
+    `UPDATE orchestration_v2_projection_runs SET status = 'failed', completed_at = ?,
+       payload_json = json_set(payload_json, '$.status', 'failed', '$.completedAt', ?)
+     WHERE run_id = ?`,
+  ).run(ended, ended, limitedRun.id);
+  db.prepare(
+    `UPDATE orchestration_v2_projection_threads
+     SET payload_json = json_set(payload_json, '$.settledOverride', NULL, '$.settledAt', NULL)
+     WHERE thread_id = ?`,
+  ).run(limited);
+  db.prepare(
+    `UPDATE orchestration_v2_projection_turn_items SET type = 'error', status = 'failed', node_id = ?,
+       payload_json = json_set(payload_json, '$.type', 'error', '$.status', 'failed', '$.nodeId', ?,
+         '$.failure', json_object('class', 'usage_limit', 'message', 'Usage limit reached',
+           'code', json('null'), 'retryable', json('false'), 'resetAt', '2099-01-01T00:00:00.000Z'))
+     WHERE turn_item_id = (SELECT MIN(turn_item_id) FROM orchestration_v2_projection_turn_items WHERE run_id = ?)`,
+  ).run(limitedRun.root, limitedRun.root, limitedRun.id);
+  // A question the restart recovery keeps open for a message answer.
+  db.exec(`UPDATE orchestration_v2_projection_runtime_requests
+    SET status = 'pending', resolved_at = NULL,
+      payload_json = json_set(payload_json, '$.status', 'pending', '$.resolvedAt', json('null'),
+        '$.responseCapability', json_object('type', 'message'))
+    WHERE runtime_request_id = (SELECT MIN(runtime_request_id) FROM orchestration_v2_projection_runtime_requests)`);
+  // An app-owned delegation still running in its parent, its child finished but undelivered.
+  const child = db
+    .prepare(
+      `SELECT t.thread_id AS id, json_extract(t.payload_json, '$.lineage.parentThreadId') AS parent
+         FROM orchestration_v2_projection_threads t
+         WHERE json_extract(t.payload_json, '$.lineage.relationshipToParent') = 'subagent'
+           AND json_extract(t.payload_json, '$.forkedFrom.type') = 'node'
+           AND EXISTS (SELECT 1 FROM orchestration_v2_projection_subagents s
+             WHERE s.thread_id = json_extract(t.payload_json, '$.lineage.parentThreadId'))
+         ORDER BY t.thread_id LIMIT 1`,
+    )
+    .get() as { id: string; parent: string };
+  const task = (
+    db
+      .prepare(
+        `SELECT subagent_id AS id FROM orchestration_v2_projection_subagents
+         WHERE thread_id = ? ORDER BY subagent_id LIMIT 1`,
+      )
+      .get(child.parent) as { id: string }
+  ).id;
+  db.prepare(
+    `UPDATE orchestration_v2_projection_subagents
+     SET origin = 'app_owned', child_thread_id = ?, status = 'running', completed_at = NULL,
+       payload_json = json_set(payload_json, '$.origin', 'app_owned', '$.childThreadId', ?,
+         '$.status', 'running', '$.completedAt', json('null'), '$.result', json('null'))
+     WHERE subagent_id = ?`,
+  ).run(child.id, child.id, task);
+  db.prepare(
+    `UPDATE orchestration_v2_projection_nodes SET status = 'running', completed_at = NULL,
+       payload_json = json_set(payload_json, '$.status', 'running', '$.completedAt', json('null'))
+     WHERE node_id = ?`,
+  ).run(task);
+  db.prepare(
+    `UPDATE orchestration_v2_projection_turn_items SET status = 'running',
+       payload_json = json_set(payload_json, '$.status', 'running', '$.origin', 'app_owned',
+         '$.childThreadId', ?, '$.completedAt', json('null'), '$.result', json('null'))
+     WHERE type = 'subagent' AND json_extract(payload_json, '$.subagentId') = ?`,
+  ).run(child.id, task);
+  db.prepare(
+    `DELETE FROM orchestration_v2_projection_context_transfers
+     WHERE source_thread_id = ? AND type = 'subagent_result'`,
+  ).run(child.id);
   db.close();
-  return { busy: [running, queued, limited, watched, transcript, startable], kept, idle, running };
+  return {
+    busy: [running, queued, limited, watched, transcript, startable, child.id, child.parent],
+    kept,
+    idle,
+    running,
+    limited,
+    task,
+  };
 };
 
 /** Plants the review's credential cases where real data held them; returns what must not survive. */
@@ -624,6 +704,13 @@ describe("secrets", () => {
     ]);
   });
 
+  it("masks a URL password whole, up to the `@`, however short", () => {
+    expect([redact("redis://:hunter2@cache.invalid"), redact("redis://:x@cache.invalid")]).toEqual([
+      "redis://:*******@cache.invalid",
+      "redis://:*@cache.invalid",
+    ]);
+  });
+
   it("finds a credential that straddles a chunk boundary of the raw file", () => {
     const path = NodePath.join(scratch("raw"), "file.bin");
     const token = SAMPLES["github-token"] as string;
@@ -890,7 +977,7 @@ describe("fixture CLI", () => {
     const directory = scratch("sanitise");
     const seeded = NodePath.join(directory, "seeded.sqlite");
     synth(seeded, "0.25");
-    const { busy, kept, idle, running } = seedPendingWork(seeded);
+    const { busy, kept, idle, running, limited, task } = seedPendingWork(seeded);
     const before = run(["scan", seeded]);
     expect(before.status).toBe(1);
     const found = (JSON.parse(before.stdout) as { runnable: Record<string, number> }).runnable;
@@ -918,7 +1005,7 @@ describe("fixture CLI", () => {
       clean,
       `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads WHERE thread_id IN ('${busy.join("','")}')`,
     );
-    expect(kept_).toBe(busy.length);
+    expect(kept_).toBe(new Set(busy).size);
     // ... plus the v1-only thread, which the server's importer turned into a v2 thread.
     expect(count(seeded, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads`) + 1).toBe(
       count(clean, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads`),
@@ -927,6 +1014,20 @@ describe("fixture CLI", () => {
       WHERE thread_id = '${running}' AND status = 'cancelled'
         AND ordinal = (SELECT MAX(ordinal) FROM orchestration_v2_projection_runs WHERE thread_id = '${running}')`;
     expect(count(clean, cancelled)).toBe(1);
+    // A usage-limit failure stays, handled with auto-resume off; questions expire; the delegation
+    // ends with its child's result.
+    const handled = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads WHERE thread_id = '${limited}'
+      AND json_extract(payload_json, '$.limitRecovery.autoResume') = 0`;
+    expect(count(clean, handled)).toBe(1);
+    expect(
+      count(
+        clean,
+        `SELECT COUNT(*) AS n FROM orchestration_v2_projection_runtime_requests WHERE status = 'pending'`,
+      ),
+    ).toBe(0);
+    const settled = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_subagents
+      WHERE subagent_id = '${task}' AND status = 'completed' AND json_extract(payload_json, '$.result') IS NOT NULL`;
+    expect(count(clean, settled)).toBe(1);
     expect(
       count(
         clean,

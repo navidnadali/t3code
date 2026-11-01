@@ -11,6 +11,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as References from "effect/References";
@@ -1615,15 +1616,17 @@ describe("AcpSessionRuntime", () => {
         expect(warnings).toEqual([]);
       }).pipe(
         Effect.provide(
-          Logger.layer([
-            Logger.make(({ logLevel, message, fiber }) => {
-              if (logLevel === "Warn") {
-                warnings.push([message, fiber.getRef(References.CurrentLogAnnotations)]);
-              }
-            }),
-          ]),
+          Layer.merge(
+            NodeServices.layer,
+            Logger.layer([
+              Logger.make(({ logLevel, message, fiber }) => {
+                if (logLevel === "Warn") {
+                  warnings.push([message, fiber.getRef(References.CurrentLogAnnotations)]);
+                }
+              }),
+            ]),
+          ),
         ),
-        Effect.provide(NodeServices.layer),
       );
     },
   );

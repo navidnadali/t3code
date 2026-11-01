@@ -132,7 +132,9 @@ function* objectParts(
     const parts = nested(key);
     const member = parts === undefined ? toJsonValue(value[key], key) : undefined;
     if (parts === undefined && isSkipped(member)) continue;
-    yield `${separator}${JSON.stringify(key)}:`;
+    yield separator;
+    yield* jsonParts(key);
+    yield ":";
     yield* parts ?? jsonParts(member);
     separator = ",";
   }

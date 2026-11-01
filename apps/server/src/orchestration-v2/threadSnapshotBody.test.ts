@@ -327,7 +327,7 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
     }),
   );
 
-  it.effect("keeps chunks bounded for a large answer with a non-callable toJSON key", () =>
+  it.effect("keeps chunks bounded for large answers, keys and non-callable toJSON keys", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const { snapshotSequence, projection } = yield* projections.getThreadSnapshot(FORK);
@@ -347,7 +347,10 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
               responseCapability: { type: "message" as const },
               createdAt: at,
               resolvedAt: at,
-              answers: { reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) } },
+              answers: {
+                reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) },
+                [TEXT.repeat(40_000)]: 0,
+              },
             },
           ],
         },

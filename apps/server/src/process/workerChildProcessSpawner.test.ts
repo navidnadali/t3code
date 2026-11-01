@@ -634,6 +634,40 @@ describe("WorkerChildProcessSpawner", () => {
   );
 
   it.live.skipIf(!workerPlatform)(
+    "kills a child of a spawner process that dies before acknowledging its start",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const watch = yield* childWatch;
+        const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
+          'child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));',
+          'child.on("spawn", () => message.args.includes("unacknowledged") || post({ t: "spawn", id, pid: child.pid }));',
+        );
+        expect(source).not.toBe(WorkerChildProcessSpawner.spawnerProcessSource);
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner, {
+          source,
+        });
+        // Once connected, the child kills the spawner, whose acknowledgement never came.
+        const pending = yield* Effect.forkScoped(
+          remoteSpawner
+            .spawn(
+              ChildProcess.make(process.execPath, [
+                "-e",
+                watch.connectScript('process.kill(process.ppid, "SIGKILL");'),
+                "unacknowledged",
+              ]),
+            )
+            .pipe(Effect.scoped),
+        );
+        yield* watch.closed(yield* watch.connected);
+        expect(summarizeError(yield* Effect.flip(Fiber.join(pending)))).toMatchObject({
+          method: "spawn",
+          causeMessage: "The process spawner stopped",
+        });
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.skipIf(!workerPlatform)(
     "the spawner process kills its children and exits when the server dies",
     () =>
       Effect.gen(function* () {

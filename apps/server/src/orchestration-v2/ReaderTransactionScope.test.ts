@@ -1137,3 +1137,25 @@ it.effect("gives back a streamed search's reader permit when interrupted as it t
     assert.isTrue(yield* semaphore.takeIfAvailable(1));
   }),
 );
+
+it.effect("lets a streamed search waiting for a reader permit be interrupted", () =>
+  Effect.gen(function* () {
+    const permits = Semaphore.makeUnsafe(1);
+    yield* permits.take(1);
+    yield* withFileStore(
+      "reader-scope-search-wait-",
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const fixture = yield* writeFixture("search-wait", 2);
+        const search = yield* Stream.runCollect(
+          store.searchThreadStream({ threadId: fixture.fork, query: "fork" }),
+        ).pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Fiber.interrupt(search);
+      }),
+      1,
+      permits,
+    );
+    yield* permits.release(1);
+    assert.isTrue(yield* permits.takeIfAvailable(1));
+  }),
+);

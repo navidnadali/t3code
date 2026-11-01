@@ -89,6 +89,8 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
+import type * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import type * as Statement from "effect/sql/Statement";
 
@@ -7328,6 +7330,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ),
           NodeSqliteClient.readOnly,
         );
+    // Takes a permit for the current scope. Only the wait is interruptible: the take and its
+    // release finalizer happen together, so an interruption cannot keep a permit.
+    const takePermitScoped = (permits: Semaphore.Semaphore) =>
+      Effect.uninterruptibleMask((restore) => {
+        const attempt: Effect.Effect<void, never, Scope.Scope> = permits
+          .takeIfAvailable(1)
+          .pipe(
+            Effect.flatMap((taken) =>
+              taken
+                ? Effect.addFinalizer(() => permits.release(1))
+                : restore(permits.withPermits(1)(Effect.void)).pipe(Effect.andThen(attempt)),
+            ),
+          );
+        return attempt;
+      });
     // The same for a stream, holding the permit until the stream ends.
     const historyStreamOnReader =
       <Args extends ReadonlyArray<unknown>, A, E, R>(
@@ -7337,13 +7354,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Stream.unwrap(
           permitsToTake.pipe(
             Effect.flatMap((permits) =>
-              permits === undefined
-                ? Effect.void
-                : Effect.uninterruptibleMask((restore) =>
-                    restore(permits.take(1)).pipe(
-                      Effect.andThen(Effect.addFinalizer(() => permits.release(1))),
-                    ),
-                  ),
+              permits === undefined ? Effect.void : takePermitScoped(permits),
             ),
             Effect.as(method(...args)),
           ),

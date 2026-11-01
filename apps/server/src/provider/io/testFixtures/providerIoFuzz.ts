@@ -140,7 +140,14 @@ const syntheticLine = (random: Random, protocol: FuzzProtocol, recorded: Readonl
       },
     });
   }
-  if (roll < 0.95) return JSON.stringify({ jsonrpc: "2.0", method: "x/ext", params: { text } });
+  if (roll < 0.9) return JSON.stringify({ jsonrpc: "2.0", method: "x/ext", params: { text } });
+  // A JSON-RPC batch: main decodes it, so its requests' replies are batched with the encoder.
+  if (roll < 0.95) {
+    return JSON.stringify([
+      { jsonrpc: "2.0", method: "x/ext", params: { text } },
+      { jsonrpc: "2.0", id: 900 + below(random, 9), method: "x/ext-request", params: { text } },
+    ]);
+  }
   if (roll < 0.97) return "";
   return `{"jsonrpc":"2.0","method":${JSON.stringify(text)}`;
 };

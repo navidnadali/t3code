@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 import type * as NodeWorkerThreads from "node:worker_threads";
 
@@ -19,6 +20,7 @@ import { vi } from "vite-plus/test";
 
 import { makeCodexAppServerProtocolLogger } from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { serializeEventNdjsonRecord } from "../EventNdjsonRecord.ts";
+import { providerIoWorkerBundle } from "../../../../../scripts/lib/provider-io-worker-bundle.ts";
 import * as ProviderIoOffloads from "./ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
 import {
@@ -38,8 +40,17 @@ import {
   type Random,
 } from "./testFixtures/providerIoFuzz.ts";
 
-// The production worker and its stages run unchanged; this only records which stage each opens.
-const workers = vi.hoisted(() => ({ stages: new Map<object, Array<string>>() }));
+// The workers run the production registry from the guarded bundle the server ships, built here
+// by its own build plugin; this only records each worker's code and the stages it opens.
+const workers = vi.hoisted(() => ({
+  bundle: undefined as string | undefined,
+  stages: new Map<object, Array<string>>(),
+  guarded: new Set<object>(),
+}));
+
+vi.mock("./embeddedProviderIoWorker.ts", () => ({
+  loadEmbeddedProviderIoWorkerSource: () => workers.bundle,
+}));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
@@ -47,6 +58,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
     constructor(...args: ConstructorParameters<typeof actual.Worker>) {
       super(...args);
       workers.stages.set(this, []);
+      if (args[0] === workers.bundle && args[1]?.eval === true) workers.guarded.add(this);
     }
     override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
       const message = args[0] as { readonly type?: unknown; readonly stage?: unknown };
@@ -228,43 +240,66 @@ interface OffloadCase {
   readonly run: (offload: Offload | undefined) => Effect.Effect<Run>;
 }
 
-// Counts the lines a case sends to the workers.
-const countingPool = (pool: Pool, counter: { calls: number }): Pool =>
+// Counts the lines a case's workers decoded; a worker may also hand a line back to main.
+const countingPool = (pool: Pool, counter: { decoded: number }): Pool =>
   ProviderIoWorkerPool.ProviderIoWorkerPool.of({
     open: (input) =>
       pool.open(input).pipe(
         Effect.map(
           Option.map((session) => ({
             ...session,
-            call: (request) => {
-              counter.calls += 1;
-              return session.call(request);
-            },
+            call: (request) =>
+              session.call(request).pipe(
+                Effect.tap((reply) =>
+                  Effect.sync(() => {
+                    if ((reply as { readonly _tag?: unknown })._tag === "Decoded") {
+                      counter.decoded += 1;
+                    }
+                  }),
+                ),
+              ),
           })),
         ),
       ),
   });
+
+const guardedBundle = Effect.promise(async () => {
+  if (workers.bundle !== undefined) return;
+  const placeholder = NodeURL.fileURLToPath(
+    new URL("./embeddedProviderIoWorker.ts", import.meta.url),
+  );
+  const module = await providerIoWorkerBundle({
+    entry: NodeURL.fileURLToPath(new URL("./providerIoWorker.ts", import.meta.url)),
+    placeholder,
+  }).load(placeholder);
+  if (typeof module !== "string") throw new Error("The worker bundle plugin built nothing.");
+  workers.bundle = JSON.parse(module.slice(module.indexOf("=> ") + 3, module.lastIndexOf(";")));
+});
 
 const preview = (value: unknown) =>
   NodeUtil.inspect(value, { depth: 6, breakLength: Infinity, maxStringLength: 160 }).slice(0, 900);
 
 const compareInThreadAndOffloaded = (cases: ReadonlyArray<OffloadCase>) =>
   Effect.gen(function* () {
+    yield* guardedBundle;
     workers.stages.clear();
+    workers.guarded.clear();
     const pool = yield* ProviderIoWorkerPool.make({ workers: 2 });
     const mismatches: Array<string> = [];
     let offloadedCases = 0;
+    let decodedLines = 0;
     yield* Effect.forEach(
       cases,
       (offloadCase) =>
         Effect.gen(function* () {
-          const counter = { calls: 0 };
+          const counter = { decoded: 0 };
           const inThread = yield* offloadCase.run(undefined);
           const offloaded = yield* offloadCase.run({
             pool: countingPool(pool, counter),
             minChars: offloadCase.minChars,
           });
-          if (counter.calls > 0) offloadedCases += 1;
+          if (counter.decoded > 0) offloadedCases += 1;
+          decodedLines += counter.decoded;
           if (!NodeUtil.isDeepStrictEqual(offloaded, inThread)) {
             const channel = (["termination", "routed", "logs"] as const).find(
               (key) => !NodeUtil.isDeepStrictEqual(offloaded[key], inThread[key]),
@@ -276,7 +311,7 @@ const compareInThreadAndOffloaded = (cases: ReadonlyArray<OffloadCase>) =>
         }),
       { concurrency: 16, discard: true },
     );
-    return { mismatches, offloadedCases };
+    return { mismatches, offloadedCases, decodedLines };
   }).pipe(Effect.scoped);
 
 const FUZZ_SEED = 0x2029_f025;
@@ -342,19 +377,23 @@ const fuzzCases = (protocol: FuzzProtocol) => {
 const STAGES: Record<FuzzProtocol, string> = { codex: "codex-app-server", acp: "acp" };
 
 it.effect.each([["codex"], ["acp"]] as const)(
-  "%s stdout gives the same messages, log records and termination with long lines on P1-025's production worker stages over 10,000 seeded cases",
+  "%s stdout gives the same messages, log records and termination with long lines on the guarded production worker bundle over 10,000 seeded cases",
   ([protocol]) =>
     Effect.gen(function* () {
       const cases = fuzzCases(protocol);
-      const { mismatches, offloadedCases } = yield* compareInThreadAndOffloaded(cases);
+      const { mismatches, offloadedCases, decodedLines } =
+        yield* compareInThreadAndOffloaded(cases);
       if (mismatches.length > 0) {
         assert.fail(
           `${mismatches.length} of ${cases.length} cases differ:\n${mismatches.slice(0, 3).join("\n")}`,
         );
       }
-      assert.isAbove(offloadedCases, cases.length / 2, "the workers took most cases' lines");
+      // Higher thresholds and lines that do not parse stay on main, so not every case decodes there.
+      assert.isAbove(offloadedCases, cases.length / 3, "the workers decoded lines in many cases");
+      assert.isAbove(decodedLines, cases.length);
       const perWorker = [...workers.stages.values()];
       assert.equal(perWorker.length, 2);
+      assert.equal(workers.guarded.size, 2, "both workers run the guarded bundle");
       for (const stages of perWorker) {
         assert.isNotEmpty(stages, "both workers took sessions");
         assert.deepEqual([...new Set(stages)], [STAGES[protocol]]);

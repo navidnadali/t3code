@@ -785,6 +785,24 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     ),
   );
 
+  it.effect("keeps stopping a closed query's CLI on main once its pool closes", () =>
+    Effect.gen(function* () {
+      const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+      yield* withRunner("worker", ({ runner }) =>
+        Effect.gen(function* () {
+          const session = yield* runner.open(openInput(cli));
+          yield* session.close;
+          // The worker's SDK sends SIGTERM before the messages end; its SIGKILL is still due.
+          yield* Stream.runDrain(session.messages);
+          assert.deepStrictEqual(cli.kills, ["SIGTERM"]);
+        }),
+      );
+      yield* TestClock.adjust("2 seconds");
+      yield* TestClock.adjust("5 seconds");
+      assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGTERM", "SIGKILL"]);
+    }),
+  );
+
   it.effect("keeps the query in-thread when the pool has no workers", () =>
     Effect.gen(function* () {
       const startedBefore = workers.started.length;

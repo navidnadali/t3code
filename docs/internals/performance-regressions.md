@@ -113,6 +113,14 @@ it, so migration 77 must run after any such rebuild, or the rebuild must recreat
 index covers nonterminal background items, including idle items. Latest user-message reads use an
 index ordered by update time.
 
+A projection read that orders messages by their first user or assistant turn item groups those
+items by `$.messageId` through a partial index on that expression (migration 78), so it does not
+parse every message item's payload; the index's expression and `WHERE` must stay identical to the
+query's. Migration 78 scans the turn-item table once on first start. Rolling back to a build
+without it can delete its `effect_sql_migrations` row and keep the index, which writes keep
+current; `DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx` removes it.
+Finalizing a delegated task reads only that child's tasks and result transfers from the parent.
+
 Command palette results keep live VCS and linked pull-request queries leased to the visible
 viewport, including a small overscan region. Cached badges remain available while leases are
 released. Local Git status reads skip divergence calculations; callers that need ahead/behind

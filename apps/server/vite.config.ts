@@ -1,14 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off - Vite config runs before any Effect runtime.
 import "vite-plus/test/config";
-import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
-import * as NodeZlib from "node:zlib";
 import { defineConfig, mergeConfig } from "vite-plus";
-import { Rolldown } from "vite-plus/pack";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
+import { providerIoWorkerBundle } from "../../scripts/lib/provider-io-worker-bundle.ts";
 import rootPackageJson from "../../package.json" with { type: "json" };
 import packageJson from "./package.json" with { type: "json" };
 import { WeightedShardSequencer } from "./src/testUtils/weightedShardSequencer.ts";
@@ -70,37 +68,6 @@ const packExecutableTargets = packExecutableTarget
   : undefined;
 
 const providerIoDir = NodeURL.fileURLToPath(new URL("./src/provider/io/", import.meta.url));
-// Executables resolve only built-ins, so the worker ships as one CommonJS string run with `eval`.
-const providerIoWorkerBundle = {
-  name: "t3code:provider-io-worker",
-  async load(id: string) {
-    if (NodePath.normalize(id) !== NodePath.join(providerIoDir, "embeddedProviderIoWorker.ts")) {
-      return null;
-    }
-    const { output } = await Rolldown.build({
-      input: NodePath.join(providerIoDir, "providerIoWorker.ts"),
-      platform: "node",
-      write: false,
-      output: { format: "cjs", codeSplitting: false },
-    });
-    const [chunk] = output;
-    // The bundler's own import list: generated code can spell require() inside strings.
-    const external = [...chunk.imports, ...chunk.dynamicImports].filter(
-      (specifier) => !NodeModule.isBuiltin(specifier) && specifier !== chunk.fileName,
-    );
-    if (external.length > 0) {
-      throw new Error(
-        `The provider I/O worker bundle requires non-built-ins: ${external.join(", ")}`,
-      );
-    }
-    // Compressed, the bundle (2 MB with the Claude Agent SDK, partly two-byte text) costs a server with
-    // the pool off a short ASCII string instead.
-    const compressed = NodeZlib.brotliCompressSync(chunk.code, {
-      params: { [NodeZlib.constants.BROTLI_PARAM_QUALITY]: 11 },
-    });
-    return `export const embeddedProviderIoWorkerBrotli = ${JSON.stringify(compressed.toString("base64"))};`;
-  },
-};
 
 // The root config's `projects` route repo-root runs to package configs,
 // including this one. Inheriting them would make this config a container.
@@ -126,7 +93,12 @@ export default mergeConfig(
       outDir: packExecutable ? "dist-exe" : "dist",
       sourcemap: !packExecutable,
       clean: true,
-      plugins: [providerIoWorkerBundle],
+      plugins: [
+        providerIoWorkerBundle({
+          entry: NodePath.join(providerIoDir, "providerIoWorker.ts"),
+          placeholder: NodePath.join(providerIoDir, "embeddedProviderIoWorker.ts"),
+        }),
+      ],
       // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
       // SEA can only resolve built-ins; keep dynamic imports inside its one module.
       ...(packExecutable ? { outputOptions: { codeSplitting: false } } : {}),

@@ -25,9 +25,9 @@ import {
   type ClaudeAgentSdkWorkerEvent,
   type ClaudeAgentSdkWorkerHooks,
   type ClaudeAgentSdkWorkerRequest,
-  claudeAgentSdkStage,
+  claudeAgentSdkStageOnMain,
   toClaudeAgentSdkProcessError,
-} from "../../provider/io/claudeAgentSdkStage.ts";
+} from "../../provider/io/claudeAgentSdkProtocol.ts";
 import * as ServerConfig from "../../config.ts";
 import {
   type ProviderIoSession,
@@ -436,7 +436,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
 
   const opened = yield* input.pool
     .open({
-      stage: claudeAgentSdkStage,
+      stage: claudeAgentSdkStageOnMain,
       options: input.stageOptions,
       onFailure: (error: WorkerSessionError) => error,
       kill: Effect.sync(() => {
@@ -446,7 +446,11 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       killAfterEnd: true,
       onEvent,
     })
-    .pipe(Effect.provideService(Scope.Scope, scope));
+    .pipe(
+      Effect.provideService(Scope.Scope, scope),
+      Effect.mapError((error) => input.toError(workerCause(error), "query")),
+      Effect.onError(() => Scope.close(scope, Exit.void)),
+    );
   if (Option.isNone(opened)) {
     yield* Scope.close(scope, Exit.void);
     return Option.none<StartedClaudeQuery<E>>();

@@ -20,9 +20,10 @@ interface WorkerSession {
   finished: boolean;
   // Async replies, posted after the outputs emitted while they were pending.
   replies: Array<ProviderIoWorkerMessage>;
-  // Events a stage raises while it takes a chunk (or a notified call), posted after its outputs.
+  // Events a stage raises while it takes a chunk (or a notified call), each at its place among the
+  // outputs, posted with them.
   pushing: boolean;
-  events: Array<unknown>;
+  events: Array<{ readonly at: number; readonly event: unknown }>;
 }
 
 const isThenable = (value: unknown): value is PromiseLike<unknown> =>
@@ -58,17 +59,30 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
     }
   };
 
-  // An output that cannot be cloned fails only its own session.
+  // An output or event that cannot be cloned fails only its own session. The held credit goes with
+  // the batch holding the last output.
   const flush = (id: number, session: WorkerSession) => {
     unflushed.delete(id);
-    const { outputs, held, freed, replies } = session;
+    const { outputs, held, freed, replies, events } = session;
     session.outputs = [];
     session.held = 0;
     session.freed = 0;
     session.replies = [];
+    session.events = [];
     try {
       if (freed > 0) post({ type: "output", session: id, outputs: [], bytes: freed });
-      if (outputs.length > 0) post({ type: "output", session: id, outputs, bytes: held });
+      let posted = 0;
+      for (const { at, event } of events) {
+        if (at > posted) {
+          const bytes = at === outputs.length ? held : 0;
+          post({ type: "output", session: id, outputs: outputs.slice(posted, at), bytes });
+          posted = at;
+        }
+        post({ type: "event", session: id, event });
+      }
+      if (outputs.length > posted) {
+        post({ type: "output", session: id, outputs: outputs.slice(posted), bytes: held });
+      }
     } catch (error) {
       fail(id, error);
       return false;
@@ -120,11 +134,7 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
 
   // Returns false when the session failed on the way.
   const postEventsRaisedInPush = (id: number, session: WorkerSession) => {
-    if (session.events.length === 0) return true;
-    const events = session.events;
-    session.events = [];
-    if (!flush(id, session)) return false;
-    return events.every((event) => postEvent(id, event));
+    return session.events.length === 0 || flush(id, session);
   };
 
   const postReply = (message: ProviderIoWorkerMessage) => {
@@ -183,7 +193,7 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
       signal: (event) => {
         if (!live()) return;
         if (session.pushing) {
-          session.events.push(event);
+          session.events.push({ at: session.outputs.length, event });
           return;
         }
         if (flushFirst(id)) postEvent(id, event);

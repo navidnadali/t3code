@@ -19,6 +19,7 @@ import {
   type CommandAvailabilityChecker,
   isCommandAvailable,
   listLoginShellCandidates,
+  locateXcodeGitWithXcrun,
   mergePathEntries,
   mergePathValues,
   npmShimExecutable,
@@ -819,7 +820,7 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
         Effect.provideService(SpawnExecutableResolution, (command) =>
           command === "git" ? options.gitOnPath : files.has(command) ? command : undefined,
         ),
-        Effect.provideService(XcodeGitLocation, () => {
+        Effect.provideService(XcodeGitLocation, async () => {
           host.xcrunCalls += 1;
           return host.xcrunGit;
         }),
@@ -836,6 +837,68 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
         expect(yield* resolve).toBe(XCODE_GIT);
         expect(host.xcrunCalls).toBe(1);
       }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
+    );
+
+    it.effect("waits for xcrun without blocking, sharing one lookup between callers", () =>
+      Effect.gen(function* () {
+        let finishLookup: (located: string | undefined) => void = () => {};
+        const lookup = new Promise<string | undefined>((resolve) => {
+          finishLookup = resolve;
+        });
+        let xcrunCalls = 0;
+        const resolve = resolveSpawnCommand("git", ["status"], { env: { PATH: "/fake/bin" } }).pipe(
+          Effect.map((resolved) => resolved.command),
+          Effect.provideService(HostProcess.Platform, "darwin"),
+          Effect.provideService(SpawnExecutableResolution, (command) =>
+            command === "git" ? "/usr/bin/git" : command === XCODE_GIT ? command : undefined,
+          ),
+          Effect.provideService(XcodeGitLocation, () => {
+            xcrunCalls += 1;
+            return lookup;
+          }),
+        );
+        const first = yield* Effect.forkChild(resolve, { startImmediately: true });
+        const second = yield* Effect.forkChild(resolve, { startImmediately: true });
+        finishLookup(XCODE_GIT);
+
+        expect(yield* Fiber.joinAll([first, second])).toEqual([XCODE_GIT, XCODE_GIT]);
+        expect(xcrunCalls).toBe(1);
+      }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
+    );
+
+    it.effect("the xcrun lookup resolves nothing when xcrun is missing or fails", () =>
+      Effect.gen(function* () {
+        const env = { PATH: "/usr/bin:/bin", DEVELOPER_DIR: "/nonexistent/t3-developer-dir" };
+        const locate = yield* XcodeGitLocation;
+        expect(yield* Effect.promise(() => locate(env))).toBeUndefined();
+        const missing = locateXcodeGitWithXcrun(env, { xcrun: "/nonexistent/t3-xcrun" });
+        expect(yield* Effect.promise(() => missing)).toBeUndefined();
+      }),
+    );
+
+    it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+      "the xcrun lookup settles at its deadline when a descendant keeps stdout open",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-xcrun-" });
+          const descendantPid = path.join(directory, "descendant.pid");
+          const xcrun = path.join(directory, "xcrun");
+          yield* fs.writeFileString(
+            xcrun,
+            `#!/bin/sh\nsleep 600 &\necho $! > '${descendantPid}'\necho /fake/git\n`,
+          );
+          yield* fs.chmod(xcrun, 0o755);
+          const stopDescendant = fs.readFileString(descendantPid).pipe(
+            Effect.flatMap((pid) => Effect.sync(() => process.kill(Number(pid.trim())))),
+            Effect.ignore,
+          );
+          const located = yield* Effect.promise(() =>
+            locateXcodeGitWithXcrun({ PATH: "/usr/bin:/bin" }, { xcrun, timeoutMs: 200 }),
+          ).pipe(Effect.ensuring(stopDescendant));
+          expect(located).toBeUndefined();
+        }).pipe(Effect.scoped),
     );
 
     it.effect("keeps git when PATH has another git or the host is not macOS", () =>

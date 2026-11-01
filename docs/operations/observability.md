@@ -164,6 +164,17 @@ waiting. Read CPU together with page faults:
   file writes.
 - Many `involuntaryContextSwitches` mean other processes were competing for the CPU.
 
+Every Git command is a child process, and Node creates each one synchronously on the thread that
+spawns it (`posix_spawn` on macOS, `fork` on Linux): about a millisecond of event loop per command,
+around 30 commands per turn. `T3CODE_VCS_SPAWN_WORKER=true` starts the processes of `VcsProcess` and
+`GitVcsDriver` (checkpoints, status, refs, source control CLIs) on a worker thread instead, with the
+same output, exit codes and errors. Git run through other services, such as the cached repository
+identity lookup, still spawns on the event loop. On Linux a `fork` from the worker still write-locks
+the server's address space while page tables are copied, interrupts every CPU running the server to
+flush its TLB, and leaves copy-on-write faults for the event loop, so measure before enabling it.
+With the knob on, those services run real processes even when a test injects a fake
+`ChildProcessSpawner`. Unset or `false` spawns them on the event loop, as Windows always does.
+
 ### Related Artifacts
 
 Provider event NDJSON files still exist for provider runtime streams. Those are separate from the main server trace file.

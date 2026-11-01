@@ -56,8 +56,9 @@ export interface TableComparison {
   readonly actualBytes: number;
 }
 
+// Kept by the server itself (migrations, search index, positions, P1-014's turn item counts).
 const DERIVED_TABLES =
-  /^(?:effect_sql_migrations|sqlite_.*|orchestration_v2_message_search(?:_.*)?|orchestration_v2_projection_metadata)$/;
+  /^(?:effect_sql_migrations|sqlite_.*|orchestration_v2_message_search(?:_.*)?|orchestration_v2_projection_metadata|orchestration_v2_projection_turn_item_counts)$/;
 
 /** Rows and bytes per table of a built database against the shape scaled, and against the plan. */
 export const compare = (shape: Shape, plan: SynthPlan, actual: Shape): Array<TableComparison> => {

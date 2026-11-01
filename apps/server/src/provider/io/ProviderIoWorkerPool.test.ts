@@ -19,9 +19,11 @@ import { CodexAppServerTransportError } from "effect-codex-app-server/errors";
 import { vi } from "vite-plus/test";
 
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
+import type { ProviderIoStage } from "./providerIoProtocol.ts";
 import { asyncStage, echoStage, linesStage } from "./testFixtures/providerIoTestStages.ts";
+import { acpWireStage, codexWireStage } from "./testFixtures/providerIoWireStages.ts";
 
-type WorkerMode = "fixture" | "production" | "silent" | "throws" | "inert";
+type WorkerMode = "fixture" | "production" | "silent" | "throws" | "inert" | "late";
 
 const workers = vi.hoisted(() => ({
   mode: "fixture" as WorkerMode,
@@ -29,6 +31,11 @@ const workers = vi.hoisted(() => ({
   exits: new WeakMap<NodeWorkerThreads.Worker, Promise<number>>(),
   opened: new Array<number>(),
   received: new Array<string>(),
+  posted: new Array<{
+    readonly worker: NodeWorkerThreads.Worker;
+    readonly type: unknown;
+    readonly session: unknown;
+  }>(),
 }));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
@@ -39,10 +46,15 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         fixture: [new URL("./testFixtures/providerIoTestWorker.ts", import.meta.url)],
         production: args,
         silent: ["setInterval(() => {}, 1 << 30);", { eval: true }],
-        throws: ['throw new Error("worker start failed");', { eval: true }],
+        throws: ['throw new Error("worker start failed with SECRET-TOKEN-42");', { eval: true }],
         // Ready, then never answers: the test injects the worker's replies itself.
         inert: [
           'require("node:worker_threads").parentPort.postMessage({ type: "ready" }); setInterval(() => {}, 1 << 30);',
+          { eval: true },
+        ],
+        // Inert, but ready only once main sends it anything.
+        late: [
+          'const { parentPort } = require("node:worker_threads"); parentPort.once("message", () => parentPort.postMessage({ type: "ready" })); setInterval(() => {}, 1 << 30);',
           { eval: true },
         ],
       };
@@ -62,6 +74,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
       if (message.type === "open" && typeof message.session === "number") {
         workers.opened.push(message.session);
       }
+      workers.posted.push({ worker: this, type: message.type, session: message.session });
       super.postMessage(...args);
     }
   }
@@ -288,8 +301,8 @@ it.effect(
           assert.instanceOf(yield* Effect.flip(acp.call("late")), AcpTransportError);
           assert.deepEqual(yield* Queue.take(lines), [
             "Warn",
-            "Provider I/O worker stopped; its sessions failed",
-            { sessions: 2, reason: "Provider I/O worker exited with code 3." },
+            "Provider I/O worker stopped",
+            { worker: 0, sessions: 2, reason: "exit", exitCode: 3 },
           ]);
           assert.equal(started(), 1);
 
@@ -360,15 +373,15 @@ it.effect.each([
     failure: "never becomes ready",
     mode: "silent" as const,
     startup: Duration.seconds(10),
-    reason: "Provider I/O worker was not ready within 10 s.",
+    annotations: { reason: "not-ready" },
   },
   {
     failure: "fails while starting",
     mode: "throws" as const,
     startup: Duration.zero,
-    reason: "worker start failed",
+    annotations: { reason: "error", errorTag: "Error" },
   },
-])("falls back to in-thread for good when the worker $failure", ({ mode, startup, reason }) =>
+])("falls back to in-thread for good when the worker $failure", ({ mode, startup, annotations }) =>
   withLogLines((lines) =>
     withPool({ workers: 1, mode }, (pool, started) =>
       Effect.gen(function* () {
@@ -377,7 +390,10 @@ it.effect.each([
         });
         yield* TestClock.adjust(startup);
         assert.isTrue(Option.isNone(yield* Fiber.join(opened)));
-        assert.deepEqual(yield* Queue.take(lines), ["Warn", unavailableWarning, { reason }]);
+        const warning = yield* Queue.take(lines);
+        assert.deepEqual(warning, ["Warn", unavailableWarning, annotations]);
+        // Log annotations never carry a worker's error text, which may hold provider data.
+        assert.notInclude(JSON.stringify(warning), "SECRET");
 
         assert.isTrue(Option.isNone(yield* openEchoOption(pool)));
         assert.equal(started(), 1);
@@ -417,12 +433,15 @@ it.effect("rejects and logs worker messages of an unknown or malformed shape and
 
 // Parks the forked fiber after `ops` operations, so the caller acts at that exact point; a budget
 // under 3 never lets a resumed fiber make progress.
+// The budget comes from the parent's context, so the fiber's root is the effect itself.
 const forkParkedAfter = <A, E, R>(ops: number, effect: Effect.Effect<A, E, R>) =>
-  Effect.forkChild(Effect.provideService(effect, Scheduler.MaxOpsBeforeYield, ops), {
-    startImmediately: true,
-  });
+  Effect.provideService(
+    Effect.forkChild(effect, { startImmediately: true }),
+    Scheduler.MaxOpsBeforeYield,
+    ops,
+  );
 
-const OP_BOUNDARIES = 40;
+const OP_BOUNDARIES = 80;
 
 it.effect("admits a waiting write whenever its credit returns during admission", () =>
   withPool({ workers: 1, mode: "inert" }, (pool) =>
@@ -564,6 +583,306 @@ it.effect("rejects a credit that is not a byte count without touching the window
   ),
 );
 
+it.effect("admits an end queued behind a write whose fiber was interrupted", () =>
+  withPool({ workers: 1, mode: "inert" }, (pool) =>
+    Effect.gen(function* () {
+      const session = yield* openEcho(pool, "t", { highWaterMark: 4 });
+      yield* session.write(bytes("full"));
+      const write = yield* Effect.forkChild(session.write(bytes("next")), {
+        startImmediately: true,
+      });
+      const end = yield* Effect.forkChild(session.end, { startImmediately: true });
+      yield* Fiber.interrupt(write);
+      yield* Fiber.join(end);
+    }),
+  ),
+);
+
+it.effect("runs a notification only after the writes waiting for credit before it", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = Option.getOrThrow(
+        yield* pool.open({
+          stage: asyncStage,
+          options: undefined,
+          onFailure: toCodexError,
+          kill: Effect.void,
+          highWaterMark: 4,
+          onEvent: (event) => {
+            events.push(event);
+          },
+        }),
+      );
+      yield* session.write(bytes("full"));
+      const write = yield* Effect.forkChild(session.write(bytes("emit-then-signal")), {
+        startImmediately: true,
+      });
+      assert.isTrue(session.notify("signal"));
+      const pull = yield* Stream.toPull(session.output);
+      assert.equal((yield* pull)[0], "late:full");
+      yield* Fiber.join(write);
+      // The chunk's event comes before the notification's: the worker saw the chunk first.
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["signalled-in-push", "event"]);
+    }),
+  ),
+);
+
+it.effect("runs a call only after the writes waiting for credit before it", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const session = yield* openEcho(pool, "t", { highWaterMark: 4 });
+      yield* session.write(bytes("full"));
+      const write = yield* Effect.forkChild(session.write(bytes("next")), {
+        startImmediately: true,
+      });
+      const call = yield* Effect.forkChild(session.call("count"), { startImmediately: true });
+      const pull = yield* Stream.toPull(session.output);
+      assert.equal((yield* pull)[0], "t:full");
+      yield* Fiber.join(write);
+      // The worker saw both chunks before the call.
+      assert.equal(yield* Fiber.join(call), "t:count:2");
+    }),
+  ),
+);
+
+it.effect("fails an open or a call whose data cannot be cloned, leaving nothing behind", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      let kills = 0;
+      const notCloneable = Object.assign({ tag: "bad" }, { callback: () => undefined });
+      const openError = yield* Effect.flip(
+        pool.open({
+          stage: echoStage,
+          options: notCloneable,
+          onFailure: toCodexError,
+          kill: Effect.sync(() => {
+            kills += 1;
+          }),
+        }),
+      );
+      assert.instanceOf(openError, CodexAppServerTransportError);
+      assert.instanceOf(openError.cause, ProviderIoWorkerPool.ProviderIoStageError);
+
+      const session = yield* openEcho(pool, "t");
+      const callError = yield* Effect.flip(session.call((() => "x") as unknown as string));
+      assert.instanceOf(callError, CodexAppServerTransportError);
+      assert.equal(yield* session.call("count"), "t:count:0");
+
+      // A crash fails the live session; the failed open left no session whose child it kills.
+      yield* session.write(bytes("exit"));
+      yield* Effect.flip(Stream.runDrain(session.output));
+      assert.equal(kills, 0);
+    }),
+  ),
+);
+
+it.effect("caps the credit a worker returns at what was sent", () =>
+  withPool({ workers: 1, mode: "inert" }, (pool) =>
+    Effect.gen(function* () {
+      const session = yield* openEcho(pool, "t", { highWaterMark: 4 });
+      workers.started.at(-1)!.emit("message", {
+        type: "output",
+        session: workers.opened.at(-1),
+        outputs: [],
+        bytes: 1_000_000,
+      });
+      yield* session.write(bytes("full"));
+      const write = yield* Effect.forkChild(session.write(bytes("next")), {
+        startImmediately: true,
+      });
+      assert.isUndefined(write.pollUnsafe());
+      yield* Fiber.interrupt(write);
+    }),
+  ),
+);
+
+it.effect("logs a worker that dies while it has no sessions", () =>
+  withLogLines((lines) =>
+    withPool({ workers: 1 }, (pool) =>
+      Effect.gen(function* () {
+        yield* openEcho(pool, "ready").pipe(Effect.scoped);
+        const worker = workers.started.at(-1)!;
+        yield* Effect.promise(() => worker.terminate());
+        const [level, message, annotations] = yield* Queue.take(lines);
+        assert.deepEqual([level, message], ["Warn", "Provider I/O worker stopped"]);
+        assert.deepInclude(annotations, { worker: 0, sessions: 0, reason: "exit" });
+      }),
+    ),
+  ),
+);
+
+// The same stage in-thread, on the same chunks: the worker must produce exactly this.
+const runInThread = <Options, Output, Request, Reply>(
+  stage: ProviderIoStage<Options, Output, Request, Reply>,
+  options: Options,
+  chunks: ReadonlyArray<Uint8Array>,
+) => {
+  const outputs: Array<Output> = [];
+  const session = stage.open(options);
+  for (const chunk of chunks) session.push(chunk, (output) => outputs.push(output));
+  session.end((output) => outputs.push(output));
+  return outputs;
+};
+
+const splitAt = (text: string, offsets: ReadonlyArray<number>) => {
+  const all = bytes(text);
+  return [0, ...offsets].map((start, index) => all.slice(start, offsets[index] ?? all.length));
+};
+
+it.effect("runs P1-023's Codex wire decode in a worker as it runs in-thread", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const text =
+        '{"id":1,"result":{}}\r\n{"method":"item/delta","params":{"text":"café"}}\n\n   \n' +
+        'not json\n{"after":"failure"}\n';
+      const accent = bytes(text).indexOf(0xc3);
+      const runs = [
+        { options: {}, chunks: splitAt(text, [10, 30, accent + 1]) },
+        { options: { maxLineBytes: 8 }, chunks: splitAt('{"a":1}\n0123456789\n{"b":2}\n', [4]) },
+      ];
+      const results = [];
+      for (const { options, chunks } of runs) {
+        const session = Option.getOrThrow(
+          yield* pool.open({
+            stage: codexWireStage,
+            options,
+            onFailure: toCodexError,
+            kill: Effect.void,
+          }),
+        );
+        for (const chunk of chunks) yield* session.write(chunk);
+        yield* session.end;
+        const outputs = yield* Stream.runCollect(session.output);
+        assert.deepEqual(outputs, runInThread(codexWireStage, options, chunks));
+        results.push(outputs);
+      }
+      const [lines, oversize] = results;
+      assert.deepEqual(
+        lines!.map((output) => output._tag),
+        ["Message", "Message", "DecodeFailed"],
+      );
+      assert.deepEqual(lines![1], {
+        _tag: "Message",
+        line: '{"method":"item/delta","params":{"text":"café"}}',
+        message: { method: "item/delta", params: { text: "café" } },
+      });
+      assert.equal(lines![2]!._tag === "DecodeFailed" ? lines![2]!.line : undefined, "not json");
+      assert.deepEqual(
+        oversize!.map((output) => output._tag),
+        ["Message", "Exceeded"],
+      );
+    }).pipe(Effect.scoped),
+  ),
+);
+
+it.effect("runs P1-023's ACP wire decode in a worker and encodes on its parser", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const text =
+        '{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s"}}\n' +
+        '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s"}}\n';
+      const good = splitAt(text, [20, 95]);
+      const bad = [bytes("not json\n"), bytes(text)];
+      const session = Option.getOrThrow(
+        yield* pool.open({
+          stage: acpWireStage,
+          options: undefined,
+          onFailure: (cause) => new AcpTransportError({ operation: "read-input-stream", cause }),
+          kill: Effect.void,
+        }),
+      );
+      const chunks = [...good, ...bad];
+      const expected = runInThread(acpWireStage, undefined, chunks);
+      assert.deepEqual(
+        expected.map((output) => output._tag),
+        ["Message", "Message", "DecodeFailed"],
+      );
+      const request = expected[0]!._tag === "Message" ? expected[0]!.message : undefined;
+      const encoded = acpWireStage.open(undefined).call!(request as never);
+      assert.isString(encoded);
+
+      for (const chunk of chunks) yield* session.write(chunk);
+      assert.equal(yield* session.call(request as never), encoded);
+      yield* session.end;
+      assert.deepEqual(yield* Stream.runCollect(session.output), expected);
+    }).pipe(Effect.scoped),
+  ),
+);
+
+it.effect("sends the end of input even when the caller stops waiting for it", () =>
+  withPool({ workers: 1, mode: "inert" }, (pool) =>
+    Effect.gen(function* () {
+      const session = yield* openEcho(pool, "t", { highWaterMark: 4 });
+      const id = workers.opened.at(-1);
+      const worker = workers.started.at(-1)!;
+      yield* session.write(bytes("full"));
+      const write = yield* Effect.forkChild(session.write(bytes("next")), {
+        startImmediately: true,
+      });
+      const end = yield* Effect.forkChild(session.end, { startImmediately: true });
+      yield* Fiber.interrupt(end);
+      worker.emit("message", {
+        type: "output",
+        session: id,
+        outputs: [],
+        bytes: 4,
+      });
+      yield* Fiber.join(write);
+      yield* session.end;
+      const sent = workers.posted.filter(
+        (message) => message.worker === worker && message.session === id,
+      );
+      assert.deepEqual(
+        sent.map((message) => message.type),
+        ["open", "bytes", "bytes", "eof"],
+      );
+    }),
+  ),
+);
+
+it.effect("releases an open's worker reservation as soon as the open fails", () =>
+  withPool({ workers: 2 }, (pool, started) =>
+    Effect.gen(function* () {
+      const [first] = workers.started.slice(-started());
+      yield* openEcho(pool, "ready").pipe(Effect.scoped);
+      yield* Effect.flip(
+        pool.open({
+          stage: echoStage,
+          options: Object.assign({ tag: "bad" }, { callback: () => undefined }),
+          onFailure: toCodexError,
+          kill: Effect.void,
+        }),
+      );
+      // With every worker idle again, the next session goes to the first one.
+      yield* openEcho(pool, "next");
+      assert.equal(
+        workers.posted.filter((message) => message.type === "open").at(-1)?.worker,
+        first,
+      );
+    }),
+  ),
+);
+
+it.effect("releases the reservation of an open interrupted while it waits for its worker", () =>
+  withPool({ workers: 2, mode: "late" }, (pool, started) =>
+    Effect.gen(function* () {
+      const poolWorkers = workers.started.slice(-started());
+      // The open's scope outlives it, so anything the interrupted open kept would show.
+      const opening = yield* Effect.forkChild(openEchoOption(pool), { startImmediately: true });
+      yield* Fiber.interrupt(opening);
+      for (const worker of poolWorkers) {
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        worker.postMessage({ type: "go" });
+      }
+      yield* openEcho(pool, "next").pipe(Effect.scoped);
+      const lastOpen = workers.posted.filter((message) => message.type === "open").at(-1);
+      assert.equal(lastOpen?.worker, poolWorkers[0]);
+    }),
+  ),
+);
+
 const openAsync = (
   pool: ProviderIoWorkerPool.ProviderIoWorkerPool["Service"],
   events: Array<string> = [],
@@ -689,6 +1008,24 @@ it.effect("posts an event a stage raises during push after the outputs it emitte
       assert.equal(yield* session.call("next"), "next");
       assert.deepEqual(events, ["signalled-in-push"]);
       assert.deepEqual(workers.received, ["output", "event", "reply"]);
+    }),
+  ),
+);
+
+it.effect("keeps an event a stage raises during push between the outputs around it", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = yield* openAsync(pool, events);
+      workers.received.length = 0;
+      yield* session.write(bytes("emit-signal-emit"));
+      assert.deepEqual(yield* Stream.runCollect(Stream.take(session.output, 2)), [
+        "before-signal",
+        "after-signal",
+      ]);
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["signalled-between"]);
+      assert.deepEqual(workers.received, ["output", "event", "output", "reply"]);
     }),
   ),
 );

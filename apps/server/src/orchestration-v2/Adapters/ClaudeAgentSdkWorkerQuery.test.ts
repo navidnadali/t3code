@@ -55,7 +55,7 @@ import {
 import type {
   ClaudeAgentSdkWorkerEvent,
   ClaudeAgentSdkWorkerRequest,
-} from "../../provider/io/claudeAgentSdkStage.ts";
+} from "../../provider/io/claudeAgentSdkProtocol.ts";
 
 const workers = vi.hoisted(() => ({
   started: new Array<NodeWorkerThreads.Worker>(),

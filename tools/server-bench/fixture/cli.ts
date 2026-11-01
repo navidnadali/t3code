@@ -64,7 +64,10 @@ const sanitiseCommand = Command.make(
           result.mode === "blank"
             ? `  content blanked: ${result.content.changed} values (${result.content.flaggedKept} allowlisted but flagged), ${result.content.keys} keys`
             : `  --keep-content: ${result.content.changed} values redacted, ${result.content.keys} keys; text kept`,
-          `  self-check: every value allowlisted or filler, 0 pattern hits, nothing runnable`,
+          `  numbers zeroed under credential names: ${result.content.numbers}`,
+          result.mode === "blank"
+            ? `  self-check: every value allowlisted or filler, 0 pattern hits, 0 extended-check hits, nothing runnable`
+            : `  self-check (--keep-content): 0 pattern hits, 0 extended-check hits, nothing runnable`,
         ].join("\n"),
       );
     }),

@@ -4,9 +4,10 @@
  */
 export interface ProviderIoStage<Options, Output, Request = never, Reply = never, Event = never> {
   readonly name: string;
+  /** A worker passes a host; a pure stage also runs in-thread without one. */
   readonly open: (
     options: Options,
-    host: ProviderIoStageHost<Output, Event>,
+    host?: ProviderIoStageHost<Output, Event>,
   ) => ProviderIoStageSession<Output, Request, Reply>;
 }
 

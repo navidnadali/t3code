@@ -271,6 +271,8 @@ export const claudeAgentSdkStage: ProviderIoStage<
     const prompts = makePromptQueue();
     let child: FacadeProcess | undefined;
     let query: Query | undefined;
+    // Main sends the close after every byte it read before closing; what comes later is unread.
+    let closed = false;
 
     const spawnClaudeCodeProcess = ({ command, args, cwd, env, signal }: SpawnOptions) => {
       const spawned = new FacadeProcess(host.signal);
@@ -342,6 +344,7 @@ export const claudeAgentSdkStage: ProviderIoStage<
         case "interrupt":
           return started().interrupt();
         case "close":
+          closed = true;
           query?.close();
           return undefined;
         case "asyncDispose":
@@ -368,7 +371,7 @@ export const claudeAgentSdkStage: ProviderIoStage<
 
     return {
       push: (chunk) => {
-        child?.stdout.push(chunk);
+        if (!closed) child?.stdout.push(chunk);
       },
       end: () => {
         child?.stdout.push(null);

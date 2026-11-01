@@ -47,10 +47,8 @@ export interface ProviderIoSession<Output, E, Request = never, Reply = never> {
   readonly end: Effect.Effect<void, E>;
   readonly output: Stream.Stream<Output, E>;
   readonly call: (request: Request) => Effect.Effect<Reply, E>;
-  /** A call whose reply nobody waits for; ordered like `call`. */
-  readonly notify: (request: Request) => void;
-  /** Ends the output after the outputs main holds now; later ones are dropped (their credit returned). */
-  readonly cutOutput: () => void;
+  /** A call whose reply nobody waits for; ordered like `call`. False when the session can take none. */
+  readonly notify: (request: Request) => boolean;
 }
 
 export interface ProviderIoOpenInput<
@@ -346,7 +344,6 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     let failure: { readonly error: E } | undefined;
     let ended = false;
     let finished = false;
-    let cut = false;
     let closed = false;
 
     const post = (message: ProviderIoMainMessage, transfer?: ReadonlyArray<ArrayBuffer>) => {
@@ -423,7 +420,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     slot.sessions.set(id, {
       deliver: (outputs, bytes) => {
         if (failure !== undefined || closed) return;
-        if (!cut && Arr.isReadonlyArrayNonEmpty(outputs)) {
+        if (Arr.isReadonlyArrayNonEmpty(outputs)) {
           Queue.offerUnsafe(queue, {
             outputs: outputs as Arr.NonEmptyReadonlyArray<Output>,
             bytes,
@@ -525,13 +522,9 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
           });
         }),
       notify: (request) => {
-        if (failure === undefined && !closed) post({ type: "notify", session: id, request });
-      },
-      cutOutput: () => {
-        if (failure !== undefined || closed || finished) return;
-        finished = true;
-        cut = true;
-        Queue.endUnsafe(queue);
+        if (failure !== undefined || closed || slot.stopped) return false;
+        post({ type: "notify", session: id, request });
+        return true;
       },
     };
     return Option.some(session);

@@ -420,12 +420,15 @@ it.effect("rejects and logs worker messages of an unknown or malformed shape and
 
 // Parks the forked fiber after `ops` operations, so the caller acts at that exact point; a budget
 // under 3 never lets a resumed fiber make progress.
+// The budget comes from the parent's context, so the fiber's root is the effect itself.
 const forkParkedAfter = <A, E, R>(ops: number, effect: Effect.Effect<A, E, R>) =>
-  Effect.forkChild(Effect.provideService(effect, Scheduler.MaxOpsBeforeYield, ops), {
-    startImmediately: true,
-  });
+  Effect.provideService(
+    Effect.forkChild(effect, { startImmediately: true }),
+    Scheduler.MaxOpsBeforeYield,
+    ops,
+  );
 
-const OP_BOUNDARIES = 40;
+const OP_BOUNDARIES = 80;
 
 it.effect("admits a waiting write whenever its credit returns during admission", () =>
   withPool({ workers: 1, mode: "inert" }, (pool) =>

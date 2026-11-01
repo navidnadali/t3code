@@ -138,28 +138,33 @@ it.effect("refuses at run time a load the build could not see", () =>
     const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-io-planted-" });
     const planted = path.join(dir, "planted.cjs");
     yield* fs.writeFileString(planted, 'module.exports = "PLANTED";\n');
+    yield* fs.writeFileString(path.join(dir, "planted.mjs"), 'export default "PLANTED";\n');
+    // Every name is computed at run time, so only the worker's own guard can refuse these.
     const source = yield* embeddedSource(
       'import * as NodeWorkerThreads from "node:worker_threads";\n' +
-        "const planted = NodeWorkerThreads.workerData as string;\n" +
-        'const key = ["re", "quire"].join("");\n' +
-        'const builtin = ["getBuiltin", "Module"].join("");\n' +
-        'const create = ["create", "Require"].join("");\n' +
+        "const dir = NodeWorkerThreads.workerData as string;\n" +
+        'const name = (...parts: Array<string>) => parts.join("");\n' +
+        "const global = globalThis as any;\n" +
+        "const code = (function () {}).constructor as any;\n" +
         "const attempts = [\n" +
-        "  () => (module as any)[key](planted),\n" +
-        '  () => (process as any)[builtin]("module")[create](planted)(planted),\n' +
+        '  () => (module as any)[name("re", "quire")](dir + "/planted.cjs"),\n' +
+        '  () => global[name("re", "quire")](dir + "/planted.cjs"),\n' +
+        '  () => global[name("re", "quire")]("node:module")[name("create", "Require")](dir + "/")("./planted.cjs"),\n' +
+        '  () => (process as any)[name("getBuiltin", "Module")]("module")[name("create", "Require")](dir + "/")("./planted.cjs"),\n' +
+        '  () => code("p", "return imp" + "ort(p)")("file://" + dir + "/planted.mjs").then((m: any) => m.default),\n' +
         "];\n" +
-        "NodeWorkerThreads.parentPort?.postMessage(attempts.map((attempt) => {\n" +
-        '  try { return attempt(); } catch { return "refused"; }\n' +
-        "}));\n",
+        "void Promise.all(attempts.map(async (attempt) => {\n" +
+        '  try { return await attempt(); } catch { return "refused"; }\n' +
+        "})).then((results) => NodeWorkerThreads.parentPort?.postMessage(results));\n",
     );
     const results = yield* Effect.callback<unknown>((resume) => {
-      const worker = new NodeWorkerThreads.Worker(source, { eval: true, workerData: planted });
+      const worker = new NodeWorkerThreads.Worker(source, { eval: true, workerData: dir });
       worker.once("message", (message) => {
         void worker.terminate();
         resume(Effect.succeed(message));
       });
       worker.once("error", (error) => resume(Effect.succeed(String(error))));
     });
-    assert.deepEqual(results, ["refused", "refused"]);
+    assert.deepEqual(results, ["refused", "refused", "refused", "refused", "refused"]);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

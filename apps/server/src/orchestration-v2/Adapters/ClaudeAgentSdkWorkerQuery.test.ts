@@ -717,6 +717,11 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
   });
 
   const PROBE = "toolu-probe";
+  class JsonList extends Array<string> {
+    toJSON() {
+      return { list: [...this] };
+    }
+  }
   class ConvertsToJson {
     readonly #json: unknown;
     constructor(json: unknown) {
@@ -777,6 +782,29 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
           entries: new Map([["key", "value"]]),
         },
       }),
+    ),
+    permissionCase("answers with an array whose class has toJSON", () =>
+      Promise.resolve({ behavior: "allow", updatedInput: { list: JsonList.from(["a", "b"]) } }),
+    ),
+    permissionCase("answers with a toJSON that is not enumerable", () =>
+      Promise.resolve({
+        behavior: "allow",
+        updatedInput: {
+          hidden: Object.defineProperty({ shown: true }, "toJSON", {
+            value: () => "hidden",
+            enumerable: false,
+          }),
+        },
+      }),
+    ),
+    permissionCase("answers through a Proxy", () =>
+      Promise.resolve({
+        behavior: "allow",
+        updatedInput: new Proxy({ command: "echo proxied" }, {}),
+      }),
+    ),
+    permissionCase("answers with a value JSON cannot write", () =>
+      Promise.resolve({ behavior: "allow", updatedInput: { count: 1n } }),
     ),
     permissionCase("answers with a function JSON drops", () =>
       Promise.resolve({

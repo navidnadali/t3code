@@ -9,7 +9,7 @@ import * as NodeReadline from "node:readline";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
-import { afterAll, describe, expect, it, onTestFinished } from "vite-plus/test";
+import { afterAll, describe, expect, it, onTestFinished, vi } from "vite-plus/test";
 
 import { BUILD_MIGRATION_HEAD } from "../../apps/server/src/persistence/databaseMigrationHead.ts";
 import {
@@ -1045,6 +1045,35 @@ describe("planSynth", () => {
         "9cc15e2401df124c59295df2c2a4c3e41b266ebd132e09c9de7d80e5a9478bea",
       ],
     });
+  });
+
+  // Every element the planner copies with Array.from is counted: planning a checkpoint-free shape
+  // once summed every thread for each run (runs × threads), far above a linear bound here.
+  it("plans a checkpoint-free shape in work linear in its threads and runs", () => {
+    const withoutCheckpointItems: Shape = {
+      ...example,
+      mix: {
+        ...example.mix,
+        turnItemTypes: Object.fromEntries(
+          Object.entries(example.mix?.turnItemTypes ?? {}).filter(
+            ([type]) => type !== "checkpoint",
+          ),
+        ),
+      },
+    };
+    const from = vi.spyOn(Array, "from");
+    let copied = 0;
+    let plan: ReturnType<typeof planSynth>;
+    try {
+      plan = planSynth(withoutCheckpointItems, 1, 7);
+      for (const [values] of from.mock.calls) {
+        copied += (values as ArrayLike<unknown> | null | undefined)?.length ?? 0;
+      }
+    } finally {
+      from.mockRestore();
+    }
+    const runs = plan.threads.reduce((count, thread) => count + thread.runs.length, 0);
+    expect(copied).toBeLessThanOrEqual(10 * (plan.threads.length + runs));
   });
 
   it("deals and apportions exact totals", () => {

@@ -1,7 +1,8 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
-  OrchestrationV2ThreadDetailSnapshot,
+  EnvironmentHttpApi,
+  type OrchestrationV2ThreadDetailSnapshot,
   type OrchestrationV2DomainEvent,
   type ProviderReplayTranscript,
 } from "@t3tools/contracts";
@@ -60,10 +61,15 @@ export const readReplayFixtureTranscript = Effect.fn("readOrchestratorReplayTran
   return yield* readProviderReplayTranscript(file);
 }, Effect.provide(NodeServices.layer));
 
-// What HttpApiBuilder sends for the snapshot endpoint's schema: the body every client reads.
-const encodeSnapshot = Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot);
+// What HttpApiBuilder sends: JSON.stringify of the endpoint's own success codec (toCodecJson).
+const encodeAsEndpoint = Schema.encodeUnknownSync(
+  [...EnvironmentHttpApi.groups.orchestration.endpoints.threadSnapshot.success][0] as Schema.Codec<
+    unknown,
+    unknown
+  >,
+);
 const encodedSnapshotJson = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
-  JSON.stringify(encodeSnapshot(snapshot));
+  JSON.stringify(encodeAsEndpoint(snapshot));
 
 function normalizeTestError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));

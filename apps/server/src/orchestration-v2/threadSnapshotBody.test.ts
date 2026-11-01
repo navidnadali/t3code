@@ -5,10 +5,11 @@ import { assert, it } from "@effect/vitest";
 import * as NodeHttpPlatform from "@effect/platform-node/NodeHttpPlatform";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import {
+  EnvironmentHttpApi,
   EventId,
   MessageId,
   NodeId,
-  OrchestrationV2ThreadDetailSnapshot,
+  type OrchestrationV2ThreadDetailSnapshot,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -45,9 +46,15 @@ const ITEMS = 1_200;
 // Escapes, a lone surrogate, astral and two-byte text: every JSON.stringify string rule.
 const TEXT = 'quote " slash \\ tab \t nl \n nul \u0000 lone \ud800 astral 𝄞 界';
 
-const encodeSnapshot = Schema.encodeUnknownSync(OrchestrationV2ThreadDetailSnapshot);
+// What HttpApiBuilder sends: JSON.stringify of the endpoint's own success codec (toCodecJson).
+const encodeAsEndpoint = Schema.encodeUnknownSync(
+  [...EnvironmentHttpApi.groups.orchestration.endpoints.threadSnapshot.success][0] as Schema.Codec<
+    unknown,
+    unknown
+  >,
+);
 const referenceBody = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
-  Buffer.from(JSON.stringify(encodeSnapshot(snapshot)), "utf8");
+  Buffer.from(JSON.stringify(encodeAsEndpoint(snapshot)), "utf8");
 
 const streamedBody = (snapshot: OrchestrationV2ThreadDetailSnapshot) =>
   encodeThreadSnapshotBody(snapshot).pipe(
@@ -178,6 +185,18 @@ const item = (
       text: TEXT.repeat(3),
       streaming: false,
     },
+    // No progress: the wire projection sets it to undefined, which the endpoint sends as null.
+    {
+      ...base,
+      type: "subagent",
+      subagentId: NodeId.make(`node:${threadId}:task:${ordinal}`),
+      origin: "app_owned",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: provider,
+      childThreadId: null,
+      prompt: `Look into ${TEXT}`,
+      result: ordinal % 2 === 0 ? null : TEXT,
+    },
   ];
   return {
     id: EventId.make(`event:${threadId}:item:${ordinal}`),
@@ -260,7 +279,7 @@ const seed = Effect.gen(function* () {
     ...Array.from({ length: ITEMS }, (_, index) => item(PARENT, parentRun, index + 1, at)),
     // Larger than a chunk, astral throughout, at both offsets: chunks split inside one member.
     ...["", "x"].map((prefix, index) => {
-      const event = item(PARENT, parentRun, 1_000 * ITEMS + index * 4, at) as Extract<
+      const event = item(PARENT, parentRun, 1_000 * ITEMS + index * 5, at) as Extract<
         OrchestrationV2DomainEvent,
         { type: "turn-item.updated" }
       >;
@@ -280,8 +299,40 @@ const seededStore = <E>(events: Effect.Effect<void, E, ProjectionStore.Projectio
 
 const TestLayer = seededStore(seed);
 
+const cycle: Record<string, unknown> = {};
+cycle.self = cycle;
+const sparse: Array<number> = [];
+sparse[2] = 3;
+// Values JSON cannot carry, for a field the schema leaves unknown.
+const NOT_JSON_VALUES: ReadonlyArray<unknown> = [
+  undefined,
+  Number.NaN,
+  DateTime.toDateUtc(DateTime.makeUnsafe(0)),
+  () => 1,
+  1n,
+  cycle,
+  Object("boxed"),
+  sparse,
+];
+
+const runtimeRequests = (answerSets: ReadonlyArray<Readonly<Record<string, unknown>>>) => {
+  const at = DateTime.makeUnsafe("2026-10-01T00:00:00.000Z");
+  return answerSets.map((answers, index) => ({
+    id: RuntimeRequestId.make(`runtime-request:snapshot-body:${index}`),
+    nodeId: NodeId.make(`node:${parentRun}`),
+    providerTurnId: null,
+    nativeRequestRef: null,
+    kind: "user_input" as const,
+    status: "resolved" as const,
+    responseCapability: { type: "message" as const },
+    createdAt: at,
+    resolvedAt: at,
+    answers,
+  }));
+};
+
 it.layer(TestLayer)("thread snapshot body", (it) => {
-  it.effect("streams a long thread and its fork as JSON.stringify of their schema encoding", () =>
+  it.effect("streams a long thread and its fork as the endpoint encodes them", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       for (const threadId of [PARENT, FORK]) {
@@ -294,6 +345,12 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
         assert.isTrue(streamed.bytes.equals(referenceBody(snapshot)));
         if (threadId === PARENT) {
           assert.strictEqual(snapshot.projection.turnItems.length, ITEMS + 2);
+          assert.isTrue(
+            snapshot.projection.turnItems.some(
+              (item) =>
+                item.type === "subagent" && "progress" in item && item.progress === undefined,
+            ),
+          );
           assert.isAtMost(streamed.largestChunk, 1024 * 1024);
         } else {
           // Inherited rows hold parent items that are not in this thread's turn items.
@@ -321,72 +378,39 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
           ],
         },
       };
-      assert.throws(() => referenceBody(invalid));
-      const error = yield* encodeThreadSnapshotBody(invalid).pipe(Effect.flip);
-      assert.isTrue(Schema.isSchemaError(error));
+      const notJson = NOT_JSON_VALUES.map((value) => ({ value })).map((answers) => ({
+        snapshotSequence,
+        projection: { ...wire, runtimeRequests: runtimeRequests([answers]) },
+      }));
+      for (const snapshot of [invalid, ...notJson]) {
+        assert.throws(() => referenceBody(snapshot));
+        const error = yield* encodeThreadSnapshotBody(snapshot).pipe(Effect.flip);
+        assert.isTrue(Schema.isSchemaError(error));
+      }
     }),
   );
 
-  it.effect("keeps chunks bounded for large answers, keys, toJSON results and boxes", () =>
+  it.effect("keeps chunks bounded for large and deeply nested answers", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const { snapshotSequence, projection } = yield* projections.getThreadSnapshot(FORK);
-      const at = DateTime.makeUnsafe("2026-10-01T00:00:00.000Z");
-      const ignored = { text: TEXT.repeat(40_000) };
-      // Each answer set hides a large value from a size estimate in its own way. Built per
-      // serialization: a toJSON that counts its calls must be called once, as JSON.stringify does.
-      const snapshot = () => ({
+      let deep: unknown = TEXT.repeat(40_000);
+      for (let depth = 0; depth < 7_000; depth++) deep = depth % 2 === 0 ? [deep] : { deep };
+      const snapshot = {
         snapshotSequence,
         projection: {
           ...projectThreadProjectionForWire(projection),
-          runtimeRequests: [
+          // Each answer set is large in its own way; the last one nests deeper than a recursive writer can.
+          runtimeRequests: runtimeRequests([
             { reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) } },
             { [TEXT.repeat(40_000)]: 0 },
-            { lazy: { toJSON: () => TEXT.repeat(40_000) } },
-            { boxed: Object(TEXT.repeat(40_000)) },
-            {
-              self: {
-                toJSON() {
-                  return this;
-                },
-                text: TEXT.repeat(40_000),
-              },
-            },
-            {
-              nested: { toJSON: () => ({ toJSON: () => "inner", text: TEXT }) },
-              large: TEXT.repeat(40_000),
-            },
-            {
-              counted: {
-                calls: 0,
-                toJSON() {
-                  return this.calls++ === 0 ? "first" : TEXT.repeat(40_000);
-                },
-              },
-            },
-            { callable: Object.assign(() => undefined, { toJSON: () => 42 }), ...ignored },
-            { sparse: Array.from({ length: 1 }).concat(new Array(1_000_000)) },
-            {
-              string: Object.assign(Object("s"), ignored),
-              number: Object.assign(Object(42), ignored),
-              boolean: Object.assign(Object(true), ignored),
-            },
-          ].map((answers, index) => ({
-            id: RuntimeRequestId.make(`runtime-request:snapshot-body:${index}`),
-            nodeId: NodeId.make(`node:${parentRun}`),
-            providerTurnId: null,
-            nativeRequestRef: null,
-            kind: "user_input" as const,
-            status: "resolved" as const,
-            responseCapability: { type: "message" as const },
-            createdAt: at,
-            resolvedAt: at,
-            answers,
-          })),
+            { many: Array.from({ length: 200_000 }, (_, index) => ({ index, text: "x" })) },
+            { deep },
+          ]),
         },
-      });
-      const streamed = yield* streamedBody(snapshot());
-      assert.isTrue(streamed.bytes.equals(referenceBody(snapshot())));
+      };
+      const streamed = yield* streamedBody(snapshot);
+      assert.isTrue(streamed.bytes.equals(referenceBody(snapshot)));
       assert.isAtMost(streamed.largestChunk, 1024 * 1024);
     }),
   );

@@ -1443,9 +1443,16 @@ export function makeCodexAppServerProtocolLogger(input: {
   };
 }
 
+// Plain objects and arrays with nothing to redact come back as they are, so the native log
+// reuses the size check the adapter already made on them.
 function redactCodexProtocolValue(value: unknown): unknown {
   if (Array.isArray(value)) {
-    return value.map(redactCodexProtocolValue);
+    const redacted = value.map(redactCodexProtocolValue);
+    return Object.getPrototypeOf(value) === Array.prototype &&
+      redacted.every((item, index) => item === value[index]) &&
+      Object.keys(value).length === value.length
+      ? value
+      : redacted;
   }
   if (value === null || typeof value !== "object") {
     if (typeof value !== "string") {
@@ -1474,12 +1481,16 @@ function redactCodexProtocolValue(value: unknown): unknown {
       return value;
     }
   }
-  return Object.fromEntries(
-    Object.entries(value).map(([key, nested]) => [
-      key,
-      isSensitiveCodexProtocolKey(key) ? "[REDACTED]" : redactCodexProtocolValue(nested),
-    ]),
-  );
+  const entries = Object.entries(value);
+  const redacted = entries.map(([key, nested]): [string, unknown] => [
+    key,
+    isSensitiveCodexProtocolKey(key) ? "[REDACTED]" : redactCodexProtocolValue(nested),
+  ]);
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return (prototype === Object.prototype || prototype === null) &&
+    redacted.every(([, nested], index) => nested === entries[index]?.[1])
+    ? value
+    : Object.fromEntries(redacted);
 }
 
 function isSensitiveCodexProtocolKey(key: string): boolean {

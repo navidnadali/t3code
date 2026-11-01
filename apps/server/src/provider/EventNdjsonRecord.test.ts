@@ -58,3 +58,28 @@ it("serializes a record the same whether or not its event was bounded on this th
     );
   }
 });
+
+it("measures a bounded event again after its size was used once, and only reuses it natively", () => {
+  const payload = (stream: "native" | "canonical", record: unknown) => {
+    const serialized = serializeEventNdjsonRecord(stream, record);
+    return serialized._tag === "Serialized" ? serialized.payload : serialized._tag;
+  };
+  const many = Object.fromEntries(Array.from({ length: 1_030 }, (_, index) => [`k${index}`, 0]));
+  const summary =
+    '{"truncated":true,"kind":"protocol","event":{"truncated":true,"params":{"truncated":true}}}';
+
+  const written: Record<string, unknown> = { params: {} };
+  boundProviderEventForLogging(written);
+  assert.equal(
+    payload("native", { kind: "protocol", event: written }),
+    '{"kind":"protocol","event":{"params":{}}}',
+  );
+  // Changed after its record was written, then written again without being bounded again.
+  written.params = many;
+  assert.equal(payload("native", { kind: "protocol", event: written }), summary);
+
+  const elsewhere: Record<string, unknown> = { params: {} };
+  boundProviderEventForLogging(elsewhere);
+  elsewhere.params = many;
+  assert.equal(payload("canonical", { kind: "protocol", event: elsewhere }), summary);
+});

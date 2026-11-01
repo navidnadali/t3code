@@ -2398,15 +2398,15 @@ const batchNode = (
 };
 
 /**
- * Counts the ingestor's sink writes. The first batch fails right after normalizing `fail.node`;
- * with `alone`, writing that node on its own fails too.
+ * Counts the ingestor's sink writes. The first batch fails (or dies, with `defect`) right after
+ * normalizing `fail.node`; with `alone`, writing that node on its own fails too.
  */
 const ingestBatchOfNodes = (input: {
   readonly nodes: (
     threadId: OrchestrationV2ExecutionNode["threadId"],
     now: DateTime.Utc,
   ) => ReadonlyArray<OrchestrationV2ExecutionNode>;
-  readonly fail?: { readonly node: string; readonly alone: boolean };
+  readonly fail?: { readonly node: string; readonly alone: boolean; readonly defect?: boolean };
 }) =>
   Effect.gen(function* () {
     const writes = { single: 0, batched: 0 };
@@ -2442,7 +2442,11 @@ const ingestBatchOfNodes = (input: {
                   steps: request.steps.map((step) =>
                     step.pipe(
                       Effect.tap((events) =>
-                        includesFailingNode(events) ? Effect.fail(constraintFailure) : Effect.void,
+                        !includesFailingNode(events)
+                          ? Effect.void
+                          : input.fail?.defect === true
+                            ? Effect.die("step defect")
+                            : Effect.fail(constraintFailure),
                       ),
                     ),
                   ),
@@ -2523,17 +2527,19 @@ it.effect("writes a run of provider events in one transaction, each as it would 
   }),
 );
 
-it.effect("rolls back a batch that fails part-way and writes its events again one by one", () =>
-  Effect.gen(function* () {
-    const { exit, writes, logged, sequencesAfterFailedBatch } = yield* ingestBatchOfNodes({
-      nodes: (threadId, now) => ["a", "b", "c"].map((name) => batchNode(threadId, name, now)),
-      fail: { node: "c", alone: false },
-    });
-    assert.isTrue(Exit.isSuccess(exit));
-    assert.deepEqual(sequencesAfterFailedBatch, [1]);
-    assert.deepEqual(logged, ["2:a:waiting", "3:b:waiting", "4:c:waiting"]);
-    assert.deepEqual(writes, { single: 3, batched: 1 });
-  }),
+it.effect.each([false, true])(
+  "rolls back a batch that fails part-way and writes its events again one by one (defect: %s)",
+  (defect) =>
+    Effect.gen(function* () {
+      const { exit, writes, logged, sequencesAfterFailedBatch } = yield* ingestBatchOfNodes({
+        nodes: (threadId, now) => ["a", "b", "c"].map((name) => batchNode(threadId, name, now)),
+        fail: { node: "c", alone: false, defect },
+      });
+      assert.isTrue(Exit.isSuccess(exit));
+      assert.deepEqual(sequencesAfterFailedBatch, [1]);
+      assert.deepEqual(logged, ["2:a:waiting", "3:b:waiting", "4:c:waiting"]);
+      assert.deepEqual(writes, { single: 3, batched: 1 });
+    }),
 );
 
 it.effect("fails a batch at the event that fails alone, after writing the events before it", () =>
@@ -2549,3 +2555,22 @@ it.effect("fails a batch at the event that fails alone, after writing the events
     assert.deepEqual(writes, { single: 2, batched: 1 });
   }),
 );
+
+it.each([
+  [undefined, 1],
+  ["", 1],
+  ["abc", 1],
+  ["-3", 1],
+  ["0", 1],
+  ["1", 1],
+  ["32", 32],
+  ["256", 256],
+  ["1000", 256],
+] as const)("reads T3CODE_PROVIDER_EVENT_BATCH_MAX=%s as %i events", (value, expected) => {
+  assert.equal(
+    ProviderEventIngestor.providerEventBatchLimitFromEnv({
+      T3CODE_PROVIDER_EVENT_BATCH_MAX: value,
+    }),
+    expected,
+  );
+});

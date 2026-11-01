@@ -37,6 +37,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as Tracer from "effect/Tracer";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 
 import { toPersistenceSqlError } from "../persistence/Errors.ts";
@@ -2987,13 +2988,57 @@ it.effect.each([
 );
 
 it.effect.each([
-  { limit: 1, writes: Array.from({ length: 22 }, () => 1), queued: [] },
-  { limit: 8, writes: [1, 4, 1, 8, 1, 1, 5, 1], queued: [1, 21, 21, 21, 21] },
+  {
+    limit: 1,
+    maxBytes: undefined,
+    text: 0,
+    count: 21,
+    writes: Array.from({ length: 22 }, () => 1),
+    batches: [],
+    backlogSpans: [],
+  },
+  // With batching off too, a take of 32 or more queued events is recorded as the run's backlog.
+  {
+    limit: 1,
+    maxBytes: undefined,
+    text: 0,
+    count: 41,
+    writes: Array.from({ length: 42 }, () => 1),
+    batches: [],
+    backlogSpans: [41],
+  },
+  {
+    limit: 8,
+    maxBytes: undefined,
+    text: 0,
+    count: 21,
+    writes: [1, 4, 1, 8, 1, 1, 5, 1],
+    batches: [4, 8, 5],
+    backlogSpans: [],
+  },
+  // About 10 KB an item: the byte budget closes a batch after three, before the event limit.
+  {
+    limit: 8,
+    maxBytes: 25_000,
+    text: 10_000,
+    count: 21,
+    writes: [1, 3, 1, 1, 3, 4, 2, 1, 3, 2, 1],
+    batches: [3, 3, 4, 2, 3, 2],
+    backlogSpans: [],
+  },
 ])(
-  "writes a provider event backlog in order, exactly once, $limit event(s) per write at most",
-  ({ limit, writes: expectedWrites, queued: expectedQueued }) =>
+  "writes a provider event backlog in order, exactly once, at most $limit events or $maxBytes bytes at once",
+  ({
+    limit,
+    maxBytes,
+    text,
+    count,
+    writes: expectedWrites,
+    batches: expectedBatches,
+    backlogSpans: expectedBacklogSpans,
+  }) =>
     Effect.gen(function* () {
-      const key = `backlog-${limit}`;
+      const key = `backlog-${limit}-${maxBytes ?? "default"}-${count}`;
       const ids = backgroundScenarioIds(key);
       const providerEvents = yield* Queue.unbounded<
         ProviderAdapter.ProviderAdapterV2Event,
@@ -3008,7 +3053,7 @@ it.effect.each([
         [15, backgroundTurnItemEvent(ids, "command_execution", "completed", 5, command)],
       ]);
       const items = Array.from(
-        { length: 21 },
+        { length: count },
         (_, index): ProviderAdapter.ProviderAdapterV2Event =>
           commandUpdates.get(index) ??
           ({
@@ -3023,12 +3068,27 @@ it.effect.each([
               type: "assistant_message",
               status: "completed",
               streaming: false,
+              text: "x".repeat(text),
             },
           } as ProviderAdapter.ProviderAdapterV2Event),
       );
       const terminal = rootTerminalEvent(ids, "completed");
       const writes: Array<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>> = [];
-      const queued: Array<number | undefined> = [];
+      const batches: Array<number> = [];
+      const backlogSpans: Array<unknown> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          if (options.name === "RunExecutionService.providerEventBacklog") {
+            const end = span.end.bind(span);
+            span.end = (endTime, exit) => {
+              end(endTime, exit);
+              backlogSpans.push(span.attributes.get("orchestration_v2.ingest.queued"));
+            };
+          }
+          return span;
+        },
+      });
       const writing = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
       // The first write holds the writer until everything else has queued behind it.
@@ -3044,11 +3104,14 @@ it.effect.each([
       yield* captureRootRunTermination({
         key,
         shouldFinalizeRun: () => Effect.succeed(true),
-        providerEventBatchLimit: limit,
+        providerEventBatching: {
+          maxEvents: limit,
+          ...(maxBytes === undefined ? {} : { maxBytes }),
+        },
         events: () => Stream.fromQueue(providerEvents),
         ingestNormalized: (input) => write([input.event]).pipe(Effect.as([])),
         ingestNormalizedBatch: (input) =>
-          Effect.sync(() => queued.push(input.queued)).pipe(
+          Effect.sync(() => batches.push(input.events.length)).pipe(
             Effect.andThen(write(input.events.map((event) => event.event))),
             Effect.as(input.events.map(() => [])),
           ),
@@ -3057,13 +3120,14 @@ it.effect.each([
             Effect.andThen(Queue.offerAll(providerEvents, [...items.slice(1), terminal])),
             Effect.andThen(Deferred.succeed(release, undefined)),
           ),
-      });
+      }).pipe(Effect.withTracer(tracer));
       assert.deepEqual(writes.flat(), [...items, terminal]);
       assert.deepEqual(
         writes.map((events) => events.length),
         expectedWrites,
       );
-      assert.deepEqual(queued, expectedQueued);
+      assert.deepEqual(batches, expectedBatches);
+      assert.deepEqual(backlogSpans, expectedBacklogSpans);
     }),
 );
 
@@ -3082,7 +3146,7 @@ it.effect.each([1, 8])(
       const { finalEvents } = yield* captureRootRunTermination({
         key,
         shouldFinalizeRun: () => Effect.succeed(true),
-        providerEventBatchLimit: limit,
+        providerEventBatching: { maxEvents: limit },
         events: () => Stream.make(node("running"), node("completed")),
         ingestNormalized: (input) =>
           input.event.type === "node.updated" && input.event.node.status === "completed"
@@ -3196,7 +3260,7 @@ function captureRootRunTermination(input: {
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
   readonly ingestNormalizedBatch?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalizedBatch"];
-  readonly providerEventBatchLimit?: number;
+  readonly providerEventBatching?: { readonly maxEvents: number; readonly maxBytes?: number };
   readonly beforeTerminalWrite?: (
     request: Parameters<EventSink.EventSinkV2["Service"]["writeIfRunCurrent"]>[0],
   ) => Effect.Effect<boolean, EventSink.EventSinkV2Error>;
@@ -3282,10 +3346,12 @@ function captureRootRunTermination(input: {
               ? {}
               : { ingestNormalizedBatch: input.ingestNormalizedBatch }),
           }),
-          Layer.succeed(
-            ProviderEventIngestor.ProviderEventBatchLimit,
-            input.providerEventBatchLimit ?? 1,
-          ),
+          Layer.succeed(ProviderEventIngestor.ProviderEventBatching, {
+            maxEvents: input.providerEventBatching?.maxEvents ?? 1,
+            maxBytes:
+              input.providerEventBatching?.maxBytes ??
+              ProviderEventIngestor.PROVIDER_EVENT_BATCH_MAX_BYTES,
+          }),
           ServerSettings.layerTest(),
           Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
             refresh: () => Effect.void,

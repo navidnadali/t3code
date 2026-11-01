@@ -317,8 +317,6 @@ export interface ProviderEventIngestorV2Shape {
    */
   readonly ingestNormalizedBatch: (input: {
     readonly events: ReadonlyArray<ProviderEventIngestInput>;
-    /** How many events were queued for the caller when it took these, recorded on the span. */
-    readonly queued?: number;
   }) => Effect.Effect<
     ReadonlyArray<ReadonlyArray<OrchestrationV2StoredEvent>>,
     ProviderEventIngestorV2Error
@@ -328,7 +326,6 @@ export interface ProviderEventIngestorV2Shape {
 // Their normalization reads only through the write transaction, and nothing after the write
 // takes a lock or can fail, so a rolled-back batch can be written again event by event.
 const BATCHABLE_EVENT_TYPES = new Set<ProviderAdapter.ProviderAdapterV2Event["type"]>([
-  "provider_session.updated",
   "provider_turn.updated",
   "node.updated",
   "message.updated",
@@ -340,18 +337,31 @@ const BATCHABLE_EVENT_TYPES = new Set<ProviderAdapter.ProviderAdapterV2Event["ty
 export const canIngestInBatch = (event: ProviderAdapter.ProviderAdapterV2Event): boolean =>
   BATCHABLE_EVENT_TYPES.has(event.type);
 
-const MAX_PROVIDER_EVENT_BATCH = 1000;
+// One batch is one writer transaction: past a few hundred events or about a MiB it holds the
+// writer for long and fills a slow client's live buffer at once, for no throughput gain.
+const MAX_PROVIDER_EVENT_BATCH = 256;
+export const PROVIDER_EVENT_BATCH_MAX_BYTES = 1024 * 1024;
 
-function providerEventBatchLimitFromEnv(env: Readonly<Record<string, string | undefined>>): number {
+export function providerEventBatchLimitFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): number {
   const value = Number(env.T3CODE_PROVIDER_EVENT_BATCH_MAX ?? "");
   return Number.isSafeInteger(value) && value > 1 ? Math.min(value, MAX_PROVIDER_EVENT_BATCH) : 1;
 }
 
-/** Most provider events a run writes per transaction; 1 (the default) writes each on its own. */
-export const ProviderEventBatchLimit = Context.Reference<number>(
-  "t3/orchestration-v2/ProviderEventIngestor/ProviderEventBatchLimit",
-  { defaultValue: () => providerEventBatchLimitFromEnv(process.env) },
-);
+/**
+ * How many provider events, and about how many bytes of them, a run writes per transaction.
+ * One event (the default) writes each on its own.
+ */
+export const ProviderEventBatching = Context.Reference<{
+  readonly maxEvents: number;
+  readonly maxBytes: number;
+}>("t3/orchestration-v2/ProviderEventIngestor/ProviderEventBatching", {
+  defaultValue: () => ({
+    maxEvents: providerEventBatchLimitFromEnv(process.env),
+    maxBytes: PROVIDER_EVENT_BATCH_MAX_BYTES,
+  }),
+});
 
 export class ProviderEventIngestorV2 extends Context.Service<
   ProviderEventIngestorV2,
@@ -860,11 +870,8 @@ export const layer: Layer.Layer<
 
     const ingestNormalizedBatch: ProviderEventIngestorV2Shape["ingestNormalizedBatch"] = Effect.fn(
       "ProviderEventIngestor.ingestNormalizedBatch",
-    )(function* ({ events, queued }) {
-      yield* Effect.annotateCurrentSpan({
-        "orchestration_v2.ingest.batch_events": events.length,
-        ...(queued === undefined ? {} : { "orchestration_v2.ingest.queued": queued }),
-      });
+    )(function* ({ events }) {
+      yield* Effect.annotateCurrentSpan({ "orchestration_v2.ingest.batch_events": events.length });
       const stored: Array<ReadonlyArray<OrchestrationV2StoredEvent>> = [];
       let start = 0;
       while (start < events.length) {

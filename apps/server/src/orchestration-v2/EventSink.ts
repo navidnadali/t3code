@@ -12,6 +12,7 @@ import {
   type ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -94,7 +95,8 @@ export interface EventSinkV2Shape {
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   /**
    * Runs each step and writes its events, in order, in one transaction. A step reads on that
-   * transaction, so it sees what earlier steps wrote. Any failure rolls back every step.
+   * transaction, so it sees what earlier steps wrote. Any failure before the commit, a defect
+   * included, rolls back every step and fails with EventSinkWriteError.
    */
   readonly writeSteps: <E>(input: {
     readonly guardPendingUserInputCancellations?: boolean;
@@ -479,34 +481,62 @@ const layerBase: Layer.Layer<
       return committed;
     });
 
-    const writeStepsEffect = Effect.fn("orchestrationV2.EventSink.writeSteps")(function* (input: {
-      readonly guardPendingUserInputCancellations?: boolean;
-      readonly steps: ReadonlyArray<
-        Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, unknown>
-      >;
-    }) {
-      const { stored, committed } = yield* commitThenPublish(
-        Effect.gen(function* () {
-          const stored: Array<ReadonlyArray<OrchestrationV2StoredEvent>> = [];
-          for (const step of input.steps) {
-            const events = yield* step;
-            if (events.length === 0) {
-              stored.push([]);
-              continue;
+    // Anything that fails before the commit, defects included, fails with its squashed cause, so a
+    // caller can rely on nothing having been written. Interruption stays interruption.
+    const failBeforeCommit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) => Effect.fail(Cause.squash(cause)),
+        ),
+      );
+
+    const writeStepsEffect = Effect.fn("orchestrationV2.EventSink.writeSteps")(function* (
+      input: {
+        readonly guardPendingUserInputCancellations?: boolean;
+        readonly steps: ReadonlyArray<
+          Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, unknown>
+        >;
+      },
+      progress: { events: number },
+    ) {
+      const stored: Array<ReadonlyArray<OrchestrationV2StoredEvent>> = [];
+      // Steps before the first one with events read nothing this batch wrote, so they need no
+      // transaction; a batch without events opens none.
+      let next = 0;
+      let first: ReadonlyArray<OrchestrationV2DomainEvent> = [];
+      while (first.length === 0 && next < input.steps.length) {
+        first = yield* failBeforeCommit(input.steps[next]!);
+        next++;
+        if (first.length === 0) stored.push([]);
+      }
+      if (first.length === 0) return stored;
+      const append = Effect.fnUntraced(function* (
+        events: ReadonlyArray<OrchestrationV2DomainEvent>,
+      ) {
+        progress.events += events.length;
+        const normalized = yield* normalizeEvents(
+          input.guardPendingUserInputCancellations === true
+            ? yield* guardUserInputCancellations(events)
+            : events,
+        );
+        const committed = yield* eventStore.append({ events: normalized });
+        yield* applyProjections(committed);
+        return committed;
+      });
+      const { committed } = yield* commitThenPublish(
+        failBeforeCommit(
+          Effect.gen(function* () {
+            stored.push(yield* append(first));
+            for (const step of input.steps.slice(next)) {
+              const events = yield* step;
+              stored.push(events.length === 0 ? [] : yield* append(events));
             }
-            const normalized = yield* normalizeEvents(
-              input.guardPendingUserInputCancellations === true
-                ? yield* guardUserInputCancellations(events)
-                : events,
-            );
-            const committed = yield* eventStore.append({ events: normalized });
-            yield* applyProjections(committed);
-            stored.push(committed);
-          }
-          const committed = stored.flat();
-          const outcomes = yield* recordProjectedSequence(committed);
-          return { stored, committed, outcomes };
-        }).pipe(Effect.withTracerEnabled(false)),
+            const committed = stored.flat();
+            const outcomes = yield* recordProjectedSequence(committed);
+            return { committed, outcomes };
+          }).pipe(Effect.withTracerEnabled(false)),
+        ),
         ({ committed, outcomes }) => publishStoredEvents(committed, outcomes),
       );
       yield* Effect.annotateCurrentSpan({
@@ -957,11 +987,14 @@ const layerBase: Layer.Layer<
           ),
         ),
       writeSteps: (input) =>
-        writeStepsEffect(input).pipe(
-          Effect.mapError(
-            (cause) => new EventSinkWriteError({ eventCount: input.steps.length, cause }),
-          ),
-        ),
+        Effect.suspend(() => {
+          const progress = { events: 0 };
+          return writeStepsEffect(input, progress).pipe(
+            Effect.mapError(
+              (cause) => new EventSinkWriteError({ eventCount: progress.events, cause }),
+            ),
+          );
+        }),
       writeIfRunCurrent: (input) =>
         writeIfRunCurrentEffect(input).pipe(
           Effect.mapError(

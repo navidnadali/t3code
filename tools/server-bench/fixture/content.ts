@@ -167,20 +167,23 @@ const keyed = (text: string) =>
 
 const blankText = (text: string) => fillText(text, keyed(text) % SEEDS);
 
-/** Key filler: a five-syllable seed, then syllables it fixes, to `length` letters (at least 10). */
+/**
+ * Key filler: a five-syllable seed, then letters it fixes, to `length` (at least 10). A `.` every
+ * eighth character after the seed keeps any run of letters short of a base64 key line.
+ */
 const keyFiller = (seed: number, length: number) => {
   const next = mulberry32(seed ^ 0x2545f491);
-  let out = syllablesOf(seed).join("");
-  while (out.length < length) {
-    out +=
-      length - out.length === 1
-        ? FINALS[Math.floor(next() * FINALS.length)]
-        : SYLLABLES[Math.floor(next() * SYLLABLES.length)];
+  let letters = syllablesOf(seed).join("");
+  while (letters.length < length) letters += SYLLABLES[Math.floor(next() * SYLLABLES.length)];
+  let out = "";
+  for (let index = 0, taken = 0; index < length; index++) {
+    const dot = index >= 10 && (index - 10) % 8 === 0 && index < length - 1;
+    out += dot ? "." : letters[taken++];
   }
   return out;
 };
 
-/** One letter per UTF-8 byte of the key (at least 10, so keys stay distinct): a valid identifier. */
+/** One character per UTF-8 byte of the key (at least 10, so keys stay distinct). */
 const blankKey = (key: string) =>
   keyFiller(keyed(key) % SEEDS, Math.max(Buffer.byteLength(key, "utf8"), SEED_SYLLABLES * 2));
 

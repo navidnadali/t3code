@@ -147,7 +147,8 @@ export function parsePollMix(text: string): ReadonlyArray<readonly [PollCall, nu
 export const USAGE = `Usage: node tools/server-bench/driver.ts --url <origin> --out <dir> [options]
 
 Drives load against a running scratch T3 server and writes <out>/driver.json. Its knobs echo
-every option but the session plan; sessionsByProvider gives the sessions per provider instance,
+every option but the session plan; sessionsByProvider gives the sessions per provider instance;
+in history mode workload.providerSwitches maps each instance to the seeded threads it took over;
 and with --session-mcp-credentials sessionMcp.credentialsEnvironment maps each planned instance
 to "set by the driver" or "already set". --provider defaults to claudeBench, not claudeAgent.
 Before any session opens it sets each planned bench instance's BENCH_STATE_DIR to a fresh,

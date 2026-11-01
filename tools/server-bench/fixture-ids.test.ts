@@ -22,5 +22,8 @@ describe("synthetic native ids", () => {
     expect(first).not.toMatch(/auth|token|secret|passw|pwd|credential|api_?key|access_?key/i);
     expect(first).toMatch(/^toolu_01[0-9A-Za-z]{22}$/);
     expect(nativeId("toolu", random(), 7)).toBe(first);
+    // A counter whose base62 tail spells `Auth`: redrawing the random part cannot fix the tail.
+    const spelling = 10 + 56 * 62 + 55 * 62 ** 2 + 43 * 62 ** 3;
+    expect(nativeId("toolu", random(), spelling)).not.toMatch(/auth|token|secret|passw|pwd/i);
   });
 });

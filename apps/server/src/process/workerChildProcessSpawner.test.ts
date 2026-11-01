@@ -10,6 +10,7 @@ import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -596,6 +597,39 @@ describe("WorkerChildProcessSpawner", () => {
         expect(() => process.kill(spawnerPid, 0)).toThrow(
           expect.objectContaining({ code: "ESRCH" }),
         );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "closing the spawner process lets it kill a child whose start the server has not heard of yet",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const watch = yield* childWatch;
+        // The spawner never reports this child's start, so only the spawner knows its PID.
+        const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
+          'child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));',
+          'child.on("spawn", () => message.args.includes("unreported") || post({ t: "spawn", id, pid: child.pid }));',
+        );
+        expect(source).not.toBe(WorkerChildProcessSpawner.spawnerProcessSource);
+        const outer = yield* Effect.scope;
+        const socket = yield* Effect.gen(function* () {
+          const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner, {
+            source,
+          });
+          // Outlives the spawner's scope: closing it fails this pending spawn instead.
+          const pending = yield* Effect.forkIn(
+            remoteSpawner.spawn(
+              ChildProcess.make(process.execPath, ["-e", watch.connectScript(), "unreported"]),
+            ),
+            outer,
+          );
+          return { connected: yield* watch.connected, pending };
+        }).pipe(Effect.scoped);
+        yield* watch.closed(socket.connected);
+        expect(yield* Effect.flip(Fiber.join(socket.pending))).toMatchObject({
+          message: expect.stringContaining("spawn"),
+        });
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

@@ -165,12 +165,12 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
 }
 
 const formatMs = (ms: number) =>
-  ms < 1_000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 100) / 10}s`;
+  Math.round(ms) < 1_000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 100) / 10}s`;
 
 const formatLatency = (latency: TraceLatency) =>
   typeof latency === "number" ? formatMs(latency) : `<${latency.underMs}ms`;
 
-function formatTraceSummary(
+export function formatTraceSummary(
   summary: ReturnType<ReturnType<typeof makeTraceSpanSummary>["finish"]>,
   limit: number,
 ) {

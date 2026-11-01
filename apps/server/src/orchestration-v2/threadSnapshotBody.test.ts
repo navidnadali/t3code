@@ -336,23 +336,36 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
         snapshotSequence,
         projection: {
           ...projectThreadProjectionForWire(projection),
+          // Each answer set holds a different way to hide a large value from a size estimate.
           runtimeRequests: [
+            { reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) } },
+            { [TEXT.repeat(40_000)]: 0 },
+            { lazy: { toJSON: () => TEXT.repeat(40_000) } },
+            { boxed: Object(TEXT.repeat(40_000)) },
             {
-              id: RuntimeRequestId.make("runtime-request:snapshot-body"),
-              nodeId: NodeId.make(`node:${parentRun}`),
-              providerTurnId: null,
-              nativeRequestRef: null,
-              kind: "user_input" as const,
-              status: "resolved" as const,
-              responseCapability: { type: "message" as const },
-              createdAt: at,
-              resolvedAt: at,
-              answers: {
-                reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) },
-                [TEXT.repeat(40_000)]: 0,
+              self: {
+                toJSON() {
+                  return this;
+                },
+                text: TEXT.repeat(40_000),
               },
             },
-          ],
+            {
+              nested: { toJSON: () => ({ toJSON: () => "inner", text: TEXT }) },
+              large: TEXT.repeat(40_000),
+            },
+          ].map((answers, index) => ({
+            id: RuntimeRequestId.make(`runtime-request:snapshot-body:${index}`),
+            nodeId: NodeId.make(`node:${parentRun}`),
+            providerTurnId: null,
+            nativeRequestRef: null,
+            kind: "user_input" as const,
+            status: "resolved" as const,
+            responseCapability: { type: "message" as const },
+            createdAt: at,
+            resolvedAt: at,
+            answers,
+          })),
         },
       };
       const streamed = yield* streamedBody(snapshot);

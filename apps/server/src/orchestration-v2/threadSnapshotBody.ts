@@ -3,6 +3,7 @@ import {
   OrchestrationV2ThreadDetailSnapshot,
   OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -67,31 +68,38 @@ const toJsonValue = (value: unknown, key: string) =>
     ? (value as { readonly toJSON: (key: string) => unknown }).toJSON(key)
     : value;
 
-// About its JSON length (escapes and toJSON results can differ); it stops early on a large value.
+const hasToJson = (value: object) =>
+  typeof (value as { readonly toJSON?: unknown }).toJSON === "function";
+
+// About the JSON length of a value already through toJSON (escapes can add more); it stops early.
 const exceedsChunk = (value: unknown) => {
   let budget = CHUNK_CHARS;
-  const visit = (current: unknown): boolean => {
+  const visit = (current: unknown, key: string, throughToJson: boolean): boolean => {
     if (typeof current === "string") return (budget -= current.length + 2) < 0;
-    if (
-      current === null ||
-      typeof current !== "object" ||
-      typeof (current as { readonly toJSON?: unknown }).toJSON === "function"
-    ) {
-      return (budget -= 32) < 0;
+    if (current === null || typeof current !== "object") return (budget -= 8) < 0;
+    if (!throughToJson && hasToJson(current)) {
+      return DateTime.isDateTime(current)
+        ? (budget -= 32) < 0
+        : visit((current as { readonly toJSON: (key: string) => unknown }).toJSON(key), key, true);
     }
-    for (const key in current) {
-      budget -= key.length + 4;
-      if (budget < 0 || visit((current as Readonly<Record<string, unknown>>)[key])) return true;
+    for (const member in current) {
+      budget -= member.length + 4;
+      const next = (current as Readonly<Record<string, unknown>>)[member];
+      if (budget < 0 || visit(next, member, false)) return true;
     }
     return (budget -= 2) < 0;
   };
-  return visit(value);
+  return visit(value, "", true);
 };
 
-// JSON.stringify unwraps boxed primitives, so a value whose valueOf is primitive is written whole.
-const isPrimitiveLike = (value: object) => {
-  const valueOf = (value as { readonly valueOf?: unknown }).valueOf;
-  return typeof valueOf === "function" && typeof valueOf.call(value) !== "object";
+// Only a real String box (thisStringValue) is unwrapped by JSON.stringify.
+const hasStringData = (value: object) => {
+  try {
+    String.prototype.valueOf.call(value);
+    return true;
+  } catch {
+    return false;
+  }
 };
 
 // Never between the halves of a surrogate pair: apart, each half encodes differently.
@@ -103,7 +111,9 @@ const sliceEnd = (text: string, start: number) => {
 
 /** JSON.stringify of a value already through toJSON, in parts of about a chunk or less. */
 function* jsonParts(value: unknown): Generator<string> {
-  if (!exceedsChunk(value)) {
+  // A value already through toJSON is written without calling its toJSON again.
+  const structural = value !== null && typeof value === "object" && hasToJson(value);
+  if (!structural && !exceedsChunk(value)) {
     yield JSON.stringify(value);
   } else if (typeof value === "string") {
     yield '"';
@@ -113,8 +123,10 @@ function* jsonParts(value: unknown): Generator<string> {
       start = end;
     }
     yield '"';
-  } else if (value === null || typeof value !== "object" || isPrimitiveLike(value)) {
+  } else if (value === null || typeof value !== "object") {
     yield JSON.stringify(value);
+  } else if (hasStringData(value)) {
+    yield* jsonParts(String(value));
   } else if (Array.isArray(value)) {
     yield* arrayParts([value]);
   } else {

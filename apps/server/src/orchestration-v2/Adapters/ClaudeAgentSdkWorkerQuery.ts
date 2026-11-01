@@ -57,8 +57,9 @@ export interface StartedClaudeQuery<E> {
 
 /**
  * The worker's share of the query options, or undefined when the query must stay in-thread: an
- * abort controller, hooks other than T3's SubagentStart context, an in-process MCP server, or no
- * CLI path (the worker cannot find the SDK's bundled CLI the way main does).
+ * abort controller, hooks other than T3's SubagentStart context, options that are not plain data
+ * (a session store, an in-process MCP server), or no CLI path (the worker cannot find the SDK's
+ * bundled CLI the way main does).
  */
 export function claudeAgentSdkStageOptions(
   options: ClaudeQueryOptions,
@@ -80,7 +81,7 @@ export function claudeAgentSdkStageOptions(
     return undefined;
   }
   if (Object.values(mcpServers ?? {}).some((server) => server.type === "sdk")) return undefined;
-  if (Object.values(data).some((value) => typeof value === "function")) return undefined;
+  if (!isPlainData(data) || !isPlainData(mcpServers)) return undefined;
   let subagentStartContext: string | undefined;
   if (hooks !== undefined) {
     const [matcher, ...otherMatchers] = hooks.SubagentStart ?? [];
@@ -107,6 +108,19 @@ export function claudeAgentSdkStageOptions(
     ...(subagentStartContext === undefined ? {} : { subagentStartContext }),
   };
 }
+
+// What structured cloning carries over unchanged: no functions, class instances or cycles.
+const isPlainData = (value: unknown, ancestors = new Set<object>()): boolean => {
+  if (typeof value === "function" || typeof value === "symbol") return false;
+  if (typeof value !== "object" || value === null) return true;
+  if (ancestors.has(value)) return false;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false;
+  ancestors.add(value);
+  const plain = Object.values(value).every((entry) => isPlainData(entry, ancestors));
+  ancestors.delete(value);
+  return plain;
+};
 
 type WorkerSessionError = ProviderIoWorkerError | ProviderIoStageError;
 
@@ -278,6 +292,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       kill: Effect.sync(() => {
         if (child !== undefined && !childDone) child.kill("SIGKILL");
       }),
+      killAfterEnd: true,
       onEvent,
     })
     .pipe(Effect.provideService(Scope.Scope, scope));
@@ -334,8 +349,11 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     stopTask: (taskId) => request({ type: "stopTask", taskId }),
     backgroundTasks: (toolUseId) => request({ type: "backgroundTasks", toolUseId }),
     interrupt: () => request({ type: "interrupt" }),
+    // In-thread, frames the SDK has not read when it closes never reach a waiting reader.
     close: () => {
-      if (!released) workerSession.notify({ type: "close" });
+      if (released) return;
+      workerSession.cutOutput();
+      workerSession.notify({ type: "close" });
     },
     [Symbol.asyncDispose]: () => runPromise(settle({ type: "asyncDispose" })),
   };

@@ -49,6 +49,8 @@ export interface ProviderIoSession<Output, E, Request = never, Reply = never> {
   readonly call: (request: Request) => Effect.Effect<Reply, E>;
   /** A call whose reply nobody waits for; ordered like `call`. */
   readonly notify: (request: Request) => void;
+  /** Ends the output after the outputs main holds now; later ones are dropped (their credit returned). */
+  readonly cutOutput: () => void;
 }
 
 export interface ProviderIoOpenInput<
@@ -64,6 +66,8 @@ export interface ProviderIoOpenInput<
   readonly onFailure: (error: ProviderIoWorkerError | ProviderIoStageError) => E;
   /** Stops the session's child process when its worker dies. */
   readonly kill: Effect.Effect<void>;
+  /** The child can outlive the session's output (a stage that runs a library), so kill it even then. */
+  readonly killAfterEnd?: boolean;
   /** Receives the stage's events on main as they arrive, ahead of queued outputs. */
   readonly onEvent?: (event: Event) => void;
   readonly highWaterMark?: number;
@@ -342,6 +346,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     let failure: { readonly error: E } | undefined;
     let ended = false;
     let finished = false;
+    let cut = false;
     let closed = false;
 
     const post = (message: ProviderIoMainMessage, transfer?: ReadonlyArray<ArrayBuffer>) => {
@@ -406,7 +411,10 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       failure = { error: mapped };
       for (const resume of calls.values()) resume(Effect.fail(mapped));
       calls.clear();
-      if (finished) return;
+      if (finished) {
+        if (kill && input.killAfterEnd === true) runFork(input.kill);
+        return;
+      }
       Queue.failCauseUnsafe(queue, Cause.fail(mapped));
       for (const waiter of waiters.splice(0)) waiter.fail(Effect.fail(mapped));
       if (kill) runFork(input.kill);
@@ -415,7 +423,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     slot.sessions.set(id, {
       deliver: (outputs, bytes) => {
         if (failure !== undefined || closed) return;
-        if (Arr.isReadonlyArrayNonEmpty(outputs)) {
+        if (!cut && Arr.isReadonlyArrayNonEmpty(outputs)) {
           Queue.offerUnsafe(queue, {
             outputs: outputs as Arr.NonEmptyReadonlyArray<Output>,
             bytes,
@@ -426,7 +434,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       },
       // A failed end fails only the output; calls stay open.
       finish: (end) => {
-        if (failure !== undefined || closed) return;
+        if (failure !== undefined || closed || finished) return;
         finished = true;
         if (end === undefined) {
           Queue.endUnsafe(queue);
@@ -518,6 +526,12 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
         }),
       notify: (request) => {
         if (failure === undefined && !closed) post({ type: "notify", session: id, request });
+      },
+      cutOutput: () => {
+        if (failure !== undefined || closed || finished) return;
+        finished = true;
+        cut = true;
+        Queue.endUnsafe(queue);
       },
     };
     return Option.some(session);

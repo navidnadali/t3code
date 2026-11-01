@@ -20,6 +20,9 @@ interface WorkerSession {
   finished: boolean;
   // Async replies, posted after the outputs emitted while they were pending.
   replies: Array<ProviderIoWorkerMessage>;
+  // Events a stage raises while it takes a chunk (or a notified call), posted after its outputs.
+  pushing: boolean;
+  events: Array<unknown>;
 }
 
 const isThenable = (value: unknown): value is PromiseLike<unknown> =>
@@ -91,15 +94,37 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
     }
   };
 
+  const postEvent = (id: number, event: unknown) => {
+    try {
+      post({ type: "event", session: id, event });
+      return true;
+    } catch (error) {
+      fail(id, error);
+      return false;
+    }
+  };
+
   // Outputs emitted before a stage throws still reach main ahead of the failure.
   const run = (id: number, session: WorkerSession, step: () => void) => {
+    session.pushing = true;
     try {
       step();
       return true;
     } catch (error) {
       if (flush(id, session)) fail(id, error);
       return false;
+    } finally {
+      session.pushing = false;
     }
+  };
+
+  // Returns false when the session failed on the way.
+  const postEventsRaisedInPush = (id: number, session: WorkerSession) => {
+    if (session.events.length === 0) return true;
+    const events = session.events;
+    session.events = [];
+    if (!flush(id, session)) return false;
+    return events.every((event) => postEvent(id, event));
   };
 
   const postReply = (message: ProviderIoWorkerMessage) => {
@@ -142,6 +167,8 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
       freed: 0,
       finished: false,
       replies: [],
+      pushing: false,
+      events: [],
       emit: (output) => {
         session.outputs.push(output);
       },
@@ -154,12 +181,12 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
         schedule(id);
       },
       signal: (event) => {
-        if (!live() || !flushFirst(id)) return;
-        try {
-          post({ type: "event", session: id, event });
-        } catch (error) {
-          fail(id, error);
+        if (!live()) return;
+        if (session.pushing) {
+          session.events.push(event);
+          return;
         }
+        if (flushFirst(id)) postEvent(id, event);
       },
       finish: (...error) => {
         if (!live() || session.finished) return;
@@ -209,12 +236,12 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
         if (!run(id, session, () => session.stage.push(message.chunk, session.emit))) return;
         if (session.outputs.length > emitted) session.held += message.chunk.byteLength;
         else session.freed += message.chunk.byteLength;
-        schedule(id);
+        if (postEventsRaisedInPush(id, session)) schedule(id);
         return;
       }
       case "eof":
         if (!run(id, session, () => session.stage.end(session.emit))) return;
-        if (!flush(id, session)) return;
+        if (!postEventsRaisedInPush(id, session) || !flush(id, session)) return;
         sessions.delete(id);
         post({ type: "end", session: id });
         return;
@@ -251,6 +278,7 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
         if (call === undefined) return;
         let value: unknown;
         if (!run(id, session, () => (value = call(message.request as never)))) return;
+        if (!postEventsRaisedInPush(id, session)) return;
         if (isThenable(value)) value.then(undefined, () => {});
         return;
       }

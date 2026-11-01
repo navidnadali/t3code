@@ -2988,7 +2988,7 @@ it.effect.each([
 
 it.effect.each([
   { limit: 1, writes: Array.from({ length: 22 }, () => 1), queued: [] },
-  { limit: 8, writes: [1, 8, 8, 4, 1], queued: [1, 21, 21, 21] },
+  { limit: 8, writes: [1, 4, 1, 8, 1, 1, 5, 1], queued: [1, 21, 21, 21, 21] },
 ])(
   "writes a provider event backlog in order, exactly once, $limit event(s) per write at most",
   ({ limit, writes: expectedWrites, queued: expectedQueued }) =>
@@ -2999,9 +2999,18 @@ it.effect.each([
         ProviderAdapter.ProviderAdapterV2Event,
         Cause.Done
       >();
+      // A background command starts, updates and ends among them: only the changes it makes to
+      // the run's tracking are written on their own.
+      const command = TurnItemId.make(`turn-item:${key}:command`);
+      const commandUpdates = new Map([
+        [5, backgroundTurnItemEvent(ids, "command_execution", "running", 5, command)],
+        [10, backgroundTurnItemEvent(ids, "command_execution", "running", 5, command)],
+        [15, backgroundTurnItemEvent(ids, "command_execution", "completed", 5, command)],
+      ]);
       const items = Array.from(
         { length: 21 },
         (_, index): ProviderAdapter.ProviderAdapterV2Event =>
+          commandUpdates.get(index) ??
           ({
             type: "turn_item.updated",
             driver,
@@ -3015,7 +3024,7 @@ it.effect.each([
               status: "completed",
               streaming: false,
             },
-          }) as ProviderAdapter.ProviderAdapterV2Event,
+          } as ProviderAdapter.ProviderAdapterV2Event),
       );
       const terminal = rootTerminalEvent(ids, "completed");
       const writes: Array<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>> = [];

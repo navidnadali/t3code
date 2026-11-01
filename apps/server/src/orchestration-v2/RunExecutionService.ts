@@ -1091,17 +1091,26 @@ export const layer: Layer.Layer<
           yield* Ref.set(rootRunFinalized, true);
         });
         // The event's changes to the run's child and background tracking, applied after its write.
+        // Membership that would not change is left out, so a repeated running update tracks nothing.
         const childLifecycleUpdates = (
           event: ProviderAdapter.ProviderAdapterV2Event,
           deliverable: boolean,
           routing: ProviderEventRoutingState,
+          tracked: {
+            readonly childProviderTurns: ReadonlySet<ProviderTurnId>;
+            readonly backgroundTurnItems: ReadonlySet<OrchestrationV2TurnItem["id"]>;
+          },
         ) => {
           const updates: Array<Effect.Effect<void>> = [];
           if (event.type === "provider_turn.updated") {
             const isRoot =
               event.providerTurn.runAttemptId === input.attempt.id ||
               event.providerTurn.id === routing.rootProviderTurnId;
-            if (!isRoot) {
+            if (
+              !isRoot &&
+              isTerminalProviderTurnStatus(event.providerTurn.status) ===
+                tracked.childProviderTurns.has(event.providerTurn.id)
+            ) {
               updates.push(
                 Ref.update(activeChildProviderTurns, (current) => {
                   const next = new Set(current);
@@ -1195,7 +1204,9 @@ export const layer: Layer.Layer<
               inheritedBackgroundTurnItemsById.get(event.turnItem.id) === event.turnItem.runId;
             if (
               backgroundCapableTurnItemTypes.has(event.turnItem.type) &&
-              (belongsToRootRun || belongsToOwnedChildThread || belongsToInheritedBackgroundItem)
+              (belongsToRootRun || belongsToOwnedChildThread || belongsToInheritedBackgroundItem) &&
+              isSettledTurnItemStatus(event.turnItem.status) ===
+                tracked.backgroundTurnItems.has(event.turnItem.id)
             ) {
               updates.push(
                 Ref.update(activeBackgroundTurnItems, (current) => {
@@ -1442,6 +1453,10 @@ export const layer: Layer.Layer<
                 event,
                 deliveredEvent !== null,
                 yield* Ref.get(eventRouting),
+                {
+                  childProviderTurns: yield* Ref.get(activeChildProviderTurns),
+                  backgroundTurnItems: yield* Ref.get(activeBackgroundTurnItems),
+                },
               );
               if (deliveredEvent) {
                 const rootTerminalAlreadySeen = yield* Ref.get(rootTerminalSeen);

@@ -106,30 +106,42 @@ const DURATION_MS = /(\\?"duration_ms\\?":)\d+/gu;
 
 // Writers interleave and race even in-thread (an interrupt's settle effect or the provider's own
 // events close a run), so writes are compared per entity, in order, without the command-derived
-// event id. Attribution is kept except on the settle effect's provider-thread write, the only
-// write that race attributes to the run's node and run.
-const SETTLE_EFFECT = /:background-work-settled$/u;
+// event id. That race leaves the settle effect's provider-thread write attributed to the
+// interrupted run's root node or to none; either reads as none, and any other attribution is kept.
+const SETTLE_EFFECT = /:provider-turn\.interrupt:(.+):background-work-settled$/u;
+
+const entityOf = (event: OrchestrationV2StoredEvent["event"]) => {
+  const entityId = (event.payload as { readonly id?: unknown } | undefined)?.id;
+  return typeof entityId === "string" ? `${event.type.split(".")[0]} ${entityId}` : event.type;
+};
 
 const byEntity = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
+  const records = new Map<string, Readonly<Record<string, unknown>>>();
+  for (const { event } of storedEvents) {
+    records.set(entityOf(event), event.payload as Readonly<Record<string, unknown>>);
+  }
+  // The provider turn's run, through its attempt, as the settle effect's decider finds it.
+  const interrupted = (providerTurnId: string) => {
+    const attemptId = records.get(`provider-turn ${providerTurnId}`)?.runAttemptId;
+    const runId = records.get(`run-attempt ${String(attemptId)}`)?.runId;
+    return { runId, nodeId: records.get(`run ${String(runId)}`)?.rootNodeId };
+  };
   const entities = new Map<string, Array<unknown>>();
   for (const { commandId, event } of storedEvents) {
     const { id: _id, ...write } = event;
-    const settled =
-      commandId !== null &&
-      SETTLE_EFFECT.test(commandId) &&
-      event.type === "provider-thread.updated";
-    const {
-      nodeId: _nodeId,
-      runId: _runId,
-      ...unattributed
-    } = write as typeof write & {
+    const { nodeId, runId, ...unattributed } = write as typeof write & {
       readonly nodeId?: unknown;
       readonly runId?: unknown;
     };
-    const entityId = (event.payload as { readonly id?: unknown } | undefined)?.id;
-    const entity =
-      typeof entityId === "string" ? `${event.type.split(".")[0]} ${entityId}` : event.type;
-    entities.set(entity, [...(entities.get(entity) ?? []), settled ? unattributed : write]);
+    const settledTurn =
+      event.type === "provider-thread.updated" ? commandId?.match(SETTLE_EFFECT)?.[1] : undefined;
+    const owner = settledTurn === undefined ? undefined : interrupted(settledTurn);
+    const ownersOrNone =
+      owner !== undefined &&
+      ((runId === undefined && nodeId === undefined) ||
+        (runId !== undefined && runId === owner.runId && nodeId === owner.nodeId));
+    const entity = entityOf(event);
+    entities.set(entity, [...(entities.get(entity) ?? []), ownersOrNone ? unattributed : write]);
   }
   return Object.fromEntries([...entities].toSorted(([a], [b]) => (a < b ? -1 : 1)));
 };
@@ -265,8 +277,9 @@ const fixtureSeed = (input: ReplayFixtureCase) => {
   return hash;
 };
 
-// Replays a fixture with the pool at `workers`, the native protocol log written by the real log
-// store, and the adapter's events recorded where the session manager reads them.
+// Replays a fixture with the pool at `workers`, the native protocol log captured synchronously (or
+// written by the real log store with `realLogStore`), and the adapter's events recorded where the
+// session manager reads them.
 const adapterRow = <
   Transcript extends ProviderReplayTranscript,
   Error,
@@ -649,22 +662,17 @@ describe("provider I/O at 0 and 2 workers", () => {
       }),
   );
 
-  it("tells EventSink writes apart by their run and node, except a settle effect's provider-thread write", () => {
+  it("tells EventSink writes apart by their run and node, except a settle effect's provider-thread write for the interrupted run", () => {
     const write = (
       commandId: string | null,
       type: string,
       attribution: { readonly runId?: string; readonly nodeId?: string },
+      payload: Readonly<Record<string, unknown>> = { id: "e" },
     ) =>
       ({
         sequence: 1,
         commandId,
-        event: {
-          id: `event:${commandId}`,
-          type,
-          threadId: "t",
-          payload: { id: "e" },
-          ...attribution,
-        },
+        event: { id: `event:${commandId}`, type, threadId: "t", payload, ...attribution },
       }) as unknown as OrchestrationV2StoredEvent;
     const sinkWrites = (writes: ReadonlyArray<OrchestrationV2StoredEvent>) =>
       normalize({ adapterEvents: [], logLines: [], sinkWrites: writes }, "/no-tmp-root", false)
@@ -678,18 +686,47 @@ describe("provider I/O at 0 and 2 workers", () => {
       sinkWrites([write("c", "run.updated", { runId: "r1", nodeId: "n2" })]),
       ordinary,
     );
-    assert.notDeepEqual(
-      sinkWrites([write("c:background-work-settled", "run.updated", { runId: "r1" })]),
-      sinkWrites([write(null, "run.updated", {})]),
-    );
-    assert.deepStrictEqual(
+
+    // Run r2 (root node n2) was interrupted through provider turn `turn`; r1 (root n1) ran before.
+    const turn = "provider-turn:provider:codex:native-turn:t2";
+    const settle = `effect:command:stop:provider-turn.interrupt:${turn}:background-work-settled`;
+    const records = [
+      write(null, "run.updated", { runId: "r1", nodeId: "n1" }, { id: "r1", rootNodeId: "n1" }),
+      write(null, "run.updated", { runId: "r2", nodeId: "n2" }, { id: "r2", rootNodeId: "n2" }),
+      write(null, "run-attempt.updated", { runId: "r1" }, { id: "a1", runId: "r1" }),
+      write(null, "run-attempt.updated", { runId: "r2" }, { id: "a2", runId: "r2" }),
+      write(null, "provider-turn.updated", { runId: "r2" }, { id: turn, runAttemptId: "a2" }),
+    ];
+    const providerThread = (
+      commandId: string,
+      attribution: { readonly runId?: string; readonly nodeId?: string },
+    ) =>
       sinkWrites([
-        write("c:background-work-settled", "provider-thread.updated", {
-          runId: "r1",
-          nodeId: "n1",
-        }),
-      ]),
-      sinkWrites([write(null, "provider-thread.updated", {})]),
+        ...records,
+        write(commandId, "provider-thread.updated", attribution, { id: "provider-thread" }),
+      ]);
+    const unattributed = providerThread(settle, {});
+    assert.deepStrictEqual(providerThread(settle, { runId: "r2", nodeId: "n2" }), unattributed);
+    // Mutants: an earlier run, the interrupted run on another node, a run or a node alone.
+    for (const misattributed of [
+      { runId: "r1", nodeId: "n1" },
+      { runId: "r2", nodeId: "n1" },
+      { runId: "r2" },
+      { nodeId: "n2" },
+    ]) {
+      assert.notDeepEqual(
+        providerThread(settle, misattributed),
+        unattributed,
+        JSON.stringify(misattributed),
+      );
+    }
+    assert.notDeepEqual(
+      providerThread("c", { runId: "r2", nodeId: "n2" }),
+      providerThread("c", {}),
+    );
+    assert.notDeepEqual(
+      sinkWrites([...records, write(settle, "run.updated", { runId: "r2", nodeId: "n2" })]),
+      sinkWrites([...records, write(settle, "run.updated", {})]),
     );
   });
 

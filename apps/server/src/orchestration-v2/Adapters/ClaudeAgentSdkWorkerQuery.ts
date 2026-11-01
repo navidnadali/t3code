@@ -131,6 +131,16 @@ const callbackOf = (
   return callbacks.hooks?.[event]?.[matcher]?.hooks[index];
 };
 
+// The SDK writes an answer as JSON, and canUseTool's spread with its tool use id. Cloning keeps
+// what JSON converts or drops (toJSON, a Buffer, a function), so only plain data crosses as is.
+const wireAnswer = (call: ClaudeAgentSdkCallbackCall, value: unknown): unknown => {
+  if (isPlainData(value)) return value;
+  const text = JSON.stringify(
+    call.name === "canUseTool" && value !== null ? { ...(value as object) } : value,
+  );
+  return text === undefined ? undefined : JSON.parse(text);
+};
+
 // What the SDK sends the CLI for a callback that throws.
 const sdkErrorText = (error: unknown) => {
   try {
@@ -304,24 +314,6 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     });
   };
 
-  const answer = (
-    reply: Extract<ClaudeAgentSdkWorkerRequest, { readonly type: "callbackResult" }>,
-  ) => {
-    try {
-      session?.notify(reply);
-    } catch {
-      // The SDK writes the answer as JSON, which drops what cloning refuses (such as functions).
-      let result: unknown;
-      try {
-        result = JSON.parse(JSON.stringify(reply.result));
-      } catch (error) {
-        session?.notify({ type: "callbackError", id: reply.id, text: sdkErrorText(error) });
-        return;
-      }
-      session?.notify({ ...reply, result });
-    }
-  };
-
   // A cancelled callback still answers, as in-thread.
   const runCallback = (id: number, call: ClaudeAgentSdkCallbackCall) => {
     const controller = callbacks.get(id);
@@ -336,14 +328,22 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     } catch (error) {
       result = Promise.reject(error);
     }
+    const fail = (error: unknown) =>
+      session?.notify({ type: "callbackError", id, text: sdkErrorText(error) });
     void Promise.resolve(result).then(
       (value) => {
-        if (callbacks.delete(id)) answer({ type: "callbackResult", id, result: value });
+        if (!callbacks.delete(id)) return;
+        let answer: unknown;
+        try {
+          answer = wireAnswer(call, value);
+        } catch (error) {
+          fail(error);
+          return;
+        }
+        session?.notify({ type: "callbackResult", id, result: answer });
       },
       (error: unknown) => {
-        if (callbacks.delete(id)) {
-          session?.notify({ type: "callbackError", id, text: sdkErrorText(error) });
-        }
+        if (callbacks.delete(id)) fail(error);
       },
     );
   };

@@ -668,6 +668,43 @@ describe("WorkerChildProcessSpawner", () => {
   );
 
   it.live.skipIf(!workerPlatform)(
+    "a spawner process that fails kills the children it started before it exits",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const watch = yield* childWatch;
+        // Only the spawner knows this child; the spawner then fails on the child's first output.
+        const source = WorkerChildProcessSpawner.spawnerProcessSource
+          .replace(
+            "if (child.pid !== undefined) started(id, child.pid);",
+            'if (child.pid !== undefined && !message.args.includes("unreported")) started(id, child.pid);',
+          )
+          .replace(
+            'child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));',
+            'child.on("spawn", () => message.args.includes("unreported") || post({ t: "spawn", id, pid: child.pid }));',
+          )
+          .replace(
+            'stream.on("data", (chunk) => {',
+            'stream.on("data", (chunk) => { if (message.args.includes("unreported")) throw new Error("spawner bug");',
+          );
+        expect(source.match(/unreported/g)).toHaveLength(3);
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner, {
+          source,
+        });
+        const pending = yield* Effect.forkScoped(
+          remoteSpawner
+            .spawn(ChildProcess.make(process.execPath, ["-e", watch.connectScript(), "unreported"]))
+            .pipe(Effect.scoped),
+        );
+        yield* watch.closed(yield* watch.connected);
+        expect(summarizeError(yield* Effect.flip(Fiber.join(pending)))).toMatchObject({
+          method: "spawn",
+          causeMessage: "The process spawner stopped",
+        });
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.skipIf(!workerPlatform)(
     "the spawner process kills its children and exits when the server dies",
     () =>
       Effect.gen(function* () {

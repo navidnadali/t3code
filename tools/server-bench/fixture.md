@@ -63,8 +63,9 @@ server does it, so the fixture keeps its production scale and a boot writes noth
    be due on start (the list under Self-check), else the run fails here.
 7. Content pass (below): every string outside the allowlist becomes filler, BLOBs become zeros of their length.
    Triggers are dropped for the pass and restored, then the message search index is rebuilt from the filler.
-   Every thread's projection and event history is decoded with the server's schemas before and after; a thread
-   that read before and not after fails the run (nothing written).
+   Every v2 projection payload and thread event is decoded with the server's schemas before and after, row by
+   row (flat memory on threads with millions of items); a row that decoded before and not after fails the run
+   (nothing written).
 8. `VACUUM INTO` the destination: no free pages, so no deleted or blanked text survives on disk.
 9. Self-check, else delete the destination and fail (below).
 

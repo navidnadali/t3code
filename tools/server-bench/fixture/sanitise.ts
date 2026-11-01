@@ -8,6 +8,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import { type ContentMode, contentFindings, emptyCounts, rewriteContent } from "./content.ts";
+import { undecodableRows } from "./decode.ts";
 import { extendedFindings } from "./extended.ts";
 import { createExclusive, fillExclusive, privateScratchDirectory, withSidecars } from "./guards.ts";
 import { CREDENTIAL_COLUMN, scanDecoded, scanFileBytes } from "./secrets.ts";
@@ -24,7 +25,6 @@ import {
   restartRecovery,
   runnableWork,
   safeDestination,
-  unreadableThreads,
   withEventSink,
   withLegacyImporter,
   withMaintenance,
@@ -686,7 +686,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
         )}`,
       );
     }
-    const readBefore = yield* unreadableThreads.pipe(Effect.provide(withEventSink(scratch)));
+    const readBefore = undecodableRows(scratch);
 
     yield* Console.log(
       mode === "blank"
@@ -705,11 +705,14 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
       catch: (cause) => failed("The content pass failed; nothing written", cause),
     });
     yield* rebuildSearch.pipe(Effect.provide(database(scratch)));
-    const readAfter = yield* unreadableThreads.pipe(Effect.provide(withEventSink(scratch)));
-    const broken = [...readAfter].filter((id) => !readBefore.has(id));
-    if (broken.length > 0) {
+    const readAfter = undecodableRows(scratch);
+    const broken: Record<string, number> = {};
+    for (const row of readAfter) {
+      if (!readBefore.has(row)) bump(broken, row.slice(0, row.lastIndexOf(":")));
+    }
+    if (Object.keys(broken).length > 0) {
       return yield* failed(
-        `The content pass made ${broken.length} thread(s) unreadable (first: ${broken.slice(0, 5).join(", ")}); nothing written.`,
+        `The content pass made rows undecodable, nothing written: ${JSON.stringify(broken)}`,
       );
     }
 
@@ -744,7 +747,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
         ]),
       ),
       content,
-      unreadableThreads: { before: readBefore.size, after: readAfter.size },
+      undecodableRows: { before: readBefore.size, after: readAfter.size },
       check,
     };
     if (report !== undefined) fillExclusive(report, `${JSON.stringify(result, null, 2)}\n`);

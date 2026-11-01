@@ -1,11 +1,9 @@
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { EventId, type OrchestrationV2DomainEvent, ThreadId } from "@t3tools/contracts";
@@ -346,23 +344,3 @@ export const compactEvents = Effect.gen(function* () {
 
 export const withMaintenance = (filename: string) =>
   ProjectionMaintenance.layer.pipe(Layer.provideMerge(withEventSink(filename)));
-
-/**
- * Threads the server cannot read: their projection or their events fail to decode. Compared
- * before and after the content pass, so blanking never breaks a thread that read before.
- */
-export const unreadableThreads = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  const projections = yield* ProjectionStore.ProjectionStoreV2;
-  const events = yield* EventStore.EventStoreV2;
-  const unreadable = new Set<string>();
-  const rows = yield* sql<{ thread_id: string }>`
-    SELECT thread_id FROM orchestration_v2_projection_threads ORDER BY thread_id`;
-  for (const { thread_id } of rows) {
-    const threadId = ThreadId.make(thread_id);
-    const projection = yield* projections.getThreadProjection(threadId).pipe(Effect.exit);
-    const history = yield* events.read({ threadId }).pipe(Stream.runDrain, Effect.exit);
-    if (Exit.isFailure(projection) || Exit.isFailure(history)) unreadable.add(thread_id);
-  }
-  return unreadable;
-});

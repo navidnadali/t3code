@@ -1065,4 +1065,5 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         expect(String(error)).toContain('at ["T3CODE_PROVIDER_IO_WORKERS"]');
       }
     }),
+  );
 });

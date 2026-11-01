@@ -3,28 +3,33 @@ import * as NodeWorkerThreads from "node:worker_threads";
 import type {
   ProviderIoMainMessage,
   ProviderIoStage,
+  ProviderIoStageHost,
   ProviderIoStageSession,
   ProviderIoWorkerMessage,
 } from "./providerIoProtocol.ts";
 
-type AnyStage = ProviderIoStage<never, unknown, never, unknown>;
+type AnyStage = ProviderIoStage<never, unknown, never, unknown, unknown>;
 
 interface WorkerSession {
-  readonly stage: ProviderIoStageSession<unknown, never, unknown>;
+  stage: ProviderIoStageSession<unknown, never, unknown>;
   readonly emit: (output: unknown) => void;
   outputs: Array<unknown>;
   // Credit of chunks that emitted outputs (returned when main takes them) and of silent ones.
   held: number;
   freed: number;
+  finished: boolean;
+  // Async replies, posted after the outputs emitted while they were pending.
+  replies: Array<ProviderIoWorkerMessage>;
+  // Events a stage raises while it takes a chunk (or a notified call), each at its place among the
+  // outputs, posted with them.
+  pushing: boolean;
+  events: Array<{ readonly at: number; readonly event: unknown }>;
 }
 
-const openSession = (stage: AnyStage, options: unknown): WorkerSession => {
-  const buffer = { outputs: new Array<unknown>(), held: 0, freed: 0 };
-  const emit = (output: unknown) => {
-    buffer.outputs.push(output);
-  };
-  return Object.assign(buffer, { stage: stage.open(options as never), emit });
-};
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as { readonly then?: unknown }).then === "function";
 
 // Runs inside the worker bundle, which may require only Node built-ins.
 export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
@@ -37,7 +42,14 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
 
   const post = (message: ProviderIoWorkerMessage) => port.postMessage(message);
 
+  const closeStage = (session: WorkerSession | undefined) => {
+    try {
+      session?.stage.close?.();
+    } catch {}
+  };
+
   const fail = (id: number, error: unknown) => {
+    closeStage(sessions.get(id));
     sessions.delete(id);
     unflushed.delete(id);
     try {
@@ -47,21 +59,36 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
     }
   };
 
-  // An output that cannot be cloned fails only its own session.
+  // An output or event that cannot be cloned fails only its own session. The held credit goes with
+  // the batch holding the last output.
   const flush = (id: number, session: WorkerSession) => {
     unflushed.delete(id);
-    const { outputs, held, freed } = session;
+    const { outputs, held, freed, replies, events } = session;
     session.outputs = [];
     session.held = 0;
     session.freed = 0;
+    session.replies = [];
+    session.events = [];
     try {
       if (freed > 0) post({ type: "output", session: id, outputs: [], bytes: freed });
-      if (outputs.length > 0) post({ type: "output", session: id, outputs, bytes: held });
-      return true;
+      let posted = 0;
+      for (const { at, event } of events) {
+        if (at > posted) {
+          const bytes = at === outputs.length ? held : 0;
+          post({ type: "output", session: id, outputs: outputs.slice(posted, at), bytes });
+          posted = at;
+        }
+        post({ type: "event", session: id, event });
+      }
+      if (outputs.length > posted) {
+        post({ type: "output", session: id, outputs: outputs.slice(posted), bytes: held });
+      }
     } catch (error) {
       fail(id, error);
       return false;
     }
+    for (const message of replies) postReply(message);
+    return true;
   };
 
   const flushAll = () => {
@@ -73,23 +100,121 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
     unflushed.clear();
   };
 
+  const schedule = (id: number) => {
+    unflushed.add(id);
+    if (!flushScheduled) {
+      flushScheduled = true;
+      setImmediate(flushAll);
+    }
+  };
+
+  const postEvent = (id: number, event: unknown) => {
+    try {
+      post({ type: "event", session: id, event });
+      return true;
+    } catch (error) {
+      fail(id, error);
+      return false;
+    }
+  };
+
   // Outputs emitted before a stage throws still reach main ahead of the failure.
   const run = (id: number, session: WorkerSession, step: () => void) => {
+    session.pushing = true;
     try {
       step();
       return true;
     } catch (error) {
       if (flush(id, session)) fail(id, error);
       return false;
+    } finally {
+      session.pushing = false;
     }
   };
 
-  const reply = (id: number, call: number, ok: boolean, value: unknown) => {
+  // Returns false when the session failed on the way.
+  const postEventsRaisedInPush = (id: number, session: WorkerSession) => {
+    return session.events.length === 0 || flush(id, session);
+  };
+
+  const postReply = (message: ProviderIoWorkerMessage) => {
+    if (message.type !== "reply") return;
     try {
-      post({ type: "reply", session: id, call, ok, value });
+      post(message);
     } catch (error) {
-      post({ type: "reply", session: id, call, ok: false, value: new Error(String(error)) });
+      post({ ...message, ok: false, value: new Error(String(error)) });
     }
+  };
+
+  // Replies and events never overtake the outputs their session emitted before them.
+  const flushFirst = (id: number) => {
+    const session = sessions.get(id);
+    return session === undefined || !unflushed.has(id) || flush(id, session);
+  };
+
+  const reply = (id: number, call: number, ok: boolean, value: unknown) => {
+    flushFirst(id);
+    postReply({ type: "reply", session: id, call, ok, value });
+  };
+
+  // An async call settles in the same turn as the work behind it, which may still be emitting.
+  const replyLater = (id: number, call: number, ok: boolean, value: unknown) => {
+    const session = sessions.get(id);
+    if (session === undefined) {
+      reply(id, call, ok, value);
+      return;
+    }
+    session.replies.push({ type: "reply", session: id, call, ok, value });
+    schedule(id);
+  };
+
+  // Registers the session before the stage opens, so the stage can use its host at once.
+  const openSession = (id: number, stage: AnyStage, options: unknown) => {
+    const session: WorkerSession = {
+      stage: { push: () => {}, end: () => {} },
+      outputs: [],
+      held: 0,
+      freed: 0,
+      finished: false,
+      replies: [],
+      pushing: false,
+      events: [],
+      emit: (output) => {
+        session.outputs.push(output);
+      },
+    };
+    const live = () => sessions.get(id) === session;
+    const host: ProviderIoStageHost<unknown, unknown> = {
+      emit: (output) => {
+        if (!live() || session.finished) return;
+        session.outputs.push(output);
+        schedule(id);
+      },
+      signal: (event) => {
+        if (!live()) return;
+        if (session.pushing) {
+          session.events.push({ at: session.outputs.length, event });
+          return;
+        }
+        if (flushFirst(id)) postEvent(id, event);
+      },
+      finish: (...error) => {
+        if (!live() || session.finished) return;
+        session.finished = true;
+        if (!flush(id, session)) return;
+        if (error.length === 0) {
+          post({ type: "end", session: id });
+          return;
+        }
+        try {
+          post({ type: "end", session: id, failed: true, error: error[0] });
+        } catch {
+          post({ type: "end", session: id, failed: true, error: new Error(String(error[0])) });
+        }
+      },
+    };
+    sessions.set(id, session);
+    session.stage = stage.open(options as never, host);
   };
 
   port.on("message", (message: ProviderIoMainMessage) => {
@@ -101,7 +226,7 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
         return;
       }
       try {
-        sessions.set(id, openSession(stage, message.options));
+        openSession(id, stage, message.options);
       } catch (error) {
         fail(id, error);
       }
@@ -121,20 +246,17 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
         if (!run(id, session, () => session.stage.push(message.chunk, session.emit))) return;
         if (session.outputs.length > emitted) session.held += message.chunk.byteLength;
         else session.freed += message.chunk.byteLength;
-        unflushed.add(id);
-        if (!flushScheduled) {
-          flushScheduled = true;
-          setImmediate(flushAll);
-        }
+        if (postEventsRaisedInPush(id, session)) schedule(id);
         return;
       }
       case "eof":
         if (!run(id, session, () => session.stage.end(session.emit))) return;
-        if (!flush(id, session)) return;
+        if (!postEventsRaisedInPush(id, session) || !flush(id, session)) return;
         sessions.delete(id);
         post({ type: "end", session: id });
         return;
       case "close":
+        closeStage(session);
         sessions.delete(id);
         unflushed.delete(id);
         return;
@@ -151,7 +273,23 @@ export const runProviderIoWorker = (stages: ReadonlyArray<AnyStage>) => {
           reply(id, message.call, false, error);
           return;
         }
+        if (isThenable(value)) {
+          value.then(
+            (resolved) => replyLater(id, message.call, true, resolved),
+            (error: unknown) => replyLater(id, message.call, false, error),
+          );
+          return;
+        }
         reply(id, message.call, true, value);
+        return;
+      }
+      case "notify": {
+        const call = session.stage.call;
+        if (call === undefined) return;
+        let value: unknown;
+        if (!run(id, session, () => (value = call(message.request as never)))) return;
+        if (!postEventsRaisedInPush(id, session)) return;
+        if (isThenable(value)) value.then(undefined, () => {});
         return;
       }
     }

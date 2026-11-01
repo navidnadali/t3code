@@ -20,7 +20,7 @@ import { vi } from "vite-plus/test";
 
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
 import type { ProviderIoStage } from "./providerIoProtocol.ts";
-import { echoStage, linesStage } from "./testFixtures/providerIoTestStages.ts";
+import { asyncStage, echoStage, linesStage } from "./testFixtures/providerIoTestStages.ts";
 import { acpWireStage, codexWireStage } from "./testFixtures/providerIoWireStages.ts";
 
 type WorkerMode = "fixture" | "production" | "silent" | "throws" | "inert" | "late";
@@ -30,6 +30,7 @@ const workers = vi.hoisted(() => ({
   started: new Array<NodeWorkerThreads.Worker>(),
   exits: new WeakMap<NodeWorkerThreads.Worker, Promise<number>>(),
   opened: new Array<number>(),
+  received: new Array<string>(),
   posted: new Array<{
     readonly worker: NodeWorkerThreads.Worker;
     readonly type: unknown;
@@ -60,6 +61,13 @@ vi.mock("node:worker_threads", async (importOriginal) => {
       super(...replacements[workers.mode]);
       workers.started.push(this);
       workers.exits.set(this, new Promise((resolve) => this.once("exit", resolve)));
+    }
+    override emit(event: string | symbol, ...args: Array<unknown>) {
+      const [message] = args as [{ readonly type?: unknown } | undefined];
+      if (event === "message" && typeof message?.type === "string") {
+        workers.received.push(message.type);
+      }
+      return super.emit(event, ...args);
     }
     override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
       const [message] = args as [{ readonly type?: unknown; readonly session?: unknown }];
@@ -590,6 +598,37 @@ it.effect("admits an end queued behind a write whose fiber was interrupted", () 
   ),
 );
 
+it.effect("runs a notification only after the writes waiting for credit before it", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = Option.getOrThrow(
+        yield* pool.open({
+          stage: asyncStage,
+          options: undefined,
+          onFailure: toCodexError,
+          kill: Effect.void,
+          highWaterMark: 4,
+          onEvent: (event) => {
+            events.push(event);
+          },
+        }),
+      );
+      yield* session.write(bytes("full"));
+      const write = yield* Effect.forkChild(session.write(bytes("emit-then-signal")), {
+        startImmediately: true,
+      });
+      assert.isTrue(session.notify("signal"));
+      const pull = yield* Stream.toPull(session.output);
+      assert.equal((yield* pull)[0], "late:full");
+      yield* Fiber.join(write);
+      // The chunk's event comes before the notification's: the worker saw the chunk first.
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["signalled-in-push", "event"]);
+    }),
+  ),
+);
+
 it.effect("runs a call only after the writes waiting for credit before it", () =>
   withPool({ workers: 1 }, (pool) =>
     Effect.gen(function* () {
@@ -840,6 +879,153 @@ it.effect("releases the reservation of an open interrupted while it waits for it
       yield* openEcho(pool, "next").pipe(Effect.scoped);
       const lastOpen = workers.posted.filter((message) => message.type === "open").at(-1);
       assert.equal(lastOpen?.worker, poolWorkers[0]);
+    }),
+  ),
+);
+
+const openAsync = (
+  pool: ProviderIoWorkerPool.ProviderIoWorkerPool["Service"],
+  events: Array<string> = [],
+) =>
+  pool
+    .open({
+      stage: asyncStage,
+      options: undefined,
+      onFailure: toCodexError,
+      kill: Effect.void,
+      onEvent: (event) => {
+        events.push(event);
+      },
+    })
+    .pipe(Effect.map(Option.getOrThrow));
+
+it.effect(
+  "delivers outputs and events a stage sends outside push, and ends output with calls open",
+  () =>
+    withPool({ workers: 1 }, (pool) =>
+      Effect.gen(function* () {
+        const events: Array<string> = [];
+        const session = yield* openAsync(pool, events);
+        yield* session.write(bytes("a"));
+        yield* session.write(bytes("b"));
+        assert.equal(yield* session.call("signal"), "signalled");
+        assert.deepEqual(events, ["event"]);
+        assert.equal(yield* session.call("finish"), "finished");
+        assert.deepEqual(yield* Stream.runCollect(session.output), ["late:a", "late:b"]);
+        assert.equal(yield* session.call("after the end"), "after the end");
+      }),
+    ),
+);
+
+it.effect(
+  "fails a stage's output after its outputs when it ends with an error, and keeps calls",
+  () =>
+    withPool({ workers: 1 }, (pool) =>
+      Effect.gen(function* () {
+        let kills = 0;
+        const session = Option.getOrThrow(
+          yield* pool.open({
+            stage: asyncStage,
+            options: undefined,
+            onFailure: toCodexError,
+            kill: Effect.sync(() => {
+              kills += 1;
+            }),
+          }),
+        );
+        yield* session.write(bytes("a"));
+        assert.equal(yield* session.call("fail"), "failed");
+        const outputs: Array<string> = [];
+        const error = yield* Stream.runForEach(session.output, (output) =>
+          Effect.sync(() => outputs.push(output)),
+        ).pipe(Effect.flip);
+        assert.deepEqual(outputs, ["late:a"]);
+        assert.instanceOf(error, CodexAppServerTransportError);
+        const stageError = error.cause as ProviderIoWorkerPool.ProviderIoStageError;
+        assert.equal(stageError.stage, "test-async");
+        assert.equal((stageError.cause as Error).message, "library failed");
+        assert.equal(yield* session.call("after the failure"), "after the failure");
+        assert.equal(kills, 0);
+      }),
+    ),
+);
+
+it.effect("posts an async reply after the outputs emitted while it settled", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const session = yield* openAsync(pool);
+      workers.received.length = 0;
+      assert.equal(yield* session.call("emit-then-settle"), "settled");
+      assert.deepEqual(workers.received, ["output", "reply"]);
+      assert.deepEqual(yield* Stream.runCollect(Stream.take(session.output, 1)), [
+        "emitted-while-settling",
+      ]);
+      const rejected = yield* Effect.flip(session.call("reject"));
+      assert.instanceOf(rejected, CodexAppServerTransportError);
+      assert.equal(
+        ((rejected.cause as ProviderIoWorkerPool.ProviderIoStageError).cause as Error).message,
+        "rejected",
+      );
+    }),
+  ),
+);
+
+it.effect("runs a notified call in order with the others and posts no reply for it", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = yield* openAsync(pool, events);
+      workers.received.length = 0;
+      session.notify("signal");
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["event"]);
+      assert.deepEqual(workers.received, ["event", "reply"]);
+    }),
+  ),
+);
+
+it.effect("runs a stage's close when main closes its session", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const probe = yield* openAsync(pool);
+      const before = Number(yield* probe.call("closed"));
+      yield* Effect.scoped(openAsync(pool));
+      assert.equal(Number(yield* probe.call("closed")), before + 1);
+    }),
+  ),
+);
+
+it.effect("posts an event a stage raises during push after the outputs it emitted first", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = yield* openAsync(pool, events);
+      workers.received.length = 0;
+      yield* session.write(bytes("emit-then-signal"));
+      assert.deepEqual(yield* Stream.runCollect(Stream.take(session.output, 1)), [
+        "emitted-in-push",
+      ]);
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["signalled-in-push"]);
+      assert.deepEqual(workers.received, ["output", "event", "reply"]);
+    }),
+  ),
+);
+
+it.effect("keeps an event a stage raises during push between the outputs around it", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = yield* openAsync(pool, events);
+      workers.received.length = 0;
+      yield* session.write(bytes("emit-signal-emit"));
+      assert.deepEqual(yield* Stream.runCollect(Stream.take(session.output, 2)), [
+        "before-signal",
+        "after-signal",
+      ]);
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["signalled-between"]);
+      assert.deepEqual(workers.received, ["output", "event", "output", "reply"]);
     }),
   ),
 );

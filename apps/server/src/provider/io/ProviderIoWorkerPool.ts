@@ -53,14 +53,27 @@ export interface ProviderIoSession<Output, E, Request = never, Reply = never> {
   readonly end: Effect.Effect<void, E>;
   readonly output: Stream.Stream<Output, E>;
   readonly call: (request: Request) => Effect.Effect<Reply, E>;
+  /** A call nobody waits on, queued like `call`; false when the session takes no more. */
+  readonly notify: (request: Request) => boolean;
 }
 
-export interface ProviderIoOpenInput<Options, Output, E, Request = never, Reply = never> {
-  readonly stage: ProviderIoStage<Options, Output, Request, Reply>;
+export interface ProviderIoOpenInput<
+  Options,
+  Output,
+  E,
+  Request = never,
+  Reply = never,
+  Event = never,
+> {
+  readonly stage: ProviderIoStage<Options, Output, Request, Reply, Event>;
   readonly options: Options;
   readonly onFailure: (error: ProviderIoWorkerError | ProviderIoStageError) => E;
   /** Stops the session's child process when its worker dies. */
   readonly kill: Effect.Effect<void>;
+  /** The child can outlive the session's output (a stage that runs a library), so kill it even then. */
+  readonly killAfterEnd?: boolean;
+  /** Receives the stage's events on main as they arrive, ahead of queued outputs. */
+  readonly onEvent?: (event: Event) => void;
   readonly highWaterMark?: number;
 }
 
@@ -71,8 +84,8 @@ export class ProviderIoWorkerPool extends Context.Service<
      * None when the pool is off or unavailable; the caller then runs the stage in-thread. An
      * open that fails or is interrupted before it returns keeps nothing.
      */
-    readonly open: <Options, Output, E, Request = never, Reply = never>(
-      input: ProviderIoOpenInput<Options, Output, E, Request, Reply>,
+    readonly open: <Options, Output, E, Request = never, Reply = never, Event = never>(
+      input: ProviderIoOpenInput<Options, Output, E, Request, Reply, Event>,
     ) => Effect.Effect<Option.Option<ProviderIoSession<Output, E, Request, Reply>>, E, Scope.Scope>;
   }
 >()("t3/provider/io/ProviderIoWorkerPool") {}
@@ -83,7 +96,8 @@ const DEFAULT_HIGH_WATER_MARK = 1024 * 1024;
 
 interface SessionHandle {
   readonly deliver: (outputs: ReadonlyArray<unknown>, bytes: number) => void;
-  readonly finish: () => void;
+  readonly finish: (failure?: { readonly error: unknown }) => void;
+  readonly event: (event: unknown) => void;
   readonly reply: (call: number, ok: boolean, value: unknown) => void;
   readonly failStage: (cause: unknown) => void;
   readonly failWorker: (error: ProviderIoWorkerError, kill: boolean) => void;
@@ -121,6 +135,7 @@ const parseWorkerMessage = (message: unknown): ProviderIoWorkerMessage | undefin
         : undefined;
     case "end":
     case "fail":
+    case "event":
       return message as ProviderIoWorkerMessage;
     default:
       return undefined;
@@ -217,7 +232,10 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
         session.deliver(message.outputs, message.bytes);
         return;
       case "end":
-        session.finish();
+        session.finish(message.failed === true ? { error: message.error } : undefined);
+        return;
+      case "event":
+        session.event(message.event);
         return;
       case "fail":
         session.failStage(message.error);
@@ -309,9 +327,9 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
   });
 
   // Untraced: the open span already covers it.
-  const makeSession = Effect.fnUntraced(function* <Options, Output, E, Request, Reply>(
+  const makeSession = Effect.fnUntraced(function* <Options, Output, E, Request, Reply, Event>(
     slot: Slot,
-    input: ProviderIoOpenInput<Options, Output, E, Request, Reply>,
+    input: ProviderIoOpenInput<Options, Output, E, Request, Reply, Event>,
   ) {
     const queue = yield* Queue.unbounded<
       { readonly outputs: Arr.NonEmptyReadonlyArray<Output>; readonly bytes: number },
@@ -416,7 +434,10 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       for (const resume of calls.values()) resume(Effect.fail(mapped));
       calls.clear();
       for (const waiter of waiters.splice(0)) waiter.fail(Effect.fail(mapped));
-      if (finished) return;
+      if (finished) {
+        if (kill && input.killAfterEnd === true) runFork(input.kill);
+        return;
+      }
       Queue.failCauseUnsafe(queue, Cause.fail(mapped));
       if (kill) runFork(input.kill);
     };
@@ -440,9 +461,26 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
           release(bytes);
         }
       },
-      finish: () => {
+      // A failed end fails only the output; calls stay open.
+      finish: (end) => {
+        if (failure !== undefined || closed || finished) return;
         finished = true;
-        Queue.endUnsafe(queue);
+        if (end === undefined) {
+          Queue.endUnsafe(queue);
+          return;
+        }
+        Queue.failCauseUnsafe(
+          queue,
+          Cause.fail(
+            input.onFailure(
+              new ProviderIoStageError({ stage: input.stage.name, cause: end.error }),
+            ),
+          ),
+        );
+      },
+      event: (event) => {
+        if (failure !== undefined || closed) return;
+        input.onEvent?.(event as Event);
       },
       reply: (call, ok, value) => {
         const resume = calls.get(call);
@@ -561,6 +599,23 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
             calls.delete(call);
           });
         }),
+      // Queued like a call, after the writes waiting for credit; a request that cannot be cloned
+      // fails the session, since nobody waits on it to hear.
+      notify: (request) => {
+        if (failure !== undefined || closed || slot.stopped) return false;
+        schedule({
+          bytes: 0,
+          admit: () => {
+            try {
+              post({ type: "notify", session: id, request });
+            } catch (cause) {
+              fail(new ProviderIoStageError({ stage: input.stage.name, cause }), false);
+            }
+          },
+          fail: () => {},
+        });
+        return true;
+      },
     };
     return Option.some(session);
   }, Effect.uninterruptible);
@@ -572,7 +627,8 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     E,
     Request,
     Reply,
-  >(input: ProviderIoOpenInput<Options, Output, E, Request, Reply>) {
+    Event,
+  >(input: ProviderIoOpenInput<Options, Output, E, Request, Reply, Event>) {
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const reserved = yield* reserve;
@@ -594,8 +650,8 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
 
   // An open that fails, finds no worker or is interrupted before it returns releases its
   // reservation and session at once; a returned session belongs to the caller's scope.
-  const open = <Options, Output, E, Request = never, Reply = never>(
-    input: ProviderIoOpenInput<Options, Output, E, Request, Reply>,
+  const open = <Options, Output, E, Request = never, Reply = never, Event = never>(
+    input: ProviderIoOpenInput<Options, Output, E, Request, Reply, Event>,
   ): Effect.Effect<Option.Option<ProviderIoSession<Output, E, Request, Reply>>, E, Scope.Scope> =>
     options.workers === 0
       ? Effect.succeedNone

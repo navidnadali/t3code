@@ -1231,52 +1231,76 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
     }),
   );
 
-  it.effect("reads only a bounded number of reads ahead of a line still off-thread", () =>
+  it.effect("keeps at most 16 reads pending behind lines still off-thread", () =>
     Effect.gen(function* () {
       const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
       const { stdio } = yield* makeInMemoryStdio();
       const routed: Array<string> = [];
-      const offloaded = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
+      const releases = [yield* Deferred.make<void>(), yield* Deferred.make<void>()];
       const allRouted = yield* Deferred.make<void>();
       const count = 64;
       const decode = AcpOffload.makeOffloadedLineDecoder();
+      let calls = 0;
+      let pulls = 0;
+      // Every fiber that can run does, until it waits; no clock involved.
+      const settle = Effect.forEach(Array.from({ length: 64 }), () => Effect.yieldNow, {
+        discard: true,
+      });
       yield* AcpProtocol.makeAcpPatchedProtocol({
         // One read per pull, as a pipe delivers them.
-        stdio: { ...stdio, stdin: Stream.fromEffectRepeat(Queue.take(input)) },
+        stdio: {
+          ...stdio,
+          stdin: Stream.fromEffectRepeat(
+            Queue.take(input).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  pulls += 1;
+                }),
+              ),
+            ),
+          ),
+        },
         serverRequestMethods: new Set(),
         lineOffload: {
           minChars: 200,
+          // The first two worker calls answer only when released.
           decode: (line) =>
-            Deferred.succeed(offloaded, undefined).pipe(
-              Effect.andThen(Deferred.await(release)),
-              Effect.as(decode(line)),
-            ),
+            Effect.suspend(() => {
+              const release = releases[calls++];
+              return release === undefined ? Effect.void : Deferred.await(release);
+            }).pipe(Effect.as(decode(line))),
           failure: Effect.never,
         },
         onNotification: (notification) =>
           Effect.suspend(() => {
             routed.push(notification.method);
-            return routed.length === count + 1
+            return routed.length === count + 2
               ? Deferred.succeed(allRouted, undefined)
               : Effect.void;
           }).pipe(Effect.asVoid),
       });
 
       yield* Queue.offer(input, encoder.encode(`${update(long)}\n`));
-      yield* Deferred.await(offloaded);
+      yield* Queue.offer(input, encoder.encode(`${update(`${long}2`)}\n`));
       for (let index = 0; index < count; index++) {
         yield* Queue.offer(input, encoder.encode(`${extNotification(`x/${index}`)}\n`));
       }
-      yield* Effect.yieldNow;
-      yield* Effect.yieldNow;
-      // Stdout waits once enough reads are pending behind the long line, and none overtakes it.
-      assert.isAbove(yield* Queue.size(input), 0);
+      // 16 reads pending and one more taken, waiting for a slot; none overtakes the long lines.
+      yield* settle;
       assert.deepEqual(routed, []);
+      assert.isAtMost(pulls, 17);
+      assert.isAbove(yield* Queue.size(input), 0);
 
-      yield* Deferred.succeed(release, undefined);
+      // One read handled frees one slot, also while the second long line is still on the worker.
+      yield* Deferred.succeed(releases[0]!, undefined);
+      yield* settle;
+      assert.deepEqual(routed, ["session/update"]);
+      assert.isAtMost(pulls, 18);
+
+      yield* Deferred.succeed(releases[1]!, undefined);
       yield* Deferred.await(allRouted);
       assert.deepEqual(routed, [
+        "session/update",
         "session/update",
         ...Array.from({ length: count }, (_, index) => `x/${index}`),
       ]);

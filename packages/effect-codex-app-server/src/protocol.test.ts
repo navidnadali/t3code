@@ -977,51 +977,76 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
     }),
   );
 
-  it.effect("reads only a bounded number of reads ahead of a line still off-thread", () =>
+  it.effect("keeps at most 16 reads pending behind lines still off-thread", () =>
     Effect.gen(function* () {
       const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
       const { stdio } = yield* makeInMemoryStdio();
       const routed: Array<string> = [];
-      const offloaded = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
+      const releases = [yield* Deferred.make<void>(), yield* Deferred.make<void>()];
       const allRouted = yield* Deferred.make<void>();
       const count = 64;
+      let calls = 0;
+      let pulls = 0;
+      // Every fiber that can run does, until it waits; no clock involved.
+      const settle = Effect.forEach(Array.from({ length: 64 }), () => Effect.yieldNow, {
+        discard: true,
+      });
       yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
         // One read per pull, as a pipe delivers them.
-        stdio: Stdio.make({ ...stdio, stdin: Stream.fromEffectRepeat(Queue.take(input)) }),
+        stdio: Stdio.make({
+          ...stdio,
+          stdin: Stream.fromEffectRepeat(
+            Queue.take(input).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  pulls += 1;
+                }),
+              ),
+            ),
+          ),
+        }),
         lineOffload: {
           minChars: 64,
+          // The first two worker calls answer only when released.
           decode: (line) =>
-            Deferred.succeed(offloaded, undefined).pipe(
-              Effect.andThen(Deferred.await(release)),
-              Effect.as(CodexOffload.decodeOffloadedLine(line)),
-            ),
+            Effect.suspend(() => {
+              const release = releases[calls++];
+              return release === undefined ? Effect.void : Deferred.await(release);
+            }).pipe(Effect.as(CodexOffload.decodeOffloadedLine(line))),
           writeLog: () => Effect.void,
           failure: Effect.never,
         },
         onNotification: (notification) =>
           Effect.suspend(() => {
             routed.push(notification.method);
-            return routed.length === count + 1
+            return routed.length === count + 2
               ? Deferred.succeed(allRouted, undefined)
               : Effect.void;
           }).pipe(Effect.asVoid),
       });
 
       yield* Queue.offer(input, encoder.encode(`${longLine}\n`));
-      yield* Deferred.await(offloaded);
+      yield* Queue.offer(input, encoder.encode(`${longLine}\n`));
       for (let index = 0; index < count; index++) {
         yield* Queue.offer(input, encoder.encode(`${shortLine(`x/${index}`)}\n`));
       }
-      yield* Effect.yieldNow;
-      yield* Effect.yieldNow;
-      // Stdout waits once enough reads are pending behind the long line, and none overtakes it.
-      assert.isAbove(yield* Queue.size(input), 0);
+      // 16 reads pending, one more waiting for a slot and one the termination watch
+      // (`Stream.interruptWhen`) pulls ahead, as in-thread; none overtakes the long lines.
+      yield* settle;
       assert.deepEqual(routed, []);
+      assert.isAtMost(pulls, 18);
+      assert.isAbove(yield* Queue.size(input), 0);
 
-      yield* Deferred.succeed(release, undefined);
+      // One read handled frees one slot, also while the second long line is still on the worker.
+      yield* Deferred.succeed(releases[0]!, undefined);
+      yield* settle;
+      assert.deepEqual(routed, ["item/agentMessage/delta"]);
+      assert.isAtMost(pulls, 19);
+
+      yield* Deferred.succeed(releases[1]!, undefined);
       yield* Deferred.await(allRouted);
       assert.deepEqual(routed, [
+        "item/agentMessage/delta",
         "item/agentMessage/delta",
         ...Array.from({ length: count }, (_, index) => `x/${index}`),
       ]);

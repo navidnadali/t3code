@@ -1089,12 +1089,13 @@ const layerMakeServer = Layer.unwrap(
       layerTailscaleServe,
       layerCloudDesiredLinkReconcile,
       HeapSnapshot.layer,
-      ProviderIoStageTiming.layerReporter,
     );
 
     return layerServerApplication.pipe(
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
       Layer.provideMerge(layerRuntimeServices),
+      // Built before the runtime, so its final report runs after provider sessions close.
+      Layer.provideMerge(ProviderIoStageTiming.layerReporter),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
           Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),

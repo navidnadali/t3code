@@ -31,6 +31,10 @@ import * as EffectAcpErrors from "effect-acp/errors";
 
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import {
+  makeProviderIoStageRecorder,
+  ProviderIoStageTiming,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import {
   makeProviderReplayGate,
@@ -642,8 +646,9 @@ describe("AcpRegistryAdapterV2", () => {
       }).pipe(Effect.provide(layerTest), Effect.scoped),
     );
 
-    it.effect("switches a mode config option under its own id", () =>
-      openWithStoredPicks({
+    it.effect("switches a mode config option under its own id", () => {
+      const stageTiming = makeProviderIoStageRecorder(() => 0);
+      return openWithStoredPicks({
         setup: { configOptions: [permissionModeOption("ask")] },
         pickFrames: [
           outbound("session/set_config_option", {
@@ -654,8 +659,22 @@ describe("AcpRegistryAdapterV2", () => {
           answer("session/set_config_option", { configOptions: [permissionModeOption("auto")] }),
         ],
         storedModePick: "auto",
-      }).pipe(Effect.provide(layerTest), Effect.scoped),
-    );
+      }).pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            const timed = stageTiming.drain();
+            assert.isTrue(timed.some(({ stage }) => stage === "json"));
+            assert.deepEqual(
+              [...new Set(timed.map(({ provider }) => provider))],
+              [ACP_REGISTRY_PROVIDER],
+            );
+          }),
+        ),
+        Effect.provideService(ProviderIoStageTiming, stageTiming),
+        Effect.provide(layerTest),
+        Effect.scoped,
+      );
+    });
 
     const modelOption = (id: string, currentValue: string, grouped = false) => ({
       id,

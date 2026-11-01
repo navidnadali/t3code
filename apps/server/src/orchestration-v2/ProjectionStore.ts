@@ -7310,22 +7310,43 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       (...args: Args): Effect.Effect<A, E, R> =>
         method(...args).pipe(NodeSqliteClient.readOnly);
 
-    // Reads of a thread's history, whole or a page of it, take a reader permit before their
-    // transaction and keep it until decoded, so the pool size bounds how many such row sets exist,
-    // decoded inside the transaction or after it. Other reads take none and never wait behind a
-    // large decode. A read inside a transaction keeps that transaction's connection.
+    // Reads of a thread's history, whole or a page, hold a reader permit from before their
+    // transaction until decoded, so the pool size bounds those row sets. Reads whose rows the history
+    // does not multiply (thread row, shells, bookkeeping at a few KB per run) take none and never
+    // wait behind a large decode. A read inside a transaction keeps that transaction's connection.
+    const permitsToTake = Effect.serviceOption(sql.transactionService).pipe(
+      Effect.map((transaction) => (Option.isNone(transaction) ? readerPermits : undefined)),
+    );
     const historyOnReader =
       <Args extends ReadonlyArray<unknown>, A, E, R>(
         method: (...args: Args) => Effect.Effect<A, E, R>,
       ) =>
       (...args: Args): Effect.Effect<A, E, R> =>
-        Effect.serviceOption(sql.transactionService).pipe(
-          Effect.flatMap((transaction) =>
-            readerPermits === undefined || Option.isSome(transaction)
-              ? method(...args)
-              : readerPermits.withPermits(1)(method(...args)),
+        permitsToTake.pipe(
+          Effect.flatMap((permits) =>
+            permits === undefined ? method(...args) : permits.withPermits(1)(method(...args)),
           ),
           NodeSqliteClient.readOnly,
+        );
+    // The same for a stream, holding the permit until the stream ends.
+    const historyStreamOnReader =
+      <Args extends ReadonlyArray<unknown>, A, E, R>(
+        method: (...args: Args) => Stream.Stream<A, E, R>,
+      ) =>
+      (...args: Args): Stream.Stream<A, E, R> =>
+        Stream.unwrap(
+          permitsToTake.pipe(
+            Effect.flatMap((permits) =>
+              permits === undefined
+                ? Effect.void
+                : Effect.uninterruptibleMask((restore) =>
+                    restore(permits.take(1)).pipe(
+                      Effect.andThen(Effect.addFinalizer(() => permits.release(1))),
+                    ),
+                  ),
+            ),
+            Effect.as(method(...args)),
+          ),
         );
 
     return {
@@ -7387,8 +7408,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThreadSnapshotWindow: historyOnReader(getThreadSnapshotWindow),
       getTimelinePage: historyOnReader(getTimelinePage),
       getThreadHistoryPage: historyOnReader(getThreadHistoryPage),
-      searchThread: readOnReader(searchThread),
-      searchThreadStream,
+      searchThread: historyOnReader(searchThread),
+      searchThreadStream: historyStreamOnReader(searchThreadStream),
       getThreadAttachmentIds: readOnReader(getThreadAttachmentIds),
     } satisfies ProjectionStoreV2Shape;
   }),

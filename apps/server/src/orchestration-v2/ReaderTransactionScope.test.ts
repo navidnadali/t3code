@@ -1084,3 +1084,20 @@ it.effect.each(largeReads)("waits for a reader permit for a $name read", (permit
     ),
   ),
 );
+
+it.effect("gives back a streamed search's reader permit however the stream ends", () =>
+  withFileStore(
+    "reader-scope-search-permit-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("search-permit", 2);
+      const search = store.searchThreadStream({ threadId: fixture.fork, query: "fork" });
+      yield* Effect.exit(Stream.runCollect(search));
+      yield* Effect.exit(Stream.runHead(search));
+      // The pool has one permit; a kept one would leave this read waiting.
+      const snapshot = yield* store.getThreadSnapshot(fixture.fork);
+      assert.strictEqual(snapshot.projection.thread.id, fixture.fork);
+    }),
+    1,
+  ),
+);

@@ -30,6 +30,7 @@ import * as CliError from "effect/cli/CliError";
 import { readBootstrapEnvelope } from "../bootstrap.ts";
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
+import { DEFAULT_SLOW_SPAN_THRESHOLD_MS } from "../diagnostics/TraceDiagnostics.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 
@@ -124,6 +125,11 @@ const EnvServerConfig = Config.all({
   traceMaxBytes: Config.Int("T3CODE_TRACE_MAX_BYTES").pipe(Config.withDefault(10 * 1024 * 1024)),
   traceMaxFiles: traceMaxFilesConfig,
   traceBatchWindowMs: Config.Int("T3CODE_TRACE_BATCH_WINDOW_MS").pipe(Config.withDefault(1_000)),
+  // Capped at the Diagnostics slow-span cutoff, so a counted span is never a slow one.
+  traceSqlMinDurationMs: Config.schema(
+    Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: DEFAULT_SLOW_SPAN_THRESHOLD_MS })),
+    "T3CODE_TRACE_SQL_MIN_DURATION_MS",
+  ).pipe(Config.withDefault(0)),
   otlpTracesUrl: Config.String("T3CODE_OTLP_TRACES_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -506,6 +512,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     traceBatchWindowMs: env.traceBatchWindowMs,
     traceMaxBytes: env.traceMaxBytes,
     traceMaxFiles: env.traceMaxFiles,
+    ...(env.traceSqlMinDurationMs > 0 ? { traceSqlMinDurationMs: env.traceSqlMinDurationMs } : {}),
     otlpTracesUrl: traces?.url,
     otlpMetricsUrl: metrics?.url,
     otlpLogsUrl: logs?.url,

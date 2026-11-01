@@ -53,8 +53,8 @@ Important fields common to both record types:
 `effect-span` records also contain `exit` with `Success`, `Failure`, or `Interrupted`. `otlp-span`
 records instead carry OTLP resource, scope, and optional status fields.
 
-The `TraceRecord`, `EffectTraceRecord`, and `OtlpTraceRecord` schemas live in
-`packages/shared/src/observability.ts`.
+The `TraceRecord`, `EffectTraceRecord`, `OtlpTraceRecord`, and `SpanSummaryTraceRecord` schemas
+live in `packages/shared/src/observability.ts`.
 
 SQL statement spans (named `sqlite`) and `sql.transaction` spans carry `db.connection` and
 `db.lock_wait_ms`. `db.connection` is `writer` for the main connection, which runs on the event loop,
@@ -74,6 +74,32 @@ far in the future for the environment server's allowed window. It can point to
 a date or time problem on either device, but it can also result from a delayed
 request.
 
+#### Fast SQL spans
+
+SQL spans are most of the file on a busy server. `T3CODE_TRACE_SQL_MIN_DURATION_MS` (default `0`,
+which writes every span) counts short ones instead of writing them. A `sqlite` or `sql.transaction`
+span is counted when it succeeded, ran for less than that many milliseconds, waited less than
+0.1 ms for its connection, and carries no log message. Taking a free connection measures a few
+microseconds, so a smaller `db.lock_wait_ms` is not a wait. Every other span is still written,
+including failed, interrupted, slow, and lock-waited SQL spans.
+
+Every minute, and when the server stops, it writes one `span-summary` record per span name it
+counted: `name`, `count`, `totalDurationMs`, `maxDurationMs`, the `thresholdMs`, and
+`startTimeUnixNano` and `endTimeUnixNano` from the first counted start to the last counted end. It
+has no `durationMs`, `traceId`, or `spanId`. `t3 trace summary` and Settings > Diagnostics add
+these counts to the span counts; a percentile that falls among them prints as `<2ms` for a 2 ms
+threshold. A crash or kill loses up to a minute of these counts; slow, failed, and lock-waited
+spans are still written as they end.
+
+With the filter on:
+
+- A written span can name a counted span as its `parentSpanId`, for example a span inside a fast
+  transaction. Treat a parent that is missing from the file as a counted SQL span.
+- Heap attribution skips SQL spans, because a span is only known to be fast when it ends. Their
+  heap growth shows on the enclosing span.
+- OTLP export still receives every span.
+- It is off while `T3CODE_TRACE_TIMING_ENABLED` is `false`, since every span then lasts 0 ms.
+
 #### Summarize the trace file
 
 `t3 trace summary` reads the trace file and its rotated backups directly, so it works while the
@@ -87,7 +113,9 @@ t3 trace summary --since 30m --limit 40
 It reads `T3CODE_TRACE_FILE` if set, else `<home>/userdata/logs/server.trace.ndjson` for
 `--base-dir` or `T3CODE_HOME`, plus the `T3CODE_TRACE_MAX_FILES` rotated backups. For a dev run or
 a copied file, set `T3CODE_TRACE_FILE`. `--since 30m` keeps spans that ended in the last 30
-minutes. The rate is per minute between the first and last span end.
+minutes. The rate is per minute between the first and last span end. A `span-summary` record
+(see [Fast SQL spans](#fast-sql-spans)) counts from its start, and `--since` keeps the whole
+record when it ends inside the window.
 
 ### Metrics
 
@@ -605,6 +633,9 @@ Local trace file:
 - `T3CODE_TRACE_BATCH_WINDOW_MS`: flush window, default `1000`
 - `T3CODE_TRACE_MIN_LEVEL`: minimum trace level, default `Info`
 - `T3CODE_TRACE_TIMING_ENABLED`: enable timing metadata, default `true`
+- `T3CODE_TRACE_SQL_MIN_DURATION_MS`: count successful SQL spans shorter than this many
+  milliseconds instead of writing them, default `0` (write all), at most `1000`, the Diagnostics
+  slow-span cutoff. See [Fast SQL spans](#fast-sql-spans).
 
 OTLP export:
 

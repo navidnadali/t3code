@@ -214,6 +214,32 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
       }),
   );
 
+  it.effect("reads a SQL span threshold up to the slow-span cutoff and rejects any other", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-trace-sql-" })),
+      );
+      const resolveThreshold = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.traceSqlMinDurationMs),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveThreshold({})).toBeUndefined();
+      expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "0" })).toBeUndefined();
+      expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "2.5" })).toBe(2.5);
+      expect(yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: "1000" })).toBe(1_000);
+      for (const value of ["-1", "2ms", "NaN", "Infinity", "1000.5"]) {
+        const error = yield* resolveThreshold({ T3CODE_TRACE_SQL_MIN_DURATION_MS: value }).pipe(
+          Effect.flip,
+        );
+        expect(String(error)).toMatch(/at \["T3CODE_TRACE_SQL_MIN_DURATION_MS"\]/);
+      }
+    }),
+  );
+
   it.effect("enables a trimmed reusable auth token only for web dev mode", () =>
     Effect.gen(function* () {
       const baseDir = yield* FileSystem.FileSystem.pipe(

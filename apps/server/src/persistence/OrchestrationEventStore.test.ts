@@ -668,7 +668,8 @@ it.effect.each(["coalesced", "distinct"] as const)(
           return yield* Effect.die("Expected project.created");
         // Three aggregates updated over and over: the buffer only needs their newest events.
         // Distinct aggregates are each a key, so the cap still ends the stream for them.
-        const burst = keys === "coalesced" ? 3 * LIVE_STREAM_MAX_ITEMS + 3 : LIVE_STREAM_MAX_ITEMS + 1;
+        const burst =
+          keys === "coalesced" ? 3 * LIVE_STREAM_MAX_ITEMS + 3 : LIVE_STREAM_MAX_ITEMS + 1;
         const events = Array.from({ length: burst }, (_, index) => ({
           ...projectEvent,
           eventId: EventId.make(`event:keyed-${keys}:${index}`),
@@ -735,7 +736,9 @@ it.effect.each(["coalesced", "distinct"] as const)(
           // The last event may land in a second pull; either way only the newest per key arrives.
           assert.isAtMost(delivered.length, 2 * projectIds.length);
           assert.isTrue(
-            delivered.every(([, sequence], index) => index === 0 || sequence > delivered[index - 1]![1]),
+            delivered.every(
+              ([, sequence], index) => index === 0 || sequence > delivered[index - 1]![1],
+            ),
           );
           const newestByProject = new Map(delivered);
           assert.deepEqual(

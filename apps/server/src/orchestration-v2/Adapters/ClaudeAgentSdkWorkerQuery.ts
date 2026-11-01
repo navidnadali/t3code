@@ -144,14 +144,17 @@ const callbackOf = (
   return callbacks.hooks?.[event]?.[matcher]?.hooks[index];
 };
 
-// The answer as the SDK writes it to the CLI (canUseTool's with its tool use id): cloning the value
-// instead would keep what JSON converts (toJSON, a Buffer) and fail on what JSON reads (a Proxy).
-const answerJson = (call: ClaudeAgentSdkCallbackCall, value: unknown): string | undefined =>
-  JSON.stringify(
-    call.name === "canUseTool" && value !== null
+// The SDK's response field for the answer, as it writes it to the CLI (canUseTool's spread with its
+// tool use id), or undefined for a null answer, which it does not answer. Cloning the value instead
+// would keep what JSON converts (toJSON, a Buffer) and fail on what JSON reads (a Proxy).
+const answerJson = (call: ClaudeAgentSdkCallbackCall, value: unknown): string | undefined => {
+  if (value === null && call.name !== "hook") return undefined;
+  const response =
+    call.name === "canUseTool"
       ? { ...(value as object), toolUseID: call.args[2].toolUseID }
-      : value,
-  );
+      : value;
+  return JSON.stringify({ response });
+};
 
 // What the SDK sends the CLI for a callback that throws.
 const sdkErrorText = (error: unknown) => {

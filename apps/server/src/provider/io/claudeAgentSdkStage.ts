@@ -105,7 +105,7 @@ export type ClaudeAgentSdkWorkerRequest =
       readonly signal: NodeJS.Signals | null;
     }
   | { readonly type: "error"; readonly error: ClaudeAgentSdkProcessError }
-  // The answer as JSON text, undefined when JSON drops it.
+  // The SDK's response field for the answer as JSON (`{"response":…}`), undefined for a null answer.
   | { readonly type: "callbackResult"; readonly id: number; readonly json: string | undefined }
   // The text the SDK sends the CLI for a callback that threw.
   | { readonly type: "callbackError"; readonly id: number; readonly text: string };
@@ -319,9 +319,17 @@ const makeCallbackRelay = (signal: Signal, read: () => number) => {
     const callback = pending.get(request.id);
     if (callback === undefined) return;
     pending.delete(request.id);
-    if (request.type === "callbackResult") {
-      callback.resolve(request.json === undefined ? undefined : JSON.parse(request.json));
-    } else callback.reject(new Error(request.text));
+    if (request.type === "callbackError") {
+      callback.reject(new Error(request.text));
+      return;
+    }
+    if (request.json === undefined) {
+      callback.resolve(null);
+      return;
+    }
+    // Whatever the SDK does with it (canUseTool's spread copies an own toJSON), it writes this.
+    const { response } = JSON.parse(request.json) as { readonly response?: unknown };
+    callback.resolve({ toJSON: () => response });
   };
 
   // Only after the query closed: the SDK sends nothing for a callback that settles then.

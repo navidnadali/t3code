@@ -53,8 +53,8 @@ Important fields common to both record types:
 `effect-span` records also contain `exit` with `Success`, `Failure`, or `Interrupted`. `otlp-span`
 records instead carry OTLP resource, scope, and optional status fields.
 
-The `TraceRecord`, `EffectTraceRecord`, and `OtlpTraceRecord` schemas live in
-`packages/shared/src/observability.ts`.
+The `TraceRecord`, `EffectTraceRecord`, `OtlpTraceRecord`, and `SpanSummaryTraceRecord` schemas
+live in `packages/shared/src/observability.ts`.
 
 SQL statement spans (named `sqlite`) and `sql.transaction` spans carry `db.connection` and
 `db.lock_wait_ms`. `db.connection` is `writer` for the main connection, which runs on the event loop,
@@ -63,11 +63,42 @@ span spent waiting for that connection, behind other SQL. That wait does not blo
 so subtract it before you blame a slow span on the query. Statements inside a transaction use its
 connection and do not carry these attributes.
 
+An MCP request over HTTP has a `McpHttpServer.authenticateRequest` span that covers only admitting
+it: the credential check, the mode limit, and the Linked environments gate. The request runs after
+it, under the `McpServer.…/<method>` span, and each tool call has its own `mcp.tool.<name>` span
+that times it. That span's attributes name the tool, never its arguments.
+
 DPoP proof failures include the safe `environment.dpop.failure_code` span
 attribute. A `time_window` failure means that a signed proof was too old or too
 far in the future for the environment server's allowed window. It can point to
 a date or time problem on either device, but it can also result from a delayed
 request.
+
+#### Fast SQL spans
+
+SQL spans are most of the file on a busy server. `T3CODE_TRACE_SQL_MIN_DURATION_MS` (default `0`,
+which writes every span) counts short ones instead of writing them. A `sqlite` or `sql.transaction`
+span is counted when it succeeded, ran for less than that many milliseconds, waited less than
+0.1 ms for its connection, and carries no log message. Taking a free connection measures a few
+microseconds, so a smaller `db.lock_wait_ms` is not a wait. Every other span is still written,
+including failed, interrupted, slow, and lock-waited SQL spans.
+
+Every minute, and when the server stops, it writes one `span-summary` record per span name it
+counted: `name`, `count`, `totalDurationMs`, `maxDurationMs`, the `thresholdMs`, and
+`startTimeUnixNano` and `endTimeUnixNano` from the first counted start to the last counted end. It
+has no `durationMs`, `traceId`, or `spanId`. `t3 trace summary` and Settings > Diagnostics add
+these counts to the span counts; a percentile that falls among them prints as `<2ms` for a 2 ms
+threshold. A crash or kill loses up to a minute of these counts; slow, failed, and lock-waited
+spans are still written as they end.
+
+With the filter on:
+
+- A written span can name a counted span as its `parentSpanId`, for example a span inside a fast
+  transaction. Treat a parent that is missing from the file as a counted SQL span.
+- Heap attribution skips SQL spans, because a span is only known to be fast when it ends. Their
+  heap growth shows on the enclosing span.
+- OTLP export still receives every span.
+- It is off while `T3CODE_TRACE_TIMING_ENABLED` is `false`, since every span then lasts 0 ms.
 
 #### Summarize the trace file
 
@@ -82,7 +113,9 @@ t3 trace summary --since 30m --limit 40
 It reads `T3CODE_TRACE_FILE` if set, else `<home>/userdata/logs/server.trace.ndjson` for
 `--base-dir` or `T3CODE_HOME`, plus the `T3CODE_TRACE_MAX_FILES` rotated backups. For a dev run or
 a copied file, set `T3CODE_TRACE_FILE`. `--since 30m` keeps spans that ended in the last 30
-minutes. The rate is per minute between the first and last span end.
+minutes. The rate is per minute between the first and last span end. A `span-summary` record
+(see [Fast SQL spans](#fast-sql-spans)) counts from its start, and `--since` keeps the whole
+record when it ends inside the window.
 
 ### Metrics
 
@@ -130,6 +163,17 @@ waiting. Read CPU together with page faults:
 - Low CPU with few major page faults points at synchronous disk I/O, such as SQLite reads or trace
   file writes.
 - Many `involuntaryContextSwitches` mean other processes were competing for the CPU.
+
+Every Git command is a child process, and Node creates each one synchronously on the thread that
+spawns it (`posix_spawn` on macOS, `fork` on Linux): about a millisecond of event loop per command,
+around 30 commands per turn. `T3CODE_VCS_SPAWN_WORKER=true` starts the processes of `VcsProcess` and
+`GitVcsDriver` (checkpoints, status, refs, source control CLIs) on a worker thread instead, with the
+same output, exit codes and errors. Git run through other services, such as the cached repository
+identity lookup, still spawns on the event loop. On Linux a `fork` from the worker still write-locks
+the server's address space while page tables are copied, interrupts every CPU running the server to
+flush its TLB, and leaves copy-on-write faults for the event loop, so measure before enabling it.
+With the knob on, those services run real processes even when a test injects a fake
+`ChildProcessSpawner`. Unset or `false` spawns them on the event loop, as Windows always does.
 
 ### Related Artifacts
 
@@ -600,6 +644,9 @@ Local trace file:
 - `T3CODE_TRACE_BATCH_WINDOW_MS`: flush window, default `1000`
 - `T3CODE_TRACE_MIN_LEVEL`: minimum trace level, default `Info`
 - `T3CODE_TRACE_TIMING_ENABLED`: enable timing metadata, default `true`
+- `T3CODE_TRACE_SQL_MIN_DURATION_MS`: count successful SQL spans shorter than this many
+  milliseconds instead of writing them, default `0` (write all), at most `1000`, the Diagnostics
+  slow-span cutoff. See [Fast SQL spans](#fast-sql-spans).
 
 OTLP export:
 
@@ -654,6 +701,22 @@ per page load for the UI, and the Expo session on mobile. A `service.instance.id
 
 If the OTLP URLs are unset, local tracing still works, metrics stay in-process only, and logs stay
 on stdout only.
+
+SQLite memory, in MiB. Unset or `0` keeps SQLite's default: a 2000 KiB page cache per connection and
+no memory map.
+
+- `T3CODE_SQLITE_CACHE_MB`: page cache of the main connection, which does every write
+- `T3CODE_SQLITE_READER_CACHE_MB`: page cache of each reader worker
+- `T3CODE_SQLITE_MMAP_MB`: experimental memory map for the main connection and each reader worker, at
+  most `2047` with Node's bundled SQLite
+
+Each connection allocates its cache as it reads pages, up to the limit, so the cost is the main
+connection's plus each reader worker's, up to `T3CODE_SQLITE_READER_POOL` (default 4) of them.
+Readers drop their cache and memory map whenever another connection commits, so the main connection
+gains most. While the database is mapped, an I/O error or a truncation from outside SQLite raises
+SIGBUS and terminates the process. CLI commands that open the database, such as `t3 project`,
+`t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
+as well as the server.
 
 ### The Kill Switch
 

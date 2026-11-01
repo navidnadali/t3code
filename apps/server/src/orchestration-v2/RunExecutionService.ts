@@ -105,6 +105,9 @@ const NATIVE_SUBAGENT_TURN_ORIGIN: ProviderEventIngestor.ProviderTurnOrigin = {
   subagent: true,
 };
 
+// Smaller takes mean the run keeps up; this keeps the backlog span off the per-event path.
+const PROVIDER_EVENT_BACKLOG_SPAN_MIN = 32;
+
 const backgroundCapableTurnItemTypes: ReadonlySet<OrchestrationV2TurnItem["type"]> = new Set([
   "command_execution",
   "dynamic_tool",
@@ -610,6 +613,7 @@ export const layer: Layer.Layer<
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+    const providerEventBatching = yield* ProviderEventIngestor.ProviderEventBatching;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const mcpAppModelContext = yield* McpAppModelContext.McpAppModelContext;
     const previewAgentActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
@@ -1089,26 +1093,38 @@ export const layer: Layer.Layer<
           }
           yield* Ref.set(rootRunFinalized, true);
         });
-        // Runs for every provider event, including streamed text updates; avoid a per-event span.
-        const trackChildLifecycle = Effect.fnUntraced(function* (
+        // The event's changes to the run's child and background tracking, applied after its write.
+        // Membership that would not change is left out, so a repeated running update tracks nothing.
+        const childLifecycleUpdates = (
           event: ProviderAdapter.ProviderAdapterV2Event,
           deliverable: boolean,
-        ) {
-          const routing = yield* Ref.get(eventRouting);
+          routing: ProviderEventRoutingState,
+          tracked: {
+            readonly childProviderTurns: ReadonlySet<ProviderTurnId>;
+            readonly backgroundTurnItems: ReadonlySet<OrchestrationV2TurnItem["id"]>;
+          },
+        ) => {
+          const updates: Array<Effect.Effect<void>> = [];
           if (event.type === "provider_turn.updated") {
             const isRoot =
               event.providerTurn.runAttemptId === input.attempt.id ||
               event.providerTurn.id === routing.rootProviderTurnId;
-            if (!isRoot) {
-              yield* Ref.update(activeChildProviderTurns, (current) => {
-                const next = new Set(current);
-                if (isTerminalProviderTurnStatus(event.providerTurn.status)) {
-                  next.delete(event.providerTurn.id);
-                } else {
-                  next.add(event.providerTurn.id);
-                }
-                return next;
-              });
+            if (
+              !isRoot &&
+              isTerminalProviderTurnStatus(event.providerTurn.status) ===
+                tracked.childProviderTurns.has(event.providerTurn.id)
+            ) {
+              updates.push(
+                Ref.update(activeChildProviderTurns, (current) => {
+                  const next = new Set(current);
+                  if (isTerminalProviderTurnStatus(event.providerTurn.status)) {
+                    next.delete(event.providerTurn.id);
+                  } else {
+                    next.add(event.providerTurn.id);
+                  }
+                  return next;
+                }),
+              );
             }
           }
           if (event.type === "subagent.updated") {
@@ -1117,15 +1133,17 @@ export const layer: Layer.Layer<
               event.subagent.threadId !== input.run.threadId &&
               routing.ownedThreadIds.has(event.subagent.threadId);
             if (belongsToRootRun || belongsToOwnedChildThread) {
-              yield* Ref.update(activeChildSubagents, (current) => {
-                const next = new Map(current);
-                if (isSettledSubagentStatus(event.subagent.status)) {
-                  next.delete(event.subagent.id);
-                } else {
-                  next.set(event.subagent.id, event.subagent.threadId);
-                }
-                return next;
-              });
+              updates.push(
+                Ref.update(activeChildSubagents, (current) => {
+                  const next = new Map(current);
+                  if (isSettledSubagentStatus(event.subagent.status)) {
+                    next.delete(event.subagent.id);
+                  } else {
+                    next.set(event.subagent.id, event.subagent.threadId);
+                  }
+                  return next;
+                }),
+              );
             }
             // Preserve childThreadId linkage for the root-run lifetime even after the subagent
             // row terminalizes, so open child-thread nodes can still be proven linked on a
@@ -1137,16 +1155,18 @@ export const layer: Layer.Layer<
                 event.subagent.runId === null &&
                 event.subagent.origin === "provider_native")
             ) {
-              yield* Ref.update(openRunOwnedSubagents, (current) => {
-                const withLink = withLinkedChildThreadId(current, event.subagent.childThreadId);
-                const subagents = new Map(withLink.subagents);
-                if (isSettledSubagentStatus(event.subagent.status)) {
-                  subagents.delete(event.subagent.id);
-                } else {
-                  subagents.set(event.subagent.id, event.subagent);
-                }
-                return { ...withLink, subagents };
-              });
+              updates.push(
+                Ref.update(openRunOwnedSubagents, (current) => {
+                  const withLink = withLinkedChildThreadId(current, event.subagent.childThreadId);
+                  const subagents = new Map(withLink.subagents);
+                  if (isSettledSubagentStatus(event.subagent.status)) {
+                    subagents.delete(event.subagent.id);
+                  } else {
+                    subagents.set(event.subagent.id, event.subagent);
+                  }
+                  return { ...withLink, subagents };
+                }),
+              );
             }
           }
           if (event.type === "node.updated") {
@@ -1162,17 +1182,19 @@ export const layer: Layer.Layer<
                 (event.node.runId === null || event.node.runId === input.run.id)
               )
             ) {
-              return;
+              return updates;
             }
-            yield* Ref.update(openRunOwnedSubagents, (current) => {
-              const nodes = new Map(current.nodes);
-              if (isOpenExecutionNodeStatus(event.node.status)) {
-                nodes.set(event.node.id, event.node);
-              } else {
-                nodes.delete(event.node.id);
-              }
-              return { ...current, nodes };
-            });
+            updates.push(
+              Ref.update(openRunOwnedSubagents, (current) => {
+                const nodes = new Map(current.nodes);
+                if (isOpenExecutionNodeStatus(event.node.status)) {
+                  nodes.set(event.node.id, event.node);
+                } else {
+                  nodes.delete(event.node.id);
+                }
+                return { ...current, nodes };
+              }),
+            );
           }
           if (event.type === "turn_item.updated") {
             const belongsToRootRun = event.turnItem.runId === input.run.id;
@@ -1185,48 +1207,57 @@ export const layer: Layer.Layer<
               inheritedBackgroundTurnItemsById.get(event.turnItem.id) === event.turnItem.runId;
             if (
               backgroundCapableTurnItemTypes.has(event.turnItem.type) &&
-              (belongsToRootRun || belongsToOwnedChildThread || belongsToInheritedBackgroundItem)
+              (belongsToRootRun || belongsToOwnedChildThread || belongsToInheritedBackgroundItem) &&
+              isSettledTurnItemStatus(event.turnItem.status) ===
+                tracked.backgroundTurnItems.has(event.turnItem.id)
             ) {
-              yield* Ref.update(activeBackgroundTurnItems, (current) => {
-                const next = new Set(current);
-                if (isSettledTurnItemStatus(event.turnItem.status)) {
-                  next.delete(event.turnItem.id);
-                } else {
-                  next.add(event.turnItem.id);
-                }
-                return next;
-              });
+              updates.push(
+                Ref.update(activeBackgroundTurnItems, (current) => {
+                  const next = new Set(current);
+                  if (isSettledTurnItemStatus(event.turnItem.status)) {
+                    next.delete(event.turnItem.id);
+                  } else {
+                    next.add(event.turnItem.id);
+                  }
+                  return next;
+                }),
+              );
             }
             if (
               belongsToOwnedChildThread &&
               (event.turnItem.runId === null || belongsToRootRun) &&
               deliverable
             ) {
-              yield* Ref.update(openRunOwnedSubagents, (current) => {
-                const childTurnItems = new Map(current.childTurnItems);
-                if (isSettledTurnItemStatus(event.turnItem.status)) {
-                  childTurnItems.delete(event.turnItem.id);
-                } else {
-                  childTurnItems.set(event.turnItem.id, event.turnItem);
-                }
-                return { ...current, childTurnItems };
-              });
+              updates.push(
+                Ref.update(openRunOwnedSubagents, (current) => {
+                  const childTurnItems = new Map(current.childTurnItems);
+                  if (isSettledTurnItemStatus(event.turnItem.status)) {
+                    childTurnItems.delete(event.turnItem.id);
+                  } else {
+                    childTurnItems.set(event.turnItem.id, event.turnItem);
+                  }
+                  return { ...current, childTurnItems };
+                }),
+              );
             }
             if (belongsToRootRun && event.turnItem.type === "subagent") {
               const subagentItem = event.turnItem;
-              yield* Ref.update(openRunOwnedSubagents, (current) => {
-                const withLink = withLinkedChildThreadId(current, subagentItem.childThreadId);
-                const turnItems = new Map(withLink.turnItems);
-                if (isSettledTurnItemStatus(subagentItem.status)) {
-                  turnItems.delete(subagentItem.subagentId);
-                } else {
-                  turnItems.set(subagentItem.subagentId, subagentItem);
-                }
-                return { ...withLink, turnItems };
-              });
+              updates.push(
+                Ref.update(openRunOwnedSubagents, (current) => {
+                  const withLink = withLinkedChildThreadId(current, subagentItem.childThreadId);
+                  const turnItems = new Map(withLink.turnItems);
+                  if (isSettledTurnItemStatus(subagentItem.status)) {
+                    turnItems.delete(subagentItem.subagentId);
+                  } else {
+                    turnItems.set(subagentItem.subagentId, subagentItem);
+                  }
+                  return { ...withLink, turnItems };
+                }),
+              );
             }
           }
-        });
+          return updates;
+        };
         const agentTurnsSettled = Effect.gen(function* () {
           if (!(yield* Ref.get(rootTerminalSeen))) {
             return false;
@@ -1293,11 +1324,51 @@ export const layer: Layer.Layer<
         // Ends once the root turn and the children it drives settle. Background commands such
         // as a dev server keep this consumer alive afterwards and must not pin preview focus.
         const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
+        // Events that writing can defer until the end of what was queued, up to the batch limits;
+        // they are written before anything that reads or orders against them.
+        const deferredIngest: Array<ProviderEventIngestor.ProviderEventIngestInput> = [];
+        let deferredBytes = 0;
+        const flushDeferredIngest = Effect.suspend(() => {
+          deferredBytes = 0;
+          const events = deferredIngest.splice(0);
+          return events.length === 0
+            ? Effect.void
+            : events.length === 1
+              ? providerEventIngestor.ingestNormalized(events[0]!).pipe(Effect.asVoid)
+              : providerEventIngestor.ingestNormalizedBatch({ events }).pipe(Effect.asVoid);
+        });
         const providerEventFiber = yield* eventSubscription.events.pipe(
-          Stream.mapEffect((event) =>
+          Stream.chunks,
+          // A take holds everything that was queued for this run, so its size is the backlog.
+          Stream.tap((events) =>
+            events.length < PROVIDER_EVENT_BACKLOG_SPAN_MIN
+              ? Effect.void
+              : Effect.void.pipe(
+                  Effect.withSpan("RunExecutionService.providerEventBacklog", {
+                    attributes: {
+                      "orchestration_v2.run_id": input.run.id,
+                      "orchestration_v2.ingest.queued": events.length,
+                    },
+                  }),
+                ),
+          ),
+          Stream.flatMap((events) =>
+            Stream.fromIterable(
+              events.map((event, index) => ({ event, lastQueued: index === events.length - 1 })),
+            ),
+          ),
+          Stream.mapEffect(({ event, lastQueued }) =>
             Effect.gen(function* () {
               const previous = yield* Ref.get(eventRouting);
               const [accepted, routing] = routeProviderEvent(event, routeIdentity, previous);
+              // Deferred writes must commit before state that failure cleanup reads moves past them.
+              if (
+                !ProviderEventIngestor.canIngestInBatch(event) ||
+                routing.rootProviderTurnId !== previous.rootProviderTurnId ||
+                routing.rootTurnEnded !== previous.rootTurnEnded
+              ) {
+                yield* flushDeferredIngest;
+              }
               yield* Ref.set(eventRouting, routing);
               if (
                 event.type === "subagent.updated" &&
@@ -1371,12 +1442,15 @@ export const layer: Layer.Layer<
                   (current) => new Set([...current].filter((id) => !detached.itemIds.has(id))),
                 );
               }
-              return { event, accepted };
+              return { event, accepted, lastQueued };
             }),
           ),
-          Stream.tap(({ event, accepted }) =>
+          Stream.tap(({ event, accepted, lastQueued }) =>
             Effect.gen(function* () {
-              if (!accepted) return;
+              if (!accepted) {
+                if (lastQueued) yield* flushDeferredIngest;
+                return;
+              }
               if (
                 event.type === "provider_turn.updated" &&
                 event.providerTurn.runAttemptId === input.attempt.id &&
@@ -1389,12 +1463,21 @@ export const layer: Layer.Layer<
                 event,
                 DateTime.toEpochMillis(yield* DateTime.now),
               );
+              const lifecycleUpdates = childLifecycleUpdates(
+                event,
+                deliveredEvent !== null,
+                yield* Ref.get(eventRouting),
+                {
+                  childProviderTurns: yield* Ref.get(activeChildProviderTurns),
+                  backgroundTurnItems: yield* Ref.get(activeBackgroundTurnItems),
+                },
+              );
               if (deliveredEvent) {
                 const rootTerminalAlreadySeen = yield* Ref.get(rootTerminalSeen);
                 const isRootProviderThreadUpdate =
                   event.type === "provider_thread.updated" &&
                   event.providerThread.id === input.providerThread.id;
-                const storedEvents = yield* providerEventIngestor.ingestNormalized({
+                const ingestInput = {
                   analyticsContext: {
                     modelSelection: input.modelSelection,
                     runtimeMode: input.runtimePolicy.runtimeMode,
@@ -1429,8 +1512,28 @@ export const layer: Layer.Layer<
                           },
                         }
                     : {}),
-                });
-                storedEventCount = storedEvents.length;
+                };
+                // An event that changes child or background tracking is written first, so that
+                // tracking only ever reflects committed events.
+                if (
+                  providerEventBatching.maxEvents > 1 &&
+                  lifecycleUpdates.length === 0 &&
+                  ProviderEventIngestor.canIngestInBatch(deliveredEvent)
+                ) {
+                  deferredIngest.push(ingestInput);
+                  // @effect-diagnostics-next-line preferSchemaOverJson:off - a size estimate for the budget, not a codec.
+                  deferredBytes += JSON.stringify(deliveredEvent).length;
+                  if (
+                    deferredIngest.length >= providerEventBatching.maxEvents ||
+                    deferredBytes >= providerEventBatching.maxBytes
+                  ) {
+                    yield* flushDeferredIngest;
+                  }
+                } else {
+                  yield* flushDeferredIngest;
+                  storedEventCount = (yield* providerEventIngestor.ingestNormalized(ingestInput))
+                    .length;
+                }
                 if (
                   isRootProviderThreadUpdate &&
                   rootTerminalAlreadySeen &&
@@ -1445,6 +1548,7 @@ export const layer: Layer.Layer<
                 event.turnItem.streaming &&
                 !reservedHeldTurnItemIds.has(event.turnItem.id)
               ) {
+                yield* flushDeferredIngest;
                 yield* turnItemPositions.allocate({
                   threadId: event.turnItem.threadId,
                   turnItemId: event.turnItem.id,
@@ -1466,6 +1570,7 @@ export const layer: Layer.Layer<
                 );
               }
               if (event.type === "turn.terminal") {
+                yield* flushDeferredIngest;
                 yield* Ref.set(terminalEvent, event);
                 yield* Ref.set(rootTerminalSeen, true);
                 yield* finalizeRootRun(event);
@@ -1477,7 +1582,8 @@ export const layer: Layer.Layer<
                   pendingBackgroundProviderTurns.delete(event.providerTurnId);
                 }
               }
-              yield* trackChildLifecycle(event, deliveredEvent !== null);
+              yield* Effect.all(lifecycleUpdates, { discard: true });
+              if (lastQueued) yield* flushDeferredIngest;
             }),
           ),
           // Also after events this run does not accept, such as a child handed to another run.
@@ -1486,7 +1592,11 @@ export const layer: Layer.Layer<
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
             }),
           ),
-          Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
+          Stream.takeUntilEffect(() =>
+            shouldStopProviderEventIngestion.pipe(
+              Effect.tap((stop) => (stop ? flushDeferredIngest : Effect.void)),
+            ),
+          ),
           Stream.runDrain,
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>

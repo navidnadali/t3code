@@ -4,8 +4,11 @@ import { assert, it } from "@effect/vitest";
 import {
   AuthSessionId,
   EnvironmentId,
+  EventId,
+  MessageId,
   ProjectId,
   ThreadId,
+  TurnItemId,
   ProviderDriverKind,
   ProviderInstanceId,
   WS_METHODS,
@@ -29,6 +32,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
 import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
 import * as SqlClient from "effect/sql/SqlClient";
+import { vi } from "vite-plus/test";
 
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as ServerBrowser from "./preview/ServerBrowser.ts";
@@ -41,6 +45,7 @@ import * as AntigravityInstallation from "./provider/AntigravityInstallation.ts"
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
+import * as CommandReceiptStore from "./orchestration-v2/CommandReceiptStore.ts";
 import * as CodexInstallation from "./provider/CodexInstallation.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
@@ -374,6 +379,104 @@ it.effect("coalesces streaming replay before synchronization and the live tail",
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
+it.effect("shares each live event item across subscribers and dedupes bodies per subscriber", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-live");
+    const messageId = MessageId.make("message:shared-live");
+    const at = DateTime.makeUnsafe("2026-10-31T00:00:00.000Z");
+    const owner = { threadId, runId: null, nodeId: null, createdAt: at, updatedAt: at };
+    // DateTime memoizes its formatted parts, so only the plain records are frozen.
+    const freeze = <A>(value: A): A => {
+      if (typeof value === "object" && value !== null && !DateTime.isDateTime(value)) {
+        for (const child of Object.values(value)) freeze(child);
+        Object.freeze(value);
+      }
+      return value;
+    };
+    const live: ReadonlyArray<OrchestrationV2StoredEvent> = freeze([
+      {
+        sequence: 1,
+        commandId: null,
+        event: {
+          id: EventId.make("event:shared-live:message"),
+          type: "message.updated",
+          threadId,
+          occurredAt: at,
+          payload: {
+            ...owner,
+            id: messageId,
+            role: "assistant",
+            text: "Done",
+            attachments: [],
+            streaming: false,
+            createdBy: "agent",
+            creationSource: "provider",
+          },
+        },
+      },
+      {
+        sequence: 2,
+        commandId: null,
+        event: {
+          id: EventId.make("event:shared-live:reply"),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: at,
+          payload: {
+            ...owner,
+            id: TurnItemId.make("item:shared-live:reply"),
+            type: "assistant_message",
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            title: null,
+            status: "completed",
+            messageId,
+            text: "Done",
+            streaming: false,
+            startedAt: at,
+            completedAt: at,
+          },
+        },
+      },
+    ] as ReadonlyArray<OrchestrationV2StoredEvent>);
+    const stringify = yield* Effect.acquireRelease(
+      Effect.sync(() => vi.spyOn(JSON, "stringify")),
+      (spy) => Effect.sync(() => spy.mockRestore()),
+    );
+    // The EventSink hands every subscriber the same projected objects.
+    const subscribe = (acceptDedupedBodies: boolean) =>
+      subscribeOrchestrationV2Thread({ threadId, afterSequence: 0, acceptDedupedBodies }).pipe(
+        Effect.flatMap(Stream.runCollect),
+        Effect.map((items) => Array.from(items)),
+        Effect.provideService(ThreadManagement.ThreadManagementService, {
+          ensureLegacyTranscript: () => Effect.void,
+          streamStoredEventsFrom: () => Stream.fromIterable(live),
+        } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+      );
+    const [deduped, first, second] = yield* Effect.forEach([true, false, false], subscribe);
+
+    assert.lengthOf(first!, live.length);
+    first!.forEach((item, index) => {
+      assert.strictEqual(item, second![index]);
+      assert.strictEqual(item.kind === "event" && item.event, live[index]!.event);
+    });
+    assert.strictEqual(deduped![0], first![0]);
+    const reply = deduped![1];
+    assert.deepInclude(reply?.kind === "event" ? reply.event.payload : undefined, {
+      text: "",
+      textOmitted: true,
+    });
+    // The live buffer sizes each shared item once, not once per subscriber.
+    assert.lengthOf(
+      stringify.mock.calls.filter(([value]) => value?.kind === "event"),
+      live.length,
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
 it.effect("shell snapshots omit idle children and older settled threads only on request", () =>
   Effect.gen(function* () {
     const shell = (
@@ -474,6 +577,82 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
     assert.deepEqual(withoutOld?.olderSettled?.counts, [
       { projectId: ProjectId.make("project"), count: 1 },
     ]);
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("shell subscribers share one thread shell read per event", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shared-shell-read");
+    const now = "2026-10-31T00:00:00.000Z";
+    const [event] = yield* sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        'shared-shell-read:0', 'thread', ${threadId}, 0, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:shared", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+    const reads: Array<ThreadId> = [];
+    const shell = { id: threadId, archivedAt: null } as unknown as OrchestrationV2ThreadShell;
+    const subscriber = subscribeOrchestrationV2Shell({
+      afterSequence: 0,
+      requestCompletionMarker: true,
+    }).pipe(
+      Effect.flatMap((stream) =>
+        stream.pipe(
+          Stream.takeUntil((item) => item.kind === "synchronized"),
+          Stream.runCollect,
+        ),
+      ),
+    );
+
+    const [first, second] = yield* Effect.all([subscriber, subscriber], {
+      concurrency: "unbounded",
+    }).pipe(
+      Effect.provide(
+        ThreadManagement.layer.pipe(
+          Layer.provide(
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              listActiveSubagentThreadIds: () => Effect.succeed([]),
+              getThreadShell: (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
+            }),
+          ),
+          Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(CommandReceiptStore.layer),
+        ),
+      ),
+      Effect.provideService(ProjectStore.ProjectStoreV2, {
+        listShells: () => Effect.succeed([]),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+      Effect.provideService(ProjectService.ProjectService, {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"]),
+      Effect.provideServiceEffect(
+        ProjectEnrichment.ProjectEnrichmentService,
+        PubSub.unbounded().pipe(
+          Effect.map(
+            (changes) =>
+              ({
+                subscribeChanges: PubSub.subscribe(changes),
+              }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+          ),
+        ),
+      ),
+    );
+
+    for (const items of [first, second]) {
+      assert.deepEqual(
+        items.flatMap((item) =>
+          item.kind === "thread.updated" ? [[item.sequence, item.thread.id]] : [],
+        ),
+        [[event!.sequence, threadId]],
+      );
+    }
+    assert.deepEqual(reads, [threadId]);
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 

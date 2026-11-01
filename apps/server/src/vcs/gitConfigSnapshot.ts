@@ -312,7 +312,7 @@ const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
 const CONFIG_SNAPSHOT_LOAD_ATTEMPTS = 3;
 const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
 const REF_RESULTS_CAPACITY = 256;
-const REPOSITORY_PATH_COUNT = 13;
+const REPOSITORY_PATH_COUNT = 12;
 const FILE_RESULTS_CAPACITY = 64;
 const REUSED_RESULTS_CAPACITY = 64;
 // Ref names whose loose file Git's files backend keeps at <common dir>/<name>: refs shared by every
@@ -372,7 +372,6 @@ const REPOSITORY_PATH_ARGS = [
   "objects",
   "--git-path",
   "refs",
-  "--git-common-dir",
   "--git-path",
   "index",
   "--git-path",
@@ -472,11 +471,9 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       head,
       objects,
       refs,
-      gitCommonDir,
       absoluteIndexPath,
       infoExclude,
     ] = paths as [
-      string,
       string,
       string,
       string,
@@ -577,7 +574,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       commonDir: refStorage === undefined || refStorage === "files" ? path.dirname(refs) : null,
       toplevel,
       prefixSegments: segments,
-      gitCommonDir,
+      gitCommonDir: path.dirname(refs),
       absoluteIndexPath,
       objectsDir: objects,
       headPath: head,

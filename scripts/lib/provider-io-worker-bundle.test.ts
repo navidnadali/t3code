@@ -225,6 +225,11 @@ it.effect("refuses at run time a load the build could not see", () =>
         '  () => (process as any).getBuiltinModule(name("re", "pl")).start,\n' +
         '  () => import(name("node:", "inspector")).then((m: any) => m.Session),\n' +
         '  () => (process as any).getBuiltinModule(name("inspector", "/promises")).Session,\n' +
+        // A direct eval sees the scope the bundle is compiled in: the guard's own bindings must
+        // not be part of it.
+        '  () => eval(name("Node", "Module")).registerHooks,\n' +
+        '  () => eval(name("buil", "tin"))(name("node:", "module")).Module,\n' +
+        '  () => eval(name("thr", "eads")).Worker,\n' +
         "];\n" +
         "void Promise.all(attempts.map(async (attempt) => {\n" +
         "  try {\n" +
@@ -236,7 +241,7 @@ it.effect("refuses at run time a load the build could not see", () =>
     const results = yield* runEmbedded(source, dir);
     assert.deepEqual(
       results,
-      Array.from({ length: 20 }, () => "refused"),
+      Array.from({ length: 23 }, () => "refused"),
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

@@ -11,6 +11,7 @@ import {
   ProjectId,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -159,6 +160,24 @@ const writeDatabase = Effect.fn("fixture.synth.write")(function* (
   return written;
 });
 
+/**
+ * The two columns the server stamps with the wall clock (when each migration ran, when the
+ * projection last moved) set to the synth's own `now`, so the same shape and seed give the same
+ * bytes. Kept in the formats the server writes.
+ */
+const pinWallClock = (path: string, now: number) => {
+  const iso = DateTime.formatIso(DateTime.makeUnsafe(now));
+  const db = new NodeSqlite.DatabaseSync(path);
+  try {
+    db.prepare(`UPDATE effect_sql_migrations SET created_at = ?`).run(
+      iso.slice(0, 19).replace("T", " "),
+    );
+    db.prepare(`UPDATE orchestration_v2_projection_metadata SET updated_at = ?`).run(iso);
+  } finally {
+    db.close();
+  }
+};
+
 export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput) {
   const destination = yield* safeDestination({
     destination: input.destination,
@@ -217,6 +236,7 @@ export const runSynth = Effect.fn("fixture.synth")(function* (input: SynthInput)
       ),
     );
     yield* Console.log(`Wrote ${events} events; compacting into ${destination}...`);
+    pinWallClock(scratch, now);
     owned.file(destination);
     yield* compactInto(scratch, destination);
 

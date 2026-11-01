@@ -215,6 +215,9 @@ not filler). "A boot writes nothing" holds for synth output as written and for s
 - Events: one per entity, plus the shape's extra updates per event type (compactable types stay at first + latest,
   so the store's compaction finds nothing to delete).
 - Not written: tables the generator has no model for (pull request links, v1 sessions, …) show as `0 / target`.
+- The same shape, `--scale`, `--seed` and flags give the same bytes: the two columns the server stamps with the
+  wall clock (`effect_sql_migrations.created_at`, `orchestration_v2_projection_metadata.updated_at`) are set to
+  the synth's newest activity time (`--now`, else the shape's `capturedAt`).
 - `--provider`, `--driver`, `--model` set the instance threads use (default `claudeAgent`, `claude-sonnet-4-6`);
   project folders sit under `--workspace-root` (default `/t3-bench-synthetic`, never created).
 

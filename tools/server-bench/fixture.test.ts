@@ -1316,9 +1316,12 @@ describe("allowlist limits", () => {
       inputTokens: 1234,
       exitCode: 1,
       auth: { expiresIn: 3600 },
-      // Test tallies, not credentials: ws1's data has these under `pass` and `PASS`.
+      // No exemption for `pass`: a tally there costs a bench fixture nothing, a password a lot.
       runs: { pass: 12, fail: 1 },
       PASS: 3,
+      db_pass: 20241231,
+      smtp: { pass: 654321 },
+      dbPass: 4242,
     });
     const stored = rewriteContent(payload, "payload_json", "blank", emptyCounts());
     expect(stored.length).toBe(payload.length);
@@ -1332,10 +1335,39 @@ describe("allowlist limits", () => {
       out.auth,
       out.runs,
       out.PASS,
-    ]).toEqual([0, 0, 0, 1234, 1, { expiresIn: 0 }, { pass: 12, fail: 1 }, 3]);
-    const kinds: Array<string> = [];
-    contentFindings(JSON.stringify({ pin: 123456 }), null, "blank", (kind) => kinds.push(kind));
-    expect(kinds).toEqual(["credential-number"]);
+      out.db_pass,
+      out.smtp,
+      out.dbPass,
+    ]).toEqual([0, 0, 0, 1234, 1, { expiresIn: 0 }, { pass: 0, fail: 1 }, 0, 0, { pass: 0 }, 0]);
+    // The re-review's cases, planted after sanitising: the check must report each.
+    const planted = (value: unknown) => {
+      const kinds: Array<string> = [];
+      contentFindings(JSON.stringify(value), null, "blank", (kind) => kinds.push(kind));
+      return kinds;
+    };
+    expect([
+      planted({ pin: 123456 }),
+      planted({ db_pass: 20241231 }),
+      planted({ pass: 77310042 }),
+      planted({ smtp: { pass: 654321 } }),
+      planted({ pass: { id: "q8Zr3Vt9Lp2Xw7MsHn4Kd8Yb" } }),
+    ]).toEqual([
+      ["credential-number"],
+      ["credential-number"],
+      ["credential-number"],
+      ["credential-number"],
+      ["not-blanked"],
+    ]);
+    // ... and sanitising blanks an id under a pass-named ancestor.
+    const nested = JSON.parse(
+      rewriteContent(
+        JSON.stringify({ pass: { id: "q8Zr3Vt9Lp2Xw7MsHn4Kd8Yb" } }),
+        "payload_json",
+        "blank",
+        emptyCounts(),
+      ),
+    ) as { pass: { id: string } };
+    expect(isFiller(nested.pass.id)).toBe(true);
   });
 
   // The project timeout (60 s) is the linearity check: a quadratic rule needs minutes on 1 MB here.

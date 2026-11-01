@@ -69,4 +69,25 @@ describe("blanking pass memory", () => {
     ]);
     expect(Object.fromEntries(step.value)).toEqual({ "github-token": 1 });
   });
+
+  // Rowids run from -2^63: the first batch must include the smallest one.
+  it("rewrites a row at the smallest rowid", () => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fixture-rowid-"));
+    onTestFinished(() => NodeFS.rmSync(directory, { recursive: true, force: true }));
+    const db = new NodeSqlite.DatabaseSync(NodePath.join(directory, "edge.sqlite"));
+    db.exec(`CREATE TABLE notes (title TEXT)`);
+    const insert = db.prepare(`INSERT INTO notes (rowid, title) VALUES (?, ?)`);
+    for (const rowid of [-(2n ** 63n), -1n, 0n, 1n, 2n ** 63n - 1n])
+      insert.run(rowid, "Title kept?");
+    const pass = blankTables(db, ["notes"], "blank", { rows: 2, bytes: 1_000_000 });
+    let rows = 0;
+    for (let step = pass.next(); step.done !== true; step = pass.next()) rows += step.value.rows;
+    const left = db
+      .prepare(`SELECT COUNT(*) AS n FROM notes WHERE title = 'Title kept?'`)
+      .get() as {
+      n: number;
+    };
+    expect([rows, left.n]).toEqual([5, 0]);
+    db.close();
+  });
 });

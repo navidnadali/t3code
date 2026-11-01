@@ -132,22 +132,24 @@ const killChildren = () => {
     } catch {}
   }
 };
-process.on("disconnect", () => {
+// Launched detached, the spawner leads its own process group (never the server's): ending that group
+// also ends what children spawned with detached: false left behind, and the spawner with them.
+const exitWithGroup = (code) => {
   killChildren();
-  process.exit(0);
-});
+  try {
+    if (process.pid > 1) process.kill(-process.pid, "SIGKILL");
+  } catch {}
+  process.exit(code);
+};
+process.on("disconnect", () => exitWithGroup(0));
 process.on("uncaughtException", (error) => {
-  killChildren();
   try {
     require("node:fs").writeSync(2, "t3-process-spawner: " + (error && error.stack ? error.stack : String(error)) + "\\n");
   } catch {}
-  process.exit(70);
+  exitWithGroup(70);
 });
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-  process.once(signal, () => {
-    killChildren();
-    process.kill(process.pid, signal);
-  });
+  process.once(signal, () => exitWithGroup(128 + require("node:os").constants.signals[signal]));
 }
 `;
 

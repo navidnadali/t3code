@@ -96,12 +96,15 @@ it.effect("fails the build when the plugin never replaces its placeholder", () =
 );
 
 // Builds the worker through the plugin and returns the embedded source a server would run.
-const embeddedSource = (worker: string) =>
+const embeddedSource = (worker: string, files: Record<string, string> = {}) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-io-embedded-" });
     yield* fs.writeFileString(path.join(dir, "worker.ts"), worker);
+    for (const [file, content] of Object.entries(files)) {
+      yield* fs.writeFileString(path.join(dir, file), content);
+    }
     yield* fs.writeFileString(path.join(dir, "placeholder.ts"), placeholderSource);
     yield* fs.writeFileString(
       path.join(dir, "host.ts"),
@@ -132,46 +135,98 @@ const embeddedSource = (worker: string) =>
     return host.source;
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
+// The worker's first message, or its startup error.
+const runEmbedded = (source: string, workerData?: unknown) =>
+  Effect.callback<unknown>((resume) => {
+    const worker = new NodeWorkerThreads.Worker(source, { eval: true, workerData });
+    worker.once("message", (message) => {
+      void worker.terminate();
+      resume(Effect.succeed(message));
+    });
+    worker.once("error", (error) => resume(Effect.succeed(`worker error: ${String(error)}`)));
+  });
+
 it.effect("refuses at run time a load the build could not see", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-io-planted-" });
-    const planted = path.join(dir, "planted.cjs");
-    yield* fs.writeFileString(planted, 'module.exports = "PLANTED";\n');
+    yield* fs.writeFileString(path.join(dir, "planted.cjs"), 'module.exports = "PLANTED";\n');
     yield* fs.writeFileString(path.join(dir, "planted.mjs"), 'export default "PLANTED";\n');
+    yield* fs.makeDirectory(path.join(dir, "node_modules", "planted"), { recursive: true });
+    yield* fs.writeFileString(
+      path.join(dir, "node_modules", "planted", "index.js"),
+      'module.exports = "PLANTED-BARE";\n',
+    );
     // Every name is computed at run time, so only the worker's own guard can refuse these.
     const source = yield* embeddedSource(
-      'import * as NodeWorkerThreads from "node:worker_threads";\n' +
+      'import * as NodeModule from "node:module";\n' +
+        'import * as NodeURL from "node:url";\n' +
+        'import * as NodeWorkerThreads from "node:worker_threads";\n' +
         "const dir = NodeWorkerThreads.workerData as string;\n" +
         'const name = (...parts: Array<string>) => parts.join("");\n' +
         "const global = globalThis as any;\n" +
         "const code = (function () {}).constructor as any;\n" +
+        'const planted = dir + "/planted.cjs";\n' +
+        "const viaModule = (Module: any, file: string) => {\n" +
+        "  const loaded = new Module(file);\n" +
+        "  loaded.load(file);\n" +
+        "  return loaded.exports;\n" +
+        "};\n" +
+        'const globalModule = () => global[name("mod", "ule")].constructor;\n' +
         "const attempts = [\n" +
         '  () => require(name(dir, "/planted.cjs")),\n' +
-        '  () => (require as any).call(null, dir + "/planted.cjs"),\n' +
+        "  () => (require as any).call(null, planted),\n" +
         '  () => import(name("file://", dir, "/planted.mjs")).then((m: any) => m.default),\n' +
-        '  () => (module as any)[name("re", "quire")](dir + "/planted.cjs"),\n' +
-        '  () => global[name("re", "quire")](dir + "/planted.cjs"),\n' +
+        '  () => (module as any)[name("re", "quire")](planted),\n' +
+        '  () => global[name("re", "quire")](planted),\n' +
         '  () => global[name("re", "quire")]("node:module")[name("create", "Require")](dir + "/")("./planted.cjs"),\n' +
         '  () => (process as any)[name("getBuiltin", "Module")]("module")[name("create", "Require")](dir + "/")("./planted.cjs"),\n' +
         '  () => code("p", "return imp" + "ort(p)")("file://" + dir + "/planted.mjs").then((m: any) => m.default),\n' +
+        // The real Module class: bare resolution from node_modules, any file, a second hook.
+        '  () => viaModule(globalModule(), globalModule()._resolveFilename("planted", null, false, { paths: [dir] })),\n' +
+        "  () => viaModule(globalModule(), planted),\n" +
+        "  () => {\n" +
+        "    globalModule().registerHooks({\n" +
+        '      resolve: (specifier: string, context: unknown, next: any) => specifier === "p1-024-hooked"\n' +
+        '        ? { url: NodeURL.pathToFileURL(dir + "/planted.mjs").href, shortCircuit: true }\n' +
+        "        : next(specifier, context),\n" +
+        "    });\n" +
+        '    return import(name("p1-024-", "hooked")).then((m: any) => m.default);\n' +
+        "  },\n" +
+        '  () => viaModule(code("return mod" + "ule")().constructor, planted),\n' +
+        // The node:module the bundle imports exposes no loader.
+        '  () => NodeModule.createRequire(dir + "/")("./planted.cjs"),\n' +
+        "  () => viaModule((NodeModule as any).Module, planted),\n" +
+        "  () => (NodeModule as any).registerHooks({ resolve: () => undefined }),\n" +
+        '  () => import(name("node:", "module")).then((m: any) => viaModule(m.Module, planted)),\n' +
         "];\n" +
         "void Promise.all(attempts.map(async (attempt) => {\n" +
-        '  try { return await attempt(); } catch { return "refused"; }\n' +
+        "  try {\n" +
+        "    const loaded = await attempt();\n" +
+        '    return typeof loaded === "string" ? loaded : `loaded ${typeof loaded}`;\n' +
+        '  } catch { return "refused"; }\n' +
         "})).then((results) => NodeWorkerThreads.parentPort?.postMessage(results));\n",
     );
-    const results = yield* Effect.callback<unknown>((resume) => {
-      const worker = new NodeWorkerThreads.Worker(source, { eval: true, workerData: dir });
-      worker.once("message", (message) => {
-        void worker.terminate();
-        resume(Effect.succeed(message));
-      });
-      worker.once("error", (error) => resume(Effect.succeed(String(error))));
-    });
+    const results = yield* runEmbedded(source, dir);
     assert.deepEqual(
       results,
-      Array.from({ length: 8 }, () => "refused"),
+      Array.from({ length: 16 }, () => "refused"),
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("lets the worker use any built-in, however a bundled module names it", () =>
+  Effect.gen(function* () {
+    const source = yield* embeddedSource(
+      'import * as NodeOS from "node:os";\n' +
+        'import * as NodeWorkerThreads from "node:worker_threads";\n' +
+        'import fromCommonJs from "./dep.cjs";\n' +
+        'void import("node:fs").then((fs) =>\n' +
+        "  NodeWorkerThreads.parentPort?.postMessage([fromCommonJs === NodeOS.EOL, typeof fs.readFileSync]),\n" +
+        ");\n",
+      { "dep.cjs": 'module.exports = require("os").EOL;\n' },
+    );
+    assert.deepEqual(yield* runEmbedded(source), [true, "function"]);
+  }),
 );

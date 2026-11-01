@@ -747,6 +747,74 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     ),
   );
 
+  it.effect("stops the CLI when the worker session fails after the close was sent", () =>
+    withRunner("worker", ({ runner }) =>
+      Effect.gen(function* () {
+        const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+        const openedBefore = workers.opened.length;
+        const session = yield* runner.open(openInput(cli));
+        const messages = yield* Stream.runDrain(session.messages).pipe(
+          Effect.flip,
+          Effect.forkChild,
+        );
+        const [opened] = workers.opened.slice(openedBefore);
+        assert.isDefined(opened);
+        yield* session.close;
+        // The session fails before the worker's SDK could end the CLI's input or kill it.
+        opened.worker.emit("message", {
+          type: "fail",
+          session: opened.session,
+          error: new Error("injected stage failure"),
+        });
+        yield* Fiber.join(messages);
+        yield* Effect.promise(() => cli.stdinEnded);
+        yield* TestClock.adjust("2 seconds");
+        yield* Effect.promise(() => cli.waitForKill("SIGTERM"));
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.promise(() => cli.waitForKill("SIGKILL"));
+        assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGKILL"]);
+      }),
+    ),
+  );
+
+  it.effect.each([
+    { malformed: "an unknown signal", event: { type: "kill", signal: "SIGBOGUS" } },
+    { malformed: "stdin data that is not text or bytes", event: { type: "stdin", data: 42 } },
+  ])(
+    "fails and kills only the session whose worker sends $malformed; the others go on",
+    ({ event }) =>
+      withRunner(
+        "worker",
+        ({ runner }) =>
+          Effect.gen(function* () {
+            const broken = new FakeClaudeCli();
+            const openedBefore = workers.opened.length;
+            const brokenSession = yield* runner.open(openInput(broken));
+            const [opened] = workers.opened.slice(openedBefore);
+            assert.isDefined(opened);
+            const failed = yield* Stream.runDrain(brokenSession.messages).pipe(
+              Effect.flip,
+              Effect.forkChild,
+            );
+            const healthy = new FakeClaudeCli({ onUser: playOnPrompt });
+            const healthySession = yield* runner.open(openInput(healthy));
+
+            opened.worker.emit("message", { type: "event", session: opened.session, event });
+            assert.notInclude(broken.kills, "SIGBOGUS");
+            const error = yield* Fiber.join(failed);
+            assert.strictEqual(error.method, "fromAsyncIterable");
+            yield* Effect.promise(() => broken.waitForKill("SIGKILL"));
+            assert.deepStrictEqual(broken.kills, ["SIGKILL"]);
+
+            yield* healthySession.offer(prompt("Run the tool."));
+            const messages = yield* takeTurn(healthySession);
+            assert.strictEqual(messages.at(-1)?.type, "result");
+            assert.deepStrictEqual(healthy.kills, []);
+          }),
+        { workers: 1 },
+      ),
+  );
+
   it.effect("fails a control call after the query ended with the in-thread error", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>
@@ -1825,6 +1893,48 @@ describe("startClaudeQueryInWorker callbacks", () => {
       scripted.raise({ type: "spawn", command: "claude", args: [], cwd: undefined, env: {} });
       assert.strictEqual(spawn.mock.calls.length, 0);
     }),
+  );
+
+  it.effect.each([
+    { call: { name: "toString", args: [{}] } },
+    { call: { name: "hook", hook: ["PreToolUse", 0, "constructor"], args: [{}, "toolu-1", {}] } },
+  ])("answers a request for a callback main does not own with an error: $call.name", ({ call }) =>
+    Effect.gen(function* () {
+      const scripted = yield* startScripted({
+        canUseTool: vi.fn(),
+        hooks: { PreToolUse: [{ hooks: [vi.fn()] }] },
+      });
+      scripted.raise({ type: "callback", id: 0, after: 0, call: call as never });
+      const [answer] = yield* Effect.promise(() =>
+        Promise.race([scripted.notifiedOf("callbackResult"), scripted.notifiedOf("callbackError")]),
+      );
+      assert.deepInclude(answer, { type: "callbackError", id: 0 });
+    }),
+  );
+
+  it.effect(
+    "runs main's callback with main's abort signal, first, whatever the worker relays",
+    () =>
+      Effect.gen(function* () {
+        const canUseTool = vi.fn(() => new Promise<never>(() => {}));
+        const scripted = yield* startScripted({ canUseTool });
+        scripted.raise({
+          type: "callback",
+          id: 0,
+          after: 0,
+          call: {
+            name: "canUseTool",
+            args: ["Bash", { command: "ls" }, { toolUseID: "toolu-1", signal: "relayed" }],
+          } as never,
+        });
+        const [, , options] = canUseTool.mock.calls[0] as unknown as [
+          unknown,
+          unknown,
+          Record<string, unknown>,
+        ];
+        assert.instanceOf(options.signal, AbortSignal);
+        assert.deepStrictEqual(Object.keys(options), ["signal", "toolUseID"]);
+      }),
   );
 
   it.effect("ignores a callback request whose id is already running", () =>

@@ -49,6 +49,20 @@ describe("ProviderIoStageTiming", () => {
     ]);
   });
 
+  it("totals every provider outside the built-in drivers under one `other` entry", () => {
+    const recorder = makeProviderIoStageRecorder(makeClock().now);
+    for (let index = 0; index < 1000; index++) {
+      recorder.forProvider(`provider-${index}`).record("json", 1, 2);
+    }
+    recorder.forProvider("codex").record("json", 3, 4);
+    assert.strictEqual(recorder.forProvider("unknown"), recorder.forProvider("provider-0"));
+
+    assert.deepStrictEqual(recorder.drain(), [
+      { provider: "other", stage: "json", count: 1000, totalMs: 1000, maxMs: 1, bytes: 2000 },
+      { provider: "codex", stage: "json", count: 1, totalMs: 3, maxMs: 3, bytes: 4 },
+    ]);
+  });
+
   it.effect("times building and running an effect, and leaves it untouched when off", () =>
     Effect.gen(function* () {
       const clock = makeClock();

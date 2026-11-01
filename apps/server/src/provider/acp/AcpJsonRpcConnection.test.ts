@@ -11,7 +11,10 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
+import * as References from "effect/References";
 import * as Scope from "effect/Scope";
 import * as Result from "effect/Result";
 import * as Scheduler from "effect/Scheduler";
@@ -53,6 +56,22 @@ const recordRequest = ({
   ...(result === undefined ? {} : { result }),
 });
 
+const isIncomingReply = (event: EffectAcpProtocol.AcpProtocolLogEvent, marker: string) =>
+  event.direction === "incoming" &&
+  event.stage === "raw" &&
+  typeof event.payload === "string" &&
+  event.payload.includes(marker);
+
+// Completes `replied` when the agent's reply to `_test/environment` arrives; on a later task,
+// so the reader has routed what it read first.
+const onEnvironmentReply = (replied: Deferred.Deferred<void>) => ({
+  logIncoming: true,
+  logger: (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
+    isIncomingReply(event, '"inherited"')
+      ? Effect.forkDetach(Deferred.succeed(replied, undefined)).pipe(Effect.asVoid)
+      : Effect.void,
+});
+
 // Records in order per request; replies to different requests can arrive in either order.
 const recordsByRequest = (records: ReadonlyArray<ReturnType<typeof recordRequest>>) => {
   const byRequest = new Map<string, Array<ReturnType<typeof recordRequest>>>();
@@ -90,6 +109,9 @@ const promptThenCancel = (input: {
       Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true })),
     );
     const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+    const environmentReplied = yield* Deferred.make<void>();
+    const environmentLogging = onEnvironmentReply(environmentReplied);
+    let finishing = false;
     let offloadedLines = 0;
     const offloads =
       input.workers === 0
@@ -123,21 +145,21 @@ const promptThenCancel = (input: {
       },
       cancelBehavior: input.cancelBehavior,
       interruptPromptOnCancel: input.interruptPromptOnCancel ?? false,
+      protocolLogging: {
+        logIncoming: true,
+        logOutgoing: input.holdPrompt?.in === "protocol-log",
+        logger: (event) =>
+          isOutgoingPrompt(event)
+            ? cancelFromLog.pipe(
+                Effect.andThen(Deferred.succeed(promptLogged, undefined)),
+                Effect.andThen(Deferred.await(promptReleased)),
+              )
+            : // Only the reply to the final round trip, not to holdPrompt's.
+              finishing
+              ? environmentLogging.logger(event)
+              : Effect.void,
+      },
       requestLogger: input.requestLogger,
-      ...(input.holdPrompt?.in === "protocol-log"
-        ? {
-            protocolLogging: {
-              logOutgoing: true,
-              logger: (event) =>
-                isOutgoingPrompt(event)
-                  ? cancelFromLog.pipe(
-                      Effect.andThen(Deferred.succeed(promptLogged, undefined)),
-                      Effect.andThen(Deferred.await(promptReleased)),
-                    )
-                  : Effect.void,
-            },
-          }
-        : {}),
     }).pipe(
       Effect.provideService(AcpSessionRuntime.AcpLineOffloads, {
         open: (openInput) =>
@@ -207,7 +229,12 @@ const promptThenCancel = (input: {
       yield* Deferred.succeed(promptReleased, undefined);
     }
     yield* Deferred.await(cancelReceived);
-    yield* runtime.request("_test/finish-cancel", {});
+    finishing = true;
+    // Not awaited: their records can queue behind a slow one. The agent answers the second
+    // only after reading every earlier line.
+    const finish = yield* runtime.request("_test/finish-cancel", {}).pipe(Effect.forkChild);
+    const environment = yield* runtime.request("_test/environment", {}).pipe(Effect.forkChild);
+    yield* Deferred.await(environmentReplied);
     const received = NodeFS.readFileSync(requestLogPath, "utf8")
       .split("\n")
       .filter((line) => line.length > 0)
@@ -221,6 +248,8 @@ const promptThenCancel = (input: {
     yield* releaseLog;
     const promptExit = yield* Fiber.await(prompt);
     yield* Fiber.join(cancel);
+    yield* Fiber.join(finish);
+    yield* Fiber.join(environment);
     return { received, promptExit, offloadedLines };
   }).pipe(Effect.scoped);
 
@@ -231,6 +260,8 @@ describe("AcpSessionRuntime", () => {
       Effect.gen(function* () {
         const setupReplied = yield* Deferred.make<void>();
         const allowStartup = yield* Deferred.make<void>();
+        const metadataReplied = yield* Deferred.make<void>();
+        let metadataSent = false;
         const events: Array<AcpSessionRuntime.AcpSessionRuntimeEvent> = [];
         const runtime = yield* AcpSessionRuntime.make({
           ...mockRuntimeOptions,
@@ -244,6 +275,16 @@ describe("AcpSessionRuntime", () => {
                 resumeMethod: "resume" as const,
               }
             : {}),
+          // The only reply after the setup's is the metadata request's.
+          protocolLogging: {
+            logIncoming: true,
+            logger: (event) =>
+              metadataSent && isIncomingReply(event, '"result"')
+                ? Effect.forkDetach(Deferred.succeed(metadataReplied, undefined)).pipe(
+                    Effect.asVoid,
+                  )
+                : Effect.void,
+          },
           requestLogger: (event) =>
             event.method === setupMethod && event.status === "succeeded"
               ? Deferred.succeed(setupReplied, undefined).pipe(
@@ -263,9 +304,15 @@ describe("AcpSessionRuntime", () => {
         );
         const startup = yield* runtime.start().pipe(Effect.forkChild);
         yield* Deferred.await(setupReplied);
-        yield* runtime.request("_test/startup-metadata", {});
+        metadataSent = true;
+        // Its records are written after the held setup record, so it returns after startup.
+        const metadata = yield* runtime
+          .request("_test/startup-metadata", {})
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(metadataReplied);
         yield* Deferred.succeed(allowStartup, undefined);
         yield* Fiber.join(startup);
+        yield* Fiber.join(metadata);
         yield* runtime.drainEvents;
 
         expect(events.map((event) => event._tag)).toEqual([
@@ -1448,10 +1495,12 @@ describe("AcpSessionRuntime", () => {
           ["session/new", ["started", "succeeded"]],
           ["session/prompt", ["started", "succeeded"]],
           ["_test/finish-cancel", ["started", "succeeded"]],
+          ["_test/environment", ["started", "succeeded"]],
         ]);
 
         const appended = yield* Deferred.make<void>();
         const slowRecords: Array<ReturnType<typeof recordRequest>> = [];
+        const slowWritten: Array<ReturnType<typeof recordRequest>> = [];
         const slow = yield* promptThenCancel({
           cancelBehavior,
           workers,
@@ -1461,11 +1510,18 @@ describe("AcpSessionRuntime", () => {
               slowRecords.push(recordRequest(event));
             }).pipe(
               Effect.andThen(isPromptStarted(event) ? Deferred.await(appended) : Effect.void),
+              Effect.andThen(
+                Effect.sync(() => {
+                  slowWritten.push(recordRequest(event));
+                }),
+              ),
             ),
           releaseLog: Deferred.succeed(appended, undefined).pipe(Effect.asVoid),
         });
         expect(slow.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
         expect(recordsByRequest(slowRecords)).toEqual(immediateByRequest);
+        // Later records wait for the slow one instead of landing ahead of it.
+        expect(slowWritten).toEqual(slowRecords);
         expect(slow.promptExit).toEqual(
           Exit.succeed({ stopReason: "cancelled", _meta: { nativeCancel: true } }),
         );
@@ -1540,13 +1596,14 @@ describe("AcpSessionRuntime", () => {
         });
         expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
         expect(run.promptExit).toEqual(Exit.succeed({ stopReason: "cancelled" }));
-        expect(yield* Deferred.isDone(appendCut)).toBe(true);
-        // A started record cut short gets no outcome record.
+        // The ordered record chain keeps the started record and writes the failed one after it;
+        // the cancel waited for neither.
+        expect(yield* Deferred.isDone(appendCut)).toBe(false);
         expect(
           recordsByRequest(records)
             .get("session/prompt")
             ?.map(({ status }) => status),
-        ).toEqual(["started"]);
+        ).toEqual(["started", "failed"]);
         expect(run.offloadedLines > 0).toBe(workers > 0);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
@@ -1636,23 +1693,264 @@ describe("AcpSessionRuntime", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("sends a request whose started record fails and fails it with that defect", () =>
-    Effect.gen(function* () {
-      const appendFailure = new Error("native log append failed");
-      const records: Array<ReturnType<typeof recordRequest>> = [];
-      const run = yield* promptThenCancel({
-        cancelBehavior: "interrupt",
-        workers: 0,
-        requestLogger: (event) =>
-          isPromptStarted(event)
-            ? Effect.die(appendFailure)
-            : Effect.sync(() => {
+  it.effect.each(["dies", "throws"] as const)(
+    "sends a request whose started record %s and fails it with that defect",
+    (failure) =>
+      Effect.gen(function* () {
+        const appendFailure = new Error("native log append failed");
+        const records: Array<ReturnType<typeof recordRequest>> = [];
+        const run = yield* promptThenCancel({
+          cancelBehavior: "interrupt",
+          workers: 0,
+          requestLogger: (event) => {
+            if (!isPromptStarted(event)) {
+              return Effect.sync(() => {
                 records.push(recordRequest(event));
+              });
+            }
+            if (failure === "throws") throw appendFailure;
+            return Effect.die(appendFailure);
+          },
+        });
+        expect(run.promptExit).toEqual(Exit.die(appendFailure));
+        expect(records.some(({ method }) => method === "session/prompt")).toBe(false);
+        expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("writes a held-back backlog of request records and returns every call", () =>
+    Effect.gen(function* () {
+      const requests = 1000;
+      const held = yield* Deferred.make<void>();
+      const allReplied = yield* Deferred.make<void>();
+      let replies = 0;
+      let environmentRecords = 0;
+      const written: Array<string> = [];
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        protocolLogging: {
+          logIncoming: true,
+          logger: (event) => {
+            if (!isIncomingReply(event, '"inherited"')) return Effect.void;
+            replies += String(event.payload).split('"inherited"').length - 1;
+            return replies < requests
+              ? Effect.void
+              : Effect.forkDetach(Deferred.succeed(allReplied, undefined)).pipe(Effect.asVoid);
+          },
+        },
+        // The first request's started record holds every later record back.
+        requestLogger: (event) =>
+          (event.method === "_test/environment" && environmentRecords++ === 0
+            ? Deferred.await(held)
+            : Effect.void
+          ).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                written.push(`${event.method} ${event.status}`);
               }),
+            ),
+          ),
       });
-      expect(run.promptExit).toEqual(Exit.die(appendFailure));
-      expect(records.some(({ method }) => method === "session/prompt")).toBe(false);
-      expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
+      yield* runtime.start();
+      const calls = yield* Effect.forEach(
+        Array.from({ length: requests }, () => runtime.request("_test/environment", {})),
+        (request) => request,
+        { concurrency: "unbounded" },
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(allReplied);
+      yield* Deferred.succeed(held, undefined);
+
+      expect(yield* Fiber.join(calls)).toHaveLength(requests);
+      expect(written.filter((record) => record.startsWith("_test/environment"))).toHaveLength(
+        2 * requests,
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "records an interrupted call as failed only, after a reply that arrived while its started record was held",
+    () =>
+      Effect.gen(function* () {
+        const held = yield* Deferred.make<void>();
+        const replied = yield* Deferred.make<void>();
+        let environmentRecords = 0;
+        const written: Array<string> = [];
+        const runtime = yield* AcpSessionRuntime.make({
+          ...mockRuntimeOptions,
+          protocolLogging: onEnvironmentReply(replied),
+          requestLogger: (event) =>
+            (event.method === "_test/environment" && environmentRecords++ === 0
+              ? Deferred.await(held)
+              : Effect.void
+            ).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  written.push(`${event.method} ${event.status}`);
+                }),
+              ),
+            ),
+        });
+        yield* runtime.start();
+        const request = yield* runtime.request("_test/environment", {}).pipe(Effect.forkChild);
+        yield* Deferred.await(replied);
+        yield* Fiber.interrupt(request);
+        yield* Deferred.succeed(held, undefined);
+        // Its records are written after the interrupted call's.
+        yield* runtime.request("_test/startup-metadata", {});
+
+        expect(written.filter((record) => record.startsWith("_test/environment"))).toEqual([
+          "_test/environment started",
+          "_test/environment failed",
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "writes an in-flight request's failed record from a slow logger when the runtime closes",
+    () => {
+      const warnings: Array<unknown> = [];
+      return Effect.gen(function* () {
+        const runtimeScope = yield* Scope.make();
+        const agentStopped = yield* Deferred.make<void>();
+        const written: Array<string> = [];
+        const runtime = yield* AcpSessionRuntime.make({
+          ...mockRuntimeOptions,
+          spawn: { ...mockRuntimeOptions.spawn, env: { T3_ACP_HANG_PROMPT_FOREVER: "1" } },
+          interruptPromptOnCancel: false,
+          // The failed record's append ends just after the runtime has stopped its agent.
+          requestLogger: (event) =>
+            (event.method === "session/prompt" && event.status === "failed"
+              ? Deferred.await(agentStopped).pipe(Effect.andThen(Effect.yieldNow))
+              : Effect.void
+            ).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  written.push(`${event.method} ${event.status}`);
+                }),
+              ),
+            ),
+        }).pipe(
+          Effect.provideService(Scope.Scope, runtimeScope),
+          Effect.provideService(AgentScope, {
+            ...AgentScope.defaultValue(),
+            wrap: ({ command, args }) =>
+              Effect.succeed({ command, args, unit: "t3code-acp-test.scope" }),
+            stop: () => Deferred.succeed(agentStopped, undefined).pipe(Effect.asVoid),
+          }),
+        );
+        yield* runtime.start();
+        const dispatched = yield* Deferred.make<void>();
+        const prompt = yield* runtime
+          .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(dispatched);
+
+        yield* Scope.close(runtimeScope, Exit.void);
+        expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+        expect(written.filter((record) => record.startsWith("session/prompt"))).toEqual([
+          "session/prompt started",
+          "session/prompt failed",
+        ]);
+        expect(warnings).toEqual([]);
+      }).pipe(
+        Effect.provide(
+          Layer.merge(
+            NodeServices.layer,
+            Logger.layer([
+              Logger.make(({ logLevel, message, fiber }) => {
+                if (logLevel === "Warn") {
+                  warnings.push([message, fiber.getRef(References.CurrentLogAnnotations)]);
+                }
+              }),
+            ]),
+          ),
+        ),
+      );
+    },
+  );
+
+  it.effect("closes without waiting for a native request record that never completes", () =>
+    Effect.gen(function* () {
+      const runtimeScope = yield* Scope.make();
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        spawn: { ...mockRuntimeOptions.spawn, env: { T3_ACP_HANG_PROMPT_FOREVER: "1" } },
+        interruptPromptOnCancel: false,
+        requestLogger: (event) => (isPromptStarted(event) ? Effect.never : Effect.void),
+      }).pipe(Effect.provideService(Scope.Scope, runtimeScope));
+      yield* runtime.start();
+      const dispatched = yield* Deferred.make<void>();
+      const prompt = yield* runtime
+        .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(dispatched);
+
+      yield* Scope.close(runtimeScope, Exit.void);
+      expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "sends session/load without waiting for its started record, keeping records in order",
+    () => {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "acp-runtime-"));
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      return Effect.gen(function* () {
+        const loadStarted = yield* Deferred.make<void>();
+        const appended = yield* Deferred.make<void>();
+        const requestAnswered = yield* Deferred.make<void>();
+        const produced: Array<string> = [];
+        const written: Array<string> = [];
+        const runtime = yield* AcpSessionRuntime.make({
+          ...mockRuntimeOptions,
+          spawn: { ...mockRuntimeOptions.spawn, env: { T3_ACP_REQUEST_LOG_PATH: requestLogPath } },
+          resumeSessionId: "mock-session-1",
+          protocolLogging: onEnvironmentReply(requestAnswered),
+          requestLogger: (event) => {
+            const record = `${event.method} ${event.status}`;
+            return Effect.sync(() => {
+              produced.push(record);
+            }).pipe(
+              Effect.andThen(
+                event.method === "session/load" && event.status === "started"
+                  ? Deferred.succeed(loadStarted, undefined).pipe(
+                      Effect.andThen(Deferred.await(appended)),
+                    )
+                  : Effect.void,
+              ),
+              Effect.andThen(
+                Effect.sync(() => {
+                  written.push(record);
+                }),
+              ),
+            );
+          },
+        });
+        yield* Effect.addFinalizer(() => Deferred.succeed(appended, undefined));
+        const startup = yield* runtime.start().pipe(Effect.forkChild);
+        yield* Deferred.await(loadStarted);
+        const request = yield* runtime.request("_test/environment", {}).pipe(Effect.forkChild);
+        yield* Deferred.await(requestAnswered);
+        const received = NodeFS.readFileSync(requestLogPath, "utf8")
+          .split("\n")
+          .filter((line) => line.length > 0)
+          .map((line) => (JSON.parse(line) as { readonly method?: string }).method)
+          .filter((method) => method === "session/resume" || method === "_test/environment");
+        yield* Deferred.succeed(appended, undefined);
+        yield* Fiber.join(startup);
+        yield* Fiber.join(request);
+
+        // ACP v2 sends session/load as session/resume.
+
+        expect(received).toEqual(["session/resume", "_test/environment"]);
+        expect(written).toEqual(produced);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(NodeServices.layer),
+        Effect.ensuring(
+          Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true })),
+        ),
+      );
+    },
   );
 });

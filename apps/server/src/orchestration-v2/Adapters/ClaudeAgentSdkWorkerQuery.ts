@@ -163,13 +163,25 @@ const readHooks = (
   return { shape, functions };
 };
 
+// Own properties only, so a name or index from the worker never reaches an inherited one.
 const callbackOf = (
   callbacks: ClaudeAgentSdkMainCallbacks,
   call: ClaudeAgentSdkCallbackCall,
 ): ((...args: ReadonlyArray<never>) => unknown) | undefined => {
-  if (call.name !== "hook") return callbacks[call.name];
-  const [event, matcher, index] = call.hook;
-  return callbacks.hooks?.[event]?.[matcher]?.hooks[index];
+  const path: ReadonlyArray<PropertyKey> =
+    call.name === "hook"
+      ? ["hooks", call.hook[0], call.hook[1], "hooks", call.hook[2]]
+      : [call.name];
+  const callback = path.reduce<unknown>(
+    (container, key) =>
+      typeof container === "object" && container !== null && Object.hasOwn(container, key)
+        ? (container as Record<PropertyKey, unknown>)[key]
+        : undefined,
+    callbacks,
+  );
+  return typeof callback === "function"
+    ? (callback as (...args: ReadonlyArray<never>) => unknown)
+    : undefined;
 };
 
 // The SDK's response field for the answer, as it writes it to the CLI (canUseTool's spread with its
@@ -221,6 +233,8 @@ const CLOSE_GRACE = Duration.seconds(2);
 const CLOSE_KILL_AFTER = Duration.seconds(5);
 // The SDK's own error for a call once its transport has closed.
 const QUERY_ENDED = "ProcessTransport is not ready for writing";
+// The signals the SDK sends its CLI; `kill` throws on an unknown name.
+const CLI_SIGNALS: ReadonlySet<string> = new Set(["SIGTERM", "SIGKILL", "SIGINT"]);
 
 /**
  * Runs `query()` on a provider I/O worker (none when the pool is off); main spawns and owns the CLI.
@@ -290,9 +304,12 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   };
 
   // What the SDK's close would do when its session can no longer run it.
+  let closeRequested = false;
+  let stopping = false;
   const stopChild = () => {
     const target = child;
-    if (target === undefined || childDone) return;
+    if (target === undefined || childDone || stopping) return;
+    stopping = true;
     target.stdin.end();
     runFork(
       Effect.gen(function* () {
@@ -420,8 +437,9 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     if (controller === undefined) return;
     let result: unknown;
     try {
-      // The SDK puts the signal first.
+      // The SDK puts the signal first; one the worker relays must not replace main's.
       const options = { signal: controller.signal, ...call.args.at(-1) };
+      options.signal = controller.signal;
       const args: Array<unknown> = [...call.args.slice(0, -1), options];
       const callback = callbackOf(input.callbacks, call);
       if (callback === undefined) throw new Error(`${call.name} callback is not provided.`);
@@ -463,13 +481,20 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       case "spawn":
         spawnChild(event);
         return;
+      // A worker bug fails only this session: the pool turns a throw here into its failure.
       case "stdin":
+        if (typeof event.data !== "string" && !(event.data instanceof Uint8Array)) {
+          throw new TypeError("The provider I/O worker sent CLI input that is not text or bytes.");
+        }
         child?.stdin.write(event.data);
         return;
       case "stdinEnd":
         child?.stdin.end();
         return;
       case "kill":
+        if (event.signal !== undefined && !CLI_SIGNALS.has(event.signal)) {
+          throw new TypeError("The provider I/O worker sent an unknown signal for the CLI.");
+        }
         if (event.signal === "SIGKILL") killSent = true;
         child?.kill(event.signal);
         return;
@@ -500,6 +525,10 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       killAfterEnd: true,
       onPoolClose: stopChildNow,
       onEvent,
+      // A failed session drops the worker's stdin end and kills, so a requested close is main's.
+      onSessionFailure: () => {
+        if (closeRequested) stopChild();
+      },
     })
     .pipe(
       Effect.provideService(Scope.Scope, scope),
@@ -565,6 +594,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     // callback there; here a callback raised after close never starts.
     close: () => {
       if (released) return;
+      closeRequested = true;
       cleanUp();
       enqueue({ type: "close" });
     },

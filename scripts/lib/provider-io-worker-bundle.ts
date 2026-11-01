@@ -158,8 +158,17 @@ export const providerIoWorkerBundle = (options: {
       const compressed = NodeZlib.brotliCompressSync(code, {
         params: { [NodeZlib.constants.BROTLI_PARAM_QUALITY]: 11 },
       }).toString("base64");
-      // zlib loads only when a worker starts, not with every server.
-      return `export const loadEmbeddedProviderIoWorkerSource = () => process.getBuiltinModule("node:zlib").brotliDecompressSync(Buffer.from(${JSON.stringify(compressed)}, "base64")).toString("utf8");`;
+      // zlib loads only when a worker starts. The base64 text is read from the source of a function
+      // that never runs, so main never compiles it into a heap string (as the guard reads the bundle).
+      return [
+        `function packedBundle() { return ${JSON.stringify(compressed)}; }`,
+        "export const loadEmbeddedProviderIoWorkerSource = () => {",
+        "  const text = packedBundle.toString();",
+        "  const start = text.search(/[\"'`]/) + 1;",
+        "  const packed = text.slice(start, text.indexOf(text[start - 1], start));",
+        '  return process.getBuiltinModule("node:zlib").brotliDecompressSync(Buffer.from(packed, "base64")).toString("utf8");',
+        "};",
+      ].join("\n");
     },
     // A placeholder path that never matches would otherwise ship a server with no worker.
     buildEnd(error?: Error) {

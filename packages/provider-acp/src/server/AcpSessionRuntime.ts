@@ -84,6 +84,7 @@ export type AcpSessionRuntimeEvent =
 const defaultSessionLoadTimeout = Duration.seconds(90);
 const defaultSessionLoadReplayIdleGap = Duration.seconds(2);
 const defaultCancelTimeout = Duration.seconds(15);
+const requestRecordCloseGrace = Duration.seconds(1);
 const maxStartupMetadataUpdates = 32;
 // Antigravity can emit an accepted 16 KiB Google authorization URL on stderr.
 const maxStderrChunkLength = 32_768;
@@ -1352,57 +1353,147 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
   const logRequest = (event: AcpSessionRequestLogEvent) =>
     options.requestLogger ? options.requestLogger(event) : Effect.void;
 
+  // Request records are written one at a time, in the order they are produced; requests go out
+  // without waiting for them, and a call returns once its records are written. At close, pending
+  // records get a short wall-clock grace (a slow logger keeps them) and are then dropped and
+  // counted in a warning, so a logger that never completes cannot hold the close.
+  const recordScope = yield* Scope.make();
+  let lastRecord: Deferred.Deferred<void> | undefined;
+  let droppedRecords = 0;
+  let recordsClosed = false;
+  yield* Scope.addFinalizer(
+    runtimeScope,
+    Effect.gen(function* () {
+      const tail = lastRecord;
+      if (tail !== undefined) {
+        yield* Deferred.await(tail).pipe(
+          Effect.exit,
+          Effect.timeoutOption(requestRecordCloseGrace),
+          withWallClock,
+        );
+      }
+      yield* Scope.close(recordScope, Exit.void);
+      recordsClosed = true;
+      if (droppedRecords > 0) {
+        yield* Effect.logWarning("Dropped native ACP request records when the runtime closed.", {
+          dropped: droppedRecords,
+        });
+      }
+    }),
+  );
+
+  /** Queues a record; the result settles once it is written (with the logger's exit) or not. */
+  const appendRequestRecord = (
+    event: AcpSessionRequestLogEvent,
+    started?: Deferred.Deferred<void>,
+    withdrawn?: () => boolean,
+  ): Effect.Effect<Deferred.Deferred<void>> =>
+    Effect.suspend(() => {
+      const written = Deferred.makeUnsafe<void>();
+      const previous = lastRecord;
+      lastRecord = written;
+      return Effect.gen(function* () {
+        if (previous !== undefined && !(yield* Deferred.isDone(previous))) {
+          yield* Effect.exit(Deferred.await(previous));
+          // On a new task: draining a backlog by nested resumption would overflow the stack.
+          yield* Effect.yieldNow;
+        }
+        // An outcome whose started record failed is not written; that failure fails the call.
+        if (started !== undefined && Exit.isFailure(yield* Effect.exit(Deferred.await(started)))) {
+          return Exit.void;
+        }
+        if (withdrawn?.() === true) return Exit.void;
+        return yield* Effect.exit(Effect.suspend(() => logRequest(event)));
+      }).pipe(
+        // Only an interrupt (the runtime closing) ends it otherwise: the record is dropped.
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit)
+            ? Deferred.done(written, exit.value)
+            : Effect.suspend(() => {
+                if (recordsClosed) {
+                  return Effect.logWarning(
+                    "Dropped a native ACP request record after the runtime closed.",
+                  );
+                }
+                droppedRecords += 1;
+                return Effect.void;
+              }).pipe(Effect.andThen(Deferred.succeed(written, undefined))),
+        ),
+        Effect.forkIn(recordScope, { startImmediately: true }),
+        Effect.as(written),
+      );
+    });
+
   // The request is sent while its started record may still be appending, so a slow log cannot
-  // let a later request (an interrupt's session/cancel) reach the agent first. The outcome is
-  // logged after the started record, and a started record that fails fails the request. An
-  // interrupt does not wait for a pending started record: it cuts it, and no outcome follows.
+  // let a later request (an interrupt's session/cancel) reach the agent first. A started record
+  // that fails fails the call once the request settles, and no outcome record follows it.
+  const withRequestRecords = <A>(
+    method: string,
+    payload: unknown,
+    effect: Effect.Effect<A, EffectAcpErrors.AcpError>,
+  ): Effect.Effect<A, EffectAcpErrors.AcpError> =>
+    options.requestLogger === undefined
+      ? effect
+      : Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const started = yield* appendRequestRecord({ method, payload, status: "started" });
+            const record = (event: AcpSessionRequestLogEvent) =>
+              appendRequestRecord(event, started).pipe(
+                Effect.flatMap((written) => Effect.interruptible(Deferred.await(written))),
+              );
+            const exit = yield* restore(effect).pipe(Effect.exit);
+            let succeededWithdrawn = false;
+            const outcome = yield* restore(
+              exit.pipe(
+                Effect.tap((result) =>
+                  appendRequestRecord(
+                    { method, payload, status: "succeeded", result },
+                    started,
+                    () => succeededWithdrawn,
+                  ).pipe(
+                    Effect.flatMap((written) => Effect.interruptible(Deferred.await(written))),
+                    // Interrupted before it is written: the failed record that follows replaces it.
+                    Effect.onInterrupt(() =>
+                      Effect.sync(() => {
+                        succeededWithdrawn = true;
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ).pipe(
+              // An interrupted request queues its failed record without waiting on the log.
+              Effect.onError((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? appendRequestRecord({ method, payload, status: "failed", cause }, started)
+                  : record({ method, payload, status: "failed", cause }),
+              ),
+              Effect.exit,
+            );
+            if (Exit.isFailure(outcome) && Cause.hasInterrupts(outcome.cause)) {
+              return yield* outcome;
+            }
+            const startedWritten = yield* restore(Deferred.await(started)).pipe(Effect.exit);
+            if (Exit.isFailure(startedWritten)) {
+              return yield* Effect.failCause(startedWritten.cause);
+            }
+            return yield* outcome;
+          }),
+        );
+
   const runLoggedRequest = <A>(
     method: string,
     payload: unknown,
     effect: Effect.Effect<A, EffectAcpErrors.AcpError>,
   ): Effect.Effect<A, EffectAcpErrors.AcpError> =>
-    Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const started = yield* logRequest({ method, payload, status: "started" }).pipe(
-          Effect.forkChild({ startImmediately: true }),
-        );
-        const exit = yield* restore(
-          (options.onStderr
-            ? Effect.raceFirst(effect, Deferred.await(stderrFailure))
-            : effect
-          ).pipe(
-            Effect.catch((error) =>
-              enrichProcessExitWithStderr(error).pipe(Effect.flatMap(Effect.fail)),
-            ),
-          ),
-        ).pipe(Effect.exit);
-        yield* restore(Fiber.await(started)).pipe(
-          Effect.onInterrupt(() => Fiber.interrupt(started)),
-          Effect.exit,
-        );
-        yield* Fiber.join(started);
-        return yield* restore(
-          exit.pipe(
-            Effect.tap((result) =>
-              logRequest({
-                method,
-                payload,
-                status: "succeeded",
-                result,
-              }),
-            ),
-          ),
-        ).pipe(
-          Effect.onError((cause) =>
-            logRequest({
-              method,
-              payload,
-              status: "failed",
-              cause,
-            }),
-          ),
-        );
-      }),
+    withRequestRecords(
+      method,
+      payload,
+      (options.onStderr ? Effect.raceFirst(effect, Deferred.await(stderrFailure)) : effect).pipe(
+        Effect.catch((error) =>
+          enrichProcessExitWithStderr(error).pipe(Effect.flatMap(Effect.fail)),
+        ),
+      ),
     );
 
   const spawnCommand =
@@ -2000,49 +2091,34 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         );
 
         return yield* Effect.gen(function* () {
-          yield* logRequest({
-            method: "session/load",
-            payload: loadPayload,
-            status: "started",
-          });
-
-          const idleFiber = yield* waitForSessionLoadReplayIdle({
-            gateRef: sessionLoadGateRef,
-          }).pipe(Effect.forkIn(runtimeScope));
-          const loaded = yield* Effect.raceFirst(
-            acp.agent.loadSession(loadPayload),
-            Fiber.join(idleFiber),
-          ).pipe(
-            Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)),
-            Effect.timeoutOption(sessionLoadTimeout),
-            Effect.flatMap((result) =>
-              Effect.fromOption(
-                result,
-                () =>
-                  new EffectAcpErrors.AcpTransportError({
-                    operation: "call-rpc",
-                    method: "session/load",
-                    detail: "session/load timed out waiting for RPC response or replay idle gap",
-                    cause: undefined,
-                  }),
-              ),
-            ),
-            Effect.tap((result) =>
-              logRequest({
-                method: "session/load",
-                payload: loadPayload,
-                status: "succeeded",
-                result,
-              }),
-            ),
-            Effect.onError((cause) =>
-              logRequest({
-                method: "session/load",
-                payload: loadPayload,
-                status: "failed",
-                cause,
-              }),
-            ),
+          const loaded = yield* withRequestRecords(
+            "session/load",
+            loadPayload,
+            Effect.gen(function* () {
+              const idleFiber = yield* waitForSessionLoadReplayIdle({
+                gateRef: sessionLoadGateRef,
+              }).pipe(Effect.forkIn(runtimeScope));
+              return yield* Effect.raceFirst(
+                acp.agent.loadSession(loadPayload),
+                Fiber.join(idleFiber),
+              ).pipe(
+                Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)),
+                Effect.timeoutOption(sessionLoadTimeout),
+                Effect.flatMap((result) =>
+                  Effect.fromOption(
+                    result,
+                    () =>
+                      new EffectAcpErrors.AcpTransportError({
+                        operation: "call-rpc",
+                        method: "session/load",
+                        detail:
+                          "session/load timed out waiting for RPC response or replay idle gap",
+                        cause: undefined,
+                      }),
+                  ),
+                ),
+              );
+            }),
           );
 
           const gate = yield* Ref.get(sessionLoadGateRef);

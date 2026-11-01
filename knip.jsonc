@@ -49,6 +49,7 @@
         "src/claude-history-worker.ts!",
         "src/provider/io/providerIoWorker.ts!",
         "src/provider/io/testFixtures/providerIoTestWorker.ts",
+        "src/provider/io/testFixtures/providerIoEquivalenceWorker.ts",
         "scripts/cli.ts",
         "scripts/fetch-expo-schema.ts",
         "scripts/probe-claude-fork-local-rollback-replay.ts",

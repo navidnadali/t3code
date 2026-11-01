@@ -53,7 +53,7 @@ export interface ProviderIoSession<Output, E, Request = never, Reply = never> {
   readonly end: Effect.Effect<void, E>;
   readonly output: Stream.Stream<Output, E>;
   readonly call: (request: Request) => Effect.Effect<Reply, E>;
-  /** A call nobody waits on, queued like `call`; false when the session takes no more. */
+  /** A call nobody waits on, queued like `call`; false once the session failed, closed or ended. */
   readonly notify: (request: Request) => boolean;
 }
 
@@ -76,6 +76,8 @@ export interface ProviderIoOpenInput<
   readonly onPoolClose?: Effect.Effect<void>;
   /** Receives the stage's events on main as they arrive, ahead of queued outputs. */
   readonly onEvent?: (event: Event) => void;
+  /** Runs once when the session fails, after which main hears nothing more from its stage. */
+  readonly onSessionFailure?: () => void;
   readonly highWaterMark?: number;
 }
 
@@ -97,11 +99,13 @@ const HANDSHAKE_TIMEOUT = Duration.seconds(10);
 const DEFAULT_HIGH_WATER_MARK = 1024 * 1024;
 
 interface SessionHandle {
+  readonly stage: string;
   readonly deliver: (outputs: ReadonlyArray<unknown>, bytes: number) => void;
   readonly finish: (failure?: { readonly error: unknown }) => void;
   readonly event: (event: unknown) => void;
   readonly reply: (call: number, ok: boolean, value: unknown) => void;
   readonly failStage: (cause: unknown) => void;
+  readonly failOnMain: (cause: unknown) => void;
   readonly failWorker: (error: ProviderIoWorkerError, kill: boolean) => void;
   readonly poolClosing: Effect.Effect<void>;
 }
@@ -230,22 +234,38 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     }
     const session = slot.sessions.get(message.session);
     if (session === undefined) return;
-    switch (message.type) {
-      case "output":
-        session.deliver(message.outputs, message.bytes);
-        return;
-      case "end":
-        session.finish(message.failed === true ? { error: message.error } : undefined);
-        return;
-      case "event":
-        session.event(message.event);
-        return;
-      case "fail":
-        session.failStage(message.error);
-        return;
-      case "reply":
-        session.reply(message.call, message.ok, message.value);
-        return;
+    // Nothing catches a throw out of the listener: it would end the server and every session.
+    try {
+      switch (message.type) {
+        case "output":
+          session.deliver(message.outputs, message.bytes);
+          return;
+        case "end":
+          session.finish(message.failed === true ? { error: message.error } : undefined);
+          return;
+        case "event":
+          session.event(message.event);
+          return;
+        case "fail":
+          session.failStage(message.error);
+          return;
+        case "reply":
+          session.reply(message.call, message.ok, message.value);
+          return;
+      }
+    } catch (cause) {
+      runFork(
+        Effect.logWarning("Provider I/O session failed handling a worker message", {
+          stage: session.stage,
+          type: message.type,
+          errorTag: errorTag(cause),
+        }),
+      );
+      try {
+        session.failOnMain(cause);
+      } catch {
+        // The session's own failure hooks threw as well; the server still goes on.
+      }
     }
   };
 
@@ -434,6 +454,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       if (failure !== undefined || closed) return;
       const mapped = input.onFailure(error);
       failure = { error: mapped };
+      input.onSessionFailure?.();
       for (const resume of calls.values()) resume(Effect.fail(mapped));
       calls.clear();
       for (const waiter of waiters.splice(0)) waiter.fail(Effect.fail(mapped));
@@ -453,6 +474,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     });
     if (opened !== undefined) return yield* Effect.fail(opened);
     slot.sessions.set(id, {
+      stage: input.stage.name,
       deliver: (outputs, bytes) => {
         if (failure !== undefined || closed) return;
         if (Arr.isReadonlyArrayNonEmpty(outputs)) {
@@ -501,6 +523,9 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       },
       failStage: (cause) =>
         fail(new ProviderIoStageError({ stage: input.stage.name, cause }), false),
+      // The worker still runs the stage, so main can no longer trust what it says of the child.
+      failOnMain: (cause) =>
+        fail(new ProviderIoStageError({ stage: input.stage.name, cause }), true),
       failWorker: fail,
       poolClosing: Effect.suspend(() =>
         closed || input.onPoolClose === undefined ? Effect.void : Effect.exit(input.onPoolClose),
@@ -608,7 +633,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       // Queued like a call, after the writes waiting for credit; a request that cannot be cloned
       // fails the session, since nobody waits on it to hear.
       notify: (request) => {
-        if (failure !== undefined || closed || slot.stopped) return false;
+        if (failure !== undefined || closed || ending !== undefined || slot.stopped) return false;
         schedule({
           bytes: 0,
           admit: () => {

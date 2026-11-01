@@ -29,7 +29,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
-import type * as Tracer from "effect/Tracer";
+import * as Tracer from "effect/Tracer";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
@@ -44,10 +44,15 @@ const modelSelection = {
 } satisfies ModelSelection;
 const at = (second: number) => DateTime.makeUnsafe(Date.UTC(2026, 0, 1, 0, 0, second));
 
-const layerFile = (filename: string) =>
+const layerFile = (filename: string, readerPoolSize?: number) =>
   EventSink.layer.pipe(
     Layer.provideMerge(Layer.merge(EventStore.layer, ProjectionStore.layer)),
-    Layer.provideMerge(SqlitePersistence.layerFromPath(filename)),
+    Layer.provideMerge(
+      SqlitePersistence.layerFromPath(
+        filename,
+        readerPoolSize === undefined ? undefined : { readerPoolSize },
+      ),
+    ),
   );
 
 const withFileStore = <A, E>(
@@ -60,12 +65,15 @@ const withFileStore = <A, E>(
     | EventStore.EventStoreV2
     | SqlClient.SqlClient
   >,
+  readerPoolSize?: number,
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const directory = yield* fs.makeTempDirectoryScoped({ prefix });
-    return yield* body.pipe(Effect.provide(layerFile(path.join(directory, "statev2.sqlite"))));
+    return yield* body.pipe(
+      Effect.provide(layerFile(path.join(directory, "statev2.sqlite"), readerPoolSize)),
+    );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 function makeThread(
@@ -535,8 +543,13 @@ const readCases: ReadonlyArray<ReadCase> = [
   {
     name: "thread records",
     read: (store, fixture) =>
-      store.getThreadRecords(fixture.fork, ["messages", "subagents", "contextTransfers"]),
-    statements: 5,
+      store.getThreadRecords(fixture.fork, [
+        "messages",
+        "subagents",
+        "contextTransfers",
+        "turnItems",
+      ]),
+    statements: 6,
     corrupt: corruptRows.subagent,
     error: "ProjectionStoreReadError",
   },
@@ -830,4 +843,61 @@ it.effect("reports the turn start context's first undecodable row in its old ord
       );
     }),
   ),
+);
+
+const isDecodeSpan = (span: Tracer.AnySpan) =>
+  span._tag === "Span" && span.name.startsWith("ProjectionStore.decode");
+
+// A read holds rows from its first statement until its outermost decode span ends.
+it.effect.each(readCases)(
+  "lets no more $name reads hold rows at once than the pool has readers",
+  (readCase) =>
+    withFileStore(
+      "reader-scope-permits-",
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const fixture = yield* writeFixture("permits", 1_500);
+        let holding = 0;
+        let mostHolding = 0;
+        const tracer = Tracer.make({
+          span(options) {
+            const span = Tracer.nativeTracer.span(options);
+            const parent = Option.getOrUndefined(options.parent);
+            if (isDecodeSpan(span) && (parent === undefined || !isDecodeSpan(parent))) {
+              const end = span.end.bind(span);
+              span.end = (endTime, exit) => {
+                holding--;
+                end(endTime, exit);
+              };
+            }
+            return span;
+          },
+        });
+        const read = Effect.suspend(() => {
+          let started = false;
+          return readCase.read(store, fixture).pipe(
+            Effect.provideService(Statement.CurrentTransformer, (statement) =>
+              Effect.sync(() => {
+                if (!started) {
+                  started = true;
+                  holding++;
+                  mostHolding = Math.max(mostHolding, holding);
+                }
+                return statement;
+              }),
+            ),
+          );
+        });
+        const results = yield* Effect.all(
+          Array.from({ length: 6 }, () => read),
+          {
+            concurrency: "unbounded",
+          },
+        ).pipe(Effect.provideService(Tracer.Tracer, tracer));
+        assert.lengthOf(results, 6);
+        assert.strictEqual(holding, 0);
+        assert.isAtMost(mostHolding, 2);
+      }),
+      2,
+    ),
 );

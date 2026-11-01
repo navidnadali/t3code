@@ -651,8 +651,15 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
         const startedBefore = workers.started.length;
         const pool = yield* ProviderIoWorkerPool.make({ workers: 1 });
         const dyingPool: ProviderIoWorkerPool.ProviderIoWorkerPool["Service"] = {
-          open: <Options, Output, E, Request = never, Reply = never>(
-            input: ProviderIoWorkerPool.ProviderIoOpenInput<Options, Output, E, Request, Reply>,
+          open: <Options, Output, E, Request = never, Reply = never, Event = never>(
+            input: ProviderIoWorkerPool.ProviderIoOpenInput<
+              Options,
+              Output,
+              E,
+              Request,
+              Reply,
+              Event
+            >,
           ) =>
             pool
               .open(input)

@@ -114,6 +114,7 @@ export class ServerConfig extends Context.Service<
     readonly providerIoWorkers?: number | undefined;
     readonly providerIoCodexOffloadMinChars?: number | undefined;
     readonly providerIoAcpOffloadMinChars?: number | undefined;
+    readonly providerIoClaudeSdk?: boolean | undefined;
   }
 >()("t3/config/ServerConfig") {
   static readonly layerTest = (

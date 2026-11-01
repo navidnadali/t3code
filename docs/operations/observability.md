@@ -732,6 +732,18 @@ With few busy sessions, handing a shorter line to a worker and taking it back ca
 thread more than handling it there. With `T3CODE_PROVIDER_IO_STAGE_TIMING=1`, every line sent to a
 worker is counted under the `offload` stage.
 
+`T3CODE_PROVIDER_IO_CLAUDE_SDK` (default off; nothing while `T3CODE_PROVIDER_IO_WORKERS` is `0`) also runs
+each Claude session's Agent SDK on those workers. The server still starts, watches, and stops the Claude CLI; a
+worker reads its output. A session whose launch settings the worker cannot reproduce (an abort controller, a
+session store or other non-data options, an in-process MCP server, or no Claude binary path) stays on the main
+thread. If the workers fail to start, provider output stays on the main thread for the rest of the process, with
+one warning.
+
+A Claude session on a worker asks you what it would on the main thread: the worker passes each tool
+approval prompt, question, MCP elicitation, resume-compaction dialog and hook call to the server,
+which answers it as it does without workers, and passes on Claude's cancellation of one. The server
+handles such a request once it has handled the output Claude sent before it.
+
 ### The Kill Switch
 
 `T3CODE_OTEL_SDK_DISABLED` and `OTEL_SDK_DISABLED` turn off every OTLP export in both the server and

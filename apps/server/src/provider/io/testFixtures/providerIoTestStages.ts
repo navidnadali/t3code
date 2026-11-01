@@ -50,3 +50,59 @@ export const echoStage: ProviderIoStage<{ readonly tag: string }, string, string
     };
   },
 };
+
+let closedAsyncSessions = 0;
+
+// Emits, settles and ends outside push, as a stage that runs a library does.
+export const asyncStage: ProviderIoStage<void, string, string, string, string> = {
+  name: "test-async",
+  open: (_options, maybeHost) => {
+    const host = maybeHost!;
+    const decoder = new TextDecoder();
+    return {
+      push: (chunk, emit) => {
+        const text = decoder.decode(chunk);
+        if (text === "emit-then-signal") {
+          emit("emitted-in-push");
+          host.signal("signalled-in-push");
+          return;
+        }
+        if (text === "emit-signal-emit") {
+          emit("before-signal");
+          host.signal("signalled-between");
+          emit("after-signal");
+          return;
+        }
+        queueMicrotask(() => host.emit(`late:${text}`));
+      },
+      end: () => {},
+      call: (request) => {
+        switch (request) {
+          case "signal":
+            host.signal("event");
+            return "signalled";
+          case "emit-then-settle":
+            return Promise.resolve().then(() => {
+              queueMicrotask(() => host.emit("emitted-while-settling"));
+              return "settled";
+            });
+          case "reject":
+            return Promise.reject(new Error("rejected"));
+          case "finish":
+            host.finish();
+            return "finished";
+          case "fail":
+            host.finish(new Error("library failed"));
+            return "failed";
+          case "closed":
+            return String(closedAsyncSessions);
+          default:
+            return request;
+        }
+      },
+      close: () => {
+        closedAsyncSessions += 1;
+      },
+    };
+  },
+};

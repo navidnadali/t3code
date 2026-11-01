@@ -86,6 +86,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -1163,6 +1164,19 @@ const decodeRows =
       ),
     );
 
+// Takes the rows out of their holder when run, so each table's raw rows are freed once decoded.
+const decodeTakenRows = <K extends string, A, E>(
+  holder: { [key in K]: ReadonlyArray<PayloadRow> },
+  key: K,
+  decode: (json: string) => Effect.Effect<A, E>,
+  threadId: ThreadId,
+) =>
+  Effect.suspend(() => {
+    const rows = holder[key];
+    holder[key] = [];
+    return decodeRows(decode, threadId)(rows);
+  });
+
 function messageIdForTurnItem(item: OrchestrationV2TurnItem): string | null {
   switch (item.type) {
     case "user_message":
@@ -1850,6 +1864,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const readerPermits = yield* NodeSqliteClient.ReaderPermits;
 
     const inlineWorkOutput = sql`item.type = 'dynamic_tool' AND (
       item.payload_json LIKE '%htmlRender%' OR item.payload_json LIKE ${`%${MCP_APP_OUTPUT_KEY}%`}
@@ -2987,26 +3002,27 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       readonly work_last_ordinal?: number | null;
       readonly work_item_count?: number | null;
     };
+    // Row fields are emptied as they decode.
     type CanonicalProjectionRows = {
       readonly threadId: ThreadId;
       readonly threadRow: PayloadRow;
-      readonly turnItemRows: ReadonlyArray<WindowPayloadRow>;
+      turnItemRows: ReadonlyArray<WindowPayloadRow>;
       /** Decoded inside the snapshot only when a window needs them to choose its cohort. */
       readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem> | undefined;
-      readonly runRows: ReadonlyArray<PayloadRow>;
-      readonly attemptRows: ReadonlyArray<PayloadRow>;
-      readonly nodeRows: ReadonlyArray<PayloadRow>;
-      readonly subagentRows: ReadonlyArray<PayloadRow>;
-      readonly providerSessionRows: ReadonlyArray<PayloadRow>;
-      readonly providerThreadRows: ReadonlyArray<PayloadRow>;
-      readonly providerTurnRows: ReadonlyArray<PayloadRow>;
-      readonly runtimeRequestRows: ReadonlyArray<PayloadRow>;
-      readonly messageRows: ReadonlyArray<PayloadRow>;
-      readonly planRows: ReadonlyArray<PayloadRow>;
-      readonly checkpointScopeRows: ReadonlyArray<PayloadRow>;
-      readonly checkpointRows: ReadonlyArray<PayloadRow>;
-      readonly contextHandoffRows: ReadonlyArray<PayloadRow>;
-      readonly contextTransferRows: ReadonlyArray<PayloadRow>;
+      runRows: ReadonlyArray<PayloadRow>;
+      attemptRows: ReadonlyArray<PayloadRow>;
+      nodeRows: ReadonlyArray<PayloadRow>;
+      subagentRows: ReadonlyArray<PayloadRow>;
+      providerSessionRows: ReadonlyArray<PayloadRow>;
+      providerThreadRows: ReadonlyArray<PayloadRow>;
+      providerTurnRows: ReadonlyArray<PayloadRow>;
+      runtimeRequestRows: ReadonlyArray<PayloadRow>;
+      messageRows: ReadonlyArray<PayloadRow>;
+      planRows: ReadonlyArray<PayloadRow>;
+      checkpointScopeRows: ReadonlyArray<PayloadRow>;
+      checkpointRows: ReadonlyArray<PayloadRow>;
+      contextHandoffRows: ReadonlyArray<PayloadRow>;
+      contextTransferRows: ReadonlyArray<PayloadRow>;
       readonly messageOrdinalRows: ReadonlyArray<{
         readonly message_id: string;
         readonly ordinal: number;
@@ -3614,12 +3630,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ),
     );
 
-    // Decodes in the order the single-pass read did, so the first undecodable row is the one reported.
+    // Turn items decode first, then the thread, then each table in statement order; that
+    // order picks which undecodable row is reported.
     const decodeCanonicalProjection = Effect.fn("ProjectionStore.decodeCanonicalProjection")(
       function* (rows: CanonicalProjectionRows, decodedThread?: OrchestrationV2AppThread) {
         const { threadId } = rows;
-        const turnItems =
-          rows.turnItems ?? (yield* decodeTurnItemRows(threadId, rows.turnItemRows));
+        const turnItemRows = rows.turnItemRows;
+        rows.turnItemRows = [];
+        const turnItems = rows.turnItems ?? (yield* decodeTurnItemRows(threadId, turnItemRows));
         const thread = decodedThread ?? (yield* decodeThreadPayload(rows.threadRow.payload_json));
         const [
           runs,
@@ -3637,20 +3655,20 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           contextHandoffs,
           contextTransfers,
         ] = yield* Effect.all([
-          decodeRows(decodeRunPayload, threadId)(rows.runRows),
-          decodeRows(decodeRunAttemptPayload, threadId)(rows.attemptRows),
-          decodeRows(decodeNodePayload, threadId)(rows.nodeRows),
-          decodeRows(decodeSubagentPayload, threadId)(rows.subagentRows),
-          decodeRows(decodeProviderSessionPayload, threadId)(rows.providerSessionRows),
-          decodeRows(decodeProviderThreadPayload, threadId)(rows.providerThreadRows),
-          decodeRows(decodeProviderTurnPayload, threadId)(rows.providerTurnRows),
-          decodeRows(decodeRuntimeRequestPayload, threadId)(rows.runtimeRequestRows),
-          decodeRows(decodeMessagePayload, threadId)(rows.messageRows),
-          decodeRows(decodePlanJson, threadId)(rows.planRows),
-          decodeRows(decodeCheckpointScopePayload, threadId)(rows.checkpointScopeRows),
-          decodeRows(decodeCheckpointPayload, threadId)(rows.checkpointRows),
-          decodeRows(decodeContextHandoffPayload, threadId)(rows.contextHandoffRows),
-          decodeRows(decodeContextTransferPayload, threadId)(rows.contextTransferRows),
+          decodeTakenRows(rows, "runRows", decodeRunPayload, threadId),
+          decodeTakenRows(rows, "attemptRows", decodeRunAttemptPayload, threadId),
+          decodeTakenRows(rows, "nodeRows", decodeNodePayload, threadId),
+          decodeTakenRows(rows, "subagentRows", decodeSubagentPayload, threadId),
+          decodeTakenRows(rows, "providerSessionRows", decodeProviderSessionPayload, threadId),
+          decodeTakenRows(rows, "providerThreadRows", decodeProviderThreadPayload, threadId),
+          decodeTakenRows(rows, "providerTurnRows", decodeProviderTurnPayload, threadId),
+          decodeTakenRows(rows, "runtimeRequestRows", decodeRuntimeRequestPayload, threadId),
+          decodeTakenRows(rows, "messageRows", decodeMessagePayload, threadId),
+          decodeTakenRows(rows, "planRows", decodePlanJson, threadId),
+          decodeTakenRows(rows, "checkpointScopeRows", decodeCheckpointScopePayload, threadId),
+          decodeTakenRows(rows, "checkpointRows", decodeCheckpointPayload, threadId),
+          decodeTakenRows(rows, "contextHandoffRows", decodeContextHandoffPayload, threadId),
+          decodeTakenRows(rows, "contextTransferRows", decodeContextTransferPayload, threadId),
         ]);
         const messageOrdinals = new Map<string, number>();
         for (const row of rows.messageOrdinalRows) messageOrdinals.set(row.message_id, row.ordinal);
@@ -3703,26 +3721,24 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const readProjection: (
       threadId: ThreadId,
       seenThreadIds: ReadonlySet<ThreadId>,
-      window?: ProjectionWindow,
+      window: ProjectionWindow,
     ) => Effect.Effect<OrchestrationV2ThreadProjection, ProjectionStoreV2Error> = Effect.fn(
       "ProjectionStore.readProjection",
     )(
       function* (
         threadId: ThreadId,
         seenThreadIds: ReadonlySet<ThreadId>,
-        window?: ProjectionWindow,
+        window: ProjectionWindow,
       ) {
         const localWindow =
-          window?.suppressLocal === true ||
-          (window?.historyAnchor !== undefined && window.historyAnchor.threadId !== threadId)
+          window.suppressLocal === true ||
+          (window.historyAnchor !== undefined && window.historyAnchor.threadId !== threadId)
             ? { ...window, rowLimit: 0, anchorItemId: undefined }
             : window;
         const projection = yield* readCanonicalProjection(
           threadId,
           localWindow,
-          window !== undefined && seenThreadIds.size > 0
-            ? ["runs", "attempts", "turnItems"]
-            : undefined,
+          seenThreadIds.size > 0 ? ["runs", "attempts", "turnItems"] : undefined,
         );
         const forkedFrom = inheritedRunFork(projection.thread);
         if (forkedFrom === null || seenThreadIds.has(forkedFrom.threadId)) {
@@ -3731,8 +3747,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
         // Page unanchored local segments fully before inherited turns affect the boundary.
         if (
-          window?.userTurnLimit !== undefined &&
-          localWindow !== undefined &&
+          window.userTurnLimit !== undefined &&
           localWindow.rowLimit > 0 &&
           projection.turnItems.length >= localWindow.rowLimit &&
           !projection.turnItems.some(isThreadHistoryUserTurn)
@@ -3740,13 +3755,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           return withLocalVisibleTurnItems(projection);
         }
 
-        const sourceWindow =
-          window === undefined
-            ? undefined
-            : yield* Effect.gen(function* () {
-                const historyAnchor = window.historyAnchor;
-                const anchorBelongsToSource = historyAnchor?.threadId === forkedFrom.threadId;
-                const rows = yield* sql<{ readonly turn_item_id: string }>`
+        const sourceWindow = yield* Effect.gen(function* () {
+          const historyAnchor = window.historyAnchor;
+          const anchorBelongsToSource = historyAnchor?.threadId === forkedFrom.threadId;
+          const rows = yield* sql<{ readonly turn_item_id: string }>`
                   WITH fork_run AS (
                     SELECT ordinal
                     FROM orchestration_v2_projection_runs
@@ -3808,33 +3820,32 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   ORDER BY ordinal DESC, turn_item_id DESC
                   LIMIT 1
                 `;
-                const anchor = rows[0]?.turn_item_id;
-                const anchorIsInDescendant =
-                  historyAnchor !== undefined &&
-                  historyAnchor.threadId !== threadId &&
-                  historyAnchor.threadId !== forkedFrom.threadId;
-                return {
-                  rowLimit: window.rowLimit,
-                  userTurnLimit: window.userTurnLimit,
-                  deferWork: window.deferWork,
-                  requiredRunId: forkedFrom.runId,
-                  suppressLocal: anchor === undefined || anchorIsInDescendant,
-                  ...(anchor === undefined || anchorIsInDescendant
-                    ? {}
-                    : { anchorItemId: TurnItemId.make(anchor) }),
-                  ...(historyAnchor === undefined || historyAnchor.threadId === threadId
-                    ? {}
-                    : { historyAnchor }),
-                };
-              });
+          const anchor = rows[0]?.turn_item_id;
+          const anchorIsInDescendant =
+            historyAnchor !== undefined &&
+            historyAnchor.threadId !== threadId &&
+            historyAnchor.threadId !== forkedFrom.threadId;
+          return {
+            rowLimit: window.rowLimit,
+            userTurnLimit: window.userTurnLimit,
+            deferWork: window.deferWork,
+            requiredRunId: forkedFrom.runId,
+            suppressLocal: anchor === undefined || anchorIsInDescendant,
+            ...(anchor === undefined || anchorIsInDescendant
+              ? {}
+              : { anchorItemId: TurnItemId.make(anchor) }),
+            ...(historyAnchor === undefined || historyAnchor.threadId === threadId
+              ? {}
+              : { historyAnchor }),
+          };
+        });
 
         // Filled local pages need only the inherited count for cursor positions.
         // Run-forked parents still need the recursive read to include their ancestry.
         if (
-          window?.userTurnLimit !== undefined &&
+          window.userTurnLimit !== undefined &&
           window.historyAnchor === undefined &&
           seenThreadIds.size === 0 &&
-          sourceWindow !== undefined &&
           activeLocalTurnItems(projection).filter((row) => isThreadHistoryUserTurn(row.item))
             .length >= Math.max(window.userTurnLimit, THREAD_HISTORY_PAGE_POLICY.maxUserTurns)
         ) {
@@ -3880,7 +3891,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           }),
         };
       },
-      (effect, threadId, _seenThreadIds, _window?) =>
+      (effect, threadId, _seenThreadIds, _window) =>
         effect.pipe(
           Effect.mapError((cause) =>
             isProjectionStoreThreadNotFoundError(cause) || isProjectionStoreReadError(cause)
@@ -3896,7 +3907,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       readonly source: Result.Result<FullProjectionRows, ProjectionStoreV2Error> | undefined;
     };
 
-    // readProjection without a window, split so a caller's read transaction holds only the SQL.
+    // readProjection without a window. It reads no SQL between a fork and its source, so unlike
+    // the windowed walk every part can wait to decode until the read transaction has ended.
     const readFullProjectionRows: (
       threadId: ThreadId,
       seenThreadIds: ReadonlySet<ThreadId>,
@@ -3913,7 +3925,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         if (forkedFrom === null || seenThreadIds.has(forkedFrom.threadId)) {
           return { rows, thread, source: undefined };
         }
-        // Kept until this thread decodes, which used to happen before the source was read.
+        // A failed source read is reported after this thread's undecodable rows.
         const source = yield* Effect.result(
           readFullProjectionRows(forkedFrom.threadId, new Set([...seenThreadIds, threadId])),
         );
@@ -4507,36 +4519,51 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           }),
         )
         .pipe(
-          // Decoded after the read transaction, in the order the rows used to be decoded.
+          // Decoded after the read transaction, in statement order.
           Effect.flatMap((rows) =>
             Effect.all({
-              runs: decodeRows(decodeRunPayload, threadId)(rows.runRows),
-              attempts: decodeRows(decodeRunAttemptPayload, threadId)(rows.attemptRows),
+              runs: decodeTakenRows(rows, "runRows", decodeRunPayload, threadId),
+              attempts: decodeTakenRows(rows, "attemptRows", decodeRunAttemptPayload, threadId),
               nodes: Effect.fromResult(rows.nodes),
-              subagents: decodeRows(decodeSubagentPayload, threadId)(rows.subagentRows),
-              providerThreads: decodeRows(
+              subagents: decodeTakenRows(rows, "subagentRows", decodeSubagentPayload, threadId),
+              providerThreads: decodeTakenRows(
+                rows,
+                "providerThreadRows",
                 decodeProviderThreadPayload,
                 threadId,
-              )(rows.providerThreadRows),
-              providerTurns: decodeRows(decodeProviderTurnPayload, threadId)(rows.providerTurnRows),
-              checkpointScopes: decodeRows(
+              ),
+              providerTurns: decodeTakenRows(
+                rows,
+                "providerTurnRows",
+                decodeProviderTurnPayload,
+                threadId,
+              ),
+              checkpointScopes: decodeTakenRows(
+                rows,
+                "checkpointScopeRows",
                 decodeCheckpointScopePayload,
                 threadId,
-              )(rows.checkpointScopeRows),
-              contextHandoffs: decodeRows(
+              ),
+              contextHandoffs: decodeTakenRows(
+                rows,
+                "contextHandoffRows",
                 decodeContextHandoffPayload,
                 threadId,
-              )(rows.contextHandoffRows),
-              contextTransfers: decodeRows(
+              ),
+              contextTransfers: decodeTakenRows(
+                rows,
+                "contextTransferRows",
                 decodeContextTransferPayload,
                 threadId,
-              )(rows.contextTransferRows),
-              turnItems: decodeRows(decodeTurnItemPayload, threadId)(rows.turnItemRows),
-              providerSessions: decodeRows(
+              ),
+              turnItems: decodeTakenRows(rows, "turnItemRows", decodeTurnItemPayload, threadId),
+              providerSessions: decodeTakenRows(
+                rows,
+                "providerSessionRows",
                 decodeProviderSessionPayload,
                 threadId,
-              )(rows.providerSessionRows),
-              messages: decodeRows(decodeMessagePayload, threadId)(rows.messageRows),
+              ),
+              messages: decodeTakenRows(rows, "messageRows", decodeMessagePayload, threadId),
             }).pipe(
               Effect.map((decoded) => ({
                 hasConversation:
@@ -4560,6 +4587,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 contextTransfers: decoded.contextTransfers,
                 turnItems: decoded.turnItems,
               })),
+              Effect.withSpan("ProjectionStore.decodeTurnStartContext"),
             ),
           ),
           Effect.mapError((cause) =>
@@ -6577,7 +6605,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   } satisfies ProjectionSettlementCandidate;
                 }),
               );
-            }),
+            }).pipe(Effect.withSpan("ProjectionStore.decodeSettlementCandidates")),
           ),
           Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
         );
@@ -7230,7 +7258,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     state,
                     visibleItemCount: visibleItemCountForShell({ threadId, statesByThreadId }),
                   });
-                }),
+                }).pipe(Effect.withSpan("ProjectionStore.decodeThreadShell")),
           ),
           Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause })),
         );
@@ -7242,6 +7270,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       (...args: Args): Effect.Effect<A, E, R> =>
         method(...args).pipe(NodeSqliteClient.readOnly);
 
+    // These reads decode after their transaction, so a permit, not the reader slot, caps how
+    // many hold rows at once. A read inside a transaction keeps that transaction's connection.
+    const decodeOnReader =
+      <Args extends ReadonlyArray<unknown>, A, E, R>(
+        method: (...args: Args) => Effect.Effect<A, E, R>,
+      ) =>
+      (...args: Args): Effect.Effect<A, E, R> =>
+        Effect.serviceOption(sql.transactionService).pipe(
+          Effect.flatMap((transaction) =>
+            readerPermits === undefined || Option.isSome(transaction)
+              ? method(...args)
+              : readerPermits.withPermits(1)(method(...args)),
+          ),
+          NodeSqliteClient.readOnly,
+        );
+
     return {
       apply,
       getShellSnapshot: readOnReader(getShellSnapshot),
@@ -7250,14 +7294,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       listActiveShellIndex: readOnReader(listActiveShellIndex),
       readShellSnapshot: readOnReader(readShellSnapshot),
       listOlderSettledThreads: readOnReader(listOlderSettledThreads),
-      getThreadShell: readOnReader(getThreadShell),
+      getThreadShell: decodeOnReader(getThreadShell),
       findGuestShareThreadId: readOnReader(findGuestShareThreadId),
       getThread: readOnReader(getThread),
-      getSettlementCandidates: readOnReader(getSettlementCandidates),
+      getSettlementCandidates: decodeOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
       getOpenRemoteDelegatedTasks: getOpenRemoteDelegatedTasks.pipe(NodeSqliteClient.readOnly),
-      getThreadProjection: (threadId) =>
+      getThreadProjection: decodeOnReader((threadId: ThreadId) =>
         sql.withTransaction(readFullProjectionRows(threadId, new Set())).pipe(
           Effect.flatMap(decodeFullProjection),
           Effect.mapError((cause) =>
@@ -7265,9 +7309,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ? cause
               : new ProjectionStoreReadError({ threadId, cause }),
           ),
-          NodeSqliteClient.readOnly,
         ),
-      getTurnStartContext: readOnReader(getTurnStartContext),
+      ),
+      getTurnStartContext: decodeOnReader(getTurnStartContext),
       getTurnStartHistory: readOnReader(getTurnStartHistory),
       getRuntimeRecoveryProjection: readOnReader(getRuntimeRecoveryProjection),
       getRunningTurnContext: readOnReader(getRunningTurnContext),
@@ -7287,7 +7331,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getNextTurnItemOrdinal: readOnReader(getNextTurnItemOrdinal),
       getTurnItem: readOnReader(getTurnItem),
       getThreadRecords: (threadId, fields, filter) =>
-        getThreadRecords(threadId, fields, filter).pipe(NodeSqliteClient.readOnly),
+        decodeOnReader(getThreadRecords)(threadId, fields, filter),
       getRuntimeRequest: readOnReader(getRuntimeRequest),
       getPlan: readOnReader(getPlan),
       getProviderControlContext: readOnReader(getProviderControlContext),
@@ -7295,7 +7339,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getLimitRecoveryWakeAt: readOnReader(getLimitRecoveryWakeAt),
       getRecoveryThreadIds: readOnReader(getRecoveryThreadIds),
       getUnreadableThreadIds: readOnReader(getUnreadableThreadIds),
-      getThreadSnapshot: readOnReader(getThreadSnapshot),
+      getThreadSnapshot: decodeOnReader(getThreadSnapshot),
       getThreadSnapshotWindow: readOnReader(getThreadSnapshotWindow),
       getTimelinePage: readOnReader(getTimelinePage),
       getThreadHistoryPage: readOnReader(getThreadHistoryPage),

@@ -901,3 +901,31 @@ it.effect.each(readCases)(
       2,
     ),
 );
+
+it.effect("reads inside a write transaction without waiting for a reader permit", () =>
+  withFileStore(
+    "reader-scope-permit-tx-",
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("permit-tx", 2);
+      const holding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* store.getThreadRecords(fixture.fork, ["runs"]).pipe(
+        Effect.provideService(Statement.CurrentTransformer, (statement) =>
+          Deferred.succeed(holding, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as(statement),
+          ),
+        ),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(holding);
+      // The only permit is taken; this read has the writer and must not wait for it.
+      const inside = yield* sql.withTransaction(store.getThreadRecords(fixture.fork, ["runs"]));
+      yield* Deferred.succeed(release, undefined);
+      assert.deepStrictEqual(yield* Fiber.join(holder), inside);
+    }),
+    1,
+  ),
+);

@@ -11,6 +11,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
 import * as Metric from "effect/Metric";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -356,6 +357,28 @@ it.effect.each([
       }),
     { readerPoolSize: size },
   ),
+);
+
+// A permit is free when all of them can be taken at once and no more.
+const assertPermits = (expected: number) =>
+  Effect.gen(function* () {
+    const permits = yield* SqliteClient.ReaderPermits;
+    assert.isDefined(permits);
+    const all = yield* permits!.withPermitsIfAvailable(expected)(Effect.void);
+    const more = yield* permits!.withPermitsIfAvailable(expected + 1)(Effect.void);
+    assert.deepEqual([Option.isSome(all), Option.isSome(more)], [true, false]);
+  });
+
+it.effect.each([
+  { setting: "1", size: 1, permits: 1 },
+  { setting: "3", size: 3, permits: 3 },
+  { setting: "unset", size: undefined, permits: 4 },
+])("gives one reader permit per reader when the pool size is $setting", ({ size, permits }) =>
+  withReaderClient(() => assertPermits(permits), { readerPoolSize: size }),
+);
+
+it.effect("gives one reader permit without reader workers", () =>
+  assertPermits(1).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:" }))),
 );
 
 it.effect.each([{ size: 0 }, { size: 33 }, { size: 1.5 }, { size: Number.NaN }])(

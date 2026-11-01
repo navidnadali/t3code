@@ -83,6 +83,15 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
     restore(Effect.provideService(effect, ReadOnly, restore)),
   );
 
+/**
+ * One permit per reader worker, or one without them. Reads that decode their rows after the read
+ * transaction hold one until decoded, so the pool size still bounds how many hold rows at once.
+ */
+export const ReaderPermits = Context.Reference<Semaphore.Semaphore | undefined>(
+  "@t3tools/shared/nodeSqliteClient/ReaderPermits",
+  { defaultValue: () => undefined },
+);
+
 interface Acquired {
   readonly connection: "writer" | "reader";
   readonly lockWaitMs: number;
@@ -959,7 +968,11 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
 
 const make = Effect.fn("makeWithDatabase")(function* (
   options: SqliteClientConfig,
-): Effect.fn.Return<Client.SqlClient, SqlError, Scope.Scope | Reactivity.Reactivity> {
+): Effect.fn.Return<
+  { readonly client: Client.SqlClient; readonly readerPermits: Semaphore.Semaphore },
+  SqlError,
+  Scope.Scope | Reactivity.Reactivity
+> {
   yield* checkNodeSqliteCompat();
 
   const compiler = Statement.makeCompilerSqlite();
@@ -1398,7 +1411,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
     ],
   });
   const withTransaction = client.withTransaction;
-  return Object.assign(client, {
+  const readerPermits = yield* Semaphore.make(Math.max(1, readers.length));
+  const transactional = Object.assign(client, {
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.uninterruptibleMask((restore) => {
         // SqlClient masks setup; acquisition must preserve the caller's interruptibility.
@@ -1420,7 +1434,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
         );
       }),
   });
+  return { client: transactional, readerPermits };
 });
 
 export const layer = (config: SqliteClientConfig): Layer.Layer<Client.SqlClient, SqlError> =>
-  Layer.effect(Client.SqlClient, make(config)).pipe(Layer.provide(Reactivity.layer));
+  Layer.effectContext(
+    Effect.map(make(config), ({ client, readerPermits }) =>
+      Context.make(Client.SqlClient, client).pipe(Context.add(ReaderPermits, readerPermits)),
+    ),
+  ).pipe(Layer.provide(Reactivity.layer));

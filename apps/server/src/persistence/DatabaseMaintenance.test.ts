@@ -112,6 +112,24 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
             INSERT INTO orchestration_v2_message_search (orchestration_v2_message_search)
             VALUES ('delete-all')
           `;
+          yield* sql`
+            INSERT INTO orchestration_v2_projection_turn_items (
+              turn_item_id, thread_id, run_id, ordinal, type, status, updated_at, payload_json
+            )
+            VALUES (
+              'item-1', 'thread-1', NULL, 1, 'assistant_message', 'completed',
+              '2026-09-01T00:00:00.000Z', '{}'
+            )
+          `;
+          // Item counts that drifted from their items: one too high, one with no items at all.
+          yield* sql`
+            UPDATE orchestration_v2_projection_turn_item_counts SET item_count = 3
+            WHERE thread_id = 'thread-1'
+          `;
+          yield* sql`
+            INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
+            VALUES ('thread-2', 'run-2', 4)
+          `;
           yield* sql`PRAGMA wal_checkpoint(TRUNCATE)`;
           yield* sql`INSERT INTO orchestration_v2_legacy_imports (
             thread_id, source_updated_at, shell_imported_at, transcript_imported_at, imported_message_count
@@ -148,11 +166,18 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         );
         assert.deepEqual(pauses, [], "offline doctor must not throttle compaction");
         assert.equal(result.deletedReceiptCount, 51);
+        assert.equal(result.repairedItemCountThreads, 2);
         assert.isBelow(result.afterBytes, result.beforeBytes - 3 * 1024 * 1024);
         yield* Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           assert.deepEqual(yield* sql`PRAGMA auto_vacuum`, [{ auto_vacuum: 2 }]);
           assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
+          assert.deepEqual(
+            yield* sql`
+              SELECT thread_id, run_id, item_count FROM orchestration_v2_projection_turn_item_counts
+            `,
+            [{ thread_id: "thread-1", run_id: "", item_count: 1 }],
+          );
           assert.deepEqual(
             yield* sql`
               SELECT messages.message_id AS "messageId"

@@ -34,8 +34,9 @@ Not generated: the per-session MCP traffic a real agent sends to the server's `/
 driver, P1-004, models it), permission prompts (run bench threads in full access), hook callbacks
 and SDK MCP calls. For the driver, `BENCH_MCP_CREDENTIALS_DIR` hands over what the server sends in
 `mcp_set_servers`: the session's T3 MCP URL and `Authorization` header, as
-`{"url", "authorization"}` in `<dir>/<session-id>.json` (replaced atomically, mode 0600, never
-logged; a later `mcp_set_servers` for the session replaces the file, and files are not removed).
+`{"url", "authorization"}` in `<dir>/<session-id>.json` (replaced atomically, mode 0600 in a
+directory locked to 0700 at start, never logged; a later `mcp_set_servers` for the session replaces
+the file, and files are not removed).
 
 ## Knobs
 
@@ -64,8 +65,7 @@ keeps its ordinal) and plays transcript `cycle[(ordinal + BENCH_SEED) % cycle.le
 turns, where the cycle spreads the weights evenly. Whatever ids the server picks, every whole cycle
 of `total weights` sessions plays each transcript exactly `weight` times, and N sessions from a
 fresh state directory play each within one of `N × weight / total weights` (within two when
-`BENCH_SEED` moves the start). Start each run with a fresh state directory (a fresh `homePath` does
-that) and the same seed for the same counts. Every stats line records the session's `ordinal`,
+`BENCH_SEED` moves the start). The load driver (`driver.ts`) owns it: before any session opens it sets each planned bench instance's `BENCH_STATE_DIR` to a fresh `<--out>/fake-state/<instance>`, so runs that restore the same settings replay the same plan. Outside the driver, give every run a fresh one. Use the same seed for the same counts. Every stats line records the session's `ordinal`,
 `transcript`, `turn`, `seed` and the configured `mix`.
 
 The fake loads every transcript in the mix before it reads stdin. A bad knob or transcript makes it

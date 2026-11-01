@@ -232,6 +232,8 @@ describe("fake claude process", () => {
     using stats = tempDir("fake-claude-stats-");
     using credentials = tempDir("fake-claude-mcp-");
     const mcpDir = NodePath.join(credentials.path, "sessions");
+    // A directory made beforehand, as the driver's --session-mcp-credentials may be, is locked too.
+    NodeFS.mkdirSync(mcpDir, { mode: 0o755 });
     using fake = startFake(STREAM_ARGS, {
       BENCH_SPEED: "0",
       BENCH_TRANSCRIPT: "large-tool-payload",
@@ -278,6 +280,7 @@ describe("fake claude process", () => {
       authorization: "Bearer mcp-secret",
     });
     expect(NodeFS.statSync(credentialFile).mode & 0o777).toBe(0o600);
+    expect(NodeFS.statSync(mcpDir).mode & 0o777).toBe(0o700);
     expect(NodeFS.readdirSync(mcpDir)).toEqual([`${SESSION}.json`]);
     expect(lines.some((line) => line.includes("mcp-secret"))).toBe(false);
     expect(JSON.stringify(responses)).not.toContain("mcp-secret");

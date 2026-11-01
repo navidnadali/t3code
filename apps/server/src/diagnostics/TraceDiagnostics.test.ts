@@ -172,6 +172,48 @@ describe("TraceDiagnostics", () => {
     }),
   );
 
+  it("counts span summaries as spans of their name, not as parse errors", () => {
+    const summary = (count: number) =>
+      JSON.stringify({
+        type: "span-summary",
+        name: "sqlite",
+        thresholdMs: 2,
+        count,
+        totalDurationMs: 1.5,
+        maxDurationMs: 0.9,
+        startTimeUnixNano: ns(900),
+        endTimeUnixNano: ns(1_200),
+      });
+    const diagnostics = aggregateLines([
+      record({
+        name: "sqlite",
+        traceId: "trace-a",
+        spanId: "span-a",
+        startMs: 1_000,
+        durationMs: 5,
+      }),
+      summary(3),
+      summary(0),
+    ]);
+
+    assert.equal(diagnostics.recordCount, 4);
+    assert.equal(diagnostics.parseErrorCount, 1);
+    assert.equal(
+      Option.match(diagnostics.firstSpanAt, { onNone: () => null, onSome: DateTime.formatIso }),
+      "1970-01-01T00:00:00.900Z",
+    );
+    assert.deepStrictEqual(diagnostics.topSpansByCount, [
+      {
+        name: "sqlite",
+        count: 4,
+        failureCount: 0,
+        totalDurationMs: 6.5,
+        averageDurationMs: 1.625,
+        maxDurationMs: 5,
+      },
+    ]);
+  });
+
   it.effect("streams rotated files into the same result as reading them whole", () =>
     Effect.gen(function* () {
       const files = new Map([

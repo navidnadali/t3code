@@ -13,7 +13,13 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodePerfHooks from "node:perf_hooks";
 
-import { type DriverOptions, parseDriverOptions, USAGE, UsageError } from "./driver/options.ts";
+import {
+  type DriverOptions,
+  missingScopes,
+  parseDriverOptions,
+  USAGE,
+  UsageError,
+} from "./driver/options.ts";
 import {
   CallError,
   classifyFetchError,
@@ -36,6 +42,12 @@ import { CredentialCallers, readCredentials } from "./driver/sessionMcp.ts";
 import { Recorder } from "./driver/stats.ts";
 import { judgeWindow, type WindowEvidence } from "./driver/verdict.ts";
 import {
+  historyAssignments,
+  prepareFakeState,
+  sessionsByInstance,
+  withEnvironment,
+} from "./providers.ts";
+import {
   newId,
   now,
   Poller,
@@ -50,10 +62,10 @@ import {
 const RESULT_FILE = "driver.json";
 const FAILED_MARKER = "driver.failed";
 const SCHEMA_VERSION = 1;
-const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate", "access:write"];
 const LOOP_DELAY_RESOLUTION_MS = 10;
 /** P1-003's fake Claude CLI writes each session's MCP credential into this directory. */
 const CREDENTIALS_ENV = "BENCH_MCP_CREDENTIALS_DIR";
+const STATE_ENV = "BENCH_STATE_DIR";
 
 const log = (message: string) =>
   process.stderr.write(`[driver ${new Date().toISOString()}] ${message}\n`);
@@ -246,7 +258,9 @@ class BenchRun implements RunContext {
   private credentialCallers: CredentialCallers<Poller> | null = null;
   private sessionCallersCreated = 0;
   private sessionCallersAtWindowStart = 0;
-  private providerSetup: { readonly credentialsEnvironment?: string } = {};
+  private providerSetup: { readonly credentialsEnvironment?: Record<string, string> } = {};
+  private fakeStateDirectories: Record<string, string> = {};
+  private grantedScopes: ReadonlyArray<string> = [];
   /** The sockets sessions send commands and follow their threads on, a few sessions each. */
   private readonly sessionSockets: Array<RpcSocket> = [];
   private readonly startedAtEpochMs = Date.now();
@@ -381,10 +395,11 @@ class BenchRun implements RunContext {
   }
 
   /**
-   * Fails fast on a provider instance the server does not have ready, and points the instance's
-   * environment at `--session-mcp-credentials` so the fake CLI writes its sessions' credentials.
+   * Fails fast on a planned provider instance the server does not have ready, gives each one a
+   * fresh BENCH_STATE_DIR under --out, and with `--session-mcp-credentials` points its
+   * BENCH_MCP_CREDENTIALS_DIR there so its fake writes its sessions' credentials.
    */
-  private async checkProvider(socket: RpcSocket): Promise<void> {
+  private async checkProviders(socket: RpcSocket): Promise<void> {
     const { options } = this;
     const config = (await socket.call("server.getConfig", {}, options.callTimeoutMs)) as {
       readonly providers: ReadonlyArray<{
@@ -404,51 +419,74 @@ class BenchRun implements RunContext {
         >;
       };
     };
-    const provider = config.providers.find((entry) => entry.instanceId === options.provider);
-    const problem =
-      provider === undefined
-        ? `is not configured (configured: ${config.providers.map((entry) => entry.instanceId).join(", ") || "none"})`
-        : !provider.enabled
-          ? "is disabled"
-          : !provider.installed || provider.availability === "unavailable"
-            ? `is unavailable: ${provider.unavailableReason ?? provider.message ?? "not installed"}`
-            : null;
-    if (problem !== null) {
-      throw new FatalError(`provider instance "${options.provider}" ${problem}`);
+    const instanceIds = [...new Set(options.sessionPlan.map((session) => session.instanceId))];
+    for (const instanceId of instanceIds) {
+      const provider = config.providers.find((entry) => entry.instanceId === instanceId);
+      const problem =
+        provider === undefined
+          ? `is not configured (configured: ${config.providers.map((entry) => entry.instanceId).join(", ") || "none"})`
+          : !provider.enabled
+            ? "is disabled"
+            : !provider.installed || provider.availability === "unavailable"
+              ? `is unavailable: ${provider.unavailableReason ?? provider.message ?? "not installed"}`
+              : null;
+      if (problem !== null) throw new FatalError(`provider instance "${instanceId}" ${problem}`);
     }
-    const directory = options.sessionMcpCredentials;
-    if (directory === null || this.sessionMcpMode() === "off") return;
-    const instance = config.settings.providerInstances?.[options.provider];
-    if (instance === undefined) {
+    const instances = config.settings.providerInstances ?? {};
+    const benchInstances = instanceIds.filter((instanceId) => instances[instanceId] !== undefined);
+    const missing = missingScopes(this.grantedScopes, {
+      updatesInstances: benchInstances.length > 0,
+    });
+    if (missing.length > 0) {
       throw new FatalError(
-        `provider instance "${options.provider}" is built in; give it a settings entry to set ${CREDENTIALS_ENV}`,
+        `The bench token lacks ${missing.join(", ")}: the driver sets the BENCH_STATE_DIR of ${benchInstances.join(", ")}`,
       );
     }
-    const environment = instance.environment ?? [];
-    if (environment.some((entry) => entry.name === CREDENTIALS_ENV && entry.value === directory)) {
-      this.providerSetup = { credentialsEnvironment: "already set" };
-      return;
+    let stateDirectories: Record<string, string>;
+    try {
+      // Every run's fakes claim their sessions' ordinals afresh, whatever settings it restored.
+      stateDirectories = prepareFakeState(options.out, benchInstances);
+    } catch (error) {
+      throw new FatalError(error instanceof Error ? error.message : String(error));
     }
-    // Entries round-trip as the server sent them; redacted secrets keep their stored values.
-    await socket.call(
-      "server.updateSettings",
-      {
-        patch: {},
-        providerInstanceMutation: {
-          operation: "upsert",
-          instanceId: options.provider,
-          instance: {
-            ...instance,
-            environment: [
-              ...environment.filter((entry) => entry.name !== CREDENTIALS_ENV),
-              { name: CREDENTIALS_ENV, value: directory, sensitive: false },
-            ],
+    this.fakeStateDirectories = stateDirectories;
+    const directory = options.sessionMcpCredentials;
+    const credentials = directory !== null && this.sessionMcpMode() !== "off";
+    const credentialsEnvironment: Record<string, string> = {};
+    for (const instanceId of instanceIds) {
+      const instance = instances[instanceId];
+      if (instance === undefined) {
+        if (!credentials) continue;
+        throw new FatalError(
+          `provider instance "${instanceId}" is built in; give it a settings entry to set ${CREDENTIALS_ENV}`,
+        );
+      }
+      const environment = instance.environment ?? [];
+      const values: Record<string, string> = { [STATE_ENV]: stateDirectories[instanceId]! };
+      if (credentials) {
+        credentialsEnvironment[instanceId] = environment.some(
+          (entry) => entry.name === CREDENTIALS_ENV && entry.value === directory,
+        )
+          ? "already set"
+          : "set by the driver";
+        values[CREDENTIALS_ENV] = directory;
+      }
+      // Set before any session opens: a Codex app-server keeps the environment it started with.
+      // Entries round-trip as the server sent them; redacted secrets keep their stored values.
+      await socket.call(
+        "server.updateSettings",
+        {
+          patch: {},
+          providerInstanceMutation: {
+            operation: "upsert",
+            instanceId,
+            instance: { ...instance, environment: withEnvironment(environment, values) },
           },
         },
-      },
-      options.callTimeoutMs,
-    );
-    this.providerSetup = { credentialsEnvironment: "set by the driver" };
+        options.callTimeoutMs,
+      );
+    }
+    if (credentials) this.providerSetup = { credentialsEnvironment };
   }
 
   private async checkScopes(): Promise<void> {
@@ -457,15 +495,12 @@ class BenchRun implements RunContext {
       scopes?: ReadonlyArray<string>;
       permissions?: ReadonlyArray<string>;
     }>(this.http, "/api/auth/session");
-    const required = [
-      ...REQUIRED_SCOPES,
-      ...(this.options.sessionMcpCredentials === null
-        ? []
-        : ["settings:write", "providers:manage"]),
-    ];
     // `permissions` lists every grant; `scopes` folds some of them into their parents.
     const granted = session.value.permissions ?? session.value.scopes ?? [];
-    const missing = required.filter((scope) => !granted.includes(scope));
+    this.grantedScopes = granted;
+    const missing = missingScopes(granted, {
+      updatesInstances: this.options.sessionMcpCredentials !== null,
+    });
     if (!session.value.authenticated || missing.length > 0) {
       throw new FatalError(
         `The bench token is not accepted or lacks scopes: ${missing.join(", ") || "unauthenticated"}`,
@@ -486,7 +521,9 @@ class BenchRun implements RunContext {
   }
 
   private sessionMcpMode(): "off" | "provider-credentials" | "client-oauth" {
-    if (this.options.sessions === 0 || this.options.sessionMcpRatePerMinute === 0) return "off";
+    if (this.options.sessionPlan.length === 0 || this.options.sessionMcpRatePerMinute === 0) {
+      return "off";
+    }
     return this.options.sessionMcpCredentials === null ? "client-oauth" : "provider-credentials";
   }
 
@@ -520,7 +557,7 @@ class BenchRun implements RunContext {
   private followSessionCredentials(pool: ReadonlyArray<string>): ReturnType<typeof setInterval> {
     const directory = this.options.sessionMcpCredentials as string;
     const callers = new CredentialCallers<Poller>(
-      this.options.sessions,
+      this.options.sessionPlan.length,
       async (name, credential) => {
         const mcp = new McpSession(
           credential.url,
@@ -552,7 +589,7 @@ class BenchRun implements RunContext {
 
   private async prepareFresh(watcher: ShellWatcher): Promise<Workload> {
     const { options } = this;
-    const projectCount = Math.max(1, Math.min(options.projects, options.sessions));
+    const projectCount = Math.max(1, Math.min(options.projects, options.sessionPlan.length));
     const projectIds: Array<string> = [];
     for (let index = 0; index < projectCount; index++) {
       const directory = NodePath.join(this.workspaceDir(), `fresh-${this.runId}-${index}`);
@@ -567,15 +604,16 @@ class BenchRun implements RunContext {
       projectIds.push(projectId);
     }
     const sessionRng = this.rng.fork("sessions");
-    for (let index = 0; index < options.sessions; index++) {
+    for (const planned of options.sessionPlan) {
       this.sessions.push(
         new Session({
-          index,
+          index: planned.index,
           threadId: newId(),
           context: this,
-          socket: this.socketFor(index),
+          socket: this.socketFor(planned.index),
           watcher,
-          rng: sessionRng.fork(String(index)),
+          rng: sessionRng.fork(String(planned.index)),
+          selection: { instanceId: planned.instanceId, model: planned.model },
           switchProvider: false,
         }),
       );
@@ -613,14 +651,15 @@ class BenchRun implements RunContext {
         thread.lineage.sideChat !== true &&
         projects.has(thread.projectId),
     );
-    if (candidates.length < options.sessions) {
+    const sessionCount = options.sessionPlan.length;
+    if (candidates.length < sessionCount) {
       throw new FatalError(
-        `history mode needs ${options.sessions} idle root-workspace threads; the fixture has ${candidates.length}`,
+        `history mode needs ${sessionCount} idle root-workspace threads; the fixture has ${candidates.length}`,
       );
     }
     const chosen = shuffled(
       this.rng.fork("assignment"),
-      pickMatching(this.rng.fork("sessions"), candidates.map(weighted), target, options.sessions),
+      pickMatching(this.rng.fork("sessions"), candidates.map(weighted), target, sessionCount),
     ).map((entry) => entry.thread);
     const readPool = pickMatching(
       this.rng.fork("reads"),
@@ -670,16 +709,18 @@ class BenchRun implements RunContext {
       }
     });
     const sessionRng = this.rng.fork("session-text");
-    for (const [index, thread] of chosen.entries()) {
+    const { assignments, switches } = historyAssignments(options.sessionPlan, chosen);
+    for (const { session: planned, thread, switchProvider } of assignments) {
       this.sessions.push(
         new Session({
-          index,
+          index: planned.index,
           threadId: thread.id,
           context: this,
-          socket: this.socketFor(index),
+          socket: this.socketFor(planned.index),
           watcher,
-          rng: sessionRng.fork(String(index)),
-          switchProvider: thread.modelSelection.instanceId !== options.provider,
+          rng: sessionRng.fork(String(planned.index)),
+          selection: { instanceId: planned.instanceId, model: planned.model },
+          switchProvider,
         }),
       );
     }
@@ -692,9 +733,7 @@ class BenchRun implements RunContext {
         sessionCandidates: candidates.length,
         rerootedProjects: rerooted.length,
         modeChanges,
-        providerSwitches: chosen.filter(
-          (thread) => thread.modelSelection.instanceId !== options.provider,
-        ).length,
+        providerSwitches: switches,
         sessionThreadIds: chosen.map((thread) => thread.id),
       },
       itemCounts,
@@ -748,12 +787,13 @@ class BenchRun implements RunContext {
         httpJson<ShellSnapshot>(this.http, "/api/orchestration/shell"),
       );
       const control = await this.race(this.openSocket());
-      await this.race(this.checkProvider(control));
+      await this.race(this.checkProviders(control));
       this.sessionSockets.push(
         ...(await this.race(
           Promise.all(
-            Array.from({ length: Math.ceil(options.sessions / options.sessionsPerSocket) }, () =>
-              this.openSocket(),
+            Array.from(
+              { length: Math.ceil(options.sessionPlan.length / options.sessionsPerSocket) },
+              () => this.openSocket(),
             ),
           ),
         )),
@@ -975,6 +1015,7 @@ class BenchRun implements RunContext {
 
   private result(server: Record<string, unknown>, measured: Record<string, unknown> | null) {
     const { options } = this;
+    const { sessionPlan: _plan, ...knobs } = options;
     const base = {
       schemaVersion: SCHEMA_VERSION,
       status: this.failure === null ? "ok" : "failed",
@@ -987,10 +1028,12 @@ class BenchRun implements RunContext {
       },
       server,
       knobs: {
-        ...options,
+        ...knobs,
         tokenFile: options.tokenFile,
         pollMix: Object.fromEntries(options.pollMix),
       },
+      sessionsByProvider: sessionsByInstance(options.sessionPlan),
+      fakeStateDirectories: this.fakeStateDirectories,
       timeline: this.timeline,
     };
     if (this.failure !== null) return { ...base, failure: this.failure };

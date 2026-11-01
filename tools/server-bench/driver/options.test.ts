@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { parseDriverOptions, parseDuration, parsePollMix, UsageError } from "./options.ts";
+import {
+  missingScopes,
+  parseDriverOptions,
+  parseDuration,
+  parsePollMix,
+  UsageError,
+} from "./options.ts";
 
 const required = ["--url", "http://127.0.0.1:3773/ignored", "--out", "/tmp/bench"];
 
@@ -58,7 +64,40 @@ describe("parseDriverOptions", () => {
     });
   });
 
+  it("plans Codex and ACP sessions next to --sessions on the bench instances", () => {
+    const options = parseDriverOptions([
+      ...required,
+      "--sessions",
+      "2",
+      "--codex-sessions",
+      "3",
+      "--acp-sessions",
+      "1",
+    ]);
+
+    expect(options).toMatchObject({
+      provider: "claudeBench",
+      sessions: 2,
+      codexSessions: 3,
+      acpSessions: 1,
+      subscribers: 6,
+    });
+    expect(options.sessionPlan.map((session) => [session.instanceId, session.model])).toEqual([
+      ["codexBench", "gpt-6-luna"],
+      ["claudeBench", "claude-sonnet-4-6"],
+      ["codexBench", "gpt-6-luna"],
+      ["acpBench", "bench-replay"],
+      ["claudeBench", "claude-sonnet-4-6"],
+      ["codexBench", "gpt-6-luna"],
+    ]);
+    expect(
+      parseDriverOptions([...required, "--mode", "fresh", "--sessions", "0", "--acp-sessions", "2"])
+        .sessionPlan.length,
+    ).toBe(2);
+  });
+
   it.each([
+    [[...required, "--codex-sessions=-1"], "--codex-sessions must be an integer"],
     [["--out", "/tmp/bench"], "--url is required"],
     [[...required, "--mode", "replay"], "--mode must be fresh or history"],
     [[...required, "--sessions", "1.5"], "--sessions must be an integer"],
@@ -67,7 +106,7 @@ describe("parseDriverOptions", () => {
     [[...required, "--taskset", "all"], "--taskset takes a CPU list"],
     [[...required, "--max-driver-elu", "2"], "--max-driver-elu must be between 0 and 1"],
     [[...required, "--sessions-per-socket", "0"], "--sessions-per-socket must be an integer"],
-    [[...required, "--mode", "fresh", "--sessions", "0"], "--sessions must be > 0"],
+    [[...required, "--mode", "fresh", "--sessions", "0"], "start at least one session"],
   ])("rejects %j", (argv, message) => {
     expect(() => parseDriverOptions(argv)).toThrow(UsageError);
     expect(() => parseDriverOptions(argv)).toThrow(message);
@@ -88,5 +127,21 @@ describe("parsePollMix", () => {
     expect(() => parsePollMix("thread_list=1")).toThrow(UsageError);
     expect(() => parsePollMix("thread_read=1,thread_read=2")).toThrow("names a call twice");
     expect(() => parsePollMix("thread_read=0")).toThrow("at least one positive weight");
+  });
+});
+
+describe("missingScopes", () => {
+  const base = ["orchestration:read", "orchestration:operate", "access:write"];
+
+  it("asks for settings scopes whenever the driver updates a bench instance, credentials or not", () => {
+    expect(missingScopes(base, { updatesInstances: true })).toEqual([
+      "settings:write",
+      "providers:manage",
+    ]);
+    expect(missingScopes(base, { updatesInstances: false })).toEqual([]);
+    expect(missingScopes(["orchestration:read"], { updatesInstances: false })).toEqual([
+      "orchestration:operate",
+      "access:write",
+    ]);
   });
 });

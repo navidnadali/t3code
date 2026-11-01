@@ -758,6 +758,8 @@ async function runStream(flags, config) {
   const transcripts = await loadMix(config);
   if (config.mcpCredentialsDir !== undefined) {
     NodeFS.mkdirSync(config.mcpCredentialsDir, { recursive: true, mode: 0o700 });
+    // The mode above only applies to a directory mkdirSync creates.
+    NodeFS.chmodSync(config.mcpCredentialsDir, 0o700);
   }
   const mix = Object.fromEntries(config.mix.map(({ name, weight }) => [name, weight]));
   let assignment;

@@ -1,5 +1,15 @@
 import * as NodeUtil from "node:util";
 
+import {
+  BENCH_PROVIDERS,
+  type PlannedSession,
+  parseProviderLoad,
+  planSessions,
+  PROVIDER_LOAD_FLAGS,
+  PROVIDER_LOAD_USAGE,
+  ProviderLoadError,
+} from "../providers.ts";
+
 export const POLL_CALLS = [
   "mcp.t3_project_list",
   "mcp.t3_thread_read",
@@ -25,7 +35,12 @@ export interface DriverOptions {
   readonly out: string;
   readonly tokenFile: string | null;
   readonly mode: "fresh" | "history";
+  /** Sessions on --provider; the plan adds --codex-sessions and --acp-sessions. */
   readonly sessions: number;
+  readonly codexSessions: number;
+  readonly acpSessions: number;
+  /** One entry per session, of every provider, in launch order. */
+  readonly sessionPlan: ReadonlyArray<PlannedSession>;
   readonly subscribers: number;
   readonly pollers: number;
   readonly projects: number;
@@ -56,6 +71,22 @@ export interface DriverOptions {
   readonly taskset: string | null;
   readonly serverPid: number | null;
   readonly stopSessions: boolean;
+}
+
+export const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate", "access:write"];
+const SETTINGS_SCOPES = ["settings:write", "providers:manage"];
+
+/**
+ * The scopes `granted` lacks: the driver's own, and the settings scopes when it updates an
+ * instance's settings (each bench instance's state directory, MCP credentials).
+ */
+export function missingScopes(
+  granted: ReadonlyArray<string>,
+  { updatesInstances }: { readonly updatesInstances: boolean },
+): ReadonlyArray<string> {
+  return [...REQUIRED_SCOPES, ...(updatesInstances ? SETTINGS_SCOPES : [])].filter(
+    (scope) => !granted.includes(scope),
+  );
 }
 
 export class UsageError extends Error {
@@ -131,24 +162,36 @@ export function parsePollMix(text: string): ReadonlyArray<readonly [PollCall, nu
 
 export const USAGE = `Usage: node tools/server-bench/driver.ts --url <origin> --out <dir> [options]
 
-Drives load against a running scratch T3 server and writes <out>/driver.json.
+Drives load against a running scratch T3 server and writes <out>/driver.json. Its knobs echo
+every option but the session plan; sessionsByProvider gives the sessions per provider instance;
+in history mode workload.providerSwitches maps each instance to the seeded threads it took over;
+and with --session-mcp-credentials sessionMcp.credentialsEnvironment maps each planned instance
+to "set by the driver" or "already set". --provider defaults to claudeBench, not claudeAgent.
+Before any session opens it sets each planned bench instance's BENCH_STATE_DIR to a fresh,
+owner-only <out>/fake-state/<instance> (and fails when that is not empty), so runs restoring the
+same settings replay the same plan; fakeStateDirectories names them.
 The bearer token comes from T3_BENCH_TOKEN or --token-file; it needs the scopes
-orchestration:read, orchestration:operate and access:write, e.g.
+orchestration:read, orchestration:operate and access:write, and settings:write and
+providers:manage whenever a planned instance has a settings entry (every bench instance), e.g.
   t3 auth session issue --base-dir <scratch> --token-only \\
-    --scope orchestration:read --scope orchestration:operate --scope access:write
+    --scope orchestration:read --scope orchestration:operate --scope access:write \\
+    --scope settings:write --scope providers:manage
 
   --mode history|fresh      history (default): sessions continue, and readers read, seeded
                             threads picked to match the fixture's turn-item distribution;
                             fresh: new projects and threads
-  --sessions N              streaming sessions (default 80)
-  --subscribers N           WebSocket clients: shell stream + one thread stream (default 80)
+  --sessions N              streaming sessions on --provider (default 80)
+${PROVIDER_LOAD_USAGE}
+  --subscribers N           WebSocket clients: shell stream + one thread stream (default: every
+                            session)
   --pollers N               MCP/HTTP pollers (default 20)
   --projects N              fresh mode: projects the threads spread over (default 8)
   --warmup DUR              unmeasured warm-up (default 60s)
   --window DUR              measured window (default 300s)
   --seed TEXT               drives every workload choice (default 1)
-  --provider ID             provider instance sessions run on (default claudeAgent)
-  --model SLUG              model for new threads and switched ones (default claude-sonnet-4-6)
+  --provider ID             provider instance --sessions run on (default ${BENCH_PROVIDERS.claude.instanceId}, the
+                            fake Claude CLI's instance from \`providers.ts settings\`)
+  --model SLUG              model for their threads (default ${BENCH_PROVIDERS.claude.model})
   --runtime-mode MODE       runtime mode sessions run in (default full-access)
   --poll-rate N             calls per second per poller (default 1)
   --poll-mix SPEC           project_list=W,thread_read=W,http_bounded=W (default 1 each)
@@ -158,8 +201,8 @@ orchestration:read, orchestration:operate and access:write, e.g.
   --session-mcp-credentials DIR
                             use the credentials providers write here (one JSON file per session:
                             {"url": …, "authorization": …}); the driver sets the provider
-                            instance's BENCH_MCP_CREDENTIALS_DIR to DIR (the token then also
-                            needs settings:write and providers:manage). Without it each session
+                            instance's BENCH_MCP_CREDENTIALS_DIR to DIR (the token then needs
+                            settings:write and providers:manage). Without it each session
                             signs in as its own MCP client
   --switch-interval DUR     subscribers move to another thread this often; 0 holds (default 30s)
   --turn-gap DUR            pause between a session's turns (default 1s)
@@ -203,8 +246,9 @@ const parseFlags = (argv: ReadonlyArray<string>) =>
       warmup: { type: "string", default: "60s" },
       window: { type: "string", default: "300s" },
       seed: { type: "string", default: "1" },
-      provider: { type: "string", default: "claudeAgent" },
-      model: { type: "string", default: "claude-sonnet-4-6" },
+      provider: { type: "string", default: BENCH_PROVIDERS.claude.instanceId },
+      model: { type: "string", default: BENCH_PROVIDERS.claude.model },
+      ...PROVIDER_LOAD_FLAGS,
       "runtime-mode": { type: "string", default: "full-access" },
       "poll-rate": { type: "string", default: "1" },
       "poll-mix": { type: "string", default: "project_list=1,thread_read=1,http_bounded=1" },
@@ -255,6 +299,18 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
     throw new UsageError("--mode must be fresh or history");
   }
   const sessions = parseCount(values.sessions, "sessions", 0);
+  let groups: ReturnType<typeof parseProviderLoad>;
+  try {
+    groups = parseProviderLoad(values, {
+      sessions,
+      provider: values.provider,
+      model: values.model,
+    });
+  } catch (error) {
+    if (error instanceof ProviderLoadError) throw new UsageError(error.message);
+    throw error;
+  }
+  const sessionPlan = planSessions(groups);
   const maxErrorRate = parseFraction(values["max-error-rate"], "max-error-rate");
   const windowMs = parseDuration(values.window, "window");
   if (windowMs <= 0) throw new UsageError("--window must be positive");
@@ -267,7 +323,11 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
     tokenFile: values["token-file"] ?? null,
     mode: values.mode,
     sessions,
-    subscribers: parseCount(values.subscribers ?? String(sessions), "subscribers", 0),
+    // parseProviderLoad lists the --provider group, then the Codex and the ACP group.
+    codexSessions: groups[1]?.count ?? 0,
+    acpSessions: groups[2]?.count ?? 0,
+    sessionPlan,
+    subscribers: parseCount(values.subscribers ?? String(sessionPlan.length), "subscribers", 0),
     pollers: parseCount(values.pollers, "pollers", 0),
     projects: parseCount(values.projects, "projects", 1),
     warmupMs: parseDuration(values.warmup, "warmup"),
@@ -304,11 +364,11 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
   };
   if (
     options.mode === "fresh" &&
-    options.sessions === 0 &&
+    options.sessionPlan.length === 0 &&
     options.subscribers + options.pollers > 0
   ) {
     throw new UsageError(
-      "fresh mode reads the threads its sessions create: --sessions must be > 0",
+      "fresh mode reads the threads its sessions create: start at least one session",
     );
   }
   return options;

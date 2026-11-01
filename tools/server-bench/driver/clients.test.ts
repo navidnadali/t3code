@@ -67,6 +67,7 @@ const harness = (call: () => Promise<unknown> = async () => ({ sequence: 1 })) =
     socket,
     watcher,
     rng: createRng("test"),
+    selection: { instanceId: "claudeBench", model: "claude-sonnet-4-6" },
     switchProvider: false,
   });
   const update = (thread: ThreadShell) =>

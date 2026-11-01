@@ -1,4 +1,4 @@
 import { runProviderIoWorker } from "../providerIoWorkerRuntime.ts";
-import { echoStage, linesStage } from "./providerIoTestStages.ts";
+import { asyncStage, echoStage, linesStage } from "./providerIoTestStages.ts";
 
-runProviderIoWorker([echoStage, linesStage]);
+runProviderIoWorker([echoStage, linesStage, asyncStage]);

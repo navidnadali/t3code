@@ -1054,6 +1054,79 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
     }),
   );
 
+  it.effect("stops reading at 4 MiB of pending reads and resumes in order", () =>
+    Effect.gen(function* () {
+      const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+      const { stdio } = yield* makeInMemoryStdio();
+      const routed: Array<string> = [];
+      const release = yield* Deferred.make<void>();
+      const allRouted = yield* Deferred.make<void>();
+      const count = 10;
+      let calls = 0;
+      let pulls = 0;
+      // Every fiber that can run does, until it waits; no clock involved.
+      const settle = Effect.forEach(Array.from({ length: 2048 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+      // One read of exactly 1 MiB: a single line.
+      const mebibyteRead = (method: string) => {
+        const message = (pad: string) => JSON.stringify({ method, params: { pad } });
+        const pad = "y".repeat(1024 * 1024 - 1 - message("").length);
+        return encoder.encode(`${message(pad)}\n`);
+      };
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        // One read per pull, as a pipe delivers them.
+        stdio: Stdio.make({
+          ...stdio,
+          stdin: Stream.fromEffectRepeat(
+            Queue.take(input).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  pulls += 1;
+                }),
+              ),
+            ),
+          ),
+        }),
+        lineOffload: {
+          minChars: 64,
+          // The first worker call answers only when released.
+          decode: (line) =>
+            (calls++ === 0 ? Deferred.await(release) : Effect.void).pipe(
+              Effect.as(CodexOffload.decodeOffloadedLine(line)),
+            ),
+          writeLog: () => Effect.void,
+          failure: Effect.never,
+        },
+        onNotification: (notification) =>
+          Effect.suspend(() => {
+            routed.push(notification.method);
+            return routed.length === count + 1
+              ? Deferred.succeed(allRouted, undefined)
+              : Effect.void;
+          }).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${longLine}\n`));
+      for (let index = 0; index < count; index++) {
+        yield* Queue.offer(input, mebibyteRead(`x/${index}`));
+      }
+      // The held line and three 1 MiB reads are pending, the fourth waits for budget and one more
+      // is pulled by the termination watch (`Stream.interruptWhen`), as in-thread.
+      yield* settle;
+      assert.deepEqual(routed, []);
+      assert.isAtLeast(pulls, 4);
+      assert.isAtMost(pulls, 6);
+
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(allRouted);
+      assert.deepEqual(routed, [
+        "item/agentMessage/delta",
+        ...Array.from({ length: count }, (_, index) => `x/${index}`),
+      ]);
+    }),
+  );
+
   it.effect("handles a line the offload hands back exactly as an in-thread line", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();
@@ -1172,6 +1245,70 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
         Deferred.await(interrupted).pipe(Effect.as("read interrupted")),
       );
       assert.equal(outcome, "read completed");
+    }),
+  );
+
+  // In-thread, stdout stops at its next read once the protocol terminates, so a read taken ahead
+  // and not begun by then was never read: it is dropped without a log line, its tail too.
+  it.effect("does not log reads taken ahead and not begun when the protocol terminates", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const logged: Array<string> = [];
+      const written: Array<string> = [];
+      const offloaded = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const died = yield* Deferred.make<never, CodexError.CodexAppServerError>();
+      // Every fiber that can run does, until it waits; no clock involved.
+      const settle = Effect.forEach(Array.from({ length: 2048 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        logIncoming: true,
+        logger: (event) =>
+          Effect.sync(() => {
+            logged.push(event.stage);
+          }),
+        lineOffload: {
+          minChars: 64,
+          decode: (line) =>
+            Deferred.succeed(offloaded, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(
+                CodexOffload.decodeOffloadedLine(line, (event) => ({
+                  stream: "native",
+                  payload: event.stage,
+                })),
+              ),
+            ),
+          writeLog: (record) =>
+            Effect.sync(() => {
+              written.push(record.payload);
+            }),
+          failure: Deferred.await(died),
+        },
+        onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${longLine}\n`));
+      yield* Deferred.await(offloaded);
+      yield* Queue.offer(input, encoder.encode(`${shortLine("x/ahead")}\n{"method":"x/tail"`));
+      yield* settle;
+      yield* Deferred.fail(
+        died,
+        new CodexError.CodexAppServerTransportError({
+          operation: "read-input-stream",
+          cause: new Error("Provider I/O worker stopped."),
+        }),
+      );
+      yield* Deferred.await(termination);
+      yield* Deferred.succeed(release, undefined);
+      yield* settle;
+
+      // The read begun before termination completes; the one taken ahead is not logged.
+      assert.deepEqual(written, ["raw", "decoded"]);
+      assert.deepEqual(logged, []);
     }),
   );
 

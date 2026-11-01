@@ -1308,6 +1308,78 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
     }),
   );
 
+  it.effect("stops reading at 4 MiB of pending reads and resumes in order", () =>
+    Effect.gen(function* () {
+      const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+      const { stdio } = yield* makeInMemoryStdio();
+      const routed: Array<string> = [];
+      const release = yield* Deferred.make<void>();
+      const allRouted = yield* Deferred.make<void>();
+      const count = 10;
+      const decode = AcpOffload.makeOffloadedLineDecoder();
+      let calls = 0;
+      let pulls = 0;
+      // Every fiber that can run does, until it waits; no clock involved.
+      const settle = Effect.forEach(Array.from({ length: 2048 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+      // One read of exactly 1 MiB: a single line.
+      const mebibyteRead = (method: string) => {
+        const message = (pad: string) =>
+          JSON.stringify({ jsonrpc: "2.0", method, params: { pad } });
+        const pad = "y".repeat(1024 * 1024 - 1 - message("").length);
+        return encoder.encode(`${message(pad)}\n`);
+      };
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        // One read per pull, as a pipe delivers them.
+        stdio: {
+          ...stdio,
+          stdin: Stream.fromEffectRepeat(
+            Queue.take(input).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  pulls += 1;
+                }),
+              ),
+            ),
+          ),
+        },
+        serverRequestMethods: new Set(),
+        lineOffload: {
+          minChars: 200,
+          // The first worker call answers only when released.
+          decode: (line) =>
+            (calls++ === 0 ? Deferred.await(release) : Effect.void).pipe(Effect.as(decode(line))),
+          failure: Effect.never,
+        },
+        onNotification: (notification) =>
+          Effect.suspend(() => {
+            routed.push(notification.method);
+            return routed.length === count + 1
+              ? Deferred.succeed(allRouted, undefined)
+              : Effect.void;
+          }).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${update(long)}\n`));
+      for (let index = 0; index < count; index++) {
+        yield* Queue.offer(input, mebibyteRead(`x/${index}`));
+      }
+      // The held line and three 1 MiB reads are pending; the fourth waits for budget.
+      yield* settle;
+      assert.deepEqual(routed, []);
+      assert.isAtLeast(pulls, 4);
+      assert.isAtMost(pulls, 5);
+
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(allRouted);
+      assert.deepEqual(routed, [
+        "session/update",
+        ...Array.from({ length: count }, (_, index) => `x/${index}`),
+      ]);
+    }),
+  );
+
   it.effect("routes a batch with more messages than a call takes arguments", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();

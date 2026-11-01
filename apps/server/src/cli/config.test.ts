@@ -929,4 +929,34 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
       });
     }),
   );
+
+  it.effect("leaves provider I/O workers off unless 0 to 32 workers are configured", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-provider-io-" })),
+      );
+      const resolveWorkers = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.providerIoWorkers),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveWorkers({})).toBeUndefined();
+      expect(yield* resolveWorkers({ T3CODE_PROVIDER_IO_WORKERS: "0" })).toBe(0);
+      expect(yield* resolveWorkers({ T3CODE_PROVIDER_IO_WORKERS: "32" })).toBe(32);
+      for (const [workers, problem] of [
+        ["-1", "between 0 and 32"],
+        ["33", "between 0 and 32"],
+        ["two", "finite number"],
+      ] as const) {
+        const error = yield* resolveWorkers({ T3CODE_PROVIDER_IO_WORKERS: workers }).pipe(
+          Effect.flip,
+        );
+        expect(String(error)).toContain(problem);
+        expect(String(error)).toContain('at ["T3CODE_PROVIDER_IO_WORKERS"]');
+      }
+    }),
+  );
 });

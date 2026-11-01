@@ -26,6 +26,7 @@ import { readBootstrapEnvelope } from "../bootstrap.ts";
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
+import { PROVIDER_IO_MAX_WORKERS } from "../provider/io/ProviderIoWorkerPool.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 
 const modeFlag = Flag.Literals("mode", ServerConfig.RuntimeMode.literals).pipe(
@@ -172,6 +173,10 @@ const EnvServerConfig = Config.all({
     Config.map(Option.getOrUndefined),
   ),
   lan: Config.Boolean("T3CODE_LAN").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  providerIoWorkers: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: PROVIDER_IO_MAX_WORKERS })),
+    "T3CODE_PROVIDER_IO_WORKERS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -519,6 +524,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logWebSocketEvents,
     tailscaleServeEnabled,
     tailscaleServePort,
+    ...(env.providerIoWorkers === undefined ? {} : { providerIoWorkers: env.providerIoWorkers }),
   };
 
   return config;

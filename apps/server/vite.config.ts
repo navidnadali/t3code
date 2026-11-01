@@ -1,5 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off - Vite config runs before any Effect runtime.
 import "vite-plus/test/config";
+import * as NodeModule from "node:module";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import { defineConfig, mergeConfig } from "vite-plus";
+import { Rolldown } from "vite-plus/pack";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
@@ -63,6 +68,33 @@ const packExecutableTargets = packExecutableTarget
     ]
   : undefined;
 
+const providerIoDir = NodeURL.fileURLToPath(new URL("./src/provider/io/", import.meta.url));
+// Executables resolve only built-ins, so the worker ships as one CommonJS string run with `eval`.
+const providerIoWorkerBundle = {
+  name: "t3code:provider-io-worker",
+  async load(id: string) {
+    if (NodePath.normalize(id) !== NodePath.join(providerIoDir, "embeddedProviderIoWorker.ts")) {
+      return null;
+    }
+    const { output } = await Rolldown.build({
+      input: NodePath.join(providerIoDir, "providerIoWorker.ts"),
+      platform: "node",
+      write: false,
+      output: { format: "cjs", codeSplitting: false },
+    });
+    const code = output[0].code;
+    const external = [...code.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/g)]
+      .map((match) => match[1]!)
+      .filter((specifier) => !NodeModule.isBuiltin(specifier));
+    if (external.length > 0) {
+      throw new Error(
+        `The provider I/O worker bundle requires non-built-ins: ${external.join(", ")}`,
+      );
+    }
+    return `export const embeddedProviderIoWorkerSource = ${JSON.stringify(code)};`;
+  },
+};
+
 // The root config's `projects` route repo-root runs to package configs,
 // including this one. Inheriting them would make this config a container.
 const { projects: _rootTestProjects, ...baseTestConfig } = baseConfig.test ?? {};
@@ -87,6 +119,7 @@ export default mergeConfig(
       outDir: packExecutable ? "dist-exe" : "dist",
       sourcemap: !packExecutable,
       clean: true,
+      plugins: [providerIoWorkerBundle],
       // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
       // SEA can only resolve built-ins; keep dynamic imports inside its one module.
       ...(packExecutable ? { outputOptions: { codeSplitting: false } } : {}),

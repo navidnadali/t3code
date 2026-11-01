@@ -899,6 +899,18 @@ it.live(
           Deferred.doneUnsafe(overflowLogged, Effect.void);
         }
       });
+      // What the store holds: every published event's thread at its newest sequence. The
+      // snapshot the server loads on resync must reflect all of it.
+      const published = new Map<ThreadId, number>([[seedThreadId, row!.sequence]]);
+      const publish = (batch: ReadonlyArray<OrchestrationV2StoredEvent>) =>
+        Effect.sync(() => {
+          for (const event of batch) published.set(event.event.threadId, event.sequence);
+        }).pipe(Effect.andThen(store.publishCommitted(batch)));
+      const newestPublished = () => Math.max(...published.values());
+      const observingStore: OrchestrationEventStore.OrchestrationEventStore["Service"] = {
+        ...store,
+        latestApplicationSequence: Effect.sync(newestPublished),
+      };
       let highWaterReads = 0;
       let snapshotLoads = 0;
       const publishOnLiveSubscription: Statement.Transformer = (statement) => {
@@ -907,11 +919,10 @@ it.live(
           return Effect.succeed(statement);
         }
         highWaterReads += 1;
-        // 1: initial snapshot, 2: first live tail (publish the burst), 3: the resync snapshot,
-        // 4: the live tail after it (publish one more event).
-        if (highWaterReads === 2) return store.publishCommitted(events).pipe(Effect.as(statement));
-        if (highWaterReads === 4)
-          return store.publishCommitted([afterResync]).pipe(Effect.as(statement));
+        // The live tail reads the high-water mark right after subscribing: 1 before the
+        // burst (publish it), 2 after the resync (publish one more event).
+        if (highWaterReads === 1) return publish(events).pipe(Effect.as(statement));
+        if (highWaterReads === 2) return publish([afterResync]).pipe(Effect.as(statement));
         return Effect.succeed(statement);
       };
       const shell = (threadId: ThreadId, sequence: number) =>
@@ -938,6 +949,7 @@ it.live(
           ),
         ),
         Effect.provideService(Statement.CurrentTransformer, publishOnLiveSubscription),
+        Effect.provideService(OrchestrationEventStore.OrchestrationEventStore, observingStore),
         Effect.provide(Logger.layer([overflowLogger], { mergeWithExisting: true })),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           listActiveShellIndex: () => Effect.succeed([]),
@@ -946,8 +958,8 @@ it.live(
               snapshotLoads += 1;
               return Effect.succeed({
                 schemaVersion: 1,
-                snapshotSequence: 0,
-                threads: [shell(seedThreadId, snapshotLoads)],
+                snapshotSequence: newestPublished(),
+                threads: Array.from(published, ([threadId, sequence]) => shell(threadId, sequence)),
                 archivedThreads: [],
               });
             }),
@@ -983,14 +995,36 @@ it.live(
       const snapshots = items.filter((item) => item.kind === "snapshot");
       assert.equal(snapshots.length, 2);
       assert.equal(snapshotLoads, 2);
-      const resyncAt = items.lastIndexOf(snapshots[1]!);
-      assert.isTrue(items.slice(resyncAt + 1).every((item) => item.kind === "thread.updated"));
-      assert.deepEqual(items.at(-1), {
-        kind: "thread.updated",
-        sequence: afterResync.sequence,
-        location: "active",
-        thread: shell(seedThreadId, afterResync.sequence),
-      });
+      const resync = snapshots[1]!;
+      if (resync.kind !== "snapshot") return yield* Effect.die("Expected a snapshot");
+      assert.isUndefined(resync.resolvedRepositoryIdentityRoots);
+      assert.equal(resync.snapshot.snapshotSequence, lastSequence);
+      // Apply the items as the client does; nothing published may be missing or applied twice.
+      const state = new Map<ThreadId, string>();
+      let cursor = 0;
+      let appliedAfterResync = 0;
+      const resyncAt = items.indexOf(resync);
+      for (const [index, item] of items.entries()) {
+        if (item.kind === "snapshot") {
+          state.clear();
+          for (const thread of item.snapshot.threads) state.set(thread.id, thread.title);
+          cursor = item.snapshot.snapshotSequence;
+          continue;
+        }
+        if (item.kind === "synchronized") continue;
+        assert.isAbove(item.sequence, cursor);
+        cursor = item.sequence;
+        if (item.kind === "thread.updated") state.set(item.thread.id, item.thread.title);
+        if (index > resyncAt) appliedAfterResync += 1;
+      }
+      assert.equal(appliedAfterResync, 1);
+      assert.deepEqual(
+        state,
+        new Map([
+          ...events.map((event) => [event.event.threadId, `Shell at ${event.sequence}`] as const),
+          [seedThreadId, `Shell at ${afterResync.sequence}`],
+        ]),
+      );
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
@@ -1040,12 +1074,14 @@ it.live(
           return Effect.succeed(statement);
         }
         highWaterReads += 1;
-        if (highWaterReads === 1) return store.publishCommitted(events).pipe(Effect.as(statement));
-        if (highWaterReads === 2)
-          return store.publishCommitted([afterResync]).pipe(Effect.as(statement));
-        return Effect.succeed(statement);
+        const batch =
+          highWaterReads === 1 ? events : highWaterReads === 2 ? [afterResync] : undefined;
+        if (batch === undefined) return Effect.succeed(statement);
+        newestPublished = batch.at(-1)!.sequence;
+        return store.publishCommitted(batch).pipe(Effect.as(statement));
       };
       let snapshotLoads = 0;
+      let newestPublished = row!.sequence;
       const projection = (title: string) =>
         ({
           thread: {
@@ -1092,12 +1128,13 @@ it.live(
         Effect.provide(Logger.layer([overflowLogger], { mergeWithExisting: true })),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
+          // The projection the store holds reflects every event published so far.
           getThreadSnapshot: () =>
             Effect.sync(() => {
               snapshotLoads += 1;
               return {
-                snapshotSequence: row!.sequence,
-                projection: projection(`Snapshot ${snapshotLoads}`),
+                snapshotSequence: newestPublished,
+                projection: projection(`Events through ${newestPublished}`),
               };
             }),
           streamStoredEventsFrom: (input: { readonly afterSequence?: number }) =>
@@ -1113,13 +1150,27 @@ it.live(
       const snapshots = items.filter((item) => item.kind === "snapshot");
       assert.equal(snapshots.length, 2);
       assert.equal(snapshotLoads, 2);
-      assert.equal(
-        snapshots[1]!.kind === "snapshot" ? snapshots[1]!.projection.thread.title : null,
-        "Snapshot 2",
-      );
       assert.deepEqual(kinds.slice(items.lastIndexOf(snapshots[1]!)), ["snapshot", "event"]);
-      const last = items.at(-1);
-      assert.equal(last?.kind === "event" ? last.sequence : null, afterResync.sequence);
+      // Apply the items as the client does: the resync snapshot carries every burst event, and
+      // only the event published after it is applied on top, once.
+      let state: { readonly title: string; readonly cursor: number } | undefined;
+      let appliedAfterResync = 0;
+      const resyncAt = items.indexOf(snapshots[1]!);
+      for (const [index, item] of items.entries()) {
+        if (item.kind === "snapshot") {
+          state = { title: item.projection.thread.title, cursor: item.snapshotSequence };
+          continue;
+        }
+        if (item.kind !== "event") continue;
+        assert.isAbove(item.sequence, state!.cursor);
+        state = { title: state!.title, cursor: item.sequence };
+        if (index > resyncAt) appliedAfterResync += 1;
+      }
+      assert.deepEqual(state, {
+        title: `Events through ${row!.sequence + burst}`,
+        cursor: afterResync.sequence,
+      });
+      assert.equal(appliedAfterResync, 1);
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 

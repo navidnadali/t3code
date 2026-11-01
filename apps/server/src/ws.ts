@@ -936,7 +936,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
               };
             })();
         if (options?.resync === true) {
-          yield* Effect.logInfo(
+          yield* Effect.logWarning(
             "orchestration thread stream resynchronized after a live buffer overflow",
             {
               threadId: input.threadId,
@@ -1188,7 +1188,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
                 projectEnrichment,
               ),
               Effect.tap((loaded) =>
-                Effect.logInfo(
+                Effect.logWarning(
                   "orchestration shell stream resynchronized after a live buffer overflow",
                   {
                     snapshotSequence: loaded.snapshot.snapshotSequence,

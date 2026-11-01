@@ -1101,3 +1101,39 @@ it.effect("gives back a streamed search's reader permit however the stream ends"
     1,
   ),
 );
+
+it.effect("gives back a streamed search's reader permit when interrupted as it takes it", () =>
+  Effect.gen(function* () {
+    const semaphore = Semaphore.makeUnsafe(1);
+    const taken = yield* Deferred.make<void>();
+    // Once a permit is taken, let the test interrupt the search before it goes on.
+    const pauseAfter = <A>(effect: Effect.Effect<A>) =>
+      effect.pipe(
+        Effect.tap(() => Deferred.succeed(taken, undefined)),
+        Effect.tap(() => Effect.yieldNow),
+      );
+    const permits = new Proxy(semaphore, {
+      get: (target, key, receiver) =>
+        key === "take"
+          ? (count: number) => pauseAfter(target.take(count))
+          : key === "takeIfAvailable"
+            ? (count: number) => pauseAfter(target.takeIfAvailable(count))
+            : Reflect.get(target, key, receiver),
+    });
+    yield* withFileStore(
+      "reader-scope-search-interrupt-",
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const fixture = yield* writeFixture("search-interrupt", 2);
+        const search = yield* Stream.runCollect(
+          store.searchThreadStream({ threadId: fixture.fork, query: "fork" }),
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(taken);
+        yield* Fiber.interrupt(search);
+      }),
+      1,
+      permits,
+    );
+    assert.isTrue(yield* semaphore.takeIfAvailable(1));
+  }),
+);

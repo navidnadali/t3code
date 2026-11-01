@@ -131,6 +131,12 @@ waiting. Read CPU together with page faults:
   file writes.
 - Many `involuntaryContextSwitches` mean other processes were competing for the CPU.
 
+Every Git command is a child process, and Node creates each one synchronously on the thread that
+spawns it (`posix_spawn` on macOS, `fork` on Linux, which grows with the server's memory): about a
+millisecond of event loop per command, around 30 commands per turn. `T3CODE_VCS_SPAWN_WORKER=true`
+starts Git and source control CLI processes on a worker thread instead, with the same output, exit
+codes and errors. Unset or `false` spawns them on the event loop, as Windows always does.
+
 ### Related Artifacts
 
 Provider event NDJSON files still exist for provider runtime streams. Those are separate from the main server trace file.

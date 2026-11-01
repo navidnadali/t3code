@@ -23,6 +23,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import type { SourceControlProcessInput } from "@t3tools/source-control-core/server/SourceControlHost";
 
 import { gitCommandDuration, gitCommandsTotal, withMetrics } from "../observability/Metrics.ts";
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
 import * as ProcessRunner from "../processRunner.ts";
 
 export interface VcsProcessInput {
@@ -373,4 +374,7 @@ export const make = Effect.gen(function* () {
   return VcsProcess.of({ run });
 });
 
-export const layer = Layer.effect(VcsProcess, make).pipe(Layer.provide(ProcessRunner.layer));
+export const layer = Layer.effect(VcsProcess, make).pipe(
+  Layer.provide(ProcessRunner.layer),
+  Layer.provide(WorkerChildProcessSpawner.layerFromConfig),
+);

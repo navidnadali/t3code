@@ -1404,6 +1404,68 @@ describe("allowlist limits", () => {
   });
 });
 
+describe("allowlisted ids", () => {
+  // Production: 20 Claude reasoning ids whose random part ended in `pwd` (any case), kept as ids, read
+  // by P1-002's extended check as `pwd:<8 letters>` assignments; the self-check failed, nothing written.
+  const NATIVE_ID = "abc_123XXXXXXXXXXXXXXXXXXXpWd:abcdefgh:1";
+
+  it("blanks a kept id that an extended rule reads as a credential", () => {
+    const payload = JSON.stringify({
+      type: "reasoning",
+      nativeItemRef: { driver: "claudeAgent", nativeId: NATIVE_ID, strength: "strong" },
+      providerThreadId: `provider-thread:${NATIVE_ID}`,
+    });
+    const out = JSON.parse(rewriteContent(payload, "payload_json", "blank", emptyCounts())) as {
+      nativeItemRef: { nativeId: string };
+      providerThreadId: string;
+    };
+    expect([isFiller(out.nativeItemRef.nativeId), isFiller(out.providerThreadId)]).toEqual([
+      true,
+      true,
+    ]);
+    const kinds: Array<string> = [];
+    contentFindings(payload, "payload_json", "blank", (kind) => kinds.push(kind));
+    expect(kinds.filter((kind) => kind.startsWith("raw|keyword assignment"))).toEqual([
+      "raw|keyword assignment (loose)",
+      "raw|keyword assignment (loose)",
+    ]);
+  });
+
+  it("sanitises a turn item and its event whose native id reads as an assignment", () => {
+    const directory = scratch("native-id");
+    const seeded = NodePath.join(directory, "seeded.sqlite");
+    synthCopy(seeded);
+    const db = new NodeSqlite.DatabaseSync(seeded);
+    const item = (
+      db
+        .prepare(
+          `SELECT turn_item_id AS id FROM orchestration_v2_projection_turn_items
+           WHERE type = 'reasoning' ORDER BY turn_item_id LIMIT 1`,
+        )
+        .get() as { id: string }
+    ).id;
+    const reference = `json_object('driver', 'claudeAgent', 'nativeId', ?, 'strength', 'strong')`;
+    db.prepare(
+      `UPDATE orchestration_v2_projection_turn_items
+       SET payload_json = json_set(payload_json, '$.nativeItemRef', ${reference}) WHERE turn_item_id = ?`,
+    ).run(NATIVE_ID, item);
+    const events = db
+      .prepare(
+        `UPDATE orchestration_events
+         SET payload_json = json_set(payload_json, '$.nativeItemRef', ${reference})
+         WHERE event_type = 'turn-item.updated' AND json_extract(payload_json, '$.id') = ?`,
+      )
+      .run(NATIVE_ID, item).changes;
+    db.close();
+    expect(Number(events)).toBeGreaterThan(0);
+    const clean = NodePath.join(directory, "clean.sqlite");
+    const result = run(["sanitise", seeded, clean]);
+    expect([result.status, result.stderr]).toEqual([0, ""]);
+    const raw = NodeFS.readFileSync(clean).toString("latin1");
+    expect(raw.includes(NATIVE_ID)).toBe(false);
+  });
+});
+
 describe("v1 imports", () => {
   it("scan counts pending v1 shell and transcript imports, and sanitise leaves none", () => {
     const directory = scratch("legacy");

@@ -23,6 +23,7 @@ import * as ProjectionStore from "../../../apps/server/src/orchestration-v2/Proj
 import * as ProviderRuntimeRecovery from "../../../apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as LegacyV1ThreadImporter from "../../../apps/server/src/orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import { rebuildMessageSearch } from "../../../apps/server/src/orchestration-v2/messageSearchIndex.ts";
+import { recountTurnItems } from "../../../apps/server/src/orchestration-v2/turnItemCounts.ts";
 import { runMigrations } from "../../../apps/server/src/persistence/Migrations.ts";
 import * as ServerSettings from "../../../apps/server/src/serverSettings.ts";
 import { assertSafeDestination } from "./guards.ts";
@@ -232,6 +233,17 @@ export const recoveryThreadIds = Effect.gen(function* () {
 
 export const rebuildSearch = Effect.gen(function* () {
   yield* rebuildMessageSearch(yield* SqlClient.SqlClient);
+});
+
+/**
+ * Migration 77's recount of the turn item counts (clear, then refill from the items), when the
+ * database has the table: the content pass runs with its triggers dropped.
+ */
+export const recountTurnItemCounts = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const table = yield* sql<{ name: string }>`
+    SELECT name FROM sqlite_schema WHERE name = 'orchestration_v2_projection_turn_item_counts'`;
+  if (table.length > 0) yield* recountTurnItems(sql);
 });
 
 /** v1 threads the legacy importer would turn into v2 threads on start (no v2 `thread.created`). */

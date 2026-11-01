@@ -5,6 +5,11 @@ import * as CodexError from "../errors.ts";
 import type { CodexAppServerStageTiming } from "../protocol.ts";
 
 export const JsonRpcId = Schema.Union([Schema.Number, Schema.String]);
+export const isJsonRpcId = Schema.is(JsonRpcId);
+
+export function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
 const JsonRpcError = Schema.Struct({
   code: Schema.Number,

@@ -32,7 +32,11 @@ export type EventNdjsonStream = "native" | "canonical" | "orchestration";
 
 export type SerializedEventNdjsonRecord =
   | { readonly _tag: "Skipped" }
-  | { readonly _tag: "Serialized"; readonly payload: string }
+  | {
+      readonly _tag: "Serialized";
+      readonly stream: EventNdjsonStream;
+      readonly payload: string;
+    }
   | { readonly _tag: "Failed"; readonly error: Schema.SchemaError };
 
 const skipped: SerializedEventNdjsonRecord = { _tag: "Skipped" };
@@ -222,11 +226,11 @@ export function boundProviderEventForLogging(event: unknown): unknown {
   return summarizeProviderEvent(event);
 }
 
-const serialize = (event: unknown): SerializedEventNdjsonRecord => {
+const serialize = (stream: EventNdjsonStream, event: unknown): SerializedEventNdjsonRecord => {
   const encoded = encodeUnknownJsonString(event);
   return Result.isFailure(encoded)
     ? { _tag: "Failed", error: encoded.failure }
-    : { _tag: "Serialized", payload: encoded.success };
+    : { _tag: "Serialized", stream, payload: encoded.success };
 };
 
 export function serializeEventNdjsonRecord(
@@ -234,12 +238,23 @@ export function serializeEventNdjsonRecord(
   event: unknown,
 ): SerializedEventNdjsonRecord {
   if (!shouldPersistProviderEvent(stream, event)) return skipped;
-  const record = serialize(boundProviderEventForLogging(event));
+  const record = serialize(stream, boundProviderEventForLogging(event));
   // Escaping can expand strings beyond their input size.
   if (record._tag === "Serialized" && Buffer.byteLength(record.payload) > MAX_RECORD_CHARACTERS) {
-    return serialize(summarizeProviderEvent(event));
+    return serialize(stream, summarizeProviderEvent(event));
   }
   return record;
+}
+
+/** Why a record serialized elsewhere is not one `serializeEventNdjsonRecord` could have built. */
+export function serializedRecordProblem(
+  stream: EventNdjsonStream,
+  record: { readonly stream: string; readonly payload: string },
+): "stream" | "line-break" | "size" | undefined {
+  if (record.stream !== stream) return "stream";
+  if (/[\n\r]/.test(record.payload)) return "line-break";
+  if (Buffer.byteLength(record.payload) > MAX_RECORD_CHARACTERS) return "size";
+  return undefined;
 }
 
 export function formatEventNdjsonLine(

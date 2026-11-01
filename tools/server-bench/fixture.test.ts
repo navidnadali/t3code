@@ -1316,18 +1316,23 @@ describe("allowlist limits", () => {
       inputTokens: 1234,
       exitCode: 1,
       auth: { expiresIn: 3600 },
+      // Test tallies, not credentials: ws1's data has these under `pass` and `PASS`.
+      runs: { pass: 12, fail: 1 },
+      PASS: 3,
     });
     const stored = rewriteContent(payload, "payload_json", "blank", emptyCounts());
     expect(stored.length).toBe(payload.length);
     const out = JSON.parse(stored) as Record<string, unknown>;
-    expect([out.pin, out.otp, out.passcode, out.inputTokens, out.exitCode, out.auth]).toEqual([
-      0,
-      0,
-      0,
-      1234,
-      1,
-      { expiresIn: 0 },
-    ]);
+    expect([
+      out.pin,
+      out.otp,
+      out.passcode,
+      out.inputTokens,
+      out.exitCode,
+      out.auth,
+      out.runs,
+      out.PASS,
+    ]).toEqual([0, 0, 0, 1234, 1, { expiresIn: 0 }, { pass: 12, fail: 1 }, 3]);
     const kinds: Array<string> = [];
     contentFindings(JSON.stringify({ pin: 123456 }), null, "blank", (kind) => kinds.push(kind));
     expect(kinds).toEqual(["credential-number"]);

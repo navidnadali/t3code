@@ -72,8 +72,8 @@ Load
   --server-pid <pid> --warmup <n>s --window <n>s [--sessions N] [--subscribers N] [--pollers N]
   [driver args], with T3_BENCH_TOKEN (a bearer token from the server's bootstrap grant) in its
   environment. It writes <out>/driver.json: { status: "ok"|"failed", failure?: { reason },
-  timeline: { window: <ISO> }, windowSeconds, calls: { <type>: { count, errors, p50, p95, p99,
-  max } }, counters: { "events.thread": { perSecond }, ... }, knobs }; status "failed", a
+  timeline: { window: <ISO> }, windowSeconds, calls: { <type>: { count, errors, unfinished, p50,
+  p95, p99, max } }, counters: { "events.thread": { perSecond }, ... }, knobs }; status "failed", a
   driver.failed marker or no file marks the run invalid. Without a window in it, the run uses
   [driver start + warmup, + window].
 
@@ -429,6 +429,8 @@ function prepareTarget(spec: string, workDir: string, buildCmd: string): Omit<Ta
 export interface CallStats {
   readonly count: number | null;
   readonly errors: number | null;
+  /** Calls still running when the driver's grace period ended; latencies leave them out. */
+  readonly unfinished: number | null;
   readonly per_s: number | null;
   readonly p50_ms: number | null;
   readonly p95_ms: number | null;
@@ -472,6 +474,7 @@ export function readDriverResult(raw: unknown): DriverSummary {
     calls[type] = {
       count: finiteOrNull(entry.count),
       errors: finiteOrNull(entry.errors),
+      unfinished: finiteOrNull(entry.unfinished),
       per_s: finiteOrNull(entry.perSecond),
       p50_ms: finiteOrNull(entry.p50),
       p95_ms: finiteOrNull(entry.p95),

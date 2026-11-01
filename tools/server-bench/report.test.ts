@@ -215,6 +215,16 @@ describe("renderComparison", () => {
     );
     expect(line(markdown, "Client `http.environment` errors")).toBeUndefined();
     expect(line(markdown, "Client `http.environment` unfinished")).toBeUndefined();
+
+    const oneRunCensored = result("one-run", 0.5, {
+      spread: {
+        min: metrics(0.5),
+        max: { driver: { calls: { "http.environment": { unfinished: 3 } } } },
+      },
+    });
+    expect(tableRows([before, oneRunCensored]).map((row) => row.label)).toContain(
+      "Client `http.environment` unfinished",
+    );
   });
 
   it("marks rows without trace or gauge data n/a, never 0", () => {

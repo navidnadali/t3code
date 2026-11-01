@@ -2,6 +2,8 @@ import type * as NodeWorkerThreads from "node:worker_threads";
 
 import {
   type CanUseTool,
+  type HookCallback,
+  type HookCallbackMatcher,
   InMemorySessionStore,
   type McpServerConfig,
   type Options as ClaudeQueryOptions,
@@ -854,6 +856,20 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       return { list: [...this] };
     }
   }
+  // The SDK reads a matcher's fields as properties, so getters and fields that are not enumerable count.
+  class GetterMatcher {
+    readonly #hooks: ReadonlyArray<HookCallback>;
+    constructor(hooks: ReadonlyArray<HookCallback>) {
+      this.#hooks = hooks;
+      Object.defineProperty(this, "timeout", { value: 5, enumerable: false });
+    }
+    get matcher() {
+      return "Bash";
+    }
+    get hooks() {
+      return this.#hooks;
+    }
+  }
   class KeyedJson {
     toJSON(key: string) {
       return { continue: true, writtenUnder: key };
@@ -1058,6 +1074,26 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
                 },
               ],
             },
+          ],
+        },
+      }),
+      [hookRequest("hook_0", "toolu-case"), hookRequest("hook_1", PROBE)],
+    ],
+    [
+      "a hook whose matcher reads its fields from getters",
+      (record) => ({
+        hooks: {
+          PreToolUse: [
+            new GetterMatcher([
+              async (...args) => {
+                record(args);
+                return { continue: true, reason: "getter matcher" };
+              },
+              async (...args) => {
+                record(args);
+                return { continue: true };
+              },
+            ]) as never,
           ],
         },
       }),
@@ -1742,6 +1778,22 @@ describe("claudeAgentSdkStageOptions", () => {
           SubagentStart: [{ hooks: 1 }],
           PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: 2 }, { hooks: 0 }],
         },
+      },
+    );
+    const getterMatcher = Object.defineProperties(
+      {},
+      {
+        matcher: { get: () => "Bash", enumerable: false },
+        timeout: { value: 5, enumerable: false },
+        hooks: { value: [hook] },
+      },
+    ) as HookCallbackMatcher;
+    assert.deepStrictEqual(
+      claudeAgentSdkStageOptions({ ...base, hooks: { PreToolUse: [getterMatcher] } }, undefined),
+      {
+        options: base,
+        callbacks: [],
+        hooks: { PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: 1 }] },
       },
     );
     assert.deepStrictEqual(claudeAgentSdkStageOptions({ ...base, hooks: {} }, undefined), {

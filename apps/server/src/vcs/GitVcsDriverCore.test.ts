@@ -332,6 +332,63 @@ it.effect("invalidates origin remote cache when a driver mutation adds origin", 
   }).pipe(Effect.provide(layerTest)),
 );
 
+describe("config reads", () => {
+  const makeCountingDriver = Effect.gen(function* () {
+    const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const spawned: Array<ReadonlyArray<string>> = [];
+    const spawner = ChildProcessSpawner.make((command) => {
+      if (ChildProcess.isStandardCommand(command)) spawned.push(command.args);
+      return delegate.spawn(command);
+    });
+    const driver = yield* makeGitVcsDriverCore().pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    );
+    return { driver, spawned };
+  });
+  const readsOnlyConfig = (args: ReadonlyArray<string>) =>
+    args[0] === "config" || args[0] === "remote" || args[0] === "var";
+  // The config GitManager's local status refresh reads after statusDetailsLocal.
+  const refreshStatus = (driver: GitVcsDriver.GitVcsDriver["Service"], cwd: string) =>
+    Effect.gen(function* () {
+      const details = yield* driver.statusDetailsLocal(cwd, {
+        includeDivergence: false,
+        includeBranchChanges: true,
+      });
+      const remoteName = yield* driver.readConfigValue(cwd, `branch.${details.branch}.remote`);
+      const remoteUrl =
+        (yield* driver.readConfigValue(cwd, `remote.${remoteName ?? "origin"}.url`)) ??
+        (yield* driver.readConfigValue(cwd, "remote.origin.url"));
+      return { details, remoteName, remoteUrl };
+    });
+
+  it.effect("runs no config reads on a refresh while the config is unchanged", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const first = yield* refreshStatus(driver, cwd);
+        const firstArgs = [...spawned];
+        spawned.length = 0;
+
+        const second = yield* refreshStatus(driver, cwd);
+
+        assert.deepStrictEqual(second, first);
+        assert.isNotEmpty(firstArgs.filter(readsOnlyConfig));
+        assert.deepStrictEqual(spawned.filter(readsOnlyConfig), []);
+
+        NodeFS.appendFileSync(
+          (yield* Path.Path).join(cwd, ".git", "config"),
+          `[branch "${initialBranch}"]\n\tremote = upstream\n[remote "upstream"]\n\turl = https://example.invalid/upstream.git\n`,
+        );
+        const edited = yield* refreshStatus(driver, cwd);
+        assert.equal(edited.remoteName, "upstream");
+        assert.equal(edited.remoteUrl, "https://example.invalid/upstream.git");
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+});
+
 it.effect.each([
   { hookExitCode: 0, commonDirFailure: "none" },
   { hookExitCode: 1, commonDirFailure: "none" },

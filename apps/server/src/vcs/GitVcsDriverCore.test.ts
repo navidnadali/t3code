@@ -670,6 +670,40 @@ describe("config reads", () => {
       ).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect("sees a repository initialised below a directory outside GIT_WORK_TREE", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["config", "t3.value", "parent"]);
+        const sub = NodePath.join(cwd, "sub");
+        NodeFS.mkdirSync(sub);
+        const workTree = yield* makeTmpDir("git-work-tree-");
+        const readWithWorkTree = Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const previous = process.env.GIT_WORK_TREE;
+            process.env.GIT_WORK_TREE = workTree;
+            return previous;
+          }),
+          () => driver.readConfigValue(sub, "t3.value"),
+          (previous) =>
+            Effect.sync(() => {
+              if (previous === undefined) delete process.env.GIT_WORK_TREE;
+              else process.env.GIT_WORK_TREE = previous;
+            }),
+        );
+        assert.equal(yield* readWithWorkTree, "parent");
+        assert.equal(yield* readWithWorkTree, "parent");
+
+        yield* git(cwd, ["init", "-q", "sub"]);
+        yield* git(sub, ["config", "t3.value", "nested"]);
+
+        assert.equal(yield* readWithWorkTree, "nested");
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
   it.effect("reads what git config --get and git remote read", () =>
     Effect.scoped(
       Effect.gen(function* () {

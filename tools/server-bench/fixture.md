@@ -187,6 +187,11 @@ paths they find no repository. For bench runs (P1-007) set, in `<base-dir>/userd
 `"sidebarAutoSettleOnMerge": false` (no settle sweep on threads the bench creates), and the environment variable
 `T3CODE_TELEMETRY_ENABLED=false`. The identity probes cannot be switched off.
 
+A fixture carries the migrations of the build that sanitised it. Booted by a newer build, its first boot runs
+the newer migrations: one made at migration 76 gains P1-014's turn item count table (migration 77 creates it,
+its triggers, and fills it from the turn items; no events). Sanitise with the build you bench, or snapshot the
+fixture after that first boot.
+
 ## synth
 
 Plans every row from the shape, then writes it through the server's `EventSink` (event store, projections, turn

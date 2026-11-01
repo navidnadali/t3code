@@ -323,6 +323,53 @@ describe("CodexAdapterV2 native protocol logging", () => {
       });
     }),
   );
+
+  it.effect("logs values that are not plain data as plain copies", () =>
+    Effect.gen(function* () {
+      const writes: Array<unknown> = [];
+      const protocolLogger = CodexAdapterV2.makeCodexAppServerProtocolLogger({
+        nativeEventLogger: {
+          filePath: "/tmp/events.log",
+          write: (event) =>
+            Effect.sync(() => {
+              writes.push(event);
+            }),
+          close: () => Effect.void,
+        },
+        threadId: ThreadId.make("thread-1"),
+        providerSessionId: ProviderSessionId.make("provider-session-1"),
+      });
+      assert.notEqual(protocolLogger, undefined);
+      if (protocolLogger === undefined) {
+        return;
+      }
+      class Usage {
+        readonly total = 20;
+      }
+
+      yield* protocolLogger({
+        direction: "outgoing",
+        stage: "decoded",
+        payload: {
+          method: "thread/event",
+          params: {
+            at: new Date(0),
+            usage: new Usage(),
+            tagged: Object.assign([1, 2], { note: "extra" }),
+          },
+        },
+      });
+
+      assert.equal(writes.length, 1);
+      const params: unknown = Reflect.get(
+        Object(Reflect.get(Object(Reflect.get(Object(writes[0]), "event")), "payload")),
+        "params",
+      );
+      assert.deepEqual(params, { at: {}, usage: { total: 20 }, tagged: [1, 2] });
+      assert.equal(Object.getPrototypeOf(Reflect.get(Object(params), "usage")), Object.prototype);
+      assert.deepEqual(Object.keys(Object(Reflect.get(Object(params), "tagged"))), ["0", "1"]);
+    }),
+  );
 });
 
 describe("CodexAdapterV2 rollback mapping", () => {

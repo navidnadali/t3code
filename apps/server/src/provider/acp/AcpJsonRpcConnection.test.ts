@@ -1569,6 +1569,55 @@ describe("AcpSessionRuntime", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("ends a prompt whose runtime closes before the prompt is queued", () =>
+    Effect.gen(function* () {
+      const testScope = yield* Scope.Scope;
+      const scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const closing = yield* Deferred.make<Fiber.Fiber<void>>();
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        // The runtime closes as the prompt's started record is taken, before the prompt is sent.
+        requestLogger: (event) =>
+          isPromptStarted(event)
+            ? Scope.close(scope, Exit.void).pipe(
+                Effect.forkIn(testScope, { startImmediately: true }),
+                Effect.flatMap((fiber) => Deferred.succeed(closing, fiber)),
+                Effect.asVoid,
+                Effect.provideService(Scheduler.MaxOpsBeforeYield, Number.POSITIVE_INFINITY),
+              )
+            : Effect.void,
+      }).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* runtime.start();
+      const dispatched = yield* Deferred.make<void>();
+      // Yielding every few operations, the prompt's fiber is in the runtime scope before it sends.
+      const prompt = yield* runtime
+        .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
+        .pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 3), Effect.forkChild);
+      yield* Fiber.join(yield* Deferred.await(closing));
+      expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+      expect(yield* Deferred.isDone(dispatched)).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("fails a prompt whose started logger throws", () =>
+    Effect.gen(function* () {
+      const loggerFailure = new Error("native logger threw");
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        requestLogger: (event) => {
+          if (isPromptStarted(event)) throw loggerFailure;
+          return Effect.void;
+        },
+      });
+      yield* runtime.start();
+      expect(
+        yield* runtime.prompt({ prompt: [{ type: "text", text: "first" }] }).pipe(Effect.exit),
+      ).toEqual(Exit.die(loggerFailure));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("sends a request whose started record fails and fails it with that defect", () =>
     Effect.gen(function* () {
       const appendFailure = new Error("native log append failed");

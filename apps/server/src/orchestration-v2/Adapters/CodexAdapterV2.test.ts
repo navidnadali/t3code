@@ -350,6 +350,8 @@ describe("CodexAdapterV2 native protocol logging", () => {
       sparse[1] = 1;
       const hidden = [1, 2];
       Object.defineProperty(hidden, 0, { enumerable: false });
+      const hooked = [1, 2];
+      Object.defineProperty(hooked, "toJSON", { value: () => "replaced", enumerable: false });
 
       yield* protocolLogger({
         direction: "outgoing",
@@ -363,6 +365,8 @@ describe("CodexAdapterV2 native protocol logging", () => {
             sparse: Object.assign(sparse, { note: "extra" }),
             hidden: Object.assign(hidden, { note: "extra" }),
             error: Object.defineProperty({}, "message", { value: "hidden", enumerable: false }),
+            hooked,
+            bare: Object.assign(Object.create(null), { id: "bare" }),
           },
         },
       });
@@ -379,6 +383,8 @@ describe("CodexAdapterV2 native protocol logging", () => {
         "sparse",
         "hidden",
         "error",
+        "hooked",
+        "bare",
       ]);
       const logged = (key: string): unknown => Reflect.get(Object(params), key);
       assert.deepEqual(logged("endpoint"), {});
@@ -388,6 +394,8 @@ describe("CodexAdapterV2 native protocol logging", () => {
       assert.deepEqual(Object.keys(Object(logged("sparse"))), ["1"]);
       assert.deepEqual(Object.keys(Object(logged("hidden"))), ["0", "1"]);
       assert.deepEqual(Object.getOwnPropertyNames(logged("error")), []);
+      assert.deepEqual(Object.getOwnPropertyNames(logged("hooked")), ["0", "1", "length"]);
+      assert.equal(Object.getPrototypeOf(logged("bare")), Object.prototype);
     }),
   );
 });

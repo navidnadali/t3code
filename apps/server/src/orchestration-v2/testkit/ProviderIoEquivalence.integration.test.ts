@@ -26,10 +26,12 @@ import {
   serializedRecordProblem,
   serializeEventNdjsonRecord,
 } from "../../provider/EventNdjsonRecord.ts";
+import { CLAUDE_AGENT_SDK_STAGE } from "../../provider/io/claudeAgentSdkProtocol.ts";
 import * as ProviderIoOffloads from "../../provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "../../provider/io/ProviderIoWorkerPool.ts";
 import { AcpRegistryOrchestratorReplayHarness } from "../Adapters/AcpRegistryAdapterV2.testkit.ts";
 import * as ClaudeAdapterV2 from "../Adapters/ClaudeAdapterV2.ts";
+import { layerClaudeAgentSdkWorkerPool } from "../Adapters/ClaudeAgentSdkWorkerQuery.ts";
 import { CodexOrchestratorReplayHarness } from "../Adapters/CodexAdapterV2.testkit.ts";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import { ORCHESTRATOR_REPLAY_FIXTURES } from "./fixtures/index.ts";
@@ -372,7 +374,9 @@ const adapterRow = <
                       session.call(request).pipe(
                         Effect.tap((reply) =>
                           Effect.sync(() => {
-                            if ((reply as { readonly _tag?: unknown })._tag === "Decoded") {
+                            if (
+                              (reply as { readonly _tag?: unknown } | undefined)?._tag === "Decoded"
+                            ) {
                               stage.decoded += 1;
                             }
                           }),
@@ -392,6 +396,7 @@ const adapterRow = <
           Effect.map((config) => ({
             ...config,
             providerIoWorkers: mode.workers,
+            ...(mode.workers > 0 ? { providerIoClaudeSdk: true } : {}),
             ...(offloadMinChars === undefined
               ? {}
               : {
@@ -411,6 +416,7 @@ const adapterRow = <
           }),
           layerPool,
           ProviderIoOffloads.layer.pipe(Layer.provide(Layer.merge(layerPool, layerConfig))),
+          layerClaudeAgentSdkWorkerPool.pipe(Layer.provide(Layer.merge(layerPool, layerConfig))),
           // The same seed in every mode, so each mode reads the same chunks.
           Layer.succeed(ReplayStdoutChunking, seededStdoutChunking(fixtureSeed(input))),
         ),
@@ -595,9 +601,9 @@ const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "claudeAgent",
     path: "wire (fake CLI)",
-    // P1-027 runs the Agent SDK on the workers; it names the stage it registers.
-    offload: "pending",
-    stage: "claude-agent-sdk",
+    // P1-027 runs the Agent SDK on the workers (T3CODE_PROVIDER_IO_CLAUDE_SDK).
+    offload: "required",
+    stage: CLAUDE_AGENT_SDK_STAGE,
     modes: [{ name: "2 workers", workers: 2 }],
     fixtures: CLAUDE_WIRE_FIXTURES,
     freshIds: true,

@@ -252,7 +252,7 @@ const countingPool = (pool: Pool, counter: { decoded: number }): Pool =>
               session.call(request).pipe(
                 Effect.tap((reply) =>
                   Effect.sync(() => {
-                    if ((reply as { readonly _tag?: unknown })._tag === "Decoded") {
+                    if ((reply as { readonly _tag?: unknown } | undefined)?._tag === "Decoded") {
                       counter.decoded += 1;
                     }
                   }),

@@ -6,7 +6,7 @@ import * as Contracts from "../../../packages/contracts/src/index.ts";
 import type * as SchemaAST from "effect/SchemaAST";
 
 import { NAMEY, highEntropy } from "./extended.ts";
-import { parseJsonContainer, rewriteJson } from "./json.ts";
+import { type NumberPlace, parseJsonContainer, rewriteJson } from "./json.ts";
 import { CREDENTIAL_NAME, redactDecoded, scanDecoded } from "./secrets.ts";
 
 /**
@@ -258,6 +258,47 @@ const CREDENTIAL_KEY_END =
   /(?:token|secret|password|passwd|pwd|access[_-]?key|api[_-]?key|apikey|private[_-]?key)$/i;
 /** Object keys kept as written; any other key becomes lowercase letters of its size. */
 const IDENTIFIER = /^[A-Za-z_$@][A-Za-z0-9_$@.:-]{0,63}$/;
+/**
+ * A key that holds a credential, so everything under it does: no allowlisted id or name, numbers
+ * zeroed. Narrower than CREDENTIAL_NAME only for `author` and token counts and usage; any `pass`
+ * word counts (a test tally lost there costs a bench fixture nothing).
+ */
+const CREDENTIAL_HOLDER =
+  /password|passwd|passphrase|passcode|secret|credential|cookie|api[_-]?key|access[_-]?key|private[_-]?key|auth(?!or)|token(?!s|[_-]?(?:usage|count|limit|budget|ize))|(?:^|[_.-])(?:key|pass|pwd|pin|otp)(?:$|[_.-])/i;
+const CAMEL_HOLDER = /[a-z0-9](?:Pin|Otp|Pwd|Pass|Passcode)(?![a-z])/;
+export const holdsCredential = (key: string) =>
+  CREDENTIAL_HOLDER.test(key) || CAMEL_HOLDER.test(key);
+/** A vendor prefix (`toolu_`, `msg_`, `chatcmpl-`, `mcp__`): the rest is that vendor's id. */
+const VENDOR_PREFIX = /^[a-z]{2,12}[_-]/;
+const ALNUM_RUN = /[A-Za-z0-9]{16,}/g;
+
+const letterDigitChanges = (run: string) => {
+  let changes = 0;
+  for (let index = 1; index < run.length; index++) {
+    const before = /[0-9]/.test(run[index - 1] as string);
+    if (before !== /[0-9]/.test(run[index] as string)) changes++;
+  }
+  return changes;
+};
+
+const entropyBits = (text: string) => {
+  const counts = new Map<string, number>();
+  for (const character of text) counts.set(character, (counts.get(character) ?? 0) + 1);
+  let bits = 0;
+  for (const count of counts.values())
+    bits -= (count / text.length) * Math.log2(count / text.length);
+  return bits;
+};
+
+/**
+ * A key shaped like a token rather than a name: an unprefixed run of 16+ letters and digits that
+ * mixes them like noise. camelCase names, MCP tool names and vendor-prefixed ids stay.
+ */
+const tokenLikeKey = (key: string) =>
+  !VENDOR_PREFIX.test(key) &&
+  [...key.matchAll(ALNUM_RUN)].some(
+    ([run]) => letterDigitChanges(run) >= 3 && entropyBits(run) >= 3.3,
+  );
 
 export type Kept = "literal" | "timestamp" | "id" | "enum" | "model" | "hash";
 
@@ -265,11 +306,12 @@ export type Kept = "literal" | "timestamp" | "id" | "enum" | "model" | "hash";
  * Why a string may stay, or null when it is blanked. `key` is the JSON key it sits under (array
  * items inherit it) or the column name. A credential-named key keeps only known literals.
  */
-export const keptAs = (key: string | null, value: string): Kept | null => {
+export const keptAs = (key: string | null, value: string, marked = false): Kept | null => {
   if (key !== null && value.length >= 8 && CREDENTIAL_KEY_END.test(key)) return null;
   if (KNOWN_LITERALS.has(value)) return "literal";
   if (TIMESTAMP.test(value)) return "timestamp";
-  if (key === null || CREDENTIAL_NAME.test(key)) return null;
+  // Under a credential-holding ancestor nothing else is kept: ids there can be the credential.
+  if (key === null || marked || CREDENTIAL_NAME.test(key)) return null;
   if (ID_KEY.test(key) && ID_VALUE.test(value)) return "id";
   if (ENUM_KEY.test(key) && ENUM_VALUE.test(value)) return "enum";
   if (MODEL_KEY.test(key) && MODEL_VALUE.test(value)) return "model";
@@ -289,13 +331,26 @@ const keptFindings = (value: string, kept: Kept, key: string | null): Array<stri
   return findings;
 };
 
-/** The allowlist for an original key: an identifier the pattern layer does not flag. */
-const keepsKey = (key: string) =>
-  IDENTIFIER.test(key) && scanDecoded(key, { entropy: false }).length === 0;
+/** What an identifier key holds that disqualifies it: a pattern finding, or a token's shape. */
+const identifierFindings = (key: string) => {
+  const findings = scanDecoded(key, { entropy: false });
+  if (tokenLikeKey(key)) findings.push("key");
+  return findings;
+};
+
+/** The allowlist for an original key: an identifier that is neither flagged nor token-shaped. */
+const keepsKey = (key: string) => IDENTIFIER.test(key) && identifierFindings(key).length === 0;
 
 /** At check time a key is an allowlisted identifier or, regenerated from its seed, key filler. */
 const keyFindings = (key: string) =>
-  IDENTIFIER.test(key) ? scanDecoded(key, { entropy: false }) : isBlankedKey(key) ? [] : ["key"];
+  IDENTIFIER.test(key) ? identifierFindings(key) : isBlankedKey(key) ? [] : ["key"];
+
+/** A number a credential could be (a PIN, an OTP): under a credential-holding key or ancestor. */
+const credentialNumber = (where: NumberPlace) =>
+  where.marked || (where.key !== null && holdsCredential(where.key));
+
+/** Zero, padded to the original's length with whitespace JSON ignores. */
+const zeroed = (raw: string) => `0${" ".repeat(raw.length - 1)}`;
 
 /** `blank` (default): filler for all but the allowlist. `redact`: the pattern layer alone. */
 export type ContentMode = "blank" | "redact";
@@ -305,30 +360,36 @@ export interface ContentCounts {
   changed: number;
   /** Allowlisted strings the pattern layer still flagged, so blanked after all. */
   flaggedKept: number;
-  /** Object keys rewritten: not an identifier, or flagged. */
+  /** Object keys rewritten: not an identifier, flagged, or shaped like a token. */
   keys: number;
+  /** Numbers zeroed under a credential-holding key. */
+  numbers: number;
 }
 
-export const emptyCounts = (): ContentCounts => ({ changed: 0, flaggedKept: 0, keys: 0 });
+export const emptyCounts = (): ContentCounts => ({
+  changed: 0,
+  flaggedKept: 0,
+  keys: 0,
+  numbers: 0,
+});
 
 const mask = (text: string) => text.replace(/\S/g, "*");
 
-/** The same member counts at every depth: rewritten keys did not collide. */
+/** The same member counts at every depth (rewritten keys did not collide); iterative. */
 const sameShape = (left: unknown, right: unknown): boolean => {
-  if (Array.isArray(left))
-    return (
-      Array.isArray(right) &&
-      left.length === right.length &&
-      left.every((item, index) => sameShape(item, right[index]))
-    );
-  if (typeof left === "object" && left !== null) {
-    if (typeof right !== "object" || right === null || Array.isArray(right)) return false;
-    const leftValues = Object.values(left);
-    const rightValues = Object.values(right);
-    return (
-      leftValues.length === rightValues.length &&
-      leftValues.every((item, index) => sameShape(item, rightValues[index]))
-    );
+  const pending: Array<readonly [unknown, unknown]> = [[left, right]];
+  for (let pair = pending.pop(); pair !== undefined; pair = pending.pop()) {
+    const [a, b] = pair;
+    if (Array.isArray(a)) {
+      if (!Array.isArray(b) || a.length !== b.length) return false;
+      a.forEach((item, index) => pending.push([item, b[index]]));
+    } else if (typeof a === "object" && a !== null) {
+      if (typeof b !== "object" || b === null || Array.isArray(b)) return false;
+      const aValues = Object.values(a);
+      const bValues = Object.values(b);
+      if (aValues.length !== bValues.length) return false;
+      aValues.forEach((item, index) => pending.push([item, bValues[index]]));
+    }
   }
   return true;
 };
@@ -344,6 +405,7 @@ export const rewriteContent = (
   key: string | null,
   mode: ContentMode,
   counts: ContentCounts,
+  marked = false,
 ): string => {
   if (text === "") return text;
   if (parseJsonContainer(text) !== null) {
@@ -351,20 +413,31 @@ export const rewriteContent = (
     const out = rewriteJson(
       text,
       (decoded, where) => {
-        if (where.role === "value") return rewriteContent(decoded, where.key, mode, counts);
+        if (where.role === "value") {
+          return rewriteContent(decoded, where.key, mode, counts, where.marked);
+        }
         if (keepsKey(decoded)) return decoded;
         keysChanged = true;
         counts.keys++;
         return blankKey(decoded);
       },
-      key,
+      {
+        rootKey: key,
+        rootMarked: marked,
+        mark: holdsCredential,
+        onNumber: (raw, where) => {
+          if (!credentialNumber(where) || /^-?0(?:\.0*)?(?:[eE][-+]?\d+)?$/.test(raw)) return raw;
+          counts.numbers++;
+          return zeroed(raw);
+        },
+      },
     );
     if (keysChanged && !sameShape(JSON.parse(text), JSON.parse(out))) {
       throw new ContentRewriteError("Two rewritten object keys collided; nothing was written.");
     }
     return out;
   }
-  const kept = keptAs(key, text);
+  const kept = keptAs(key, text, marked);
   if (kept !== null) {
     if (keptFindings(text, kept, key).length === 0) return text;
     counts.flaggedKept++;
@@ -390,6 +463,7 @@ export const contentFindings = (
   key: string | null,
   mode: ContentMode,
   report: (kind: string) => void,
+  marked = false,
 ): void => {
   if (text === "") return;
   if (parseJsonContainer(text) !== null) {
@@ -397,14 +471,22 @@ export const contentFindings = (
       text,
       (decoded, where) => {
         if (where.role === "key") keyFindings(decoded).forEach(report);
-        else contentFindings(decoded, where.key, mode, report);
+        else contentFindings(decoded, where.key, mode, report, where.marked);
         return decoded;
       },
-      key,
+      {
+        rootKey: key,
+        rootMarked: marked,
+        mark: holdsCredential,
+        onNumber: (raw, where) => {
+          if (credentialNumber(where) && Number(raw) !== 0) report("credential-number");
+          return raw;
+        },
+      },
     );
     return;
   }
-  const kept = keptAs(key, text);
+  const kept = keptAs(key, text, marked);
   if (kept !== null) {
     keptFindings(text, kept, key).forEach(report);
     return;

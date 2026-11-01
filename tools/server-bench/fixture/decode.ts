@@ -84,9 +84,10 @@ interface EventRow {
 /**
  * Rows the server cannot decode, as `table:rowid` (events as `orchestration_events:sequence`):
  * every v2 projection payload and v2 thread event, one row at a time so memory stays flat on a
- * thread with millions of items. Compared before and after the content pass.
+ * thread with millions of items, a step per 2,000 rows. Compared before and after the content pass.
  */
-export const undecodableRows = (path: string): Set<string> => {
+export const undecodableRows = function* (path: string): Generator<void, Set<string>> {
+  let seen = 0;
   const failed = new Set<string>();
   const db = new NodeSqlite.DatabaseSync(path, { readOnly: true });
   try {
@@ -103,6 +104,7 @@ export const undecodableRows = (path: string): Set<string> => {
       rows.setReadBigInts(true);
       for (const row of rows.iterate() as Iterable<{ id: bigint; payload_json: unknown }>) {
         if (Exit.isFailure(decode(row.payload_json))) failed.add(`${table}:${row.id}`);
+        if (++seen % 2_000 === 0) yield;
       }
     }
     if (tables.has("orchestration_events")) {
@@ -126,6 +128,7 @@ export const undecodableRows = (path: string): Set<string> => {
           ...pick("rawEventId"),
         });
         if (Exit.isFailure(decoded)) failed.add(`orchestration_events:${row.sequence}`);
+        if (++seen % 2_000 === 0) yield;
       }
     }
   } finally {

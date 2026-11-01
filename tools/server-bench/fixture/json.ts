@@ -1,7 +1,26 @@
-/** Where a JSON string sits: an object key, or a value under the nearest key (arrays inherit it). */
+/**
+ * Where a JSON string sits: an object key, or a value under the nearest key (arrays inherit it).
+ * `marked` is true when that key or any enclosing one satisfies the caller's `mark`.
+ */
 export type StringRole =
   | { readonly role: "key" }
-  | { readonly role: "value"; readonly key: string | null };
+  | { readonly role: "value"; readonly key: string | null; readonly marked: boolean };
+
+/** Where a JSON number sits: the nearest key, and whether it or an enclosing key is marked. */
+export interface NumberPlace {
+  readonly key: string | null;
+  readonly marked: boolean;
+}
+
+export interface RewriteOptions {
+  /** The key a top-level array's items sit under (the column or the enclosing field). */
+  readonly rootKey?: string | null;
+  /** True when the text itself sits under a marked key (nested JSON inside a marked field). */
+  readonly rootMarked?: boolean;
+  readonly mark?: (key: string) => boolean;
+  /** Called with each number as written; a different return replaces it. */
+  readonly onNumber?: (raw: string, where: NumberPlace) => string;
+}
 
 /** The text when it is a JSON object or array, else null. Scalars stay plain text. */
 export const parseJsonContainer = (text: string): unknown => {
@@ -24,32 +43,46 @@ const closingQuote = (text: string, from: number) => {
   return -1;
 };
 
+const NUMBER_CHARACTER = /[-+0-9.eE]/;
+
 interface Frame {
   readonly kind: "object" | "array";
+  readonly marked: boolean;
   key: string | null;
   expectKey: boolean;
 }
 
 /**
- * Rewrites the string tokens of valid JSON text in place: numbers, key order and formatting stay
- * byte for byte, and only a string `onString` changes is re-encoded. Callers check validity first.
- * `rootKey` is the key a top-level array's strings sit under (the column or the enclosing field).
+ * Rewrites the string (and, with `onNumber`, number) tokens of valid JSON text in place: key order
+ * and formatting stay byte for byte, and only a token the callback changes is re-encoded. Callers
+ * check validity first. Iterative, so nesting depth costs no stack.
  */
 export const rewriteJson = (
   text: string,
   onString: (decoded: string, where: StringRole) => string,
-  rootKey: string | null = null,
+  options: RewriteOptions = {},
 ): string => {
+  const { rootKey = null, rootMarked = false, mark, onNumber } = options;
   const stack: Array<Frame> = [];
   let out = "";
   let copied = 0;
+  const isMarked = (key: string | null) => key !== null && mark !== undefined && mark(key);
   const valueKey = () => (stack.length === 0 ? rootKey : (stack.at(-1)?.key ?? null));
+  const markedHere = () => {
+    const top = stack.at(-1);
+    return top === undefined ? rootMarked || isMarked(rootKey) : top.marked || isMarked(top.key);
+  };
+  const replace = (start: number, end: number, next: string) => {
+    out += text.slice(copied, start) + next;
+    copied = end;
+  };
   for (let index = 0; index < text.length; index++) {
-    const char = text[index];
+    const char = text[index] as string;
     if (char === "{" || char === "[") {
       const inherited = char === "[" ? valueKey() : null;
       stack.push({
         kind: char === "{" ? "object" : "array",
+        marked: markedHere(),
         key: inherited,
         expectKey: char === "{",
       });
@@ -64,17 +97,23 @@ export const rewriteJson = (
     } else if (char === '"') {
       const close = closingQuote(text, index + 1);
       if (close === -1) break;
-      const token = text.slice(index, close + 1);
-      const decoded = JSON.parse(token) as string;
+      const decoded = JSON.parse(text.slice(index, close + 1)) as string;
       const top = stack.at(-1);
       const isKey = top?.kind === "object" && top.expectKey;
-      const next = onString(decoded, isKey ? { role: "key" } : { role: "value", key: valueKey() });
+      const next = onString(
+        decoded,
+        isKey ? { role: "key" } : { role: "value", key: valueKey(), marked: markedHere() },
+      );
       if (isKey && top !== undefined) top.key = decoded;
-      if (next !== decoded) {
-        out += text.slice(copied, index) + JSON.stringify(next);
-        copied = close + 1;
-      }
+      if (next !== decoded) replace(index, close + 1, JSON.stringify(next));
       index = close;
+    } else if (onNumber !== undefined && (char === "-" || (char >= "0" && char <= "9"))) {
+      let end = index + 1;
+      while (end < text.length && NUMBER_CHARACTER.test(text[end] as string)) end++;
+      const raw = text.slice(index, end);
+      const next = onNumber(raw, { key: valueKey(), marked: markedHere() });
+      if (next !== raw) replace(index, end, next);
+      index = end - 1;
     }
   }
   return copied === 0 ? text : out + text.slice(copied);

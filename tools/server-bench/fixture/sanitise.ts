@@ -7,11 +7,12 @@ import * as Console from "effect/Console";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
-import { type ContentMode, contentFindings, emptyCounts, rewriteContent } from "./content.ts";
+import { type BlankStep, blankTables } from "./blank.ts";
+import { type ContentMode, contentFindings } from "./content.ts";
 import { undecodableRows } from "./decode.ts";
 import { extendedFindings } from "./extended.ts";
 import { createExclusive, fillExclusive, privateScratchDirectory, withSidecars } from "./guards.ts";
-import { CREDENTIAL_COLUMN, scanDecoded, scanFileBytes } from "./secrets.ts";
+import { CREDENTIAL_COLUMN, scanDecoded, scanFileBytesSteps } from "./secrets.ts";
 import {
   compactEvents,
   database,
@@ -52,16 +53,44 @@ export const CLEARED_TABLES: ReadonlyArray<string> = [
   "pull_request_review_guides",
 ];
 
-/** The server's own bookkeeping, kept whole: migration names and projection positions. */
+/** Turn items per thread and run (P1-014's migration 77), kept by triggers: counts and ids. */
+const TURN_ITEM_COUNTS = "orchestration_v2_projection_turn_item_counts";
+
+/**
+ * The server's own bookkeeping, kept whole: migration names, projection positions, and turn item
+ * counts (recounted after the content pass, so they match whatever ids it changed).
+ */
 const STRUCTURAL_TABLES: ReadonlySet<string> = new Set([
   "effect_sql_migrations",
   "orchestration_v2_projection_metadata",
+  TURN_ITEM_COUNTS,
 ]);
+
+/** The count table's own recount (migration 77), when the database has it. */
+const recountTurnItems = (path: string) => {
+  const db = openWritable(path);
+  try {
+    if (
+      db.prepare(`SELECT 1 FROM sqlite_schema WHERE name = ?`).get(TURN_ITEM_COUNTS) === undefined
+    ) {
+      return;
+    }
+    db.exec(`BEGIN;
+      DELETE FROM ${TURN_ITEM_COUNTS};
+      INSERT INTO ${TURN_ITEM_COUNTS} (thread_id, run_id, item_count)
+        SELECT thread_id, COALESCE(run_id, ''), SUM(item_count)
+        FROM (SELECT thread_id, run_id, COUNT(*) AS item_count
+          FROM orchestration_v2_projection_turn_items GROUP BY thread_id, run_id)
+        GROUP BY thread_id, COALESCE(run_id, '');
+      COMMIT;`);
+  } finally {
+    db.close();
+  }
+};
 
 const FTS_SHADOW = /^orchestration_v2_message_search_(?:data|idx|content|docsize|config)$/;
 
 const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
-const literal = (text: string) => `'${text.replaceAll("'", "''")}'`;
 
 /** Every table that holds rows of its own: no SQLite internals, no search index (rebuilt). */
 const tableNames = (db: NodeSqlite.DatabaseSync) =>
@@ -86,12 +115,53 @@ const bump = (counts: Record<string, number>, key: string) => {
   counts[key] = (counts[key] ?? 0) + 1;
 };
 
+/** Rows between turns of the event loop in the long passes: SIGINT and SIGTERM land between. */
+export const BATCH_ROWS = 2_000;
+
+const yieldToSignals = Effect.promise(
+  () => new Promise<void>((resolve) => setImmediate(() => resolve())),
+);
+
+/**
+ * Runs a stepwise pass, giving the event loop a turn after each step (so SIGINT and SIGTERM land
+ * between batches) and handing each step to `onStep`.
+ */
+export const runSteps = Effect.fn("fixture.runSteps")(function* <S, A>(
+  steps: Generator<S, A>,
+  what: string,
+  onStep: (step: S) => Effect.Effect<void> = () => Effect.void,
+) {
+  for (;;) {
+    const step = yield* Effect.try({
+      try: () => steps.next(),
+      catch: (cause) => failed(what, cause),
+    });
+    if (step.done === true) return step.value;
+    yield* onStep(step.value);
+    yield* yieldToSignals;
+  }
+});
+
+const mib = (bytes: number) => `${(bytes / 1048576).toFixed(1)} MiB`;
+
+/** Progress of the blanking pass: every 50,000 rows of a table, and its last batch. */
+const reportBlankStep = (step: BlankStep) =>
+  step.done === step.total ||
+  Math.floor(step.done / 50_000) > Math.floor((step.done - step.rows) / 50_000)
+    ? Console.log(
+        `  ${step.table}: ${step.done.toLocaleString("en-GB")} / ${step.total.toLocaleString("en-GB")} rows, ${mib(step.tableBytes)}`,
+      )
+    : Effect.void;
+
 /**
  * P1-002's extended check (`fixture/extended.ts`) on every value of every table, the search
  * index's shadow tables included: `table:scope|kind` counts. A gate beside the self-check.
  */
-export const extendedTables = (db: NodeSqlite.DatabaseSync): Record<string, number> => {
+export const extendedTables = function* (
+  db: NodeSqlite.DatabaseSync,
+): Generator<void, Record<string, number>> {
   const rows: Record<string, number> = {};
+  let seen = 0;
   const tables = db
     .prepare(
       `SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
@@ -117,6 +187,7 @@ export const extendedTables = (db: NodeSqlite.DatabaseSync): Record<string, numb
           extendedFindings(Buffer.from(value).toString("utf8"), report);
         }
       }
+      if (++seen % BATCH_ROWS === 0) yield;
     }
   }
   return rows;
@@ -134,7 +205,11 @@ export interface TableScan {
  * Every value of every table. Blank mode checks both layers: each string is allowlisted and
  * unflagged, or filler; keys are identifiers; BLOBs are zero. Redact mode runs the pattern layer.
  */
-export const scanTables = (db: NodeSqlite.DatabaseSync, mode: ContentMode): TableScan => {
+export const scanTables = function* (
+  db: NodeSqlite.DatabaseSync,
+  mode: ContentMode,
+): Generator<void, TableScan> {
+  let seen = 0;
   const hits: Record<string, number> = {};
   const notBlanked: Record<string, number> = {};
   const credentialColumns: Record<string, number> = {};
@@ -171,6 +246,7 @@ export const scanTables = (db: NodeSqlite.DatabaseSync, mode: ContentMode): Tabl
           bump(notBlanked, `${name}.${column}`);
         }
       });
+      if (++seen % BATCH_ROWS === 0) yield;
     }
   }
   return { hits, notBlanked, credentialColumns };
@@ -597,48 +673,6 @@ const settleDeliveries = (db: NodeSqlite.DatabaseSync, now: string) => {
   };
 };
 
-/**
- * Rewrites every string and BLOB of every table but the structural ones: blank mode leaves only
- * the allowlist and filler, redact mode masks what the pattern layer finds. Triggers (the message
- * search index) are dropped for the pass and restored; the index is rebuilt afterwards.
- */
-const rewriteTables = (db: NodeSqlite.DatabaseSync, mode: ContentMode) => {
-  const counts = emptyCounts();
-  const byTable: Record<string, number> = {};
-  db.function(
-    "fixture_content",
-    { deterministic: true, useBigIntArguments: true },
-    (value, column) => {
-      if (typeof value === "string") return rewriteContent(value, String(column), mode, counts);
-      if (value instanceof Uint8Array && mode === "blank") {
-        if (value.some((byte) => byte !== 0)) counts.changed++;
-        return new Uint8Array(value.length);
-      }
-      return value;
-    },
-  );
-  const triggers = db
-    .prepare(`SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL`)
-    .all() as Array<{ name: string; sql: string }>;
-  // No journal to roll back with on failure: the caller deletes the scratch copy.
-  db.exec("BEGIN");
-  for (const trigger of triggers) db.exec(`DROP TRIGGER ${quote(trigger.name)}`);
-  for (const { name } of tableNames(db)) {
-    if (STRUCTURAL_TABLES.has(name)) continue;
-    const columns = columnsOf(db, name).map((column) => column.name);
-    const before = counts.changed;
-    db.prepare(
-      `UPDATE ${quote(name)} SET ${columns
-        .map((column) => `${quote(column)} = fixture_content(${quote(column)}, ${literal(column)})`)
-        .join(", ")}`,
-    ).run();
-    if (counts.changed > before) byTable[name] = counts.changed - before;
-  }
-  for (const trigger of triggers) db.exec(trigger.sql);
-  db.exec("COMMIT");
-  return { ...counts, byTable };
-};
-
 /** True when VACUUM INTO kept every message rowid, which the contentless search index keys on. */
 const sameMessageRowids = (left: string, right: string) => {
   const query = `SELECT rowid, message_id FROM orchestration_v2_projection_messages ORDER BY rowid`;
@@ -712,8 +746,8 @@ export const checkFixture = Effect.fn("fixture.check")(function* (path: string, 
   let tables: TableScan;
   let extendedHits: Record<string, number>;
   try {
-    tables = scanTables(db, mode);
-    extendedHits = extendedTables(db);
+    tables = yield* runSteps(scanTables(db, mode), "The content check failed");
+    extendedHits = yield* runSteps(extendedTables(db), "The extended check failed");
   } finally {
     db.close();
   }
@@ -724,7 +758,9 @@ export const checkFixture = Effect.fn("fixture.check")(function* (path: string, 
     extendedHits,
     notBlanked: tables.notBlanked,
     credentialColumns: tables.credentialColumns,
-    rawHits: Object.fromEntries(scanFileBytes(path)),
+    rawHits: Object.fromEntries(
+      yield* runSteps(scanFileBytesSteps(path), "The raw-byte scan failed"),
+    ),
     runnable: { ...runnable },
   } satisfies FixtureCheck;
 });
@@ -854,26 +890,28 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
         )}`,
       );
     }
-    const readBefore = undecodableRows(scratch);
+    const readBefore = yield* runSteps(undecodableRows(scratch), "The decode check failed");
 
     yield* Console.log(
       mode === "blank"
         ? "Blanking content: filler for every string outside the allowlist..."
         : "Redacting credential patterns (--keep-content: content kept)...",
     );
-    const content = yield* Effect.try({
-      try: () => {
-        const rewriting = openWritable(scratch);
-        try {
-          return rewriteTables(rewriting, mode);
-        } finally {
-          rewriting.close();
-        }
-      },
-      catch: (cause) => failed("The content pass failed; nothing written", cause),
-    });
+    const rewriting = openWritable(scratch);
+    const content = yield* runSteps(
+      blankTables(
+        rewriting,
+        tableNames(rewriting)
+          .map((table) => table.name)
+          .filter((name) => !STRUCTURAL_TABLES.has(name)),
+        mode,
+      ),
+      "The content pass failed; nothing written",
+      reportBlankStep,
+    ).pipe(Effect.ensuring(Effect.sync(() => rewriting.close())));
+    recountTurnItems(scratch);
     yield* rebuildSearch.pipe(Effect.provide(database(scratch)));
-    const readAfter = undecodableRows(scratch);
+    const readAfter = yield* runSteps(undecodableRows(scratch), "The decode check failed");
     const broken: Record<string, number> = {};
     for (const row of readAfter) {
       if (!readBefore.has(row)) bump(broken, row.slice(0, row.lastIndexOf(":")));

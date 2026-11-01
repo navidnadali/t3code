@@ -18,6 +18,7 @@ import {
   keptAs,
   rewriteContent,
 } from "./fixture/content.ts";
+import { extendedFindings } from "./fixture/extended.ts";
 import { UnsafePathError, assertSafeDestination, withSidecars } from "./fixture/guards.ts";
 import { Spreader, apportion, planSynth } from "./fixture/plan.ts";
 import { TOKEN_PATTERNS, redact, scanFileBytes, secretHits } from "./fixture/secrets.ts";
@@ -1182,6 +1183,19 @@ describe("content blanking", () => {
       findings.push(kind),
     );
     expect(findings).toEqual(["key"]);
+    // Rewritten keys of base64-line length carry separators: neither check reads them as a key body.
+    for (const length of [60, 64, 65, 76]) {
+      const path = `/${"x".repeat(length - 1)}`;
+      const stored = rewriteContent(JSON.stringify({ [path]: "x" }), null, "blank", emptyCounts());
+      const rows: Array<string> = [];
+      contentFindings(stored, null, "blank", (kind) => rows.push(kind));
+      extendedFindings(stored, (row) => rows.push(row));
+      expect([length, Object.keys(JSON.parse(stored))[0]?.length, rows]).toEqual([
+        length,
+        length,
+        [],
+      ]);
+    }
     const env = out.env as Record<string, string>;
     expect(Object.keys(env)[0]).toBe("DB_PASSWORD");
     // A rewritten key has at least ten letters, so keys of one object stay distinct.

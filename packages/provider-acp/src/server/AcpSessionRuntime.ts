@@ -1092,6 +1092,17 @@ export interface AcpSessionActivationOptions {
   readonly httpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
 }
 
+/** Decodes long ACP stdout lines on a provider I/O worker; absent, or `open` none: in-thread. */
+export class AcpLineOffloads extends Context.Service<
+  AcpLineOffloads,
+  {
+    readonly open: (input: {
+      /** Stops the agent when its worker dies. */
+      readonly kill: Effect.Effect<void>;
+    }) => Effect.Effect<Option.Option<EffectAcpProtocol.AcpLineOffload>, never, Scope.Scope>;
+  }
+>()("@t3tools/provider-acp/server/AcpSessionRuntime/AcpLineOffloads") {}
+
 export class AcpSessionRuntime extends Context.Service<
   AcpSessionRuntime,
   {
@@ -1653,9 +1664,16 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
 
   const stageRecorder = yield* ProviderIoStageTiming;
   const stageTiming = stageRecorder?.forProvider(yield* ProviderIoStageDriver);
+  const offloads = yield* Effect.serviceOption(AcpLineOffloads);
+  const lineOffload = Option.isNone(offloads)
+    ? undefined
+    : yield* offloads.value
+        .open({ kill: child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore) })
+        .pipe(Effect.map(Option.getOrUndefined), Effect.provideService(Scope.Scope, runtimeScope));
   const acpContext = yield* Layer.build(
     EffectAcpClient.layerChildProcess(child, {
       ...(options.transformStdout ? { transformStdout: options.transformStdout } : {}),
+      ...(lineOffload === undefined ? {} : { lineOffload }),
       ...(options.transformSessionUpdate
         ? { transformSessionUpdate: options.transformSessionUpdate }
         : {}),

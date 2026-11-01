@@ -7,6 +7,7 @@ import * as NodeSqlite from "node:sqlite";
 import { describe, expect, it, onTestFinished } from "vite-plus/test";
 
 import { type BlankStep, blankTables } from "./fixture/blank.ts";
+import { scanFileBytes, scanFileBytesSteps } from "./fixture/secrets.ts";
 
 describe("blanking pass memory", () => {
   // node:sqlite keeps every value a user function sees until its statement ends, so one UPDATE
@@ -48,5 +49,24 @@ describe("blanking pass memory", () => {
       .get() as { n: number };
     expect(left.n).toBe(0);
     db.close();
+  });
+
+  // The raw-byte scan reads the whole file; it must hand back control after every chunk, so a
+  // signal can clean up during it.
+  it("scans raw bytes a chunk per step, finding what the one-shot scan finds", () => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fixture-raw-steps-"));
+    onTestFinished(() => NodeFS.rmSync(directory, { recursive: true, force: true }));
+    const path = NodePath.join(directory, "file.bin");
+    const token = `gh${"p"}_${"A1b2".repeat(9)}`;
+    NodeFS.writeFileSync(path, `${" ".repeat(950)}${token}${"y".repeat(1000)}`);
+    const steps = scanFileBytesSteps(path, 100);
+    let yields = 0;
+    let step = steps.next();
+    for (; step.done !== true; step = steps.next()) yields++;
+    expect([yields >= 19, Object.fromEntries(step.value)]).toEqual([
+      true,
+      Object.fromEntries(scanFileBytes(path, 100)),
+    ]);
+    expect(Object.fromEntries(step.value)).toEqual({ "github-token": 1 });
   });
 });

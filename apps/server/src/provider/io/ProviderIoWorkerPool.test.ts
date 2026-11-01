@@ -460,3 +460,47 @@ it.effect("never hands out a session on a worker that stopped while it was openi
     }),
   ),
 );
+
+it.effect("returns a silent chunk's credit at once, even when it shares a batch with outputs", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const session = Option.getOrThrow(
+        yield* pool.open({
+          stage: linesStage,
+          options: undefined,
+          onFailure: toCodexError,
+          kill: Effect.void,
+          highWaterMark: 8,
+        }),
+      );
+      yield* session.write(bytes("ab\n"));
+      yield* session.write(bytes("cdefg"));
+      // The window is full and no output was taken; only the silent chunk's credit can admit this.
+      yield* session.write(bytes("h\n"));
+      yield* session.end;
+      assert.deepEqual(yield* Stream.runCollect(session.output), ["ab", "cdefgh"]);
+    }),
+  ),
+);
+
+it.effect("rejects a credit that is not a byte count without touching the window", () =>
+  withLogLines((lines) =>
+    withPool({ workers: 1, mode: "inert" }, (pool) =>
+      Effect.gen(function* () {
+        const session = yield* openEcho(pool, "t", { highWaterMark: 4 });
+        workers.started.at(-1)!.emit("message", {
+          type: "output",
+          session: workers.opened.at(-1),
+          outputs: [],
+          bytes: Number.NaN,
+        });
+        assert.deepEqual(yield* Queue.take(lines), [
+          "Warn",
+          "Provider I/O worker sent an unknown message",
+          { type: "output" },
+        ]);
+        yield* session.write(bytes("ok"));
+      }),
+    ),
+  ),
+);

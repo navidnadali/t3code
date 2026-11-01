@@ -115,7 +115,8 @@ export function claudeAgentSdkStageOptions(
   };
 }
 
-// Null when a matcher is not plain data besides its hooks, or a hook is not a function.
+// The fields the SDK reads from each matcher, read as it does (getters and all); null when a matcher's
+// hooks are not functions or its matcher or timeout is not plain data.
 const hooksShape = (
   hooks: NonNullable<ClaudeQueryOptions["hooks"]>,
 ): ClaudeAgentSdkWorkerHooks | null => {
@@ -125,10 +126,14 @@ const hooksShape = (
     const matcherShapes = [];
     for (const matcher of matchers as ReadonlyArray<unknown>) {
       if (typeof matcher !== "object" || matcher === null) return null;
-      const { hooks: callbacks, ...rest } = matcher as { readonly hooks?: unknown };
-      if (!Array.isArray(callbacks) || !isPlainData(rest)) return null;
+      const { hooks: callbacks, matcher: pattern, timeout } = matcher as Record<string, unknown>;
+      if (!Array.isArray(callbacks) || !isPlainData(pattern) || !isPlainData(timeout)) return null;
       if (!callbacks.every((callback) => typeof callback === "function")) return null;
-      matcherShapes.push({ ...rest, hooks: callbacks.length });
+      matcherShapes.push({
+        ...(pattern === undefined ? {} : { matcher: pattern as string }),
+        ...(timeout === undefined ? {} : { timeout: timeout as number }),
+        hooks: callbacks.length,
+      });
     }
     shape[event] = matcherShapes;
   }

@@ -19,6 +19,7 @@ import {
   type CommandAvailabilityChecker,
   isCommandAvailable,
   listLoginShellCandidates,
+  locateXcodeGitWithXcrun,
   mergePathEntries,
   mergePathValues,
   npmShimExecutable,
@@ -867,11 +868,11 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
 
     it.effect("the xcrun lookup resolves nothing when xcrun is missing or fails", () =>
       Effect.gen(function* () {
+        const env = { PATH: "/usr/bin:/bin", DEVELOPER_DIR: "/nonexistent/t3-developer-dir" };
         const locate = yield* XcodeGitLocation;
-        const located = yield* Effect.promise(() =>
-          locate({ PATH: "/usr/bin:/bin", DEVELOPER_DIR: "/nonexistent/t3-developer-dir" }),
-        );
-        expect(located).toBeUndefined();
+        expect(yield* Effect.promise(() => locate(env))).toBeUndefined();
+        const missing = locateXcodeGitWithXcrun(env, { xcrun: "/nonexistent/t3-xcrun" });
+        expect(yield* Effect.promise(() => missing)).toBeUndefined();
       }),
     );
 

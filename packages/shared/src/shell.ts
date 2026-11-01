@@ -753,13 +753,16 @@ const XCRUN_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 // xcrun honors DEVELOPER_DIR and the `xcode-select` choice, as the shim does.
 // It takes ~15 ms and reruns when the cached answer expires, so it must not block the event loop.
-function locateXcodeGitWithXcrun(env: NodeJS.ProcessEnv): Promise<string | undefined> {
+export function locateXcodeGitWithXcrun(
+  env: NodeJS.ProcessEnv,
+  options: { readonly xcrun?: string; readonly timeoutMs?: number } = {},
+): Promise<string | undefined> {
   return new Promise((resolve) => {
     let child: NodeChildProcess.ChildProcess;
     try {
-      child = NodeChildProcess.spawn("/usr/bin/xcrun", ["--find", "git"], {
+      child = NodeChildProcess.spawn(options.xcrun ?? "/usr/bin/xcrun", ["--find", "git"], {
         env,
-        timeout: 5_000,
+        timeout: options.timeoutMs ?? 5_000,
         stdio: ["ignore", "pipe", "ignore"],
       });
     } catch {

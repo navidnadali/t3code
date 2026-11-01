@@ -167,7 +167,17 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       const secret = "codex-notification-secret-sentinel";
       const { stdio, input } = yield* makeInMemoryStdio();
       const warnings: Array<unknown> = [];
-      const client = yield* CodexClient.make(stdio).pipe(
+      const timedStages: Array<string> = [];
+      const adapterTimed = yield* Deferred.make<void>();
+      const client = yield* CodexClient.make(stdio, {
+        stageTiming: {
+          now: () => 0,
+          record: (stage) => {
+            timedStages.push(stage);
+            if (stage === "adapter") Deferred.doneUnsafe(adapterTimed, Effect.void);
+          },
+        },
+      }).pipe(
         Effect.provide(
           Logger.layer([
             Logger.make(({ logLevel, fiber }) => {
@@ -207,6 +217,11 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
         issueKinds: expect.arrayContaining(["MissingKey"]),
       });
       assert.notInclude(JSON.stringify(warnings), secret);
+      yield* Deferred.await(adapterTimed);
+      assert.deepEqual(
+        timedStages.filter((stage) => stage === "decode" || stage === "adapter"),
+        ["decode", "decode", "decode", "adapter"],
+      );
     }),
   );
 });

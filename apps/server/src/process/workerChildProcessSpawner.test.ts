@@ -6,6 +6,7 @@ import * as NodeOS from "node:os";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Clock from "effect/Clock";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -682,6 +683,54 @@ describe("WorkerChildProcessSpawner", () => {
         });
         expect({ code, stdout }).toEqual({ code: 0, stdout: "killed" });
       }),
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "restarts a spawner process that keeps stopping a few times per window, then fails commands",
+    () => {
+      const { logs, layer } = capturedLogs();
+      return Effect.gen(function* () {
+        const { calls, spawner } = yield* recordingSpawner;
+        let nanos = 0n;
+        const clock: Clock.Clock = {
+          currentTimeMillisUnsafe: () => Number(nanos / 1_000_000n),
+          currentTimeMillis: Effect.sync(() => Number(nanos / 1_000_000n)),
+          currentTimeNanosUnsafe: () => nanos,
+          currentTimeNanos: Effect.sync(() => nanos),
+          monotonicTimeNanosUnsafe: () => nanos,
+          monotonicTimeNanos: Effect.sync(() => nanos),
+          sleep: () => Effect.void,
+        };
+        // Each command starts, then the spawner exits on its stdin: a crash after a success.
+        const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
+          'case "stdin":',
+          'case "stdin": process.exit(70);',
+        );
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(spawner, {
+          source,
+        }).pipe(Effect.provideService(Clock.Clock, clock));
+        const crash = Effect.gen(function* () {
+          const handle = yield* remoteSpawner.spawn(
+            node("process.stdin.resume(); setInterval(() => {}, 1000)"),
+          );
+          yield* Stream.run(Stream.make(new Uint8Array([1])), handle.stdin).pipe(Effect.ignore);
+          yield* Effect.flip(handle.exitCode);
+        }).pipe(Effect.scoped);
+        const { restarts, windowMillis } = WorkerChildProcessSpawner.spawnerRestartLimit;
+        for (let stop = 0; stop < restarts; stop++) yield* crash;
+        // Stops older than the window no longer count.
+        nanos += BigInt(windowMillis + 1) * 1_000_000n;
+        for (let stop = 0; stop < restarts; stop++) yield* crash;
+        expect(logs.map(({ level }) => level)).toEqual(Array(2 * restarts).fill("Warn"));
+        yield* crash;
+        expect(logs.at(-1)?.level).toBe("Error");
+        expect(yield* spawnError(remoteSpawner, node("1"))).toMatchObject({
+          method: "spawn",
+          causeMessage: "The process spawner stopped",
+        });
+        expect(calls).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
+    },
   );
 
   it.live.skipIf(!workerPlatform)(

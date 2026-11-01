@@ -41,6 +41,8 @@ const STREAM_WINDOW_BYTES = 1024 * 1024;
 const processGroupGraceMillis = 1_000;
 const processGroupPollIntervalMillis = 10;
 const spawnerCloseGraceMillis = 1_000;
+/** Each restart forks the server; a spawner that keeps stopping is a fault, whatever the load. */
+export const spawnerRestartLimit = { restarts: 3, windowMillis: 10 * 60_000 };
 
 type ExitCodeWithSignal = readonly [code: number | null, signal: NodeJS.Signals | null];
 

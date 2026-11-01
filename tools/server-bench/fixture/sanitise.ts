@@ -7,7 +7,8 @@ import * as Console from "effect/Console";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
-import { type ContentMode, contentFindings, emptyCounts, rewriteContent } from "./content.ts";
+import { type BlankStep, blankTables } from "./blank.ts";
+import { type ContentMode, contentFindings } from "./content.ts";
 import { undecodableRows } from "./decode.ts";
 import { extendedFindings } from "./extended.ts";
 import { createExclusive, fillExclusive, privateScratchDirectory, withSidecars } from "./guards.ts";
@@ -61,7 +62,6 @@ const STRUCTURAL_TABLES: ReadonlySet<string> = new Set([
 const FTS_SHADOW = /^orchestration_v2_message_search_(?:data|idx|content|docsize|config)$/;
 
 const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
-const literal = (text: string) => `'${text.replaceAll("'", "''")}'`;
 
 /** Every table that holds rows of its own: no SQLite internals, no search index (rebuilt). */
 const tableNames = (db: NodeSqlite.DatabaseSync) =>
@@ -85,6 +85,41 @@ const count = (db: NodeSqlite.DatabaseSync, sql: string, ...params: Array<string
 const bump = (counts: Record<string, number>, key: string) => {
   counts[key] = (counts[key] ?? 0) + 1;
 };
+
+const yieldToSignals = Effect.promise(
+  () => new Promise<void>((resolve) => setImmediate(() => resolve())),
+);
+
+/**
+ * Runs a stepwise pass, giving the event loop a turn after each step (so SIGINT and SIGTERM land
+ * between batches) and handing each step to `onStep`.
+ */
+export const runSteps = Effect.fn("fixture.runSteps")(function* <S, A>(
+  steps: Generator<S, A>,
+  what: string,
+  onStep: (step: S) => Effect.Effect<void> = () => Effect.void,
+) {
+  for (;;) {
+    const step = yield* Effect.try({
+      try: () => steps.next(),
+      catch: (cause) => failed(what, cause),
+    });
+    if (step.done === true) return step.value;
+    yield* onStep(step.value);
+    yield* yieldToSignals;
+  }
+});
+
+const mib = (bytes: number) => `${(bytes / 1048576).toFixed(1)} MiB`;
+
+/** Progress of the blanking pass: every 50,000 rows of a table, and its last batch. */
+const reportBlankStep = (step: BlankStep) =>
+  step.done === step.total ||
+  Math.floor(step.done / 50_000) > Math.floor((step.done - step.rows) / 50_000)
+    ? Console.log(
+        `  ${step.table}: ${step.done.toLocaleString("en-GB")} / ${step.total.toLocaleString("en-GB")} rows, ${mib(step.tableBytes)}`,
+      )
+    : Effect.void;
 
 /**
  * P1-002's extended check (`fixture/extended.ts`) on every value of every table, the search
@@ -597,48 +632,6 @@ const settleDeliveries = (db: NodeSqlite.DatabaseSync, now: string) => {
   };
 };
 
-/**
- * Rewrites every string and BLOB of every table but the structural ones: blank mode leaves only
- * the allowlist and filler, redact mode masks what the pattern layer finds. Triggers (the message
- * search index) are dropped for the pass and restored; the index is rebuilt afterwards.
- */
-const rewriteTables = (db: NodeSqlite.DatabaseSync, mode: ContentMode) => {
-  const counts = emptyCounts();
-  const byTable: Record<string, number> = {};
-  db.function(
-    "fixture_content",
-    { deterministic: true, useBigIntArguments: true },
-    (value, column) => {
-      if (typeof value === "string") return rewriteContent(value, String(column), mode, counts);
-      if (value instanceof Uint8Array && mode === "blank") {
-        if (value.some((byte) => byte !== 0)) counts.changed++;
-        return new Uint8Array(value.length);
-      }
-      return value;
-    },
-  );
-  const triggers = db
-    .prepare(`SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL`)
-    .all() as Array<{ name: string; sql: string }>;
-  // No journal to roll back with on failure: the caller deletes the scratch copy.
-  db.exec("BEGIN");
-  for (const trigger of triggers) db.exec(`DROP TRIGGER ${quote(trigger.name)}`);
-  for (const { name } of tableNames(db)) {
-    if (STRUCTURAL_TABLES.has(name)) continue;
-    const columns = columnsOf(db, name).map((column) => column.name);
-    const before = counts.changed;
-    db.prepare(
-      `UPDATE ${quote(name)} SET ${columns
-        .map((column) => `${quote(column)} = fixture_content(${quote(column)}, ${literal(column)})`)
-        .join(", ")}`,
-    ).run();
-    if (counts.changed > before) byTable[name] = counts.changed - before;
-  }
-  for (const trigger of triggers) db.exec(trigger.sql);
-  db.exec("COMMIT");
-  return { ...counts, byTable };
-};
-
 /** True when VACUUM INTO kept every message rowid, which the contentless search index keys on. */
 const sameMessageRowids = (left: string, right: string) => {
   const query = `SELECT rowid, message_id FROM orchestration_v2_projection_messages ORDER BY rowid`;
@@ -861,17 +854,18 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
         ? "Blanking content: filler for every string outside the allowlist..."
         : "Redacting credential patterns (--keep-content: content kept)...",
     );
-    const content = yield* Effect.try({
-      try: () => {
-        const rewriting = openWritable(scratch);
-        try {
-          return rewriteTables(rewriting, mode);
-        } finally {
-          rewriting.close();
-        }
-      },
-      catch: (cause) => failed("The content pass failed; nothing written", cause),
-    });
+    const rewriting = openWritable(scratch);
+    const content = yield* runSteps(
+      blankTables(
+        rewriting,
+        tableNames(rewriting)
+          .map((table) => table.name)
+          .filter((name) => !STRUCTURAL_TABLES.has(name)),
+        mode,
+      ),
+      "The content pass failed; nothing written",
+      reportBlankStep,
+    ).pipe(Effect.ensuring(Effect.sync(() => rewriting.close())));
     yield* rebuildSearch.pipe(Effect.provide(database(scratch)));
     const readAfter = undecodableRows(scratch);
     const broken: Record<string, number> = {};

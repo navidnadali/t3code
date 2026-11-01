@@ -378,6 +378,17 @@ export type ProjectionRecordField = Exclude<
   keyof OrchestrationV2ThreadProjection,
   "thread" | "updatedAt" | "visibleTurnItems"
 >;
+// Tables that grow with a thread's items and text; records that read one hold a large row set.
+const HISTORY_RECORD_FIELDS: ReadonlySet<ProjectionRecordField> = new Set([
+  "turnItems",
+  "nodes",
+  "messages",
+  "subagents",
+  "plans",
+  "contextHandoffs",
+  "contextTransfers",
+]);
+
 export type ProjectionRecords<K extends ProjectionRecordField> = Pick<
   OrchestrationV2ThreadProjection,
   "thread" | K
@@ -7299,9 +7310,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       (...args: Args): Effect.Effect<A, E, R> =>
         method(...args).pipe(NodeSqliteClient.readOnly);
 
-    // These reads decode after their transaction, so a permit, not the reader slot, caps how
-    // many hold rows at once. A read inside a transaction keeps that transaction's connection.
-    const decodeOnReader =
+    // Reads of a thread's history, whole or a page of it, take a reader permit before their
+    // transaction and keep it until decoded, so the pool size bounds how many such row sets exist,
+    // decoded inside the transaction or after it. Other reads take none and never wait behind a
+    // large decode. A read inside a transaction keeps that transaction's connection.
+    const historyOnReader =
       <Args extends ReadonlyArray<unknown>, A, E, R>(
         method: (...args: Args) => Effect.Effect<A, E, R>,
       ) =>
@@ -7323,14 +7336,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       listActiveShellIndex: readOnReader(listActiveShellIndex),
       readShellSnapshot: readOnReader(readShellSnapshot),
       listOlderSettledThreads: readOnReader(listOlderSettledThreads),
-      getThreadShell: decodeOnReader(getThreadShell),
+      getThreadShell: readOnReader(getThreadShell),
       findGuestShareThreadId: readOnReader(findGuestShareThreadId),
       getThread: readOnReader(getThread),
-      getSettlementCandidates: decodeOnReader(getSettlementCandidates),
+      getSettlementCandidates: readOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
       getOpenRemoteDelegatedTasks: getOpenRemoteDelegatedTasks.pipe(NodeSqliteClient.readOnly),
-      getThreadProjection: decodeOnReader((threadId: ThreadId) =>
+      getThreadProjection: historyOnReader((threadId: ThreadId) =>
         sql.withTransaction(readFullProjectionRows(threadId, new Set())).pipe(
           Effect.flatMap(decodeFullProjection),
           Effect.mapError((cause) =>
@@ -7340,8 +7353,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ),
         ),
       ),
-      getTurnStartContext: decodeOnReader(getTurnStartContext),
-      getTurnStartHistory: readOnReader(getTurnStartHistory),
+      getTurnStartContext: historyOnReader(getTurnStartContext),
+      getTurnStartHistory: historyOnReader(getTurnStartHistory),
       getRuntimeRecoveryProjection: readOnReader(getRuntimeRecoveryProjection),
       getRunningTurnContext: readOnReader(getRunningTurnContext),
       getThreadProviderContext: readOnReader(getThreadProviderContext),
@@ -7360,7 +7373,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getNextTurnItemOrdinal: readOnReader(getNextTurnItemOrdinal),
       getTurnItem: readOnReader(getTurnItem),
       getThreadRecords: (threadId, fields, filter) =>
-        decodeOnReader(getThreadRecords)(threadId, fields, filter),
+        (fields.some((field) => HISTORY_RECORD_FIELDS.has(field)) ? historyOnReader : readOnReader)(
+          getThreadRecords,
+        )(threadId, fields, filter),
       getRuntimeRequest: readOnReader(getRuntimeRequest),
       getPlan: readOnReader(getPlan),
       getProviderControlContext: readOnReader(getProviderControlContext),
@@ -7368,10 +7383,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getLimitRecoveryWakeAt: readOnReader(getLimitRecoveryWakeAt),
       getRecoveryThreadIds: readOnReader(getRecoveryThreadIds),
       getUnreadableThreadIds: readOnReader(getUnreadableThreadIds),
-      getThreadSnapshot: decodeOnReader(getThreadSnapshot),
-      getThreadSnapshotWindow: readOnReader(getThreadSnapshotWindow),
-      getTimelinePage: readOnReader(getTimelinePage),
-      getThreadHistoryPage: readOnReader(getThreadHistoryPage),
+      getThreadSnapshot: historyOnReader(getThreadSnapshot),
+      getThreadSnapshotWindow: historyOnReader(getThreadSnapshotWindow),
+      getTimelinePage: historyOnReader(getTimelinePage),
+      getThreadHistoryPage: historyOnReader(getThreadHistoryPage),
       searchThread: readOnReader(searchThread),
       searchThreadStream,
       getThreadAttachmentIds: readOnReader(getThreadAttachmentIds),

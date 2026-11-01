@@ -876,7 +876,7 @@ const isDecodeSpan = (span: Tracer.AnySpan) =>
   span._tag === "Span" && span.name.startsWith("ProjectionStore.decode");
 
 // A read holds rows from its first statement until its outermost decode span ends.
-it.effect.each(readCases)(
+it.effect.each(readCases.filter((readCase) => readCase.permit))(
   "lets no more $name reads hold rows at once than the pool has readers",
   (readCase) =>
     withFileStore(

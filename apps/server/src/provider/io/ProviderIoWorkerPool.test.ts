@@ -19,6 +19,8 @@ import { CodexAppServerTransportError } from "effect-codex-app-server/errors";
 import { vi } from "vite-plus/test";
 
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
+import type { ProviderIoStage } from "./providerIoProtocol.ts";
+import { acpWireStage, codexWireStage } from "./providerIoStages.ts";
 import { echoStage, linesStage } from "./testFixtures/providerIoTestStages.ts";
 
 type WorkerMode = "fixture" | "production" | "silent" | "throws" | "inert";
@@ -655,5 +657,103 @@ it.effect("logs a worker that dies while it has no sessions", () =>
         assert.deepInclude(annotations, { worker: 0, sessions: 0, reason: "exit" });
       }),
     ),
+  ),
+);
+
+// The same stage in-thread, on the same chunks: the worker must produce exactly this.
+const runInThread = <Options, Output, Request, Reply>(
+  stage: ProviderIoStage<Options, Output, Request, Reply>,
+  options: Options,
+  chunks: ReadonlyArray<Uint8Array>,
+) => {
+  const outputs: Array<Output> = [];
+  const session = stage.open(options);
+  for (const chunk of chunks) session.push(chunk, (output) => outputs.push(output));
+  session.end((output) => outputs.push(output));
+  return outputs;
+};
+
+const splitAt = (text: string, offsets: ReadonlyArray<number>) => {
+  const all = bytes(text);
+  return [0, ...offsets].map((start, index) => all.slice(start, offsets[index] ?? all.length));
+};
+
+it.effect("runs the Codex wire stage on the production worker as it runs in-thread", () =>
+  withPool({ workers: 1, mode: "production" }, (pool) =>
+    Effect.gen(function* () {
+      const text =
+        '{"id":1,"result":{}}\r\n{"method":"item/delta","params":{"text":"café"}}\n\n   \n' +
+        'not json\n{"after":"failure"}\n';
+      const accent = bytes(text).indexOf(0xc3);
+      const runs = [
+        { options: {}, chunks: splitAt(text, [10, 30, accent + 1]) },
+        { options: { maxLineBytes: 8 }, chunks: splitAt('{"a":1}\n0123456789\n{"b":2}\n', [4]) },
+      ];
+      const results = [];
+      for (const { options, chunks } of runs) {
+        const session = Option.getOrThrow(
+          yield* pool.open({
+            stage: codexWireStage,
+            options,
+            onFailure: toCodexError,
+            kill: Effect.void,
+          }),
+        );
+        for (const chunk of chunks) yield* session.write(chunk);
+        yield* session.end;
+        const outputs = yield* Stream.runCollect(session.output);
+        assert.deepEqual(outputs, runInThread(codexWireStage, options, chunks));
+        results.push(outputs);
+      }
+      const [lines, oversize] = results;
+      assert.deepEqual(
+        lines!.map((output) => output._tag),
+        ["Message", "Message", "DecodeFailed"],
+      );
+      assert.deepEqual(lines![1], {
+        _tag: "Message",
+        line: '{"method":"item/delta","params":{"text":"café"}}',
+        message: { method: "item/delta", params: { text: "café" } },
+      });
+      assert.equal(lines![2]!._tag === "DecodeFailed" ? lines![2]!.line : undefined, "not json");
+      assert.deepEqual(
+        oversize!.map((output) => output._tag),
+        ["Message", "Exceeded"],
+      );
+    }).pipe(Effect.scoped),
+  ),
+);
+
+it.effect("runs the ACP wire stage on the production worker and encodes on its parser", () =>
+  withPool({ workers: 1, mode: "production" }, (pool) =>
+    Effect.gen(function* () {
+      const text =
+        '{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s"}}\n' +
+        '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s"}}\n';
+      const good = splitAt(text, [20, 95]);
+      const bad = [bytes("not json\n"), bytes(text)];
+      const session = Option.getOrThrow(
+        yield* pool.open({
+          stage: acpWireStage,
+          options: undefined,
+          onFailure: (cause) => new AcpTransportError({ operation: "read-input-stream", cause }),
+          kill: Effect.void,
+        }),
+      );
+      const chunks = [...good, ...bad];
+      const expected = runInThread(acpWireStage, undefined, chunks);
+      assert.deepEqual(
+        expected.map((output) => output._tag),
+        ["Message", "Message", "DecodeFailed"],
+      );
+      const request = expected[0]!._tag === "Message" ? expected[0]!.message : undefined;
+      const encoded = acpWireStage.open(undefined).call!(request as never);
+      assert.isString(encoded);
+
+      for (const chunk of chunks) yield* session.write(chunk);
+      assert.equal(yield* session.call(request as never), encoded);
+      yield* session.end;
+      assert.deepEqual(yield* Stream.runCollect(session.output), expected);
+    }).pipe(Effect.scoped),
   ),
 );

@@ -1526,6 +1526,44 @@ describe("AcpSessionRuntime", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect(
+    "records an interrupted call as failed only, after a reply that arrived while its started record was held",
+    () =>
+      Effect.gen(function* () {
+        const held = yield* Deferred.make<void>();
+        const replied = yield* Deferred.make<void>();
+        let environmentRecords = 0;
+        const written: Array<string> = [];
+        const runtime = yield* AcpSessionRuntime.make({
+          ...mockRuntimeOptions,
+          protocolLogging: onEnvironmentReply(replied),
+          requestLogger: (event) =>
+            (event.method === "_test/environment" && environmentRecords++ === 0
+              ? Deferred.await(held)
+              : Effect.void
+            ).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  written.push(`${event.method} ${event.status}`);
+                }),
+              ),
+            ),
+        });
+        yield* runtime.start();
+        const request = yield* runtime.request("_test/environment", {}).pipe(Effect.forkChild);
+        yield* Deferred.await(replied);
+        yield* Fiber.interrupt(request);
+        yield* Deferred.succeed(held, undefined);
+        // Its records are written after the interrupted call's.
+        yield* runtime.request("_test/startup-metadata", {});
+
+        expect(written.filter((record) => record.startsWith("_test/environment"))).toEqual([
+          "_test/environment started",
+          "_test/environment failed",
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("closes without waiting for a native request record that never completes", () =>
     Effect.gen(function* () {
       const runtimeScope = yield* Scope.make();

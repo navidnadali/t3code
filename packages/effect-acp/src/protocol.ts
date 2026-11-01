@@ -18,11 +18,12 @@ import * as RpcMessage from "effect/rpc/RpcMessage";
 import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as RpcServer from "effect/rpc/RpcServer";
 
-import * as AcpSchema from "./schema.ts";
-import * as AcpSchemaV1 from "./_generated/schema-v1.gen.ts";
+import type * as AcpSchema from "./schema.ts";
+import type * as AcpSchemaV1 from "./_generated/schema-v1.gen.ts";
 import { CLIENT_METHODS } from "./_generated/meta.gen.ts";
 import * as AcpError from "./errors.ts";
 import { isolateNotificationHandler, timeStage, timeSync } from "./_internal/shared.ts";
+import * as AcpWire from "./wire.ts";
 const isAcpError = Schema.is(AcpError.AcpError);
 
 export interface AcpProtocolLogEvent {
@@ -150,71 +151,12 @@ interface AcpOutgoingWriterState {
   readonly terminalError?: AcpError.AcpError;
 }
 
-const decodeSessionUpdate = Schema.decodeUnknownEffect(
-  Schema.Union([
-    // Claude ACP v2 reports prompt failures on idle; alpha.3 omits that field.
-    Schema.Struct({
-      ...AcpSchema.UpdateSessionNotification.fields,
-      update: Schema.Struct({
-        sessionUpdate: Schema.Literal("state_update"),
-        state: Schema.Literal("idle"),
-        stopReason: Schema.optionalKey(Schema.NullOr(AcpSchema.StopReason)),
-        usage: Schema.optionalKey(Schema.NullOr(AcpSchema.Usage)),
-        error: Schema.optionalKey(Schema.NullOr(AcpSchema.Error)),
-        _meta: AcpSchema.UpdateSessionNotification.fields._meta,
-      }),
-    }),
-    AcpSchema.UpdateSessionNotification,
-    AcpSchemaV1.SessionNotification,
-  ]),
-);
-const decodeElicitationComplete = Schema.decodeUnknownEffect(
-  AcpSchema.CompleteElicitationNotification,
-);
+const decodeSessionUpdate = (payload: unknown) =>
+  Effect.fromResult(AcpWire.decodeSessionUpdate(payload));
+const decodeElicitationComplete = (payload: unknown) =>
+  Effect.fromResult(AcpWire.decodeElicitationComplete(payload));
 const parserFactory = RpcSerialization.ndJsonRpc();
-// ndJsonRpc skips lines that are not JSON. A malformed agent line has to end the
-// session, so frames are split here and each one goes through the strict codec.
-const makeStrictNdJsonRpcParser = (timing: AcpStageTiming | undefined) => {
-  const codec = RpcSerialization.jsonRpc().makeUnsafe();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  return {
-    decode: (bytes: Uint8Array | string): ReadonlyArray<unknown> => {
-      const startedAt = timing?.now() ?? 0;
-      buffer += typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      if (timing === undefined) return lines.flatMap((line) => codec.decode(line));
-      timing.record(
-        "framing",
-        timing.now() - startedAt,
-        typeof bytes === "string" ? Buffer.byteLength(bytes, "utf8") : bytes.byteLength,
-      );
-      return lines.flatMap((line) => {
-        const lineBytes = Buffer.byteLength(line, "utf8");
-        const lineStartedAt = timing.now();
-        const messages = codec.decode(line);
-        timing.record("json", timing.now() - lineStartedAt, lineBytes);
-        return messages;
-      });
-    },
-    encode: (response: Parameters<typeof codec.encode>[0]) => {
-      const encoded = codec.encode(response);
-      return encoded === undefined ? undefined : `${encoded}\n`;
-    },
-  };
-};
 const MAX_BUFFERED_RAW_NOTIFICATIONS = 32;
-
-const decodeFailureDiagnostics = (error: AcpError.AcpProtocolParseError) => ({
-  operation: error.operation,
-  ...(error.method === undefined ? {} : { method: error.method }),
-  ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
-  ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
-  ...(error.issueKinds === undefined ? {} : { issueKinds: error.issueKinds }),
-  ...(error.maximumPathDepth === undefined ? {} : { maximumPathDepth: error.maximumPathDepth }),
-  ...(error.issueSummary === undefined ? {} : { issueSummary: error.issueSummary }),
-});
 const encodeJsonRpcNotification = Schema.encodeUnknownExit(
   Schema.fromJsonString(
     Schema.Struct({
@@ -235,37 +177,12 @@ export const RPC_REQUEST_ID_START = 2 ** 30;
 const isEffectRpcRequestId = (requestId: AcpError.AcpRequestId): boolean =>
   typeof requestId === "number" && Number.isSafeInteger(requestId);
 
-/**
- * Effect RPC's JSON-RPC codec treats a standard JSON-RPC error object as a
- * defect unless it carries Effect's private `_tag: "Cause"` envelope.
- */
-function normalizeAcpJsonRpcError(
-  message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
-): RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded {
-  if (message._tag !== "Exit" || message.exit._tag !== "Failure") return message;
-  const [failure] = message.exit.cause;
-  if (
-    message.exit.cause.length !== 1 ||
-    failure?._tag !== "Die" ||
-    !isProtocolError(failure.defect)
-  ) {
-    return message;
-  }
-  return {
-    ...message,
-    exit: {
-      _tag: "Failure",
-      cause: [{ _tag: "Fail", error: failure.defect }],
-    },
-  };
-}
-
 export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(function* (
   options: AcpPatchedProtocolOptions,
 ): Effect.fn.Return<AcpPatchedProtocol, never, Scope.Scope> {
   const timing = options.stageTiming;
   const onNotification = options.onNotification;
-  const parser = makeStrictNdJsonRpcParser(timing);
+  const parser = AcpWire.makeStrictNdJsonRpcParser(timing);
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
   const notificationQueue = yield* Queue.sliding<AcpIncomingNotification>(
@@ -562,7 +479,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       method,
       cause,
     );
-    const diagnostics = decodeFailureDiagnostics(error);
+    const diagnostics = AcpWire.decodeFailureDiagnostics(error);
     const key = `${method}\n${error.issueSummary}`;
     const firstOfItsKind = !warnedDecodeFailures.has(key);
     warnedDecodeFailures.add(key);
@@ -668,7 +585,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           return completeExtPendingSuccess(message.requestId, message.exit.value);
         }
         const failure = message.exit.cause.find((entry) => entry._tag === "Fail");
-        if (failure && isProtocolError(failure.error)) {
+        if (failure && AcpWire.isProtocolError(failure.error)) {
           return completeExtPendingFailure(
             message.requestId,
             AcpError.AcpRequestError.fromProtocolError(failure.error, {
@@ -741,21 +658,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           ? logIncomingRaw(data)
           : timeSync(timing, "logShape", () => logIncomingRaw(data))
       ).pipe(
-        Effect.flatMap(() =>
-          Effect.try({
-            try: () =>
-              (
-                parser.decode(data) as ReadonlyArray<
-                  RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded
-                >
-              ).map(normalizeAcpJsonRpcError),
-            catch: (cause) =>
-              new AcpError.AcpProtocolParseError({
-                operation: "decode-wire-message",
-                cause,
-              }),
-          }),
-        ),
+        Effect.flatMap(() => Effect.fromResult(AcpWire.decodeWireChunk(parser, data))),
         Effect.tap((messages) =>
           timing === undefined
             ? logIncomingDecoded(messages)
@@ -765,7 +668,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           logProtocol({
             direction: "incoming",
             stage: "decode_failed",
-            payload: decodeFailureDiagnostics(error),
+            payload: AcpWire.decodeFailureDiagnostics(error),
           }),
         ),
         Effect.flatMap((messages) =>
@@ -1042,5 +945,3 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     notify: sendNotification,
   } satisfies AcpPatchedProtocol;
 });
-
-const isProtocolError = Schema.is(AcpSchema.Error);

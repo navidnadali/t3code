@@ -5,6 +5,8 @@ import type * as Effect from "effect/Effect";
 export interface EventNdjsonLogger {
   readonly filePath: string;
   readonly write: (event: unknown, threadId: ThreadId | null) => Effect.Effect<void>;
+  /** Appends a record serialized elsewhere; the logger adds the timestamp and stream label. */
+  readonly writeSerialized?: (payload: string, threadId: ThreadId | null) => Effect.Effect<void>;
   readonly close: () => Effect.Effect<void>;
 }
 

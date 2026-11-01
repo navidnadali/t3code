@@ -27,6 +27,10 @@
       "types": "./src/protocol.ts",
       "import": "./src/protocol.ts"
     },
+    "./wire": {
+      "types": "./src/wire.ts",
+      "import": "./src/wire.ts"
+    },
     "./errors": {
       "types": "./src/errors.ts",
       "import": "./src/errors.ts"

@@ -11,13 +11,9 @@ import * as CodexRpc from "./_generated/meta.gen.ts";
 import * as CodexSchema from "./_generated/schema.gen.ts";
 import * as CodexError from "./errors.ts";
 import * as CodexProtocol from "./protocol.ts";
-import {
-  decodeNotificationPayload,
-  decodeOptionalPayload,
-  encodeOptionalPayload,
-  runHandler,
-} from "./_internal/shared.ts";
+import { decodeOptionalPayload, encodeOptionalPayload, runHandler } from "./_internal/shared.ts";
 import { makeChildStdio, makeStderrTail, makeTerminationError } from "./_internal/stdio.ts";
+import * as CodexWire from "./wire.ts";
 
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
@@ -178,16 +174,14 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
   const dispatchNotification = (
     notification: CodexProtocol.CodexAppServerIncomingNotification,
   ): Effect.Effect<void, never> => {
-    const schema =
-      notification.method in CodexRpc.SERVER_NOTIFICATION_PARAMS
-        ? CodexRpc.SERVER_NOTIFICATION_PARAMS[
-            notification.method as CodexRpc.ServerNotificationMethod
-          ]
-        : undefined;
+    const decoded = CodexWire.decodeServerNotificationParams(
+      notification.method,
+      notification.params,
+    );
     const handlers = notificationHandlers.get(notification.method) ?? [];
 
-    if (schema) {
-      return decodeNotificationPayload(notification.method, schema, notification.params).pipe(
+    if (decoded) {
+      return Effect.fromResult(decoded).pipe(
         Effect.tapError(warnUndecodableNotification),
         Effect.flatMap((decoded) =>
           Effect.forEach(handlers, (handler) => handler(decoded), { discard: true }),

@@ -19,6 +19,10 @@
       "types": "./src/protocol.ts",
       "import": "./src/protocol.ts"
     },
+    "./wire": {
+      "types": "./src/wire.ts",
+      "import": "./src/wire.ts"
+    },
     "./replay": {
       "types": "./src/replay.ts",
       "import": "./src/replay.ts"

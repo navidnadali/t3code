@@ -50,6 +50,54 @@ it("drops spans that ended before the window and counts unreadable lines", () =>
   );
 });
 
+function sqlSummary(count: number, startMs: number, endMs: number) {
+  return JSON.stringify({
+    type: "span-summary",
+    name: "sqlite",
+    thresholdMs: 2,
+    count,
+    totalDurationMs: count * 0.5,
+    maxDurationMs: 1.5,
+    startTimeUnixNano: String(BigInt(startMs) * 1_000_000n),
+    endTimeUnixNano: String(BigInt(endMs) * 1_000_000n),
+  });
+}
+
+it("counts summarised SQL spans over their window and a percentile among them as under it", () => {
+  const rates = (
+    [
+      [-Infinity, [sqlSummary(600, 0, MINUTE_MS)]],
+      [-Infinity, [sqlSummary(600, 0, MINUTE_MS), sqlSummary(600, MINUTE_MS, 2 * MINUTE_MS)]],
+      [MINUTE_MS - 1_000, [sqlSummary(600, 0, MINUTE_MS)]],
+    ] as const
+  ).map(([sinceMs, lines]) => {
+    const summarizer = makeTraceSpanSummary(sinceMs);
+    lines.forEach(summarizer.addLine);
+    return summarizer.finish().spans.map((entry) => entry.perMinute);
+  });
+  assert.deepStrictEqual(rates, [[600], [600], [600]]);
+
+  const summarizer = makeTraceSpanSummary();
+  [
+    sqlSummary(8, MINUTE_MS, 2 * MINUTE_MS),
+    span("sqlite", 5, 2 * MINUTE_MS),
+    span("sqlite", 10, 3 * MINUTE_MS),
+  ].forEach(summarizer.addLine);
+  const summary = summarizer.finish();
+
+  assert.strictEqual(summary.skippedLineCount, 0);
+  assert.deepStrictEqual(
+    summary.spans.map((entry) => [
+      entry.count,
+      entry.perMinute,
+      entry.p50Ms,
+      entry.p90Ms,
+      entry.maxMs,
+    ]),
+    [[10, 5, { underMs: 2 }, 5, 10]],
+  );
+});
+
 it("reads failures and interrupts of browser spans from their OTLP status", () => {
   const summarizer = makeTraceSpanSummary();
   [

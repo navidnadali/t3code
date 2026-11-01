@@ -9,6 +9,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 
 import * as CodexError from "./errors.ts";
 import * as CodexProtocol from "./protocol.ts";
@@ -184,16 +185,47 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
       }),
   );
 
-  it.effect.each([1, 7, 1024])(
-    "preserves JSONL framing and UTF-8 across %i-byte input chunks",
-    (chunkSize) =>
+  it.effect.each(
+    [1, 7, 1024].flatMap((chunkSize) => [false, true].map((timed) => ({ chunkSize, timed }))),
+  )(
+    "preserves JSONL framing and UTF-8 across $chunkSize-byte input chunks (stage timing $timed)",
+    ({ chunkSize, timed }) =>
       Effect.gen(function* () {
         const { stdio, input } = yield* makeInMemoryStdio();
         const notifications: Array<CodexProtocol.CodexAppServerIncomingNotification> = [];
         const rawLines: Array<unknown> = [];
+        // Text decoding and JSON parsing each advance the clock, so only their windows see time.
+        let clock = 0;
+        const parse = JSON.parse;
+        using _parse = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+          clock += 5;
+          return parse(text, reviver);
+        });
+        const decode = TextDecoder.prototype.decode;
+        using _decode = vi.spyOn(TextDecoder.prototype, "decode").mockImplementation(function (
+          this: TextDecoder,
+          input,
+          options,
+        ) {
+          clock += 7;
+          return decode.call(this, input, options);
+        });
+        const framingMs: Array<number> = [];
+        let framingBytes = 0;
+        const jsonFrames: Array<{ readonly elapsedMs: number; readonly bytes: number }> = [];
         const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+        const stageTiming: CodexProtocol.CodexAppServerStageTiming = {
+          now: () => clock,
+          record: (stage, elapsedMs, bytes) => {
+            if (stage === "json") jsonFrames.push({ elapsedMs, bytes });
+            if (stage !== "framing") return;
+            framingMs.push(elapsedMs);
+            framingBytes += bytes;
+          },
+        };
         yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
           stdio,
+          ...(timed ? { stageTiming } : {}),
           logIncoming: true,
           logger: (event) =>
             Effect.sync(() => {
@@ -227,6 +259,20 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
           { method: "x/final", params: { text: "最後" } },
         ]);
         assert.deepEqual(rawLines, [firstLine, secondLine, finalLine]);
+        assert.deepEqual(
+          jsonFrames,
+          timed
+            ? [firstLine, secondLine, finalLine].map((line) => ({
+                elapsedMs: 5,
+                bytes: encoder.encode(line).byteLength,
+              }))
+            : [],
+        );
+        assert.deepEqual(
+          framingMs,
+          timed ? Array.from({ length: Math.ceil(bytes.byteLength / chunkSize) }, () => 7) : [],
+        );
+        assert.equal(framingBytes, timed ? bytes.byteLength : 0);
       }),
   );
 
@@ -683,6 +729,52 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
       assert.equal("detail" in payload, false);
       assert.notInclude(encodeUnknownJsonString(event), secret);
     }),
+  );
+
+  it.effect("fails malformed and unroutable lines with the schema decoder's errors", () =>
+    Effect.forEach(
+      [
+        '{"id":1,"result":',
+        "not json",
+        '{"id":1}}',
+        "{'id':1}",
+        "[1,",
+        "42",
+        '"text"',
+        "null",
+        "[1]",
+      ],
+      (line) =>
+        Effect.gen(function* () {
+          const { stdio, input } = yield* makeInMemoryStdio();
+          const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+          yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+            stdio,
+            onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+          });
+          yield* Queue.offer(input, encoder.encode(`${line}\n`));
+          const error = yield* Deferred.await(termination);
+
+          const expected = yield* decodeJson(line).pipe(
+            Effect.match({
+              onFailure: (cause) =>
+                CodexError.CodexAppServerProtocolParseError.fromSchemaError(
+                  "decode-wire-message",
+                  cause,
+                ),
+              onSuccess: (message) =>
+                CodexError.CodexAppServerProtocolParseError.fromUnroutableMessage(message),
+            }),
+          );
+          assert.instanceOf(error, CodexError.CodexAppServerProtocolParseError);
+          assert.equal(error.message, expected.message);
+          assert.deepEqual(
+            { ...error, cause: String(error.cause) },
+            { ...expected, cause: String(expected.cause) },
+          );
+        }).pipe(Effect.scoped),
+      { discard: true },
+    ),
   );
 
   it.effect("describes unroutable messages with safe structural diagnostics", () =>

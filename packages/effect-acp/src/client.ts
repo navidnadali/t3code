@@ -47,6 +47,7 @@ export interface AcpClientOptions {
   readonly logIncoming?: boolean;
   readonly logOutgoing?: boolean;
   readonly logger?: (event: AcpProtocol.AcpProtocolLogEvent) => Effect.Effect<void, never>;
+  readonly stageTiming?: AcpProtocol.AcpStageTiming;
   readonly onIncomingRequest?: AcpProtocol.AcpPatchedProtocolOptions["onIncomingRequest"];
   readonly onTermination?: AcpProtocol.AcpPatchedProtocolOptions["onTermination"];
   readonly onOutgoingResponseFailure?: AcpProtocol.AcpPatchedProtocolOptions["onOutgoingResponseFailure"];
@@ -883,6 +884,7 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
     ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.stageTiming ? { stageTiming: options.stageTiming } : {}),
     ...(options.onIncomingRequest ? { onIncomingRequest: options.onIncomingRequest } : {}),
     onTermination: (error) =>
       Effect.all(

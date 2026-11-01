@@ -206,6 +206,7 @@ interface RemoteChild {
   readonly ended: [boolean, boolean];
   referenced: boolean;
   closed: boolean;
+  killedOnStop: boolean;
 }
 
 interface SpawnCallbacks {
@@ -295,6 +296,8 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
             // Already gone.
           }
         }
+        // Node cannot reap another thread's children: the zombie stays until the server exits.
+        child.killedOnStop = true;
         completeExit(entry, null, "SIGKILL");
       }
       for (const [index, stream] of [child.stdout, child.stderr].entries()) {
@@ -449,6 +452,7 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
       ended: [false, false],
       referenced: true,
       closed: false,
+      killedOnStop: false,
     };
     const entry: Entry = {
       child,
@@ -493,8 +497,10 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
   };
 
   return {
-    get failed() {
-      return failed;
+    /** Starts the worker on first use; false once it has failed or closed. */
+    start: () => {
+      ensureWorker();
+      return !failed;
     },
     get closing() {
       return closing;
@@ -631,6 +637,7 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
     });
 
   const isProcessAlive = (child: RemoteChild): boolean => {
+    if (child.killedOnStop) return false;
     if (!Deferred.isDoneUnsafe(child.exitSignal)) return true;
     try {
       process.kill(-child.pid!, 0);
@@ -824,7 +831,7 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
       if (platform === "win32" || !runsOnWorker(command)) {
         return yield* fallback.spawn(command);
       }
-      if (host.failed) {
+      if (!host.start()) {
         if (!announcedFallback && !host.closing) {
           announcedFallback = true;
           yield* Effect.logWarning(
@@ -840,7 +847,8 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
 
 /**
  * Replaces the ambient ChildProcessSpawner with the worker-backed one when
- * T3CODE_VCS_SPAWN_WORKER is true; unset or false keeps it.
+ * T3CODE_VCS_SPAWN_WORKER is true; unset or false keeps it. The worker spawns real processes,
+ * so an injected (fake) spawner then only sees the command shapes the worker does not run.
  */
 export const layerFromConfig = Layer.effect(
   ChildProcessSpawner,

@@ -753,6 +753,7 @@ const XCRUN_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 // xcrun honors DEVELOPER_DIR and the `xcode-select` choice, as the shim does.
 // It takes ~15 ms and reruns when the cached answer expires, so it must not block the event loop.
+// The deadline also covers a descendant that keeps stdout open after xcrun exits.
 export function locateXcodeGitWithXcrun(
   env: NodeJS.ProcessEnv,
   options: { readonly xcrun?: string; readonly timeoutMs?: number } = {},
@@ -762,32 +763,42 @@ export function locateXcodeGitWithXcrun(
     try {
       child = NodeChildProcess.spawn(options.xcrun ?? "/usr/bin/xcrun", ["--find", "git"], {
         env,
-        timeout: options.timeoutMs ?? 5_000,
         stdio: ["ignore", "pipe", "ignore"],
       });
     } catch {
       resolve(undefined);
       return;
     }
+    const settle = (located: string | undefined) => {
+      clearTimeout(deadline);
+      resolve(located);
+    };
+    const giveUp = () => {
+      child.kill();
+      child.stdout?.destroy();
+      settle(undefined);
+    };
+    // @effect-diagnostics-next-line globalTimers:off - a Promise-based lookup outside any fiber.
+    const deadline = setTimeout(giveUp, options.timeoutMs ?? 5_000);
+    deadline.unref();
     const chunks: Array<Buffer> = [];
     let bytes = 0;
     child.stdout?.on("data", (chunk: Buffer) => {
       bytes += chunk.byteLength;
       if (bytes > XCRUN_MAX_OUTPUT_BYTES) {
-        child.kill();
-        resolve(undefined);
+        giveUp();
         return;
       }
       chunks.push(chunk);
     });
-    child.once("error", () => resolve(undefined));
+    child.once("error", () => settle(undefined));
     child.once("close", (code) => {
       if (code !== 0) {
-        resolve(undefined);
+        settle(undefined);
         return;
       }
       const located = Buffer.concat(chunks).toString("utf8").trim();
-      resolve(NodePath.isAbsolute(located) ? located : undefined);
+      settle(NodePath.isAbsolute(located) ? located : undefined);
     });
   });
 }

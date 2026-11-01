@@ -193,6 +193,24 @@ const statFingerprint = (dependency: GitConfigDependency) =>
 const fingerprintDependencies = (dependencies: ReadonlyArray<GitConfigDependency>) =>
   Effect.promise(() => Promise.all(dependencies.map(statFingerprint)));
 
+const fileIdentity = (path: string) =>
+  new Promise<string | null>((resolve) => {
+    try {
+      NodeFS.stat(path, { bigint: true }, (error, stats) =>
+        resolve(error ? null : `${stats.dev}:${stats.ino}`),
+      );
+    } catch {
+      resolve(null);
+    }
+  });
+
+const isSameFile = (left: string, right: string) =>
+  Effect.promise(() => Promise.all([fileIdentity(left), fileIdentity(right)])).pipe(
+    Effect.map(
+      ([leftIdentity, rightIdentity]) => leftIdentity !== null && leftIdentity === rightIdentity,
+    ),
+  );
+
 export interface GitConfigSnapshot {
   readonly values: ReadonlyMap<string, string | null>;
   // Results of commands that read only config, valid while the snapshot is.
@@ -324,7 +342,8 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     }
     const [toplevel, , config, configWorktree, commondir, remotes, branches, head, objects, refs] =
       paths as [string, string, string, string, string, string, string, string, string, string];
-    const [locations, listResult, remoteFiles, branchFiles] = yield* Effect.all(
+    const segments = prefix.split("/").filter((segment) => segment.length > 0);
+    const [locations, listResult, remoteFiles, branchFiles, insideTopLevel] = yield* Effect.all(
       [
         readConfigFileLocations(cwd, environment),
         runGit("GitVcsDriver.configSnapshot.list", cwd, [
@@ -335,16 +354,17 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
         ]),
         listDirectory(remotes),
         listDirectory(branches),
+        isSameFile(cwd, path.join(toplevel, ...segments)),
       ],
       { concurrency: "unbounded" },
     );
-    if (locations === null) return null;
+    // A directory outside the work tree (GIT_WORK_TREE elsewhere) has no prefix to walk.
+    if (locations === null || !insideTopLevel) return null;
 
     // Discovery: the directory, what would make Git stop below the top level (a `.git`, or HEAD of a
     // bare repository), the `.git` it found, and what keeps that a repository. The prefix comes from
     // Git, cased as on disk like the top level, whatever case the directory was given in.
     const dependencies: GitConfigDependency[] = [{ path: cwd, kind: "identity" }];
-    const segments = prefix.split("/").filter((segment) => segment.length > 0);
     for (let depth = segments.length; depth > 0; depth--) {
       const directory = path.join(toplevel, ...segments.slice(0, depth));
       dependencies.push(

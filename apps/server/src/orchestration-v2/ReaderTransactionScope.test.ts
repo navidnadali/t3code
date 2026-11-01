@@ -938,7 +938,7 @@ it.effect("reads inside a write transaction without waiting for a reader permit"
       const fixture = yield* writeFixture("permit-tx", 2);
       const holding = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
-      const holder = yield* store.getThreadRecords(fixture.fork, ["runs"]).pipe(
+      const holder = yield* store.getThreadRecords(fixture.fork, ["runs", "turnItems"]).pipe(
         Effect.provideService(Statement.CurrentTransformer, (statement) =>
           Deferred.succeed(holding, undefined).pipe(
             Effect.andThen(Deferred.await(release)),
@@ -949,7 +949,9 @@ it.effect("reads inside a write transaction without waiting for a reader permit"
       );
       yield* Deferred.await(holding);
       // The only permit is taken; this read has the writer and must not wait for it.
-      const inside = yield* sql.withTransaction(store.getThreadRecords(fixture.fork, ["runs"]));
+      const inside = yield* sql.withTransaction(
+        store.getThreadRecords(fixture.fork, ["runs", "turnItems"]),
+      );
       yield* Deferred.succeed(release, undefined);
       assert.deepStrictEqual(yield* Fiber.join(holder), inside);
     }),

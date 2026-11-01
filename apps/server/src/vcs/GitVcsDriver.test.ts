@@ -584,6 +584,62 @@ it.effect("checkpoint recovery preserves interruption and removes the private in
   }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
 );
 
+it.effect("checkpoint capture reads core.sparseCheckout again only after the config changes", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const liveRunner = yield* ProcessRunner.ProcessRunner;
+    const spawned: Array<ReadonlyArray<string>> = [];
+    const countingProcess = yield* VcsProcess.make.pipe(
+      Effect.provideService(ProcessRunner.ProcessRunner, {
+        run: (input) => {
+          spawned.push(input.args);
+          return liveRunner.run(input);
+        },
+      }),
+    );
+    const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+      Effect.provideService(VcsProcess.VcsProcess, countingProcess),
+    );
+    const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-checkpoint-toggle-" });
+    const { git } = yield* makeCheckpointFixture(driver, cwd);
+    for (const name of ["in/file", "out/file"]) {
+      yield* fileSystem.makeDirectory(path.join(cwd, path.dirname(name)), { recursive: true });
+      yield* fileSystem.writeFileString(path.join(cwd, name), `${name}\n`);
+    }
+    yield* git(["add", "."]);
+    yield* git(["commit", "-m", "fixture"]);
+    let turn = 0;
+    const capture = Effect.gen(function* () {
+      const checkpointRef = CheckpointRef.make(`refs/t3/checkpoints/toggle/${++turn}`);
+      spawned.length = 0;
+      yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef });
+      const coldRef = CheckpointRef.make(`refs/t3/checkpoints/toggle/cold-${turn}`);
+      const cold = yield* GitVcsDriver.makeVcsDriverShape();
+      yield* cold.checkpoints.captureCheckpoint({ cwd, checkpointRef: coldRef });
+      const tree = (ref: string) => git(["rev-parse", `${ref}^{tree}`]);
+      assert.strictEqual((yield* tree(checkpointRef)).stdout, (yield* tree(coldRef)).stdout);
+      return {
+        readsFlag: spawned.some((args) => args.includes("core.sparseCheckout")),
+        sparse: spawned.some((args) => args.includes("add") && args.includes("-h")),
+      };
+    });
+
+    const first = yield* capture;
+    yield* capture;
+    const warm = yield* capture;
+    yield* git(["sparse-checkout", "set", "--cone", "in"]);
+    const sparse = yield* capture;
+    yield* git(["sparse-checkout", "disable"]);
+    const dense = yield* capture;
+
+    assert.deepStrictEqual(first, { readsFlag: true, sparse: false });
+    assert.deepStrictEqual(warm, { readsFlag: false, sparse: false });
+    assert.isTrue(sparse.sparse);
+    assert.isFalse(dense.sparse);
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
 it.effect.each(
   [false, true].flatMap((nested) =>
     (["sparse", "flags", "manual-skip", "missing", "non-cone-missing"] as const).map(

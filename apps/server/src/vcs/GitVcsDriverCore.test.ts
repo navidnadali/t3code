@@ -333,34 +333,35 @@ it.effect("invalidates origin remote cache when a driver mutation adds origin", 
   }).pipe(Effect.provide(layerTest)),
 );
 
-describe("config reads", () => {
-  const makeCountingDriver = Effect.gen(function* () {
-    const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const spawned: Array<ReadonlyArray<string>> = [];
-    const spawner = ChildProcessSpawner.make((command) => {
-      if (ChildProcess.isStandardCommand(command)) spawned.push(command.args);
-      return delegate.spawn(command);
-    });
-    const driver = yield* makeGitVcsDriverCore().pipe(
-      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-    );
-    return { driver, spawned };
+const makeCountingDriver = Effect.gen(function* () {
+  const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const spawned: Array<ReadonlyArray<string>> = [];
+  const spawner = ChildProcessSpawner.make((command) => {
+    if (ChildProcess.isStandardCommand(command)) spawned.push(command.args);
+    return delegate.spawn(command);
   });
+  const driver = yield* makeGitVcsDriverCore().pipe(
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+  );
+  return { driver, spawned };
+});
+// The config GitManager's local status refresh reads after statusDetailsLocal.
+const refreshStatus = (driver: GitVcsDriver.GitVcsDriver["Service"], cwd: string) =>
+  Effect.gen(function* () {
+    const details = yield* driver.statusDetailsLocal(cwd, {
+      includeDivergence: false,
+      includeBranchChanges: true,
+    });
+    const remoteName = yield* driver.readConfigValue(cwd, `branch.${details.branch}.remote`);
+    const remoteUrl =
+      (yield* driver.readConfigValue(cwd, `remote.${remoteName ?? "origin"}.url`)) ??
+      (yield* driver.readConfigValue(cwd, "remote.origin.url"));
+    return { details, remoteName, remoteUrl };
+  });
+
+describe("config reads", () => {
   const readsOnlyConfig = (args: ReadonlyArray<string>) =>
     args[0] === "config" || args[0] === "remote" || args[0] === "var";
-  // The config GitManager's local status refresh reads after statusDetailsLocal.
-  const refreshStatus = (driver: GitVcsDriver.GitVcsDriver["Service"], cwd: string) =>
-    Effect.gen(function* () {
-      const details = yield* driver.statusDetailsLocal(cwd, {
-        includeDivergence: false,
-        includeBranchChanges: true,
-      });
-      const remoteName = yield* driver.readConfigValue(cwd, `branch.${details.branch}.remote`);
-      const remoteUrl =
-        (yield* driver.readConfigValue(cwd, `remote.${remoteName ?? "origin"}.url`)) ??
-        (yield* driver.readConfigValue(cwd, "remote.origin.url"));
-      return { details, remoteName, remoteUrl };
-    });
 
   it.effect("runs no config reads on a refresh while the config is unchanged", () =>
     Effect.scoped(
@@ -739,6 +740,232 @@ describe("config reads", () => {
 
         assert.equal(yield* driver.readConfigValue(cwd, "t3.value"), "second");
         assert.deepStrictEqual(spawned, [["config", "--get", "t3.value"]]);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+});
+
+describe("ref and index reads", () => {
+  type TestServices = GitVcsDriver.GitVcsDriver | FileSystem.FileSystem | Path.Path;
+  type TestError = GitCommandError | PlatformError.PlatformError;
+  // The index path, upstream and base-branch probes of a status refresh.
+  const probesRefs = (args: ReadonlyArray<string>) =>
+    (args[0] === "rev-parse" && args[1] === "--git-path" && args.length === 3) ||
+    (args[0] === "rev-parse" && args.at(-1)!.endsWith("@{upstream}")) ||
+    args[0] === "show-ref";
+  const subcommand = (args: ReadonlyArray<string>) => {
+    let index = 0;
+    while (args[index] === "-c") index += 2;
+    while (args[index]?.startsWith("--")) index++;
+    return args[index];
+  };
+  const summarise = ({ details }: Effect.Success<ReturnType<typeof refreshStatus>>) =>
+    `${details.branch} ${details.branchChanges?.baseRef ?? "-"} +${details.branchChanges?.insertions}`;
+  const initMain = (cwd: string) =>
+    initRepoWithCommit(cwd).pipe(Effect.andThen(git(cwd, ["branch", "-M", "main"])));
+  const addOrigin = (cwd: string, branches: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const origin = yield* makeTmpDir("git-vcs-driver-origin-");
+      yield* git(origin, ["init", "-q", "--bare"]);
+      yield* git(cwd, ["remote", "add", "origin", origin]);
+      yield* git(cwd, ["push", "-q", "-u", "origin", ...branches]);
+    });
+
+  it.effect("runs only the status and diff commands on a refresh while refs are unchanged", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initMain(cwd);
+        yield* writeTextFile(cwd, "README.md", "# edited\n");
+        yield* writeTextFile(cwd, "untracked.txt", "new\n");
+        const first = yield* refreshStatus(driver, cwd);
+        yield* refreshStatus(driver, cwd);
+        spawned.length = 0;
+
+        const warm = yield* refreshStatus(driver, cwd);
+
+        assert.deepStrictEqual(warm, first);
+        assert.equal(summarise(warm), "main - +2");
+        assert.deepStrictEqual(spawned.map(subcommand).toSorted(), [
+          "add",
+          "diff",
+          "diff",
+          "diff-index",
+          "ls-files",
+          "status",
+          "update-index",
+        ]);
+        const cold = yield* makeCountingDriver;
+        assert.deepStrictEqual(yield* refreshStatus(cold.driver, cwd), warm);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("reuses the resolved upstream while its refs and config are unchanged", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initMain(cwd);
+        yield* addOrigin(cwd, ["main"]);
+        const first = yield* refreshStatus(driver, cwd);
+        yield* refreshStatus(driver, cwd);
+        spawned.length = 0;
+
+        const warm = yield* refreshStatus(driver, cwd);
+
+        assert.deepStrictEqual(warm, first);
+        assert.equal(summarise(warm), "main origin/main +0");
+        assert.deepStrictEqual(spawned.filter(probesRefs), []);
+        const cold = yield* makeCountingDriver;
+        assert.deepStrictEqual(yield* refreshStatus(cold.driver, cwd), warm);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
+  interface RefChange {
+    readonly name: string;
+    // Prepares the repository at `cwd` and returns the directory to refresh.
+    readonly setup: (cwd: string) => Effect.Effect<string, TestError, Scope.Scope | TestServices>;
+    readonly change: (cwd: string) => Effect.Effect<void, TestError, TestServices>;
+    readonly before: string;
+    readonly after: string;
+    // False when a probe's result cannot be reused, so every refresh runs it.
+    readonly reused: boolean;
+  }
+  const changes: ReadonlyArray<RefChange> = [
+    {
+      name: "a branch created as a loose ref",
+      setup: Effect.succeed,
+      change: (cwd) => git(cwd, ["branch", "master"]).pipe(Effect.asVoid),
+      before: "main - +0",
+      after: "main master +0",
+      reused: true,
+    },
+    {
+      name: "a loose ref written without Git",
+      setup: Effect.succeed,
+      change: (cwd) =>
+        git(cwd, ["rev-parse", "HEAD"]).pipe(
+          Effect.map((sha) =>
+            NodeFS.writeFileSync(NodePath.join(cwd, ".git", "refs", "heads", "master"), `${sha}\n`),
+          ),
+        ),
+      before: "main - +0",
+      after: "main master +0",
+      reused: true,
+    },
+    {
+      name: "a packed branch deleted",
+      setup: (cwd) =>
+        git(cwd, ["branch", "master"]).pipe(
+          Effect.andThen(git(cwd, ["pack-refs", "--all"])),
+          Effect.as(cwd),
+        ),
+      change: (cwd) => git(cwd, ["update-ref", "-d", "refs/heads/master"]).pipe(Effect.asVoid),
+      before: "main master +0",
+      after: "main - +0",
+      reused: true,
+    },
+    {
+      name: "a branch switch",
+      setup: (cwd) => git(cwd, ["branch", "master"]).pipe(Effect.as(cwd)),
+      change: (cwd) => git(cwd, ["checkout", "-q", "-b", "feature"]).pipe(Effect.asVoid),
+      before: "main master +0",
+      after: "feature main +0",
+      reused: true,
+    },
+    {
+      name: "a symbolic branch losing its target",
+      setup: (cwd) =>
+        git(cwd, ["branch", "real"]).pipe(
+          Effect.andThen(git(cwd, ["symbolic-ref", "refs/heads/master", "refs/heads/real"])),
+          Effect.as(cwd),
+        ),
+      change: (cwd) => git(cwd, ["update-ref", "-d", "refs/heads/real"]).pipe(Effect.asVoid),
+      before: "main master +0",
+      after: "main - +0",
+      reused: false,
+    },
+    {
+      name: "an upstream config change",
+      setup: (cwd) =>
+        git(cwd, ["branch", "other"]).pipe(
+          Effect.andThen(addOrigin(cwd, ["main", "other"])),
+          Effect.as(cwd),
+        ),
+      change: (cwd) =>
+        git(cwd, ["branch", "-q", "--set-upstream-to=origin/other"]).pipe(Effect.asVoid),
+      before: "main origin/main +0",
+      after: "main origin/other +0",
+      reused: true,
+    },
+    {
+      name: "a deleted upstream ref",
+      setup: (cwd) => addOrigin(cwd, ["main"]).pipe(Effect.as(cwd)),
+      change: (cwd) =>
+        git(cwd, ["update-ref", "-d", "refs/remotes/origin/main"]).pipe(Effect.asVoid),
+      before: "main origin/main +0",
+      after: "main - +0",
+      reused: true,
+    },
+    {
+      name: "a fetch that moves the upstream",
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          yield* addOrigin(cwd, ["main"]);
+          yield* writeTextFile(cwd, "README.md", "# local\n");
+          yield* git(cwd, ["commit", "-q", "-am", "local"]);
+          return cwd;
+        }),
+      change: (cwd) =>
+        Effect.gen(function* () {
+          const tracked = yield* git(cwd, ["rev-parse", "refs/remotes/origin/main"]);
+          // Pushing to the URL, not the remote name, leaves the remote-tracking ref for the fetch.
+          yield* git(cwd, ["push", "-q", yield* git(cwd, ["remote", "get-url", "origin"]), "main"]);
+          assert.equal(yield* git(cwd, ["rev-parse", "refs/remotes/origin/main"]), tracked);
+          yield* git(cwd, ["fetch", "-q", "origin"]);
+        }),
+      before: "main origin/main +1",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
+      name: "a branch created beside a linked worktree",
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          yield* git(cwd, ["branch", "-M", "trunk"]);
+          const worktree = NodePath.join(yield* makeTmpDir("git-worktrees-"), "linked");
+          yield* git(cwd, ["worktree", "add", "-q", "-b", "feature", worktree]);
+          return worktree;
+        }),
+      change: (cwd) => git(cwd, ["branch", "master"]).pipe(Effect.asVoid),
+      before: "feature - +0",
+      after: "feature master +0",
+      reused: true,
+    },
+  ];
+
+  it.effect.each(changes)("sees $name on the next refresh", (change) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* initMain(cwd);
+        const readCwd = yield* change.setup(cwd);
+        assert.equal(summarise(yield* refreshStatus(driver, readCwd)), change.before);
+        yield* refreshStatus(driver, readCwd);
+        spawned.length = 0;
+        assert.equal(summarise(yield* refreshStatus(driver, readCwd)), change.before);
+        assert.equal(spawned.filter(probesRefs).length === 0, change.reused);
+
+        yield* change.change(cwd);
+
+        const after = yield* refreshStatus(driver, readCwd);
+        assert.equal(summarise(after), change.after);
+        const cold = yield* makeCountingDriver;
+        assert.deepStrictEqual(yield* refreshStatus(cold.driver, readCwd), after);
       }),
     ).pipe(Effect.provide(layerTest)),
   );

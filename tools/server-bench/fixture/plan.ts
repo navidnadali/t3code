@@ -511,11 +511,11 @@ export const planSynth = (shape: Shape, scale: number, seed: number): SynthPlan 
   checkpointItems.forEach((value, index) => {
     if (value > 0) hasCheckpoints[threadOfRun[index] as number] = 1;
   });
+  const anyCheckpoints = hasCheckpoints.includes(1);
   const standalone = apportion(
     Math.max(0, target("orchestration_v2_projection_checkpoints") - sum(checkpointItems)),
     allRuns.map((_, index) =>
-      isNative[index] &&
-      (hasCheckpoints[threadOfRun[index] as number] === 1 || sum(hasCheckpoints) === 0)
+      isNative[index] && (hasCheckpoints[threadOfRun[index] as number] === 1 || !anyCheckpoints)
         ? 1
         : 0,
     ),

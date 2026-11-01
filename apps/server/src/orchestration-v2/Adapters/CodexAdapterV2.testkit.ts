@@ -10,6 +10,7 @@ import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../../config.ts";
+import { CodexLineOffloads } from "../../provider/io/ProviderIoOffloads.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -20,6 +21,7 @@ import {
   type OrchestratorV2ProviderReplayHarness,
 } from "../testkit/ProviderReplayHarness.ts";
 import type { ProviderReplayGate } from "@t3tools/provider-testing/replayGate";
+import { ReplayStdoutChunking } from "../testkit/ReplayStdoutChunking.ts";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
 
 const DEFAULT_CODEX_SETTINGS = Schema.decodeSync(CodexSettings)({});
@@ -100,12 +102,14 @@ export function layer(input: {
   readonly transcript: CodexReplay.CodexAppServerReplayTranscript;
   readonly driver?: CodexReplay.CodexAppServerReplayDriver;
 }) {
-  // Like the real factory, replays write protocol logs when the native event logger is provided.
+  // Like the real factory, replays log and offload long lines when those services are provided.
   const layerReplayClientFactory = Layer.effect(
     CodexAdapterV2.CodexAppServerClientFactory,
     Effect.gen(function* () {
       const loggers = yield* Effect.serviceOption(ProviderEventLoggers.ProviderEventLoggers);
       const nativeEventLogger = Option.isSome(loggers) ? loggers.value.native : undefined;
+      const offloads = yield* Effect.serviceOption(CodexLineOffloads);
+      const chunking = yield* Effect.serviceOption(ReplayStdoutChunking);
       return CodexAdapterV2.CodexAppServerClientFactory.of({
         open: (openInput) =>
           Effect.gen(function* () {
@@ -114,12 +118,40 @@ export function layer(input: {
               threadId: openInput.threadId,
               providerSessionId: openInput.providerSessionId,
             });
-            const options =
-              logger === undefined ? {} : { logIncoming: true, logOutgoing: true, logger };
+            const writeSerialized = nativeEventLogger?.writeSerialized;
+            // As the real factory; a replay has no process for a dead worker to stop.
+            const lineOffload =
+              Option.isNone(offloads) ||
+              (nativeEventLogger !== undefined && writeSerialized === undefined)
+                ? undefined
+                : Option.getOrUndefined(
+                    yield* offloads.value.open({
+                      kill: Effect.void,
+                      ...(writeSerialized === undefined
+                        ? {}
+                        : {
+                            log: {
+                              providerSessionId: openInput.providerSessionId,
+                              writeSerialized: (payload) =>
+                                writeSerialized(
+                                  { stream: "native", payload },
+                                  openInput.threadId,
+                                ).pipe(Effect.ignore),
+                            },
+                          }),
+                    }),
+                  );
+            const options = {
+              ...(logger === undefined ? {} : { logIncoming: true, logOutgoing: true, logger }),
+              ...(lineOffload === undefined ? {} : { lineOffload }),
+            };
+            const inbound = Option.isSome(chunking)
+              ? { split: chunking.value.makeSplitter() }
+              : undefined;
             const layerReplay =
               input.driver === undefined
-                ? CodexReplay.layerReplay(input.transcript, options)
-                : CodexReplay.layerReplayWithDriver(input.driver, options);
+                ? CodexReplay.layerReplay(input.transcript, options, inbound)
+                : CodexReplay.layerReplayWithDriver(input.driver, options, inbound);
             const context = yield* Layer.build(layerReplay).pipe(
               Effect.mapError(
                 (cause) =>

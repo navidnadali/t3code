@@ -6,6 +6,7 @@ import {
   type ProviderReplayTranscript,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { materializeReplayTranscriptWorkspace } from "@t3tools/provider-testing/replayTranscript";
 import * as Effect from "effect/Effect";
@@ -20,12 +21,14 @@ import * as Stream from "effect/Stream";
 import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import * as EventNdjsonLogger from "../../provider/EventNdjsonLogger.ts";
+import * as ProviderIoOffloads from "../../provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "../../provider/io/ProviderIoWorkerPool.ts";
 import { AcpRegistryOrchestratorReplayHarness } from "../Adapters/AcpRegistryAdapterV2.testkit.ts";
 import * as ClaudeAdapterV2 from "../Adapters/ClaudeAdapterV2.ts";
 import { CodexOrchestratorReplayHarness } from "../Adapters/CodexAdapterV2.testkit.ts";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import { ORCHESTRATOR_REPLAY_FIXTURES } from "./fixtures/index.ts";
+import { ReplayStdoutChunking, seededStdoutChunking } from "./ReplayStdoutChunking.ts";
 import { runReplayFixture, type ReplayFixtureCase } from "./ProviderReplayFixtures.ts";
 import {
   makeReplayServerConfig,
@@ -34,31 +37,56 @@ import {
 
 type ProviderIoServices =
   | ProviderEventLoggers.ProviderEventLoggers
-  | ProviderIoWorkerPool.ProviderIoWorkerPool;
+  | ProviderIoWorkerPool.ProviderIoWorkerPool
+  | ProviderIoOffloads.CodexLineOffloads
+  | AcpLineOffloads
+  | ReplayStdoutChunking;
 
 interface Capture {
   /** Per provider session, in open order. */
   readonly adapterEvents: ReadonlyArray<ReadonlyArray<unknown>>;
-  readonly logLines: ReadonlyArray<unknown>;
+  /** Per file, stream, direction and provider session (see `byLogWriter`), in order. */
+  readonly logLines: Readonly<Record<string, ReadonlyArray<unknown>>>;
   /** Per writer (see `bySource`), in order. */
   readonly sinkWrites: Readonly<Record<string, ReadonlyArray<unknown>>>;
+  /** The type of each thread's and run's first EventSink write, across writers. */
+  readonly firstWrites: Readonly<Record<string, string>>;
+}
+
+interface PoolUse {
+  readonly sessions: number;
+  /** Requests sent to the workers (offloaded lines). */
+  readonly calls: number;
 }
 
 interface CaptureRun {
   readonly capture: Capture;
-  readonly poolSessions: number;
+  /** Per stage name. */
+  readonly pool: Readonly<Record<string, PoolUse>>;
+}
+
+interface WorkerMode {
+  readonly name: string;
+  readonly workers: number;
+  /** T3CODE_PROVIDER_IO_{CODEX,ACP}_OFFLOAD_MIN_CHARS; unset keeps the defaults. */
+  readonly offloadMinChars?: number;
 }
 
 interface AdapterRow {
   readonly driver: string;
   readonly path: string;
   /**
-   * `pending` until the provider's output runs on the workers: the row still compares 0 and 2
-   * workers. `required` also fails unless 2 workers took the provider's sessions.
+   * `pending` until the provider's output runs on the workers: the row still compares each mode
+   * with 0 workers. `required` also fails unless the workers took the provider's sessions, and,
+   * with an offload threshold of 0, its lines.
    */
   readonly offload: "pending" | "required";
+  /** The pool stage that takes this provider's output. */
+  readonly stage: string;
   readonly fixtures?: ReadonlySet<string>;
-  readonly capture: (input: ReplayFixtureCase, workers: number) => Effect.Effect<CaptureRun>;
+  /** Compared with 0 workers. */
+  readonly modes: ReadonlyArray<WorkerMode>;
+  readonly capture: (input: ReplayFixtureCase, mode: WorkerMode) => Effect.Effect<CaptureRun>;
 }
 
 const ISO_TIMESTAMP = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/gu;
@@ -83,13 +111,49 @@ const bySource = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
   return Object.fromEntries([...sources].toSorted(([a], [b]) => (a < b ? -1 : 1)));
 };
 
+interface LogLine {
+  readonly file: string;
+  readonly stream: string | undefined;
+  readonly record: unknown;
+}
+
+// Each session's incoming protocol records come from its stdout reader and the outgoing ones from
+// its request senders, so the order is compared per file, stream, direction and session.
+const byLogWriter = (logLines: ReadonlyArray<LogLine>) => {
+  const writers = new Map<string, Array<unknown>>();
+  for (const { file, stream, record } of logLines) {
+    const { event, providerSessionId } = record as {
+      readonly event?: { readonly direction?: unknown };
+      readonly providerSessionId?: unknown;
+    };
+    const direction = typeof event?.direction === "string" ? event.direction : "-";
+    const session = typeof providerSessionId === "string" ? providerSessionId : "-";
+    const writer = `${file} ${String(stream)} ${direction} ${session}`;
+    writers.set(writer, [...(writers.get(writer) ?? []), record]);
+  }
+  return Object.fromEntries([...writers].toSorted(([a], [b]) => (a < b ? -1 : 1)));
+};
+
+// Writers race, but each thread and run starts with the same write whatever the interleaving.
+const firstWrites = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
+  const first = new Map<string, string>();
+  for (const { event } of storedEvents) {
+    const { threadId, runId } = event as { readonly threadId?: unknown; readonly runId?: unknown };
+    for (const key of [`thread ${String(threadId)}`, `run ${String(runId)}`]) {
+      if (!key.endsWith(" undefined") && !first.has(key)) first.set(key, event.type);
+    }
+  }
+  return Object.fromEntries([...first].toSorted(([a], [b]) => (a < b ? -1 : 1)));
+};
+
 // Timestamps, per-run temporary directory names and random ids are the only run-specific values.
-// Random ids (v4 UUIDs; with `freshIds` also the ids a fake CLI mints) are renamed by first
-// appearance across the channels, so where each id recurs is still compared.
+// Temporary directories keep their prefix, and they and random ids (v4 UUIDs; with `freshIds` also
+// the ids a fake CLI mints) are renamed by first appearance across the channels, so where each one
+// recurs is still compared.
 const normalize = (
   raw: {
     readonly adapterEvents: ReadonlyArray<ReadonlyArray<unknown>>;
-    readonly logLines: ReadonlyArray<unknown>;
+    readonly logLines: ReadonlyArray<LogLine>;
     readonly sinkWrites: ReadonlyArray<OrchestrationV2StoredEvent>;
   },
   tmpRoot: string,
@@ -99,13 +163,26 @@ const normalize = (
     `(?:/private)?${tmpRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/[^/\\\\\\s"']+`,
     "gu",
   );
+  const tmpNames = new Map<string, string>();
+  const tmpName = (match: string) => {
+    const directory = match.slice(match.lastIndexOf("/") + 1);
+    // mkdtemp appends six random characters to the prefix.
+    const known = tmpNames.get(directory) ?? `<tmp ${directory.slice(0, -6)}#${tmpNames.size + 1}>`;
+    tmpNames.set(directory, known);
+    return known;
+  };
   const scrub = (value: unknown) => {
     const text = JSON.stringify(value)
-      .replace(tmpDirectory, "<tmp>")
+      .replace(tmpDirectory, tmpName)
       .replace(ISO_TIMESTAMP, "<timestamp>");
     return freshIds ? text.replace(DURATION_MS, (_match, key: string) => `${key}0`) : text;
   };
-  const texts = [scrub(raw.adapterEvents), scrub(raw.logLines), scrub(bySource(raw.sinkWrites))];
+  const texts = [
+    scrub(raw.adapterEvents),
+    scrub(byLogWriter(raw.logLines)),
+    scrub(bySource(raw.sinkWrites)),
+    scrub(firstWrites(raw.sinkWrites)),
+  ];
   const ids = new Map<string, string>();
   const name = (id: string) => {
     if (!ids.has(id)) ids.set(id, `<id ${ids.size + 1}>`);
@@ -116,10 +193,10 @@ const normalize = (
     if (freshIds) for (const match of text.matchAll(API_ID)) name(match[0]);
   }
   const renames = [...ids].toSorted(([a], [b]) => b.length - a.length);
-  const [adapterEvents, logLines, sinkWrites] = texts.map((text) =>
+  const [adapterEvents, logLines, sinkWrites, firstWritten] = texts.map((text) =>
     JSON.parse(renames.reduce((renamed, [id, alias]) => renamed.replaceAll(id, alias), text)),
   );
-  return { adapterEvents, logLines, sinkWrites };
+  return { adapterEvents, logLines, sinkWrites, firstWrites: firstWritten };
 };
 
 const recordAdapterEvents = (
@@ -153,6 +230,14 @@ const recordAdapterEvents = (
       ),
   });
 
+const fixtureSeed = (input: ReplayFixtureCase) => {
+  let hash = 0x2029;
+  for (const character of `${input.driver.driver} ${input.fixtureName}`) {
+    hash = Math.imul(hash ^ character.charCodeAt(0), 0x01000193);
+  }
+  return hash;
+};
+
 // Replays a fixture with the pool at `workers`, the native protocol log written by the real log
 // store, and the adapter's events recorded where the session manager reads them.
 const adapterRow = <
@@ -163,7 +248,9 @@ const adapterRow = <
   readonly driver: string;
   readonly path: string;
   readonly offload: AdapterRow["offload"];
+  readonly stage: string;
   readonly fixtures?: ReadonlySet<string>;
+  readonly modes: AdapterRow["modes"];
   readonly freshIds?: boolean;
   /** Off where the provider is not replayed from the fixture's recording, so its checks do not apply. */
   readonly checkOutput?: boolean;
@@ -183,8 +270,10 @@ const adapterRow = <
   driver: row.driver,
   path: row.path,
   offload: row.offload,
+  stage: row.stage,
   ...(row.fixtures === undefined ? {} : { fixtures: row.fixtures }),
-  capture: (input, workers) =>
+  modes: row.modes,
+  capture: (input, mode) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -195,28 +284,59 @@ const adapterRow = <
         path.join(logDir, "events.log"),
         { batchWindowMs: 0 },
       );
-      const pool = yield* ProviderIoWorkerPool.make({ workers });
-      let poolSessions = 0;
-      const services = Layer.mergeAll(
-        Layer.succeed(ProviderEventLoggers.ProviderEventLoggers, {
-          native: store.logger("native"),
-          canonical: undefined,
-        }),
-        Layer.succeed(
-          ProviderIoWorkerPool.ProviderIoWorkerPool,
-          ProviderIoWorkerPool.ProviderIoWorkerPool.of({
-            open: (openInput) =>
-              pool.open(openInput).pipe(
-                Effect.tap((session) =>
-                  Effect.sync(() => {
-                    if (Option.isSome(session)) poolSessions += 1;
-                  }),
-                ),
+      const pool = yield* ProviderIoWorkerPool.make({ workers: mode.workers });
+      const use: Record<string, { sessions: number; calls: number }> = {};
+      const layerPool = Layer.succeed(
+        ProviderIoWorkerPool.ProviderIoWorkerPool,
+        ProviderIoWorkerPool.ProviderIoWorkerPool.of({
+          open: (openInput) =>
+            pool.open(openInput).pipe(
+              Effect.map(
+                Option.map((session) => {
+                  const stage = (use[openInput.stage.name] ??= { sessions: 0, calls: 0 });
+                  stage.sessions += 1;
+                  return {
+                    ...session,
+                    call: (request) => {
+                      stage.calls += 1;
+                      return session.call(request);
+                    },
+                  };
+                }),
               ),
+            ),
+        }),
+      );
+      const offloadMinChars = mode.offloadMinChars;
+      const layerConfig = Layer.effect(
+        ServerConfig.ServerConfig,
+        makeReplayServerConfig(input.fixtureName).pipe(
+          Effect.map((config) =>
+            offloadMinChars === undefined
+              ? config
+              : {
+                  ...config,
+                  providerIoCodexOffloadMinChars: offloadMinChars,
+                  providerIoAcpOffloadMinChars: offloadMinChars,
+                },
+          ),
+          Effect.orDie,
+        ),
+      ).pipe(Layer.provide(NodeServices.layer));
+      // As in the server: sessions find the pool and the line offloads in their context.
+      const services = yield* Layer.build(
+        Layer.mergeAll(
+          Layer.succeed(ProviderEventLoggers.ProviderEventLoggers, {
+            native: store.logger("native"),
+            canonical: undefined,
           }),
+          layerPool,
+          ProviderIoOffloads.layer.pipe(Layer.provide(Layer.merge(layerPool, layerConfig))),
+          // The same seed in every mode, so each mode reads the same chunks.
+          Layer.succeed(ReplayStdoutChunking, seededStdoutChunking(fixtureSeed(input))),
         ),
       );
-      const harness = yield* row.harness(services, input);
+      const harness = yield* row.harness(Layer.succeedContext(services), input);
       const adapterEvents: Array<Array<unknown>> = [];
       const result = yield* runReplayFixture({
         ...input,
@@ -236,9 +356,9 @@ const adapterRow = <
         ...(row.materializeWorkspace === undefined
           ? {}
           : { materializeWorkspace: row.materializeWorkspace }),
-      });
+      }).pipe(Effect.provide(services));
       yield* store.close();
-      const logLines: Array<unknown> = [];
+      const logLines: Array<LogLine> = [];
       for (const file of (yield* fileSystem.readDirectory(logDir)).toSorted()) {
         const contents = yield* fileSystem.readFileString(path.join(logDir, file));
         for (const line of contents.split("\n")) {
@@ -253,7 +373,7 @@ const adapterRow = <
         path.dirname(logDir),
         row.freshIds === true,
       );
-      return { capture, poolSessions };
+      return { capture, pool: use };
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.orDie),
 });
 
@@ -345,12 +465,20 @@ const CLAUDE_WIRE_FIXTURES = new Set([
   "web_search",
 ]);
 
+// The replay fixtures' lines are mostly short, so one mode sends every line to the workers.
+const LINE_OFFLOAD_MODES: ReadonlyArray<WorkerMode> = [
+  { name: "2 workers", workers: 2 },
+  { name: "2 workers, every line offloaded", workers: 2, offloadMinChars: 0 },
+];
+
 const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "codex",
     path: "replay",
-    // P1-025 moves Codex stdout handling onto the workers.
+    // P1-025 moves long Codex stdout lines onto the workers.
     offload: "pending",
+    stage: "codex-app-server",
+    modes: LINE_OFFLOAD_MODES,
     harness: replayHarness(CodexOrchestratorReplayHarness),
     materializeWorkspace: (transcript, workspace) =>
       Effect.succeed(materializeReplayTranscriptWorkspace(transcript, workspace)),
@@ -358,15 +486,19 @@ const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "acpRegistry",
     path: "replay",
-    // P1-025 moves ACP stdout handling onto the workers.
+    // P1-025 moves long ACP stdout lines onto the workers.
     offload: "pending",
+    stage: "acp",
+    modes: LINE_OFFLOAD_MODES,
     harness: replayHarness(AcpRegistryOrchestratorReplayHarness),
   }),
   adapterRow({
     driver: "claudeAgent",
     path: "wire (fake CLI)",
-    // P1-027 runs the Agent SDK on the workers.
+    // P1-027 runs the Agent SDK on the workers; it names the stage it registers.
     offload: "pending",
+    stage: "claude-agent-sdk",
+    modes: [{ name: "2 workers", workers: 2 }],
     fixtures: CLAUDE_WIRE_FIXTURES,
     freshIds: true,
     checkOutput: false,
@@ -388,22 +520,38 @@ const CASES = ROWS.flatMap((row) =>
 );
 
 describe("provider I/O at 0 and 2 workers", () => {
-  it.effect.each(CASES)(
-    "$name: same adapter events, EventSink writes and protocol-log lines",
-    ({ row, input }) =>
+  // `%s` keeps the whole fixture name in the title, so `-t` can select it.
+  it.effect.each(CASES.map((testCase) => [testCase.name, testCase] as const))(
+    "%s: same adapter events, EventSink writes and protocol-log lines",
+    ([, { row, input }]) =>
       Effect.gen(function* () {
-        const inThread = yield* row.capture(input, 0);
-        const onWorkers = yield* row.capture(input, 2);
-        assert.equal(inThread.poolSessions, 0);
-        if (row.offload === "required") {
-          assert.isAbove(onWorkers.poolSessions, 0, "2 workers took the provider's sessions");
-        }
+        const inThread = yield* row.capture(input, { name: "0 workers", workers: 0 });
+        assert.deepEqual(inThread.pool, {});
         assert.isNotEmpty(inThread.capture.adapterEvents.flat());
-        assert.isNotEmpty(inThread.capture.logLines);
+        assert.isNotEmpty(Object.keys(inThread.capture.logLines));
         assert.isNotEmpty(Object.keys(inThread.capture.sinkWrites));
-        assert.deepStrictEqual(onWorkers.capture.adapterEvents, inThread.capture.adapterEvents);
-        assert.deepStrictEqual(onWorkers.capture.logLines, inThread.capture.logLines);
-        assert.deepStrictEqual(onWorkers.capture.sinkWrites, inThread.capture.sinkWrites);
+        for (const mode of row.modes) {
+          const onWorkers = yield* row.capture(input, mode);
+          if (row.offload === "required") {
+            const use = onWorkers.pool[row.stage];
+            assert.isAbove(use?.sessions ?? 0, 0, `${mode.name}: workers took the sessions`);
+            if (mode.offloadMinChars === 0) {
+              assert.isAbove(use?.calls ?? 0, 0, `${mode.name}: workers took the lines`);
+            }
+          }
+          for (const channel of [
+            "adapterEvents",
+            "logLines",
+            "sinkWrites",
+            "firstWrites",
+          ] as const) {
+            assert.deepStrictEqual(
+              onWorkers.capture[channel],
+              inThread.capture[channel],
+              `${mode.name}: ${channel}`,
+            );
+          }
+        }
       }),
   );
 

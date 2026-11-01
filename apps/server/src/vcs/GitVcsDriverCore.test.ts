@@ -1250,6 +1250,25 @@ describe("ref and index reads", () => {
       reused: true,
     },
     {
+      name: "a branch that makes an upstream ending in HEAD ambiguous",
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          yield* addOrigin(cwd, ["main"]);
+          yield* git(cwd, ["branch", "topic/HEAD"]);
+          yield* addRemote(cwd, "up", ["topic/HEAD"]);
+          yield* git(cwd, ["branch", "-q", "--set-upstream-to=up/topic/HEAD", "main"]);
+          // Git shortens refs/remotes/up/topic/HEAD to up/topic while nothing else answers to it.
+          yield* git(cwd, ["tag", "up/topic/HEAD"]);
+          yield* git(cwd, ["tag", "remotes/up/topic/HEAD"]);
+          yield* git(cwd, ["symbolic-ref", "refs/heads/up/topic", "refs/heads/real"]);
+          return cwd;
+        }),
+      change: (cwd) => git(cwd, ["branch", "real"]).pipe(Effect.asVoid),
+      before: "main up/topic/HEAD +0",
+      after: "main origin/main +0",
+      reused: false,
+    },
+    {
       name: "a deleted upstream ref",
       setup: (cwd) => addOrigin(cwd, ["main"]).pipe(Effect.as(cwd)),
       change: (cwd) =>

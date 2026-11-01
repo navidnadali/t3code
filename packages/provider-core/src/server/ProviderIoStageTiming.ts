@@ -10,7 +10,8 @@ export type ProviderIoStage =
   | "logSerialize"
   | "sdkMessage"
   | "adapter"
-  | "ingest";
+  | "ingest"
+  | "offload";
 
 export interface ProviderIoStageTimer {
   readonly now: () => number;

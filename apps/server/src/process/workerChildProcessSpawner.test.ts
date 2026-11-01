@@ -367,66 +367,33 @@ describe("WorkerChildProcessSpawner", () => {
   );
 
   it.live.skipIf(!workerPlatform)(
-    "never signals the server's own process group for a child the worker reports as pid 0",
+    "rejects a child the worker reports as pid 0, 1 or -1, never signalling the server's own process group",
     () =>
       Effect.gen(function* () {
-        const nodeSpawner = yield* ChildProcessSpawner;
-        // The worker reports pid 0, then throws on the first stdin write.
-        const workerSource = WorkerChildProcessSpawner.spawnWorkerSource
-          .replace("pid: child.pid", "pid: 0")
-          .replace('case "stdin":', 'case "stdin": throw new Error("worker crashed");');
-        expect(workerSource).toContain("pid: 0");
+        const { calls, spawner } = yield* recordingSpawner;
         const realKill = process.kill.bind(process);
         // kill(0) would signal this test's own group: refuse it as a missing group would.
         const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
           if (Math.abs(pid) <= 1) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
           return realKill(pid, signal);
         });
-        let stranded: number | undefined;
         const ownGroupCalls = yield* Effect.gen(function* () {
-          const workerSpawner = yield* WorkerChildProcessSpawner.make(nodeSpawner, {
-            workerSource,
-          });
-          // A failed exit signals the group from its exit listener and its release.
-          yield* Effect.gen(function* () {
-            const failed = yield* workerSpawner.spawn(node("process.exit(3)"));
-            expect(yield* failed.exitCode).toBe(3);
-          }).pipe(Effect.scoped);
-          // A kill falls back to the worker's own kill of the child.
-          yield* Effect.gen(function* () {
-            const running = yield* workerSpawner.spawn(node("setInterval(() => {}, 1000)"));
-            yield* running.kill();
-            expect(yield* running.isRunning).toBe(false);
-          }).pipe(Effect.scoped);
-          // A stopped worker kills its children's groups.
-          yield* Effect.gen(function* () {
-            const child = yield* workerSpawner.spawn(
-              node(
-                "process.stdout.write(String(process.pid)); process.stdin.on('end', () => process.exit(0)); process.stdin.resume()",
-              ),
+          for (const pid of [0, 1, -1]) {
+            const workerSource = WorkerChildProcessSpawner.spawnWorkerSource.replace(
+              "pid: child.pid",
+              `pid: ${pid}`,
             );
-            const first = yield* Stream.runHead(Stream.decodeText(child.stdout));
-            stranded = Number(first._tag === "Some" ? first.value : Number.NaN);
-            yield* Stream.run(Stream.make(new Uint8Array([1])), child.stdin).pipe(Effect.ignore);
-            yield* Effect.flip(child.exitCode);
-          }).pipe(Effect.scoped);
+            expect(workerSource).toContain(`pid: ${pid}`);
+            const workerSpawner = yield* WorkerChildProcessSpawner.make(spawner, { workerSource });
+            expect(yield* spawnError(workerSpawner, node("process.exit(3)"))).toMatchObject({
+              method: "spawn",
+              causeMessage: "The child process spawner worker stopped",
+            });
+          }
           return kill.mock.calls.filter(([pid]) => Math.abs(pid) <= 1);
-        }).pipe(
-          Effect.scoped,
-          Effect.ensuring(
-            Effect.sync(() => {
-              kill.mockRestore();
-              if (stranded !== undefined && Number.isInteger(stranded) && stranded > 1) {
-                try {
-                  process.kill(stranded, "SIGKILL");
-                } catch {
-                  // Already gone.
-                }
-              }
-            }),
-          ),
-        );
+        }).pipe(Effect.scoped, Effect.ensuring(Effect.sync(() => kill.mockRestore())));
         expect(ownGroupCalls).toEqual([]);
+        expect(calls).toEqual([]);
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

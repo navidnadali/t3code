@@ -94,6 +94,58 @@ type WorkerMessage =
       readonly error?: SerializedError;
     };
 
+const isSerializedError = (error: unknown) =>
+  Predicate.isObject(error) &&
+  typeof (error as { name?: unknown }).name === "string" &&
+  typeof (error as { message?: unknown }).message === "string";
+
+const isStreamIndex = (s: unknown) => s === 0 || s === 1;
+
+// kill(0) and kill(-1) reach this server's group or every process the user owns.
+const isChildPid = (pid: unknown) => Number.isSafeInteger(pid) && (pid as number) > 1;
+
+/** A message the host can act on; anything else means the transport is broken. */
+const isWorkerMessage = (value: unknown): value is WorkerMessage => {
+  if (!Predicate.isObject(value)) return false;
+  const message = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(message.id)) return false;
+  switch (message.t) {
+    case "spawn":
+    case "started":
+      return isChildPid(message.pid);
+    case "data":
+      return isStreamIndex(message.s) && message.chunk instanceof Uint8Array;
+    case "end":
+      return isStreamIndex(message.s);
+    case "stream-error":
+      return isStreamIndex(message.s) && isSerializedError(message.error);
+    case "error":
+    case "throw":
+    case "stdin-error":
+      return isSerializedError(message.error);
+    case "exit":
+      return (
+        (message.code === null || Number.isInteger(message.code)) &&
+        (message.signal === null || typeof message.signal === "string")
+      );
+    case "close":
+      return true;
+    case "stdin-done":
+      return (
+        Number.isSafeInteger(message.seq) &&
+        (message.error === undefined || isSerializedError(message.error))
+      );
+    case "kill-result":
+      return (
+        Number.isSafeInteger(message.seq) &&
+        typeof message.killed === "boolean" &&
+        (message.error === undefined || isSerializedError(message.error))
+      );
+    default:
+      return false;
+  }
+};
+
 const reviveError = (fields: SerializedError): Error => {
   const error =
     fields.name === "TypeError"
@@ -154,7 +206,7 @@ interface Transport {
 }
 
 interface TransportEvents {
-  readonly onMessage: (message: WorkerMessage) => void;
+  readonly onMessage: (message: unknown) => void;
   readonly onStop: (cause: unknown) => void;
 }
 
@@ -372,7 +424,9 @@ const makeRemoteHost = (options: {
     try {
       const opened = options.open({
         onMessage: (message) => {
-          if (generation === current) onMessage(message);
+          if (generation !== current) return;
+          if (isWorkerMessage(message)) onMessage(message);
+          else stop(new Error("The spawner sent a malformed message"));
         },
         onStop: (cause) => {
           if (generation === current) stop(cause);
@@ -602,9 +656,7 @@ const openSpawnerProcess =
       partial = lines.pop() ?? "";
       for (const line of lines) {
         const [id, pid] = line.split(" ").map(Number);
-        if (Number.isSafeInteger(id) && Number.isSafeInteger(pid)) {
-          events.onMessage({ t: "started", id: id!, pid: pid! });
-        }
+        events.onMessage({ t: "started", id, pid });
       }
     });
     starts.on("close", () => {

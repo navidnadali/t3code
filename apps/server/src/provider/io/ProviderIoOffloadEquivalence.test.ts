@@ -273,7 +273,11 @@ const guardedBundle = Effect.promise(async () => {
     placeholder,
   }).load(placeholder);
   if (typeof module !== "string") throw new Error("The worker bundle plugin built nothing.");
-  workers.bundle = JSON.parse(module.slice(module.indexOf("=> ") + 3, module.lastIndexOf(";")));
+  // The placeholder the plugin generates, run as is: it decodes the source the server embeds.
+  const embedded = (await import(`data:text/javascript,${encodeURIComponent(module)}`)) as {
+    readonly loadEmbeddedProviderIoWorkerSource: () => string;
+  };
+  workers.bundle = embedded.loadEmbeddedProviderIoWorkerSource();
 });
 
 const preview = (value: unknown) =>

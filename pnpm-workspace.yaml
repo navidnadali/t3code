@@ -398,6 +398,9 @@ patchedDependencies:
   # Observe the owned host exit independently of descendants retaining its stdio.
   "@muse-code/sdk@1.4.6": patches/@muse-code__sdk@1.4.6.patch
   app-builder-lib@26.16.1: patches/app-builder-lib@26.16.1.patch
+  # Effect-TS/effect#10004 (4.0.7): a response whose client disconnected no longer holds its
+  # request fiber and body forever.
+  "@effect/platform-node@4.0.5": patches/@effect__platform-node@4.0.5.patch
 
 peerDependencyRules:
   allowAny:

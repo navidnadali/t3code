@@ -24,6 +24,7 @@ import { gitCommandDuration, gitCommandsTotal } from "../observability/Metrics.t
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
+import { gitConfigBool, parseGitConfigList } from "./gitConfigSnapshot.ts";
 import type * as VcsDriver from "./VcsDriver.ts";
 import * as VcsDriverRegistry from "./VcsDriverRegistry.ts";
 import * as VcsProcess from "./VcsProcess.ts";
@@ -582,6 +583,135 @@ it.effect("checkpoint recovery preserves interruption and removes the private in
     assert.isFalse(yield* fs.exists(privateIndex!));
     assert.isFalse(yield* driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef }));
   }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect("reads a boolean the way git config --bool does", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-config-bool-" });
+    const git = (args: ReadonlyArray<string>) =>
+      driver.execute({ operation: "config-bool-test", cwd, args, allowNonZeroExit: true });
+    yield* git(["init", "-q"]);
+    // Each case: the key's values in order, and whether gitConfigBool answers without Git.
+    const cases: ReadonlyArray<readonly [values: ReadonlyArray<string | null>, parsed: boolean]> = [
+      [[null], true],
+      [[""], true],
+      [["true"], true],
+      [["TRUE"], true],
+      [["Yes"], true],
+      [["on"], true],
+      [["false"], true],
+      [["No"], true],
+      [["OFF"], true],
+      [["0"], true],
+      [["1"], true],
+      [["2"], true],
+      [["123456789"], true],
+      [["1234567890"], false],
+      [["007"], false],
+      [["08"], false],
+      [["0x1"], false],
+      [["1k"], false],
+      [["-1"], false],
+      [['" 1"'], false],
+      [["maybe"], false],
+      [["yes", "off"], true],
+      [["maybe", "true"], false],
+      [["0x1", "false"], false],
+    ];
+    const include = path.join(cwd, "flags.inc");
+    yield* fileSystem.writeFileString(
+      include,
+      `[t3]\n${cases
+        .flatMap(([values], index) =>
+          values.map((value) =>
+            value === null ? `\tflag${index}\n` : `\tflag${index} = ${value}\n`,
+          ),
+        )
+        .join("")}`,
+    );
+    yield* git(["config", "include.path", include]);
+    const listed = parseGitConfigList(
+      (yield* git(["config", "--list", "--show-origin", "-z"])).stdout,
+    );
+    const valueLists = new Map<string, Array<string | null>>();
+    for (const { key, value } of listed ?? []) {
+      valueLists.set(key, [...(valueLists.get(key) ?? []), value]);
+    }
+    const keys = [...cases.keys(), cases.length].map((index) => `t3.Flag${index}`);
+
+    const parsed = keys.map((key) => gitConfigBool(valueLists, key));
+
+    const printed = yield* Effect.forEach(keys, (key) =>
+      git(["config", "--bool", key]).pipe(Effect.map(({ stdout }) => stdout.trim() === "true")),
+    );
+    assert.deepStrictEqual(
+      parsed.map((value, index) => value ?? printed[index]),
+      printed,
+    );
+    assert.deepStrictEqual(
+      parsed.map((value) => value !== null),
+      [...cases.map(([, known]) => known), true],
+    );
+  }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect("checkpoint capture reads core.sparseCheckout again only after the config changes", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const liveRunner = yield* ProcessRunner.ProcessRunner;
+    const spawned: Array<ReadonlyArray<string>> = [];
+    const countingProcess = yield* VcsProcess.make.pipe(
+      Effect.provideService(ProcessRunner.ProcessRunner, {
+        run: (input) => {
+          spawned.push(input.args);
+          return liveRunner.run(input);
+        },
+      }),
+    );
+    const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+      Effect.provideService(VcsProcess.VcsProcess, countingProcess),
+    );
+    const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-checkpoint-toggle-" });
+    const { git } = yield* makeCheckpointFixture(driver, cwd);
+    for (const name of ["in/file", "out/file"]) {
+      yield* fileSystem.makeDirectory(path.join(cwd, path.dirname(name)), { recursive: true });
+      yield* fileSystem.writeFileString(path.join(cwd, name), `${name}\n`);
+    }
+    yield* git(["add", "."]);
+    yield* git(["commit", "-m", "fixture"]);
+    let turn = 0;
+    const capture = Effect.gen(function* () {
+      const checkpointRef = CheckpointRef.make(`refs/t3/checkpoints/toggle/${++turn}`);
+      spawned.length = 0;
+      yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef });
+      const coldRef = CheckpointRef.make(`refs/t3/checkpoints/toggle/cold-${turn}`);
+      const cold = yield* GitVcsDriver.makeVcsDriverShape();
+      yield* cold.checkpoints.captureCheckpoint({ cwd, checkpointRef: coldRef });
+      const tree = (ref: string) => git(["rev-parse", `${ref}^{tree}`]);
+      assert.strictEqual((yield* tree(checkpointRef)).stdout, (yield* tree(coldRef)).stdout);
+      return {
+        readsFlag: spawned.some((args) => args.includes("core.sparseCheckout")),
+        sparse: spawned.some((args) => args.includes("add") && args.includes("-h")),
+      };
+    });
+
+    const first = yield* capture;
+    yield* capture;
+    const warm = yield* capture;
+    yield* git(["sparse-checkout", "set", "--cone", "in"]);
+    const sparse = yield* capture;
+    yield* git(["sparse-checkout", "disable"]);
+    const dense = yield* capture;
+
+    assert.deepStrictEqual(first, { readsFlag: true, sparse: false });
+    assert.deepStrictEqual(warm, { readsFlag: false, sparse: false });
+    assert.isTrue(sparse.sparse);
+    assert.isFalse(dense.sparse);
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
 
 it.effect.each(

@@ -291,6 +291,9 @@ describe("CodexAdapterV2 native protocol logging", () => {
             id: "evt-1",
             http_headers: { Authorization: "Bearer secret-codex-token" },
             usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+            headers: [{ Authorization: "Bearer secret-in-array" }],
+            tokens: ["Bearer secret-array-item", "plain"],
+            data: [[{ settings: { apiKey: "sk-nested-array" } }], ["kept"]],
           },
         },
       });
@@ -317,10 +320,88 @@ describe("CodexAdapterV2 native protocol logging", () => {
               id: "evt-1",
               http_headers: { Authorization: "[REDACTED]" },
               usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+              headers: [{ Authorization: "[REDACTED]" }],
+              tokens: ["[REDACTED]", "plain"],
+              data: [[{ settings: { apiKey: "[REDACTED]" } }], ["kept"]],
             },
           },
         },
       });
+    }),
+  );
+
+  it.effect("logs values that are not plain data as plain copies", () =>
+    Effect.gen(function* () {
+      const writes: Array<unknown> = [];
+      const protocolLogger = CodexAdapterV2.makeCodexAppServerProtocolLogger({
+        nativeEventLogger: {
+          filePath: "/tmp/events.log",
+          write: (event) =>
+            Effect.sync(() => {
+              writes.push(event);
+            }),
+          close: () => Effect.void,
+        },
+        threadId: ThreadId.make("thread-1"),
+        providerSessionId: ProviderSessionId.make("provider-session-1"),
+      });
+      assert.notEqual(protocolLogger, undefined);
+      if (protocolLogger === undefined) {
+        return;
+      }
+      class Usage {
+        readonly total = 20;
+      }
+      const sparse: Array<number> = [];
+      sparse[1] = 1;
+      const hidden = [1, 2];
+      Object.defineProperty(hidden, 0, { enumerable: false });
+      const hooked = [1, 2];
+      Object.defineProperty(hooked, "toJSON", { value: () => "replaced", enumerable: false });
+
+      yield* protocolLogger({
+        direction: "outgoing",
+        stage: "decoded",
+        payload: {
+          method: "thread/event",
+          params: {
+            endpoint: new URL("https://example.test/"),
+            usage: new Usage(),
+            tagged: Object.assign([1, 2], { note: "extra" }),
+            sparse: Object.assign(sparse, { note: "extra" }),
+            hidden: Object.assign(hidden, { note: "extra" }),
+            error: Object.defineProperty({}, "message", { value: "hidden", enumerable: false }),
+            hooked,
+            bare: Object.assign(Object.create(null), { id: "bare" }),
+          },
+        },
+      });
+
+      assert.equal(writes.length, 1);
+      const params: unknown = Reflect.get(
+        Object(Reflect.get(Object(Reflect.get(Object(writes[0]), "event")), "payload")),
+        "params",
+      );
+      assert.deepEqual(Object.keys(Object(params)), [
+        "endpoint",
+        "usage",
+        "tagged",
+        "sparse",
+        "hidden",
+        "error",
+        "hooked",
+        "bare",
+      ]);
+      const logged = (key: string): unknown => Reflect.get(Object(params), key);
+      assert.deepEqual(logged("endpoint"), {});
+      assert.deepEqual(logged("usage"), { total: 20 });
+      assert.equal(Object.getPrototypeOf(logged("usage")), Object.prototype);
+      assert.deepEqual(Object.keys(Object(logged("tagged"))), ["0", "1"]);
+      assert.deepEqual(Object.keys(Object(logged("sparse"))), ["1"]);
+      assert.deepEqual(Object.keys(Object(logged("hidden"))), ["0", "1"]);
+      assert.deepEqual(Object.getOwnPropertyNames(logged("error")), []);
+      assert.deepEqual(Object.getOwnPropertyNames(logged("hooked")), ["0", "1", "length"]);
+      assert.equal(Object.getPrototypeOf(logged("bare")), Object.prototype);
     }),
   );
 });

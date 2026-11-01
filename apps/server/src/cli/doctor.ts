@@ -108,7 +108,11 @@ export const runDoctor = Effect.fn("runDoctor")(function* (
         .pipe(
           Effect.tap((result) =>
             Console.log(
-              `Done: ${formatBytes(result.beforeBytes)} -> ${formatBytes(result.afterBytes)}, ${result.deletedEventCount} superseded events removed.`,
+              `Done: ${formatBytes(result.beforeBytes)} -> ${formatBytes(result.afterBytes)}, ${result.deletedEventCount} superseded events removed${
+                result.repairedItemCountThreads > 0
+                  ? `, item counts recounted on ${result.repairedItemCountThreads} threads`
+                  : ""
+              }.`,
             ),
           ),
         ),

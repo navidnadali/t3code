@@ -1,8 +1,12 @@
+// @effect-diagnostics nodeBuiltinImport:off - Vite config runs before any Effect runtime.
 import "vite-plus/test/config";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import { defineConfig, mergeConfig } from "vite-plus";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
+import { providerIoWorkerBundle } from "../../scripts/lib/provider-io-worker-bundle.ts";
 import rootPackageJson from "../../package.json" with { type: "json" };
 import packageJson from "./package.json" with { type: "json" };
 import { WeightedShardSequencer } from "./src/testUtils/weightedShardSequencer.ts";
@@ -63,6 +67,8 @@ const packExecutableTargets = packExecutableTarget
     ]
   : undefined;
 
+const providerIoDir = NodeURL.fileURLToPath(new URL("./src/provider/io/", import.meta.url));
+
 // The root config's `projects` route repo-root runs to package configs,
 // including this one. Inheriting them would make this config a container.
 const { projects: _rootTestProjects, ...baseTestConfig } = baseConfig.test ?? {};
@@ -87,6 +93,12 @@ export default mergeConfig(
       outDir: packExecutable ? "dist-exe" : "dist",
       sourcemap: !packExecutable,
       clean: true,
+      plugins: [
+        providerIoWorkerBundle({
+          entry: NodePath.join(providerIoDir, "providerIoWorker.ts"),
+          placeholder: NodePath.join(providerIoDir, "embeddedProviderIoWorker.ts"),
+        }),
+      ],
       // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
       // SEA can only resolve built-ins; keep dynamic imports inside its one module.
       ...(packExecutable ? { outputOptions: { codeSplitting: false } } : {}),

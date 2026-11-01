@@ -123,6 +123,10 @@
       "types": "./src/server/ProviderHost.ts",
       "import": "./src/server/ProviderHost.ts"
     },
+    "./server/ProviderIoStageTiming": {
+      "types": "./src/server/ProviderIoStageTiming.ts",
+      "import": "./src/server/ProviderIoStageTiming.ts"
+    },
     "./server/ProviderLatestVersions": {
       "types": "./src/server/ProviderLatestVersions.ts",
       "import": "./src/server/ProviderLatestVersions.ts"

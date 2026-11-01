@@ -12,6 +12,7 @@ import {
   type ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -25,7 +26,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import { replayAndBufferProjectedLiveEvents } from "./LiveStreamBudget.ts";
 import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventStore.ts";
-import { projectDomainEventForWire } from "./WireProjection.ts";
+import { projectStoredEventForWire } from "./WireProjection.ts";
 import { makeRunOutcomeRecorder, type RunOutcome } from "./RunMetrics.ts";
 
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
@@ -92,6 +93,15 @@ export interface EventSinkV2Shape {
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
+  /**
+   * Runs each step and writes its events, in order, in one transaction. A step reads on that
+   * transaction, so it sees what earlier steps wrote. Any failure before the commit, a defect
+   * included, rolls back every step and fails with EventSinkWriteError.
+   */
+  readonly writeSteps: <E>(input: {
+    readonly guardPendingUserInputCancellations?: boolean;
+    readonly steps: ReadonlyArray<Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, E>>;
+  }) => Effect.Effect<ReadonlyArray<ReadonlyArray<OrchestrationV2StoredEvent>>, EventSinkV2Error>;
   readonly writeIfRunCurrent: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
@@ -352,12 +362,15 @@ const layerBase: Layer.Layer<
       );
     };
 
-    const applyStoredEvents =
+    const applyProjections = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) =>
+      Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
+        concurrency: 1,
+        discard: true,
+      });
+
+    const recordProjectedSequence =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(function* (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) {
-        yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
-          concurrency: 1,
-        });
         const sequence = storedEvents.at(-1)?.sequence;
         if (sequence !== undefined) {
           const now = DateTime.formatIso(yield* DateTime.now);
@@ -383,6 +396,13 @@ const layerBase: Layer.Layer<
         }
         // Read lineage here, on the connection this transaction holds; see makeRunOutcomeRecorder.
         return yield* runOutcomes.prepare(storedEvents);
+      });
+
+    const applyStoredEvents =
+      /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
+      Effect.fnUntraced(function* (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) {
+        yield* applyProjections(storedEvents);
+        return yield* recordProjectedSequence(storedEvents);
       });
 
     // The enclosing write or commit span already traces this per-event projection merge.
@@ -459,6 +479,72 @@ const layerBase: Layer.Layer<
           }),
       );
       return committed;
+    });
+
+    // Anything that fails before the commit, defects included, fails with its squashed cause, so a
+    // caller can rely on nothing having been written. Interruption stays interruption.
+    const failBeforeCommit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) => Effect.fail(Cause.squash(cause)),
+        ),
+      );
+
+    const writeStepsEffect = Effect.fn("orchestrationV2.EventSink.writeSteps")(function* (
+      input: {
+        readonly guardPendingUserInputCancellations?: boolean;
+        readonly steps: ReadonlyArray<
+          Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, unknown>
+        >;
+      },
+      progress: { events: number },
+    ) {
+      const stored: Array<ReadonlyArray<OrchestrationV2StoredEvent>> = [];
+      // Steps before the first one with events read nothing this batch wrote, so they need no
+      // transaction; a batch without events opens none.
+      let next = 0;
+      let first: ReadonlyArray<OrchestrationV2DomainEvent> = [];
+      while (first.length === 0 && next < input.steps.length) {
+        first = yield* failBeforeCommit(input.steps[next]!);
+        next++;
+        if (first.length === 0) stored.push([]);
+      }
+      if (first.length === 0) return stored;
+      const append = Effect.fnUntraced(function* (
+        events: ReadonlyArray<OrchestrationV2DomainEvent>,
+      ) {
+        progress.events += events.length;
+        const normalized = yield* normalizeEvents(
+          input.guardPendingUserInputCancellations === true
+            ? yield* guardUserInputCancellations(events)
+            : events,
+        );
+        const committed = yield* eventStore.append({ events: normalized });
+        yield* applyProjections(committed);
+        return committed;
+      });
+      const { committed } = yield* commitThenPublish(
+        failBeforeCommit(
+          Effect.gen(function* () {
+            stored.push(yield* append(first));
+            for (const step of input.steps.slice(next)) {
+              const events = yield* step;
+              stored.push(events.length === 0 ? [] : yield* append(events));
+            }
+            const committed = stored.flat();
+            const outcomes = yield* recordProjectedSequence(committed);
+            return { committed, outcomes };
+          }).pipe(Effect.withTracerEnabled(false)),
+        ),
+        ({ committed, outcomes }) => publishStoredEvents(committed, outcomes),
+      );
+      yield* Effect.annotateCurrentSpan({
+        "orchestration_v2.step_count": input.steps.length,
+        "orchestration_v2.event_count": committed.length,
+        "orchestration_v2.thread_id": committed[0]?.event.threadId ?? null,
+      });
+      return stored;
     });
 
     const writeIfRunCurrentEffect = Effect.fn("orchestrationV2.EventSink.writeIfRunCurrent")(
@@ -863,7 +949,7 @@ const layerBase: Layer.Layer<
               afterSequence,
               filter: matches,
               replay,
-              project: (stored) => ({ ...stored, event: projectDomainEventForWire(stored.event) }),
+              project: projectStoredEventForWire,
             });
           }
           const subscription = yield* PubSub.subscribe(pubsub);
@@ -900,6 +986,15 @@ const layerBase: Layer.Layer<
               }),
           ),
         ),
+      writeSteps: (input) =>
+        Effect.suspend(() => {
+          const progress = { events: 0 };
+          return writeStepsEffect(input, progress).pipe(
+            Effect.mapError(
+              (cause) => new EventSinkWriteError({ eventCount: progress.events, cause }),
+            ),
+          );
+        }),
       writeIfRunCurrent: (input) =>
         writeIfRunCurrentEffect(input).pipe(
           Effect.mapError(

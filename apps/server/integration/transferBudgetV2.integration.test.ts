@@ -116,6 +116,8 @@ const layerManagement = Layer.unwrap(
           .getThreadHistoryPage(id, cursor, throughEntryId, conversationOnly)
           .pipe(Effect.orDie),
       getThreadShell: (id) => projections.getThreadShell(id).pipe(Effect.orDie),
+      getThreadShellForEvent: (input) =>
+        projections.getThreadShell(input.threadId).pipe(Effect.orDie),
       getShellSnapshot: (options) => projections.getShellSnapshot(options).pipe(Effect.orDie),
       listActiveShellIndex: () => projections.listActiveShellIndex().pipe(Effect.orDie),
       listActiveSubagentThreadIds: () =>

@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -26,6 +27,7 @@ import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import type { ProviderReplayGate } from "@t3tools/provider-testing/replayGate";
+import { ReplayStdoutChunking } from "../testkit/ReplayStdoutChunking.ts";
 import { ACP_PROTOCOL, type AcpAdapterV2RuntimeInput } from "@t3tools/provider-acp/server/adapter";
 
 export const AcpReplayTranscript = Schema.Struct({
@@ -186,6 +188,22 @@ function holdGatedReplayLines(
     );
 }
 
+type StdoutTransform = NonNullable<AcpSessionRuntime.AcpSessionRuntimeOptions["transformStdout"]>;
+
+// Re-chunks the agent's stdout line by line, so the chunks do not depend on how the pipe batched it.
+function rechunkStdoutLines(
+  split: (frame: Uint8Array) => ReadonlyArray<Uint8Array>,
+  gate: StdoutTransform | undefined,
+): StdoutTransform {
+  const encoder = new TextEncoder();
+  return (stdout) =>
+    (gate === undefined ? stdout : gate(stdout)).pipe(
+      Stream.decodeText,
+      Stream.splitLines,
+      Stream.flatMap((line) => Stream.fromIterable(split(encoder.encode(`${line}\n`)))),
+    );
+}
+
 export function makeAcpReplayRuntime(input: {
   readonly transcript: AcpReplayTranscript;
   readonly statusPath: string;
@@ -219,6 +237,14 @@ export function makeAcpReplayRuntime(input: {
               }),
           ),
         );
+      const gate =
+        input.replayGate === undefined
+          ? undefined
+          : holdGatedReplayLines(input.transcript, input.replayGate);
+      const chunking = yield* Effect.serviceOption(ReplayStdoutChunking);
+      const transformStdout = Option.isNone(chunking)
+        ? gate
+        : rechunkStdoutLines(chunking.value.makeSplitter(), gate);
       const context = yield* Layer.build(
         AcpSessionRuntime.layer({
           ...runtimeInput,
@@ -238,9 +264,7 @@ export function makeAcpReplayRuntime(input: {
           ...(input.cancelMeta === undefined ? {} : { cancelMeta: input.cancelMeta }),
           ...(input.cancelBehavior === undefined ? {} : { cancelBehavior: input.cancelBehavior }),
           ...(input.initializeMeta === undefined ? {} : { initializeMeta: input.initializeMeta }),
-          ...(input.replayGate === undefined
-            ? {}
-            : { transformStdout: holdGatedReplayLines(input.transcript, input.replayGate) }),
+          ...(transformStdout === undefined ? {} : { transformStdout }),
         }).pipe(
           Layer.provide(
             Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, input.childProcessSpawner),

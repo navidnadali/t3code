@@ -11,28 +11,40 @@ import {
   ProviderSessionId,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderInstanceId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Option from "effect/Option";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 
 import { AgentScope } from "@t3tools/shared/AgentScope";
 
 import * as ServerSettings from "../serverSettings.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as EventSink from "./EventSink.ts";
+import * as EventStore from "./EventStore.ts";
+import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -768,4 +780,302 @@ it.effect("Force stop refuses once a newer run has started, before killing anyth
     expect(error.reason).toBe("superseded");
     expect(killed).toBe(false);
   }),
+);
+
+type GetThreadShell = Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
+
+const layerSharedShellReadsTest = (getThreadShell: GetThreadShell) =>
+  ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({ getThreadShell })),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+
+const sharedShellReadsTest = (
+  getThreadShell: GetThreadShell,
+  test: (
+    forEvent: (threadId: ThreadId, sequence: number) => ReturnType<GetThreadShell>,
+  ) => Effect.Effect<void, Orchestrator.OrchestratorV2Error>,
+) =>
+  Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    return yield* test((threadId, sequence) =>
+      threads.getThreadShellForEvent({ threadId, sequence }),
+    );
+  }).pipe(Effect.provide(layerSharedShellReadsTest(getThreadShell)));
+
+const shellRead = (threadId: ThreadId, read: number) =>
+  ({ id: threadId, title: `read ${read}` }) as unknown as OrchestrationV2ThreadShell;
+
+it.effect("callers share an in-flight thread shell read, even after one leaves", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:in-flight");
+    const release = yield* Deferred.make<void>();
+    let reads = 0;
+    yield* sharedShellReadsTest(
+      (id) => Deferred.await(release).pipe(Effect.map(() => shellRead(id, ++reads))),
+      (forEvent) =>
+        Effect.gen(function* () {
+          const leaving = yield* Effect.forkChild(forEvent(threadId, 5), {
+            startImmediately: true,
+          });
+          const staying = yield* Effect.forkChild(forEvent(threadId, 5), {
+            startImmediately: true,
+          });
+          yield* Fiber.interrupt(leaving);
+          yield* Deferred.succeed(release, undefined);
+          expect(yield* Fiber.join(staying)).toEqual(shellRead(threadId, 1));
+          expect(reads).toBe(1);
+        }),
+    );
+  }),
+);
+
+it.effect("a thread's shell reads run in order, and a queued read covers newer events", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:order");
+    const firstStarted = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const log: Array<string> = [];
+    let reads = 0;
+    yield* sharedShellReadsTest(
+      (id) =>
+        Effect.gen(function* () {
+          const read = ++reads;
+          log.push(`start ${read}`);
+          if (read === 1) {
+            yield* Deferred.succeed(firstStarted, undefined);
+            yield* Deferred.await(release);
+          }
+          log.push(`end ${read}`);
+          return shellRead(id, read);
+        }),
+      (forEvent) =>
+        Effect.gen(function* () {
+          const first = yield* Effect.forkChild(forEvent(threadId, 1));
+          yield* Deferred.await(firstStarted);
+          const second = yield* Effect.forkChild(forEvent(threadId, 2), {
+            startImmediately: true,
+          });
+          const third = yield* Effect.forkChild(forEvent(threadId, 3), {
+            startImmediately: true,
+          });
+          yield* Deferred.succeed(release, undefined);
+          expect(yield* Fiber.join(first)).toEqual(shellRead(threadId, 1));
+          expect(yield* Fiber.join(second)).toEqual(shellRead(threadId, 2));
+          expect(yield* Fiber.join(third)).toEqual(shellRead(threadId, 2));
+          expect(log).toEqual(["start 1", "end 1", "start 2", "end 2"]);
+        }),
+    );
+  }),
+);
+
+it.effect("a thread shell read serves its event and older ones until a newer event or expiry", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:sequence");
+    let reads = 0;
+    yield* sharedShellReadsTest(
+      (id) => Effect.sync(() => shellRead(id, ++reads)),
+      (forEvent) =>
+        Effect.gen(function* () {
+          expect(yield* forEvent(threadId, 5)).toEqual(shellRead(threadId, 1));
+          expect(yield* forEvent(threadId, 5)).toEqual(shellRead(threadId, 1));
+          expect(yield* forEvent(threadId, 3)).toEqual(shellRead(threadId, 1));
+          expect(yield* forEvent(threadId, 6)).toEqual(shellRead(threadId, 2));
+          expect(yield* forEvent(threadId, 5)).toEqual(shellRead(threadId, 2));
+          yield* TestClock.adjust(
+            Duration.millis(ThreadManagementService.SHARED_SHELL_READ_TTL_MS),
+          );
+          expect(yield* forEvent(threadId, 6)).toEqual(shellRead(threadId, 3));
+        }),
+    );
+  }),
+);
+
+it.effect("a thread shell read requested after the service closed fails instead of waiting", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:closed");
+    let reads = 0;
+    const threads = yield* ThreadManagementService.ThreadManagementService.pipe(
+      Effect.provide(layerSharedShellReadsTest((id) => Effect.sync(() => shellRead(id, ++reads)))),
+    );
+    for (const sequence of [1, 1]) {
+      const exit = yield* Effect.exit(threads.getThreadShellForEvent({ threadId, sequence }));
+      expect(Exit.hasInterrupts(exit)).toBe(true);
+    }
+    expect(reads).toBe(0);
+  }),
+);
+
+it.effect("a failed thread shell read is not shared with later callers", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:shared-shell:failure");
+    let reads = 0;
+    yield* sharedShellReadsTest(
+      (id) =>
+        Effect.suspend(() =>
+          ++reads === 1
+            ? Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId: id }))
+            : Effect.succeed(shellRead(id, reads)),
+        ),
+      (forEvent) =>
+        Effect.gen(function* () {
+          expect(Exit.isFailure(yield* Effect.exit(forEvent(threadId, 5)))).toBe(true);
+          expect(yield* forEvent(threadId, 5)).toEqual(shellRead(threadId, 2));
+        }),
+    );
+  }),
+);
+
+it.effect("shared thread shell reads keep only the most recent threads once reads settle", () =>
+  Effect.gen(function* () {
+    const threadIds = Array.from(
+      { length: ThreadManagementService.SHARED_SHELL_READ_CAPACITY + 1 },
+      (_, index) => ThreadId.make(`thread:shared-shell:capacity:${index}`),
+    );
+    const firstReleased = yield* Deferred.make<void>();
+    const secondReleased = yield* Deferred.make<void>();
+    const othersReleased = yield* Deferred.make<void>();
+    const reads: Array<ThreadId> = [];
+    yield* sharedShellReadsTest(
+      (id) =>
+        Deferred.await(
+          id === threadIds[0]
+            ? firstReleased
+            : id === threadIds[1]
+              ? secondReleased
+              : othersReleased,
+        ).pipe(Effect.andThen(Effect.sync(() => reads.push(id))), Effect.as(shellRead(id, 1))),
+      (forEvent) =>
+        Effect.gen(function* () {
+          const callers = yield* Effect.forEach(threadIds, (threadId) =>
+            Effect.forkChild(forEvent(threadId, 1), { startImmediately: true }),
+          );
+          yield* Deferred.succeed(firstReleased, undefined);
+          yield* Fiber.join(callers[0]!);
+          yield* Deferred.succeed(secondReleased, undefined);
+          yield* Fiber.join(callers[1]!);
+          yield* Deferred.succeed(othersReleased, undefined);
+          yield* Fiber.joinAll(callers);
+          yield* forEvent(threadIds.at(-1)!, 1);
+          yield* forEvent(threadIds[0]!, 1);
+          yield* forEvent(threadIds[1]!, 1);
+        }),
+    );
+    expect(reads).toHaveLength(threadIds.length + 2);
+    expect(new Set(reads.slice(0, threadIds.length))).toEqual(new Set(threadIds));
+    expect(reads.slice(threadIds.length)).toEqual([threadIds[0], threadIds[1]]);
+  }),
+);
+
+it.effect("hydrates a legacy transcript on the writer, then reads the projection on a reader", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "thread-management-legacy-" });
+    const layerStores = EventSink.layer.pipe(
+      Layer.provideMerge(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+      Layer.provideMerge(SqlitePersistence.layerFromPath(path.join(directory, "statev2.sqlite"))),
+    );
+    const layerOrchestrator = Layer.unwrap(
+      Effect.gen(function* () {
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        return Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadProjection: (threadId) =>
+            projections
+              .getThreadProjection(threadId)
+              .pipe(
+                Effect.mapError(
+                  (cause) => new Orchestrator.OrchestratorProjectionError({ threadId, cause }),
+                ),
+              ),
+        });
+      }),
+    );
+    const layerTest = ThreadManagementService.layerWithLegacyImporter.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(layerOrchestrator),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(CommandReceiptStore.layer),
+      Layer.provideMerge(LegacyV1ThreadImporter.layer),
+      Layer.provideMerge(layerStores),
+    );
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const threadId = ThreadId.make("thread:thread-management:legacy");
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, scripts_json, created_at, updated_at
+        ) VALUES (
+          'project:legacy', 'Legacy project', '/tmp/legacy', '[]',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, created_at, updated_at
+        ) VALUES (
+          ${threadId}, 'project:legacy', 'Legacy thread',
+          '{"instanceId":"codex","model":"gpt-5.4"}', 'full-access', 'default',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_thread_messages (
+          message_id, thread_id, role, text, is_streaming, created_at, updated_at
+        ) VALUES
+          ('message:legacy:old', ${threadId}, 'user', 'Old question', 0,
+            '2026-01-01T01:00:00.000Z', '2026-01-01T01:00:00.000Z'),
+          ('message:legacy:latest', ${threadId}, 'user', 'Latest question', 0,
+            '2026-01-02T01:00:00.000Z', '2026-01-02T01:00:00.000Z')
+      `;
+      yield* importer.reconcileShells;
+      const shell = yield* projections.getThreadProjection(threadId);
+      expect(shell.messages.map((message) => message.text)).toEqual(["Latest question"]);
+
+      const statements: Array<{ readonly query: string; readonly span: Tracer.Span }> = [];
+      const hydrated = yield* threads.getThreadProjection(threadId).pipe(
+        Effect.provideService(Statement.CurrentTransformer, (statement, _sql, _fiber, span) => {
+          statements.push({ query: statement.compile()[0], span });
+          return Effect.succeed(statement);
+        }),
+        Effect.provideService(Statement.SpanPropagationEnabled, true),
+      );
+      expect(hydrated.messages.map((message) => message.text)).toEqual([
+        "Old question",
+        "Latest question",
+      ]);
+      const lineage = (span: Tracer.Span) => {
+        const spans = [span];
+        let parent = Option.getOrUndefined(span.parent);
+        while (parent?._tag === "Span") {
+          spans.push(parent);
+          parent = Option.getOrUndefined(parent.parent);
+        }
+        return spans;
+      };
+      const connections = (matches: (query: string, spans: Array<Tracer.Span>) => boolean) => [
+        ...new Set(
+          statements
+            .filter(({ query, span }) => matches(query, lineage(span)))
+            .map(({ span }) =>
+              lineage(span)
+                .find((candidate) => candidate.attributes.has("db.connection"))
+                ?.attributes.get("db.connection"),
+            ),
+        ),
+      ];
+      expect(connections((query) => /^\s*(INSERT|UPDATE)\b/.test(query))).toEqual(["writer"]);
+      expect(
+        connections((_query, spans) =>
+          spans.some((span) => span.name === "ProjectionStore.readProjection"),
+        ),
+      ).toEqual(["reader"]);
+    }).pipe(Effect.provide(layerTest));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

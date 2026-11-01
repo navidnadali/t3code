@@ -13,6 +13,7 @@ import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import { rebuildMessageSearch } from "../orchestration-v2/messageSearchIndex.ts";
+import { recountTurnItems } from "../orchestration-v2/turnItemCounts.ts";
 
 export class DatabaseMissingError extends Schema.TaggedError<DatabaseMissingError>()(
   "DatabaseMissingError",
@@ -88,6 +89,8 @@ export class DatabaseMaintenance extends Context.Service<
         readonly afterBytes: number;
         readonly deletedEventCount: number;
         readonly deletedReceiptCount: number;
+        /** Threads whose drifted turn-item counts were recounted before compacting. */
+        readonly repairedItemCountThreads: number;
       },
       | DatabaseMissingError
       | DatabaseInUseError
@@ -180,7 +183,14 @@ const make = Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         yield* lockExclusively(databasePath);
         const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
-        if (!(yield* maintenance.verify).valid) {
+        let verification = yield* maintenance.verify;
+        // Nothing else repairs drifted item counts, and the items they count are intact.
+        const repairedItemCountThreads = verification.turnItemCountDriftThreadIds.length;
+        if (repairedItemCountThreads > 0) {
+          yield* recountTurnItems(sql);
+          verification = yield* maintenance.verify;
+        }
+        if (!verification.valid) {
           return yield* new DatabaseProjectionsInvalidError({ path: databasePath });
         }
         const summary = yield* maintenance.compactEventStore();
@@ -192,7 +202,7 @@ const make = Effect.gen(function* () {
         yield* sql`VACUUM`;
         yield* rebuildMessageSearch(sql);
         yield* sql`PRAGMA wal_checkpoint(TRUNCATE)`;
-        return summary;
+        return { ...summary, repairedItemCountThreads };
       }).pipe(
         Effect.provide(
           ProjectionMaintenance.layer.pipe(
@@ -207,6 +217,7 @@ const make = Effect.gen(function* () {
         afterBytes,
         deletedEventCount: result.deletedEventCount,
         deletedReceiptCount: result.deletedReceiptCount,
+        repairedItemCountThreads: result.repairedItemCountThreads,
       };
     },
     (effect, databasePath) =>

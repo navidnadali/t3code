@@ -12,12 +12,13 @@ import * as CodexSchema from "./_generated/schema.gen.ts";
 import * as CodexError from "./errors.ts";
 import * as CodexProtocol from "./protocol.ts";
 import {
-  decodeNotificationPayload,
   decodeOptionalPayload,
   encodeOptionalPayload,
   runHandler,
+  timeStage,
 } from "./_internal/shared.ts";
 import { makeChildStdio, makeStderrTail, makeTerminationError } from "./_internal/stdio.ts";
+import * as CodexWire from "./wire.ts";
 
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
@@ -25,6 +26,8 @@ export interface CodexAppServerClientOptions {
   readonly logger?: (
     event: CodexProtocol.CodexAppServerProtocolLogEvent,
   ) => Effect.Effect<void, never>;
+  readonly stageTiming?: CodexProtocol.CodexAppServerStageTiming;
+  readonly lineOffload?: CodexProtocol.CodexAppServerLineOffload;
 }
 
 interface CodexAppServerClientRaw {
@@ -178,19 +181,20 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
   const dispatchNotification = (
     notification: CodexProtocol.CodexAppServerIncomingNotification,
   ): Effect.Effect<void, never> => {
-    const schema =
-      notification.method in CodexRpc.SERVER_NOTIFICATION_PARAMS
-        ? CodexRpc.SERVER_NOTIFICATION_PARAMS[
-            notification.method as CodexRpc.ServerNotificationMethod
-          ]
-        : undefined;
+    const schema = CodexWire.serverNotificationParamsSchema(notification.method);
     const handlers = notificationHandlers.get(notification.method) ?? [];
 
     if (schema) {
-      return decodeNotificationPayload(notification.method, schema, notification.params).pipe(
+      return timeStage(options.stageTiming, "decode", 0, () =>
+        Effect.fromResult(
+          CodexWire.decodeNotificationPayload(notification.method, schema, notification.params),
+        ),
+      ).pipe(
         Effect.tapError(warnUndecodableNotification),
         Effect.flatMap((decoded) =>
-          Effect.forEach(handlers, (handler) => handler(decoded), { discard: true }),
+          timeStage(options.stageTiming, "adapter", 0, () =>
+            Effect.forEach(handlers, (handler) => handler(decoded), { discard: true }),
+          ),
         ),
         Effect.ignore,
       );
@@ -227,6 +231,8 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.stageTiming ? { stageTiming: options.stageTiming } : {}),
+    ...(options.lineOffload ? { lineOffload: options.lineOffload } : {}),
     onNotification: dispatchNotification,
     onRequest: dispatchRequest,
     onTermination: (error) => Deferred.fail(termination, error).pipe(Effect.asVoid),

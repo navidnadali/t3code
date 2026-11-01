@@ -4,6 +4,10 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { ThreadId } from "@t3tools/contracts";
+import {
+  makeProviderIoStageRecorder,
+  ProviderIoStageTiming,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { RotatingFileSinkError } from "@t3tools/shared/logging";
@@ -20,6 +24,7 @@ import {
   type PendingRecord,
   writeBatchedMessages,
 } from "./EventNdjsonLogger.ts";
+import { serializeEventNdjsonRecord } from "./EventNdjsonRecord.ts";
 
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
@@ -120,6 +125,55 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
       }),
   );
 
+  it.effect("appends a record serialized elsewhere exactly like a written event", () => {
+    const warnings: Array<unknown> = [];
+    const logCapture = Logger.make<unknown, void>(({ message }) => {
+      warnings.push(message);
+    });
+
+    return Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
+      const basePath = NodePath.join(tempDir, "events.log");
+      const event = { id: "native-event", output: "x".repeat(70 * 1_024) };
+      const record = serializeEventNdjsonRecord("native", event);
+      assert.equal(record._tag, "Serialized");
+
+      try {
+        const store = yield* makeEventNdjsonLogStore(basePath, { batchWindowMs: 0 });
+        const native = store.logger("native");
+        const writeSerialized = native.writeSerialized;
+        assert.isDefined(writeSerialized);
+        if (record._tag !== "Serialized" || writeSerialized === undefined) return;
+        const threadId = ThreadId.make("thread-serialized");
+
+        yield* native.write(event, threadId);
+        yield* writeSerialized(record, threadId);
+        // Records `write` would never append are refused.
+        yield* writeSerialized({ stream: "canonical", payload: record.payload }, threadId);
+        yield* writeSerialized({ stream: "native", payload: '{"a":1}\n{"b":2}' }, threadId);
+        yield* writeSerialized(
+          { stream: "native", payload: `"${"x".repeat(64 * 1_024)}"` },
+          threadId,
+        );
+        yield* store.close();
+
+        const [written, appended, extra] = NodeFS.readFileSync(
+          ownedLogPath(basePath, "thread-serialized"),
+          "utf8",
+        ).split("\n");
+        assert.match(written ?? "", /^\[[^\]]+\] NTIVE: \{"truncated":true,"id":"native-event"/);
+        assert.equal(appended, written);
+        assert.equal(extra, "");
+        assert.deepEqual(
+          warnings.flat().filter((message) => typeof message === "object"),
+          ["stream", "line-break", "size"].map((problem) => ({ stream: "native", problem })),
+        );
+      } finally {
+        NodeFS.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }).pipe(Effect.provide(Logger.layer([logCapture], { mergeWithExisting: false })));
+  });
+
   it.effect("shares one thread writer across native and canonical streams", () =>
     Effect.gen(function* () {
       const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
@@ -148,6 +202,49 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
               stream: "CANON",
               payload: '{"type":"item.completed","id":"canonical-event"}',
             },
+          ],
+        );
+      } finally {
+        NodeFS.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }),
+  );
+
+  it.effect("times serialisation of persisted records per provider when stage timing is on", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
+      const basePath = NodePath.join(tempDir, "events.log");
+      const recorder = makeProviderIoStageRecorder(() => 0);
+
+      try {
+        const store = yield* makeEventNdjsonLogStore(basePath, { batchWindowMs: 0 }).pipe(
+          Effect.provideService(ProviderIoStageTiming, recorder),
+        );
+        const native = store.logger("native");
+        const threadId = ThreadId.make("thread-timed");
+
+        yield* native.write({ provider: "claudeAgent", event: { type: "assistant" } }, threadId);
+        yield* native.write(
+          { provider: "codex", event: { stage: "raw", payload: "{}" } },
+          threadId,
+        );
+        yield* native.write({ event: { provider: "antigravity", kind: "request" } }, threadId);
+        yield* store.close();
+
+        const lineBytes = NodeFS.readFileSync(ownedLogPath(basePath, "thread-timed"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => Buffer.byteLength(`${line}\n`));
+        assert.deepEqual(
+          recorder.drain().map(({ provider, stage, count, bytes }) => ({
+            provider,
+            stage,
+            count,
+            bytes,
+          })),
+          [
+            { provider: "claudeAgent", stage: "logSerialize", count: 1, bytes: lineBytes[0] },
+            { provider: "antigravity", stage: "logSerialize", count: 1, bytes: lineBytes[1] },
           ],
         );
       } finally {

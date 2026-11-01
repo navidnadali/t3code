@@ -1,4 +1,3 @@
-import { pipe } from "effect/Function";
 import * as DocumentText from "../../provider/DocumentText.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
@@ -113,11 +112,13 @@ import {
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
 } from "../../provider/Drivers/CodexHomeLayout.ts";
-import {
-  boundProviderEventForLogging,
-  shouldPersistProviderEvent,
-} from "../../provider/EventNdjsonLogger.ts";
+import { codexProtocolLogRecord } from "../../provider/CodexProtocolLog.ts";
+import { CodexLineOffloads } from "../../provider/io/ProviderIoOffloads.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import {
+  ProviderIoStageTiming,
+  timeProviderIoLogShape,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import { codexAppServerArgs, resolveCodexLaunchArgs } from "../../provider/codexLaunchArgs.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
@@ -1427,70 +1428,10 @@ export function makeCodexAppServerProtocolLogger(input: {
   }
 
   return (event) => {
-    if (!shouldPersistProviderEvent("native", event)) return Effect.void;
-    return nativeEventLogger
-      .write(
-        {
-          provider: CODEX_PROVIDER,
-          protocol: "codex.app-server",
-          kind: "protocol",
-          providerSessionId: input.providerSessionId,
-          event: redactCodexProtocolValue(boundProviderEventForLogging(event)),
-        },
-        input.threadId,
-      )
-      .pipe(Effect.ignore);
+    const record = codexProtocolLogRecord(event, input.providerSessionId);
+    if (record === undefined) return Effect.void;
+    return nativeEventLogger.write(record, input.threadId).pipe(Effect.ignore);
   };
-}
-
-function redactCodexProtocolValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(redactCodexProtocolValue);
-  }
-  if (value === null || typeof value !== "object") {
-    if (typeof value !== "string") {
-      return value;
-    }
-    if (/^Bearer\s+/i.test(value)) {
-      return "[REDACTED]";
-    }
-    const trimmed = value.trim();
-    if (
-      !(
-        (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-        (trimmed.startsWith("[") && trimmed.endsWith("]"))
-      )
-    ) {
-      return value;
-    }
-    try {
-      return pipe(
-        JSON.parse(trimmed) as unknown,
-        boundProviderEventForLogging,
-        redactCodexProtocolValue,
-        JSON.stringify,
-      );
-    } catch {
-      return value;
-    }
-  }
-  return Object.fromEntries(
-    Object.entries(value).map(([key, nested]) => [
-      key,
-      isSensitiveCodexProtocolKey(key) ? "[REDACTED]" : redactCodexProtocolValue(nested),
-    ]),
-  );
-}
-
-function isSensitiveCodexProtocolKey(key: string): boolean {
-  const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
-  return (
-    normalized.endsWith("authorization") ||
-    normalized.endsWith("apikey") ||
-    normalized.endsWith("token") ||
-    normalized.endsWith("password") ||
-    normalized.endsWith("secret")
-  );
 }
 
 export const layerAppServerClientFactory: Layer.Layer<
@@ -1503,6 +1444,8 @@ export const layerAppServerClientFactory: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
+    const stageTiming = (yield* ProviderIoStageTiming)?.forProvider(CODEX_PROVIDER);
+    const offloads = yield* Effect.serviceOption(CodexLineOffloads);
 
     return CodexAppServerClientFactory.of({
       open: Effect.fn("CodexAdapterV2.open")(function* (input) {
@@ -1535,14 +1478,39 @@ export const layerAppServerClientFactory: Layer.Layer<
           threadId: input.threadId,
           providerSessionId: input.providerSessionId,
         });
-        const clientOptions: CodexClient.CodexAppServerClientOptions =
-          protocolLogger === undefined
+        const writeSerialized = nativeEventLogger?.writeSerialized;
+        // A logger that cannot append records built elsewhere keeps every line in-thread.
+        const lineOffload =
+          Option.isNone(offloads) ||
+          (nativeEventLogger !== undefined && writeSerialized === undefined)
+            ? undefined
+            : Option.getOrUndefined(
+                yield* offloads.value
+                  .open({
+                    kill: handle.kill().pipe(Effect.ignore),
+                    ...(writeSerialized === undefined
+                      ? {}
+                      : {
+                          log: {
+                            providerSessionId: input.providerSessionId,
+                            writeSerialized: (record) =>
+                              writeSerialized(record, input.threadId).pipe(Effect.ignore),
+                          },
+                        }),
+                  })
+                  .pipe(Effect.provideService(Scope.Scope, scope)),
+              );
+        const clientOptions: CodexClient.CodexAppServerClientOptions = {
+          ...(protocolLogger === undefined
             ? {}
             : {
                 logIncoming: true,
                 logOutgoing: true,
-                logger: protocolLogger,
-              };
+                logger: timeProviderIoLogShape(stageTiming, protocolLogger),
+              }),
+          ...(stageTiming === undefined ? {} : { stageTiming }),
+          ...(lineOffload === undefined ? {} : { lineOffload }),
+        };
         const context = yield* Layer.build(CodexClient.layerChildProcess(handle, clientOptions));
         return yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
           Effect.provide(context),

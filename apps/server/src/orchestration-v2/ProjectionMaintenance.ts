@@ -19,6 +19,7 @@ export interface ProjectionVerificationV2 {
   readonly unreadableThreadIds: ReadonlyArray<ThreadId>;
   readonly missingThreadIds: ReadonlyArray<ThreadId>;
   readonly unexpectedThreadIds: ReadonlyArray<ThreadId>;
+  readonly turnItemCountDriftThreadIds: ReadonlyArray<ThreadId>;
 }
 
 export class ProjectionMaintenanceError extends Schema.TaggedError<ProjectionMaintenanceError>()(
@@ -67,6 +68,35 @@ export const layer: Layer.Layer<
     const eventStore = yield* EventStore.EventStoreV2;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
 
+    // Migration 77 adds the maintained counts; maintenance also runs on older schemas.
+    const hasTurnItemCounts = sql`
+      SELECT 1 FROM sqlite_schema
+      WHERE type = 'table' AND name = 'orchestration_v2_projection_turn_item_counts'
+    `.pipe(Effect.map((rows) => rows.length > 0));
+    // Threads whose maintained counts differ from a COUNT(*) of their items, either way.
+    const selectTurnItemCountDrift = sql<{ readonly thread_id: string }>`
+      WITH stored AS (
+        SELECT thread_id, run_id, item_count
+        FROM orchestration_v2_projection_turn_item_counts
+      ),
+      counted AS (
+        SELECT thread_id, COALESCE(run_id, '') AS run_id, SUM(item_count) AS item_count
+        FROM (
+          SELECT thread_id, run_id, COUNT(*) AS item_count
+          FROM orchestration_v2_projection_turn_items
+          GROUP BY thread_id, run_id
+        )
+        GROUP BY thread_id, COALESCE(run_id, '')
+      )
+      SELECT DISTINCT thread_id
+      FROM (
+        SELECT * FROM (SELECT * FROM stored EXCEPT SELECT * FROM counted)
+        UNION ALL
+        SELECT * FROM (SELECT * FROM counted EXCEPT SELECT * FROM stored)
+      )
+      ORDER BY thread_id ASC
+    `;
+
     const verify = Effect.gen(function* () {
       const expectedThreadRows = yield* sql<{ readonly thread_id: string }>`
         SELECT DISTINCT stream_id AS thread_id
@@ -88,6 +118,9 @@ export const layer: Layer.Layer<
       const missingThreadIds = expectedIds.filter((threadId) => !actualSet.has(threadId));
       const unexpectedThreadIds = actualIds.filter((threadId) => !expectedSet.has(threadId));
       const unreadableThreadIds = yield* projectionStore.getUnreadableThreadIds();
+      const turnItemCountDriftThreadIds = (yield* hasTurnItemCounts)
+        ? (yield* selectTurnItemCountDrift).map((row) => ThreadId.make(row.thread_id))
+        : [];
       const metadata = yield* sql<ProjectionMetadataRow>`
         SELECT schema_version, last_sequence
         FROM orchestration_v2_projection_metadata
@@ -103,13 +136,15 @@ export const layer: Layer.Layer<
           projectionSequence === expectedSequence &&
           missingThreadIds.length === 0 &&
           unexpectedThreadIds.length === 0 &&
-          unreadableThreadIds.length === 0,
+          unreadableThreadIds.length === 0 &&
+          turnItemCountDriftThreadIds.length === 0,
         schemaVersion,
         expectedSequence,
         projectionSequence,
         unreadableThreadIds,
         missingThreadIds,
         unexpectedThreadIds,
+        turnItemCountDriftThreadIds,
       } satisfies ProjectionVerificationV2;
     }).pipe(sql.withTransaction);
 
@@ -121,6 +156,10 @@ export const layer: Layer.Layer<
           yield* sql`DELETE FROM orchestration_v2_projection_context_handoffs`;
           yield* sql`DELETE FROM orchestration_v2_projection_checkpoints`;
           yield* sql`DELETE FROM orchestration_v2_projection_checkpoint_scopes`;
+          // Replay recounts through the turn-item triggers, from zero.
+          if (yield* hasTurnItemCounts) {
+            yield* sql`DELETE FROM orchestration_v2_projection_turn_item_counts`;
+          }
           yield* sql`DELETE FROM orchestration_v2_projection_turn_items`;
           yield* sql`DELETE FROM orchestration_v2_projection_plans`;
           yield* sql`DELETE FROM orchestration_v2_projection_messages`;

@@ -37,6 +37,7 @@ import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 import { claudeTaskOutputRoot } from "./ClaudeTaskOutputTail.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { ProviderAdapterDriverCreateError } from "@t3tools/provider-core/server/adapterDriver";
+import type { ProviderAdapterV2 } from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import {
@@ -261,7 +262,7 @@ type ClaudeOutboundFrame =
   | ClaudeSessionForkFrame
   | ClaudeSubagentLookupFrame;
 
-interface ClaudeQueryRunner {
+export interface ClaudeQueryRunner {
   readonly open: (
     input: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput,
   ) => ClaudeAdapterV2.ClaudeAgentSdkQuerySession;
@@ -272,6 +273,9 @@ interface ClaudeQueryRunner {
     input: ClaudeAdapterV2.ClaudeAgentSdkSubagentLookupInput,
   ) => string | null;
   readonly assertComplete: () => void;
+  /** True once every inbound frame up to the next expected outbound one has been yielded. */
+  readonly awaitsOutbound: () => boolean;
+  readonly inboundYielded: () => number;
 }
 
 function stableStringify(value: unknown): string {
@@ -486,11 +490,12 @@ function makeClaudeSessionForkFrame(
   };
 }
 
-function makeReplayQueryRunner(
+export function makeReplayQueryRunner(
   transcript: ClaudeAgentSdkReplayTranscript,
   replayOptions: { readonly replayGate?: ProviderReplayGate } = {},
 ): ClaudeQueryRunner {
   let cursor = 0;
+  let inboundYielded = 0;
   let failure: ClaudeAgentSdkReplayError | null = null;
   let cursorAdvanced = makeCursorSignal();
   const iteratorAbortControllers = new Set<AbortController>();
@@ -593,6 +598,7 @@ function makeReplayQueryRunner(
           continue;
         }
         advance();
+        inboundYielded += 1;
         yield sdkMessageFromReplayFrame(withReplayedPromptUuids(entry.frame));
         continue;
       }
@@ -868,6 +874,11 @@ function makeReplayQueryRunner(
         return toolUseId === null || typeof toolUseId === "string";
       }).toolUseId;
     },
+    awaitsOutbound: () => {
+      const entry = transcript.entries[cursor];
+      return failure !== null || entry === undefined || entry.type === "expect_outbound";
+    },
+    inboundYielded: () => inboundYielded,
     assertComplete: () => {
       if (failure !== null) {
         throw failure;
@@ -896,7 +907,7 @@ function metadataFromTranscript(transcript: ProviderReplayTranscript): {
   };
 }
 
-function nativeSessionIdFor(transcript: ClaudeAgentSdkReplayTranscript): string {
+export function nativeSessionIdFor(transcript: ClaudeAgentSdkReplayTranscript): string {
   const metadataSessionId = transcript.metadata?.nativeSessionId;
   return typeof metadataSessionId === "string"
     ? metadataSessionId
@@ -906,7 +917,7 @@ function nativeSessionIdFor(transcript: ClaudeAgentSdkReplayTranscript): string 
 const isClaudeAgentSdkQueryRunnerError = Schema.is(ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError);
 const isClaudeAgentSdkReplayError = Schema.is(ClaudeAgentSdkReplayError);
 
-function replayQueryRunnerError(
+export function replayQueryRunnerError(
   transcript: ClaudeAgentSdkReplayTranscript,
   cause: unknown,
 ): ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError {
@@ -1013,11 +1024,14 @@ const writeReplayTaskOutputFiles = Effect.fn("ClaudeReplay.writeTaskOutputFiles"
   return tmpRoot;
 });
 
-function layerClaudeProviderAdapterRegistryReplay(
+export function layerClaudeProviderAdapterRegistryReplay(
   transcript: ClaudeAgentSdkReplayTranscript,
   options: {
     readonly replayGate?: ProviderReplayGate;
     readonly queryRunner?: ClaudeQueryRunner;
+    /** Replaces the replaying query runner, e.g. with the real one over a replaying CLI. */
+    readonly queryRunnerLayer?: Layer.Layer<ClaudeAdapterV2.ClaudeAgentSdkQueryRunner>;
+    readonly wrapAdapter?: (adapter: ProviderAdapterV2["Service"]) => ProviderAdapterV2["Service"];
   } = {},
 ) {
   const layerServerConfig = Layer.effect(
@@ -1038,7 +1052,7 @@ function layerClaudeProviderAdapterRegistryReplay(
               config: DEFAULT_CLAUDE_SETTINGS,
             },
             {},
-          ).pipe(Effect.map((adapter) => [adapter])),
+          ).pipe(Effect.map((adapter) => [options.wrapAdapter?.(adapter) ?? adapter])),
         ),
       ),
       Effect.provide(NodeServices.layer),
@@ -1046,7 +1060,7 @@ function layerClaudeProviderAdapterRegistryReplay(
   ).pipe(
     Layer.provide(
       Layer.mergeAll(
-        layerClaudeAgentSdkReplay(transcript, options),
+        options.queryRunnerLayer ?? layerClaudeAgentSdkReplay(transcript, options),
         IdAllocator.layer,
         NodeServices.layer,
         layerServerConfig,

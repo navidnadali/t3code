@@ -63,6 +63,10 @@ export const layer = Layer.unwrap(
                 resource,
               });
 
+        // Without timing every span lasts 0 ms, so a slow SQL span would be summarised too.
+        const sqlMinDurationMs = config.traceTimingEnabled
+          ? (config.traceSqlMinDurationMs ?? 0)
+          : 0;
         const tracer = yield* makeLocalFileTracer({
           filePath: config.serverTracePath,
           maxBytes: config.traceMaxBytes,
@@ -70,9 +74,14 @@ export const layer = Layer.unwrap(
           batchWindowMs: config.traceBatchWindowMs,
           sink,
           ...(delegate ? { delegate } : {}),
+          sqlMinDurationMs,
         });
 
-        const heapAttribution = yield* HeapAttribution.make(tracer);
+        // Whether a SQL span is fast is known only at its end, so none is measured.
+        const heapAttribution = yield* HeapAttribution.make(
+          tracer,
+          sqlMinDurationMs > 0 ? { skip: SharedObservability.isSqlSpanName } : {},
+        );
         yield* heapAttribution.run;
 
         return Layer.mergeAll(

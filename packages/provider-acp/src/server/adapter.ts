@@ -67,6 +67,7 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { makeAcpMcpOverAcpBridge, type AcpMcpOverAcpBridge } from "./mcpOverAcpBridge.ts";
 import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import { ProviderIoStageDriver } from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import {
   applyAcpAgentTerminalUpdate,
@@ -2150,11 +2151,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             ...(nativeLogging?.requestLogger === undefined
               ? {}
               : { requestLogger: nativeLogging.requestLogger }),
-            protocolLogging: nativeLogging?.protocolLogging ?? {
-              logIncoming: true,
-              logOutgoing: true,
-              logger: () => Effect.void,
-            },
+            protocolLogging: nativeLogging?.protocolLogging ?? {},
           };
         };
         let runtimeScope: Scope.Closeable | undefined;
@@ -6490,6 +6487,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
               Effect.provideService(AgentScope, agentScope),
               Effect.provideService(AgentScopeThreadId, threadId ?? undefined),
+              Effect.provideService(ProviderIoStageDriver, driver),
             );
         });
 
@@ -6569,6 +6567,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
                 Effect.provideService(AgentScope, agentScope),
                 Effect.provideService(AgentScopeThreadId, threadId ?? undefined),
+                Effect.provideService(ProviderIoStageDriver, driver),
               );
             yield* replacementRuntime.handleSessionUpdate((notification) =>
               Effect.suspend(() => handleCandidateSessionUpdate(notification)),

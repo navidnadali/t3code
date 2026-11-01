@@ -1,17 +1,25 @@
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import type * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import { AcpTransportError } from "effect-acp/errors";
 import { CodexAppServerTransportError } from "effect-codex-app-server/errors";
+import type { AcpLineOffload } from "effect-acp/protocol";
 import type { CodexAppServerLineOffload } from "effect-codex-app-server/protocol";
 import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime";
 
 import * as ServerConfig from "../../config.ts";
 import { acpIoStage } from "./acpIoStage.ts";
 import { codexIoStage } from "./codexIoStage.ts";
-import { ProviderIoWorkerPool } from "./ProviderIoWorkerPool.ts";
+import type { ProviderIoStage } from "./providerIoProtocol.ts";
+import {
+  type ProviderIoStageError,
+  type ProviderIoWorkerError,
+  ProviderIoWorkerPool,
+} from "./ProviderIoWorkerPool.ts";
 
 // Shorter lines cost main less in-thread than a worker round trip (P1-025 measurements).
 const DEFAULT_CODEX_OFFLOAD_MIN_CHARS = 2048;
@@ -27,7 +35,7 @@ export interface CodexLineOffloadInput {
   };
 }
 
-/** Parses, logs and decodes long Codex app-server lines on a provider I/O worker. */
+/** Parses long Codex app-server lines and builds their log records on a provider I/O worker. */
 export class CodexLineOffloads extends Context.Service<
   CodexLineOffloads,
   {
@@ -38,6 +46,31 @@ export class CodexLineOffloads extends Context.Service<
   }
 >()("t3/provider/io/ProviderIoOffloads/CodexLineOffloads") {}
 
+// The line stages emit no outputs, so the output stream only fails: when the worker dies. The
+// child is killed only after that failure is seen, so it explains the input end the kill causes.
+const openLineSession = Effect.fnUntraced(function* <Options, Reply, E>(
+  pool: ProviderIoWorkerPool["Service"],
+  input: {
+    readonly stage: ProviderIoStage<Options, never, string, Reply>;
+    readonly options: Options;
+    readonly onFailure: (error: ProviderIoWorkerError | ProviderIoStageError) => E;
+    readonly kill: Effect.Effect<void>;
+  },
+) {
+  const failed = yield* Deferred.make<never, E>();
+  const session = yield* pool.open({
+    ...input,
+    kill: Deferred.await(failed).pipe(Effect.ignore, Effect.andThen(input.kill)),
+  });
+  if (Option.isNone(session)) return Option.none();
+  yield* session.value.output.pipe(
+    Stream.runDrain,
+    Effect.catch((error) => Deferred.fail(failed, error)),
+    Effect.forkScoped,
+  );
+  return Option.some({ call: session.value.call, failure: Deferred.await(failed) });
+});
+
 export interface LineOffloadThresholds {
   readonly codex: number;
   readonly acp: number;
@@ -46,7 +79,7 @@ export interface LineOffloadThresholds {
 export const make = (pool: ProviderIoWorkerPool["Service"], minChars: LineOffloadThresholds) => ({
   codex: CodexLineOffloads.of({
     open: Effect.fn("CodexLineOffloads.open")(function* (input) {
-      const session = yield* pool.open({
+      const session = yield* openLineSession(pool, {
         stage: codexIoStage,
         options:
           input.log === undefined ? {} : { logProviderSessionId: input.log.providerSessionId },
@@ -54,22 +87,27 @@ export const make = (pool: ProviderIoWorkerPool["Service"], minChars: LineOffloa
           new CodexAppServerTransportError({ operation: "read-input-stream", cause }),
         kill: input.kill,
       });
-      return Option.map(session, (opened): CodexAppServerLineOffload => ({
+      return Option.map(session, ({ call, failure }): CodexAppServerLineOffload => ({
         minChars: minChars.codex,
-        decode: opened.call,
+        decode: call,
         writeLog: input.log?.writeSerialized ?? (() => Effect.void),
+        failure,
       }));
     }),
   }),
   acp: AcpLineOffloads.of({
     open: Effect.fn("AcpLineOffloads.open")(function* (input) {
-      const session = yield* pool.open({
+      const session = yield* openLineSession(pool, {
         stage: acpIoStage,
         options: undefined,
         onFailure: (cause) => new AcpTransportError({ operation: "read-input-stream", cause }),
         kill: input.kill,
       });
-      return Option.map(session, (opened) => ({ minChars: minChars.acp, decode: opened.call }));
+      return Option.map(session, ({ call, failure }): AcpLineOffload => ({
+        minChars: minChars.acp,
+        decode: call,
+        failure,
+      }));
     }),
   }),
 });

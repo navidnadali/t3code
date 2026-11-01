@@ -88,6 +88,8 @@ export interface AcpLineOffload {
   /** Lines at least this many characters long go off-thread; shorter ones cost less in-thread. */
   readonly minChars: number;
   readonly decode: (line: string) => Effect.Effect<AcpOffload.OffloadedLine, AcpError.AcpError>;
+  /** Fails when the offload stops working (its worker died); that error then ends the connection. */
+  readonly failure: Effect.Effect<never, AcpError.AcpError>;
 }
 
 export interface AcpPatchedProtocolOptions {
@@ -393,6 +395,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       }),
     }).pipe(Effect.asVoid);
 
+  const offloadFailure = lineOffload?.failure;
   const handleTermination = (classify: () => Effect.Effect<AcpError.AcpError>) =>
     Ref.modify(terminationHandled, (handled) => {
       if (handled) {
@@ -401,7 +404,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       return [
         Effect.gen(function* () {
           yield* Queue.offer(disconnects, 0);
-          const error = yield* classify();
+          // A dead offload kills the agent, so its error explains the input end that follows.
+          const error = yield* offloadFailure === undefined
+            ? classify()
+            : Effect.raceFirst(Effect.flip(offloadFailure), classify());
           yield* Deferred.fail(terminationFailure, error);
           yield* failAllExtPending(error);
           yield* emitClientProtocolError(error);
@@ -412,6 +418,13 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         true,
       ] as const;
     }).pipe(Effect.flatten);
+
+  if (offloadFailure !== undefined) {
+    yield* offloadFailure.pipe(
+      Effect.catch((error) => handleTermination(() => Effect.succeed(error))),
+      Effect.forkScoped,
+    );
+  }
 
   const respondWithSuccess = (requestId: AcpError.AcpRequestId, value: unknown) =>
     offerOutgoing({

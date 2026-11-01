@@ -56,6 +56,8 @@ export interface CodexAppServerLineOffload {
   ) => Effect.Effect<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
   /** Appends an incoming log entry built off-thread. */
   readonly writeLog: (payload: string) => Effect.Effect<void>;
+  /** Fails when the offload stops working (its worker died); that error then ends the protocol. */
+  readonly failure: Effect.Effect<never, CodexError.CodexAppServerError>;
 }
 
 export interface CodexAppServerPatchedProtocolOptions {
@@ -207,6 +209,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         Effect.andThen(Ref.set(pending, new Map())),
       );
 
+    const offloadFailure = options.lineOffload?.failure;
     const handleTermination = (classify: () => Effect.Effect<CodexError.CodexAppServerError>) =>
       Ref.modify(terminationHandled, (handled) => {
         if (handled) {
@@ -214,7 +217,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         }
         return [
           Effect.gen(function* () {
-            const error = yield* classify();
+            // A dead offload kills the process, so its error explains the input end that follows.
+            const error = yield* offloadFailure === undefined
+              ? classify()
+              : Effect.raceFirst(Effect.flip(offloadFailure), classify());
             yield* Ref.set(terminationFailure, Option.some(error));
             yield* failAllPending(error);
             yield* Queue.end(outgoing);
@@ -230,6 +236,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           true,
         ] as const;
       }).pipe(Effect.flatten);
+
+    if (offloadFailure !== undefined) {
+      yield* offloadFailure.pipe(
+        Effect.catch((error) => handleTermination(() => Effect.succeed(error))),
+        Effect.forkScoped,
+      );
+    }
 
     const offerOutgoing =
       /* Every protocol write reaches this helper; request spans cover the operation. */
@@ -388,17 +401,15 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         return Effect.void;
       }
       if (lineOffload !== undefined && line.length >= lineOffload.minChars) {
-        return lineOffload
-          .decode(line)
-          .pipe(
-            Effect.flatMap((offloaded) =>
-              offloaded._tag === "InThread"
-                ? handleLineInThread(line)
-                : Effect.forEach(offloaded.logs ?? [], lineOffload.writeLog, {
-                    discard: true,
-                  }).pipe(Effect.andThen(routeMessage(offloaded.message))),
-            ),
-          );
+        return lineOffload.decode(line).pipe(
+          Effect.flatMap((offloaded) =>
+            offloaded._tag === "InThread"
+              ? handleLineInThread(line)
+              : Effect.forEach(offloaded.logs ?? [], lineOffload.writeLog, {
+                  discard: true,
+                }).pipe(Effect.andThen(routeMessage(offloaded.message))),
+          ),
+        );
       }
       return handleLineInThread(line);
     };

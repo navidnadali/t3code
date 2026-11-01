@@ -8,6 +8,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   historyAssignments,
+  prepareFakeState,
+  withEnvironment,
   parseProviderLoad,
   planSessions,
   readBenchKnobs,
@@ -156,7 +158,62 @@ describe("bench provider settings", () => {
   });
 });
 
+describe("fake state per run", () => {
+  it("gives each planned instance a fresh, owner-only directory under the run's --out", () => {
+    const out = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bench-run-"));
+    const dirs = prepareFakeState(out, ["codexBench", "acp/Bench"]);
+
+    expect(dirs).toEqual({
+      codexBench: NodePath.join(out, "fake-state", "codexBench"),
+      "acp/Bench": NodePath.join(out, "fake-state", "acp_Bench"),
+    });
+    for (const dir of [NodePath.join(out, "fake-state"), ...Object.values(dirs)]) {
+      expect(NodeFS.readdirSync(dir).filter((name) => !name.endsWith("Bench"))).toEqual([]);
+      expect(NodeFS.statSync(dir).mode & 0o777).toBe(0o700);
+    }
+    // A run that reuses an --out would claim ordinals after the previous run's.
+    NodeFS.writeFileSync(NodePath.join(dirs.codexBench!, "ordinal-0"), "thread");
+    expect(() => prepareFakeState(out, ["codexBench"])).toThrow(/not empty/);
+  });
+
+  it("sets environment variables on an instance, replacing what it had and keeping the rest", () => {
+    expect(
+      withEnvironment(
+        [
+          { name: "BENCH_STATE_DIR", value: "/old", sensitive: false },
+          { name: "BENCH_SPEED", value: "4", sensitive: false },
+        ],
+        { BENCH_STATE_DIR: "/run/fake-state/codexBench", BENCH_MCP_CREDENTIALS_DIR: "/run/c" },
+      ),
+    ).toEqual([
+      { name: "BENCH_SPEED", value: "4", sensitive: false },
+      { name: "BENCH_STATE_DIR", value: "/run/fake-state/codexBench", sensitive: false },
+      { name: "BENCH_MCP_CREDENTIALS_DIR", value: "/run/c", sensitive: false },
+    ]);
+  });
+});
+
 describe("bench provider settings command", () => {
+  it("leaves the fakes' state directory to the load driver", () => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bench-settings-"));
+    const out = NodePath.join(dir, "settings.json");
+    const run = NodeChildProcess.spawnSync(
+      process.execPath,
+      [
+        NodePath.join(import.meta.dirname, "providers.ts"),
+        "settings",
+        "--out",
+        out,
+        "--stats-dir",
+        NodePath.join(dir, "stats"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(run.status).toBe(0);
+    expect(NodeFS.readFileSync(out, "utf8")).not.toContain("BENCH_STATE_DIR");
+  });
+
   it.each([
     [["--speed=-1"], /BENCH_SPEED/],
     [["--turn-loops=0"], /BENCH_TURN_LOOPS/],

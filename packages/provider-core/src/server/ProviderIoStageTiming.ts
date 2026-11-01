@@ -99,33 +99,46 @@ export const ProviderIoStageTiming = Context.Reference<ProviderIoStageRecorder |
   { defaultValue: () => providerIoStageRecorderFromEnv(process.env) },
 );
 
+/** The driver ACP transport timing is recorded under; the ACP adapter provides its own. */
+export const ProviderIoStageDriver = Context.Reference<string>(
+  "@t3tools/provider-core/server/ProviderIoStageDriver",
+  { defaultValue: () => "acp" },
+);
+
 /**
- * Records wall time, which is main-thread busy time only while the effect does not suspend.
- * The effect is built inside the window because some constructors do their work eagerly.
+ * Builds the effect where it is called, as when timing is off, and records building plus running
+ * it: wall time, which is main-thread busy time only while the effect does not suspend.
  */
 export const timeProviderIoStage = <A, E, R>(
   timer: ProviderIoStageTimer | undefined,
   stage: ProviderIoStage,
   bytes: number,
   makeEffect: () => Effect.Effect<A, E, R>,
-): Effect.Effect<A, E, R> =>
-  timer === undefined
-    ? makeEffect()
-    : Effect.suspend(() => {
-        const startedAt = timer.now();
-        return Effect.onExit(makeEffect(), () =>
-          Effect.sync(() => timer.record(stage, timer.now() - startedAt, bytes)),
-        );
-      });
+): Effect.Effect<A, E, R> => {
+  if (timer === undefined) return makeEffect();
+  const buildStartedAt = timer.now();
+  const effect = makeEffect();
+  const buildMs = timer.now() - buildStartedAt;
+  return Effect.suspend(() => {
+    const startedAt = timer.now();
+    return Effect.onExit(effect, () =>
+      Effect.sync(() => timer.record(stage, buildMs + timer.now() - startedAt, bytes)),
+    );
+  });
+};
 
-/** Times the synchronous shaping a protocol logger does before it returns its write effect. */
-export const timeProviderIoLogShape = <Event, Write>(
+/** Times the synchronous shaping a protocol logger does for provider output (incoming events). */
+export const timeProviderIoLogShape = <
+  Event extends { readonly direction: "incoming" | "outgoing" },
+  Write,
+>(
   timer: ProviderIoStageTimer | undefined,
   logger: (event: Event) => Write,
 ): ((event: Event) => Write) =>
   timer === undefined
     ? logger
     : (event) => {
+        if (event.direction !== "incoming") return logger(event);
         const startedAt = timer.now();
         const write = logger(event);
         timer.record("logShape", timer.now() - startedAt, 0);

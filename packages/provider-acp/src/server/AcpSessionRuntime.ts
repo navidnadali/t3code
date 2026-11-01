@@ -32,7 +32,10 @@ import { AgentScope, AgentScopeThreadId, RAISE_OOM_SCORE_LINE } from "@t3tools/s
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
-import { ProviderIoStageTiming } from "@t3tools/provider-core/server/ProviderIoStageTiming";
+import {
+  ProviderIoStageDriver,
+  ProviderIoStageTiming,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import { appendAcpStderrTail, sanitizeAcpStderrExcerpt } from "./stderr.ts";
 import {
   collectSessionConfigOptionValues,
@@ -1648,7 +1651,8 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
     Effect.forkIn(runtimeScope),
   );
 
-  const stageTiming = (yield* ProviderIoStageTiming)?.forProvider("acp");
+  const stageRecorder = yield* ProviderIoStageTiming;
+  const stageTiming = stageRecorder?.forProvider(yield* ProviderIoStageDriver);
   const acpContext = yield* Layer.build(
     EffectAcpClient.layerChildProcess(child, {
       ...(options.transformStdout ? { transformStdout: options.transformStdout } : {}),

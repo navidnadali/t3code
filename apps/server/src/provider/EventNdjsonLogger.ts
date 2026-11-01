@@ -21,6 +21,18 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { toSafeThreadAttachmentSegment } from "../attachmentStore.ts";
 import type * as ResourceAttribution from "../resourceTelemetry/ResourceAttribution.ts";
+import {
+  type EventNdjsonStream,
+  formatEventNdjsonLine,
+  serializedRecordProblem,
+  serializeEventNdjsonRecord,
+} from "./EventNdjsonRecord.ts";
+
+export {
+  boundProviderEventForLogging,
+  type EventNdjsonStream,
+  shouldPersistProviderEvent,
+} from "./EventNdjsonRecord.ts";
 
 const MEBIBYTE = 1024 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -32,36 +44,8 @@ const DEFAULT_MAX_AGE_MS = 14 * DAY_MS;
 const DEFAULT_RETENTION_CHECK_INTERVAL_MS = 5 * 60 * 1_000;
 const DEFAULT_MAX_BUFFERED_BYTES = MEBIBYTE;
 const DEFAULT_MAX_BUFFERED_RECORDS = 512;
-const MAX_RECORD_CHARACTERS = 64 * 1024;
-const MAX_RECORD_FIELDS = 1_024;
-const MAX_RECORD_DEPTH = 16;
 const GLOBAL_THREAD_SEGMENT = "_global";
 const LOG_SCOPE = "provider-observability";
-const encodeUnknownJsonString = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
-
-const transientCanonicalEventTypes = new Set([
-  "content.delta",
-  "hook.progress",
-  "item.updated",
-  "task.progress",
-  "thread.realtime.audio.delta",
-  "tool.progress",
-  "turn.proposed.delta",
-]);
-const transientNativeMethods = new Set([
-  "item/agentMessage/delta",
-  "item/commandExecution/outputDelta",
-  "item/fileChange/outputDelta",
-  "item/plan/delta",
-  "item/reasoning/summaryTextDelta",
-  "item/reasoning/textDelta",
-  "thread/realtime/outputAudio/delta",
-  "thread/realtime/transcript/delta",
-  "turn/diff/updated",
-]);
-const transientAcpUpdates = new Set(["agent_message_chunk", "agent_thought_chunk"]);
-
-export type EventNdjsonStream = "native" | "canonical" | "orchestration";
 
 export interface EventNdjsonLogStore {
   readonly filePath: string;
@@ -150,10 +134,6 @@ function resolveThreadSegment(raw: string | null | undefined): string {
   return normalized ?? GLOBAL_THREAD_SEGMENT;
 }
 
-function resolveStreamLabel(stream: EventNdjsonStream): string {
-  return stream === "native" ? "NTIVE" : stream === "orchestration" ? "ORCH" : "CANON";
-}
-
 function providerLogPrefix(filePath: string): string {
   const basename = NodePath.basename(filePath);
   const extension = NodePath.extname(basename);
@@ -162,231 +142,6 @@ function providerLogPrefix(filePath: string): string {
 
 function providerLogPath(directory: string, prefix: string, threadSegment: string): string {
   return NodePath.join(directory, `${prefix}${threadSegment}.log`);
-}
-
-export function shouldPersistProviderEvent(stream: EventNdjsonStream, event: unknown): boolean {
-  if (stream === "orchestration" || typeof event !== "object" || event === null) {
-    return true;
-  }
-  try {
-    const type = Reflect.get(event, "type");
-    if (typeof type === "string" && transientCanonicalEventTypes.has(type)) {
-      return false;
-    }
-    if (stream !== "native") return true;
-
-    const nested = Reflect.get(event, "event");
-    const envelope = typeof nested === "object" && nested !== null ? nested : event;
-    // Decoded frames preserve raw-frame information without duplicating every token delta.
-    if (Reflect.get(envelope, "stage") === "raw") return false;
-    const decodedPayload = Reflect.get(envelope, "payload");
-    const nativeEvent =
-      Reflect.get(envelope, "stage") === "decoded" &&
-      typeof decodedPayload === "object" &&
-      decodedPayload !== null
-        ? decodedPayload
-        : envelope;
-    const method = Reflect.get(nativeEvent, "method");
-    if (
-      typeof method === "string" &&
-      (transientNativeMethods.has(method) ||
-        method.startsWith("claude/stream_event/content_block_delta/"))
-    ) {
-      return false;
-    }
-
-    const nativeType = Reflect.get(nativeEvent, "type");
-    if (nativeType === "system" && Reflect.get(nativeEvent, "subtype") === "thinking_tokens") {
-      return false;
-    }
-    if (nativeType === "message.part.delta") return false;
-    if (nativeType === "stream_event") {
-      const streamEvent = Reflect.get(nativeEvent, "event");
-      if (
-        typeof streamEvent === "object" &&
-        streamEvent !== null &&
-        Reflect.get(streamEvent, "type") === "content_block_delta"
-      ) {
-        return false;
-      }
-    }
-
-    const payload = Reflect.get(nativeEvent, "payload");
-    if (typeof payload !== "object" || payload === null) return true;
-
-    if (method === "session/update") {
-      const update = Reflect.get(payload, "update");
-      if (typeof update !== "object" || update === null) return true;
-      const updateType = Reflect.get(update, "sessionUpdate");
-      return typeof updateType !== "string" || !transientAcpUpdates.has(updateType);
-    }
-
-    if (nativeType === "message.part.updated") {
-      const properties = Reflect.get(payload, "properties");
-      if (typeof properties !== "object" || properties === null) return true;
-      const part = Reflect.get(properties, "part");
-      if (typeof part !== "object" || part === null) return true;
-      const partType = Reflect.get(part, "type");
-      if (partType === "text" || partType === "reasoning") return false;
-      if (partType === "tool") {
-        // Running snapshots repeat growing output.
-        const state = Reflect.get(part, "state");
-        if (typeof state === "object" && state !== null) {
-          return Reflect.get(state, "status") !== "running";
-        }
-      }
-      return true;
-    }
-
-    return true;
-  } catch {
-    return true;
-  }
-}
-
-const summaryFields = [
-  "provider",
-  "protocol",
-  "kind",
-  "providerSessionId",
-  "direction",
-  "stage",
-  "type",
-  "subtype",
-  "method",
-  "id",
-  "threadId",
-  "turnId",
-  "requestId",
-  "session_id",
-  "status",
-  "is_error",
-  "api_error_status",
-  "terminal_reason",
-  "stop_reason",
-  "operation",
-  "code",
-  "willRetry",
-  "message",
-  "event",
-  "payload",
-  "params",
-  "result",
-  "thread",
-  "turn",
-  "error",
-  "turns",
-  "items",
-  "content",
-] as const;
-
-function summarizeProviderEvent(event: unknown): unknown {
-  let remainingFields = 128;
-  let remainingCharacters = 8 * 1024;
-  const summarize = (value: unknown, depth: number): unknown => {
-    if (typeof value === "string") {
-      if (value.length > Math.min(1_024, remainingCharacters)) {
-        return { omittedCharacters: value.length };
-      }
-      remainingCharacters -= value.length;
-      return value;
-    }
-    if (value === null || typeof value === "number" || typeof value === "boolean") return value;
-    if (typeof value !== "object") return undefined;
-    if (Array.isArray(value)) return { itemCount: value.length };
-    const summary: Record<string, unknown> = { truncated: true };
-    if (depth >= 6) return summary;
-    for (const key of summaryFields) {
-      if (remainingFields <= 0) break;
-      const nested = Reflect.get(value, key);
-      if (nested === undefined) continue;
-      remainingFields -= 1;
-      summary[key] = summarize(nested, depth + 1);
-    }
-    return summary;
-  };
-  try {
-    return summarize(event, 0);
-  } catch {
-    return { truncated: true };
-  }
-}
-
-interface RecordUsage {
-  readonly characters: number;
-  readonly fields: number;
-  // Arrays are rejected by length before their items are counted, so this can exceed `fields`.
-  readonly requiredFields: number;
-  readonly depth: number;
-}
-
-// Events the adapters bounded whole, so the record that wraps one does not walk it again.
-const fittingEventUsage = new WeakMap<object, RecordUsage>();
-
-function measureProviderEvent(event: unknown, reuseFitting: boolean): RecordUsage | undefined {
-  let remainingCharacters = MAX_RECORD_CHARACTERS;
-  let remainingFields = MAX_RECORD_FIELDS;
-  let requiredFields = 0;
-  let depthReached = 0;
-  const ancestors = new WeakSet<object>();
-  const fits = (value: unknown, depth: number): boolean => {
-    if (typeof value === "string") {
-      remainingCharacters -= value.length;
-      return remainingCharacters >= 0;
-    }
-    if (typeof value !== "object" || value === null) return true;
-    if (depth > MAX_RECORD_DEPTH || ancestors.has(value)) return false;
-    const usedFields = MAX_RECORD_FIELDS - remainingFields;
-    const known = reuseFitting ? fittingEventUsage.get(value) : undefined;
-    if (known !== undefined) {
-      if (depth + known.depth > MAX_RECORD_DEPTH || remainingFields < known.requiredFields) {
-        return false;
-      }
-      requiredFields = Math.max(requiredFields, usedFields + known.requiredFields);
-      depthReached = Math.max(depthReached, depth + known.depth);
-      remainingFields -= known.fields;
-      remainingCharacters -= known.characters;
-      return remainingCharacters >= 0;
-    }
-    if (depth > depthReached) depthReached = depth;
-    if (Array.isArray(value)) {
-      if (value.length > remainingFields) return false;
-      requiredFields = Math.max(requiredFields, usedFields + value.length);
-    }
-    ancestors.add(value);
-    for (const key in value) {
-      if (!Object.hasOwn(value, key)) continue;
-      remainingFields -= 1;
-      remainingCharacters -= key.length;
-      if (
-        remainingFields < 0 ||
-        remainingCharacters < 0 ||
-        !fits(Reflect.get(value, key), depth + 1)
-      )
-        return false;
-    }
-    ancestors.delete(value);
-    return true;
-  };
-  try {
-    if (!fits(event, 0)) return undefined;
-  } catch {
-    return undefined;
-  }
-  const fields = MAX_RECORD_FIELDS - remainingFields;
-  return {
-    characters: MAX_RECORD_CHARACTERS - remainingCharacters,
-    fields,
-    requiredFields: Math.max(requiredFields, fields),
-    depth: depthReached,
-  };
-}
-
-export function boundProviderEventForLogging(event: unknown): unknown {
-  const usage = measureProviderEvent(event, false);
-  if (usage === undefined) return summarizeProviderEvent(event);
-  if (typeof event === "object" && event !== null) fittingEventUsage.set(event, usage);
-  return event;
 }
 
 function loggedProvider(event: unknown): string {
@@ -635,16 +390,6 @@ const drainPending = Effect.fnUntraced(function* (input: {
   ];
 });
 
-const serializeEvent = Effect.fnUntraced(function* (event: unknown) {
-  return yield* encodeUnknownJsonString(event).pipe(
-    Effect.catch((error) =>
-      logWarning("failed to serialize provider event log record", {
-        errorTag: errorTag(error),
-      }).pipe(Effect.as(undefined)),
-    ),
-  );
-});
-
 export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
   filePath: string,
   options: EventNdjsonLogStoreOptions = {},
@@ -767,25 +512,19 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
     const existing = loggerViews.get(stream);
     if (existing) return existing;
 
-    const write = Effect.fnUntraced(function* (event: unknown, threadId: ThreadId | null) {
-      const startedAt = stageTiming?.now() ?? 0;
-      if (!shouldPersistProviderEvent(stream, event)) return;
-      let payload = yield* serializeEvent(
-        measureProviderEvent(event, true) === undefined ? summarizeProviderEvent(event) : event,
-      );
-      if (payload === undefined) return;
-      // Escaping can expand strings beyond their input size.
-      if (Buffer.byteLength(payload) > MAX_RECORD_CHARACTERS) {
-        payload = yield* serializeEvent(summarizeProviderEvent(event));
-        if (payload === undefined) return;
-      }
-
+    const appendRecord = Effect.fnUntraced(function* (
+      payload: string,
+      threadId: ThreadId | null,
+      timed: { readonly event: unknown; readonly startedAt: number } | undefined,
+    ) {
       const observedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-      const line = `[${observedAt}] ${resolveStreamLabel(stream)}: ${payload}\n`;
+      const line = formatEventNdjsonLine(observedAt, stream, payload);
       const bytes = Buffer.byteLength(line);
-      stageTiming
-        ?.forProvider(loggedProvider(event))
-        .record("logSerialize", stageTiming.now() - startedAt, bytes);
+      if (timed !== undefined) {
+        stageTiming
+          ?.forProvider(loggedProvider(timed.event))
+          .record("logSerialize", stageTiming.now() - timed.startedAt, bytes);
+      }
       const action = yield* SynchronizedRef.modifyEffect(stateRef, (state) => {
         if (state.closed) {
           return Effect.succeed([{ flush: false }, state] as const);
@@ -814,9 +553,37 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
       }
     });
 
+    const writeSerialized = (
+      record: ProviderEventLoggers.SerializedProviderEventRecord,
+      threadId: ThreadId | null,
+    ) => {
+      const problem = serializedRecordProblem(stream, record);
+      return problem === undefined
+        ? appendRecord(record.payload, threadId, undefined)
+        : logWarning("rejected a serialized provider event log record", { stream, problem });
+    };
+
+    const write = Effect.fnUntraced(function* (event: unknown, threadId: ThreadId | null) {
+      const startedAt = stageTiming?.now() ?? 0;
+      const record = serializeEventNdjsonRecord(stream, event);
+      if (record._tag === "Failed") {
+        return yield* logWarning("failed to serialize provider event log record", {
+          errorTag: errorTag(record.error),
+        });
+      }
+      if (record._tag === "Serialized") {
+        yield* appendRecord(
+          record.payload,
+          threadId,
+          stageTiming === undefined ? undefined : { event, startedAt },
+        );
+      }
+    });
+
     const view = {
       filePath,
       write,
+      writeSerialized,
       close: () => Effect.void,
     } satisfies ProviderEventLoggers.EventNdjsonLogger;
     loggerViews.set(stream, view);

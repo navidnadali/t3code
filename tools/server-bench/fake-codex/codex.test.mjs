@@ -474,6 +474,28 @@ describe("fake codex app-server", () => {
     });
   });
 
+  it("ends a turn interrupted before its first item as an interrupted turn", async () => {
+    const stats = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fake-codex-"));
+    // At speed 1 the recording waits 2.8 s before its first item, so the interrupt lands first.
+    using fake = startFake({ BENCH_SPEED: "1", BENCH_STATS_DIR: stats });
+    fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
+    const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
+    fake.send({ id: 2, method: "turn/start", params: { threadId, input: [] } });
+    const turnId = frameOf((await fake.until(answerTo(2))).at(-1)).result.turn.id;
+    fake.send({ id: 3, method: "turn/interrupt", params: { threadId, turnId } });
+    const frames = (await fake.until(isTurnCompleted)).map(frameOf);
+
+    expect(frames.find((frame) => frame.id === 3)).toEqual({ id: 3, result: {} });
+    expect(frames.at(-1).params.turn).toMatchObject({ id: turnId, status: "interrupted" });
+    expect(frames.some((frame) => frame.method === "item/started")).toBe(false);
+    fake.end();
+    expect(await fake.exited).toBe(0);
+    const record = statsIn(stats).find((line) => line.kind === "turn");
+    expect(record).toMatchObject({ sessionId: threadId, aborted: true });
+    expect(record.frames["turn/completed"]).toBe(1);
+    expect(record.frames["item/started"]).toBeUndefined();
+  });
+
   it("resumes a thread without starting it again", async () => {
     using fake = startFake({});
     fake.send(

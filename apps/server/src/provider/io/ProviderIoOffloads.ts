@@ -21,9 +21,9 @@ import {
   ProviderIoWorkerPool,
 } from "./ProviderIoWorkerPool.ts";
 
-// Shorter lines cost main less in-thread than a worker round trip (P1-025 measurements).
-const DEFAULT_CODEX_OFFLOAD_MIN_CHARS = 2048;
-const DEFAULT_ACP_OFFLOAD_MIN_CHARS = 16384;
+// Below this a worker round trip can cost main more than the line itself when few sessions are
+// busy; above it the offload paid in every measurement (P1-025).
+const DEFAULT_OFFLOAD_MIN_CHARS = 64 * 1024;
 
 export interface CodexLineOffloadInput {
   /** Stops the app-server when its worker dies. */
@@ -47,7 +47,8 @@ export class CodexLineOffloads extends Context.Service<
 >()("t3/provider/io/ProviderIoOffloads/CodexLineOffloads") {}
 
 // The line stages emit no outputs, so the output stream only fails: when the worker dies. The
-// child is killed only after that failure is seen, so it explains the input end the kill causes.
+// child is killed only once that failure is seen (or the watch has ended with the session), so
+// the failure explains the input end the kill causes.
 const openLineSession = Effect.fnUntraced(function* <Options, Reply, E>(
   pool: ProviderIoWorkerPool["Service"],
   input: {
@@ -58,14 +59,16 @@ const openLineSession = Effect.fnUntraced(function* <Options, Reply, E>(
   },
 ) {
   const failed = yield* Deferred.make<never, E>();
+  const watched = yield* Deferred.make<void>();
   const session = yield* pool.open({
     ...input,
-    kill: Deferred.await(failed).pipe(Effect.ignore, Effect.andThen(input.kill)),
+    kill: Deferred.await(watched).pipe(Effect.andThen(input.kill)),
   });
   if (Option.isNone(session)) return Option.none();
   yield* session.value.output.pipe(
     Stream.runDrain,
     Effect.catch((error) => Deferred.fail(failed, error)),
+    Effect.ensuring(Deferred.succeed(watched, undefined)),
     Effect.forkScoped,
   );
   return Option.some({ call: session.value.call, failure: Deferred.await(failed) });
@@ -112,14 +115,25 @@ export const make = (pool: ProviderIoWorkerPool["Service"], minChars: LineOffloa
   }),
 });
 
+const openNothing = Effect.fnUntraced(function* () {
+  return Option.none<never>();
+});
+
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const pool = yield* ProviderIoWorkerPool;
     const config = yield* ServerConfig.ServerConfig;
-    const { codex, acp } = make(pool, {
-      codex: config.providerIoCodexOffloadMinChars ?? DEFAULT_CODEX_OFFLOAD_MIN_CHARS,
-      acp: config.providerIoAcpOffloadMinChars ?? DEFAULT_ACP_OFFLOAD_MIN_CHARS,
-    });
+    // Without workers, sessions open nothing at all.
+    const { codex, acp } =
+      (config.providerIoWorkers ?? 0) === 0
+        ? {
+            codex: CodexLineOffloads.of({ open: openNothing }),
+            acp: AcpLineOffloads.of({ open: openNothing }),
+          }
+        : make(pool, {
+            codex: config.providerIoCodexOffloadMinChars ?? DEFAULT_OFFLOAD_MIN_CHARS,
+            acp: config.providerIoAcpOffloadMinChars ?? DEFAULT_OFFLOAD_MIN_CHARS,
+          });
     return Layer.mergeAll(
       Layer.succeed(CodexLineOffloads, codex),
       Layer.succeed(AcpLineOffloads, acp),

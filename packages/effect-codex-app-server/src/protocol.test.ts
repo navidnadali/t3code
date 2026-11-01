@@ -919,6 +919,42 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
     }),
   );
 
+  it.effect("times a line sent off-thread as offload and a short line as json", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const recorded: Array<readonly [string, number]> = [];
+      const routed = yield* Deferred.make<void>();
+      let count = 0;
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        stageTiming: {
+          now: () => 0,
+          record: (stage, _elapsedMs, bytes) => {
+            if (stage !== "framing") recorded.push([stage, bytes]);
+          },
+        },
+        lineOffload: {
+          minChars: 64,
+          decode: (line) => Effect.succeed(CodexOffload.decodeOffloadedLine(line)),
+          writeLog: () => Effect.void,
+          failure: Effect.never,
+        },
+        onNotification: () =>
+          Effect.suspend(() =>
+            ++count === 2 ? Deferred.succeed(routed, undefined) : Effect.void,
+          ).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${shortLine("x/short")}\n${longLine}\n`));
+      yield* Deferred.await(routed);
+
+      assert.deepEqual(recorded, [
+        ["json", shortLine("x/short").length],
+        ["offload", longLine.length],
+      ]);
+    }),
+  );
+
   it.effect.each(["while it decodes a line", "before stdout closes", "after stdout closes"])(
     "ends the protocol with the offload's error when its worker dies %s",
     (when) =>

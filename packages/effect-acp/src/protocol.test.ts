@@ -1145,6 +1145,42 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
     }),
   );
 
+  it.effect("times framing per chunk, json per short line and offload per long line", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const recorded: Array<readonly [string, number]> = [];
+      const routed = yield* Deferred.make<void>();
+      let count = 0;
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        stageTiming: {
+          now: () => 0,
+          record: (stage, _elapsedMs, bytes) => {
+            if (stage === "framing" || stage === "json" || stage === "offload") {
+              recorded.push([stage, bytes]);
+            }
+          },
+        },
+        lineOffload: makeOffload([]),
+        onNotification: () =>
+          Effect.suspend(() =>
+            ++count === 2 ? Deferred.succeed(routed, undefined) : Effect.void,
+          ).pipe(Effect.asVoid),
+      });
+
+      const chunk = encoder.encode(`${update("short")}\n${update(long)}\n`);
+      yield* Queue.offer(input, chunk);
+      yield* Deferred.await(routed);
+
+      assert.deepEqual(recorded, [
+        ["framing", chunk.byteLength],
+        ["json", update("short").length],
+        ["offload", update(long).length],
+      ]);
+    }),
+  );
+
   it.effect("decodes a line on main when the offload hands it back", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();

@@ -33,11 +33,14 @@ export interface AcpProtocolLogEvent {
   readonly payload: unknown;
 }
 
-/** Optional main-thread timing of incoming frames; unset costs nothing. */
+/**
+ * Optional main-thread timing of incoming frames; unset costs nothing. A line sent to a line
+ * offload records `offload` (its wait for the result) instead of `json`, which runs off-thread.
+ */
 export interface AcpStageTiming {
   readonly now: () => number;
   readonly record: (
-    stage: "framing" | "json" | "decode" | "logShape" | "adapter",
+    stage: "framing" | "json" | "decode" | "logShape" | "adapter" | "offload",
     elapsedMs: number,
     bytes: number,
   ) => void;
@@ -193,8 +196,18 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
 ): Effect.fn.Return<AcpPatchedProtocol, never, Scope.Scope> {
   const timing = options.stageTiming;
   const onNotification = options.onNotification;
-  const parser = AcpWire.makeStrictNdJsonRpcParser(timing);
   const lineOffload = options.lineOffload;
+  // With an offload, main splits each chunk and times that as framing; the parser sees lines.
+  const parser = AcpWire.makeStrictNdJsonRpcParser(
+    timing === undefined || lineOffload === undefined
+      ? timing
+      : {
+          now: timing.now,
+          record: (stage, elapsedMs, bytes) => {
+            if (stage !== "framing") timing.record(stage, elapsedMs, bytes);
+          },
+        },
+  );
   const splitLines = lineOffload === undefined ? undefined : AcpWire.makeLineSplitter();
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
@@ -681,14 +694,19 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     data: Uint8Array,
   ) {
     const messages: Array<AcpWire.WireMessage> = [];
+    const startedAt = timing?.now() ?? 0;
+    const lines = split(data);
+    timing?.record("framing", timing.now() - startedAt, data.byteLength);
     const decodeHere = (line: string) =>
       Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`));
-    for (const line of split(data)) {
+    for (const line of lines) {
       if (line.length < offload.minChars || AcpWire.isBatchLine(line)) {
         messages.push(...(yield* decodeHere(line)));
         continue;
       }
-      const decoded = yield* offload.decode(line);
+      const decoded = yield* timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () =>
+        offload.decode(line),
+      );
       if (decoded._tag === "InThread") {
         messages.push(...(yield* decodeHere(line)));
         continue;

@@ -10,6 +10,7 @@ import type * as ProviderEventLoggers from "@t3tools/provider-core/server/Provid
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -22,8 +23,10 @@ import * as AcpError from "effect-acp/errors";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexError from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
+import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { vi } from "vite-plus/test";
 
+import * as ServerConfig from "../../config.ts";
 import { makeCodexAppServerProtocolLogger } from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { serializeEventNdjsonRecord } from "../EventNdjsonRecord.ts";
 import * as ProviderIoOffloads from "./ProviderIoOffloads.ts";
@@ -606,6 +609,35 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
 
         assert.equal(inThread.deepResult, kind === "codex" ? depth : depth + 1);
         assert.deepStrictEqual(offloaded, inThread);
+      }),
+  );
+
+  it.effect.each([0, 1])(
+    "with %i workers the offload layer opens offloads only when there are workers",
+    (count) =>
+      Effect.gen(function* () {
+        const startedBefore = workers.started.length;
+        const config = {
+          providerIoWorkers: count,
+        } as unknown as ServerConfig.ServerConfig["Service"];
+        const opened = yield* Effect.gen(function* () {
+          const codex = yield* ProviderIoOffloads.CodexLineOffloads;
+          const acp = yield* AcpLineOffloads;
+          return [
+            Option.isSome(yield* codex.open({ kill: Effect.void })),
+            Option.isSome(yield* acp.open({ kill: Effect.void })),
+          ];
+        }).pipe(
+          Effect.provide(
+            ProviderIoOffloads.layer.pipe(
+              Layer.provideMerge(ProviderIoWorkerPool.layer),
+              Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+            ),
+          ),
+          Effect.scoped,
+        );
+        assert.deepEqual(opened, [count > 0, count > 0]);
+        assert.equal(workers.started.length - startedBefore, count);
       }),
   );
 });

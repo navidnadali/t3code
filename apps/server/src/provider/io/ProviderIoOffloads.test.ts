@@ -466,4 +466,146 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
       assert.equal(workers.started.length - startedBefore, 2);
     }).pipe(Effect.scoped),
   );
+
+  // Past about 2,400 nested objects main cannot read a clone back; at 30,000 the worker cannot send.
+  const nested = (shape: "objects" | "arrays", depth: number) =>
+    shape === "objects"
+      ? `${'{"a":'.repeat(depth)}1${"}".repeat(depth)}`
+      : `${"[".repeat(depth)}${"]".repeat(depth)}`;
+  const depthOf = (value: unknown) => {
+    let deepest = 0;
+    const stack: Array<readonly [unknown, number]> = [[value, 0]];
+    while (stack.length > 0) {
+      const [current, depth] = stack.pop()!;
+      if (typeof current !== "object" || current === null) continue;
+      deepest = Math.max(deepest, depth + 1);
+      for (const child of Object.values(current)) stack.push([child, depth + 1]);
+    }
+    return deepest;
+  };
+
+  // A session whose next line or termination is awaited, so a dead worker fails rather than hangs.
+  const codexLineSession = (
+    offloads: ReturnType<typeof ProviderIoOffloads.make> | undefined,
+    logs: Array<string>,
+  ) =>
+    Effect.gen(function* () {
+      const { input, stdio } = yield* makeStdio;
+      const native = nativeLogger(logs);
+      const lineOffload =
+        offloads === undefined
+          ? undefined
+          : Option.getOrThrow(
+              yield* offloads.codex.open({
+                kill: Effect.void,
+                log: {
+                  providerSessionId,
+                  writeSerialized: (payload) => native.writeSerialized!(payload, threadId),
+                },
+              }),
+            );
+      const client = yield* CodexClient.make(stdio, {
+        logIncoming: true,
+        logOutgoing: true,
+        logger: makeCodexAppServerProtocolLogger({
+          nativeEventLogger: native,
+          threadId,
+          providerSessionId: providerSessionId as never,
+        })!,
+        ...(lineOffload === undefined ? {} : { lineOffload }),
+      });
+      const received = yield* Queue.unbounded<unknown>();
+      yield* client.handleUnknownServerNotification((_method, params) =>
+        Queue.offer(received, params).pipe(Effect.asVoid),
+      );
+      const send = (params: string) =>
+        Queue.offer(input, encoder.encode(`{"method":"x/line","params":${params}}\n`));
+      const next = Effect.raceFirst(
+        Queue.take(received),
+        client.awaitTermination.pipe(
+          Effect.flip,
+          Effect.flatMap((error) => Effect.die(`Codex session ended: ${error._tag}`)),
+        ),
+      );
+      return { send, next };
+    });
+
+  const acpLineSession = (offloads: ReturnType<typeof ProviderIoOffloads.make> | undefined) =>
+    Effect.gen(function* () {
+      const { input, stdio } = yield* makeStdio;
+      const lineOffload =
+        offloads === undefined
+          ? undefined
+          : Option.getOrThrow(yield* offloads.acp.open({ kill: Effect.void }));
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      const client = yield* AcpClient.make(stdio, {
+        ...(lineOffload === undefined ? {} : { lineOffload }),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+      });
+      const received = yield* Queue.unbounded<unknown>();
+      yield* client.handleUnknownExtNotification((_method, params) =>
+        Queue.offer(received, params).pipe(Effect.asVoid),
+      );
+      const send = (params: string) =>
+        Queue.offer(
+          input,
+          encoder.encode(`{"jsonrpc":"2.0","method":"x/line","params":{"tree":${params}}}\n`),
+        );
+      const next = Effect.raceFirst(
+        Queue.take(received),
+        Deferred.await(terminated).pipe(
+          Effect.flatMap((error) => Effect.die(`ACP session ended: ${error._tag}`)),
+        ),
+      );
+      return { send, next };
+    });
+
+  it.effect.each([
+    ["codex", "objects", 3000],
+    ["codex", "arrays", 30_000],
+    ["acp", "objects", 3000],
+    ["acp", "arrays", 30_000],
+  ] as const)(
+    "%s: a line of %s nested %i deep gives the in-thread result and spares other sessions",
+    ([kind, shape, depth]) =>
+      Effect.gen(function* () {
+        const deep = nested(shape, depth);
+        const run = (offloads: ReturnType<typeof ProviderIoOffloads.make> | undefined) =>
+          Effect.gen(function* () {
+            const logs: Array<string> = [];
+            const session =
+              kind === "codex"
+                ? yield* codexLineSession(offloads, logs)
+                : yield* acpLineSession(offloads);
+            yield* session.send(deep);
+            const deepResult = depthOf(yield* session.next);
+            yield* session.send('"after"');
+            const after = yield* session.next;
+            return { deepResult, after, logs: logs.filter(isIncoming) };
+          });
+
+        const inThread = yield* run(undefined).pipe(Effect.scoped);
+        const offloaded = yield* Effect.gen(function* () {
+          const pool = yield* ProviderIoWorkerPool.make({ workers: 1 });
+          const offloads = ProviderIoOffloads.make(pool, { codex: 0, acp: 0 });
+          const codexBystander = yield* codexLineSession(offloads, []);
+          const acpBystander = yield* acpLineSession(offloads);
+          yield* codexBystander.send('"before"');
+          yield* acpBystander.send('"before"');
+          assert.equal(yield* codexBystander.next, "before");
+          assert.deepEqual(yield* acpBystander.next, { tree: "before" });
+
+          const result = yield* run(offloads);
+
+          yield* codexBystander.send('"still"');
+          yield* acpBystander.send('"still"');
+          assert.equal(yield* codexBystander.next, "still");
+          assert.deepEqual(yield* acpBystander.next, { tree: "still" });
+          return result;
+        }).pipe(Effect.scoped);
+
+        assert.equal(inThread.deepResult, kind === "codex" ? depth : depth + 1);
+        assert.deepStrictEqual(offloaded, inThread);
+      }),
+  );
 });

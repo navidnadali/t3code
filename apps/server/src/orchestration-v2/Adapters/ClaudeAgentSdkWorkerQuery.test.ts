@@ -785,10 +785,17 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     ),
   );
 
-  it.effect("keeps stopping a closed query's CLI on main once its pool closes", () =>
+  it.effect("kills a CLI that ignores SIGTERM before the pool's close returns", () =>
     Effect.gen(function* () {
       const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
-      yield* withRunner("worker", ({ runner }) =>
+      const signalled = yield* Deferred.make<void>();
+      const kill = cli.kill.bind(cli);
+      cli.kill = (signal) => {
+        const sent = kill(signal);
+        if (cli.kills.length === 2) Deferred.doneUnsafe(signalled, Effect.void);
+        return sent;
+      };
+      const run = yield* withRunner("worker", ({ runner }) =>
         Effect.gen(function* () {
           const session = yield* runner.open(openInput(cli));
           yield* session.close;
@@ -796,9 +803,10 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
           yield* Stream.runDrain(session.messages);
           assert.deepStrictEqual(cli.kills, ["SIGTERM"]);
         }),
-      );
-      yield* TestClock.adjust("2 seconds");
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(signalled);
       yield* TestClock.adjust("5 seconds");
+      yield* Fiber.join(run);
       assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGTERM", "SIGKILL"]);
     }),
   );

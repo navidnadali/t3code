@@ -368,6 +368,54 @@ it.effect("fails only the session whose stage throws, after the outputs it emitt
   ),
 );
 
+it.effect(
+  "fails and kills only the session whose handler throws on main, and logs no error text",
+  () =>
+    withLogLines((lines) =>
+      withPool({ workers: 1 }, (pool) =>
+        Effect.gen(function* () {
+          const killed = yield* Deferred.make<void>();
+          const failing = Option.getOrThrow(
+            yield* pool.open({
+              stage: asyncStage,
+              options: undefined,
+              onFailure: toCodexError,
+              kill: Deferred.succeed(killed, undefined),
+              onEvent: () => {
+                throw new Error("handler threw on SECRET-TOKEN-42");
+              },
+            }),
+          );
+          const events: Array<string> = [];
+          const healthy = yield* openAsync(pool, events);
+
+          const error = yield* Effect.flip(failing.call("signal"));
+          assert.instanceOf(error, CodexAppServerTransportError);
+          const stageError = error.cause as ProviderIoWorkerPool.ProviderIoStageError;
+          assert.instanceOf(stageError, ProviderIoWorkerPool.ProviderIoStageError);
+          assert.equal(stageError.stage, "test-async");
+          assert.equal((stageError.cause as Error).message, "handler threw on SECRET-TOKEN-42");
+          yield* Deferred.await(killed);
+          assert.instanceOf(yield* Effect.flip(failing.call("late")), CodexAppServerTransportError);
+          const warning = yield* Queue.take(lines);
+          assert.deepEqual(warning, [
+            "Warn",
+            "Provider I/O session failed handling a worker message",
+            { stage: "test-async", type: "event", errorTag: "Error" },
+          ]);
+          assert.notInclude(JSON.stringify(warning), "SECRET");
+
+          assert.equal(yield* healthy.call("signal"), "signalled");
+          yield* healthy.write(bytes("still"));
+          assert.deepEqual(yield* Stream.runCollect(Stream.take(healthy.output, 1)), [
+            "late:still",
+          ]);
+          assert.deepEqual(events, ["event"]);
+        }),
+      ),
+    ),
+);
+
 it.effect.each([
   {
     failure: "never becomes ready",

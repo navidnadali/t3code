@@ -777,6 +777,44 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     ),
   );
 
+  it.effect.each([
+    { malformed: "an unknown signal", event: { type: "kill", signal: "SIGBOGUS" } },
+    { malformed: "stdin data that is not text or bytes", event: { type: "stdin", data: 42 } },
+  ])(
+    "fails and kills only the session whose worker sends $malformed; the others go on",
+    ({ event }) =>
+      withRunner(
+        "worker",
+        ({ runner }) =>
+          Effect.gen(function* () {
+            const broken = new FakeClaudeCli();
+            const openedBefore = workers.opened.length;
+            const brokenSession = yield* runner.open(openInput(broken));
+            const [opened] = workers.opened.slice(openedBefore);
+            assert.isDefined(opened);
+            const failed = yield* Stream.runDrain(brokenSession.messages).pipe(
+              Effect.flip,
+              Effect.forkChild,
+            );
+            const healthy = new FakeClaudeCli({ onUser: playOnPrompt });
+            const healthySession = yield* runner.open(openInput(healthy));
+
+            opened.worker.emit("message", { type: "event", session: opened.session, event });
+            assert.notInclude(broken.kills, "SIGBOGUS");
+            const error = yield* Fiber.join(failed);
+            assert.strictEqual(error.method, "fromAsyncIterable");
+            yield* Effect.promise(() => broken.waitForKill("SIGKILL"));
+            assert.deepStrictEqual(broken.kills, ["SIGKILL"]);
+
+            yield* healthySession.offer(prompt("Run the tool."));
+            const messages = yield* takeTurn(healthySession);
+            assert.strictEqual(messages.at(-1)?.type, "result");
+            assert.deepStrictEqual(healthy.kills, []);
+          }),
+        { workers: 1 },
+      ),
+  );
+
   it.effect("fails a control call after the query ended with the in-thread error", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>

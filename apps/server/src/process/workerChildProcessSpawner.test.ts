@@ -732,6 +732,58 @@ describe("WorkerChildProcessSpawner", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.live.skipIf(!workerPlatform)(
+    "VCS layers provided per WebSocket connection reuse the server's spawner process",
+    () =>
+      Effect.gen(function* () {
+        const spawnerPid = Effect.gen(function* () {
+          const vcs = yield* VcsProcess.VcsProcess;
+          const output = yield* vcs.run({
+            operation: "test.process-spawner",
+            command: process.execPath,
+            args: ["-e", "process.stdout.write(String(process.ppid))"],
+            cwd: process.cwd(),
+          });
+          return Number(output.stdout);
+        });
+        const vcsLayers = Layer.mergeAll(VcsProcess.layer, GitVcsDriver.layer);
+        const server = vcsLayers.pipe(
+          Layer.provide(ProcessRunner.layer),
+          Layer.provideMerge(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-process-spawner-test-" }),
+          ),
+          Layer.provideMerge(
+            ConfigProvider.layer(
+              ConfigProvider.fromUnknown({
+                [WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV]: "child",
+              }),
+            ),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          const serverSpawner = yield* spawnerPid;
+          // As ws.ts provides each connection's layers inside the server's context.
+          const connectionSpawner = yield* spawnerPid.pipe(Effect.provide(vcsLayers));
+          expect(connectionSpawner).toBe(serverSpawner);
+          const spawners = NodeChildProcess.execFileSync("ps", [
+            "-A",
+            "-ww",
+            "-o",
+            "ppid=,pid=,command=",
+          ])
+            .toString()
+            .split("\n")
+            .map((line) => line.trim().split(/\s+/))
+            .filter(
+              ([ppid, , ...command]) =>
+                Number(ppid) === process.pid && command.join(" ").includes("t3-process-spawner"),
+            )
+            .map(([, pid]) => Number(pid));
+          expect(spawners).toEqual([serverSpawner]);
+        }).pipe(Effect.provide(server));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.live(
     `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} and ${WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV}=child move VCS commands off the main spawner, results and errors unchanged`,
     () =>

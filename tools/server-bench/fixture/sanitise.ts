@@ -53,11 +53,40 @@ export const CLEARED_TABLES: ReadonlyArray<string> = [
   "pull_request_review_guides",
 ];
 
-/** The server's own bookkeeping, kept whole: migration names and projection positions. */
+/** Turn items per thread and run (P1-014's migration 77), kept by triggers: counts and ids. */
+const TURN_ITEM_COUNTS = "orchestration_v2_projection_turn_item_counts";
+
+/**
+ * The server's own bookkeeping, kept whole: migration names, projection positions, and turn item
+ * counts (recounted after the content pass, so they match whatever ids it changed).
+ */
 const STRUCTURAL_TABLES: ReadonlySet<string> = new Set([
   "effect_sql_migrations",
   "orchestration_v2_projection_metadata",
+  TURN_ITEM_COUNTS,
 ]);
+
+/** The count table's own recount (migration 77), when the database has it. */
+const recountTurnItems = (path: string) => {
+  const db = openWritable(path);
+  try {
+    if (
+      db.prepare(`SELECT 1 FROM sqlite_schema WHERE name = ?`).get(TURN_ITEM_COUNTS) === undefined
+    ) {
+      return;
+    }
+    db.exec(`BEGIN;
+      DELETE FROM ${TURN_ITEM_COUNTS};
+      INSERT INTO ${TURN_ITEM_COUNTS} (thread_id, run_id, item_count)
+        SELECT thread_id, COALESCE(run_id, ''), SUM(item_count)
+        FROM (SELECT thread_id, run_id, COUNT(*) AS item_count
+          FROM orchestration_v2_projection_turn_items GROUP BY thread_id, run_id)
+        GROUP BY thread_id, COALESCE(run_id, '');
+      COMMIT;`);
+  } finally {
+    db.close();
+  }
+};
 
 const FTS_SHADOW = /^orchestration_v2_message_search_(?:data|idx|content|docsize|config)$/;
 
@@ -878,6 +907,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
       "The content pass failed; nothing written",
       reportBlankStep,
     ).pipe(Effect.ensuring(Effect.sync(() => rewriting.close())));
+    recountTurnItems(scratch);
     yield* rebuildSearch.pipe(Effect.provide(database(scratch)));
     const readAfter = yield* runSteps(undecodableRows(scratch), "The decode check failed");
     const broken: Record<string, number> = {};

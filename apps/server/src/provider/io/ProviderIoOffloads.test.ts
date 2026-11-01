@@ -640,4 +640,40 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
         assert.equal(workers.started.length - startedBefore, count);
       }),
   );
+
+  // The worker dies inside the session scope's close, after the offload's own finalizers ran.
+  it.effect.each(["after", "before"])(
+    "kills the child of a session whose worker dies while it closes, %s its failure watch started",
+    (when) =>
+      Effect.gen(function* () {
+        const startedBefore = workers.started.length;
+        const pool = yield* ProviderIoWorkerPool.make({ workers: 1 });
+        const dyingPool: ProviderIoWorkerPool.ProviderIoWorkerPool["Service"] = {
+          open: <Options, Output, E, Request = never, Reply = never>(
+            input: ProviderIoWorkerPool.ProviderIoOpenInput<Options, Output, E, Request, Reply>,
+          ) =>
+            pool
+              .open(input)
+              .pipe(
+                Effect.tap(() =>
+                  Effect.addFinalizer(() =>
+                    Effect.promise(() => workers.started[startedBefore]!.terminate()),
+                  ),
+                ),
+              ),
+        };
+        const offloads = ProviderIoOffloads.make(dyingPool, { codex: 0, acp: 0 });
+        const killed = yield* Deferred.make<void>();
+
+        yield* Effect.gen(function* () {
+          const offload = Option.getOrThrow(
+            yield* offloads.codex.open({ kill: Deferred.succeed(killed, undefined) }),
+          );
+          // A round trip lets the failure watch start; without it the scope closes first.
+          if (when === "after") yield* offload.decode('{"id":1,"result":{}}');
+        }).pipe(Effect.scoped);
+
+        yield* Deferred.await(killed);
+      }).pipe(Effect.scoped),
+  );
 });

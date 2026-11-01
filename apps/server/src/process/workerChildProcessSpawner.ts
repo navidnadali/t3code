@@ -674,6 +674,12 @@ const openSpawnerProcess =
       else if (!closing) spawner.kill("SIGKILL");
     });
     spawner.on("exit", (code, signal) => {
+      // Launched detached, it led its own group; while members remain, no process can take its id.
+      try {
+        if (launch.options.detached) signalProcessGroup(spawner.pid!, "SIGKILL");
+      } catch {
+        // No member left.
+      }
       const cause = new Error(`The process spawner exited with ${signal ?? `code ${code}`}`);
       exitCause = cause;
       stopWhenDrained();

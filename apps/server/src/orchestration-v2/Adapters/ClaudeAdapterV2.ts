@@ -3,7 +3,7 @@ import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts"
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
 import {
   ClaudeAgentSdkWorkerPool,
-  claudeAgentSdkStageOptions,
+  claudeAgentSdkWorkerSetup,
   type ClaudeQueryControl,
   startClaudeQueryInWorker,
 } from "./ClaudeAgentSdkWorkerQuery.ts";
@@ -1080,14 +1080,13 @@ export const layerQueryRunner: Layer.Layer<
               ),
             })),
           );
-          const stageOptions = workerPool && claudeAgentSdkStageOptions(options, mcpServers);
+          const workerSetup = workerPool && claudeAgentSdkWorkerSetup(options, mcpServers);
           const startQuery =
-            workerPool === undefined || stageOptions === undefined
+            workerPool === undefined || workerSetup === undefined
               ? startInThread
               : startClaudeQueryInWorker({
                   pool: workerPool,
-                  stageOptions,
-                  callbacks: options,
+                  ...workerSetup,
                   prompt,
                   spawn: spawnClaudeCodeProcess,
                   toError: queryRunnerError,

@@ -335,6 +335,7 @@ export const runnableWork = Effect.gen(function* () {
   const counts: Record<string, number> = {
     recoveryThreads: (yield* recoveryThreadIds).size,
     settlementCandidates: (yield* projections.getSettlementCandidates()).length,
+    remoteDelegatedTasks: (yield* projections.getOpenRemoteDelegatedTasks).length,
   };
   for (const [name, table, query] of RUNNABLE_QUERIES) {
     if (!tables.has(table)) continue;

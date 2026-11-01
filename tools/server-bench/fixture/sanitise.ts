@@ -282,59 +282,96 @@ const SUBAGENT_RESULT_CHILDREN = `
           AND type = 'subagent_result')))`;
 
 /**
- * What the restart recovery leaves open on purpose (requests answerable by a message, questions
- * it converted to them, app-owned delegations), closed as P1-002's sanitiser closes them: nothing
- * outside a held queued run stays pending, running or waiting.
+ * What the restart recovery leaves open and a boot would still act on (requests answerable by a
+ * message, open tool and subagent items, remote delegations), closed as P1-002's sanitiser closes
+ * them. Rows no boot would touch stay as they are.
  */
 const settleLeftovers = (db: NodeSqlite.DatabaseSync, now: string) => {
   const changes = (sql: string, ...params: Array<string>) =>
     Number(db.prepare(sql).run(...params).changes);
-  const queued = `SELECT run_id FROM orchestration_v2_projection_runs WHERE status = 'queued'`;
+  db.exec(`CREATE TEMP TABLE open_requests AS
+    SELECT runtime_request_id, node_id FROM orchestration_v2_projection_runtime_requests
+    WHERE status = 'pending'`);
+  // Remote delegations a follower would resume on start (getOpenRemoteDelegatedTasks): no result
+  // yet, or a stop still owed to the other machine, whose link is cleared.
+  db.exec(`CREATE TEMP TABLE remote_tasks AS
+    SELECT subagent_id FROM orchestration_v2_projection_subagents
+    WHERE origin = 'app_owned' AND child_thread_id IS NULL
+      AND json_type(payload_json, '$.remoteChild') = 'object'
+      AND (json_type(payload_json, '$.result') = 'null'
+        OR (json_extract(payload_json, '$.status') IN ('cancelled', 'interrupted')
+          AND json_type(payload_json, '$.remoteChild.stoppedThere') IS NOT 'true')
+        OR json_type(payload_json, '$.remoteChild.stoppedThere') = 'false')`);
+  const ended = `CASE WHEN status IN ('idle', 'pending', 'running', 'waiting') THEN 'cancelled'
+    ELSE status END`;
+  const remoteTasks = changes(
+    `UPDATE orchestration_v2_projection_subagents SET status = ${ended}, updated_at = ?,
+       completed_at = COALESCE(completed_at, ?),
+       payload_json = json_set(payload_json, '$.status', ${ended}, '$.updatedAt', ?,
+         '$.completedAt', COALESCE(json_extract(payload_json, '$.completedAt'), ?),
+         '$.result', COALESCE(json_extract(payload_json, '$.result'), ?),
+         '$.remoteChild.stoppedThere', json('true'))
+     WHERE subagent_id IN (SELECT subagent_id FROM temp.remote_tasks)`,
+    now,
+    now,
+    now,
+    now,
+    SETTLED_RESULT,
+  );
+  const requests = changes(
+    `UPDATE orchestration_v2_projection_runtime_requests SET status = 'expired', resolved_at = ?,
+       payload_json = json_set(payload_json, '$.status', 'expired', '$.resolvedAt', ?,
+         '$.responseCapability', json_object('type', 'not_resumable',
+           'reason', 'The server restarted before this runtime request was resolved.'))
+     WHERE runtime_request_id IN (SELECT runtime_request_id FROM temp.open_requests)`,
+    now,
+    now,
+  );
+  // The nodes those requests held open, and run-less root turns of subagent children.
+  const nodes = changes(
+    `UPDATE orchestration_v2_projection_nodes SET status = 'cancelled', completed_at = ?,
+       payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?)
+     WHERE status IN ('pending', 'running', 'waiting') AND (
+       node_id IN (SELECT node_id FROM temp.open_requests)
+       OR node_id IN (SELECT subagent_id FROM temp.remote_tasks)
+       OR (run_id IS NULL AND kind = 'root_turn' AND thread_id IN (
+         SELECT child_thread_id FROM orchestration_v2_projection_subagents
+         WHERE child_thread_id IS NOT NULL)))`,
+    now,
+    now,
+  );
+  db.exec(`DROP TABLE temp.open_requests; DROP TABLE temp.remote_tasks;`);
+  const turnItems = changes(
+    `UPDATE orchestration_v2_projection_turn_items SET status = 'cancelled', updated_at = ?,
+       payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?,
+         '$.updatedAt', ?,
+         '$.result', CASE WHEN type = 'subagent' AND json_type(payload_json, '$.result') IS 'null'
+           THEN ? ELSE json_extract(payload_json, '$.result') END)
+     WHERE type IN ('command_execution', 'dynamic_tool', 'subagent')
+       AND status IN ('pending', 'running', 'waiting')
+       AND NOT EXISTS (SELECT 1 FROM orchestration_v2_projection_runs AS run
+         WHERE run.run_id = orchestration_v2_projection_turn_items.run_id
+           AND run.status = 'rolled_back')`,
+    now,
+    now,
+    now,
+    SETTLED_RESULT,
+  );
   return {
-    requests: changes(
-      `UPDATE orchestration_v2_projection_runtime_requests SET status = 'expired', resolved_at = ?,
-         payload_json = json_set(payload_json, '$.status', 'expired', '$.resolvedAt', ?,
-           '$.responseCapability', json_object('type', 'not_resumable',
-             'reason', 'The server restarted before this runtime request was resolved.'))
-       WHERE status = 'pending'`,
-      now,
-      now,
-    ),
-    nodes: changes(
-      `UPDATE orchestration_v2_projection_nodes SET status = 'cancelled', completed_at = ?,
-         payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?)
-       WHERE status IN ('pending', 'running', 'waiting')
-         AND (run_id IS NULL OR run_id NOT IN (${queued}))`,
-      now,
-      now,
-    ),
-    providerTurns: changes(
-      `UPDATE orchestration_v2_projection_provider_turns SET status = 'cancelled', completed_at = ?,
-         payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?)
-       WHERE status IN ('pending', 'running')`,
-      now,
-      now,
-    ),
-    turnItems: changes(
-      `UPDATE orchestration_v2_projection_turn_items SET status = 'cancelled', updated_at = ?,
+    requests,
+    remoteTasks,
+    nodes,
+    turnItems,
+    subagents: changes(
+      `UPDATE orchestration_v2_projection_subagents SET status = 'cancelled', completed_at = ?,
+         updated_at = ?,
          payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?,
            '$.updatedAt', ?)
-       WHERE status NOT IN ('completed', 'interrupted', 'failed', 'cancelled')
-         AND (run_id IS NULL OR run_id NOT IN (${queued}))`,
+       WHERE origin = 'provider_native' AND status IN ('pending', 'running', 'waiting')`,
       now,
       now,
       now,
-    ),
-    secretRequests: changes(
-      `UPDATE orchestration_v2_projection_turn_items
-       SET payload_json = json_set(payload_json, '$.secretStatus', 'cancelled')
-       WHERE type = 'secret_request' AND json_extract(payload_json, '$.secretStatus') = 'pending'`,
-    ),
-    subagentItems: changes(
-      `UPDATE orchestration_v2_projection_turn_items
-       SET payload_json = json_set(payload_json, '$.result', ?)
-       WHERE type = 'subagent' AND status = 'cancelled' AND json_type(payload_json, '$.result') IS 'null'`,
-      SETTLED_RESULT,
+      now,
     ),
     providerThreads: changes(
       `UPDATE orchestration_v2_projection_provider_threads
@@ -352,17 +389,6 @@ const settleLeftovers = (db: NodeSqlite.DatabaseSync, now: string) => {
          payload_json = json_set(payload_json, '$.status', 'stopped', '$.updatedAt', ?,
            '$.lastError', json('null'))
        WHERE status NOT IN ('stopped', 'error')`,
-      now,
-      now,
-    ),
-    subagents: changes(
-      `UPDATE orchestration_v2_projection_subagents SET status = 'cancelled', completed_at = ?,
-         updated_at = ?,
-         payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?,
-           '$.updatedAt', ?)
-       WHERE status IN ('pending', 'running', 'waiting')`,
-      now,
-      now,
       now,
       now,
     ),

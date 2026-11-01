@@ -274,11 +274,15 @@ const keptFindings = (value: string, kept: Kept, key: string | null): Array<stri
   return findings;
 };
 
+/** What `blankKey` writes: filler syllables and at most one final consonant. */
+const BLANKED_KEY = /^(?:[bdfglmnprsvz][aeiou])*[nrsl]?$/;
+
+/** Identifiers stay unless flagged; anything else must be a rewritten key. */
 const keyFindings = (key: string) =>
-  key === "" || /^[a-z]+$/.test(key)
-    ? []
-    : IDENTIFIER.test(key)
-      ? scanDecoded(key, { entropy: false })
+  IDENTIFIER.test(key)
+    ? scanDecoded(key, { entropy: false })
+    : BLANKED_KEY.test(key)
+      ? []
       : ["key"];
 
 /** `blank` (default): filler for all but the allowlist. `redact`: the pattern layer alone. */

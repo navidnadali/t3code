@@ -678,7 +678,10 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     Effect.suspend(() => {
       closing = true;
       const sessions = slots.flatMap((slot) => [...(slot?.sessions.values() ?? [])]);
-      return Effect.forEach(sessions, (session) => session.poolClosing, { discard: true });
+      return Effect.forEach(sessions, (session) => session.poolClosing, {
+        concurrency: "unbounded",
+        discard: true,
+      });
     }).pipe(
       Effect.andThen(
         Effect.promise(() => Promise.all(slots.map((slot) => slot?.worker.terminate()))),

@@ -256,6 +256,8 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   let childDone = false;
   // Main or the worker's SDK has sent SIGKILL: nothing is left to wait for.
   let killSent = false;
+  // The pool is closing: a spawn that arrives now would outlive it.
+  let poolClosing = false;
   let outputDone = false;
   let released = false;
   // Like the SDK's cleanup: no callback starts after it, and the ones running are aborted.
@@ -305,6 +307,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   // What the SDK's exit handler and close would still do once its worker is gone, awaited: the pool
   // closes as the server stops, and nothing on main runs after that.
   const stopChildNow = Effect.suspend(() => {
+    poolClosing = true;
     cleanUp();
     const target = child;
     if (target === undefined || childDone || killSent) return Effect.void;
@@ -365,7 +368,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   };
 
   const spawnChild = (event: Extract<ClaudeAgentSdkWorkerEvent, { readonly type: "spawn" }>) => {
-    if (child !== undefined || released) return;
+    if (child !== undefined || released || poolClosing) return;
     let spawned: ClaudeSpawnedProcess;
     try {
       // The SDK passes cwd even when it is undefined.

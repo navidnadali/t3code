@@ -30,6 +30,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
+import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -38,6 +39,7 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { encodeThreadHistoryCursor } from "./threadHistoryPaging.ts";
 
 const providerInstanceId = ProviderInstanceId.make("codex");
 const providerDriver = ProviderDriverKind.make("codex");
@@ -962,6 +964,7 @@ it.effect("reads inside a write transaction without waiting for a reader permit"
 // Reader permits all held, as by large decodes: a read that asks for one fails instead of waiting.
 const heldReaderPermits = () => {
   const semaphore = Semaphore.makeUnsafe(2);
+  const waited = Effect.die(new Error("waited for a reader permit"));
   return Effect.as(
     semaphore.take(2),
     new Proxy(semaphore, {
@@ -972,14 +975,14 @@ const heldReaderPermits = () => {
                 target
                   .withPermitsIfAvailable(permits)(effect)
                   .pipe(
-                    Effect.flatMap(
-                      Option.match({
-                        onNone: () => Effect.die(new Error("waited for a reader permit")),
-                        onSome: Effect.succeed,
-                      }),
-                    ),
+                    Effect.flatMap(Option.match({ onNone: () => waited, onSome: Effect.succeed })),
                   )
-          : Reflect.get(target, key, receiver),
+          : key === "take"
+            ? (permits: number) =>
+                target
+                  .takeIfAvailable(permits)
+                  .pipe(Effect.flatMap((taken) => (taken ? Effect.succeed(permits) : waited)))
+            : Reflect.get(target, key, receiver),
     }),
   );
 };
@@ -1015,6 +1018,32 @@ const largeReads: ReadonlyArray<PermitCase> = [
   {
     name: "timeline page",
     read: (store, fixture) => store.getTimelinePage(fixture.fork, { limit: 50 }),
+  },
+  {
+    name: "history page",
+    read: (store, fixture) =>
+      store.getThreadHistoryPage(
+        fixture.fork,
+        encodeThreadHistoryCursor({
+          snapshotSequence: 0,
+          sourceThreadId: fixture.fork,
+          sourceItemId: TurnItemId.make("item:held:fork:10"),
+          position: 10,
+        }),
+      ),
+  },
+  {
+    name: "turn-start history",
+    read: (store, fixture) => store.getTurnStartHistory(fixture.fork),
+  },
+  {
+    name: "thread search",
+    read: (store, fixture) => store.searchThread({ threadId: fixture.fork, query: "fork" }),
+  },
+  {
+    name: "streamed thread search",
+    read: (store, fixture) =>
+      Stream.runCollect(store.searchThreadStream({ threadId: fixture.fork, query: "fork" })),
   },
 ];
 

@@ -333,6 +333,7 @@ describe("workload fingerprint", () => {
       const agent = NodePath.join(root, "agents", "agent.cjs");
       write(agent, 'require("./lib.cjs");\n');
       write(NodePath.join(root, "agents", "lib.cjs"), "\n");
+      write(NodePath.join(root, "agents", "agent"), 'require("./lib.cjs");\n');
       const node = NodePath.join(root, "bin", "node");
       write(node, "\u007fELF executable\n");
       const work = NodePath.join(root, "work");
@@ -341,6 +342,8 @@ describe("workload fingerprint", () => {
         { binaryPath: wrapper },
         { commandPath: node, commandArgs: [agent] },
         { binaryPath: NodePath.join(root, "wrappers", "claude.mjs") },
+        // JavaScript without an extension or #!: node runs it all the same.
+        { commandPath: node, commandArgs: [NodePath.join(root, "agents", "agent")] },
       ].entries()) {
         const template = NodePath.join(root, `template-${index}`);
         write(

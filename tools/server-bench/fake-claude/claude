@@ -1,0 +1,5 @@
+#!/bin/sh
+# A native-looking launcher: the server wraps non-script binaries in the agent scope it gives
+# the real CLI, and a .mjs binaryPath would skip that.
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+exec "${BENCH_NODE:-node}" "$dir/claude.mjs" "$@"

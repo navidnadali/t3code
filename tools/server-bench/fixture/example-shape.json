@@ -1,0 +1,675 @@
+{
+  "format": "t3-server-bench-shape",
+  "version": 1,
+  "source": {
+    "label": "Example: hand-written structure (distributions, lineage, item mix); rows, bytes and sizes measured from `synth --seed 1 --scale 1` of it.",
+    "capturedAt": "2026-10-31T00:00:00.000Z"
+  },
+  "pageSize": 4096,
+  "pageCount": 39725,
+  "tables": {
+    "effect_sql_migrations": {
+      "rows": 76,
+      "bytes": 12288
+    },
+    "orchestration_events": {
+      "rows": 40930,
+      "bytes": 102670336,
+      "payload": {
+        "column": "payload_json",
+        "mean": 1230.6,
+        "quantiles": [
+          [0, 250],
+          [0.1, 652],
+          [0.2, 740],
+          [0.3, 744],
+          [0.4, 794],
+          [0.5, 841],
+          [0.6, 980],
+          [0.7, 1021],
+          [0.8, 1280],
+          [0.9, 1885],
+          [0.95, 2902],
+          [0.98, 5134],
+          [0.99, 7869],
+          [0.995, 10649],
+          [0.999, 20364],
+          [1, 58401]
+        ]
+      }
+    },
+    "orchestration_v2_legacy_imports": {
+      "rows": 20,
+      "bytes": 12288
+    },
+    "orchestration_v2_message_search": {
+      "rows": 2523,
+      "bytes": 0
+    },
+    "orchestration_v2_message_search_config": {
+      "rows": 1,
+      "bytes": 4096
+    },
+    "orchestration_v2_message_search_data": {
+      "rows": 728,
+      "bytes": 2985984
+    },
+    "orchestration_v2_message_search_docsize": {
+      "rows": 2523,
+      "bytes": 36864
+    },
+    "orchestration_v2_message_search_idx": {
+      "rows": 717,
+      "bytes": 16384
+    },
+    "orchestration_v2_projection_checkpoint_scopes": {
+      "rows": 69,
+      "bytes": 126976,
+      "payload": {
+        "column": "payload_json",
+        "mean": 636.7,
+        "quantiles": [
+          [0, 603],
+          [0.1, 603],
+          [0.2, 603],
+          [0.3, 603],
+          [0.4, 603],
+          [0.5, 603],
+          [0.6, 603],
+          [0.7, 603],
+          [0.8, 603],
+          [0.9, 861],
+          [0.95, 861],
+          [0.98, 861],
+          [0.99, 861],
+          [0.995, 861],
+          [0.999, 861],
+          [1, 861]
+        ]
+      }
+    },
+    "orchestration_v2_projection_checkpoints": {
+      "rows": 720,
+      "bytes": 1568768,
+      "payload": {
+        "column": "payload_json",
+        "mean": 1190.7,
+        "quantiles": [
+          [0, 760],
+          [0.1, 861],
+          [0.2, 862],
+          [0.3, 865],
+          [0.4, 868],
+          [0.5, 869],
+          [0.6, 869],
+          [0.7, 875],
+          [0.8, 1180],
+          [0.9, 1854],
+          [0.95, 2721],
+          [0.98, 3694],
+          [0.99, 6114],
+          [0.995, 10068],
+          [0.999, 12235],
+          [1, 12235]
+        ]
+      }
+    },
+    "orchestration_v2_projection_context_transfers": {
+      "rows": 32,
+      "bytes": 86016,
+      "payload": {
+        "column": "payload_json",
+        "mean": 895.2,
+        "quantiles": [
+          [0, 795],
+          [0.1, 795],
+          [0.2, 795],
+          [0.3, 795],
+          [0.4, 884],
+          [0.5, 884],
+          [0.6, 885],
+          [0.7, 1002],
+          [0.8, 1002],
+          [0.9, 1003],
+          [0.95, 1003],
+          [0.98, 1004],
+          [0.99, 1004],
+          [0.995, 1004],
+          [0.999, 1004],
+          [1, 1004]
+        ]
+      }
+    },
+    "orchestration_v2_projection_messages": {
+      "rows": 2929,
+      "bytes": 4947968,
+      "payload": {
+        "column": "payload_json",
+        "mean": 916.6,
+        "quantiles": [
+          [0, 340],
+          [0.1, 351],
+          [0.2, 357],
+          [0.3, 358],
+          [0.4, 466],
+          [0.5, 468],
+          [0.6, 481],
+          [0.7, 632],
+          [0.8, 905],
+          [0.9, 1773],
+          [0.95, 2992],
+          [0.98, 5391],
+          [0.99, 7827],
+          [0.995, 11024],
+          [0.999, 17962],
+          [1, 36045]
+        ]
+      }
+    },
+    "orchestration_v2_projection_metadata": {
+      "rows": 1,
+      "bytes": 8192
+    },
+    "orchestration_v2_projection_nodes": {
+      "rows": 2400,
+      "bytes": 6246400,
+      "payload": {
+        "column": "payload_json",
+        "mean": 976.2,
+        "quantiles": [
+          [0, 860],
+          [0.1, 860],
+          [0.2, 864],
+          [0.3, 864],
+          [0.4, 1011],
+          [0.5, 1011],
+          [0.6, 1015],
+          [0.7, 1015],
+          [0.8, 1019],
+          [0.9, 1037],
+          [0.95, 1041],
+          [0.98, 1343],
+          [0.99, 1343],
+          [0.995, 1365],
+          [0.999, 1365],
+          [1, 1365]
+        ]
+      }
+    },
+    "orchestration_v2_projection_plans": {
+      "rows": 171,
+      "bytes": 364544,
+      "payload": {
+        "column": "payload_json",
+        "mean": 1002.1,
+        "quantiles": [
+          [0, 650],
+          [0.1, 652],
+          [0.2, 653],
+          [0.3, 653],
+          [0.4, 654],
+          [0.5, 655],
+          [0.6, 655],
+          [0.7, 665],
+          [0.8, 755],
+          [0.9, 1331],
+          [0.95, 2163],
+          [0.98, 5195],
+          [0.99, 9947],
+          [0.995, 11912],
+          [0.999, 11912],
+          [1, 11912]
+        ]
+      }
+    },
+    "orchestration_v2_projection_provider_session_bindings": {
+      "rows": 80,
+      "bytes": 45056
+    },
+    "orchestration_v2_projection_provider_sessions": {
+      "rows": 80,
+      "bytes": 360448,
+      "payload": {
+        "column": "payload_json",
+        "mean": 2650.9,
+        "quantiles": [
+          [0, 2644],
+          [0.1, 2644],
+          [0.2, 2644],
+          [0.3, 2644],
+          [0.4, 2644],
+          [0.5, 2644],
+          [0.6, 2644],
+          [0.7, 2644],
+          [0.8, 2644],
+          [0.9, 2694],
+          [0.95, 2694],
+          [0.98, 2694],
+          [0.99, 2694],
+          [0.995, 2694],
+          [0.999, 2694],
+          [1, 2694]
+        ]
+      }
+    },
+    "orchestration_v2_projection_provider_threads": {
+      "rows": 85,
+      "bytes": 139264,
+      "payload": {
+        "column": "payload_json",
+        "mean": 699.4,
+        "quantiles": [
+          [0, 685],
+          [0.1, 685],
+          [0.2, 685],
+          [0.3, 685],
+          [0.4, 685],
+          [0.5, 685],
+          [0.6, 685],
+          [0.7, 686],
+          [0.8, 686],
+          [0.9, 785],
+          [0.95, 785],
+          [0.98, 785],
+          [0.99, 785],
+          [0.995, 785],
+          [0.999, 785],
+          [1, 785]
+        ]
+      }
+    },
+    "orchestration_v2_projection_provider_turns": {
+      "rows": 930,
+      "bytes": 1683456,
+      "payload": {
+        "column": "payload_json",
+        "mean": 755.4,
+        "quantiles": [
+          [0, 740],
+          [0.1, 740],
+          [0.2, 740],
+          [0.3, 740],
+          [0.4, 740],
+          [0.5, 744],
+          [0.6, 744],
+          [0.7, 744],
+          [0.8, 744],
+          [0.9, 748],
+          [0.95, 980],
+          [0.98, 980],
+          [0.99, 980],
+          [0.995, 980],
+          [0.999, 980],
+          [1, 980]
+        ]
+      }
+    },
+    "orchestration_v2_projection_run_attempts": {
+      "rows": 930,
+      "bytes": 2187264,
+      "payload": {
+        "column": "payload_json",
+        "mean": 784,
+        "quantiles": [
+          [0, 764],
+          [0.1, 766],
+          [0.2, 766],
+          [0.3, 766],
+          [0.4, 766],
+          [0.5, 770],
+          [0.6, 770],
+          [0.7, 770],
+          [0.8, 770],
+          [0.9, 774],
+          [0.95, 1056],
+          [0.98, 1056],
+          [0.99, 1056],
+          [0.995, 1056],
+          [0.999, 1056],
+          [1, 1056]
+        ]
+      }
+    },
+    "orchestration_v2_projection_runs": {
+      "rows": 900,
+      "bytes": 1581056,
+      "payload": {
+        "column": "payload_json",
+        "mean": 850.2,
+        "quantiles": [
+          [0, 833],
+          [0.1, 833],
+          [0.2, 833],
+          [0.3, 833],
+          [0.4, 833],
+          [0.5, 837],
+          [0.6, 837],
+          [0.7, 837],
+          [0.8, 837],
+          [0.9, 841],
+          [0.95, 1099],
+          [0.98, 1099],
+          [0.99, 1099],
+          [0.995, 1099],
+          [0.999, 1099],
+          [1, 1099]
+        ]
+      }
+    },
+    "orchestration_v2_projection_runtime_requests": {
+      "rows": 38,
+      "bytes": 90112,
+      "payload": {
+        "column": "payload_json",
+        "mean": 606.6,
+        "quantiles": [
+          [0, 602],
+          [0.1, 604],
+          [0.2, 604],
+          [0.3, 604],
+          [0.4, 604],
+          [0.5, 605],
+          [0.6, 605],
+          [0.7, 605],
+          [0.8, 606],
+          [0.9, 617],
+          [0.95, 618],
+          [0.98, 618],
+          [0.99, 618],
+          [0.995, 618],
+          [0.999, 618],
+          [1, 618]
+        ]
+      }
+    },
+    "orchestration_v2_projection_subagents": {
+      "rows": 57,
+      "bytes": 229376,
+      "payload": {
+        "column": "payload_json",
+        "mean": 2021.4,
+        "quantiles": [
+          [0, 770],
+          [0.1, 770],
+          [0.2, 772],
+          [0.3, 774],
+          [0.4, 846],
+          [0.5, 846],
+          [0.6, 848],
+          [0.7, 1088],
+          [0.8, 2254],
+          [0.9, 3410],
+          [0.95, 5846],
+          [0.98, 15674],
+          [0.99, 23244],
+          [0.995, 23244],
+          [0.999, 23244],
+          [1, 23244]
+        ]
+      }
+    },
+    "orchestration_v2_projection_threads": {
+      "rows": 120,
+      "bytes": 241664,
+      "payload": {
+        "column": "payload_json",
+        "mean": 1095.1,
+        "quantiles": [
+          [0, 935],
+          [0.1, 1001],
+          [0.2, 1058],
+          [0.3, 1059],
+          [0.4, 1059],
+          [0.5, 1059],
+          [0.6, 1059],
+          [0.7, 1060],
+          [0.8, 1145],
+          [0.9, 1224],
+          [0.95, 1298],
+          [0.98, 1299],
+          [0.99, 1299],
+          [0.995, 1299],
+          [0.999, 1299],
+          [1, 1299]
+        ]
+      }
+    },
+    "orchestration_v2_projection_turn_items": {
+      "rows": 9000,
+      "bytes": 31555584,
+      "payload": {
+        "column": "payload_json",
+        "mean": 1872.5,
+        "quantiles": [
+          [0, 473],
+          [0.1, 792],
+          [0.2, 983],
+          [0.3, 1003],
+          [0.4, 1057],
+          [0.5, 1220],
+          [0.6, 1414],
+          [0.7, 1590],
+          [0.8, 2008],
+          [0.9, 3327],
+          [0.95, 4968],
+          [0.98, 8743],
+          [0.99, 11236],
+          [0.995, 16159],
+          [0.999, 26081],
+          [1, 58401]
+        ]
+      }
+    },
+    "orchestration_v2_turn_item_positions": {
+      "rows": 9000,
+      "bytes": 2953216
+    },
+    "projection_projects": {
+      "rows": 8,
+      "bytes": 16384
+    },
+    "projection_thread_messages": {
+      "rows": 1500,
+      "bytes": 1953792,
+      "payload": {
+        "column": "text",
+        "mean": 801.5,
+        "quantiles": [
+          [0, 20],
+          [0.1, 71],
+          [0.2, 119],
+          [0.3, 189],
+          [0.4, 290],
+          [0.5, 399],
+          [0.6, 609],
+          [0.7, 811],
+          [0.8, 1136],
+          [0.9, 1737],
+          [0.95, 3044],
+          [0.98, 4330],
+          [0.99, 5410],
+          [0.995, 9084],
+          [0.999, 10807],
+          [1, 11634]
+        ]
+      }
+    },
+    "projection_threads": {
+      "rows": 20,
+      "bytes": 32768
+    }
+  },
+  "stat1": [],
+  "distributions": {
+    "threadsPerProject": [
+      [0, 1],
+      [0.25, 4],
+      [0.5, 9],
+      [0.75, 18],
+      [1, 40]
+    ],
+    "turnItemsPerThread": [
+      [0, 0],
+      [0.1, 2],
+      [0.2, 6],
+      [0.3, 10],
+      [0.4, 16],
+      [0.5, 24],
+      [0.6, 34],
+      [0.7, 50],
+      [0.8, 75],
+      [0.9, 140],
+      [0.95, 260],
+      [0.98, 520],
+      [0.99, 800],
+      [1, 1500]
+    ]
+  },
+  "lineage": {
+    "root": 84,
+    "fork": 12,
+    "subagent": 24,
+    "v1Import": 20,
+    "runless": 32
+  },
+  "mix": {
+    "turnItemTypes": {
+      "user_message": {
+        "rows": 900,
+        "meanBytes": 900
+      },
+      "assistant_message": {
+        "rows": 1700,
+        "meanBytes": 1400
+      },
+      "reasoning": {
+        "rows": 1500,
+        "meanBytes": 1100
+      },
+      "command_execution": {
+        "rows": 2510,
+        "meanBytes": 2600
+      },
+      "file_change": {
+        "rows": 800,
+        "meanBytes": 2400
+      },
+      "dynamic_tool": {
+        "rows": 500,
+        "meanBytes": 1800
+      },
+      "todo_list": {
+        "rows": 180,
+        "meanBytes": 1000
+      },
+      "checkpoint": {
+        "rows": 700,
+        "meanBytes": 750
+      },
+      "subagent": {
+        "rows": 60,
+        "meanBytes": 2200
+      },
+      "error": {
+        "rows": 60,
+        "meanBytes": 900
+      },
+      "approval_request": {
+        "rows": 40,
+        "meanBytes": 1900
+      },
+      "notification": {
+        "rows": 50,
+        "meanBytes": 950
+      }
+    },
+    "eventTypes": {
+      "checkpoint-scope.created": {
+        "rows": 69,
+        "meanBytes": 636.7
+      },
+      "checkpoint.captured": {
+        "rows": 720,
+        "meanBytes": 1190.7
+      },
+      "context-transfer.created": {
+        "rows": 32,
+        "meanBytes": 895.2
+      },
+      "message.updated": {
+        "rows": 4000,
+        "meanBytes": 869.8
+      },
+      "node.updated": {
+        "rows": 4000,
+        "meanBytes": 965.1
+      },
+      "plan.updated": {
+        "rows": 171,
+        "meanBytes": 1002.1
+      },
+      "provider-session.attached": {
+        "rows": 80,
+        "meanBytes": 2650.9
+      },
+      "provider-session.updated": {
+        "rows": 300,
+        "meanBytes": 2651
+      },
+      "provider-thread.updated": {
+        "rows": 900,
+        "meanBytes": 699.5
+      },
+      "provider-turn.updated": {
+        "rows": 9000,
+        "meanBytes": 755.4
+      },
+      "run-attempt.created": {
+        "rows": 930,
+        "meanBytes": 784
+      },
+      "run-attempt.updated": {
+        "rows": 900,
+        "meanBytes": 784.2
+      },
+      "run.created": {
+        "rows": 900,
+        "meanBytes": 850.2
+      },
+      "run.updated": {
+        "rows": 2700,
+        "meanBytes": 850.2
+      },
+      "runtime-request.updated": {
+        "rows": 80,
+        "meanBytes": 606.5
+      },
+      "subagent.updated": {
+        "rows": 900,
+        "meanBytes": 1464.9
+      },
+      "thread.created": {
+        "rows": 120,
+        "meanBytes": 1046.1
+      },
+      "thread.settled": {
+        "rows": 120,
+        "meanBytes": 1095.1
+      },
+      "turn-item.updated": {
+        "rows": 15000,
+        "meanBytes": 1824.7
+      }
+    },
+    "applicationEvents": {
+      "v2/project": {
+        "rows": 8,
+        "meanBytes": 250
+      },
+      "v2/thread": {
+        "rows": 40922,
+        "meanBytes": 1230.8
+      }
+    }
+  }
+}

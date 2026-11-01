@@ -4,6 +4,10 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { ThreadId } from "@t3tools/contracts";
+import {
+  makeProviderIoStageRecorder,
+  ProviderIoStageTiming,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { RotatingFileSinkError } from "@t3tools/shared/logging";
@@ -148,6 +152,49 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
               stream: "CANON",
               payload: '{"type":"item.completed","id":"canonical-event"}',
             },
+          ],
+        );
+      } finally {
+        NodeFS.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }),
+  );
+
+  it.effect("times serialisation of persisted records per provider when stage timing is on", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
+      const basePath = NodePath.join(tempDir, "events.log");
+      const recorder = makeProviderIoStageRecorder(() => 0);
+
+      try {
+        const store = yield* makeEventNdjsonLogStore(basePath, { batchWindowMs: 0 }).pipe(
+          Effect.provideService(ProviderIoStageTiming, recorder),
+        );
+        const native = store.logger("native");
+        const threadId = ThreadId.make("thread-timed");
+
+        yield* native.write({ provider: "claudeAgent", event: { type: "assistant" } }, threadId);
+        yield* native.write(
+          { provider: "codex", event: { stage: "raw", payload: "{}" } },
+          threadId,
+        );
+        yield* native.write({ event: { provider: "antigravity", kind: "request" } }, threadId);
+        yield* store.close();
+
+        const lineBytes = NodeFS.readFileSync(ownedLogPath(basePath, "thread-timed"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => Buffer.byteLength(`${line}\n`));
+        assert.deepEqual(
+          recorder.drain().map(({ provider, stage, count, bytes }) => ({
+            provider,
+            stage,
+            count,
+            bytes,
+          })),
+          [
+            { provider: "claudeAgent", stage: "logSerialize", count: 1, bytes: lineBytes[0] },
+            { provider: "antigravity", stage: "logSerialize", count: 1, bytes: lineBytes[1] },
           ],
         );
       } finally {

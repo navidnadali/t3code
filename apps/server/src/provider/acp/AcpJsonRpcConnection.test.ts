@@ -14,6 +14,7 @@ import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Result from "effect/Result";
+import * as Scheduler from "effect/Scheduler";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/process";
 import { describe, expect } from "vite-plus/test";
@@ -21,6 +22,7 @@ import { describe, expect } from "vite-plus/test";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as EffectAcpErrors from "effect-acp/errors";
+import type * as EffectAcpProtocol from "effect-acp/protocol";
 
 import * as ProviderIoOffloads from "../io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "../io/ProviderIoWorkerPool.ts";
@@ -60,12 +62,25 @@ const recordsByRequest = (records: ReadonlyArray<ReturnType<typeof recordRequest
   return byRequest;
 };
 
+const isOutgoingPrompt = (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
+  event.direction === "outgoing" &&
+  event.stage === "decoded" &&
+  typeof event.payload === "object" &&
+  event.payload !== null &&
+  Reflect.get(event.payload, "tag") === "session/prompt";
+
 // Prompts, cancels as soon as the prompt is dispatched, and returns what the agent received in order.
+// holdPrompt slows the prompt on its way out: its outgoing protocol log record waits until the agent
+// has answered a later request, or its fiber yields every few operations.
 const promptThenCancel = (input: {
   readonly cancelBehavior: "interrupt" | "wait-for-prompt";
   readonly workers: number;
   readonly requestLogger: NonNullable<AcpSessionRuntime.AcpSessionRuntimeOptions["requestLogger"]>;
   readonly releaseLog?: Effect.Effect<void>;
+  readonly holdPrompt?: {
+    readonly in: "protocol-log" | "scheduler";
+    readonly cancelOn: "dispatch" | "call";
+  };
 }) =>
   Effect.gen(function* () {
     const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "acp-runtime-"));
@@ -81,6 +96,8 @@ const promptThenCancel = (input: {
             codex: 0,
             acp: 0,
           }).acp;
+    const promptLogged = yield* Deferred.make<void>();
+    const promptReleased = yield* Deferred.make<void>();
     const runtime = yield* AcpSessionRuntime.make({
       ...mockRuntimeOptions,
       spawn: {
@@ -93,6 +110,19 @@ const promptThenCancel = (input: {
       cancelBehavior: input.cancelBehavior,
       interruptPromptOnCancel: false,
       requestLogger: input.requestLogger,
+      ...(input.holdPrompt?.in === "protocol-log"
+        ? {
+            protocolLogging: {
+              logOutgoing: true,
+              logger: (event) =>
+                isOutgoingPrompt(event)
+                  ? Deferred.succeed(promptLogged, undefined).pipe(
+                      Effect.andThen(Deferred.await(promptReleased)),
+                    )
+                  : Effect.void,
+            },
+          }
+        : {}),
     }).pipe(
       Effect.provideService(AcpSessionRuntime.AcpLineOffloads, {
         open: (openInput) =>
@@ -112,7 +142,9 @@ const promptThenCancel = (input: {
       }),
     );
     const releaseLog = input.releaseLog ?? Effect.void;
-    yield* Effect.addFinalizer(() => releaseLog);
+    yield* Effect.addFinalizer(() =>
+      releaseLog.pipe(Effect.andThen(Deferred.succeed(promptReleased, undefined))),
+    );
     const cancelReceived = yield* Deferred.make<void>();
     yield* runtime.getEvents().pipe(
       Stream.runForEach((event) => {
@@ -130,9 +162,32 @@ const promptThenCancel = (input: {
     const dispatched = yield* Deferred.make<void>();
     const prompt = yield* runtime
       .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
-      .pipe(Effect.forkChild);
-    yield* Deferred.await(dispatched);
-    const cancel = yield* runtime.cancel.pipe(Effect.forkChild({ startImmediately: true }));
+      .pipe(
+        input.holdPrompt?.in === "scheduler"
+          ? Effect.provideService(Scheduler.MaxOpsBeforeYield, 3)
+          : (effect) => effect,
+        Effect.forkChild,
+      );
+    let cancel: Fiber.Fiber<void, EffectAcpErrors.AcpError>;
+    if (input.holdPrompt === undefined) {
+      yield* Deferred.await(dispatched);
+      cancel = yield* runtime.cancel.pipe(Effect.forkChild({ startImmediately: true }));
+    } else {
+      if (input.holdPrompt.in === "protocol-log") yield* Deferred.await(promptLogged);
+      // A round trip: whatever was queued before it reaches the agent first.
+      const roundTrip = runtime.request("_test/environment", {});
+      if (input.holdPrompt.cancelOn === "dispatch") {
+        cancel = yield* Deferred.await(dispatched).pipe(
+          Effect.andThen(runtime.cancel),
+          Effect.forkChild({ startImmediately: true }),
+        );
+      } else {
+        yield* roundTrip;
+        cancel = yield* runtime.cancel.pipe(Effect.forkChild({ startImmediately: true }));
+      }
+      yield* roundTrip;
+      yield* Deferred.succeed(promptReleased, undefined);
+    }
     yield* Deferred.await(cancelReceived);
     yield* runtime.request("_test/finish-cancel", {});
     const received = NodeFS.readFileSync(requestLogPath, "utf8")
@@ -1397,6 +1452,45 @@ describe("AcpSessionRuntime", () => {
           Exit.succeed({ stopReason: "cancelled", _meta: { nativeCancel: true } }),
         );
         expect(slow.offloadedLines > 0).toBe(workers > 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each(
+    (["interrupt", "wait-for-prompt"] as const).flatMap((cancelBehavior) =>
+      [0, 2].flatMap((workers) =>
+        (
+          [
+            { in: "protocol-log", cancelOn: "dispatch" },
+            { in: "protocol-log", cancelOn: "call" },
+            { in: "scheduler", cancelOn: "dispatch" },
+          ] as const
+        ).map((holdPrompt) => ({ cancelBehavior, workers, holdPrompt })),
+      ),
+    ),
+  )(
+    "writes session/prompt before a cancel issued while the prompt is held in the $holdPrompt.in ($cancelBehavior, $workers workers, cancel on $holdPrompt.cancelOn)",
+    ({ cancelBehavior, workers, holdPrompt }) =>
+      Effect.gen(function* () {
+        const records: Array<ReturnType<typeof recordRequest>> = [];
+        const run = yield* promptThenCancel({
+          cancelBehavior,
+          workers,
+          holdPrompt,
+          requestLogger: (event) =>
+            Effect.sync(() => {
+              records.push(recordRequest(event));
+            }),
+        });
+        expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
+        expect(
+          recordsByRequest(records)
+            .get("session/prompt")
+            ?.map(({ status }) => status),
+        ).toEqual(["started", "succeeded"]);
+        expect(run.promptExit).toEqual(
+          Exit.succeed({ stopReason: "cancelled", _meta: { nativeCancel: true } }),
+        );
+        expect(run.offloadedLines > 0).toBe(workers > 0);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 

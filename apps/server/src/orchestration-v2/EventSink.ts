@@ -92,6 +92,14 @@ export interface EventSinkV2Shape {
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
+  /**
+   * Runs each step and writes its events, in order, in one transaction. A step reads on that
+   * transaction, so it sees what earlier steps wrote. Any failure rolls back every step.
+   */
+  readonly writeSteps: <E>(input: {
+    readonly guardPendingUserInputCancellations?: boolean;
+    readonly steps: ReadonlyArray<Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, E>>;
+  }) => Effect.Effect<ReadonlyArray<ReadonlyArray<OrchestrationV2StoredEvent>>, EventSinkV2Error>;
   readonly writeIfRunCurrent: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
@@ -352,12 +360,15 @@ const layerBase: Layer.Layer<
       );
     };
 
-    const applyStoredEvents =
+    const applyProjections = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) =>
+      Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
+        concurrency: 1,
+        discard: true,
+      });
+
+    const recordProjectedSequence =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(function* (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) {
-        yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
-          concurrency: 1,
-        });
         const sequence = storedEvents.at(-1)?.sequence;
         if (sequence !== undefined) {
           const now = DateTime.formatIso(yield* DateTime.now);
@@ -383,6 +394,13 @@ const layerBase: Layer.Layer<
         }
         // Read lineage here, on the connection this transaction holds; see makeRunOutcomeRecorder.
         return yield* runOutcomes.prepare(storedEvents);
+      });
+
+    const applyStoredEvents =
+      /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
+      Effect.fnUntraced(function* (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) {
+        yield* applyProjections(storedEvents);
+        return yield* recordProjectedSequence(storedEvents);
       });
 
     // The enclosing write or commit span already traces this per-event projection merge.
@@ -459,6 +477,44 @@ const layerBase: Layer.Layer<
           }),
       );
       return committed;
+    });
+
+    const writeStepsEffect = Effect.fn("orchestrationV2.EventSink.writeSteps")(function* (input: {
+      readonly guardPendingUserInputCancellations?: boolean;
+      readonly steps: ReadonlyArray<
+        Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, unknown>
+      >;
+    }) {
+      const { stored, committed } = yield* commitThenPublish(
+        Effect.gen(function* () {
+          const stored: Array<ReadonlyArray<OrchestrationV2StoredEvent>> = [];
+          for (const step of input.steps) {
+            const events = yield* step;
+            if (events.length === 0) {
+              stored.push([]);
+              continue;
+            }
+            const normalized = yield* normalizeEvents(
+              input.guardPendingUserInputCancellations === true
+                ? yield* guardUserInputCancellations(events)
+                : events,
+            );
+            const committed = yield* eventStore.append({ events: normalized });
+            yield* applyProjections(committed);
+            stored.push(committed);
+          }
+          const committed = stored.flat();
+          const outcomes = yield* recordProjectedSequence(committed);
+          return { stored, committed, outcomes };
+        }).pipe(Effect.withTracerEnabled(false)),
+        ({ committed, outcomes }) => publishStoredEvents(committed, outcomes),
+      );
+      yield* Effect.annotateCurrentSpan({
+        "orchestration_v2.step_count": input.steps.length,
+        "orchestration_v2.event_count": committed.length,
+        "orchestration_v2.thread_id": committed[0]?.event.threadId ?? null,
+      });
+      return stored;
     });
 
     const writeIfRunCurrentEffect = Effect.fn("orchestrationV2.EventSink.writeIfRunCurrent")(
@@ -898,6 +954,12 @@ const layerBase: Layer.Layer<
                 ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                 cause,
               }),
+          ),
+        ),
+      writeSteps: (input) =>
+        writeStepsEffect(input).pipe(
+          Effect.mapError(
+            (cause) => new EventSinkWriteError({ eventCount: input.steps.length, cause }),
           ),
         ),
       writeIfRunCurrent: (input) =>

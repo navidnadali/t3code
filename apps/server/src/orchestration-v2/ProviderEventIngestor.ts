@@ -26,6 +26,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SqlError from "effect/sql/SqlError";
 
@@ -310,7 +311,47 @@ export interface ProviderEventIngestorV2Shape {
       };
     },
   ) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, ProviderEventIngestorV2Error>;
+  /**
+   * Ingests events in order, as `ingestNormalized` would one by one, but writes each run of
+   * `canIngestInBatch` events in one transaction. Returns each event's stored events.
+   */
+  readonly ingestNormalizedBatch: (input: {
+    readonly events: ReadonlyArray<ProviderEventIngestInput>;
+    /** How many events were queued for the caller when it took these, recorded on the span. */
+    readonly queued?: number;
+  }) => Effect.Effect<
+    ReadonlyArray<ReadonlyArray<OrchestrationV2StoredEvent>>,
+    ProviderEventIngestorV2Error
+  >;
 }
+
+// Their normalization reads only through the write transaction, and nothing after the write
+// takes a lock or can fail, so a rolled-back batch can be written again event by event.
+const BATCHABLE_EVENT_TYPES = new Set<ProviderAdapter.ProviderAdapterV2Event["type"]>([
+  "provider_session.updated",
+  "provider_turn.updated",
+  "node.updated",
+  "message.updated",
+  "turn_item.updated",
+  "runtime_request.updated",
+  "plan.updated",
+]);
+
+export const canIngestInBatch = (event: ProviderAdapter.ProviderAdapterV2Event): boolean =>
+  BATCHABLE_EVENT_TYPES.has(event.type);
+
+const MAX_PROVIDER_EVENT_BATCH = 1000;
+
+function providerEventBatchLimitFromEnv(env: Readonly<Record<string, string | undefined>>): number {
+  const value = Number(env.T3CODE_PROVIDER_EVENT_BATCH_MAX ?? "");
+  return Number.isSafeInteger(value) && value > 1 ? Math.min(value, MAX_PROVIDER_EVENT_BATCH) : 1;
+}
+
+/** Most provider events a run writes per transaction; 1 (the default) writes each on its own. */
+export const ProviderEventBatchLimit = Context.Reference<number>(
+  "t3/orchestration-v2/ProviderEventIngestor/ProviderEventBatchLimit",
+  { defaultValue: () => providerEventBatchLimitFromEnv(process.env) },
+);
 
 export class ProviderEventIngestorV2 extends Context.Service<
   ProviderEventIngestorV2,
@@ -756,8 +797,98 @@ export const layer: Layer.Layer<
           ),
       );
 
-    return ProviderEventIngestorV2.of({
+    // Runs after every ingested event; the enclosing operation owns the span.
+    const recordCompletedTurn = Effect.fnUntraced(function* (
+      input: ProviderEventIngestInput,
+      storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>,
+    ) {
+      if (storedEvents.length === 0 || input.event.type !== "provider_turn.updated") return;
+      const providerTurn = input.event.providerTurn;
+      if (
+        providerTurn.status !== "completed" &&
+        providerTurn.status !== "failed" &&
+        providerTurn.status !== "interrupted" &&
+        providerTurn.status !== "cancelled"
+      )
+        return;
+      const key = `${input.providerInstanceId}:${providerTurn.id}`;
+      if (completedTurnAnalytics.has(key)) return;
+      completedTurnAnalytics.add(key);
+      if (completedTurnAnalytics.size > 4096) {
+        const oldest = completedTurnAnalytics.values().next().value;
+        if (oldest !== undefined) completedTurnAnalytics.delete(oldest);
+      }
+      yield* analytics.record(
+        providerTurnAnalyticsProperties({
+          driver: input.event.driver,
+          providerTurn,
+          ...(input.analyticsContext === undefined ? {} : { context: input.analyticsContext }),
+        }),
+      );
+    });
+
+    // Runs once per batch inside ingestNormalizedBatch's span.
+    const writeBatch = Effect.fnUntraced(function* (
+      inputs: ReadonlyArray<ProviderEventIngestInput>,
+    ) {
+      const written = yield* timeProviderIoStage(
+        stageTiming?.forProvider(inputs[0]!.event.driver),
+        "ingest",
+        0,
+        () =>
+          eventSink
+            .writeSteps({
+              guardPendingUserInputCancellations: true,
+              steps: inputs.map((input) => normalize(input)),
+            })
+            .pipe(Effect.result),
+      );
+      if (Result.isFailure(written)) {
+        // Nothing committed; one by one, each event commits or fails as it would alone.
+        yield* Effect.logWarning("orchestration-v2.provider-event-batch-write-failed", {
+          providerSessionId: inputs[0]?.providerSessionId,
+          eventCount: inputs.length,
+          cause: written.failure,
+        });
+        return yield* Effect.forEach(inputs, (input) => ingestor.ingestNormalized(input));
+      }
+      yield* Effect.forEach(inputs, (input, index) =>
+        recordCompletedTurn(input, written.success[index] ?? []),
+      );
+      return written.success;
+    });
+
+    const ingestNormalizedBatch: ProviderEventIngestorV2Shape["ingestNormalizedBatch"] = Effect.fn(
+      "ProviderEventIngestor.ingestNormalizedBatch",
+    )(function* ({ events, queued }) {
+      yield* Effect.annotateCurrentSpan({
+        "orchestration_v2.ingest.batch_events": events.length,
+        ...(queued === undefined ? {} : { "orchestration_v2.ingest.queued": queued }),
+      });
+      const stored: Array<ReadonlyArray<OrchestrationV2StoredEvent>> = [];
+      let start = 0;
+      while (start < events.length) {
+        let end = start;
+        while (
+          end < events.length &&
+          events[end]!.commandId === undefined &&
+          canIngestInBatch(events[end]!.event)
+        )
+          end++;
+        if (end - start > 1) {
+          stored.push(...(yield* writeBatch(events.slice(start, end))));
+          start = end;
+        } else {
+          stored.push(yield* ingestor.ingestNormalized(events[start]!));
+          start++;
+        }
+      }
+      return stored;
+    });
+
+    const ingestor = ProviderEventIngestorV2.of({
       normalize,
+      ingestNormalizedBatch,
       ingestNormalized:
         /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
         Effect.fnUntraced(
@@ -877,36 +1008,7 @@ export const layer: Layer.Layer<
                       ),
                     ),
               ),
-              Effect.tap((storedEvents) =>
-                Effect.gen(function* () {
-                  if (storedEvents.length === 0 || input.event.type !== "provider_turn.updated")
-                    return;
-                  const providerTurn = input.event.providerTurn;
-                  if (
-                    providerTurn.status !== "completed" &&
-                    providerTurn.status !== "failed" &&
-                    providerTurn.status !== "interrupted" &&
-                    providerTurn.status !== "cancelled"
-                  )
-                    return;
-                  const key = `${input.providerInstanceId}:${providerTurn.id}`;
-                  if (completedTurnAnalytics.has(key)) return;
-                  completedTurnAnalytics.add(key);
-                  if (completedTurnAnalytics.size > 4096) {
-                    const oldest = completedTurnAnalytics.values().next().value;
-                    if (oldest !== undefined) completedTurnAnalytics.delete(oldest);
-                  }
-                  yield* analytics.record(
-                    providerTurnAnalyticsProperties({
-                      driver: input.event.driver,
-                      providerTurn,
-                      ...(input.analyticsContext === undefined
-                        ? {}
-                        : { context: input.analyticsContext }),
-                    }),
-                  );
-                }),
-              ),
+              Effect.tap((storedEvents) => recordCompletedTurn(input, storedEvents)),
               (effect) =>
                 input.event.type === "app_thread.created"
                   ? threadCommands.withLock(input.event.appThread.id, effect)
@@ -921,5 +1023,6 @@ export const layer: Layer.Layer<
             ),
         ),
     });
+    return ingestor;
   }),
 );

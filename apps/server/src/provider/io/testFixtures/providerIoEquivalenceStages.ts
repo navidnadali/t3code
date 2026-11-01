@@ -59,8 +59,7 @@ const decodeCodexLine = (line: string) => {
       logs,
     } as const;
   }
-  if (CodexWire.isIncomingResponse(message)) return { type: "response", message, logs } as const;
-  return { type: "unroutable", message, logs } as const;
+  return { type: "response-or-unroutable", message, logs } as const;
 };
 
 export type CodexWireFrame = ReturnType<typeof decodeCodexLine>;

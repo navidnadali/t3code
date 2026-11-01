@@ -30,6 +30,8 @@ import { CLAUDE_AGENT_SDK_STAGE } from "../../provider/io/claudeAgentSdkProtocol
 import * as ProviderIoOffloads from "../../provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "../../provider/io/ProviderIoWorkerPool.ts";
 import { AcpRegistryOrchestratorReplayHarness } from "../Adapters/AcpRegistryAdapterV2.testkit.ts";
+import { FxOrchestratorReplayHarness } from "../Adapters/FxAdapterV2.testkit.ts";
+import { GrokOrchestratorReplayHarness } from "../Adapters/GrokAdapterV2.testkit.ts";
 import * as ClaudeAdapterV2 from "../Adapters/ClaudeAdapterV2.ts";
 import { layerClaudeAgentSdkWorkerPool } from "../Adapters/ClaudeAgentSdkWorkerQuery.ts";
 import { CodexOrchestratorReplayHarness } from "../Adapters/CodexAdapterV2.testkit.ts";
@@ -90,6 +92,8 @@ interface AdapterRow {
   readonly offload: "pending" | "required";
   /** The pool stage that takes this provider's output. */
   readonly stage: string;
+  /** False where the provider's replay writes no native log, so there are no lines to compare. */
+  readonly logs: boolean;
   readonly fixtures?: ReadonlySet<string>;
   /** Compared with 0 workers. */
   readonly modes: ReadonlyArray<WorkerMode>;
@@ -194,13 +198,14 @@ const normalize = (
   tmpRoot: string,
   freshIds: boolean,
 ): Capture => {
-  // Either separator (Windows), repeated where a path sits inside an escaped JSON string.
+  // Either separator (Windows), repeated where a path sits inside an escaped JSON string; a
+  // backtick ends a name too (tool titles quote paths in backticks).
   const separator = String.raw`[\\/]+`;
   const tmpDirectory = new RegExp(
     `(?:${separator}private)?${tmpRoot
       .split(/[\\/]+/u)
       .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
-      .join(separator)}${separator}([^\\\\/\\s"']+)`,
+      .join(separator)}${separator}([^\\\\/\\s"'\`]+)`,
     "gu",
   );
   const tmpNames = new Map<string, string>();
@@ -289,6 +294,7 @@ const adapterRow = <
   readonly path: string;
   readonly offload: AdapterRow["offload"];
   readonly stage: string;
+  readonly logs?: false;
   readonly fixtures?: ReadonlySet<string>;
   readonly modes: AdapterRow["modes"];
   readonly freshIds?: boolean;
@@ -313,6 +319,7 @@ const adapterRow = <
   path: row.path,
   offload: row.offload,
   stage: row.stage,
+  logs: row.logs !== false,
   ...(row.fixtures === undefined ? {} : { fixtures: row.fixtures }),
   modes: row.modes,
   capture: (input, mode) =>
@@ -567,6 +574,21 @@ const ACP_REAL_LOG_STORE_FIXTURES = new Set([
   "turn_interrupt",
 ]);
 
+// These race even in-thread against in-thread, so this table, which runs each mode once, leaves
+// them out: the fast wake's checkpoint lands on either run (1 in 4 runs), and the blocked
+// command's approval request is or is not written as completed (1 in 12).
+const GROK_RACY_IN_THREAD = new Set([
+  "grok_background_bash_fast_wake",
+  "grok_auto_blocked_command",
+]);
+const GROK_FIXTURES = new Set(
+  ORCHESTRATOR_REPLAY_FIXTURES.filter(
+    (fixture) =>
+      !GROK_RACY_IN_THREAD.has(fixture.name) &&
+      fixture.providers.some((provider) => provider.driver === "grok"),
+  ).map((fixture) => fixture.name),
+);
+
 const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "codex",
@@ -598,6 +620,26 @@ const ROWS: ReadonlyArray<AdapterRow> = [
     fixtures: ACP_REAL_LOG_STORE_FIXTURES,
     realLogStore: true,
     harness: replayHarness(AcpRegistryOrchestratorReplayHarness),
+  }),
+  adapterRow({
+    driver: "grok",
+    path: "replay",
+    // Grok and Fx are ACP agents too; Grok's wake handling is sensitive to delivery order.
+    offload: "required",
+    stage: "acp",
+    logs: false,
+    modes: LINE_OFFLOAD_MODES,
+    fixtures: GROK_FIXTURES,
+    harness: replayHarness(GrokOrchestratorReplayHarness),
+  }),
+  adapterRow({
+    driver: "fx",
+    path: "replay",
+    offload: "required",
+    stage: "acp",
+    logs: false,
+    modes: LINE_OFFLOAD_MODES,
+    harness: replayHarness(FxOrchestratorReplayHarness),
   }),
   adapterRow({
     driver: "claudeAgent",
@@ -635,7 +677,7 @@ describe("provider I/O at 0 and 2 workers", () => {
         const inThread = yield* row.capture(input, { name: "0 workers", workers: 0 });
         assert.deepEqual(inThread.pool, {});
         assert.isNotEmpty(inThread.capture.adapterEvents.flat());
-        assert.isNotEmpty(Object.keys(inThread.capture.logLines));
+        if (row.logs) assert.isNotEmpty(Object.keys(inThread.capture.logLines));
         assert.isNotEmpty(Object.keys(inThread.capture.sinkWrites));
         for (const mode of row.modes) {
           const onWorkers = yield* row.capture(input, mode);

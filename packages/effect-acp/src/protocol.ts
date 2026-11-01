@@ -5,12 +5,15 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as Stdio from "effect/Stdio";
 import * as RpcClient from "effect/rpc/RpcClient";
@@ -95,6 +98,22 @@ export interface AcpLineOffload {
   /** Fails when the offload stops working (its worker died); that error then ends the connection. */
   readonly failure: Effect.Effect<never, AcpError.AcpError>;
 }
+
+// Reads queued and not yet handled, at most; past this, stdout is not read further. A replay
+// burst queues ~230 one-line reads; fewer than ~33 drain the pipeline and delay delivery.
+const READ_AHEAD_LIMIT = 256;
+// Raw bytes of those reads, at most (a larger read takes all of it); whichever bound comes first
+// stops reading, so the backlog stays in the pipe. Behind a stalled line pending reads hold 2.3-5.2x
+// their bytes in heap and buffers: 9.6-21 MiB at this budget, 37-83 MiB with 256 reads alone.
+const READ_AHEAD_BYTES = 4 * 1024 * 1024;
+
+// A worker call's outcome, kept so that a failure surfaces at its line, as it would in-thread.
+type OffloadOutcome = Exit.Exit<AcpOffload.OffloadedLine, AcpError.AcpError>;
+
+const noOffloadedLines: Iterator<OffloadOutcome> = [][Symbol.iterator]();
+
+const isOffloaded = (offload: AcpLineOffload, line: string) =>
+  line.length >= offload.minChars && !AcpWire.isBatchLine(line);
 
 export interface AcpPatchedProtocolOptions {
   readonly stdio: AcpStdio;
@@ -701,77 +720,170 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const logIncomingDecoded = (messages: ReadonlyArray<unknown>) =>
     logProtocol({ direction: "incoming", stage: "decoded", payload: messages });
 
-  // Short lines and batches decode with main's parser, so a failure is still the chunk's first.
-  const decodeOffloadedChunk = Effect.fnUntraced(function* (
+  const readChunk = (
+    data: Uint8Array,
+    decode: () => Effect.Effect<ReadonlyArray<AcpWire.WireMessage>, AcpError.AcpError>,
+  ) =>
+    (!options.logIncoming
+      ? Effect.void
+      : timing === undefined
+        ? logIncomingRaw(data)
+        : timeSync(timing, "logShape", () => logIncomingRaw(data))
+    ).pipe(
+      Effect.flatMap(decode),
+      Effect.tap((messages) =>
+        timing === undefined
+          ? logIncomingDecoded(messages)
+          : timeSync(timing, "logShape", () => logIncomingDecoded(messages)),
+      ),
+      Effect.tapErrorTag("AcpProtocolParseError", (error) =>
+        logProtocol({
+          direction: "incoming",
+          stage: "decode_failed",
+          payload: AcpWire.decodeFailureDiagnostics(error),
+        }),
+      ),
+      Effect.flatMap((messages) =>
+        Effect.forEach(messages, routeDecodedMessage, {
+          discard: true,
+        }),
+      ),
+    );
+
+  // Short lines and batches decode with main's parser, in line order, so a failure is still the
+  // chunk's first; `offloaded` holds the long lines' worker outcomes, in the same order.
+  const decodeOffloadedLines = (
+    offload: AcpLineOffload,
+    lines: ReadonlyArray<string>,
+    offloaded: Iterator<OffloadOutcome>,
+  ): Effect.Effect<ReadonlyArray<AcpWire.WireMessage>, AcpError.AcpError> =>
+    Effect.suspend(() => {
+      const messages: Array<AcpWire.WireMessage> = [];
+      // Not a spread: a JSON-RPC batch can hold more messages than a call takes arguments.
+      const append = (decoded: ReadonlyArray<AcpWire.WireMessage>) => {
+        for (const message of decoded) messages.push(message);
+      };
+      for (const line of lines) {
+        const outcome: OffloadOutcome | undefined = isOffloaded(offload, line)
+          ? offloaded.next().value
+          : undefined;
+        if (outcome !== undefined && Exit.isFailure(outcome))
+          return Effect.failCause(outcome.cause);
+        const decoded = outcome?.value;
+        if (decoded?._tag === "Failed") {
+          return Effect.fail(
+            new AcpError.AcpProtocolParseError({
+              operation: "decode-wire-message",
+              cause: decoded.cause,
+            }),
+          );
+        }
+        const result =
+          decoded === undefined || decoded._tag === "InThread"
+            ? AcpWire.decodeWireChunk(parser, `${line}\n`)
+            : AcpWire.normalizeOffloadedMessages(decoded.messages);
+        if (Result.isFailure(result)) return Effect.fail(result.failure);
+        append(result.success);
+      }
+      return Effect.succeed(messages);
+    });
+
+  // A read with no long line is handled where it arrives, as in-thread, unless reads before it
+  // are still pending. A read with long lines sends them to the worker at once and waits in a
+  // queue that a second fiber handles in order, so the next reads arrive at their own pace
+  // instead of each waiting a round trip; one whose lines are back is handled at once.
+  const readAhead = (
     offload: AcpLineOffload,
     split: (bytes: Uint8Array) => ReadonlyArray<string>,
-    data: Uint8Array,
-  ) {
-    const messages: Array<AcpWire.WireMessage> = [];
-    const startedAt = timing?.now() ?? 0;
-    const lines = split(data);
-    timing?.record("framing", timing.now() - startedAt, data.byteLength);
-    // Not a spread: a JSON-RPC batch can hold more messages than a call takes arguments.
-    const append = (decoded: ReadonlyArray<AcpWire.WireMessage>) => {
-      for (const message of decoded) messages.push(message);
-    };
-    const decodeHere = (line: string) =>
-      Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`)).pipe(Effect.map(append));
-    for (const line of lines) {
-      if (line.length < offload.minChars || AcpWire.isBatchLine(line)) {
-        yield* decodeHere(line);
-        continue;
-      }
-      const decoded = yield* timing === undefined
-        ? offload.decode(line)
-        : timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () => offload.decode(line));
-      if (decoded._tag === "InThread") {
-        yield* decodeHere(line);
-        continue;
-      }
-      if (decoded._tag === "Failed") {
-        return yield* new AcpError.AcpProtocolParseError({
-          operation: "decode-wire-message",
-          cause: decoded.cause,
-        });
-      }
-      append(yield* Effect.fromResult(AcpWire.normalizeOffloadedMessages(decoded.messages)));
-    }
-    return messages;
-  });
-
-  yield* options.stdio.stdin.pipe(
-    Stream.runForEach((data) =>
-      (!options.logIncoming
-        ? Effect.void
-        : timing === undefined
-          ? logIncomingRaw(data)
-          : timeSync(timing, "logShape", () => logIncomingRaw(data))
-      ).pipe(
-        Effect.flatMap(() =>
-          lineOffload === undefined || splitLines === undefined
-            ? Effect.fromResult(AcpWire.decodeWireChunk(parser, data))
-            : decodeOffloadedChunk(lineOffload, splitLines, data),
-        ),
-        Effect.tap((messages) =>
-          timing === undefined
-            ? logIncomingDecoded(messages)
-            : timeSync(timing, "logShape", () => logIncomingDecoded(messages)),
-        ),
-        Effect.tapErrorTag("AcpProtocolParseError", (error) =>
-          logProtocol({
-            direction: "incoming",
-            stage: "decode_failed",
-            payload: AcpWire.decodeFailureDiagnostics(error),
+  ) => {
+    // Reads queued and not yet handled, and a slot and their bytes for each, released once it is
+    // handled; reading waits for whichever runs out first, so stdout backs up into the pipe.
+    let pending = 0;
+    const slots = Semaphore.makeUnsafe(READ_AHEAD_LIMIT);
+    const budget = Semaphore.makeUnsafe(READ_AHEAD_BYTES);
+    return Stream.unwrap(
+      Effect.gen(function* () {
+        const reads = yield* Queue.unbounded<
+          {
+            readonly data: Uint8Array;
+            readonly lines: ReadonlyArray<string>;
+            readonly offloaded: Fiber.Fiber<ReadonlyArray<OffloadOutcome>> | undefined;
+            readonly bytes: number;
+          },
+          PlatformError.PlatformError | AcpError.AcpError | Cause.Done
+        >();
+        yield* options.stdio.stdin.pipe(
+          Stream.runForEach(
+            Effect.fnUntraced(function* (data) {
+              const startedAt = timing?.now() ?? 0;
+              const lines = split(data);
+              timing?.record("framing", timing.now() - startedAt, data.byteLength);
+              const long = lines.filter((line) => isOffloaded(offload, line));
+              if (long.length === 0 && pending === 0) {
+                return yield* readChunk(data, () =>
+                  decodeOffloadedLines(offload, lines, noOffloadedLines),
+                );
+              }
+              // A read larger than the budget takes all of it.
+              const bytes = Math.min(data.byteLength, READ_AHEAD_BYTES);
+              yield* Semaphore.take(slots, 1);
+              yield* Semaphore.take(budget, bytes);
+              pending += 1;
+              const offloaded =
+                long.length === 0
+                  ? undefined
+                  : yield* Effect.forEach(
+                      long,
+                      (line) =>
+                        Effect.exit(
+                          timing === undefined
+                            ? offload.decode(line)
+                            : timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () =>
+                                offload.decode(line),
+                              ),
+                        ),
+                      { concurrency: "unbounded" },
+                    ).pipe(Effect.forkScoped);
+              yield* Queue.offer(reads, { data, lines, offloaded, bytes });
+            }),
+          ),
+          Effect.matchCauseEffect({
+            onSuccess: () => Queue.end(reads),
+            onFailure: (cause) => Queue.failCause(reads, cause),
           }),
-        ),
-        Effect.flatMap((messages) =>
-          Effect.forEach(messages, routeDecodedMessage, {
-            discard: true,
+          Effect.forkScoped,
+        );
+        return Stream.fromQueue(reads);
+      }),
+    ).pipe(
+      Stream.runForEach(({ data, lines, offloaded, bytes }) =>
+        (offloaded === undefined ? Effect.succeed([]) : Fiber.join(offloaded)).pipe(
+          Effect.flatMap((results) => {
+            const next = results[Symbol.iterator]();
+            return readChunk(data, () => decodeOffloadedLines(offload, lines, next));
           }),
+          Effect.tap(() =>
+            Effect.suspend(() => {
+              pending -= 1;
+              return Semaphore.release(slots, 1).pipe(
+                Effect.andThen(Semaphore.release(budget, bytes)),
+              );
+            }),
+          ),
         ),
       ),
-    ),
+    );
+  };
+
+  yield* (
+    lineOffload === undefined || splitLines === undefined
+      ? options.stdio.stdin.pipe(
+          Stream.runForEach((data) =>
+            readChunk(data, () => Effect.fromResult(AcpWire.decodeWireChunk(parser, data))),
+          ),
+        )
+      : readAhead(lineOffload, splitLines)
+  ).pipe(
     // Anything that ends the reader, including a defect in a callback it runs,
     // terminates the connection so pending requests fail instead of hanging.
     Effect.matchCauseEffect({

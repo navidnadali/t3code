@@ -260,10 +260,11 @@ const CREDENTIAL_KEY_END =
 const IDENTIFIER = /^[A-Za-z_$@][A-Za-z0-9_$@.:-]{0,63}$/;
 /**
  * A key that holds a credential, so everything under it does: no allowlisted id or name, numbers
- * zeroed. Narrower than CREDENTIAL_NAME: `author`, token counts and token usage are not secrets.
+ * zeroed. Narrower than CREDENTIAL_NAME: `author`, token counts and usage, and a bare `pass` (a test
+ * tally far more often than a password) are not secrets.
  */
 const CREDENTIAL_HOLDER =
-  /password|passwd|passphrase|passcode|secret|credential|cookie|api[_-]?key|access[_-]?key|private[_-]?key|auth(?!or)|token(?!s|[_-]?(?:usage|count|limit|budget|ize))|(?:^|[_.-])(?:key|pass|pwd|pin|otp)(?:$|[_.-])/i;
+  /password|passwd|passphrase|passcode|secret|credential|cookie|api[_-]?key|access[_-]?key|private[_-]?key|auth(?!or)|token(?!s|[_-]?(?:usage|count|limit|budget|ize))|(?:^|[_.-])(?:key|pwd|pin|otp)(?:$|[_.-])/i;
 const CAMEL_HOLDER = /[a-z0-9](?:Pin|Otp|Pwd|Passcode)(?![a-z])/;
 export const holdsCredential = (key: string) =>
   CREDENTIAL_HOLDER.test(key) || CAMEL_HOLDER.test(key);

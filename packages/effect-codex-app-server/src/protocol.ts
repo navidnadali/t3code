@@ -12,7 +12,7 @@ import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
 
 import * as CodexError from "./errors.ts";
-import { JsonRpcId, JsonRpcResponseEnvelope } from "./_internal/shared.ts";
+import { JsonRpcId, JsonRpcResponseEnvelope, timeStage } from "./_internal/shared.ts";
 import * as CodexWire from "./wire.ts";
 const isJsonRpcId = Schema.is(JsonRpcId);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
@@ -23,6 +23,16 @@ export interface CodexAppServerProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
   readonly stage: "raw" | "decoded" | "decode_failed";
   readonly payload: unknown;
+}
+
+/** Optional main-thread timing of incoming frames; unset costs nothing. */
+export interface CodexAppServerStageTiming {
+  readonly now: () => number;
+  readonly record: (
+    stage: "framing" | "json" | "decode" | "adapter",
+    elapsedMs: number,
+    bytes: number,
+  ) => void;
 }
 
 export interface CodexAppServerIncomingNotification {
@@ -44,6 +54,7 @@ export interface CodexAppServerPatchedProtocolOptions {
   // Test override; production uses MAX_INCOMING_MESSAGE_BYTES.
   readonly maxIncomingMessageBytes?: number;
   readonly logger?: (event: CodexAppServerProtocolLogEvent) => Effect.Effect<void, never>;
+  readonly stageTiming?: CodexAppServerStageTiming;
   readonly onNotification?: (
     notification: CodexAppServerIncomingNotification,
   ) => Effect.Effect<void, never>;
@@ -151,6 +162,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const maxIncomingMessageBytes =
       options.maxIncomingMessageBytes ?? CodexWire.MAX_INCOMING_MESSAGE_BYTES;
     const framer = CodexWire.makeLineFramer(maxIncomingMessageBytes);
+    const timing = options.stageTiming;
     const terminationHandled = yield* Ref.make(false);
     const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
     const terminationSignal = yield* Deferred.make<void>();
@@ -366,7 +378,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         stage: "raw",
         payload: line,
       }).pipe(
-        Effect.flatMap(() => decodeWireMessage(line)),
+        Effect.flatMap(() =>
+          timing === undefined
+            ? decodeWireMessage(line)
+            : timeStage(timing, "json", Buffer.byteLength(line, "utf8"), () =>
+                decodeWireMessage(line),
+              ),
+        ),
         Effect.tap((decoded) =>
           logProtocol({
             direction: "incoming",
@@ -389,7 +407,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       Stream.interruptWhen(Deferred.await(terminationSignal)),
       Stream.runForEach(
         Effect.fnUntraced(function* (chunk) {
+          const startedAt = timing?.now() ?? 0;
           const framed = framer.push(chunk);
+          const framingMs = timing === undefined ? 0 : timing.now() - startedAt;
           for (const line of framed.lines) {
             yield* handleLine(line);
           }
@@ -399,6 +419,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
               cause: new Error(`Incoming message exceeded ${maxIncomingMessageBytes} bytes.`),
             });
           }
+          timing?.record("framing", framingMs, chunk.byteLength);
         }),
       ),
       Effect.matchEffect({

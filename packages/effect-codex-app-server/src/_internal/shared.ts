@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import * as CodexError from "../errors.ts";
+import type { CodexAppServerStageTiming } from "../protocol.ts";
 
 export const JsonRpcId = Schema.Union([Schema.Number, Schema.String]);
 
@@ -74,3 +75,22 @@ export const runHandler = Effect.fnUntraced(function* <A, B>(
     ),
   );
 });
+
+/**
+ * Wall time, which is main-thread busy time while the effect does not suspend. Schema decoders
+ * validate when called, so the effect is built inside the timed window.
+ */
+export const timeStage = <A, E, R>(
+  timing: CodexAppServerStageTiming | undefined,
+  stage: Parameters<CodexAppServerStageTiming["record"]>[0],
+  bytes: number,
+  makeEffect: () => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  timing === undefined
+    ? makeEffect()
+    : Effect.suspend(() => {
+        const startedAt = timing.now();
+        return Effect.onExit(makeEffect(), () =>
+          Effect.sync(() => timing.record(stage, timing.now() - startedAt, bytes)),
+        );
+      });

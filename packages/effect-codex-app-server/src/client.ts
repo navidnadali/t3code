@@ -11,7 +11,12 @@ import * as CodexRpc from "./_generated/meta.gen.ts";
 import * as CodexSchema from "./_generated/schema.gen.ts";
 import * as CodexError from "./errors.ts";
 import * as CodexProtocol from "./protocol.ts";
-import { decodeOptionalPayload, encodeOptionalPayload, runHandler } from "./_internal/shared.ts";
+import {
+  decodeOptionalPayload,
+  encodeOptionalPayload,
+  runHandler,
+  timeStage,
+} from "./_internal/shared.ts";
 import { makeChildStdio, makeStderrTail, makeTerminationError } from "./_internal/stdio.ts";
 import * as CodexWire from "./wire.ts";
 
@@ -21,6 +26,7 @@ export interface CodexAppServerClientOptions {
   readonly logger?: (
     event: CodexProtocol.CodexAppServerProtocolLogEvent,
   ) => Effect.Effect<void, never>;
+  readonly stageTiming?: CodexProtocol.CodexAppServerStageTiming;
 }
 
 interface CodexAppServerClientRaw {
@@ -178,12 +184,16 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     const handlers = notificationHandlers.get(notification.method) ?? [];
 
     if (schema) {
-      return Effect.fromResult(
-        CodexWire.decodeNotificationPayload(notification.method, schema, notification.params),
+      return timeStage(options.stageTiming, "decode", 0, () =>
+        Effect.fromResult(
+          CodexWire.decodeNotificationPayload(notification.method, schema, notification.params),
+        ),
       ).pipe(
         Effect.tapError(warnUndecodableNotification),
         Effect.flatMap((decoded) =>
-          Effect.forEach(handlers, (handler) => handler(decoded), { discard: true }),
+          timeStage(options.stageTiming, "adapter", 0, () =>
+            Effect.forEach(handlers, (handler) => handler(decoded), { discard: true }),
+          ),
         ),
         Effect.ignore,
       );
@@ -220,6 +230,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.stageTiming ? { stageTiming: options.stageTiming } : {}),
     onNotification: dispatchNotification,
     onRequest: dispatchRequest,
     onTermination: (error) => Deferred.fail(termination, error).pipe(Effect.asVoid),

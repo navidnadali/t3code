@@ -6,6 +6,7 @@ import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as AcpSchema from "./schema.ts";
 import * as AcpSchemaV1 from "./_generated/schema-v1.gen.ts";
 import * as AcpError from "./errors.ts";
+import type { AcpStageTiming } from "./protocol.ts";
 
 export type WireMessage = RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded;
 
@@ -32,16 +33,29 @@ export const decodeElicitationComplete = Schema.decodeUnknownResult(
 );
 // ndJsonRpc skips lines that are not JSON. A malformed agent line has to end the
 // session, so frames are split here and each one goes through the strict codec.
-export const makeStrictNdJsonRpcParser = () => {
+export const makeStrictNdJsonRpcParser = (timing?: AcpStageTiming) => {
   const codec = RpcSerialization.jsonRpc().makeUnsafe();
   const decoder = new TextDecoder();
   let buffer = "";
   return {
     decode: (bytes: Uint8Array | string): ReadonlyArray<unknown> => {
+      const startedAt = timing?.now() ?? 0;
       buffer += typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
-      return lines.flatMap((line) => codec.decode(line));
+      if (timing === undefined) return lines.flatMap((line) => codec.decode(line));
+      timing.record(
+        "framing",
+        timing.now() - startedAt,
+        typeof bytes === "string" ? Buffer.byteLength(bytes, "utf8") : bytes.byteLength,
+      );
+      return lines.flatMap((line) => {
+        const lineBytes = Buffer.byteLength(line, "utf8");
+        const lineStartedAt = timing.now();
+        const messages = codec.decode(line);
+        timing.record("json", timing.now() - lineStartedAt, lineBytes);
+        return messages;
+      });
     },
     encode: (response: Parameters<typeof codec.encode>[0]) => {
       const encoded = codec.encode(response);

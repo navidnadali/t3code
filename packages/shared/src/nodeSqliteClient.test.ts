@@ -245,6 +245,38 @@ it.effect("waits for another process's lock while the database opens", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+// A page cache size makes the writer read the schema, which needs the lock the open waits for.
+it.effect("waits for another process's lock while the database opens with a page cache size", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-open-" });
+    const filename = path.join(directory, "state.sqlite");
+    const seed = new NodeSqlite.DatabaseSync(filename);
+    seed.exec("PRAGMA journal_mode = WAL; CREATE TABLE entries(name TEXT NOT NULL)");
+    seed.close();
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const holder = yield* spawner.spawn(
+      ChildProcess.make(process.execPath, [
+        "-e",
+        `const db = new (require("node:sqlite").DatabaseSync)(process.argv[1]);
+        db.exec("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE");
+        console.log("held");
+        setTimeout(() => db.close(), 300);`,
+        filename,
+      ]),
+    );
+    yield* Stream.runHead(holder.stdout);
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepEqual(yield* sql`SELECT COUNT(*) FROM entries`.values, [[0]]);
+      assert.deepEqual(yield* sql`PRAGMA cache_size`.values, [[-1024]]);
+    }).pipe(
+      Effect.provide(SqliteClient.layer({ filename, checkpointWorker: true, cacheSizeMb: 1 })),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("reports a transaction blocked by another writer as a lock timeout", () =>
   Effect.gen(function* () {
     const { filename, other } = yield* makeTempDatabase;

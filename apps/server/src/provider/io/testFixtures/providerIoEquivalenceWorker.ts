@@ -6,5 +6,5 @@ import {
   type EquivalenceWorkerVariant,
 } from "./providerIoEquivalenceStages.ts";
 
-const variant: EquivalenceWorkerVariant = NodeWorkerThreads.workerData ?? { framer: "intact" };
+const variant: EquivalenceWorkerVariant = NodeWorkerThreads.workerData ?? { part: "intact" };
 runProviderIoWorker(equivalenceWorkerStages(variant));

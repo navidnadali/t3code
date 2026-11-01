@@ -1,6 +1,4 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as NodeFS from "node:fs";
-import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import type * as NodeWorkerThreads from "node:worker_threads";
 
@@ -13,23 +11,38 @@ import { vi } from "vite-plus/test";
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
 import type { ProviderIoStage } from "./providerIoProtocol.ts";
 import {
-  acpMutantNames,
   acpWireStage,
   claudeSdkLogStage,
-  codexMutantNames,
   codexWireStage,
+  mutantVariants,
   type CodexWireOptions,
   type EquivalenceWorkerVariant,
 } from "./testFixtures/providerIoEquivalenceStages.ts";
+import {
+  ACP_SYNTHETIC_LINES,
+  acpWireLines,
+  below,
+  fuzzInput,
+  inboundFrames,
+  limitInputs,
+  logSizeInputs,
+  materialize,
+  mulberry32,
+  pick,
+  splitPoints,
+  utf8,
+  type FuzzProtocol,
+  type Random,
+} from "./testFixtures/providerIoFuzz.ts";
 
 const workers = vi.hoisted(() => ({
-  variant: { framer: "intact" } as EquivalenceWorkerVariant,
+  variant: { part: "intact" } as EquivalenceWorkerVariant,
   sessions: new Map<object, number>(),
 }));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
-  // Pool workers run the equivalence stages, intact or with one framer broken on purpose.
+  // Pool workers run the equivalence stages, intact or with one rule broken on purpose.
   class EquivalenceWorker extends actual.Worker {
     constructor(..._args: ConstructorParameters<typeof actual.Worker>) {
       super(new URL("./testFixtures/providerIoEquivalenceWorker.ts", import.meta.url), {
@@ -50,9 +63,20 @@ vi.mock("node:worker_threads", async (importOriginal) => {
 
 type Pool = ProviderIoWorkerPool.ProviderIoWorkerPool["Service"];
 
+// Class, message and own fields: a worker that fails with another class or shape must not pass.
+const describeFailure = (error: unknown) =>
+  error instanceof Error
+    ? {
+        name: error.name,
+        constructor: error.constructor.name,
+        message: error.message,
+        fields: { ...error },
+      }
+    : { thrown: NodeUtil.inspect(error) };
+
 interface StageRun {
   readonly outputs: ReadonlyArray<unknown>;
-  readonly failure?: string;
+  readonly failure?: unknown;
 }
 
 interface StageCase {
@@ -61,8 +85,6 @@ interface StageCase {
     pool: Pool,
   ) => Effect.Effect<{ readonly run: StageRun; readonly onWorker: boolean }>;
 }
-
-const messageOf = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
 const runInThread = <Options, Output>(
   stage: ProviderIoStage<Options, Output>,
@@ -79,7 +101,7 @@ const runInThread = <Options, Output>(
     session.end(emit);
     return { outputs };
   } catch (error) {
-    return { outputs, failure: messageOf(error) };
+    return { outputs, failure: describeFailure(error) };
   }
 };
 
@@ -119,8 +141,8 @@ const stageCase = <Options, Output>(
             outputs,
             failure:
               error._tag === "ProviderIoStageError"
-                ? messageOf(error.cause)
-                : `worker stopped: ${messageOf(error.cause)}`,
+                ? describeFailure(error.cause)
+                : { workerStopped: describeFailure(error.cause) },
           }),
         }),
       );
@@ -144,7 +166,7 @@ const describeMismatch = (inThread: StageRun, onWorker: StageRun) => {
   }
   return index < length
     ? `output ${index} (of ${inThread.outputs.length} in-thread, ${onWorker.outputs.length} on a worker): in-thread ${preview(inThread.outputs[index])} / worker ${preview(onWorker.outputs[index])}`
-    : `failure: in-thread ${String(inThread.failure)} / worker ${String(onWorker.failure)}`;
+    : `failure: in-thread ${preview(inThread.failure)} / worker ${preview(onWorker.failure)}`;
 };
 
 interface Comparison {
@@ -180,12 +202,8 @@ const compareAtZeroAndTwoWorkers = (
     return { mismatches, offloaded };
   }).pipe(Effect.scoped);
 
-const assertEquivalent = (comparison: Comparison, cases: number) => {
-  if (comparison.mismatches.length > 0) {
-    assert.fail(
-      `${comparison.mismatches.length} of ${cases} cases differ:\n${comparison.mismatches.slice(0, 3).join("\n")}`,
-    );
-  }
+// Every case ran on a worker and both workers took sessions, so a crashed worker is not a pass.
+const assertOffloaded = (comparison: Comparison, cases: number) => {
   assert.equal(comparison.offloaded, cases, "every case ran on a worker");
   const perWorker = [...workers.sessions.values()];
   assert.equal(perWorker.length, 2);
@@ -195,38 +213,14 @@ const assertEquivalent = (comparison: Comparison, cases: number) => {
   );
 };
 
-function mulberry32(seed: number) {
-  let state = seed;
-  return () => {
-    state = (state + 0x6d2b79f5) | 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-type Random = () => number;
-const below = (random: Random, bound: number) => Math.floor(random() * bound);
-const pick = <A>(random: Random, items: ReadonlyArray<A>): A => items[below(random, items.length)]!;
-
-const encoder = new TextEncoder();
-
-const FIXTURES = NodePath.join(import.meta.dirname, "../../orchestration-v2/testkit/fixtures");
-
-const inboundFrames = (transcript: string) =>
-  NodeFS.readdirSync(FIXTURES, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .flatMap((entry) => {
-      const file = NodePath.join(FIXTURES, entry.name, transcript);
-      if (!NodeFS.existsSync(file)) return [];
-      const frames = NodeFS.readFileSync(file, "utf8")
-        .split("\n")
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line) as { readonly type?: unknown; readonly frame?: unknown })
-        .filter((entry) => entry.type === "emit_inbound")
-        .map((entry) => entry.frame);
-      return [{ fixture: entry.name, frames }];
-    });
+const assertEquivalent = (comparison: Comparison, cases: number) => {
+  if (comparison.mismatches.length > 0) {
+    assert.fail(
+      `${comparison.mismatches.length} of ${cases} cases differ:\n${comparison.mismatches.slice(0, 3).join("\n")}`,
+    );
+  }
+  assertOffloaded(comparison, cases);
+};
 
 const fixedChunks = (bytes: Uint8Array, size: number) =>
   Array.from({ length: Math.ceil(bytes.length / size) }, (_, index) =>
@@ -244,7 +238,7 @@ const randomChunks = (bytes: Uint8Array, random: Random) => {
 };
 
 const fixtureChunkings = (text: string, seed: number) => {
-  const bytes = encoder.encode(text);
+  const bytes = utf8(text);
   return [
     { name: "whole", chunks: [bytes] },
     { name: "4096-byte", chunks: fixedChunks(bytes, 4096) },
@@ -267,33 +261,13 @@ const casesFor = <Options>(
 const codexFixtureCases = () =>
   inboundFrames("codex_transcript.ndjson").flatMap(({ fixture, frames }) => {
     const lines = frames.map((frame) => JSON.stringify(frame));
-    const sizes = lines.map((line) => encoder.encode(line).length).toSorted((a, b) => a - b);
+    const sizes = lines.map((line) => utf8(line).length).toSorted((a, b) => a - b);
     const median = sizes[Math.floor(sizes.length / 2)] ?? 64;
     return casesFor<CodexWireOptions>(fixture, codexWireStage, [
       { name: "lf", text: `${lines.join("\n")}\n`, options: {} },
       { name: "crlf-blank-tail", text: `\r\n \t\n${lines.join("\r\n\n")}`, options: {} },
       { name: "oversize", text: `${lines.join("\n")}\n`, options: { maxLineBytes: median } },
     ]);
-  });
-
-const ACP_SYNTHETIC_LINES = [
-  '{"jsonrpc":"2.0","id":5,"error":{"code":-32000,"message":"denied é"}}',
-  '{"jsonrpc":"2.0","id":7,"error":{"_tag":"Cause","code":-32603,"message":"x","data":[{"_tag":"Die","defect":{"code":-32000,"message":"boom"}}]}}',
-  '{"jsonrpc":"2.0","method":"session/update","params":{}}',
-  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"state_update","state":"idle","error":{"code":1,"message":"m"}}}}',
-  '{"jsonrpc":"2.0","method":"elicitation/complete","params":{"elicitationId":"e1"}}',
-  '{"jsonrpc":"2.0","method":"session/elicitation/complete","params":{"bad":true}}',
-  '{"jsonrpc":"2.0","method":"x/ext","params":{"t":"🙂最"}}',
-  '{"jsonrpc":"2.0","id":"str-1","method":"x/ext-request","params":{}}',
-];
-
-const acpWireLines = (frames: ReadonlyArray<unknown>) =>
-  frames.map((frame, index) => {
-    const { kind, method, params, result } = frame as Record<string, unknown>;
-    const id = 100 + index;
-    if (kind === "notification") return JSON.stringify({ jsonrpc: "2.0", method, params });
-    if (kind === "request") return JSON.stringify({ jsonrpc: "2.0", id, method, params });
-    return JSON.stringify({ jsonrpc: "2.0", id, result: result ?? null });
   });
 
 const acpFixtureCases = () =>
@@ -321,157 +295,112 @@ const claudeFixtureCases = () =>
   });
 
 it.effect.each([
-  { provider: "Codex", fixtures: 20, cases: codexFixtureCases },
-  { provider: "ACP", fixtures: 10, cases: acpFixtureCases },
-  { provider: "Claude", fixtures: 30, cases: claudeFixtureCases },
-])(
-  "$provider replay fixtures decode to the same frames and log records at 0 and 2 workers",
-  ({ fixtures, cases }) =>
+  ["Codex", 20, codexFixtureCases],
+  ["ACP", 10, acpFixtureCases],
+  ["Claude", 30, claudeFixtureCases],
+] as const)(
+  "%s replay fixtures decode to the same frames and log records at 0 and 2 workers",
+  ([, fixtures, cases]) =>
     Effect.gen(function* () {
       const all = cases();
       assert.isAbove(all.length, fixtures * 4);
-      assertEquivalent(yield* compareAtZeroAndTwoWorkers({ framer: "intact" }, all), all.length);
+      assertEquivalent(yield* compareAtZeroAndTwoWorkers({ part: "intact" }, all), all.length);
     }),
 );
 
 const FUZZ_SEED = 0x2029_f022;
 const FUZZ_CASES = 10_000;
-const MULTIBYTE = ["é", "ß", "€", "最", "🙂", "𝄞", "ࠀ", "�"];
-
-const randomText = (random: Random) =>
-  Array.from({ length: below(random, 12) }, () =>
-    random() < 0.5 ? pick(random, MULTIBYTE) : String.fromCharCode(32 + below(random, 95)),
-  ).join("");
+const LINE_LIMITS = [16, 64, 100, 257];
 
 // Short real frames, so the fuzz mixes known, unknown and malformed payloads.
-const shortLines = (lines: ReadonlyArray<string>) =>
-  lines.filter((line) => encoder.encode(line).length <= 600);
+const recordedLines = (protocol: FuzzProtocol) =>
+  (protocol === "codex"
+    ? inboundFrames("codex_transcript.ndjson").flatMap(({ frames }) =>
+        frames.map((frame) => JSON.stringify(frame)),
+      )
+    : [
+        ...inboundFrames("registry_transcript.ndjson").flatMap(({ frames }) =>
+          acpWireLines(frames),
+        ),
+        ...ACP_SYNTHETIC_LINES,
+      ]
+  ).filter((line) => utf8(line).length <= 600);
 
-const codexFuzzLines = () =>
-  shortLines(
-    inboundFrames("codex_transcript.ndjson").flatMap(({ frames }) =>
-      frames.map((frame) => JSON.stringify(frame)),
-    ),
-  );
-
-const acpFuzzLines = () =>
-  shortLines([
-    ...inboundFrames("registry_transcript.ndjson").flatMap(({ frames }) => acpWireLines(frames)),
-    ...ACP_SYNTHETIC_LINES,
-  ]);
-
-const codexFuzzLine = (random: Random, recorded: ReadonlyArray<string>) => {
-  const roll = random();
-  if (roll < 0.45) return pick(random, recorded);
-  const text = randomText(random);
-  if (roll < 0.7) {
-    return JSON.stringify({
-      method: "item/agentMessage/delta",
-      params: { threadId: "t", turnId: "u", itemId: "i", delta: text },
-    });
-  }
-  if (roll < 0.8) return JSON.stringify({ method: `x/${text}`, params: { text } });
-  if (roll < 0.85) return JSON.stringify({ id: below(random, 9), result: { text } });
-  if (roll < 0.9) return pick(random, ["", " \t", "\r", "[1,2]"]);
-  if (roll < 0.95) return `${text}${"x".repeat(below(random, 300))}`;
-  return `{"id":1,"text":${JSON.stringify(text)}`;
+const caseFor = (
+  protocol: FuzzProtocol,
+  name: string,
+  random: Random,
+  bytes: Uint8Array,
+  maxLineBytes: number | undefined,
+) => {
+  const points = splitPoints(random, bytes);
+  const chunks = materialize(random, bytes, points);
+  const highWaterMark = pick(random, [1, 8, 64, undefined]);
+  const title = `${name} split at ${points.join(",")}`;
+  const options: CodexWireOptions = { maxLineBytes };
+  return {
+    splits: points.length,
+    stageCase:
+      protocol === "acp"
+        ? stageCase(title, acpWireStage, undefined, chunks, highWaterMark)
+        : stageCase(title, codexWireStage, options, chunks, highWaterMark),
+  };
 };
 
-const acpFuzzLine = (random: Random, recorded: ReadonlyArray<string>) => {
-  const roll = random();
-  if (roll < 0.45) return pick(random, recorded);
-  const text = randomText(random);
-  if (roll < 0.8) {
-    return JSON.stringify({
-      jsonrpc: "2.0",
-      method: "session/update",
-      params: {
-        sessionId: "s",
-        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
-      },
-    });
-  }
-  if (roll < 0.95) return JSON.stringify({ jsonrpc: "2.0", method: "x/ext", params: { text } });
-  if (roll < 0.97) return "";
-  return `{"jsonrpc":"2.0","method":${JSON.stringify(text)}`;
-};
-
-// Split points favour the middle of a UTF-8 sequence and the gap between CR and LF.
-const splitPoints = (random: Random, bytes: Uint8Array) => {
-  if (bytes.length < 2) return [];
-  const points = new Set<number>();
-  for (let count = 1 + below(random, Math.min(16, bytes.length - 1)); count > 0; count -= 1) {
-    let point = 1 + below(random, bytes.length - 1);
-    if (random() < 0.5) {
-      for (let step = 0; step < bytes.length; step += 1) {
-        const at = ((point - 1 + step) % (bytes.length - 1)) + 1;
-        if ((bytes[at]! & 0xc0) === 0x80 || (bytes[at - 1] === 0x0d && bytes[at] === 0x0a)) {
-          point = at;
-          break;
-        }
+const fuzzCases = (protocol: FuzzProtocol) => {
+  const random = mulberry32(FUZZ_SEED ^ (protocol === "codex" ? 0x0c0d : 0x0acb));
+  const recorded = recordedLines(protocol);
+  let splits = 0;
+  const cases = Array.from({ length: FUZZ_CASES }, (_, index) => {
+    const { bytes, features } = fuzzInput(random, protocol, recorded);
+    const maxLineBytes =
+      protocol === "codex" && random() < 0.4 ? 16 + below(random, 400) : undefined;
+    const name = `${protocol} fuzz case ${index} (seed ${FUZZ_SEED.toString(16)}; ${features.join(" ") || "plain"}) ${NodeUtil.inspect(Buffer.from(bytes).toString("latin1").slice(0, 300))}`;
+    const made = caseFor(protocol, name, random, bytes, maxLineBytes);
+    splits += made.splits;
+    return made.stageCase;
+  });
+  // Lines at exactly the Codex line limit and one byte over, each split three ways.
+  if (protocol === "codex") {
+    for (const input of limitInputs(LINE_LIMITS)) {
+      for (let chunking = 0; chunking < 3; chunking += 1) {
+        const made = caseFor(protocol, `limit ${input.name}`, random, input.bytes, input.limit);
+        splits += made.splits;
+        cases.push(made.stageCase);
       }
     }
-    points.add(point);
+    for (const input of logSizeInputs()) {
+      for (let chunking = 0; chunking < 2; chunking += 1) {
+        const made = caseFor(protocol, input.name, random, input.bytes, undefined);
+        splits += made.splits;
+        cases.push(made.stageCase);
+      }
+    }
   }
-  return [...points].toSorted((a, b) => a - b);
-};
-
-// Chunks arrive as views into a larger buffer, as owned arrays, or as Node Buffers.
-const materialize = (random: Random, bytes: Uint8Array, points: ReadonlyArray<number>) =>
-  [0, ...points].map((start, index) => {
-    const view = bytes.subarray(start, points[index] ?? bytes.length);
-    const kind = below(random, 3);
-    return kind === 0 ? view : kind === 1 ? view.slice() : Buffer.from(view);
-  });
-
-const fuzzCases = (framer: "codex" | "acp") => {
-  const random = mulberry32(FUZZ_SEED ^ (framer === "codex" ? 0x0c0d : 0x0acb));
-  const recorded = framer === "codex" ? codexFuzzLines() : acpFuzzLines();
-  let splits = 0;
-  const cases = Array.from({ length: FUZZ_CASES }, (_, index): StageCase => {
-    const lines = Array.from({ length: 1 + below(random, 8) }, () =>
-      framer === "codex" ? codexFuzzLine(random, recorded) : acpFuzzLine(random, recorded),
-    );
-    const text = lines
-      .map((line, at) => {
-        const roll = random();
-        if (at === lines.length - 1 && roll < 0.25) return line;
-        return line + (roll < 0.6 ? "\n" : roll < 0.95 ? "\r\n" : "\r\r\n");
-      })
-      .join("");
-    const bytes = encoder.encode(text);
-    const points = splitPoints(random, bytes);
-    splits += points.length;
-    const chunks = materialize(random, bytes, points);
-    const highWaterMark = pick(random, [1, 8, 64, undefined]);
-    const name = `${framer} fuzz case ${index} (seed ${FUZZ_SEED.toString(16)}) ${JSON.stringify(text)} split at ${points.join(",")}`;
-    if (framer === "acp") return stageCase(name, acpWireStage, undefined, chunks, highWaterMark);
-    const maxLineBytes = random() < 0.4 ? 16 + below(random, 400) : undefined;
-    return stageCase(name, codexWireStage, { maxLineBytes }, chunks, highWaterMark);
-  });
   return { cases, splits };
 };
 
-it.effect.each(["codex", "acp"] as const)(
+it.effect.each([["codex"], ["acp"]] as const)(
   "the %s framer gives the same output in-thread and on a worker over 10,000 seeded random splits",
-  (framer) =>
+  ([protocol]) =>
     Effect.gen(function* () {
-      const { cases, splits } = fuzzCases(framer);
+      const { cases, splits } = fuzzCases(protocol);
       assert.isAtLeast(splits, FUZZ_CASES);
-      assertEquivalent(
-        yield* compareAtZeroAndTwoWorkers({ framer: "intact" }, cases),
-        cases.length,
-      );
+      assertEquivalent(yield* compareAtZeroAndTwoWorkers({ part: "intact" }, cases), cases.length);
     }),
 );
 
-it.effect.each([
-  ...codexMutantNames.map((mutant) => ({ framer: "codex" as const, mutant })),
-  ...acpMutantNames.map((mutant) => ({ framer: "acp" as const, mutant })),
-])("fails when the worker's $framer framer $mutant", (variant) =>
-  Effect.gen(function* () {
-    const { cases } = fuzzCases(variant.framer);
-    const comparison = yield* compareAtZeroAndTwoWorkers(variant, cases.slice(0, 2_000));
-    assert.isNotEmpty(comparison.mismatches);
-  }),
+// The fuzz cases each mutant must fail on: its part's own protocol (log mutants: Codex).
+const MUTANT_CASES = 2_500;
+
+it.effect.each(mutantVariants.map((variant) => [variant.part, variant.mutant, variant] as const))(
+  "fails when the worker's %s %s",
+  ([, , variant]) =>
+    Effect.gen(function* () {
+      const { cases } = fuzzCases(variant.part === "acp parser" ? "acp" : "codex");
+      const sample = [...cases.slice(0, MUTANT_CASES), ...cases.slice(FUZZ_CASES)];
+      const comparison = yield* compareAtZeroAndTwoWorkers(variant, sample);
+      assertOffloaded(comparison, sample.length);
+      assert.isNotEmpty(comparison.mismatches);
+    }),
 );

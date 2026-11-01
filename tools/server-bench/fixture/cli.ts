@@ -59,7 +59,7 @@ const sanitiseCommand = Command.make(
           `Sanitised fixture: ${result.destination} (${mib(result.sizeBytes)})`,
           `  start-up work on ${result.threadsWithStartupWork} threads, done in place: ${JSON.stringify(result.restartRecovery)}; deliveries settled ${JSON.stringify(result.deliveriesSettled)}; v1 imports ${JSON.stringify(result.legacyImport)}`,
           `  cleared ${JSON.stringify(result.clearedRows)}`,
-          `  auto-pull off on ${result.autoPullDisabled} projects, auto-settle off on ${result.autoSettleDisabled} threads, pull request links and branch cleared on ${result.pullRequestInputsCleared}, timers cleared on ${result.timersCleared}`,
+          `  auto-pull off on ${result.autoPullDisabled} projects, auto-settle off on ${result.autoSettleDisabled} threads, pull request links and branch cleared on ${result.pullRequestInputsCleared}, snoozes cleared on ${result.snoozesCleared}, usage-limit recovery handled on ${result.limitRecoveriesHandled}`,
           `  event store compacted: ${result.compaction.deletedEventCount} events, ${result.compaction.deletedReceiptCount} receipts`,
           result.mode === "blank"
             ? `  content blanked: ${result.content.changed} values (${result.content.flaggedKept} allowlisted but flagged), ${result.content.keys} keys`
@@ -70,7 +70,7 @@ const sanitiseCommand = Command.make(
     }),
 ).pipe(
   Command.withDescription(
-    "Copy a T3 database with VACUUM INTO, run the server's migrations, drop thread families with live work, a pull request watch or a pending v1 import, clear credentials and queued work (scheduled tasks, outbox, launch workflows, peer links, sessions, pairing, provider runtime, pull request state), turn off auto-pull and auto-settle, compact the event store, blank every string outside the allowlist (see fixture.md), compact, and check both layers.",
+    "Copy a T3 database with VACUUM INTO and run the server's migrations; keep every thread. Clear credentials, links and queued work (sessions, pairing, peer links, provider runtime, scheduled tasks, outbox, launch workflows, webhook requests, pull request state); do the start-up work in place (the server's v1 import and restart recovery, pending deliveries settled, auto-pull, auto-settle, pull request links, snoozes and usage-limit recovery off); compact the event store; blank every string outside the allowlist (see fixture.md); compact; and check the content, P1-002's extended rules, the raw bytes and the start-up work.",
   ),
 );
 

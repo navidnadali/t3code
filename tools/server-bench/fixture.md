@@ -49,15 +49,19 @@ server does it, so the fixture keeps its production scale and a boot writes noth
    `importPendingTranscripts`), then the restart recovery (`ProviderRuntimeRecoveryService.reconcile("startup")`,
    continuation off): active runs, attempts, nodes, provider turns and items cancelled, pending runtime requests
    closed, provider threads idle, sessions stopped, unheld queues held.
-4. Settle what a boot would still deliver, as the server leaves it once delivered (P1-002's production sanitiser
-   is the reference): remote delegated completions lose their pending delivery, subagent completion deliveries
-   are disposed, messages still streaming are final, a finished app-owned subagent child gets its task's result
-   (`[bench fixture] Result withheld…`) and a consumed `subagent_result` transfer to its parent, and a v1
-   transcript the importer cannot copy is marked imported (the server retries it on every start).
+4. Settle what a boot would still deliver or finish, as the server leaves it once done (P1-002's production
+   sanitiser is the reference): remote delegated completions lose their pending delivery, subagent completion
+   deliveries are disposed, messages still streaming are final, a finished app-owned subagent child gets its
+   task's result (`[bench fixture] Result withheld…`) and a consumed `subagent_result` transfer to its parent,
+   and the task, its node and the parent's mirrored item end as the child's run did. What the restart recovery
+   leaves open on purpose is then closed: pending runtime requests (answerable by a message) expire, and nodes,
+   provider turns, items and subagents still pending, running or waiting outside a held queued run are
+   cancelled. A v1 transcript the importer cannot copy is marked imported (the server retries it every start).
 5. Through the server's event sink (one `thread.metadata-updated` per thread, `updatedAt` kept): automatic
    settlement off on every thread the settle sweep could pick (no settle event, hook or `git`), pull request
-   links and the branch cleared (the pull request sync and branch discovery read the host and `git`), usage-limit
-   recovery and snooze timers removed (nothing wakes later).
+   links and the branch cleared (the pull request sync and branch discovery read the host and `git`), snoozes
+   removed, and a usage-limit failure marked handled with auto-resume off (`limitRecovery` set to its run and
+   reset time, as a Stop leaves it), so the recovery worker never picks it.
 6. Run the server's event-store compaction (`ProjectionMaintenance.compactEventStore`), as a first boot would.
    Then the server's own recovery queries must find nothing to resume, recover or deliver, and nothing else may
    be due on start (the list under Self-check), else the run fails here.

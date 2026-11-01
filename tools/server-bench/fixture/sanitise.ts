@@ -282,6 +282,94 @@ const SUBAGENT_RESULT_CHILDREN = `
           AND type = 'subagent_result')))`;
 
 /**
+ * What the restart recovery leaves open on purpose (requests answerable by a message, questions
+ * it converted to them, app-owned delegations), closed as P1-002's sanitiser closes them: nothing
+ * outside a held queued run stays pending, running or waiting.
+ */
+const settleLeftovers = (db: NodeSqlite.DatabaseSync, now: string) => {
+  const changes = (sql: string, ...params: Array<string>) =>
+    Number(db.prepare(sql).run(...params).changes);
+  const queued = `SELECT run_id FROM orchestration_v2_projection_runs WHERE status = 'queued'`;
+  return {
+    requests: changes(
+      `UPDATE orchestration_v2_projection_runtime_requests SET status = 'expired', resolved_at = ?,
+         payload_json = json_set(payload_json, '$.status', 'expired', '$.resolvedAt', ?,
+           '$.responseCapability', json_object('type', 'not_resumable',
+             'reason', 'The server restarted before this runtime request was resolved.'))
+       WHERE status = 'pending'`,
+      now,
+      now,
+    ),
+    nodes: changes(
+      `UPDATE orchestration_v2_projection_nodes SET status = 'cancelled', completed_at = ?,
+         payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?)
+       WHERE status IN ('pending', 'running', 'waiting')
+         AND (run_id IS NULL OR run_id NOT IN (${queued}))`,
+      now,
+      now,
+    ),
+    providerTurns: changes(
+      `UPDATE orchestration_v2_projection_provider_turns SET status = 'cancelled', completed_at = ?,
+         payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?)
+       WHERE status IN ('pending', 'running')`,
+      now,
+      now,
+    ),
+    turnItems: changes(
+      `UPDATE orchestration_v2_projection_turn_items SET status = 'cancelled', updated_at = ?,
+         payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?,
+           '$.updatedAt', ?)
+       WHERE status NOT IN ('completed', 'interrupted', 'failed', 'cancelled')
+         AND (run_id IS NULL OR run_id NOT IN (${queued}))`,
+      now,
+      now,
+      now,
+    ),
+    secretRequests: changes(
+      `UPDATE orchestration_v2_projection_turn_items
+       SET payload_json = json_set(payload_json, '$.secretStatus', 'cancelled')
+       WHERE type = 'secret_request' AND json_extract(payload_json, '$.secretStatus') = 'pending'`,
+    ),
+    subagentItems: changes(
+      `UPDATE orchestration_v2_projection_turn_items
+       SET payload_json = json_set(payload_json, '$.result', ?)
+       WHERE type = 'subagent' AND status = 'cancelled' AND json_type(payload_json, '$.result') IS 'null'`,
+      SETTLED_RESULT,
+    ),
+    providerThreads: changes(
+      `UPDATE orchestration_v2_projection_provider_threads
+       SET status = CASE WHEN status = 'active' THEN 'idle' ELSE status END, updated_at = ?,
+         payload_json = json_set(payload_json, '$.status',
+           CASE WHEN status = 'active' THEN 'idle' ELSE status END,
+           '$.pendingBackgroundTasks', json('[]'), '$.updatedAt', ?)
+       WHERE status = 'active' OR (json_valid(payload_json)
+         AND json_array_length(payload_json, '$.pendingBackgroundTasks') > 0)`,
+      now,
+      now,
+    ),
+    providerSessions: changes(
+      `UPDATE orchestration_v2_projection_provider_sessions SET status = 'stopped', updated_at = ?,
+         payload_json = json_set(payload_json, '$.status', 'stopped', '$.updatedAt', ?,
+           '$.lastError', json('null'))
+       WHERE status NOT IN ('stopped', 'error')`,
+      now,
+      now,
+    ),
+    subagents: changes(
+      `UPDATE orchestration_v2_projection_subagents SET status = 'cancelled', completed_at = ?,
+         updated_at = ?,
+         payload_json = json_set(payload_json, '$.status', 'cancelled', '$.completedAt', ?,
+           '$.updatedAt', ?)
+       WHERE status IN ('pending', 'running', 'waiting')`,
+      now,
+      now,
+      now,
+      now,
+    ),
+  };
+};
+
+/**
  * What a boot would still deliver, settled as the server leaves it once done (as P1-002's
  * sanitiser does): delegated and subagent deliveries closed, streaming messages final, finished
  * subagent children given a result and a consumed transfer, failed v1 transcripts marked imported.
@@ -317,6 +405,7 @@ const settleDeliveries = (db: NodeSqlite.DatabaseSync, now: string) => {
      WHERE json_extract(payload_json, '$.completionDelivery.state') = 'pending'`,
   );
   let results = 0;
+  let closed = 0;
   let transfers = 0;
   let unsettled = 0;
   for (let round = 0; round < 3; round++) {
@@ -333,13 +422,15 @@ const settleDeliveries = (db: NodeSqlite.DatabaseSync, now: string) => {
         .get(child) as { parent: string };
       const run = db
         .prepare(
-          `SELECT run_id, provider,
+          `SELECT run_id, provider, status,
              COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId')) AS instance
            FROM orchestration_v2_projection_runs
            WHERE thread_id = ? AND NOT (status = 'queued' AND json_extract(payload_json, '$.queueHeld') IS 1)
            ORDER BY ordinal DESC LIMIT 1`,
         )
-        .get(child) as { run_id: string; provider: string; instance: string | null } | undefined;
+        .get(child) as
+        | { run_id: string; provider: string; status: string; instance: string | null }
+        | undefined;
       results += changes(
         `UPDATE orchestration_v2_projection_subagents
          SET payload_json = json_set(payload_json, '$.result', ?)
@@ -348,6 +439,54 @@ const settleDeliveries = (db: NodeSqlite.DatabaseSync, now: string) => {
         SETTLED_RESULT,
         child,
       );
+      // The task, its node and the parent's mirrored item end as the child's run did: the restart
+      // recovery leaves app-owned delegations open for the child to close.
+      if (run !== undefined) {
+        const ended =
+          run.status === "completed" || run.status === "failed" ? run.status : "cancelled";
+        const tasks = `SELECT subagent_id FROM orchestration_v2_projection_subagents
+          WHERE child_thread_id = ? AND json_extract(payload_json, '$.origin') = 'app_owned'`;
+        closed += changes(
+          `UPDATE orchestration_v2_projection_subagents SET status = ?, updated_at = ?,
+             completed_at = COALESCE(completed_at, ?),
+             payload_json = json_set(payload_json, '$.status', ?, '$.updatedAt', ?,
+               '$.completedAt', COALESCE(json_extract(payload_json, '$.completedAt'), ?))
+           WHERE subagent_id IN (${tasks}) AND status IN ('idle', 'pending', 'running', 'waiting')`,
+          ended,
+          now,
+          now,
+          ended,
+          now,
+          now,
+          child,
+        );
+        closed += changes(
+          `UPDATE orchestration_v2_projection_nodes SET status = ?, completed_at = COALESCE(completed_at, ?),
+             payload_json = json_set(payload_json, '$.status', ?,
+               '$.completedAt', COALESCE(json_extract(payload_json, '$.completedAt'), ?))
+           WHERE node_id IN (${tasks}) AND status IN ('idle', 'pending', 'running', 'waiting')`,
+          ended,
+          now,
+          ended,
+          now,
+          child,
+        );
+        closed += changes(
+          `UPDATE orchestration_v2_projection_turn_items SET status = ?, updated_at = ?,
+             payload_json = json_set(payload_json, '$.status', ?, '$.updatedAt', ?,
+               '$.completedAt', COALESCE(json_extract(payload_json, '$.completedAt'), ?),
+               '$.result', COALESCE(json_extract(payload_json, '$.result'), ?))
+           WHERE type = 'subagent' AND json_extract(payload_json, '$.subagentId') IN (${tasks})
+             AND status NOT IN ('completed', 'interrupted', 'failed', 'cancelled')`,
+          ended,
+          now,
+          ended,
+          now,
+          now,
+          SETTLED_RESULT,
+          child,
+        );
+      }
       const delivered = db
         .prepare(
           `SELECT 1 FROM orchestration_v2_projection_context_transfers
@@ -418,14 +557,17 @@ const settleDeliveries = (db: NodeSqlite.DatabaseSync, now: string) => {
       );
     }
   }
+  const leftover = settleLeftovers(db, now);
   return {
     delegated,
     deliveries,
     streaming,
     results,
+    closed,
     transfers,
     unsettled,
     transcriptsUnimportable,
+    leftover,
   };
 };
 

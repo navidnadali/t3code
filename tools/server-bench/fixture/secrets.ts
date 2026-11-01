@@ -67,6 +67,8 @@ export const TOKEN_PATTERNS: ReadonlyArray<TokenPattern> = [
     name: "url-credentials",
     pattern:
       /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/[^\s/:@"'\\]{0,256}:(?<secret>[^\s/@"'\\]{1,256})@/g,
+    // A password already masked to `*` is not one.
+    confirm: (match) => /[^*]/.test(match.groups?.secret ?? ""),
   },
 ];
 
@@ -209,9 +211,10 @@ export const redactDecoded = (raw: string, options: DecodedScan): string => {
   const maskMatch = (match: string, ...rest: Array<unknown>) => {
     const groups = rest.at(-1) as { secret?: string } | string;
     const secret = typeof groups === "object" ? groups.secret : undefined;
-    return secret === undefined
-      ? mask(match)
-      : match.slice(0, match.length - secret.length) + mask(secret);
+    if (secret === undefined) return mask(match);
+    // The secret is the last capture but need not end the match (a URL's password precedes `@`).
+    const at = match.lastIndexOf(secret);
+    return match.slice(0, at) + mask(secret) + match.slice(at + secret.length);
   };
   for (const { pattern, confirm } of TOKEN_PATTERNS) {
     out = out.replace(pattern, (match: string, ...rest: Array<unknown>) => {

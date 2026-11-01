@@ -6,7 +6,12 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { EventId, type OrchestrationV2DomainEvent, ThreadId } from "@t3tools/contracts";
+import {
+  EventId,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2LimitRecovery,
+  ThreadId,
+} from "@t3tools/contracts";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 
@@ -93,17 +98,16 @@ export const PULL_REQUEST_THREADS = `
     OR json_type(payload_json, '$.branchPullRequest') NOT IN ('null')
     OR json_type(payload_json, '$.branch') NOT IN ('null'))`;
 
-/** Threads a timer would act on: a usage-limit recovery or a snooze to wake from. */
-const TIMED_THREADS = `
+/** Threads a snooze would wake. */
+const SNOOZED_THREADS = `
   SELECT thread_id FROM orchestration_v2_projection_threads
-  WHERE json_valid(payload_json) AND (
-    json_type(payload_json, '$.limitRecovery') NOT IN ('null')
-    OR json_type(payload_json, '$.snoozedUntil') NOT IN ('null'))`;
+  WHERE json_valid(payload_json) AND json_type(payload_json, '$.snoozedUntil') NOT IN ('null')`;
+const FAR_FUTURE = DateTime.makeUnsafe("9999-01-01T00:00:00.000Z");
 
 /**
  * Per thread a boot would act on, one `thread.metadata-updated` (`updatedAt` kept): auto-settle
- * off, pull request links and branch cleared, limit-recovery and snooze timers removed. Run it
- * after the restart recovery, which turns threads with cancelled runs into settle candidates.
+ * off, pull request links and branch cleared, snooze removed, and a usage-limit failure marked
+ * handled with auto-resume off (as a Stop leaves it), so the recovery worker never picks it.
  */
 export const neutraliseThreads = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -118,9 +122,23 @@ export const neutraliseThreads = Effect.gen(function* () {
     (yield* projections.getSettlementCandidates()).map((thread) => thread.id),
   );
   const linked = yield* rows(PULL_REQUEST_THREADS);
-  const timed = yield* rows(TIMED_THREADS);
+  const snoozed = yield* rows(SNOOZED_THREADS);
+  const limited = new Map<string, OrchestrationV2LimitRecovery>();
+  for (const candidate of yield* projections.getLimitRecoveryCandidates({
+    now: FAR_FUTURE,
+    autoResume: true,
+    snooze: true,
+  })) {
+    if (candidate.latestRunId === null || candidate.usageLimitResetAt == null) continue;
+    limited.set(candidate.id, {
+      runId: candidate.latestRunId,
+      resetAt: candidate.usageLimitResetAt,
+      autoResume: false,
+      snooze: false,
+    });
+  }
   const events: Array<OrchestrationV2DomainEvent> = [];
-  for (const id of new Set([...settling, ...linked, ...timed])) {
+  for (const id of new Set([...settling, ...linked, ...snoozed, ...limited.keys()])) {
     const thread = yield* projections.getThread(ThreadId.make(id)).pipe(Effect.option);
     if (Option.isNone(thread)) continue;
     events.push({
@@ -134,7 +152,8 @@ export const neutraliseThreads = Effect.gen(function* () {
         ...(linked.has(id)
           ? { pullRequests: [], linkedPullRequest: null, branchPullRequest: null, branch: null }
           : {}),
-        ...(timed.has(id) ? { limitRecovery: null, snoozedUntil: null, snoozedAt: null } : {}),
+        ...(snoozed.has(id) ? { snoozedUntil: null, snoozedAt: null } : {}),
+        ...(limited.has(id) ? { limitRecovery: limited.get(id) } : {}),
       },
     });
   }
@@ -144,7 +163,8 @@ export const neutraliseThreads = Effect.gen(function* () {
   return {
     autoSettleDisabled: settling.size,
     pullRequestInputsCleared: linked.size,
-    timersCleared: timed.size,
+    snoozesCleared: snoozed.size,
+    limitRecoveriesHandled: limited.size,
   };
 });
 
@@ -200,9 +220,8 @@ export const recoveryThreadIds = Effect.gen(function* () {
   for (const kind of RECOVERY_KINDS) {
     for (const id of yield* projections.getRecoveryThreadIds(kind)) ids.add(id);
   }
-  const far = DateTime.makeUnsafe("9999-01-01T00:00:00.000Z");
   for (const candidate of yield* projections.getLimitRecoveryCandidates({
-    now: far,
+    now: FAR_FUTURE,
     autoResume: true,
     snooze: true,
   })) {
@@ -259,12 +278,6 @@ const RUNNABLE_QUERIES: ReadonlyArray<readonly [name: string, table: string, que
     "orchestration_v2_projection_threads.pullRequestOrBranch",
     "orchestration_v2_projection_threads",
     `SELECT COUNT(*) AS n FROM (${PULL_REQUEST_THREADS})`,
-  ],
-  [
-    "orchestration_v2_projection_threads.limitRecovery",
-    "orchestration_v2_projection_threads",
-    `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads
-     WHERE json_extract(payload_json, '$.limitRecovery') IS NOT NULL`,
   ],
   [
     "queuedRunsStartable",

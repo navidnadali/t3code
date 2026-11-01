@@ -407,7 +407,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       Stream.interruptWhen(Deferred.await(terminationSignal)),
       Stream.runForEach(
         Effect.fnUntraced(function* (chunk) {
-          const startedAt = timing?.now() ?? 0;
+          const startedAt = timing === undefined ? 0 : timing.now();
           const framed = framer.push(chunk);
           const framingMs = timing === undefined ? 0 : timing.now() - startedAt;
           for (const line of framed.lines) {

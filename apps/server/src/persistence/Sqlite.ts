@@ -46,7 +46,10 @@ const layerSetup = Layer.effectDiscard(
 
 export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (
   dbPath: string,
-  tuning?: { readonly readerPoolSize?: number | undefined },
+  tuning?: Pick<
+    NodeSqliteClient.SqliteClientConfig,
+    "readerPoolSize" | "cacheSizeMb" | "readerCacheSizeMb" | "mmapSizeMb"
+  >,
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -57,9 +60,9 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (
     NodeSqliteClient.layer({
       filename: dbPath,
       readerWorker: true,
-      readerPoolSize: tuning?.readerPoolSize,
       // Run checkpoint fsyncs off the event loop so slow disk flushes cannot stall clients.
       checkpointWorker: true,
+      ...tuning,
       spanAttributes: {
         "db.name": path.basename(dbPath),
         "service.name": "t3code-server",
@@ -75,8 +78,13 @@ export const layerMemory = Layer.provideMerge(
 
 export const layerConfig = Layer.unwrap(
   Effect.gen(function* () {
-    const { dbPath, sqliteReaderPoolSize } = yield* ServerConfig.ServerConfig;
-    yield* initializeV2Database(dbPath);
-    return layerFromPath(dbPath, { readerPoolSize: sqliteReaderPoolSize });
+    const config = yield* ServerConfig.ServerConfig;
+    yield* initializeV2Database(config.dbPath);
+    return layerFromPath(config.dbPath, {
+      readerPoolSize: config.sqliteReaderPoolSize,
+      cacheSizeMb: config.sqliteCacheSizeMb,
+      readerCacheSizeMb: config.sqliteReaderCacheSizeMb,
+      mmapSizeMb: config.sqliteMmapSizeMb,
+    });
   }),
 );

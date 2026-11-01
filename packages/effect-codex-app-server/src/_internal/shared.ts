@@ -77,20 +77,24 @@ export const runHandler = Effect.fnUntraced(function* <A, B>(
 });
 
 /**
- * Wall time, which is main-thread busy time while the effect does not suspend. Schema decoders
- * validate when called, so the effect is built inside the timed window.
+ * Builds the effect where it is called, as when timing is off, and records building it (schema
+ * decoders validate when called) plus running it: wall time, which is main-thread busy time while
+ * the effect does not suspend.
  */
 export const timeStage = <A, E, R>(
   timing: CodexAppServerStageTiming | undefined,
   stage: Parameters<CodexAppServerStageTiming["record"]>[0],
   bytes: number,
   makeEffect: () => Effect.Effect<A, E, R>,
-): Effect.Effect<A, E, R> =>
-  timing === undefined
-    ? makeEffect()
-    : Effect.suspend(() => {
-        const startedAt = timing.now();
-        return Effect.onExit(makeEffect(), () =>
-          Effect.sync(() => timing.record(stage, timing.now() - startedAt, bytes)),
-        );
-      });
+): Effect.Effect<A, E, R> => {
+  if (timing === undefined) return makeEffect();
+  const buildStartedAt = timing.now();
+  const effect = makeEffect();
+  const buildMs = timing.now() - buildStartedAt;
+  return Effect.suspend(() => {
+    const startedAt = timing.now();
+    return Effect.onExit(effect, () =>
+      Effect.sync(() => timing.record(stage, buildMs + timing.now() - startedAt, bytes)),
+    );
+  });
+};

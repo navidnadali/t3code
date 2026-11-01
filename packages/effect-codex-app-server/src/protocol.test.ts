@@ -185,9 +185,11 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
       }),
   );
 
-  it.effect.each([1, 7, 1024])(
-    "preserves JSONL framing and UTF-8 across %i-byte input chunks",
-    (chunkSize) =>
+  it.effect.each(
+    [1, 7, 1024].flatMap((chunkSize) => [false, true].map((timed) => ({ chunkSize, timed }))),
+  )(
+    "preserves JSONL framing and UTF-8 across $chunkSize-byte input chunks (stage timing $timed)",
+    ({ chunkSize, timed }) =>
       Effect.gen(function* () {
         const { stdio, input } = yield* makeInMemoryStdio();
         const notifications: Array<CodexProtocol.CodexAppServerIncomingNotification> = [];
@@ -212,17 +214,18 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
         let framingBytes = 0;
         const jsonFrames: Array<{ readonly elapsedMs: number; readonly bytes: number }> = [];
         const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+        const stageTiming: CodexProtocol.CodexAppServerStageTiming = {
+          now: () => clock,
+          record: (stage, elapsedMs, bytes) => {
+            if (stage === "json") jsonFrames.push({ elapsedMs, bytes });
+            if (stage !== "framing") return;
+            framingMs.push(elapsedMs);
+            framingBytes += bytes;
+          },
+        };
         yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
           stdio,
-          stageTiming: {
-            now: () => clock,
-            record: (stage, elapsedMs, bytes) => {
-              if (stage === "json") jsonFrames.push({ elapsedMs, bytes });
-              if (stage !== "framing") return;
-              framingMs.push(elapsedMs);
-              framingBytes += bytes;
-            },
-          },
+          ...(timed ? { stageTiming } : {}),
           logIncoming: true,
           logger: (event) =>
             Effect.sync(() => {
@@ -258,16 +261,18 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
         assert.deepEqual(rawLines, [firstLine, secondLine, finalLine]);
         assert.deepEqual(
           jsonFrames,
-          [firstLine, secondLine, finalLine].map((line) => ({
-            elapsedMs: 5,
-            bytes: encoder.encode(line).byteLength,
-          })),
+          timed
+            ? [firstLine, secondLine, finalLine].map((line) => ({
+                elapsedMs: 5,
+                bytes: encoder.encode(line).byteLength,
+              }))
+            : [],
         );
         assert.deepEqual(
           framingMs,
-          Array.from({ length: Math.ceil(bytes.byteLength / chunkSize) }, () => 7),
+          timed ? Array.from({ length: Math.ceil(bytes.byteLength / chunkSize) }, () => 7) : [],
         );
-        assert.equal(framingBytes, bytes.byteLength);
+        assert.equal(framingBytes, timed ? bytes.byteLength : 0);
       }),
   );
 

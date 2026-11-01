@@ -254,13 +254,22 @@ export function parseDuration(text: string): number | null {
 /**
  * The innermost cause the server last logged for `threadId` (named as is, or URL-encoded in a run
  * id): its pretty log prints errors as quoted string pieces, and the last `[cause]:` with the
- * lines up to its stack is the provider's own message (a fake's stderr, say).
+ * lines up to its stack is the provider's own message (a fake's stderr, say). Failing that, the
+ * last raw line naming an error, so a new log format degrades instead of losing the cause.
  */
 export function failureCause(log: string, threadId: string): string | null {
   const entries = log.split(/\n(?=\[\d\d:\d\d:\d\d\.\d{3}\] )/u);
   const names = [threadId, encodeURIComponent(threadId)];
+  let fallback: string | null = null;
   for (const entry of entries.toReversed()) {
     if (!names.some((name) => entry.includes(name))) continue;
+    // A format this parser does not know still yields its last raw error line.
+    fallback ??=
+      entry
+        .split("\n")
+        .findLast((line) => /[A-Za-z]Error\b/u.test(line))
+        ?.trim()
+        .slice(0, 500) ?? null;
     // A logged `error:` or `cause:` property starts a cause too, nested `[cause]:` lines or not.
     const lines = entry.split("\n").flatMap((line) => {
       const match = /^\s*(?:(error|cause): )?'(.*)'\s*\+?\s*$/u.exec(line);
@@ -278,7 +287,7 @@ export function failureCause(log: string, threadId: string): string | null {
     }
     return cause.join("; ").replace(/\s*\{$/u, "");
   }
-  return null;
+  return fallback;
 }
 
 /** Items the provider produced: no checkpoints, no workspace preparation step. */

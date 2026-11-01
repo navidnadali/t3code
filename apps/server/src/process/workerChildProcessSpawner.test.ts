@@ -217,6 +217,47 @@ describe("WorkerChildProcessSpawner", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.live.skipIf(!workerPlatform)(
+    "kills the process group of an exited child whose descendant outlives the worker",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const workerSource = WorkerChildProcessSpawner.spawnWorkerSource.replace(
+          'case "stdin":',
+          'case "stdin": throw new Error("worker crashed");',
+        );
+        const workerSpawner = yield* WorkerChildProcessSpawner.make(nodeSpawner, { workerSource });
+        // The leader exits at once; its SIGTERM-ignoring descendant keeps stdout open.
+        const leader = node(
+          `const child = require("node:child_process").spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: ["ignore", "inherit", "ignore"] }); process.stdout.write(String(child.pid)); process.exit(0)`,
+        );
+        let descendant: number | undefined;
+        const kill = vi.spyOn(process, "kill");
+        yield* Effect.gen(function* () {
+          const handle = yield* workerSpawner.spawn(leader);
+          const first = yield* Stream.runHead(Stream.decodeText(handle.stdout));
+          descendant = Number(first._tag === "Some" ? first.value : Number.NaN);
+          expect(yield* handle.exitCode).toBe(0);
+          yield* Stream.run(Stream.make(new Uint8Array([1])), handle.stdin).pipe(Effect.ignore);
+          expect(kill).toHaveBeenCalledWith(-handle.pid, "SIGKILL");
+        }).pipe(
+          Effect.scoped,
+          Effect.ensuring(
+            Effect.sync(() => {
+              kill.mockRestore();
+              if (descendant !== undefined && Number.isInteger(descendant)) {
+                try {
+                  process.kill(descendant, "SIGKILL");
+                } catch {
+                  // Already gone.
+                }
+              }
+            }),
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live("runs the command on the fallback spawner when the worker cannot start", () =>
     Effect.gen(function* () {
       const { calls, spawner } = yield* recordingSpawner;

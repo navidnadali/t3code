@@ -1,0 +1,43 @@
+[23:43:43.236] WARN (#10643): orchestration V2 provider event ingestion failed
+  {
+    runId: 'run:thread:mcp%3A407ac761-5ea4-4809-b09f-886c22d680cc:ordinal:1',
+    cause: 'RunExecutionIngestError: Failed while ingesting orchestration V2 run execution run:thread:mcp%3A407ac761-5ea4-4809-b09f-886c22d680cc:ordinal:1.\n' +
+      '    at file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:281049:95\n' +
+      '    at file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/Effect-BniB5fSx.mjs:10044:96\n' +
+      '    at RunExecutionService.startRootRun (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302189:23)\n' +
+      '    at RunExecutionService.startRootRun (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:280729:50)\n' +
+      '    at ProviderTurnStartService.start (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302571:57)\n' +
+      '    at ProviderTurnStartService.start (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302222:48)\n' +
+      '    at OrchestrationEffectExecutorV2.execute (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302878:30)\n' +
+      '    at OrchestrationEffectExecutorV2.execute (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302547:53)\n' +
+      '    at serverActivation.forkParkedFiber (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:317187:29)\n' +
+      '    at serverActivation.forkParkedFiber (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:141244:25)\n' +
+      '    at ServerRuntimeStartup.startEffectWorkerWithRelay (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:317263:79)\n' +
+      '    at ServerRuntimeStartup.startEffectWorkerWithRelay (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:317186:36) {\n' +
+      '  [cause]: ProviderAdapterEventStreamError: Failed while streaming codex provider session provider-session:provider-instance:codexBench:shared events.\n' +
+      '      at file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:229203:73\n' +
+      '      at file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/Effect-BniB5fSx.mjs:9989:96 {\n' +
+      '    [cause]: CodexAppServerProcessExitedError: Codex App Server process exited with code 1\n' +
+      '        at file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:227470:10\n' +
+      '  }\n' +
+      '}'
+  }
+[23:43:53.035] WARN (#11273): orchestration-v2.acp-prompt-failed
+  {
+    driver: 'acpRegistry',
+    providerSessionId: 'provider-session:provider-instance:acpBench:thread:mcp%3A45b0f4b3-7ac0-44a1-be2e-28a3765d0b7f:dd90c2ab-1ec8-46af-acae-7349864c8d64',
+    providerThreadId: 'provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253A45b0f4b3-7ac0-44a1-be2e-28a3765d0b7f%3Aordinal%3A1',
+    providerTurnId: 'provider-turn:provider:acpRegistry:native-turn:provider-instance%3AacpBench%3A7e21e034-2406-4721-b470-aa566e4aaa93%3Aturn%3A1',
+    cause: 'AcpProcessExitedError: ACP process exited with code 1\n' +
+      '    at Object.onSuccess (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:169851:23)\n' +
+      '    at AcpAdapterV2.startTurn (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:178315:54)\n' +
+      '    at AcpAdapterV2.startTurn (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:178036:30)\n' +
+      '    at AcpAdapterV2.startTurn.transition (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:282133:25)\n' +
+      '    at AcpAdapterV2.startTurn.transition (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:178314:22)\n' +
+      '    at RunExecutionService.startRootRun (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302189:23)\n' +
+      '    at RunExecutionService.startRootRun (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:280729:50)\n' +
+      '    at ProviderTurnStartService.start (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302571:57)\n' +
+      '    at ProviderTurnStartService.start (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302222:48)\n' +
+      '    at OrchestrationEffectExecutorV2.execute (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302878:30)\n' +
+      '    at OrchestrationEffectExecutorV2.execute (definition) (file:///private/var/www/vhosts/t3code-perf-wt/p1-008-bench-codex-acp-load/apps/server/dist/binCli-DRSmVb1j.mjs:302547:53)'
+  }

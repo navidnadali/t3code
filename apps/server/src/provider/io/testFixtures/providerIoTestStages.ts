@@ -66,6 +66,12 @@ export const asyncStage: ProviderIoStage<void, string, string, string, string> =
           host.signal("signalled-in-push");
           return;
         }
+        if (text === "emit-signal-emit") {
+          emit("before-signal");
+          host.signal("signalled-between");
+          emit("after-signal");
+          return;
+        }
         queueMicrotask(() => host.emit(`late:${text}`));
       },
       end: () => {},

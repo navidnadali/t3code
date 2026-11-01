@@ -692,3 +692,21 @@ it.effect("posts an event a stage raises during push after the outputs it emitte
     }),
   ),
 );
+
+it.effect("keeps an event a stage raises during push between the outputs around it", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = yield* openAsync(pool, events);
+      workers.received.length = 0;
+      yield* session.write(bytes("emit-signal-emit"));
+      assert.deepEqual(yield* Stream.runCollect(Stream.take(session.output, 2)), [
+        "before-signal",
+        "after-signal",
+      ]);
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["signalled-between"]);
+      assert.deepEqual(workers.received, ["output", "event", "output", "reply"]);
+    }),
+  ),
+);

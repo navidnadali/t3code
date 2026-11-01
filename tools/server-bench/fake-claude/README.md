@@ -65,8 +65,7 @@ keeps its ordinal) and plays transcript `cycle[(ordinal + BENCH_SEED) % cycle.le
 turns, where the cycle spreads the weights evenly. Whatever ids the server picks, every whole cycle
 of `total weights` sessions plays each transcript exactly `weight` times, and N sessions from a
 fresh state directory play each within one of `N × weight / total weights` (within two when
-`BENCH_SEED` moves the start). Start each run with a fresh state directory (a fresh `homePath` does
-that) and the same seed for the same counts. Every stats line records the session's `ordinal`,
+`BENCH_SEED` moves the start). The load driver (`driver.ts`) owns it: before any session opens it sets each planned bench instance's `BENCH_STATE_DIR` to a fresh `<--out>/fake-state/<instance>`, so runs that restore the same settings replay the same plan. Outside the driver, give every run a fresh one. Use the same seed for the same counts. Every stats line records the session's `ordinal`,
 `transcript`, `turn`, `seed` and the configured `mix`.
 
 The fake loads every transcript in the mix before it reads stdin. A bad knob or transcript makes it

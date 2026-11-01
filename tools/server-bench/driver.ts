@@ -35,7 +35,12 @@ import {
 import { CredentialCallers, readCredentials } from "./driver/sessionMcp.ts";
 import { Recorder } from "./driver/stats.ts";
 import { judgeWindow, type WindowEvidence } from "./driver/verdict.ts";
-import { historyAssignments, sessionsByInstance } from "./providers.ts";
+import {
+  historyAssignments,
+  prepareFakeState,
+  sessionsByInstance,
+  withEnvironment,
+} from "./providers.ts";
 import {
   newId,
   now,
@@ -55,6 +60,7 @@ const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate", "access:
 const LOOP_DELAY_RESOLUTION_MS = 10;
 /** P1-003's fake Claude CLI writes each session's MCP credential into this directory. */
 const CREDENTIALS_ENV = "BENCH_MCP_CREDENTIALS_DIR";
+const STATE_ENV = "BENCH_STATE_DIR";
 
 const log = (message: string) =>
   process.stderr.write(`[driver ${new Date().toISOString()}] ${message}\n`);
@@ -248,6 +254,7 @@ class BenchRun implements RunContext {
   private sessionCallersCreated = 0;
   private sessionCallersAtWindowStart = 0;
   private providerSetup: { readonly credentialsEnvironment?: Record<string, string> } = {};
+  private fakeStateDirectories: Record<string, string> = {};
   /** The sockets sessions send commands and follow their threads on, a few sessions each. */
   private readonly sessionSockets: Array<RpcSocket> = [];
   private readonly startedAtEpochMs = Date.now();
@@ -382,8 +389,9 @@ class BenchRun implements RunContext {
   }
 
   /**
-   * Fails fast on a planned provider instance the server does not have ready, and points each
-   * one's environment at `--session-mcp-credentials` so its fake writes its sessions' credentials.
+   * Fails fast on a planned provider instance the server does not have ready, gives each one a
+   * fresh BENCH_STATE_DIR under --out, and with `--session-mcp-credentials` points its
+   * BENCH_MCP_CREDENTIALS_DIR there so its fake writes its sessions' credentials.
    */
   private async checkProviders(socket: RpcSocket): Promise<void> {
     const { options } = this;
@@ -418,22 +426,38 @@ class BenchRun implements RunContext {
               : null;
       if (problem !== null) throw new FatalError(`provider instance "${instanceId}" ${problem}`);
     }
+    const instances = config.settings.providerInstances ?? {};
+    let stateDirectories: Record<string, string>;
+    try {
+      // Every run's fakes claim their sessions' ordinals afresh, whatever settings it restored.
+      stateDirectories = prepareFakeState(
+        options.out,
+        instanceIds.filter((instanceId) => instances[instanceId] !== undefined),
+      );
+    } catch (error) {
+      throw new FatalError(error instanceof Error ? error.message : String(error));
+    }
+    this.fakeStateDirectories = stateDirectories;
     const directory = options.sessionMcpCredentials;
-    if (directory === null || this.sessionMcpMode() === "off") return;
+    const credentials = directory !== null && this.sessionMcpMode() !== "off";
     const credentialsEnvironment: Record<string, string> = {};
     for (const instanceId of instanceIds) {
-      const instance = config.settings.providerInstances?.[instanceId];
+      const instance = instances[instanceId];
       if (instance === undefined) {
+        if (!credentials) continue;
         throw new FatalError(
           `provider instance "${instanceId}" is built in; give it a settings entry to set ${CREDENTIALS_ENV}`,
         );
       }
       const environment = instance.environment ?? [];
-      if (
-        environment.some((entry) => entry.name === CREDENTIALS_ENV && entry.value === directory)
-      ) {
-        credentialsEnvironment[instanceId] = "already set";
-        continue;
+      const values: Record<string, string> = { [STATE_ENV]: stateDirectories[instanceId]! };
+      if (credentials) {
+        credentialsEnvironment[instanceId] = environment.some(
+          (entry) => entry.name === CREDENTIALS_ENV && entry.value === directory,
+        )
+          ? "already set"
+          : "set by the driver";
+        values[CREDENTIALS_ENV] = directory;
       }
       // Set before any session opens: a Codex app-server keeps the environment it started with.
       // Entries round-trip as the server sent them; redacted secrets keep their stored values.
@@ -444,20 +468,13 @@ class BenchRun implements RunContext {
           providerInstanceMutation: {
             operation: "upsert",
             instanceId,
-            instance: {
-              ...instance,
-              environment: [
-                ...environment.filter((entry) => entry.name !== CREDENTIALS_ENV),
-                { name: CREDENTIALS_ENV, value: directory, sensitive: false },
-              ],
-            },
+            instance: { ...instance, environment: withEnvironment(environment, values) },
           },
         },
         options.callTimeoutMs,
       );
-      credentialsEnvironment[instanceId] = "set by the driver";
     }
-    this.providerSetup = { credentialsEnvironment };
+    if (credentials) this.providerSetup = { credentialsEnvironment };
   }
 
   private async checkScopes(): Promise<void> {
@@ -1007,6 +1024,7 @@ class BenchRun implements RunContext {
         pollMix: Object.fromEntries(options.pollMix),
       },
       sessionsByProvider: sessionsByInstance(options.sessionPlan),
+      fakeStateDirectories: this.fakeStateDirectories,
       timeline: this.timeline,
     };
     if (this.failure !== null) return { ...base, failure: this.failure };

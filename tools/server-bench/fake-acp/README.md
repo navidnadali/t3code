@@ -43,7 +43,7 @@ mode 0600 in a 0700 directory, never logged).
 | --------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `BENCH_ACP_TRANSCRIPT`      | `todo_list`            | The mix: comma-separated `name` or `name:weight` (weight 1 if omitted). A name is a generator in `transcripts/` (`large-tool-payload`), a fixture with a `registry_transcript.ndjson` under `apps/server/src/orchestration-v2/testkit/fixtures/`, or an absolute path. |
 | `BENCH_SEED`                | `0`                    | Rotates where the assignment cycle starts.                                                                                                                                                                                                                             |
-| `BENCH_STATE_DIR`           | `<tmpdir>/t3-fake-acp` | Where sessions claim their ordinals; set a fresh one for each run.                                                                                                                                                                                                     |
+| `BENCH_STATE_DIR`           | `<tmpdir>/t3-fake-acp` | Where sessions claim their ordinals; the load driver sets a fresh one per run.                                                                                                                                                                                         |
 | `BENCH_SPEED`               | `1`                    | Time scale for every wait; `0` never waits.                                                                                                                                                                                                                            |
 | `BENCH_DELTAS_PER_SEC`      | `40`                   | Text chunk rate at speed 1.                                                                                                                                                                                                                                            |
 | `BENCH_MAX_GAP_MS`          | unset                  | Caps every other wait, before `BENCH_SPEED` scales it.                                                                                                                                                                                                                 |
@@ -67,6 +67,7 @@ A session claims the next free ordinal in `BENCH_STATE_DIR` at its first prompt 
 never prompts) and plays transcript `cycle[(ordinal + BENCH_SEED) % cycle.length]`, its prompt
 turns in order, where the cycle spreads the weights evenly (smooth weighted round-robin). The same
 mix, seed and session count from a fresh state directory play the same transcripts and turns.
+The load driver (`driver.ts`) owns it: before any session opens it sets each planned bench instance's `BENCH_STATE_DIR` to a fresh `<--out>/fake-state/<instance>`, so runs that restore the same settings replay the same plan. Outside the driver, give every run a fresh one.
 
 ## Stats
 

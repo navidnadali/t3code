@@ -150,6 +150,9 @@ Drives load against a running scratch T3 server and writes <out>/driver.json. It
 every option but the session plan; sessionsByProvider gives the sessions per provider instance,
 and with --session-mcp-credentials sessionMcp.credentialsEnvironment maps each planned instance
 to "set by the driver" or "already set". --provider defaults to claudeBench, not claudeAgent.
+Before any session opens it sets each planned bench instance's BENCH_STATE_DIR to a fresh,
+owner-only <out>/fake-state/<instance> (and fails when that is not empty), so runs restoring the
+same settings replay the same plan; fakeStateDirectories names them.
 The bearer token comes from T3_BENCH_TOKEN or --token-file; it needs the scopes
 orchestration:read, orchestration:operate and access:write, e.g.
   t3 auth session issue --base-dir <scratch> --token-only \\

@@ -200,6 +200,49 @@ export function historyAssignments<
   return { assignments, switches };
 }
 
+export const FAKE_STATE_DIR = "fake-state";
+
+/**
+ * A fresh, owner-only directory per planned instance under `<out>/fake-state`: a run's sessions
+ * claim their ordinals from 0 whatever settings it restores. A non-empty one is refused, since
+ * reusing it would shift the mix.
+ */
+export function prepareFakeState(
+  out: string,
+  instanceIds: ReadonlyArray<string>,
+): Record<string, string> {
+  const root = NodePath.resolve(out, FAKE_STATE_DIR);
+  if (NodeFS.existsSync(root) && NodeFS.readdirSync(root).length > 0) {
+    throw new ProviderLoadError(`${root} is not empty: give every run its own --out`);
+  }
+  const create = (dir: string) => {
+    NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    NodeFS.chmodSync(dir, 0o700);
+    return dir;
+  };
+  create(root);
+  return Object.fromEntries(
+    instanceIds.map((id) => [id, create(NodePath.join(root, id.replace(/[^\w.-]/gu, "_")))]),
+  );
+}
+
+type InstanceEnvironment = ReadonlyArray<{
+  readonly name: string;
+  readonly value: string;
+  readonly sensitive?: boolean;
+}>;
+
+/** `environment` with `values` set: entries of the same names replaced, the rest kept in order. */
+export function withEnvironment(
+  environment: InstanceEnvironment,
+  values: Readonly<Record<string, string>>,
+): InstanceEnvironment {
+  return [
+    ...environment.filter((entry) => !(entry.name in values)),
+    ...Object.entries(values).map(([name, value]) => ({ name, value, sensitive: false })),
+  ];
+}
+
 /** Sessions per provider instance, the way a run's result names them. */
 export function sessionsByInstance(
   plan: ReadonlyArray<PlannedSession>,
@@ -225,8 +268,6 @@ export interface BenchInstanceOptions {
   readonly node: string;
   /** Each fake appends a JSON line per played turn here (BENCH_STATS_DIR). */
   readonly statsDir: string;
-  /** Each kind claims session ordinals in `<stateDir>/<kind>` (BENCH_STATE_DIR); fresh per run. */
-  readonly stateDir?: string;
   readonly kinds: ReadonlyArray<ProviderKind>;
   readonly knobs?: BenchKnobs;
   readonly transcripts?: Partial<Record<ProviderKind, string>>;
@@ -275,8 +316,6 @@ export function benchProviderInstances(
       environment: environment({
         BENCH_NODE: options.node,
         BENCH_STATS_DIR: options.statsDir,
-        BENCH_STATE_DIR:
-          options.stateDir === undefined ? undefined : NodePath.join(options.stateDir, kind),
         BENCH_SEED: options.knobs?.seed,
         BENCH_SPEED: options.knobs?.speed,
         BENCH_DELTAS_PER_SEC: options.knobs?.deltasPerSec,
@@ -380,14 +419,13 @@ export async function validateBenchInstance(
 const SETTINGS_USAGE = `Usage: node tools/server-bench/providers.ts settings --out <settings.json> --stats-dir <dir> [options]
 
 Adds the replaying bench provider instances to a scratch server's settings.json (created when
-missing, other keys kept) and disables the built-in instances. Write it before the server starts:
-a running Codex app-server is shared by its instance's sessions and keeps the environment it
-started with.
+missing, other keys kept) and disables the built-in instances. Write it before the server
+starts: a running Codex app-server is shared by its instance's sessions and keeps the
+environment it started with. It sets no BENCH_STATE_DIR: the load driver gives each run's fakes a
+fresh one, so restoring these settings for every run replays the same plan.
 
   --kinds LIST              claude,codex,acp (default codex,acp; claude needs fake-claude/claude)
   --seed N                  BENCH_SEED for every fake: where the transcript mix's cycle starts
-  --state-dir DIR           ordinals are claimed in DIR/<kind> (default <stats-dir>/../fake-state);
-                            use a fresh one for every run, so the same counts play the same plan
   --speed X                 BENCH_SPEED for every fake (time scale; 0 never waits)
   --deltas-per-sec N        BENCH_DELTAS_PER_SEC for every fake
   --turn-loops N            BENCH_TURN_LOOPS for every fake
@@ -410,7 +448,6 @@ async function settingsCommand(argv: ReadonlyArray<string>): Promise<void> {
       "stats-dir": { type: "string" },
       kinds: { type: "string", default: "codex,acp" },
       seed: { type: "string" },
-      "state-dir": { type: "string" },
       speed: { type: "string" },
       "deltas-per-sec": { type: "string" },
       "turn-loops": { type: "string" },
@@ -465,9 +502,6 @@ async function settingsCommand(argv: ReadonlyArray<string>): Promise<void> {
     benchDir,
     node: values.node,
     statsDir: NodePath.resolve(values["stats-dir"]),
-    stateDir: NodePath.resolve(
-      values["state-dir"] ?? NodePath.join(values["stats-dir"], "..", "fake-state"),
-    ),
     kinds: kinds as ReadonlyArray<ProviderKind>,
     knobs: {
       seed: values.seed,

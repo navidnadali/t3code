@@ -75,8 +75,8 @@ A thread claims the next free ordinal in `BENCH_STATE_DIR` at `thread/start` (a 
 keeps its ordinal, also across an app-server restart) and plays transcript
 `cycle[(ordinal + BENCH_SEED) % cycle.length]`, its completed turns in order, where the cycle
 spreads the weights evenly (smooth weighted round-robin). Whatever ids the server picks, the same
-mix, seed and thread count from a fresh state directory play the same transcripts and turns; start
-each run with a fresh state directory (a fresh `homePath` does that).
+mix, seed and thread count from a fresh state directory play the same transcripts and turns.
+The load driver (`driver.ts`) owns it: before any session opens it sets each planned bench instance's `BENCH_STATE_DIR` to a fresh `<--out>/fake-state/<instance>`, so runs that restore the same settings replay the same plan. Outside the driver, give every run a fresh one.
 
 ## Stats
 

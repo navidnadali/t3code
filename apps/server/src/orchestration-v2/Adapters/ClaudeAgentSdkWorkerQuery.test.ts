@@ -838,6 +838,11 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       return { list: [...this] };
     }
   }
+  class KeyedJson {
+    toJSON(key: string) {
+      return { continue: true, writtenUnder: key };
+    }
+  }
   class ConvertsToJson {
     readonly #json: unknown;
     constructor(json: unknown) {
@@ -913,6 +918,14 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
         },
       }),
     ),
+    // The SDK spreads canUseTool's answer, which copies an own toJSON into what it writes.
+    permissionCase("answers with its own toJSON", () =>
+      Promise.resolve({
+        behavior: "allow",
+        updatedInput: {},
+        toJSON: () => "written instead",
+      } as never),
+    ),
     permissionCase("answers through a Proxy", () =>
       Promise.resolve({
         behavior: "allow",
@@ -946,6 +959,18 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
         onElicitation: async (...args) => {
           record(args);
           return args[0].message === PROBE ? { action: "decline" } : (null as never);
+        },
+      }),
+      [elicitationRequest("Pick one"), elicitationRequest(PROBE)],
+    ],
+    [
+      "onElicitation answers with a value whose JSON is null",
+      (record) => ({
+        onElicitation: async (...args) => {
+          record(args);
+          return args[0].message === PROBE
+            ? { action: "decline" }
+            : ({ toJSON: () => null } as never);
         },
       }),
       [elicitationRequest("Pick one"), elicitationRequest(PROBE)],
@@ -1018,6 +1043,28 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
                 async (...args) => {
                   record(args);
                   return new ConvertsToJson({ continue: false, stopReason: "converted" }) as never;
+                },
+                async (...args) => {
+                  record(args);
+                  return { continue: true };
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      [hookRequest("hook_0", "toolu-case"), hookRequest("hook_1", PROBE)],
+    ],
+    [
+      "a hook whose toJSON reads the key it is written under",
+      (record) => ({
+        hooks: {
+          PreToolUse: [
+            {
+              hooks: [
+                async (...args) => {
+                  record(args);
+                  return new KeyedJson() as never;
                 },
                 async (...args) => {
                   record(args);

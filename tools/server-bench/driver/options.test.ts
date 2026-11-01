@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { parseDriverOptions, parseDuration, parsePollMix, UsageError } from "./options.ts";
+import {
+  missingScopes,
+  parseDriverOptions,
+  parseDuration,
+  parsePollMix,
+  UsageError,
+} from "./options.ts";
 
 const required = ["--url", "http://127.0.0.1:3773/ignored", "--out", "/tmp/bench"];
 
@@ -121,5 +127,21 @@ describe("parsePollMix", () => {
     expect(() => parsePollMix("thread_list=1")).toThrow(UsageError);
     expect(() => parsePollMix("thread_read=1,thread_read=2")).toThrow("names a call twice");
     expect(() => parsePollMix("thread_read=0")).toThrow("at least one positive weight");
+  });
+});
+
+describe("missingScopes", () => {
+  const base = ["orchestration:read", "orchestration:operate", "access:write"];
+
+  it("asks for settings scopes whenever the driver updates a bench instance, credentials or not", () => {
+    expect(missingScopes(base, { updatesInstances: true })).toEqual([
+      "settings:write",
+      "providers:manage",
+    ]);
+    expect(missingScopes(base, { updatesInstances: false })).toEqual([]);
+    expect(missingScopes(["orchestration:read"], { updatesInstances: false })).toEqual([
+      "orchestration:operate",
+      "access:write",
+    ]);
   });
 });

@@ -34,9 +34,10 @@ export const HELP = `Usage:
 Per ref: restore the pristine fixture into a fresh base dir, start the server, sample it at 1 Hz
 (collect.ts), run the load driver, stop the server, read the trace. --runs rounds, counterbalanced
 (A B, B A, A B ...). An attempt is invalid when the server fails or exits, the driver fails, or,
-unless T3CODE_TRACE_MIN_LEVEL is Warn or above, the trace does not cover the window
-(trace_missing / trace_coverage / trace_stale / trace_rotated_during_read); it is retried in its
-own slot up to --retries times, so the order holds. Then <out>/<label>.result.json (median of the
+unless T3CODE_TRACE_MIN_LEVEL is Warn or above or T3CODE_TRACE_TIMING_ENABLED is false (untimed
+spans; span metrics are then n/a), the trace does not cover the window (trace_missing /
+trace_coverage / trace_stale / trace_rotated_during_read); it is retried in its own slot up to
+--retries times, so the order holds. Then <out>/<label>.result.json (median of the
 valid runs, min/max spread, the attempt order, every attempt's detail) and, with two or more refs,
 <out>/compare.md (the first ref against each other one, via report.ts; a refused comparison
 exits 2).
@@ -137,8 +138,14 @@ const TRACE_PROBLEMS = new Set([
   "trace_stale",
   "trace_rotated_during_read",
 ]);
-/** Below Warn the server writes spans continuously, so a trace problem voids the attempt. */
+/** The values the server's Config.Boolean reads as false. */
+const FALSE_LITERALS = new Set(["false", "no", "off", "0", "n"]);
+/**
+ * Below Warn the server writes timed spans continuously, so a trace problem voids the attempt.
+ * With timing off its spans carry no times and no window can be read from them.
+ */
 export const traceRequired = (env: Readonly<Record<string, string>>) =>
+  !FALSE_LITERALS.has(env.T3CODE_TRACE_TIMING_ENABLED ?? "true") &&
   !["warn", "error", "fatal", "none"].includes(
     (env.T3CODE_TRACE_MIN_LEVEL ?? "Info").trim().toLowerCase(),
   );

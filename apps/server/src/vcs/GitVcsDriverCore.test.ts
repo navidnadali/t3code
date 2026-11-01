@@ -842,12 +842,23 @@ describe("ref and index reads", () => {
     `${details.branch} ${details.branchChanges?.baseRef ?? "-"} +${details.branchChanges?.insertions}`;
   const initMain = (cwd: string) =>
     initRepoWithCommit(cwd).pipe(Effect.andThen(git(cwd, ["branch", "-M", "main"])));
-  const addOrigin = (cwd: string, branches: ReadonlyArray<string>) =>
+  const addRemote = (cwd: string, name: string, branches: ReadonlyArray<string>) =>
     Effect.gen(function* () {
-      const origin = yield* makeTmpDir("git-vcs-driver-origin-");
-      yield* git(origin, ["init", "-q", "--bare"]);
-      yield* git(cwd, ["remote", "add", "origin", origin]);
-      yield* git(cwd, ["push", "-q", "-u", "origin", ...branches]);
+      const remote = yield* makeTmpDir("git-vcs-driver-remote-");
+      yield* git(remote, ["init", "-q", "--bare"]);
+      yield* git(cwd, ["remote", "add", name, remote]);
+      yield* git(cwd, ["push", "-q", "-u", name, ...branches]);
+    });
+  const addOrigin = (cwd: string, branches: ReadonlyArray<string>) =>
+    addRemote(cwd, "origin", branches);
+  // main tracks up/trunk; without it the base falls back to origin/main.
+  const trackUpTrunk = (cwd: string) =>
+    Effect.gen(function* () {
+      yield* addOrigin(cwd, ["main"]);
+      yield* git(cwd, ["branch", "trunk"]);
+      yield* addRemote(cwd, "up", ["trunk"]);
+      yield* git(cwd, ["branch", "-q", "--set-upstream-to=up/trunk", "main"]);
+      return cwd;
     });
 
   it.effect("runs only the status and diff commands on a refresh while refs are unchanged", () =>
@@ -1021,6 +1032,42 @@ describe("ref and index reads", () => {
       ).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect("does not reuse ref results when the refs are not loose files", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { driver, spawned } = yield* makeCountingDriver;
+        const cwd = yield* makeTmpDir();
+        yield* git(cwd, ["init", "-q", "--ref-format=reftable"]);
+        yield* git(cwd, [
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@test.com",
+          "commit",
+          "-q",
+          "--allow-empty",
+          "-m",
+          "initial",
+        ]);
+        // Git takes extensions from the repository's own config file only, not from includes.
+        const include = NodePath.join(yield* makeTmpDir("git-include-"), "storage.inc");
+        NodeFS.writeFileSync(include, "[extensions]\n\trefStorage = files\n");
+        yield* git(cwd, ["config", "include.path", include]);
+        yield* git(cwd, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        const exists = driver.remoteBranchExists({ cwd, remoteName: "origin", refName: "main" });
+        assert.isTrue(yield* exists);
+        assert.isTrue(yield* exists);
+        spawned.length = 0;
+        assert.isTrue(yield* exists);
+        assert.isTrue(spawned.some((args) => args[0] === "show-ref"));
+
+        yield* git(cwd, ["update-ref", "-d", "refs/remotes/origin/main"]);
+
+        assert.isFalse(yield* exists);
+      }),
+    ).pipe(Effect.provide(layerTest)),
+  );
+
   interface RefChange {
     readonly name: string;
     // Prepares the repository at `cwd` and returns the directory to refresh.
@@ -1148,6 +1195,44 @@ describe("ref and index reads", () => {
       before: "main origin/old +0",
       after: "main origin/new +0",
       reused: false,
+    },
+    {
+      name: "tags that make the upstream's short name ambiguous",
+      setup: trackUpTrunk,
+      change: (cwd) =>
+        git(cwd, ["tag", "up/trunk"]).pipe(
+          Effect.andThen(git(cwd, ["tag", "remotes/up/trunk"])),
+          Effect.asVoid,
+        ),
+      before: "main up/trunk +0",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
+      name: "branches that make the upstream's short name ambiguous",
+      setup: trackUpTrunk,
+      change: (cwd) =>
+        git(cwd, ["branch", "up/trunk"]).pipe(
+          Effect.andThen(git(cwd, ["branch", "remotes/up/trunk"])),
+          Effect.asVoid,
+        ),
+      before: "main up/trunk +0",
+      after: "main origin/main +0",
+      reused: true,
+    },
+    {
+      name: "a root ref file that makes the upstream's short name ambiguous",
+      setup: trackUpTrunk,
+      change: (cwd) =>
+        Effect.gen(function* () {
+          const sha = yield* git(cwd, ["rev-parse", "HEAD"]);
+          NodeFS.mkdirSync(NodePath.join(cwd, ".git", "up"));
+          NodeFS.writeFileSync(NodePath.join(cwd, ".git", "up", "trunk"), `${sha}\n`);
+          yield* git(cwd, ["branch", "remotes/up/trunk"]);
+        }),
+      before: "main up/trunk +0",
+      after: "main origin/main +0",
+      reused: true,
     },
     {
       name: "a deleted upstream ref",

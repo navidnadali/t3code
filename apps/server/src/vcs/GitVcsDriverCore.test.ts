@@ -904,6 +904,44 @@ describe("ref and index reads", () => {
       ).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect.each(["GIT_OBJECT_DIRECTORY", "alternates"] as const)(
+    "reads a ref again when its object store changes (%s)",
+    (change) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { driver, spawned } = yield* makeCountingDriver;
+          const source = yield* makeTmpDir();
+          yield* initMain(source);
+          const cwd = NodePath.join(yield* makeTmpDir(), "clone");
+          yield* git(source, ["clone", "-q", "--shared", source, cwd]);
+          const exists = driver.remoteBranchExists({ cwd, remoteName: "origin", refName: "main" });
+          assert.isTrue(yield* exists);
+          assert.isTrue(yield* exists);
+          spawned.length = 0;
+          assert.isTrue(yield* exists);
+          assert.deepStrictEqual(spawned, []);
+
+          if (change === "alternates") {
+            NodeFS.writeFileSync(NodePath.join(cwd, ".git", "objects", "info", "alternates"), "");
+          } else {
+            const objects = yield* makeTmpDir("git-objects-");
+            yield* Effect.acquireRelease(
+              Effect.sync(() => {
+                process.env.GIT_OBJECT_DIRECTORY = objects;
+              }),
+              () => Effect.sync(() => delete process.env.GIT_OBJECT_DIRECTORY),
+            );
+          }
+
+          assert.isFalse(yield* exists);
+          const cold = yield* makeCountingDriver;
+          assert.isFalse(
+            yield* cold.driver.remoteBranchExists({ cwd, remoteName: "origin", refName: "main" }),
+          );
+        }),
+      ).pipe(Effect.provide(layerTest)),
+  );
+
   interface RefChange {
     readonly name: string;
     // Prepares the repository at `cwd` and returns the directory to refresh.
@@ -988,6 +1026,24 @@ describe("ref and index reads", () => {
       before: "main origin/main +0",
       after: "main origin/other +0",
       reused: true,
+    },
+    {
+      name: "a symbolic upstream retargeted",
+      setup: (cwd) =>
+        Effect.gen(function* () {
+          yield* git(cwd, ["branch", "old"]);
+          yield* git(cwd, ["branch", "new"]);
+          yield* addOrigin(cwd, ["main", "old", "new"]);
+          yield* git(cwd, ["symbolic-ref", "refs/remotes/origin/main", "refs/remotes/origin/old"]);
+          return cwd;
+        }),
+      change: (cwd) =>
+        git(cwd, ["symbolic-ref", "refs/remotes/origin/main", "refs/remotes/origin/new"]).pipe(
+          Effect.asVoid,
+        ),
+      before: "main origin/old +0",
+      after: "main origin/new +0",
+      reused: false,
     },
     {
       name: "a deleted upstream ref",

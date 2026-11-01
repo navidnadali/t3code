@@ -13,6 +13,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2DomainEvent,
@@ -323,6 +324,37 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
       assert.throws(() => referenceBody(invalid));
       const error = yield* encodeThreadSnapshotBody(invalid).pipe(Effect.flip);
       assert.isTrue(Schema.isSchemaError(error));
+    }),
+  );
+
+  it.effect("keeps chunks bounded for a large answer with a non-callable toJSON key", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const { snapshotSequence, projection } = yield* projections.getThreadSnapshot(FORK);
+      const at = DateTime.makeUnsafe("2026-10-01T00:00:00.000Z");
+      const snapshot = {
+        snapshotSequence,
+        projection: {
+          ...projectThreadProjectionForWire(projection),
+          runtimeRequests: [
+            {
+              id: RuntimeRequestId.make("runtime-request:snapshot-body"),
+              nodeId: NodeId.make(`node:${parentRun}`),
+              providerTurnId: null,
+              nativeRequestRef: null,
+              kind: "user_input" as const,
+              status: "resolved" as const,
+              responseCapability: { type: "message" as const },
+              createdAt: at,
+              resolvedAt: at,
+              answers: { reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) } },
+            },
+          ],
+        },
+      };
+      const streamed = yield* streamedBody(snapshot);
+      assert.isTrue(streamed.bytes.equals(referenceBody(snapshot)));
+      assert.isAtMost(streamed.largestChunk, 1024 * 1024);
     }),
   );
 });

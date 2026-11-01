@@ -72,7 +72,11 @@ const exceedsChunk = (value: unknown) => {
   let budget = CHUNK_CHARS;
   const visit = (current: unknown): boolean => {
     if (typeof current === "string") return (budget -= current.length + 2) < 0;
-    if (current === null || typeof current !== "object" || "toJSON" in current) {
+    if (
+      current === null ||
+      typeof current !== "object" ||
+      typeof (current as { readonly toJSON?: unknown }).toJSON === "function"
+    ) {
       return (budget -= 32) < 0;
     }
     for (const key in current) {

@@ -3,14 +3,12 @@ import * as Schema from "effect/Schema";
 
 import * as CodexRpc from "./_generated/meta.gen.ts";
 import * as CodexError from "./errors.ts";
-import { JsonRpcId, JsonRpcResponseEnvelope } from "./_internal/shared.ts";
+import { isJsonRpcId, isObject } from "./_internal/shared.ts";
 import type {
   CodexAppServerIncomingNotification,
   CodexAppServerIncomingRequest,
 } from "./protocol.ts";
 
-const isJsonRpcId = Schema.is(JsonRpcId);
-const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 // Bound JSONL lines before joining and parsing; the LF delimiter is excluded.
 export const MAX_INCOMING_MESSAGE_BYTES = 128 * 1024 * 1024;
 
@@ -83,10 +81,6 @@ export const decodeFailedLogPayload = (error: CodexError.CodexAppServerProtocolP
   ...(error.maximumPathDepth === undefined ? {} : { maximumPathDepth: error.maximumPathDepth }),
 });
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
 export function isIncomingRequest(value: unknown): value is CodexAppServerIncomingRequest {
   if (!isObject(value) || typeof value.method !== "string") {
     return false;
@@ -98,10 +92,6 @@ export function isIncomingNotification(
   value: unknown,
 ): value is CodexAppServerIncomingNotification {
   return isObject(value) && typeof value.method === "string" && !("id" in value);
-}
-
-export function isIncomingResponse(value: unknown): value is typeof JsonRpcResponseEnvelope.Type {
-  return isJsonRpcResponseEnvelope(value);
 }
 
 export const decodeNotificationPayload = <A, I>(

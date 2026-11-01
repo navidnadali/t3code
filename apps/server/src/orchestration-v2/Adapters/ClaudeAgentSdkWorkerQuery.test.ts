@@ -1843,6 +1843,48 @@ describe("startClaudeQueryInWorker callbacks", () => {
     }),
   );
 
+  it.effect.each([
+    { call: { name: "toString", args: [{}] } },
+    { call: { name: "hook", hook: ["PreToolUse", 0, "constructor"], args: [{}, "toolu-1", {}] } },
+  ])("answers a request for a callback main does not own with an error: $call.name", ({ call }) =>
+    Effect.gen(function* () {
+      const scripted = yield* startScripted({
+        canUseTool: vi.fn(),
+        hooks: { PreToolUse: [{ hooks: [vi.fn()] }] },
+      });
+      scripted.raise({ type: "callback", id: 0, after: 0, call: call as never });
+      const [answer] = yield* Effect.promise(() =>
+        Promise.race([scripted.notifiedOf("callbackResult"), scripted.notifiedOf("callbackError")]),
+      );
+      assert.deepInclude(answer, { type: "callbackError", id: 0 });
+    }),
+  );
+
+  it.effect(
+    "runs main's callback with main's abort signal, first, whatever the worker relays",
+    () =>
+      Effect.gen(function* () {
+        const canUseTool = vi.fn(() => new Promise<never>(() => {}));
+        const scripted = yield* startScripted({ canUseTool });
+        scripted.raise({
+          type: "callback",
+          id: 0,
+          after: 0,
+          call: {
+            name: "canUseTool",
+            args: ["Bash", { command: "ls" }, { toolUseID: "toolu-1", signal: "relayed" }],
+          } as never,
+        });
+        const [, , options] = canUseTool.mock.calls[0] as unknown as [
+          unknown,
+          unknown,
+          Record<string, unknown>,
+        ];
+        assert.instanceOf(options.signal, AbortSignal);
+        assert.deepStrictEqual(Object.keys(options), ["signal", "toolUseID"]);
+      }),
+  );
+
   it.effect("ignores a callback request whose id is already running", () =>
     Effect.gen(function* () {
       const canUseTool = vi.fn(() => new Promise<never>(() => {}));

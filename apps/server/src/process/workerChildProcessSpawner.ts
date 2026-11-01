@@ -204,6 +204,7 @@ interface RemoteChild {
   readonly stderr: NodeStream.PassThrough;
   readonly stdin: NodeStream.Writable;
   readonly ended: [boolean, boolean];
+  readonly detached: boolean;
   referenced: boolean;
   closed: boolean;
   killedOnStop: boolean;
@@ -285,20 +286,20 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
       const { child } = entry;
       if (!entry.spawned) {
         entry.callbacks.onError(error);
-      } else if (!Deferred.isDoneUnsafe(child.exitSignal) && child.pid !== undefined) {
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {
-          // A child spawned with detached: false leads no process group.
+      } else if (child.pid !== undefined) {
+        const running = !Deferred.isDoneUnsafe(child.exitSignal);
+        // Descendants can outlive an exited leader in its group; a child spawned with
+        // detached: false leads no group, and once exited its PID may belong to another process.
+        if (child.detached || running) {
           try {
-            process.kill(child.pid, "SIGKILL");
+            process.kill(child.detached ? -child.pid : child.pid, "SIGKILL");
           } catch {
             // Already gone.
           }
         }
-        // Node cannot reap another thread's children: the zombie stays until the server exits.
+        // Node cannot reap another thread's children: a zombie stays until the server exits.
         child.killedOnStop = true;
-        completeExit(entry, null, "SIGKILL");
+        if (running) completeExit(entry, null, "SIGKILL");
       }
       for (const [index, stream] of [child.stdout, child.stderr].entries()) {
         if (!child.ended[index]) stream.destroy(error);
@@ -450,6 +451,7 @@ const makeWorkerHost = (options: { readonly source: string; readonly windowBytes
         },
       }),
       ended: [false, false],
+      detached: spawnOptions.detached === true,
       referenced: true,
       closed: false,
       killedOnStop: false,

@@ -15,8 +15,10 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import { errorTag } from "@t3tools/shared/observability";
+
 import * as ServerConfig from "../../config.ts";
-import { embeddedProviderIoWorkerSource } from "./embeddedProviderIoWorker.ts";
+import { loadEmbeddedProviderIoWorkerSource } from "./embeddedProviderIoWorker.ts";
 import type {
   ProviderIoMainMessage,
   ProviderIoStage,
@@ -25,7 +27,11 @@ import type {
 
 export class ProviderIoWorkerError extends Schema.TaggedError<ProviderIoWorkerError>()(
   "ProviderIoWorkerError",
-  { cause: Schema.Defect() },
+  {
+    reason: Schema.Literals(["spawn-failed", "not-ready", "error", "exit", "message-error"]),
+    exitCode: Schema.optionalKey(Schema.Int),
+    cause: Schema.optionalKey(Schema.Defect()),
+  },
 ) {
   override get message() {
     return "Provider I/O worker stopped.";
@@ -64,11 +70,7 @@ export class ProviderIoWorkerPool extends Context.Service<
     /** None when the pool is off or unavailable; the caller then runs the stage in-thread. */
     readonly open: <Options, Output, E, Request = never, Reply = never>(
       input: ProviderIoOpenInput<Options, Output, E, Request, Reply>,
-    ) => Effect.Effect<
-      Option.Option<ProviderIoSession<Output, E, Request, Reply>>,
-      never,
-      Scope.Scope
-    >;
+    ) => Effect.Effect<Option.Option<ProviderIoSession<Output, E, Request, Reply>>, E, Scope.Scope>;
   }
 >()("t3/provider/io/ProviderIoWorkerPool") {}
 
@@ -90,6 +92,7 @@ interface Slot {
   readonly handshake: Deferred.Deferred<void, ProviderIoWorkerError>;
   readonly sessions: Map<number, SessionHandle>;
   load: number;
+  ready: boolean;
   stopped: boolean;
 }
 
@@ -126,17 +129,21 @@ const describeMessageType = (message: unknown) =>
     ? message.type.slice(0, 64)
     : typeof message;
 
-const reasonOf = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
+// A worker's error text can carry provider data, so logs name only its class and a fixed reason.
+const describeStop = (error: ProviderIoWorkerError) => ({
+  reason: error.reason,
+  ...(error.exitCode === undefined ? {} : { exitCode: error.exitCode }),
+  ...(error.cause === undefined ? {} : { errorTag: errorTag(error.cause) }),
+});
 
-const spawnWorker = () =>
-  embeddedProviderIoWorkerSource === undefined
+const spawnWorker = () => {
+  const source = loadEmbeddedProviderIoWorkerSource();
+  return source === undefined
     ? new NodeWorkerThreads.Worker(new URL("./providerIoWorker.ts", import.meta.url), {
         name: "t3-provider-io",
       })
-    : new NodeWorkerThreads.Worker(embeddedProviderIoWorkerSource, {
-        eval: true,
-        name: "t3-provider-io",
-      });
+    : new NodeWorkerThreads.Worker(source, { eval: true, name: "t3-provider-io" });
+};
 
 // Cloning a view copies its whole backing buffer, so only a chunk that owns its buffer is cloned;
 // any other is copied once and the copy transferred.
@@ -156,12 +163,12 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
   let nextSessionId = 0;
 
   // Called synchronously, so the pool is off before anything else can run; the log follows.
-  const turnOff = (cause: unknown) => {
+  const turnOff = (error: ProviderIoWorkerError) => {
     if (unavailable || closing) return Effect.void;
     unavailable = true;
     return Effect.logWarning(
       "Provider I/O workers unavailable; provider output is handled on the main thread",
-      { reason: reasonOf(cause) },
+      describeStop(error),
     );
   };
 
@@ -173,11 +180,13 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     const sessions = [...slot.sessions.values()];
     slot.sessions.clear();
     for (const session of sessions) session.failWorker(error, !closing);
-    if (sessions.length > 0 && !closing) {
+    // A worker that never became ready is reported by its handshake as the pool turning off.
+    if (slot.ready && !closing) {
       runFork(
-        Effect.logWarning("Provider I/O worker stopped; its sessions failed", {
+        Effect.logWarning("Provider I/O worker stopped", {
+          worker: slot.index,
           sessions: sessions.length,
-          reason: reasonOf(error.cause),
+          ...describeStop(error),
         }),
       );
     }
@@ -194,6 +203,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       return;
     }
     if (message.type === "ready") {
+      slot.ready = true;
       Deferred.doneUnsafe(slot.handshake, Exit.void);
       return;
     }
@@ -225,21 +235,19 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       handshake: Deferred.makeUnsafe(),
       sessions: new Map(),
       load: 0,
+      ready: false,
       stopped: false,
     };
     slots[index] = slot;
     worker.on("message", (message: unknown) => receive(slot, message));
-    worker.on("error", (cause) => stop(slot, new ProviderIoWorkerError({ cause })));
-    worker.on("exit", (code) =>
-      stop(
-        slot,
-        new ProviderIoWorkerError({
-          cause: new Error(`Provider I/O worker exited with code ${code}.`),
-        }),
-      ),
+    worker.on("error", (cause) =>
+      stop(slot, new ProviderIoWorkerError({ reason: "error", cause })),
+    );
+    worker.on("exit", (exitCode) =>
+      stop(slot, new ProviderIoWorkerError({ reason: "exit", exitCode })),
     );
     worker.on("messageerror", (cause) => {
-      stop(slot, new ProviderIoWorkerError({ cause }));
+      stop(slot, new ProviderIoWorkerError({ reason: "message-error", cause }));
       void worker.terminate();
     });
     return slot;
@@ -249,14 +257,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     Deferred.await(slot.handshake).pipe(
       Effect.timeoutOrElse({
         duration: HANDSHAKE_TIMEOUT,
-        orElse: () =>
-          Effect.fail(
-            new ProviderIoWorkerError({
-              cause: new Error(
-                `Provider I/O worker was not ready within ${Duration.toSeconds(HANDSHAKE_TIMEOUT)} s.`,
-              ),
-            }),
-          ),
+        orElse: () => Effect.fail(new ProviderIoWorkerError({ reason: "not-ready" })),
       }),
       Effect.matchEffect({
         onSuccess: () => Effect.logDebug("Provider I/O worker ready", { worker: slot.index }),
@@ -264,7 +265,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
           Effect.suspend(() => {
             stop(slot, error);
             void slot.worker.terminate();
-            return turnOff(error.cause);
+            return turnOff(error);
           }),
       }),
       Effect.forkIn(scope, { startImmediately: true }),
@@ -276,7 +277,9 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     try {
       slot = spawnSlot(index);
     } catch (cause) {
-      return turnOff(cause).pipe(Effect.as(Option.none()));
+      return turnOff(new ProviderIoWorkerError({ reason: "spawn-failed", cause })).pipe(
+        Effect.as(Option.none()),
+      );
     }
     slot.load = load;
     return watchHandshake(slot).pipe(Effect.as(Option.some(slot)));
@@ -315,10 +318,11 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
     if (slot.stopped || unavailable || closing) return Option.none();
     const id = nextSessionId++;
     const highWaterMark = Math.max(1, input.highWaterMark ?? DEFAULT_HIGH_WATER_MARK);
+    // Writes, ends and calls leave in arrival order; only writes need credit.
     const waiters: Array<{
       readonly bytes: number;
       readonly admit: () => void;
-      readonly fail: (effect: Effect.Effect<void, E>) => void;
+      readonly fail: (effect: Effect.Effect<never, E>) => void;
     }> = [];
     const calls = new Map<number, (effect: Effect.Effect<Reply, E>) => void>();
     let nextCallId = 0;
@@ -330,6 +334,15 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
 
     const post = (message: ProviderIoMainMessage, transfer?: ReadonlyArray<ArrayBuffer>) => {
       if (!slot.stopped) slot.worker.postMessage(message, transfer);
+    };
+    // Options and call requests come from the caller and may not survive a structured clone.
+    const postCloned = (message: ProviderIoMainMessage): E | undefined => {
+      try {
+        post(message);
+        return undefined;
+      } catch (cause) {
+        return input.onFailure(new ProviderIoStageError({ stage: input.stage.name, cause }));
+      }
     };
     const send = (chunk: Uint8Array) => {
       outstanding += chunk.byteLength;
@@ -349,11 +362,26 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
         next.admit();
       }
     };
+    // A worker never returns more than was sent; a bogus count must not open the window for good.
     const release = (bytes: number) => {
-      outstanding -= bytes;
+      outstanding = Math.max(0, outstanding - bytes);
       admit();
     };
-    // Checks the window and queues the waiter in one step, so returning credit cannot miss it.
+    // Admits at once or queues, in one step, so returning credit cannot miss the waiter; the
+    // returned cancel also lets whatever queued behind it go.
+    const schedule = (waiter: (typeof waiters)[number]) => {
+      if (waiters.length === 0 && (waiter.bytes === 0 || outstanding < highWaterMark)) {
+        waiter.admit();
+        return () => {};
+      }
+      waiters.push(waiter);
+      return () => {
+        const index = waiters.indexOf(waiter);
+        if (index === -1) return;
+        waiters.splice(index, 1);
+        admit();
+      };
+    };
     const whenAdmitted = (bytes: number, onAdmit: () => void) =>
       Effect.callback<void, E>((resume) => {
         if (failure !== undefined) {
@@ -364,24 +392,15 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
           resume(Effect.interrupt);
           return;
         }
-        if (waiters.length === 0 && (bytes === 0 || outstanding < highWaterMark)) {
-          onAdmit();
-          resume(Effect.void);
-          return;
-        }
-        const waiter = {
+        const cancel = schedule({
           bytes,
           admit: () => {
             onAdmit();
             resume(Effect.void);
           },
           fail: resume,
-        };
-        waiters.push(waiter);
-        return Effect.sync(() => {
-          const index = waiters.indexOf(waiter);
-          if (index !== -1) waiters.splice(index, 1);
         });
+        return Effect.sync(cancel);
       });
     // A session whose output already ended keeps its outputs and its child; only calls fail.
     const fail = (error: ProviderIoWorkerError | ProviderIoStageError, kill: boolean) => {
@@ -390,12 +409,19 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       failure = { error: mapped };
       for (const resume of calls.values()) resume(Effect.fail(mapped));
       calls.clear();
+      for (const waiter of waiters.splice(0)) waiter.fail(Effect.fail(mapped));
       if (finished) return;
       Queue.failCauseUnsafe(queue, Cause.fail(mapped));
-      for (const waiter of waiters.splice(0)) waiter.fail(Effect.fail(mapped));
       if (kill) runFork(input.kill);
     };
 
+    const opened = postCloned({
+      type: "open",
+      session: id,
+      stage: input.stage.name,
+      options: input.options,
+    });
+    if (opened !== undefined) return yield* Effect.fail(opened);
     slot.sessions.set(id, {
       deliver: (outputs, bytes) => {
         if (failure !== undefined || closed) return;
@@ -431,7 +457,6 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
       failWorker: fail,
     });
     if (slot.sessions.size === 1) slot.worker.ref();
-    post({ type: "open", session: id, stage: input.stage.name, options: input.options });
 
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
@@ -466,6 +491,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
           return Arr.flatMap(batches, (batch) => batch.outputs);
         }),
       ),
+      // Queued behind waiting writes, so the stage answers on the state they leave.
       call: (request) =>
         Effect.callback<Reply, E>((resume) => {
           if (failure !== undefined) {
@@ -477,9 +503,19 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
             return;
           }
           const call = nextCallId++;
-          calls.set(call, resume);
-          post({ type: "call", session: id, call, request });
+          const cancel = schedule({
+            bytes: 0,
+            admit: () => {
+              calls.set(call, resume);
+              const failed = postCloned({ type: "call", session: id, call, request });
+              if (failed === undefined) return;
+              calls.delete(call);
+              resume(Effect.fail(failed));
+            },
+            fail: resume,
+          });
           return Effect.sync(() => {
+            cancel();
             calls.delete(call);
           });
         }),

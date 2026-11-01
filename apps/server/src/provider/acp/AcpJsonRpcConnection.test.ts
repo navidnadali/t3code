@@ -74,6 +74,7 @@ const isOutgoingPrompt = (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
 // has answered a later request, or its fiber yields every few operations.
 const promptThenCancel = (input: {
   readonly cancelBehavior: "interrupt" | "wait-for-prompt";
+  readonly interruptPromptOnCancel?: boolean;
   readonly workers: number;
   readonly requestLogger: NonNullable<AcpSessionRuntime.AcpSessionRuntimeOptions["requestLogger"]>;
   readonly releaseLog?: Effect.Effect<void>;
@@ -108,7 +109,7 @@ const promptThenCancel = (input: {
         },
       },
       cancelBehavior: input.cancelBehavior,
-      interruptPromptOnCancel: false,
+      interruptPromptOnCancel: input.interruptPromptOnCancel ?? false,
       requestLogger: input.requestLogger,
       ...(input.holdPrompt?.in === "protocol-log"
         ? {
@@ -1492,6 +1493,80 @@ describe("AcpSessionRuntime", () => {
         );
         expect(run.offloadedLines > 0).toBe(workers > 0);
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each([0, 2])(
+    "sends session/cancel for an interrupted prompt whose started record is still appending (%i workers)",
+    (workers) =>
+      Effect.gen(function* () {
+        const appended = yield* Deferred.make<void>();
+        const appendCut = yield* Deferred.make<void>();
+        const records: Array<ReturnType<typeof recordRequest>> = [];
+        const run = yield* promptThenCancel({
+          cancelBehavior: "interrupt",
+          interruptPromptOnCancel: true,
+          workers,
+          requestLogger: (event) =>
+            Effect.sync(() => {
+              records.push(recordRequest(event));
+            }).pipe(
+              Effect.andThen(
+                isPromptStarted(event)
+                  ? Deferred.await(appended).pipe(
+                      Effect.onInterrupt(() => Deferred.succeed(appendCut, undefined)),
+                    )
+                  : Effect.void,
+              ),
+            ),
+          releaseLog: Deferred.succeed(appended, undefined).pipe(Effect.asVoid),
+        });
+        expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
+        expect(run.promptExit).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+        expect(yield* Deferred.isDone(appendCut)).toBe(true);
+        // A started record cut short gets no outcome record.
+        expect(
+          recordsByRequest(records)
+            .get("session/prompt")
+            ?.map(({ status }) => status),
+        ).toEqual(["started"]);
+        expect(run.offloadedLines > 0).toBe(workers > 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("closes a runtime while its prompt's started record is still appending", () =>
+    Effect.gen(function* () {
+      const scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const appended = yield* Deferred.make<void>();
+      const appendCut = yield* Deferred.make<void>();
+      yield* Effect.addFinalizer(() => Deferred.succeed(appended, undefined));
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        spawn: {
+          ...mockRuntimeOptions.spawn,
+          env: { T3_ACP_COMPLETE_FIRST_PROMPT_ON_CANCEL: "1" },
+        },
+        requestLogger: (event) =>
+          isPromptStarted(event)
+            ? Deferred.await(appended).pipe(
+                Effect.onInterrupt(() => Deferred.succeed(appendCut, undefined)),
+              )
+            : Effect.void,
+      }).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* runtime.start();
+      const dispatched = yield* Deferred.make<void>();
+      const prompt = yield* runtime
+        .prompt({ prompt: [{ type: "text", text: "first" }] }, { dispatched })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(dispatched);
+      const closing = yield* Scope.close(scope, Exit.void).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.await(appendCut);
+      yield* Fiber.join(closing);
+      expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("sends a request whose started record fails and fails it with that defect", () =>

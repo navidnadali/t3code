@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "lib": ["ESNext", "esnext.disposable", "DOM"],
+    // fixture/ imports the server's modules and dependencies, resolved as the server resolves them.
+    "paths": {
+      "effect": ["../../apps/server/node_modules/effect/dist/index.d.ts"],
+      "effect/cli": ["../../apps/server/node_modules/effect/dist/cli/index.d.ts"],
+      "effect/*": ["../../apps/server/node_modules/effect/dist/*.d.ts"],
+      "@effect/platform-node/*": [
+        "../../apps/server/node_modules/@effect/platform-node/dist/*.d.ts"
+      ],
+      "@t3tools/contracts": ["../../packages/contracts/src/index.ts"],
+      "@t3tools/shared/*": ["../../packages/shared/src/*.ts"],
+      "@t3tools/provider-core/server/*": ["../../packages/provider-core/src/server/*.ts"]
+    }
+  },
+  "include": ["**/*.ts"]
+}

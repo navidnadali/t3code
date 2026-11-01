@@ -2,8 +2,14 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import * as CodexError from "../errors.ts";
+import type { CodexAppServerStageTiming } from "../protocol.ts";
 
 export const JsonRpcId = Schema.Union([Schema.Number, Schema.String]);
+export const isJsonRpcId = Schema.is(JsonRpcId);
+
+export function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
 const JsonRpcError = Schema.Struct({
   code: Schema.Number,
@@ -59,21 +65,6 @@ export const encodeOptionalPayload = <A, I>(
   );
 };
 
-export const decodeNotificationPayload = <A, I>(
-  method: string,
-  schema: Schema.Codec<A, I> | undefined,
-  raw: unknown,
-): Effect.Effect<A, CodexError.CodexAppServerProtocolParseError> =>
-  decodeOptionalPayload(method, schema, raw).pipe(
-    Effect.mapError((error) =>
-      CodexError.CodexAppServerProtocolParseError.fromRequestError(
-        "decode-notification-payload",
-        method,
-        error,
-      ),
-    ),
-  );
-
 export const runHandler = Effect.fnUntraced(function* <A, B>(
   handler: ((payload: A) => Effect.Effect<B, CodexError.CodexAppServerError>) | undefined,
   payload: A,
@@ -89,3 +80,26 @@ export const runHandler = Effect.fnUntraced(function* <A, B>(
     ),
   );
 });
+
+/**
+ * Builds the effect where it is called, as when timing is off, and records building it (schema
+ * decoders validate when called) plus running it: wall time, which is main-thread busy time while
+ * the effect does not suspend.
+ */
+export const timeStage = <A, E, R>(
+  timing: CodexAppServerStageTiming | undefined,
+  stage: Parameters<CodexAppServerStageTiming["record"]>[0],
+  bytes: number,
+  makeEffect: () => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> => {
+  if (timing === undefined) return makeEffect();
+  const buildStartedAt = timing.now();
+  const effect = makeEffect();
+  const buildMs = timing.now() - buildStartedAt;
+  return Effect.suspend(() => {
+    const startedAt = timing.now();
+    return Effect.onExit(effect, () =>
+      Effect.sync(() => timing.record(stage, buildMs + timing.now() - startedAt, bytes)),
+    );
+  });
+};

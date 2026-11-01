@@ -40,6 +40,7 @@ it.effect(
                       afterBytes: 1000,
                       deletedEventCount: 1,
                       deletedReceiptCount: 0,
+                      repairedItemCountThreads: 0,
                     };
                   }),
                 removeLegacyDatabase: () => Effect.sync(() => calls.push("remove legacy")),

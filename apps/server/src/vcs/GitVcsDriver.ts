@@ -1395,7 +1395,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           cwd: input.cwd,
           args: [...durableWrite, "update-ref", input.checkpointRef, commitOid],
         });
-        if (snapshot?.commonDir != null) {
+        if (snapshot !== null && snapshot.commonDir !== null) {
           refMemory.rememberRef(snapshot.commonDir, input.checkpointRef, commitOid);
         }
       }).pipe(Effect.ensuring(cleanupTempIndex));

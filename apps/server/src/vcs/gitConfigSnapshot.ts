@@ -708,89 +708,87 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
    * result) or from its result; null means the result cannot be reused. Untraced like read: it runs
    * for every ref probe, and the Git command it may run keeps its own span.
    */
-  const runWithRefs = <E>(
+  const runWithRefs = Effect.fnUntraced(function* <E>(
     snapshot: GitConfigSnapshot | null,
     args: ReadonlyArray<string>,
     refs: (result?: GitVcsDriver.ExecuteGitResult) => ReadonlyArray<string> | null,
     run: Effect.Effect<GitVcsDriver.ExecuteGitResult, E>,
-  ): Effect.Effect<GitVcsDriver.ExecuteGitResult, E> =>
-    Effect.gen(function* () {
-      const commonDir = snapshot?.commonDir ?? null;
-      if (snapshot === null || commonDir === null) return yield* run;
-      const key = args.join("\0");
-      const cached = snapshot.refResults.get(key);
-      const known = refs();
-      const dependencies =
-        cached?.dependencies ?? (known === null ? [] : refDependencies(commonDir, known));
-      const fingerprints = yield* fingerprintDependencies(dependencies);
-      const fingerprint = fingerprints.join("\n");
-      if (cached !== undefined && cached.fingerprint === fingerprint) return cached.result;
-      const result = yield* run;
-      const names = isReusableResult(result) ? refs(result) : null;
-      const needed = names?.every(isLooseRefName) ? refDependencies(commonDir, names) : null;
-      // A symbolic ref's result depends on its target, which is not tracked.
-      const symbolic =
-        needed !== null &&
-        (yield* Effect.promise(() =>
-          Promise.all(
-            needed
-              .filter((dependency) => dependency.kind === "entry")
-              .map((dependency) => readsSymbolicRef(dependency.path)),
-          ),
-        )).some(Boolean);
-      const statedFirst =
-        needed !== null &&
-        needed.length === dependencies.length &&
-        needed.every((dependency, index) => dependency.path === dependencies[index]!.path);
-      const reftable = statedFirst && !fingerprints.at(-1)!.startsWith("!");
-      if (needed === null || symbolic || reftable) {
-        snapshot.refResults.delete(key);
-        return result;
-      }
-      if (!snapshot.refResults.has(key) && snapshot.refResults.size >= REF_RESULTS_CAPACITY) {
-        snapshot.refResults.delete(snapshot.refResults.keys().next().value!);
-      }
-      snapshot.refResults.set(key, {
-        dependencies: needed,
-        fingerprint: statedFirst ? fingerprint : null,
-        result,
-      });
+  ) {
+    const commonDir = snapshot?.commonDir ?? null;
+    if (snapshot === null || commonDir === null) return yield* run;
+    const key = args.join("\0");
+    const cached = snapshot.refResults.get(key);
+    const known = refs();
+    const dependencies =
+      cached?.dependencies ?? (known === null ? [] : refDependencies(commonDir, known));
+    const fingerprints = yield* fingerprintDependencies(dependencies);
+    const fingerprint = fingerprints.join("\n");
+    if (cached !== undefined && cached.fingerprint === fingerprint) return cached.result;
+    const result = yield* run;
+    const names = isReusableResult(result) ? refs(result) : null;
+    const needed = names?.every(isLooseRefName) ? refDependencies(commonDir, names) : null;
+    // A symbolic ref's result depends on its target, which is not tracked.
+    const symbolic =
+      needed !== null &&
+      (yield* Effect.promise(() =>
+        Promise.all(
+          needed
+            .filter((dependency) => dependency.kind === "entry")
+            .map((dependency) => readsSymbolicRef(dependency.path)),
+        ),
+      )).some(Boolean);
+    const statedFirst =
+      needed !== null &&
+      needed.length === dependencies.length &&
+      needed.every((dependency, index) => dependency.path === dependencies[index]!.path);
+    const reftable = statedFirst && !fingerprints.at(-1)!.startsWith("!");
+    if (needed === null || symbolic || reftable) {
+      snapshot.refResults.delete(key);
       return result;
+    }
+    if (!snapshot.refResults.has(key) && snapshot.refResults.size >= REF_RESULTS_CAPACITY) {
+      snapshot.refResults.delete(snapshot.refResults.keys().next().value!);
+    }
+    snapshot.refResults.set(key, {
+      dependencies: needed,
+      fingerprint: statedFirst ? fingerprint : null,
+      result,
     });
+    return result;
+  });
 
   /**
    * Runs an effect whose result depends only on the snapshot and on the content of `files`, once
    * per state of those files. Every file is stat'ed before the run, so a write during the run
    * leaves the result stale for one read rather than wrong. Failures are not kept.
    */
-  const runWithFiles = <A, E, R>(
+  const runWithFiles = Effect.fnUntraced(function* <A, E, R>(
     snapshot: GitConfigSnapshot,
     key: string,
     files: ReadonlyArray<string>,
     run: Effect.Effect<A, E, R>,
-  ): Effect.Effect<A, E, R> =>
-    Effect.gen(function* () {
-      const dependencies = files.map((file): GitConfigDependency => ({
-        path: file,
-        kind: "content",
-      }));
-      const fingerprint = (yield* fingerprintDependencies(dependencies)).join("\n");
-      const cached = snapshot.fileResults.get(key);
-      if (
-        cached !== undefined &&
-        cached.fingerprint === fingerprint &&
-        cached.dependencies.length === dependencies.length &&
-        cached.dependencies.every((dependency, index) => dependency.path === files[index])
-      ) {
-        return cached.value as A;
-      }
-      const value = yield* run;
-      if (!snapshot.fileResults.has(key) && snapshot.fileResults.size >= FILE_RESULTS_CAPACITY) {
-        snapshot.fileResults.delete(snapshot.fileResults.keys().next().value!);
-      }
-      snapshot.fileResults.set(key, { dependencies, fingerprint, value });
-      return value;
-    });
+  ) {
+    const dependencies = files.map((file): GitConfigDependency => ({
+      path: file,
+      kind: "content",
+    }));
+    const fingerprint = (yield* fingerprintDependencies(dependencies)).join("\n");
+    const cached = snapshot.fileResults.get(key);
+    if (
+      cached !== undefined &&
+      cached.fingerprint === fingerprint &&
+      cached.dependencies.length === dependencies.length &&
+      cached.dependencies.every((dependency, index) => dependency.path === files[index])
+    ) {
+      return cached.value as A;
+    }
+    const value = yield* run;
+    if (!snapshot.fileResults.has(key) && snapshot.fileResults.size >= FILE_RESULTS_CAPACITY) {
+      snapshot.fileResults.delete(snapshot.fileResults.keys().next().value!);
+    }
+    snapshot.fileResults.set(key, { dependencies, fingerprint, value });
+    return value;
+  });
 
   return { read, peek, runWithRefs, runWithFiles };
 });

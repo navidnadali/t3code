@@ -16,12 +16,7 @@ import { ChildProcessSpawner } from "effect/process";
 import * as Metric from "effect/Metric";
 import { assert, it } from "@effect/vitest";
 
-import {
-  CheckpointRef,
-  GitCommandError,
-  VcsProcessExitError,
-  VcsUnsupportedOperationError,
-} from "@t3tools/contracts";
+import { CheckpointRef, GitCommandError, VcsProcessExitError } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as ServerConfig from "../config.ts";

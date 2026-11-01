@@ -20,8 +20,8 @@ import { vi } from "vite-plus/test";
 
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
 import type { ProviderIoStage } from "./providerIoProtocol.ts";
-import { acpWireStage, codexWireStage } from "./providerIoStages.ts";
 import { echoStage, linesStage } from "./testFixtures/providerIoTestStages.ts";
+import { acpWireStage, codexWireStage } from "./testFixtures/providerIoWireStages.ts";
 
 type WorkerMode = "fixture" | "production" | "silent" | "throws" | "inert" | "late";
 
@@ -692,8 +692,8 @@ const splitAt = (text: string, offsets: ReadonlyArray<number>) => {
   return [0, ...offsets].map((start, index) => all.slice(start, offsets[index] ?? all.length));
 };
 
-it.effect("runs the Codex wire stage on the production worker as it runs in-thread", () =>
-  withPool({ workers: 1, mode: "production" }, (pool) =>
+it.effect("runs P1-023's Codex wire decode in a worker as it runs in-thread", () =>
+  withPool({ workers: 1 }, (pool) =>
     Effect.gen(function* () {
       const text =
         '{"id":1,"result":{}}\r\n{"method":"item/delta","params":{"text":"café"}}\n\n   \n' +
@@ -738,8 +738,8 @@ it.effect("runs the Codex wire stage on the production worker as it runs in-thre
   ),
 );
 
-it.effect("runs the ACP wire stage on the production worker and encodes on its parser", () =>
-  withPool({ workers: 1, mode: "production" }, (pool) =>
+it.effect("runs P1-023's ACP wire decode in a worker and encodes on its parser", () =>
+  withPool({ workers: 1 }, (pool) =>
     Effect.gen(function* () {
       const text =
         '{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s"}}\n' +

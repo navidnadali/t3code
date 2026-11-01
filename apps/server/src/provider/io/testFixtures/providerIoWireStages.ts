@@ -2,9 +2,10 @@ import * as AcpWire from "effect-acp/wire";
 import * as CodexWire from "effect-codex-app-server/wire";
 import * as Result from "effect/Result";
 
-import type { ProviderIoStage } from "./providerIoProtocol.ts";
+import type { ProviderIoStage } from "../providerIoProtocol.ts";
 
-// Outputs are plain data: errors cross threads as their diagnostics and are rebuilt on main.
+// P1-023's pure stages wrapped for the pool, so tests run real provider code in a worker. The
+// production registry is P1-025's. Outputs are plain data; errors cross as their diagnostics.
 export type CodexWireOutput =
   | { readonly _tag: "Message"; readonly line: string; readonly message: unknown }
   | {

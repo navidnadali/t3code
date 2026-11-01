@@ -1448,7 +1448,8 @@ export function makeCodexAppServerProtocolLogger(input: {
 }
 
 // Plain objects and arrays with nothing to redact come back as they are, so the native log
-// reuses the size check the adapter already made on them.
+// reuses the size check the adapter already made on them. Frames must hold plain data
+// properties only: the log reads the original again, so an accessor could hand it a secret.
 function redactCodexProtocolValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     const redacted = value.map(redactCodexProtocolValue);

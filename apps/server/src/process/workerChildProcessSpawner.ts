@@ -38,9 +38,13 @@ export { spawnerProcessSource, spawnWorkerSource };
 export const VCS_SPAWN_WORKER_ENV = "T3CODE_VCS_SPAWN_WORKER";
 export const PROCESS_SPAWNER_ENV = "T3CODE_PROCESS_SPAWNER";
 
+// Unread output per stream before the child blocks: a per-stream bound, not tuned to load. Memory
+// grows only with concurrent commands, which callers cap (VcsProcess and GitVcsDriver permits).
 const STREAM_WINDOW_BYTES = 1024 * 1024;
+// As NodeChildProcessSpawner: the wait after a group signal, polled.
 const processGroupGraceMillis = 1_000;
 const processGroupPollIntervalMillis = 10;
+// Time the spawner gets at close to kill its children before it is killed.
 const spawnerCloseGraceMillis = 1_000;
 /** Each restart forks the server; a spawner that keeps stopping is a fault, whatever the load. */
 export const spawnerRestartLimit = { restarts: 3, windowMillis: 10 * 60_000 };

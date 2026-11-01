@@ -173,12 +173,23 @@ identity lookup, still spawns on the event loop. On Linux a `fork` from the work
 the server's address space while page tables are copied, interrupts every CPU running the server to
 flush its TLB, and leaves copy-on-write faults for the event loop, so measure before enabling it.
 
-`T3CODE_PROCESS_SPAWNER=child` (it takes precedence over the worker) starts the same commands from
-a small spawner process instead, started once while the server is small, so the server never forks
-for them: each fork copies only the spawner's page tables. A spawner that stops is restarted once;
-if it stops again before starting a command, those commands fail with a logged error until the
-server restarts. It exits and kills its children when the server exits. macOS already spawns with
-`posix_spawn`, which copies no page tables, so the gain there is only the event-loop time.
+`T3CODE_PROCESS_SPAWNER=child` (also `1` or `true`, any case; it takes precedence over the worker)
+starts the same commands from a small spawner process instead, started once while the server is
+small, so the server never forks for them: each fork copies only the spawner's page tables.
+`worker` selects the worker thread, `default` (`0`, `false`) or unset neither; any other value is
+logged as an error and keeps the default. A spawner that stops is restarted, which forks the server
+once. If it stops again before starting a command, or more than 3 times in 10 minutes, those
+commands fail with "The process spawner stopped" and an error is logged until the server restarts.
+Each command's unread output waits in the server, up to 1 MiB per stream, where it would otherwise
+wait in a 64 KiB pipe. macOS already spawns with `posix_spawn`, which copies no page tables, so the
+gain there is only the event-loop time.
+
+The spawner kills its children and its own process group, then exits, when the server exits
+however it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP. Once the server has
+begun to shut down, a Git command still running or started later fails with "The process spawner
+stopped" instead of running on the server. Stop the server with systemd's `KillMode=mixed`: with
+`control-group`, the spawner gets SIGTERM while the server is still shutting down, and the server
+logs a warning and forks once more if another command arrives.
 
 With either knob on, those services run real processes even when a test injects a fake
 `ChildProcessSpawner`. Unset spawns them on the event loop, as Windows always does.

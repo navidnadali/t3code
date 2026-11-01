@@ -60,16 +60,16 @@ const encodeVisibleRows = Effect.fnUntraced(function* (
 const isSkipped = (value: unknown) =>
   value === undefined || typeof value === "function" || typeof value === "symbol";
 
-// JSON.stringify calls a member's toJSON with its key before serializing it.
+const hasToJson = (value: unknown) =>
+  typeof (value as { readonly toJSON?: unknown }).toJSON === "function";
+
+// JSON.stringify calls the toJSON of any object (functions too) or BigInt with the member's key.
 const toJsonValue = (value: unknown, key: string) =>
   value !== null &&
-  (typeof value === "object" || typeof value === "bigint") &&
-  typeof (value as { readonly toJSON?: unknown }).toJSON === "function"
+  (typeof value === "object" || typeof value === "function" || typeof value === "bigint") &&
+  hasToJson(value)
     ? (value as { readonly toJSON: (key: string) => unknown }).toJSON(key)
     : value;
-
-const hasToJson = (value: object) =>
-  typeof (value as { readonly toJSON?: unknown }).toJSON === "function";
 
 // About the JSON length of a value already through toJSON (escapes can add more); it stops early.
 // Any toJSON but DateTime's counts as large, so the writer calls it once, member by member.
@@ -77,9 +77,17 @@ const exceedsChunk = (value: unknown) => {
   let budget = CHUNK_CHARS;
   const visit = (current: unknown, throughToJson: boolean): boolean => {
     if (typeof current === "string") return (budget -= current.length + 2) < 0;
-    if (current === null || typeof current !== "object") return (budget -= 8) < 0;
-    if (!throughToJson && hasToJson(current)) {
+    const isObject = typeof current === "object" || typeof current === "function";
+    if (!throughToJson && isObject && current !== null && hasToJson(current)) {
       return !DateTime.isDateTime(current) || (budget -= 32) < 0;
+    }
+    if (current === null || typeof current !== "object") return (budget -= 8) < 0;
+    // By length: holes write as null but are not enumerable.
+    if (Array.isArray(current)) {
+      for (let index = 0; index < current.length; index++) {
+        if ((budget -= 1) < 0 || visit(current[index], false)) return true;
+      }
+      return (budget -= 2) < 0;
     }
     for (const member in current) {
       budget -= member.length + 4;

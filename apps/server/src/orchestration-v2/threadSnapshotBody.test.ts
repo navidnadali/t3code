@@ -364,6 +364,8 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
                 },
               },
             },
+            { callable: Object.assign(() => undefined, { toJSON: () => 42 }), ...ignored },
+            { sparse: Array.from({ length: 1 }).concat(new Array(1_000_000)) },
             {
               string: Object.assign(Object("s"), ignored),
               number: Object.assign(Object(42), ignored),

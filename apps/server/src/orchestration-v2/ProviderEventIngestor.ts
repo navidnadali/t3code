@@ -833,12 +833,18 @@ export const layer: Layer.Layer<
     const writeBatch = Effect.fnUntraced(function* (
       inputs: ReadonlyArray<ProviderEventIngestInput>,
     ) {
-      const written = yield* eventSink
-        .writeSteps({
-          guardPendingUserInputCancellations: true,
-          steps: inputs.map((input) => normalize(input)),
-        })
-        .pipe(Effect.result);
+      const written = yield* timeProviderIoStage(
+        stageTiming?.forProvider(inputs[0]!.event.driver),
+        "ingest",
+        0,
+        () =>
+          eventSink
+            .writeSteps({
+              guardPendingUserInputCancellations: true,
+              steps: inputs.map((input) => normalize(input)),
+            })
+            .pipe(Effect.result),
+      );
       if (Result.isFailure(written)) {
         // Nothing committed; one by one, each event commits or fails as it would alone.
         yield* Effect.logWarning("orchestration-v2.provider-event-batch-write-failed", {

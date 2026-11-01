@@ -83,3 +83,52 @@ it("measures a bounded event again after its size was used once, and only reuses
   elsewhere.params = many;
   assert.equal(payload("canonical", { kind: "protocol", event: elsewhere }), summary);
 });
+
+it("bounds a wrapped protocol event against the whole record", () => {
+  const decode = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+  const fields = (count: number) => ({
+    params: Object.fromEntries(Array.from({ length: count }, (_, index) => [`k${index}`, 0])),
+  });
+  const nested = (depth: number) => {
+    let value: unknown = 0;
+    for (let index = 0; index < depth; index += 1) value = { n: value };
+    return value;
+  };
+  // As the adapters do: bound the event, then wrap it in a record.
+  const logged = (event: unknown, trailer?: { readonly after: number }) => {
+    const record = serializeEventNdjsonRecord("native", {
+      kind: "protocol",
+      event: boundProviderEventForLogging(event),
+      ...trailer,
+    });
+    assert.equal(record._tag, "Serialized");
+    return record._tag === "Serialized" ? decode(record.payload) : undefined;
+  };
+  const truncatedRecord = (event: unknown) => ({ truncated: true, kind: "protocol", event });
+  const truncatedFields = { truncated: true, params: { truncated: true } };
+
+  assert.deepEqual(logged(fields(1_021)), { kind: "protocol", event: fields(1_021) });
+  assert.deepEqual(logged(fields(1_022)), truncatedRecord(truncatedFields));
+  assert.deepEqual(logged(fields(1_024)), { kind: "protocol", event: truncatedFields });
+  const list = (items: Array<unknown>) => ({ list: items, last: 0 });
+  assert.nestedPropertyVal(
+    logged(list(Array.from({ length: 1_020 }, () => 0))),
+    "event.list.length",
+    1_020,
+  );
+  assert.deepEqual(
+    logged(list(Array.from({ length: 1_021 }, () => 0))),
+    truncatedRecord({ truncated: true }),
+  );
+  assert.nestedPropertyVal(logged(list(new Array(1_021))), "event.list.length", 1_021);
+  assert.deepEqual(logged(list(new Array(1_022))), truncatedRecord({ truncated: true }));
+  assert.deepEqual(logged(nested(16)), { kind: "protocol", event: nested(16) });
+  assert.deepEqual(logged(nested(17)), truncatedRecord({ truncated: true }));
+  assert.deepEqual(logged(nested(18)), { kind: "protocol", event: { truncated: true } });
+  assert.deepEqual(logged(fields(1_020), { after: 0 }), {
+    kind: "protocol",
+    event: fields(1_020),
+    after: 0,
+  });
+  assert.deepEqual(logged(fields(1_021), { after: 0 }), truncatedRecord(truncatedFields));
+});

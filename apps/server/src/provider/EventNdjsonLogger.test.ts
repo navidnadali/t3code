@@ -20,7 +20,6 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
-  boundProviderEventForLogging,
   makeEventNdjsonLogStore,
   type PendingRecord,
   writeBatchedMessages,
@@ -425,78 +424,6 @@ it.layer(NodeServices.layer)("EventNdjsonLogger", (it) => {
         assert.propertyVal(record, "type", "turn.diff.updated");
         assert.propertyVal(record, "threadId", threadId);
         assert.propertyVal(record, "turnId", "native-turn");
-      } finally {
-        NodeFS.rmSync(tempDir, { recursive: true, force: true });
-      }
-    }),
-  );
-
-  it.effect("bounds a wrapped protocol event against the whole record", () =>
-    Effect.gen(function* () {
-      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
-      const basePath = NodePath.join(tempDir, "events.log");
-      const threadId = ThreadId.make("wrapped");
-      const fields = (count: number) => ({
-        params: Object.fromEntries(Array.from({ length: count }, (_, index) => [`k${index}`, 0])),
-      });
-      const nested = (depth: number) => {
-        let value: unknown = 0;
-        for (let index = 0; index < depth; index += 1) value = { n: value };
-        return value;
-      };
-      try {
-        const store = yield* makeEventNdjsonLogStore(basePath, { batchWindowMs: 0 });
-        const logger = store.logger("native");
-        // As the adapters do: bound the event, then wrap it in a two-field record.
-        const write = (event: unknown) =>
-          logger.write({ kind: "protocol", event: boundProviderEventForLogging(event) }, threadId);
-        yield* write(fields(1_021));
-        yield* write(fields(1_022));
-        yield* write(fields(1_024));
-        yield* write({ list: Array.from({ length: 1_020 }, () => 0), last: 0 });
-        yield* write({ list: Array.from({ length: 1_021 }, () => 0), last: 0 });
-        yield* write({ list: new Array(1_021), last: 0 });
-        yield* write({ list: new Array(1_022), last: 0 });
-        yield* write(nested(16));
-        yield* write(nested(17));
-        yield* write(nested(18));
-        yield* logger.write(
-          { kind: "protocol", event: boundProviderEventForLogging(fields(1_020)), after: 0 },
-          threadId,
-        );
-        yield* logger.write(
-          { kind: "protocol", event: boundProviderEventForLogging(fields(1_021)), after: 0 },
-          threadId,
-        );
-        yield* store.close();
-
-        const records = NodeFS.readFileSync(ownedLogPath(basePath, "wrapped"), "utf8")
-          .trim()
-          .split("\n")
-          .map((line) => decodeUnknownJson(parseLogLine(line).payload));
-        const truncatedRecord = (event: unknown) => ({ truncated: true, kind: "protocol", event });
-        assert.equal(records.length, 12);
-        assert.deepEqual(records[0], { kind: "protocol", event: fields(1_021) });
-        assert.deepEqual(
-          records[1],
-          truncatedRecord({ truncated: true, params: { truncated: true } }),
-        );
-        assert.deepEqual(records[2], {
-          kind: "protocol",
-          event: { truncated: true, params: { truncated: true } },
-        });
-        assert.nestedPropertyVal(records[3], "event.list.length", 1_020);
-        assert.deepEqual(records[4], truncatedRecord({ truncated: true }));
-        assert.nestedPropertyVal(records[5], "event.list.length", 1_021);
-        assert.deepEqual(records[6], truncatedRecord({ truncated: true }));
-        assert.deepEqual(records[7], { kind: "protocol", event: nested(16) });
-        assert.deepEqual(records[8], truncatedRecord({ truncated: true }));
-        assert.deepEqual(records[9], { kind: "protocol", event: { truncated: true } });
-        assert.deepEqual(records[10], { kind: "protocol", event: fields(1_020), after: 0 });
-        assert.deepEqual(
-          records[11],
-          truncatedRecord({ truncated: true, params: { truncated: true } }),
-        );
       } finally {
         NodeFS.rmSync(tempDir, { recursive: true, force: true });
       }

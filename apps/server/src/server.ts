@@ -51,7 +51,10 @@ import * as ProviderEventIngestor from "./orchestration-v2/ProviderEventIngestor
 import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as ResetCreditCoordinator from "./provider/resetCreditCoordinator.ts";
 import * as EventNdjsonLogger from "./provider/EventNdjsonLogger.ts";
+import * as ProviderIoWorkerPool from "./provider/io/ProviderIoWorkerPool.ts";
+import { ClaudeAgentSdkWorkerPool } from "./orchestration-v2/Adapters/ClaudeAgentSdkWorkerQuery.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
+import * as ProviderIoStageTiming from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as OpenCodeRuntime from "@t3tools/provider-opencode/server/OpenCodeRuntime";
 import * as OpenCodeServerLedger from "@t3tools/provider-opencode/server/OpenCodeServerLedger";
@@ -652,12 +655,23 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
 );
 
+// Claude queries use the provider I/O pool only when T3CODE_PROVIDER_IO_CLAUDE_SDK opts in.
+const layerClaudeAgentSdkWorkerPool = Layer.effect(
+  ClaudeAgentSdkWorkerPool,
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    if (config.providerIoClaudeSdk !== true) return undefined;
+    return yield* ProviderIoWorkerPool.ProviderIoWorkerPool;
+  }),
+);
+
 const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
   Layer.provideMerge(layerPtyAdapter),
   Layer.provideMerge(AcpRegistrySupport.layerFromHost.pipe(Layer.provide(ProviderHostLive.layer))),
   Layer.provideMerge(
     Layer.mergeAll(
       layerProviderEventLoggers,
+      layerClaudeAgentSdkWorkerPool.pipe(Layer.provideMerge(ProviderIoWorkerPool.layer)),
       ModelManifest.layerModelCatalog.pipe(Layer.provideMerge(ModelManifest.layer)),
       ResetCreditCoordinator.layer,
       ProviderLatestVersions.layer,
@@ -1093,6 +1107,8 @@ const layerMakeServer = Layer.unwrap(
     return layerServerApplication.pipe(
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
       Layer.provideMerge(layerRuntimeServices),
+      // Built before the runtime, so its final report runs after provider sessions close.
+      Layer.provideMerge(ProviderIoStageTiming.layerReporter),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
           Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),

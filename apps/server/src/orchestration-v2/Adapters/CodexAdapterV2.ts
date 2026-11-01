@@ -1495,7 +1495,8 @@ function redactCodexProtocolValue(value: unknown): unknown {
   ]);
   const prototype: unknown = Object.getPrototypeOf(value);
   return (prototype === Object.prototype || prototype === null) &&
-    redacted.every(([, nested], index) => nested === entries[index]?.[1])
+    redacted.every(([, nested], index) => nested === entries[index]?.[1]) &&
+    Object.getOwnPropertyNames(value).length === entries.length
     ? value
     : Object.fromEntries(redacted);
 }

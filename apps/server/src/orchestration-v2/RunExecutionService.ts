@@ -610,7 +610,7 @@ export const layer: Layer.Layer<
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
-    const providerEventBatchLimit = yield* ProviderEventIngestor.ProviderEventBatchLimit;
+    const providerEventBatching = yield* ProviderEventIngestor.ProviderEventBatching;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const mcpAppModelContext = yield* McpAppModelContext.McpAppModelContext;
     const previewAgentActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
@@ -1321,17 +1321,19 @@ export const layer: Layer.Layer<
         // Ends once the root turn and the children it drives settle. Background commands such
         // as a dev server keep this consumer alive afterwards and must not pin preview focus.
         const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
-        // Events that writing can defer until the end of what was queued, up to the batch limit;
+        // Events that writing can defer until the end of what was queued, up to the batch limits;
         // they are written before anything that reads or orders against them.
         const deferredIngest: Array<ProviderEventIngestor.ProviderEventIngestInput> = [];
+        let deferredBytes = 0;
         const flushDeferredIngest = (queued: number) =>
-          Effect.suspend(() =>
-            deferredIngest.length === 0
+          Effect.suspend(() => {
+            deferredBytes = 0;
+            return deferredIngest.length === 0
               ? Effect.void
               : providerEventIngestor
                   .ingestNormalizedBatch({ events: deferredIngest.splice(0), queued })
-                  .pipe(Effect.asVoid),
-          );
+                  .pipe(Effect.asVoid);
+          });
         const providerEventFiber = yield* eventSubscription.events.pipe(
           Stream.chunks,
           Stream.flatMap((events) =>
@@ -1502,13 +1504,18 @@ export const layer: Layer.Layer<
                 // An event that changes child or background tracking is written first, so that
                 // tracking only ever reflects committed events.
                 if (
-                  providerEventBatchLimit > 1 &&
+                  providerEventBatching.maxEvents > 1 &&
                   !isRootProviderThreadUpdate &&
                   lifecycleUpdates.length === 0 &&
                   ProviderEventIngestor.canIngestInBatch(deliveredEvent)
                 ) {
                   deferredIngest.push(ingestInput);
-                  if (deferredIngest.length >= providerEventBatchLimit) {
+                  // UTF-16 length: close enough for a budget, without encoding the event.
+                  deferredBytes += JSON.stringify(deliveredEvent).length;
+                  if (
+                    deferredIngest.length >= providerEventBatching.maxEvents ||
+                    deferredBytes >= providerEventBatching.maxBytes
+                  ) {
                     yield* flushDeferredIngest(queued);
                   }
                 } else {

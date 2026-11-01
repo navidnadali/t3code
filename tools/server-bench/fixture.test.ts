@@ -430,6 +430,13 @@ const seedPendingWork = (path: string) => {
     `DELETE FROM orchestration_v2_projection_context_transfers
      WHERE source_thread_id = ? AND type = 'subagent_result'`,
   ).run(child.id);
+  // P1-014's migration 77: turn items per thread and run, kept by triggers. Sanitise must keep it.
+  db.exec(`CREATE TABLE IF NOT EXISTS orchestration_v2_projection_turn_item_counts (
+      thread_id TEXT NOT NULL, run_id TEXT NOT NULL, item_count INTEGER NOT NULL,
+      PRIMARY KEY (thread_id, run_id)) WITHOUT ROWID;
+    INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
+      SELECT thread_id, COALESCE(run_id, ''), COUNT(*) FROM orchestration_v2_projection_turn_items
+      GROUP BY thread_id, COALESCE(run_id, '');`);
   // A task delegated to another machine, still without its result: its follower resumes on start.
   db.prepare(
     `UPDATE orchestration_v2_projection_subagents
@@ -1058,6 +1065,16 @@ describe("fixture CLI", () => {
         `SELECT COUNT(*) AS n FROM orchestration_v2_projection_runtime_requests WHERE status = 'pending'`,
       ),
     ).toBe(0);
+    // Turn item counts stay, exact for the items the fixture holds.
+    const counts = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts AS c
+      WHERE c.item_count = (SELECT COUNT(*) FROM orchestration_v2_projection_turn_items AS i
+        WHERE i.thread_id = c.thread_id AND COALESCE(i.run_id, '') = c.run_id)`;
+    expect(count(clean, counts)).toBe(
+      count(clean, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts`),
+    );
+    expect(
+      count(clean, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts`),
+    ).toBeGreaterThan(0);
     const settled = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_subagents
       WHERE subagent_id = '${task}' AND status = 'completed' AND json_extract(payload_json, '$.result') IS NOT NULL`;
     expect(count(clean, settled)).toBe(1);

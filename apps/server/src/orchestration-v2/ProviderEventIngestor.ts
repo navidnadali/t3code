@@ -335,12 +335,10 @@ const BATCHABLE_EVENT_TYPES = new Set<ProviderAdapter.ProviderAdapterV2Event["ty
   "turn_item.updated",
   "runtime_request.updated",
   "plan.updated",
-  "background_work.updated",
-  "command_output.delta",
 ]);
 
-export const canIngestInBatch = (input: ProviderEventIngestInput): boolean =>
-  input.commandId === undefined && BATCHABLE_EVENT_TYPES.has(input.event.type);
+export const canIngestInBatch = (event: ProviderAdapter.ProviderAdapterV2Event): boolean =>
+  BATCHABLE_EVENT_TYPES.has(event.type);
 
 const MAX_PROVIDER_EVENT_BATCH = 1000;
 
@@ -871,7 +869,12 @@ export const layer: Layer.Layer<
       let start = 0;
       while (start < events.length) {
         let end = start;
-        while (end < events.length && canIngestInBatch(events[end]!)) end++;
+        while (
+          end < events.length &&
+          events[end]!.commandId === undefined &&
+          canIngestInBatch(events[end]!.event)
+        )
+          end++;
         if (end - start > 1) {
           stored.push(...(yield* writeBatch(events.slice(start, end))));
           start = end;

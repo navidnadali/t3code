@@ -333,7 +333,11 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
       killAfterEnd: true,
       onEvent,
     })
-    .pipe(Effect.provideService(Scope.Scope, scope));
+    .pipe(
+      Effect.provideService(Scope.Scope, scope),
+      Effect.mapError((error) => input.toError(workerCause(error), "query")),
+      Effect.onError(() => Scope.close(scope, Exit.void)),
+    );
   if (Option.isNone(opened)) {
     yield* Scope.close(scope, Exit.void);
     return Option.none<StartedClaudeQuery<E>>();

@@ -731,6 +731,52 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
     }),
   );
 
+  it.effect("fails malformed and unroutable lines with the schema decoder's errors", () =>
+    Effect.forEach(
+      [
+        '{"id":1,"result":',
+        "not json",
+        '{"id":1}}',
+        "{'id':1}",
+        "[1,",
+        "42",
+        '"text"',
+        "null",
+        "[1]",
+      ],
+      (line) =>
+        Effect.gen(function* () {
+          const { stdio, input } = yield* makeInMemoryStdio();
+          const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+          yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+            stdio,
+            onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+          });
+          yield* Queue.offer(input, encoder.encode(`${line}\n`));
+          const error = yield* Deferred.await(termination);
+
+          const expected = yield* decodeJson(line).pipe(
+            Effect.match({
+              onFailure: (cause) =>
+                CodexError.CodexAppServerProtocolParseError.fromSchemaError(
+                  "decode-wire-message",
+                  cause,
+                ),
+              onSuccess: (message) =>
+                CodexError.CodexAppServerProtocolParseError.fromUnroutableMessage(message),
+            }),
+          );
+          assert.instanceOf(error, CodexError.CodexAppServerProtocolParseError);
+          assert.equal(error.message, expected.message);
+          assert.deepEqual(
+            { ...error, cause: String(error.cause) },
+            { ...expected, cause: String(expected.cause) },
+          );
+        }).pipe(Effect.scoped),
+      { discard: true },
+    ),
+  );
+
   it.effect("describes unroutable messages with safe structural diagnostics", () =>
     Effect.gen(function* () {
       const secret = "codex-unroutable-secret-sentinel";

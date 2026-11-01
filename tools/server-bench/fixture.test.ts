@@ -8,8 +8,9 @@ import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeSqlite from "node:sqlite";
 
-import { describe, expect, it, onTestFinished } from "vite-plus/test";
+import { afterAll, describe, expect, it, onTestFinished } from "vite-plus/test";
 
+import { BUILD_MIGRATION_HEAD } from "../../apps/server/src/persistence/databaseMigrationHead.ts";
 import {
   contentFindings,
   emptyCounts,
@@ -92,6 +93,39 @@ const synth = (destination: string, scale: string, seed = "1", report?: string) 
   expect(result.stderr).toBe("");
   expect(result.status).toBe(0);
 };
+
+// One synthetic database at scale 0.25 for every test that seeds and sanitises: each test
+// mutates its own copy. Synthesising it once per test cost the most time on a loaded machine.
+const sharedDirectory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fixture-shared-"));
+afterAll(() => NodeFS.rmSync(sharedDirectory, { recursive: true, force: true }));
+let sharedDatabase: string | undefined;
+
+/** A fresh copy of the shared scale-0.25 synthetic database at `destination`. */
+const synthCopy = (destination: string) => {
+  if (sharedDatabase === undefined) {
+    const database = NodePath.join(sharedDirectory, "synthetic.sqlite");
+    synth(database, "0.25");
+    sharedDatabase = database;
+  }
+  NodeFS.copyFileSync(sharedDatabase, destination);
+};
+
+/**
+ * Migration 77's turn item counts against `COUNT(*)` of the items, both ways: rows whose count is
+ * off, plus (thread, run) pairs with items but no row.
+ */
+const turnItemCountsMismatch = (path: string) => ({
+  rows: count(path, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts`),
+  wrong: count(
+    path,
+    `SELECT COUNT(*) AS n FROM (
+       SELECT thread_id, COALESCE(run_id, '') AS run_id, COUNT(*) AS items
+       FROM orchestration_v2_projection_turn_items GROUP BY thread_id, COALESCE(run_id, '')) AS i
+     FULL OUTER JOIN orchestration_v2_projection_turn_item_counts AS c
+       ON c.thread_id = i.thread_id AND c.run_id = i.run_id
+     WHERE c.item_count IS NOT i.items`,
+  ),
+});
 
 const count = (path: string, sql: string) => {
   const db = new NodeSqlite.DatabaseSync(path, { readOnly: true });
@@ -988,12 +1022,17 @@ describe("fixture CLI", () => {
     expect(Math.abs(result.sizeDeviation)).toBeLessThan(0.1);
     const off = result.tables.filter((row) => row.target > 0 && Math.abs(row.deviation ?? 1) > 0.1);
     expect(off).toEqual([]);
+    // Migration 77's turn item counts, kept by its triggers while synth writes: exact.
+    expect(turnItemCountsMismatch(NodePath.join(directory, "example.sqlite"))).toEqual({
+      rows: expect.any(Number),
+      wrong: 0,
+    });
   });
 
   it("sanitise leaves a seeded fixture with nothing runnable and no credentials", () => {
     const directory = scratch("sanitise");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     const { busy, kept, idle, running, limited, task } = seedPendingWork(seeded);
     const before = run(["scan", seeded]);
     expect(before.status).toBe(1);
@@ -1042,6 +1081,9 @@ describe("fixture CLI", () => {
         `SELECT COUNT(*) AS n FROM orchestration_v2_projection_runtime_requests WHERE status = 'pending'`,
       ),
     ).toBe(0);
+    // Migration 77's turn item counts stay, exact for the items the fixture holds.
+    const counted = turnItemCountsMismatch(clean);
+    expect([counted.rows > 0, counted.wrong]).toEqual([true, 0]);
     const settled = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_subagents
       WHERE subagent_id = '${task}' AND status = 'completed' AND json_extract(payload_json, '$.result') IS NOT NULL`;
     expect(count(clean, settled)).toBe(1);
@@ -1064,7 +1106,7 @@ describe("sanitise content", () => {
   it("leaves none of the review's planted credentials, and scan fails on any planted afterwards", () => {
     const directory = scratch("credentials");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     const secrets = seedCredentials(seeded);
     const clean = NodePath.join(directory, "clean.sqlite");
     const result = run(["sanitise", seeded, clean]);
@@ -1076,35 +1118,36 @@ describe("sanitise content", () => {
     expect(survivors).toEqual([]);
     expect(run(["scan", clean]).status).toBe(0);
 
-    const plant = (name: string, sql: string, value: string) => {
-      const copy = NodePath.join(directory, `${name}.sqlite`);
-      NodeFS.copyFileSync(clean, copy);
-      const db = new NodeSqlite.DatabaseSync(copy);
-      db.prepare(sql).run(value);
-      db.close();
-      return run(["scan", copy]).status;
-    };
-    const inId = plant(
-      "token-in-id",
+    // Planted afterwards, each in its own row, all in one copy and one scan: a token in an id
+    // field, prose in a message, and a random value under a session name (P1-002 reads it as one).
+    const planted = NodePath.join(directory, "planted.sqlite");
+    NodeFS.copyFileSync(clean, planted);
+    const db = new NodeSqlite.DatabaseSync(planted);
+    db.prepare(
       `UPDATE orchestration_v2_projection_turn_items
        SET payload_json = json_set(payload_json, '$.nativeItemRef', json_object('driver', 'claudeAgent', 'nativeId', ?, 'strength', 'strong'))
        WHERE turn_item_id = (SELECT MIN(turn_item_id) FROM orchestration_v2_projection_turn_items)`,
-      TOKENS.github as string,
-    );
-    const prose = plant(
-      "prose",
+    ).run(TOKENS.github as string);
+    db.prepare(
       `UPDATE orchestration_v2_projection_messages SET payload_json = json_set(payload_json, '$.text', ?)
        WHERE message_id = (SELECT MIN(message_id) FROM orchestration_v2_projection_messages)`,
-      "the staging db password is hunter two, keep it quiet",
-    );
-    // A random value under a session/key/auth name: P1-002's extended check reads it as one.
-    const sessionKey = plant(
-      "session-key",
+    ).run("the staging db password is hunter two, keep it quiet");
+    db.prepare(
       `UPDATE orchestration_v2_projection_messages SET payload_json = json_set(payload_json, '$.sessionId', ?)
-       WHERE message_id = (SELECT MIN(message_id) FROM orchestration_v2_projection_messages)`,
-      `${"q8Zr3Vt9Lp2Xw7Ms".repeat(2)}`,
-    );
-    expect([inId, prose, sessionKey]).toEqual([1, 1, 1]);
+       WHERE message_id = (SELECT MAX(message_id) FROM orchestration_v2_projection_messages)`,
+    ).run(`${"q8Zr3Vt9Lp2Xw7Ms".repeat(2)}`);
+    db.close();
+    const scan = run(["scan", planted]);
+    const found = JSON.parse(scan.stdout) as {
+      secretHits: Record<string, number>;
+      notBlanked: Record<string, number>;
+    };
+    expect([
+      scan.status,
+      (found.secretHits["orchestration_v2_projection_turn_items:github-token"] ?? 0) > 0,
+      (found.notBlanked["orchestration_v2_projection_messages.payload_json"] ?? 0) > 0,
+      (found.secretHits["orchestration_v2_projection_messages:high-entropy"] ?? 0) > 0,
+    ]).toEqual([1, true, true, true]);
   });
 });
 
@@ -1212,10 +1255,13 @@ describe("content blanking", () => {
   it("--keep-content removes every planted credential with the pattern layer alone", () => {
     const directory = scratch("keep-content");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     const secrets = seedCredentials(seeded);
     const kept = NodePath.join(directory, "kept.sqlite");
-    expect(run(["sanitise", "--keep-content", seeded, kept]).status).toBe(0);
+    const sanitised = run(["sanitise", "--keep-content", seeded, kept]);
+    expect(sanitised.status).toBe(0);
+    // Its summary names the checks it ran, not the blank-mode filler check.
+    expect(sanitised.stdout).not.toMatch(/allowlisted or filler/);
     const raw = NodeFS.readFileSync(kept).toString("latin1");
     const survivors = secrets.filter(
       (secret) => raw.includes(secret) || raw.includes(JSON.stringify(secret).slice(1, -1)),
@@ -1227,11 +1273,142 @@ describe("content blanking", () => {
   });
 });
 
+describe("allowlist limits", () => {
+  const secret = "q8Zr3Vt9Lp2Xw7MsHn4Kd8Yb";
+
+  it("blanks ids under credential-named ancestors and token-like keys, keeping names and prefixed ids", () => {
+    const payload = JSON.stringify({
+      credentials: { id: secret, clientId: secret },
+      session: { token: { refreshTokenId: secret } },
+      threadId: "thread-1",
+      [secret]: 1,
+      cacheReadInputTokens: 7,
+      mcp__atlassian__getJiraIssue: 2,
+      toolu_01ABCdefGHIjklMNOpqrSTU: 3,
+    });
+    const out = JSON.parse(rewriteContent(payload, "payload_json", "blank", emptyCounts())) as {
+      credentials: { id: string; clientId: string };
+      session: { token: { refreshTokenId: string } };
+      threadId: string;
+    };
+    expect([
+      isFiller(out.credentials.id),
+      isFiller(out.credentials.clientId),
+      isFiller(out.session.token.refreshTokenId),
+      out.threadId,
+    ]).toEqual([true, true, true, "thread-1"]);
+    const keys = Object.keys(out);
+    expect(keys.includes(secret)).toBe(false);
+    expect(
+      [
+        "cacheReadInputTokens",
+        "mcp__atlassian__getJiraIssue",
+        "toolu_01ABCdefGHIjklMNOpqrSTU",
+      ].filter((key) => !keys.includes(key)),
+    ).toEqual([]);
+    const planted = (value: unknown) => {
+      const kinds: Array<string> = [];
+      contentFindings(JSON.stringify(value), null, "blank", (kind) => kinds.push(kind));
+      return kinds;
+    };
+    expect([planted({ credentials: { id: secret } }), planted({ [secret]: 1 })]).toEqual([
+      ["not-blanked"],
+      ["key"],
+    ]);
+  });
+
+  it("zeroes numbers under credential names, keeping counts such as token usage", () => {
+    const payload = JSON.stringify({
+      pin: 123456,
+      otp: 654321,
+      passcode: -42.5e3,
+      inputTokens: 1234,
+      exitCode: 1,
+      auth: { expiresIn: 3600 },
+      // No exemption for `pass`: a tally there costs a bench fixture nothing, a password a lot.
+      runs: { pass: 12, fail: 1 },
+      PASS: 3,
+      db_pass: 20241231,
+      smtp: { pass: 654321 },
+      dbPass: 4242,
+    });
+    const stored = rewriteContent(payload, "payload_json", "blank", emptyCounts());
+    expect(stored.length).toBe(payload.length);
+    const out = JSON.parse(stored) as Record<string, unknown>;
+    expect([
+      out.pin,
+      out.otp,
+      out.passcode,
+      out.inputTokens,
+      out.exitCode,
+      out.auth,
+      out.runs,
+      out.PASS,
+      out.db_pass,
+      out.smtp,
+      out.dbPass,
+    ]).toEqual([0, 0, 0, 1234, 1, { expiresIn: 0 }, { pass: 0, fail: 1 }, 0, 0, { pass: 0 }, 0]);
+    // The re-review's cases, planted after sanitising: the check must report each.
+    const planted = (value: unknown) => {
+      const kinds: Array<string> = [];
+      contentFindings(JSON.stringify(value), null, "blank", (kind) => kinds.push(kind));
+      return kinds;
+    };
+    expect([
+      planted({ pin: 123456 }),
+      planted({ db_pass: 20241231 }),
+      planted({ pass: 77310042 }),
+      planted({ smtp: { pass: 654321 } }),
+      planted({ pass: { id: "q8Zr3Vt9Lp2Xw7MsHn4Kd8Yb" } }),
+    ]).toEqual([
+      ["credential-number"],
+      ["credential-number"],
+      ["credential-number"],
+      ["credential-number"],
+      ["not-blanked"],
+    ]);
+    // ... and sanitising blanks an id under a pass-named ancestor.
+    const nested = JSON.parse(
+      rewriteContent(
+        JSON.stringify({ pass: { id: "q8Zr3Vt9Lp2Xw7MsHn4Kd8Yb" } }),
+        "payload_json",
+        "blank",
+        emptyCounts(),
+      ),
+    ) as { pass: { id: string } };
+    expect(isFiller(nested.pass.id)).toBe(true);
+  });
+
+  // The project timeout (60 s) is the linearity check: a quadratic rule needs minutes on 1 MB here.
+  it("runs the extended rules in linear time and walks deep JSON without recursion", () => {
+    const rows: Array<string> = [];
+    extendedFindings("TOKEN".repeat(200_000), (row) => rows.push(row));
+    extendedFindings("t3_session".repeat(100_000), (row) => rows.push(row));
+    expect(rows).toEqual([]);
+    const found: Array<string> = [];
+    extendedFindings(`export DB_PASSWORD=${"Zx9q".repeat(4)}`, (row) => found.push(row));
+    extendedFindings(`t3_session_id=${"Ab12".repeat(5)}`, (row) => found.push(row));
+    // Both linear rules still find what their regexes found.
+    expect(
+      ["raw|p1002:secret env var", "raw|p1002:t3 session cookie"].filter(
+        (row) => !found.includes(row),
+      ),
+    ).toEqual([]);
+    const deepArray = `${"[".repeat(5000)}"x"${"]".repeat(5000)}`;
+    const deepObject = `${'{"a":'.repeat(5000)}{"/k":1}${"}".repeat(5000)}`;
+    expect(() => {
+      extendedFindings(deepArray, () => undefined);
+      extendedFindings(deepObject, () => undefined);
+      rewriteContent(deepObject, null, "blank", emptyCounts());
+    }).not.toThrow();
+  });
+});
+
 describe("v1 imports", () => {
   it("scan counts pending v1 shell and transcript imports, and sanitise leaves none", () => {
     const directory = scratch("legacy");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     const db = new NodeSqlite.DatabaseSync(seeded);
     const at = "2026-01-01T00:00:00.000Z";
     db.exec(`UPDATE orchestration_v2_legacy_imports SET transcript_imported_at = NULL
@@ -1259,7 +1436,7 @@ describe("server on a fixture", () => {
     synth(database, "0.05");
     const events = count(database, `SELECT COUNT(*) AS n FROM orchestration_events`);
     const booted = await boot(database);
-    expect([booted.status, booted.migration]).toEqual([200, 76]);
+    expect([booted.status, booted.migration]).toEqual([200, BUILD_MIGRATION_HEAD]);
     expect(Object.values(recoveryCounts(booted.log))).toEqual([0, 0, 0, 0, 0]);
     expect(count(booted.copy, `SELECT COUNT(*) AS n FROM orchestration_events`)).toBe(events);
   });
@@ -1267,7 +1444,7 @@ describe("server on a fixture", () => {
   it("runs none of a sanitised fixture's seeded work, where the unsanitised copy recovers it", async () => {
     const directory = scratch("boot-seeded");
     const seeded = NodePath.join(directory, "seeded.sqlite");
-    synth(seeded, "0.25");
+    synthCopy(seeded);
     seedPendingWork(seeded);
     const clean = NodePath.join(directory, "clean.sqlite");
     expect(run(["sanitise", seeded, clean]).status).toBe(0);

@@ -101,9 +101,17 @@ sessions. The orchestrator still validates the current thread before applying se
 
 Read receipts use `ProjectionStore.getThread` to load only canonical thread metadata. A visit
 advances `lastVisitedAt` monotonically without changing `updatedAt` or decoding history. Shell
-queries use a covering thread/run index for item counts and a partial index for nonterminal
-background items, including idle items. Latest user-message reads use an index ordered by update
-time.
+queries read item counts from `orchestration_v2_projection_turn_item_counts`, one row per thread
+and run that triggers on the turn-item table keep exact, so a shell read never counts a thread's
+items. `ProjectionMaintenance.verify` reports counts that drifted from their items, `rebuild`
+recounts them during replay, and `t3 doctor` recounts drifted counts before it compacts. The
+triggers write to that table: dropping the table while they remain makes every turn-item insert
+fail, so drop the three triggers first. Rolling back to a build without migration 77 can instead
+delete its `effect_sql_migrations` row and keep the table and triggers, which go on counting. A
+migration that rebuilds the turn-item table (create, copy, drop, rename) drops the triggers with
+it, so migration 77 must run after any such rebuild, or the rebuild must recreate them. A partial
+index covers nonterminal background items, including idle items. Latest user-message reads use an
+index ordered by update time.
 
 Command palette results keep live VCS and linked pull-request queries leased to the visible
 viewport, including a small overscan region. Cached badges remain available while leases are

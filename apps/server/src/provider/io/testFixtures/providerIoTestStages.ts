@@ -56,7 +56,8 @@ let closedAsyncSessions = 0;
 // Emits, settles and ends outside push, as a stage that runs a library does.
 export const asyncStage: ProviderIoStage<void, string, string, string, string> = {
   name: "test-async",
-  open: (_options, host) => {
+  open: (_options, maybeHost) => {
+    const host = maybeHost!;
     const decoder = new TextDecoder();
     return {
       push: (chunk, emit) => {

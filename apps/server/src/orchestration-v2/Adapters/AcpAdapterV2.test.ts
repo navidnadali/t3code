@@ -311,6 +311,8 @@ function makeMockRuntime(input: {
           ? runtimeInput.protocolLogging
           : {
               ...runtimeInput.protocolLogging,
+              logIncoming: true,
+              logOutgoing: true,
               logger: (event: EffectAcpProtocol.AcpProtocolLogEvent) =>
                 Queue.offer(protocolEvents, event).pipe(
                   Effect.andThen(runtimeInput.protocolLogging.logger?.(event) ?? Effect.void),
@@ -2887,6 +2889,52 @@ describe("AcpAdapterV2", () => {
       assert.isFalse(
         items.some((item) => item.threadId === threadId && item.type === "dynamic_tool"),
       );
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.effect("leaves ACP protocol logging off when nothing consumes it", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const makeRuntime = makeMockRuntime({ childProcessSpawner, mockAgentPath });
+      const protocolLogging: Array<AcpAdapterV2RuntimeInput["protocolLogging"]> = [];
+      const instanceId = ProviderInstanceId.make("acp-test-protocol-logging-off");
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          makeRuntime: (runtimeInput) => {
+            protocolLogging.push(runtimeInput.protocolLogging);
+            return makeRuntime(runtimeInput);
+          },
+        },
+        selfInvocation,
+      });
+      const threadId = ThreadId.make("thread-acp-protocol-logging-off");
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-protocol-logging-off"),
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
+
+      assert.isAbove(protocolLogging.length, 0);
+      for (const logging of protocolLogging) {
+        assert.notEqual(logging.logIncoming, true);
+        assert.notEqual(logging.logOutgoing, true);
+      }
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 

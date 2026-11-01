@@ -267,7 +267,8 @@ export const claudeAgentSdkStage: ProviderIoStage<
   ClaudeAgentSdkWorkerEvent
 > = {
   name: CLAUDE_AGENT_SDK_STAGE,
-  open: (stageOptions, host: ProviderIoStageHost<SDKMessage, ClaudeAgentSdkWorkerEvent>) => {
+  open: (stageOptions, host?: ProviderIoStageHost<SDKMessage, ClaudeAgentSdkWorkerEvent>) => {
+    if (host === undefined) throw new Error("The Claude Agent SDK stage runs only on a worker.");
     const prompts = makePromptQueue();
     let child: FacadeProcess | undefined;
     let query: Query | undefined;

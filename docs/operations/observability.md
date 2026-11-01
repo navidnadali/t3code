@@ -715,20 +715,13 @@ Provider I/O workers, experimental and off by default:
 - `T3CODE_PROVIDER_IO_CLAUDE_SDK`: also run each Claude session's Agent SDK on those workers,
   default off; it does nothing while `T3CODE_PROVIDER_IO_WORKERS` is `0`. The server still starts,
   watches, and stops the Claude CLI; a worker reads its output. A session whose launch settings the
-  worker cannot reproduce (an abort controller, hooks other than T3's own, a session store or
-  other non-data options, an in-process MCP server, or no Claude binary path) stays on the main
-  thread.
+  worker cannot reproduce (an abort controller, a session store or other non-data options, an
+  in-process MCP server, or no Claude binary path) stays on the main thread.
 
-A Claude session on a worker cannot ask you anything yet. Every question Claude would put to you is
-answered on the worker instead, and a warning is logged once per session and kind:
-
-- tool approval prompts are denied with "T3 Code cannot answer permission requests while Claude runs
-  in a provider I/O worker.", and so are `AskUserQuestion` and `ExitPlanMode`, which Claude asks
-  through the same prompt;
-- MCP elicitations are declined;
-- the resume-compaction dialog is cancelled;
-- the server's own handling of those prompts is skipped: no approval request or question appears in
-  the thread, and no tool row is started for it.
+A Claude session on a worker asks you what it would on the main thread: the worker passes each tool
+approval prompt, question, MCP elicitation, resume-compaction dialog and hook call to the server,
+which answers it as it does without workers, and passes on Claude's cancellation of one. The server
+handles such a request once it has handled the output Claude sent before it.
 
 ### The Kill Switch
 

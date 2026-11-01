@@ -697,18 +697,22 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     const startedAt = timing?.now() ?? 0;
     const lines = split(data);
     timing?.record("framing", timing.now() - startedAt, data.byteLength);
+    // Not a spread: a JSON-RPC batch can hold more messages than a call takes arguments.
+    const append = (decoded: ReadonlyArray<AcpWire.WireMessage>) => {
+      for (const message of decoded) messages.push(message);
+    };
     const decodeHere = (line: string) =>
-      Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`));
+      Effect.fromResult(AcpWire.decodeWireChunk(parser, `${line}\n`)).pipe(Effect.map(append));
     for (const line of lines) {
       if (line.length < offload.minChars || AcpWire.isBatchLine(line)) {
-        messages.push(...(yield* decodeHere(line)));
+        yield* decodeHere(line);
         continue;
       }
       const decoded = yield* timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () =>
         offload.decode(line),
       );
       if (decoded._tag === "InThread") {
-        messages.push(...(yield* decodeHere(line)));
+        yield* decodeHere(line);
         continue;
       }
       if (decoded._tag === "Failed") {
@@ -717,9 +721,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           cause: decoded.cause,
         });
       }
-      messages.push(
-        ...(yield* Effect.fromResult(AcpWire.normalizeOffloadedMessages(decoded.messages))),
-      );
+      append(yield* Effect.fromResult(AcpWire.normalizeOffloadedMessages(decoded.messages)));
     }
     return messages;
   });

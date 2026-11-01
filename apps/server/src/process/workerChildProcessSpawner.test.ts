@@ -895,6 +895,26 @@ describe("WorkerChildProcessSpawner", () => {
   }
 
   it.live.skipIf(!workerPlatform)(
+    "closing the spawner process ends what its non-detached children left in its process group",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const watch = yield* childWatch;
+        const socket = yield* Effect.gen(function* () {
+          const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner);
+          // Without its own group, the child's descendant stays in the spawner's group after it exits.
+          const leaver = node(
+            `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(watch.connectScript())}], { stdio: "ignore" })`,
+            { detached: false },
+          );
+          expect((yield* collect(remoteSpawner, leaver)).exit).toEqual({ code: 0 });
+          return yield* watch.connected;
+        }).pipe(Effect.scoped);
+        yield* watch.closed(socket);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.skipIf(!workerPlatform)(
     "the spawner process kills its children and exits when the server dies",
     () =>
       Effect.gen(function* () {

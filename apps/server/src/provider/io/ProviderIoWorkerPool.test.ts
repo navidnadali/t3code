@@ -30,6 +30,11 @@ const workers = vi.hoisted(() => ({
   started: new Array<NodeWorkerThreads.Worker>(),
   exits: new WeakMap<NodeWorkerThreads.Worker, Promise<number>>(),
   opened: new Array<number>(),
+  posted: new Array<{
+    readonly worker: NodeWorkerThreads.Worker;
+    readonly type: unknown;
+    readonly session: unknown;
+  }>(),
 }));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
@@ -56,6 +61,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
       if (message.type === "open" && typeof message.session === "number") {
         workers.opened.push(message.session);
       }
+      workers.posted.push({ worker: this, type: message.type, session: message.session });
       super.postMessage(...args);
     }
   }
@@ -755,5 +761,56 @@ it.effect("runs the ACP wire stage on the production worker and encodes on its p
       yield* session.end;
       assert.deepEqual(yield* Stream.runCollect(session.output), expected);
     }).pipe(Effect.scoped),
+  ),
+);
+
+it.effect("sends the end of input even when the caller stops waiting for it", () =>
+  withPool({ workers: 1, mode: "inert" }, (pool) =>
+    Effect.gen(function* () {
+      const session = yield* openEcho(pool, "t", { highWaterMark: 4 });
+      const id = workers.opened.at(-1);
+      yield* session.write(bytes("full"));
+      const write = yield* Effect.forkChild(session.write(bytes("next")), {
+        startImmediately: true,
+      });
+      const end = yield* Effect.forkChild(session.end, { startImmediately: true });
+      yield* Fiber.interrupt(end);
+      workers.started.at(-1)!.emit("message", {
+        type: "output",
+        session: id,
+        outputs: [],
+        bytes: 4,
+      });
+      yield* Fiber.join(write);
+      yield* session.end;
+      const sent = workers.posted.filter((message) => message.session === id);
+      assert.deepEqual(
+        sent.map((message) => message.type),
+        ["open", "bytes", "bytes", "eof"],
+      );
+    }),
+  ),
+);
+
+it.effect("releases an open's worker reservation as soon as the open fails", () =>
+  withPool({ workers: 2 }, (pool, started) =>
+    Effect.gen(function* () {
+      const [first] = workers.started.slice(-started());
+      yield* openEcho(pool, "ready").pipe(Effect.scoped);
+      yield* Effect.flip(
+        pool.open({
+          stage: echoStage,
+          options: Object.assign({ tag: "bad" }, { callback: () => undefined }),
+          onFailure: toCodexError,
+          kill: Effect.void,
+        }),
+      );
+      // With every worker idle again, the next session goes to the first one.
+      yield* openEcho(pool, "next");
+      assert.equal(
+        workers.posted.filter((message) => message.type === "open").at(-1)?.worker,
+        first,
+      );
+    }),
   ),
 );

@@ -69,6 +69,18 @@ it.effect("rejects a worker that requires or imports a computed name", () =>
   }),
 );
 
+it.effect("rejects a worker that reaches a loader indirectly", () =>
+  Effect.gen(function* () {
+    for (const worker of [
+      'module["require"]("./package.json");\n',
+      'require.call(null, "./package.json");\n',
+      'const load = require;\nload("./package.json");\n',
+    ]) {
+      assert.include(yield* rejection(worker), "require");
+    }
+  }),
+);
+
 it.effect("fails the build when the plugin never replaces its placeholder", () =>
   Effect.gen(function* () {
     const error = yield* buildHost('console.log("worker");\n', {

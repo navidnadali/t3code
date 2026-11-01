@@ -915,6 +915,32 @@ describe("WorkerChildProcessSpawner", () => {
   );
 
   it.live.skipIf(!workerPlatform)(
+    "a spawner process killed outright still takes its process group with it",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const watch = yield* childWatch;
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner);
+        // The child's descendant, in the spawner's group, SIGKILLs the spawner once connected.
+        const descendant = watch.connectScript(
+          'process.kill(Number(process.env.T3_P1070_SPAWNER), "SIGKILL");',
+        );
+        const child = node(
+          `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { stdio: "ignore", env: { ...process.env, T3_P1070_SPAWNER: String(process.ppid) } }).unref(); setInterval(() => {}, 1000)`,
+          { detached: false },
+        );
+        yield* Effect.gen(function* () {
+          const handle = yield* remoteSpawner.spawn(child);
+          const socket = yield* watch.connected;
+          expect(summarizeError(yield* Effect.flip(handle.exitCode)).causeMessage).toContain(
+            "SIGKILL",
+          );
+          yield* watch.closed(socket);
+        }).pipe(Effect.scoped);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.skipIf(!workerPlatform)(
     "the spawner process kills its children and exits when the server dies",
     () =>
       Effect.gen(function* () {

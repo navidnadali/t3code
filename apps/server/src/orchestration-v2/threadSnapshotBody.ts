@@ -56,24 +56,80 @@ const encodeVisibleRows = Effect.fnUntraced(function* (
   return encoded;
 });
 
+const isSkipped = (value: unknown) =>
+  value === undefined || typeof value === "function" || typeof value === "symbol";
+
+// JSON.stringify calls a member's toJSON with its key before serializing it.
+const toJsonValue = (value: unknown, key: string) =>
+  value !== null &&
+  (typeof value === "object" || typeof value === "bigint") &&
+  typeof (value as { readonly toJSON?: unknown }).toJSON === "function"
+    ? (value as { readonly toJSON: (key: string) => unknown }).toJSON(key)
+    : value;
+
+// About its JSON length (escapes and toJSON results can differ); it stops early on a large value.
+const exceedsChunk = (value: unknown) => {
+  let budget = CHUNK_CHARS;
+  const visit = (current: unknown): boolean => {
+    if (typeof current === "string") return (budget -= current.length + 2) < 0;
+    if (current === null || typeof current !== "object" || "toJSON" in current) {
+      return (budget -= 32) < 0;
+    }
+    for (const key in current) {
+      budget -= key.length + 4;
+      if (budget < 0 || visit((current as Readonly<Record<string, unknown>>)[key])) return true;
+    }
+    return (budget -= 2) < 0;
+  };
+  return visit(value);
+};
+
+// Never between the halves of a surrogate pair: apart, each half encodes differently.
+const sliceEnd = (text: string, start: number) => {
+  const end = Math.min(start + CHUNK_CHARS, text.length);
+  const last = text.charCodeAt(end - 1);
+  return end < text.length && last >= 0xd800 && last <= 0xdbff ? end - 1 : end;
+};
+
+/** JSON.stringify of a value already through toJSON, in parts of about a chunk or less. */
+function* jsonParts(value: unknown): Generator<string> {
+  if (!exceedsChunk(value)) {
+    yield JSON.stringify(value);
+  } else if (typeof value === "string") {
+    yield '"';
+    for (let start = 0; start < value.length; ) {
+      const end = sliceEnd(value, start);
+      yield JSON.stringify(value.slice(start, end)).slice(1, -1);
+      start = end;
+    }
+    yield '"';
+  } else if (
+    value === null ||
+    typeof value !== "object" ||
+    value instanceof String ||
+    value instanceof Number ||
+    value instanceof Boolean
+  ) {
+    yield JSON.stringify(value);
+  } else if (Array.isArray(value)) {
+    yield* arrayParts([value]);
+  } else {
+    yield* objectParts(value as Readonly<Record<string, unknown>>, () => undefined);
+  }
+}
+
 function* objectParts(
   value: Readonly<Record<string, unknown>>,
-  nested: (key: string, value: unknown) => Iterable<string> | undefined,
+  nested: (key: string) => Iterable<string> | undefined,
 ): Generator<string> {
   yield "{";
   let separator = "";
   for (const key of Object.keys(value)) {
-    const parts = nested(key, value[key]);
-    if (parts !== undefined) {
-      yield `${separator}${JSON.stringify(key)}:`;
-      yield* parts;
-      separator = ",";
-      continue;
-    }
-    // A one-key object keeps JSON.stringify's own rules: toJSON(key), and no key for undefined.
-    const member = JSON.stringify({ [key]: value[key] }).slice(1, -1);
-    if (member === "") continue;
-    yield `${separator}${member}`;
+    const parts = nested(key);
+    const member = parts === undefined ? toJsonValue(value[key], key) : undefined;
+    if (parts === undefined && isSkipped(member)) continue;
+    yield `${separator}${JSON.stringify(key)}:`;
+    yield* parts ?? jsonParts(member);
     separator = ",";
   }
   yield "}";
@@ -81,31 +137,24 @@ function* objectParts(
 
 function* arrayParts(batches: Batches): Generator<string> {
   yield "[";
-  let separator = "";
+  let index = 0;
   for (const batch of batches) {
     for (const element of batch) {
-      // A one-element array keeps JSON.stringify's array rules, such as null for undefined.
-      yield `${separator}${JSON.stringify([element]).slice(1, -1)}`;
-      separator = ",";
+      if (index > 0) yield ",";
+      const value = toJsonValue(element, String(index++));
+      yield* isSkipped(value) ? ["null"] : jsonParts(value);
     }
   }
   yield "]";
 }
 
-// Never between the halves of a surrogate pair, which would encode as two replacement characters.
-const chunkEnd = (text: string) => {
-  const last = text.charCodeAt(CHUNK_CHARS - 1);
-  return last >= 0xd800 && last <= 0xdbff ? CHUNK_CHARS - 1 : CHUNK_CHARS;
-};
-
 function* chunks(parts: Iterable<string>): Generator<Uint8Array> {
   let pending = "";
   for (const part of parts) {
     pending += part;
-    while (pending.length >= CHUNK_CHARS) {
-      const end = chunkEnd(pending);
-      yield Buffer.from(pending.slice(0, end), "utf8");
-      pending = pending.slice(end);
+    if (pending.length >= CHUNK_CHARS) {
+      yield Buffer.from(pending, "utf8");
+      pending = "";
     }
   }
   if (pending.length > 0) yield Buffer.from(pending, "utf8");
@@ -151,9 +200,9 @@ export const encodeThreadSnapshotBody = Effect.fn("ThreadSnapshotBody.encode")(f
   return Stream.suspend(() =>
     Stream.fromIterable(
       chunks(
-        objectParts(envelope, (key, value) =>
+        objectParts(envelope, (key) =>
           key === "projection"
-            ? objectParts(value as Readonly<Record<string, unknown>>, (field) => {
+            ? objectParts(envelope.projection as Readonly<Record<string, unknown>>, (field) => {
                 const batches = arrays.get(field);
                 return batches === undefined ? undefined : arrayParts(batches);
               })

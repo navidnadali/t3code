@@ -17,6 +17,7 @@ import {
   type ThreadPlan,
   makeRandom,
 } from "./plan.ts";
+import { nativeId } from "./ids.ts";
 import { quantile } from "./shape.ts";
 
 export interface BuildOptions {
@@ -84,7 +85,6 @@ const WORDS = (
   "start stop run wait retry timeout signal process memory disk network socket message session " +
   "provider model agent tool call plan step task note summary detail reason status state order"
 ).split(" ");
-const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const BULK_FIELDS = ["output", "diffStr", "text", "result", "prompt", "message", "detail"];
 // Payload bytes of a native item before its text, with the server's composite ids.
 const NATIVE_ITEM_BASE = 1_000;
@@ -189,14 +189,7 @@ export class Builder {
 
   /** A Claude-style native id (`toolu_01…`, `msg_01…`), unique by its counter tail. */
   private native(prefix: string): string {
-    let id = `${prefix}_01`;
-    for (let index = 0; index < 14; index++) id += BASE62[Math.floor(this.random() * 62)];
-    let tail = this.counter++;
-    for (let index = 0; index < 8; index++) {
-      id += BASE62[tail % 62];
-      tail = Math.floor(tail / 62);
-    }
-    return id;
+    return nativeId(prefix, this.random, this.counter++);
   }
 
   private text(length: number): string {

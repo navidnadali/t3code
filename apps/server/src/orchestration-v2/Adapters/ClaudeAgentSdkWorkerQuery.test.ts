@@ -43,7 +43,10 @@ import {
   claudeAgentSdkStageOptions,
 } from "./ClaudeAgentSdkWorkerQuery.ts";
 
-const workers = vi.hoisted(() => ({ started: new Array<NodeWorkerThreads.Worker>() }));
+const workers = vi.hoisted(() => ({
+  started: new Array<NodeWorkerThreads.Worker>(),
+  opened: new Array<{ readonly worker: NodeWorkerThreads.Worker; readonly session: number }>(),
+}));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
@@ -51,6 +54,13 @@ vi.mock("node:worker_threads", async (importOriginal) => {
     constructor(...args: ConstructorParameters<typeof actual.Worker>) {
       super(...args);
       workers.started.push(this);
+    }
+    override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      const [message] = args as [{ readonly type?: unknown; readonly session?: unknown }];
+      if (message.type === "open" && typeof message.session === "number") {
+        workers.opened.push({ worker: this, session: message.session });
+      }
+      super.postMessage(...args);
     }
   }
   return { ...actual, Worker: RecordedWorker };
@@ -596,40 +606,103 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
-  it.effect("drops the frames still on their way when the query closes, as in-thread", () =>
+  const resultFrame = (uuid: string, text: string) => ({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+    result: text,
+    session_id: SESSION_ID,
+    total_cost_usd: 0,
+    usage: { input_tokens: 1, output_tokens: 1 },
+    modelUsage: {},
+    permission_denials: [],
+    uuid,
+  });
+
+  const nextMacrotask = Effect.promise(() => new Promise((resolve) => setImmediate(resolve)));
+
+  it.effect(
+    "delivers the frames read before the query closes and none sent after, as in-thread",
+    () =>
+      Effect.gen(function* () {
+        const run = (mode: Mode) =>
+          withRunner(mode, ({ runner }) =>
+            Effect.gen(function* () {
+              const cli = new FakeClaudeCli(streamThenWait);
+              const session = yield* runner.open(openInput(cli));
+              yield* session.offer(prompt("Stream until closed."));
+              const turn = yield* streamUntilDelta(session, "delta-15");
+              cli.write(resultFrame("result-read", "x".repeat(2 * 1024 * 1024)));
+              // In-thread the SDK has parsed it by now; on a worker main has sent it there.
+              yield* nextMacrotask;
+              yield* session.close;
+              cli.write(resultFrame("result-after-close", "late"));
+              const messages = yield* Fiber.join(turn);
+              return messages.map((message) => ("uuid" in message ? message.uuid : message.type));
+            }),
+          );
+        const inThread = yield* run("thread");
+        const inWorker = yield* run("worker");
+
+        assert.deepStrictEqual(inThread, [
+          ...Array.from({ length: 16 }, (_, delta) => `delta-${delta}`),
+          "result-read",
+        ]);
+        assert.deepStrictEqual(inWorker, inThread);
+      }),
+  );
+
+  it.effect("stops the CLI when a query closes after its worker session failed", () =>
+    withRunner("worker", ({ runner }) =>
+      Effect.gen(function* () {
+        const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+        const openedBefore = workers.opened.length;
+        const session = yield* runner.open(openInput(cli));
+        const messages = yield* Stream.runDrain(session.messages).pipe(
+          Effect.flip,
+          Effect.forkChild,
+        );
+        const [opened] = workers.opened.slice(openedBefore);
+        assert.isDefined(opened);
+        // What main hears when the stage throws on the worker.
+        opened.worker.emit("message", {
+          type: "fail",
+          session: opened.session,
+          error: new Error("injected stage failure"),
+        });
+        const error = yield* Fiber.join(messages);
+        assert.strictEqual(error.method, "fromAsyncIterable");
+        yield* session.close;
+        yield* Effect.promise(() => cli.stdinEnded);
+        yield* TestClock.adjust("2 seconds");
+        yield* Effect.promise(() => cli.waitForKill("SIGTERM"));
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.promise(() => cli.waitForKill("SIGKILL"));
+        assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGKILL"]);
+      }),
+    ),
+  );
+
+  it.effect("fails a control call after the query ended with the in-thread error", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>
         withRunner(mode, ({ runner }) =>
           Effect.gen(function* () {
-            const cli = new FakeClaudeCli(streamThenWait);
+            const cli = new FakeClaudeCli();
             const session = yield* runner.open(openInput(cli));
-            yield* session.offer(prompt("Stream until closed."));
-            const turn = yield* streamUntilDelta(session, "delta-15");
-            // The reader is waiting for its next frame; this one is still being read when it closes.
-            cli.write({
-              type: "result",
-              subtype: "success",
-              is_error: false,
-              duration_ms: 1,
-              duration_api_ms: 1,
-              num_turns: 1,
-              result: "x".repeat(2 * 1024 * 1024),
-              session_id: SESSION_ID,
-              total_cost_usd: 0,
-              usage: { input_tokens: 1, output_tokens: 1 },
-              modelUsage: {},
-              permission_denials: [],
-              uuid: "result-in-flight",
-            });
             yield* session.close;
-            const messages = yield* Fiber.join(turn);
-            return messages.map((message) => message.type);
+            yield* Stream.runDrain(session.messages);
+            yield* Effect.promise(() => cli.stdinEnded);
+            const error = yield* Effect.flip(session.setModel("claude-opus-4-1"));
+            return { method: error.method, message: (error.cause as Error).message };
           }),
         );
       const inThread = yield* run("thread");
       const inWorker = yield* run("worker");
 
-      assert.deepStrictEqual(inThread, Array(16).fill("stream_event"));
       assert.deepStrictEqual(inWorker, inThread);
     }),
   );

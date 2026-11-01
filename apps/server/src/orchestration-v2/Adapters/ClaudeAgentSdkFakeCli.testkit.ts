@@ -68,6 +68,7 @@ export class FakeClaudeCli extends NodeEvents.EventEmitter implements SpawnedPro
     readonly resolve: (frame: FakeClaudeCliFrame) => void;
   }>();
   readonly #pending = new Map<string, (answer: Record<string, unknown>) => void>();
+  readonly #killWaiters = new Map<NodeJS.Signals, Array<() => void>>();
   #nextRequest = 0;
   #unsent: Array<string> | undefined;
 
@@ -134,10 +135,19 @@ export class FakeClaudeCli extends NodeEvents.EventEmitter implements SpawnedPro
     );
   }
 
+  waitForKill(signal: NodeJS.Signals): Promise<void> {
+    if (this.kills.includes(signal)) return Promise.resolve();
+    return new Promise((resolve) =>
+      this.#killWaiters.set(signal, [...(this.#killWaiters.get(signal) ?? []), resolve]),
+    );
+  }
+
   kill(signal: NodeJS.Signals) {
     if (this.exitCode !== null || this.signalCode !== null) return false;
     this.killed = true;
     this.kills.push(signal);
+    for (const resolve of this.#killWaiters.get(signal) ?? []) resolve();
+    this.#killWaiters.delete(signal);
     if (this.#options.exitOnKill !== false) process.nextTick(() => this.exit(null, signal));
     return true;
   }

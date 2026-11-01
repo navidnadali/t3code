@@ -59,8 +59,13 @@ export const asyncStage: ProviderIoStage<void, string, string, string, string> =
   open: (_options, host) => {
     const decoder = new TextDecoder();
     return {
-      push: (chunk) => {
+      push: (chunk, emit) => {
         const text = decoder.decode(chunk);
+        if (text === "emit-then-signal") {
+          emit("emitted-in-push");
+          host.signal("signalled-in-push");
+          return;
+        }
         queueMicrotask(() => host.emit(`late:${text}`));
       },
       end: () => {},

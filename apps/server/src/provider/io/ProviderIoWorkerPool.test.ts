@@ -675,3 +675,20 @@ it.effect("runs a stage's close when main closes its session", () =>
     }),
   ),
 );
+
+it.effect("posts an event a stage raises during push after the outputs it emitted first", () =>
+  withPool({ workers: 1 }, (pool) =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const session = yield* openAsync(pool, events);
+      workers.received.length = 0;
+      yield* session.write(bytes("emit-then-signal"));
+      assert.deepEqual(yield* Stream.runCollect(Stream.take(session.output, 1)), [
+        "emitted-in-push",
+      ]);
+      assert.equal(yield* session.call("next"), "next");
+      assert.deepEqual(events, ["signalled-in-push"]);
+      assert.deepEqual(workers.received, ["output", "event", "reply"]);
+    }),
+  ),
+);

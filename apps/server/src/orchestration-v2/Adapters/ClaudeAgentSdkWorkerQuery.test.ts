@@ -1,10 +1,11 @@
 import type * as NodeWorkerThreads from "node:worker_threads";
 
-import type {
-  McpServerConfig,
-  Options as ClaudeQueryOptions,
-  SDKMessage,
-  SDKUserMessage,
+import {
+  InMemorySessionStore,
+  type McpServerConfig,
+  type Options as ClaudeQueryOptions,
+  type SDKMessage,
+  type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -595,6 +596,61 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
+  it.effect("drops the frames still on their way when the query closes, as in-thread", () =>
+    Effect.gen(function* () {
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner }) =>
+          Effect.gen(function* () {
+            const cli = new FakeClaudeCli(streamThenWait);
+            const session = yield* runner.open(openInput(cli));
+            yield* session.offer(prompt("Stream until closed."));
+            const turn = yield* streamUntilDelta(session, "delta-15");
+            // The reader is waiting for its next frame; this one is still being read when it closes.
+            cli.write({
+              type: "result",
+              subtype: "success",
+              is_error: false,
+              duration_ms: 1,
+              duration_api_ms: 1,
+              num_turns: 1,
+              result: "x".repeat(2 * 1024 * 1024),
+              session_id: SESSION_ID,
+              total_cost_usd: 0,
+              usage: { input_tokens: 1, output_tokens: 1 },
+              modelUsage: {},
+              permission_denials: [],
+              uuid: "result-in-flight",
+            });
+            yield* session.close;
+            const messages = yield* Fiber.join(turn);
+            return messages.map((message) => message.type);
+          }),
+        );
+      const inThread = yield* run("thread");
+      const inWorker = yield* run("worker");
+
+      assert.deepStrictEqual(inThread, Array(16).fill("stream_event"));
+      assert.deepStrictEqual(inWorker, inThread);
+    }),
+  );
+
+  it.effect("kills a CLI that outlives its output when its worker dies", () =>
+    withRunner("worker", ({ runner }) =>
+      Effect.gen(function* () {
+        const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+        const session = yield* runner.open(openInput(cli));
+        yield* session.close;
+        yield* Stream.runDrain(session.messages);
+        assert.isNull(cli.exitCode);
+        yield* Effect.promise(() =>
+          Promise.all(workers.started.map((worker) => worker.terminate())),
+        );
+        yield* Effect.promise(() => cli.waitForKill("SIGKILL"));
+        assert.include(cli.kills, "SIGKILL");
+      }),
+    ),
+  );
+
   it.effect("keeps the query in-thread when the pool has no workers", () =>
     Effect.gen(function* () {
       const startedBefore = workers.started.length;
@@ -762,6 +818,9 @@ describe("claudeAgentSdkStageOptions", () => {
       [{ ...base, hooks: { SubagentStart: [{ hooks: [hook], timeout: 5 }] } }, undefined],
       [{ ...base, includeHookEvents: vi.fn() as never }, undefined],
       [base, { local: { type: "sdk", name: "local", instance: {} as never } }],
+      [{ ...base, sessionStore: { load: vi.fn(), append: vi.fn() } as never }, undefined],
+      [{ ...base, sessionStore: new InMemorySessionStore() }, undefined],
+      [{ ...base, settings: { env: new Map() } as never }, undefined],
     ];
     for (const [options, mcpServers] of cases) {
       assert.isUndefined(claudeAgentSdkStageOptions(options, mcpServers, subagentStart));

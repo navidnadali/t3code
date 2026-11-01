@@ -263,11 +263,16 @@ export function failureCause(log: string, threadId: string): string | null {
   let fallback: string | null = null;
   for (const entry of entries.toReversed()) {
     if (!names.some((name) => entry.includes(name))) continue;
-    // A format this parser does not know still yields its last raw error line.
+    // A format this parser does not know still yields its last raw error line. Outside a pretty
+    // entry (which names one thread) only lines naming the thread count: they may be anyone's.
+    const pretty = /^\[\d\d:\d\d:\d\d\.\d{3}\] /u.test(entry);
     fallback ??=
       entry
         .split("\n")
-        .findLast((line) => /[A-Za-z]Error\b/u.test(line))
+        .findLast(
+          (line) =>
+            /[A-Za-z]Error\b/u.test(line) && (pretty || names.some((name) => line.includes(name))),
+        )
         ?.trim()
         .slice(0, 500) ?? null;
     // A logged `error:` or `cause:` property starts a cause too, nested `[cause]:` lines or not.

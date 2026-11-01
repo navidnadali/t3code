@@ -172,6 +172,7 @@ describe("provider check runs", () => {
     const log = [
       '{"level":"warn","msg":"turn failed","threadId":"mcp:5f0c1d2e-0000-4000-8000-000000000001"}',
       '{"level":"warn","error":"AcpProcessExitedError: ACP process exited with code 3","threadId":"mcp:5f0c1d2e-0000-4000-8000-000000000001"}',
+      '{"level":"warn","error":"CodexAppServerProcessExitedError: exited with code 1","threadId":"mcp:5f0c1d2e-0000-4000-8000-000000000002"}',
     ].join("\n");
 
     expect(failureCause(log, "mcp:5f0c1d2e-0000-4000-8000-000000000001")).toContain(

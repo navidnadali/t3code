@@ -6,6 +6,11 @@ import {
 } from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
+import {
+  SQLITE_MAX_CACHE_SIZE_MB,
+  SQLITE_MAX_MMAP_SIZE_MB,
+  SQLITE_MAX_READER_POOL_SIZE,
+} from "@t3tools/shared/nodeSqliteClient";
 import { DesktopBackendBootstrap, PortSchema } from "@t3tools/contracts";
 import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
@@ -101,6 +106,17 @@ export const traceMaxFilesConfig = Config.Int("T3CODE_TRACE_MAX_FILES").pipe(
   Config.withDefault(10),
 );
 
+const sqliteMebibytesConfig = (name: string, maximum: number) =>
+  Config.schema(
+    Schema.Int.check(
+      Schema.isBetween(
+        { minimum: 0, maximum },
+        { message: `${name} must be 0 (SQLite default) to ${maximum} MiB` },
+      ),
+    ),
+    name,
+  ).pipe(Config.option, Config.map(Option.getOrUndefined));
+
 const EnvServerConfig = Config.all({
   logLevel: Config.LogLevel("T3CODE_LOG_LEVEL").pipe(Config.withDefault("Info")),
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
@@ -178,6 +194,16 @@ const EnvServerConfig = Config.all({
     Config.map(Option.getOrUndefined),
   ),
   lan: Config.Boolean("T3CODE_LAN").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  sqliteReaderPoolSize: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: SQLITE_MAX_READER_POOL_SIZE })),
+    "T3CODE_SQLITE_READER_POOL",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  sqliteCacheSizeMb: sqliteMebibytesConfig("T3CODE_SQLITE_CACHE_MB", SQLITE_MAX_CACHE_SIZE_MB),
+  sqliteReaderCacheSizeMb: sqliteMebibytesConfig(
+    "T3CODE_SQLITE_READER_CACHE_MB",
+    SQLITE_MAX_CACHE_SIZE_MB,
+  ),
+  sqliteMmapSizeMb: sqliteMebibytesConfig("T3CODE_SQLITE_MMAP_MB", SQLITE_MAX_MMAP_SIZE_MB),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -526,6 +552,12 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logWebSocketEvents,
     tailscaleServeEnabled,
     tailscaleServePort,
+    ...(env.sqliteReaderPoolSize === undefined
+      ? {}
+      : { sqliteReaderPoolSize: env.sqliteReaderPoolSize }),
+    sqliteCacheSizeMb: env.sqliteCacheSizeMb,
+    sqliteReaderCacheSizeMb: env.sqliteReaderCacheSizeMb,
+    sqliteMmapSizeMb: env.sqliteMmapSizeMb,
   };
 
   return config;

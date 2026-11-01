@@ -63,6 +63,17 @@ span spent waiting for that connection, behind other SQL. That wait does not blo
 so subtract it before you blame a slow span on the query. Statements inside a transaction use its
 connection and do not carry these attributes.
 
+An MCP request over HTTP has a `McpHttpServer.authenticateRequest` span that covers only admitting
+it: the credential check, the mode limit, and the Linked environments gate. The request runs after
+it, under the `McpServer.…/<method>` span, and each tool call has its own `mcp.tool.<name>` span
+that times it. That span's attributes name the tool, never its arguments.
+
+DPoP proof failures include the safe `environment.dpop.failure_code` span
+attribute. A `time_window` failure means that a signed proof was too old or too
+far in the future for the environment server's allowed window. It can point to
+a date or time problem on either device, but it can also result from a delayed
+request.
+
 #### Fast SQL spans
 
 SQL spans are most of the file on a busy server. `T3CODE_TRACE_SQL_MIN_DURATION_MS` (default `0`,
@@ -88,12 +99,6 @@ With the filter on:
   heap growth shows on the enclosing span.
 - OTLP export still receives every span.
 - It is off while `T3CODE_TRACE_TIMING_ENABLED` is `false`, since every span then lasts 0 ms.
-
-DPoP proof failures include the safe `environment.dpop.failure_code` span
-attribute. A `time_window` failure means that a signed proof was too old or too
-far in the future for the environment server's allowed window. It can point to
-a date or time problem on either device, but it can also result from a delayed
-request.
 
 #### Summarize the trace file
 
@@ -685,6 +690,22 @@ per page load for the UI, and the Expo session on mobile. A `service.instance.id
 
 If the OTLP URLs are unset, local tracing still works, metrics stay in-process only, and logs stay
 on stdout only.
+
+SQLite memory, in MiB. Unset or `0` keeps SQLite's default: a 2000 KiB page cache per connection and
+no memory map.
+
+- `T3CODE_SQLITE_CACHE_MB`: page cache of the main connection, which does every write
+- `T3CODE_SQLITE_READER_CACHE_MB`: page cache of each reader worker
+- `T3CODE_SQLITE_MMAP_MB`: experimental memory map for the main connection and each reader worker, at
+  most `2047` with Node's bundled SQLite
+
+Each connection allocates its cache as it reads pages, up to the limit, so the cost is the main
+connection's plus each reader worker's, up to `T3CODE_SQLITE_READER_POOL` (default 4) of them.
+Readers drop their cache and memory map whenever another connection commits, so the main connection
+gains most. While the database is mapped, an I/O error or a truncation from outside SQLite raises
+SIGBUS and terminates the process. CLI commands that open the database, such as `t3 project`,
+`t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
+as well as the server.
 
 ### The Kill Switch
 

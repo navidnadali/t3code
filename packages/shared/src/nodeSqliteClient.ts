@@ -1206,6 +1206,13 @@ const make = Effect.fn("makeWithDatabase")(function* (
           }),
       }).pipe(Effect.orDie),
     );
+    // Started after the close finalizer, so the worker stops before the writer closes.
+    const checkpoint =
+      options.checkpointWorker && isFileDatabase
+        ? yield* startCheckpointWorker(options.filename, db)
+        : undefined;
+    // After the checkpoint worker's start, whose first statement makes the writer wait for another
+    // process's lock: a page cache size reads the schema, which needs that lock.
     if (writerPragmas !== "") {
       yield* Effect.try({
         try: () => db.exec(writerPragmas),
@@ -1215,11 +1222,6 @@ const make = Effect.fn("makeWithDatabase")(function* (
           }),
       });
     }
-    // Started after the close finalizer, so the worker stops before the writer closes.
-    const checkpoint =
-      options.checkpointWorker && isFileDatabase
-        ? yield* startCheckpointWorker(options.filename, db)
-        : undefined;
 
     const statementReaderCache = new WeakMap<NodeSqlite.StatementSync, boolean>();
     interface CheckpointClassification {

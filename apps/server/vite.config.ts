@@ -82,16 +82,17 @@ const providerIoWorkerBundle = {
       write: false,
       output: { format: "cjs", codeSplitting: false },
     });
-    const code = output[0].code;
-    const external = [...code.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/g)]
-      .map((match) => match[1]!)
-      .filter((specifier) => !NodeModule.isBuiltin(specifier));
+    const [chunk] = output;
+    // The bundler's own import list: generated code can spell require() inside strings.
+    const external = [...chunk.imports, ...chunk.dynamicImports].filter(
+      (specifier) => !NodeModule.isBuiltin(specifier) && specifier !== chunk.fileName,
+    );
     if (external.length > 0) {
       throw new Error(
         `The provider I/O worker bundle requires non-built-ins: ${external.join(", ")}`,
       );
     }
-    return `export const embeddedProviderIoWorkerSource = ${JSON.stringify(code)};`;
+    return `export const embeddedProviderIoWorkerSource = ${JSON.stringify(chunk.code)};`;
   },
 };
 

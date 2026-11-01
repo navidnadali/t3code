@@ -2,6 +2,12 @@ import * as DocumentText from "../../provider/DocumentText.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
 import {
+  ClaudeAgentSdkWorkerPool,
+  claudeAgentSdkStageOptions,
+  type ClaudeQueryControl,
+  startClaudeQueryInWorker,
+} from "./ClaudeAgentSdkWorkerQuery.ts";
+import {
   dynamicToolTitle,
   formatReadToolLabel,
   formatSearchToolLabel,
@@ -662,7 +668,7 @@ function queryRunnerError(cause: unknown, method: string): ClaudeAgentSdkQueryRu
     : new ClaudeAgentSdkQueryRunnerError({ cause, method });
 }
 
-function closeClaudeQuery(queryRuntime: ClaudeQuery) {
+function closeClaudeQuery(queryRuntime: ClaudeQueryControl) {
   return Effect.try({
     try: () => queryRuntime.close(),
     catch: (cause) => queryRunnerError(cause, "close"),
@@ -956,6 +962,7 @@ export const layerQueryRunner: Layer.Layer<
     const hostEnvironment = yield* HostProcess.Environment;
     const portDiscovery = yield* PortScanner.PortDiscovery;
     const stageTiming = (yield* ProviderIoStageTiming)?.forProvider(CLAUDE_PROVIDER);
+    const workerPool = yield* ClaudeAgentSdkWorkerPool;
 
     return ClaudeAgentSdkQueryRunner.of({
       allocateSessionId: crypto
@@ -1058,16 +1065,44 @@ export const layerQueryRunner: Layer.Layer<
             });
             return child;
           };
-          const queryRuntime = yield* Effect.uninterruptibleMask((restore) =>
-            Effect.try({
-              try: () =>
-                query({
+          const startInThread = Effect.try({
+            try: () =>
+              query({
+                prompt,
+                options: { ...options, spawnClaudeCodeProcess },
+              }),
+            catch: (cause) => queryRunnerError(cause, "query"),
+          }).pipe(
+            Effect.map((queryRuntime) => ({
+              query: queryRuntime as ClaudeQueryControl,
+              messages: Stream.fromAsyncIterable(claudeQueryMessages(queryRuntime), (cause) =>
+                queryRunnerError(cause, "fromAsyncIterable"),
+              ),
+            })),
+          );
+          const stageOptions =
+            workerPool &&
+            claudeAgentSdkStageOptions(options, mcpServers, {
+              hook: subagentDeviceInstructions,
+              context: T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
+            });
+          const startQuery =
+            workerPool === undefined || stageOptions === undefined
+              ? startInThread
+              : startClaudeQueryInWorker({
+                  pool: workerPool,
+                  stageOptions,
                   prompt,
-                  options: { ...options, spawnClaudeCodeProcess },
-                }),
-              catch: (cause) => queryRunnerError(cause, "query"),
-            }).pipe(
-              Effect.tap((queryRuntime) =>
+                  spawn: spawnClaudeCodeProcess,
+                  toError: queryRunnerError,
+                }).pipe(
+                  Effect.flatMap(
+                    Option.match({ onNone: () => startInThread, onSome: Effect.succeed }),
+                  ),
+                );
+          const { query: queryRuntime, messages } = yield* Effect.uninterruptibleMask((restore) =>
+            startQuery.pipe(
+              Effect.tap(({ query: queryRuntime }) =>
                 restore(
                   Effect.gen(function* () {
                     if (mcpServers !== undefined) {
@@ -1144,9 +1179,7 @@ export const layerQueryRunner: Layer.Layer<
           );
 
           return {
-            messages: Stream.fromAsyncIterable(claudeQueryMessages(queryRuntime), (cause) =>
-              queryRunnerError(cause, "fromAsyncIterable"),
-            ).pipe(
+            messages: messages.pipe(
               (messages) =>
                 countSdkMessage === undefined
                   ? messages

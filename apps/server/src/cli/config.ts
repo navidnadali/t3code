@@ -209,6 +209,10 @@ const EnvServerConfig = Config.all({
     Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: PROVIDER_IO_MAX_WORKERS })),
     "T3CODE_PROVIDER_IO_WORKERS",
   ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  providerIoClaudeSdk: Config.Boolean("T3CODE_PROVIDER_IO_CLAUDE_SDK").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -564,6 +568,9 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     sqliteReaderCacheSizeMb: env.sqliteReaderCacheSizeMb,
     sqliteMmapSizeMb: env.sqliteMmapSizeMb,
     ...(env.providerIoWorkers === undefined ? {} : { providerIoWorkers: env.providerIoWorkers }),
+    ...(env.providerIoClaudeSdk === undefined
+      ? {}
+      : { providerIoClaudeSdk: env.providerIoClaudeSdk }),
   };
 
   return config;

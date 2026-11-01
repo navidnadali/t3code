@@ -2555,3 +2555,22 @@ it.effect("fails a batch at the event that fails alone, after writing the events
     assert.deepEqual(writes, { single: 2, batched: 1 });
   }),
 );
+
+it.each([
+  [undefined, 1],
+  ["", 1],
+  ["abc", 1],
+  ["-3", 1],
+  ["0", 1],
+  ["1", 1],
+  ["32", 32],
+  ["256", 256],
+  ["1000", 256],
+] as const)("reads T3CODE_PROVIDER_EVENT_BATCH_MAX=%s as %i events", (value, expected) => {
+  assert.equal(
+    ProviderEventIngestor.providerEventBatchLimitFromEnv({
+      T3CODE_PROVIDER_EVENT_BATCH_MAX: value,
+    }),
+    expected,
+  );
+});

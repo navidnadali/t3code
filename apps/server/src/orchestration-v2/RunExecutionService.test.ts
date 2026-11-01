@@ -2987,13 +2987,33 @@ it.effect.each([
 );
 
 it.effect.each([
-  { limit: 1, writes: Array.from({ length: 22 }, () => 1), queued: [] },
-  { limit: 8, writes: [1, 4, 1, 8, 1, 1, 5, 1], queued: [1, 21, 21, 21, 21] },
+  {
+    limit: 1,
+    maxBytes: undefined,
+    text: 0,
+    writes: Array.from({ length: 22 }, () => 1),
+    queued: [],
+  },
+  {
+    limit: 8,
+    maxBytes: undefined,
+    text: 0,
+    writes: [1, 4, 1, 8, 1, 1, 5, 1],
+    queued: [1, 21, 21, 21, 21],
+  },
+  // About 10 KB an item: the byte budget closes a batch after three, before the event limit.
+  {
+    limit: 8,
+    maxBytes: 25_000,
+    text: 10_000,
+    writes: [1, 3, 1, 1, 3, 4, 2, 1, 3, 2, 1],
+    queued: [1, 21, 21, 21, 21, 21, 21, 21],
+  },
 ])(
-  "writes a provider event backlog in order, exactly once, $limit event(s) per write at most",
-  ({ limit, writes: expectedWrites, queued: expectedQueued }) =>
+  "writes a provider event backlog in order, exactly once, at most $limit events or $maxBytes bytes at once",
+  ({ limit, maxBytes, text, writes: expectedWrites, queued: expectedQueued }) =>
     Effect.gen(function* () {
-      const key = `backlog-${limit}`;
+      const key = `backlog-${limit}-${maxBytes ?? "default"}`;
       const ids = backgroundScenarioIds(key);
       const providerEvents = yield* Queue.unbounded<
         ProviderAdapter.ProviderAdapterV2Event,
@@ -3023,6 +3043,7 @@ it.effect.each([
               type: "assistant_message",
               status: "completed",
               streaming: false,
+              text: "x".repeat(text),
             },
           } as ProviderAdapter.ProviderAdapterV2Event),
       );
@@ -3044,7 +3065,10 @@ it.effect.each([
       yield* captureRootRunTermination({
         key,
         shouldFinalizeRun: () => Effect.succeed(true),
-        providerEventBatchLimit: limit,
+        providerEventBatching: {
+          maxEvents: limit,
+          ...(maxBytes === undefined ? {} : { maxBytes }),
+        },
         events: () => Stream.fromQueue(providerEvents),
         ingestNormalized: (input) => write([input.event]).pipe(Effect.as([])),
         ingestNormalizedBatch: (input) =>
@@ -3082,7 +3106,7 @@ it.effect.each([1, 8])(
       const { finalEvents } = yield* captureRootRunTermination({
         key,
         shouldFinalizeRun: () => Effect.succeed(true),
-        providerEventBatchLimit: limit,
+        providerEventBatching: { maxEvents: limit },
         events: () => Stream.make(node("running"), node("completed")),
         ingestNormalized: (input) =>
           input.event.type === "node.updated" && input.event.node.status === "completed"
@@ -3196,7 +3220,7 @@ function captureRootRunTermination(input: {
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
   readonly ingestNormalizedBatch?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalizedBatch"];
-  readonly providerEventBatchLimit?: number;
+  readonly providerEventBatching?: { readonly maxEvents: number; readonly maxBytes?: number };
   readonly beforeTerminalWrite?: (
     request: Parameters<EventSink.EventSinkV2["Service"]["writeIfRunCurrent"]>[0],
   ) => Effect.Effect<boolean, EventSink.EventSinkV2Error>;
@@ -3282,10 +3306,12 @@ function captureRootRunTermination(input: {
               ? {}
               : { ingestNormalizedBatch: input.ingestNormalizedBatch }),
           }),
-          Layer.succeed(
-            ProviderEventIngestor.ProviderEventBatchLimit,
-            input.providerEventBatchLimit ?? 1,
-          ),
+          Layer.succeed(ProviderEventIngestor.ProviderEventBatching, {
+            maxEvents: input.providerEventBatching?.maxEvents ?? 1,
+            maxBytes:
+              input.providerEventBatching?.maxBytes ??
+              ProviderEventIngestor.PROVIDER_EVENT_BATCH_MAX_BYTES,
+          }),
           ServerSettings.layerTest(),
           Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
             refresh: () => Effect.void,

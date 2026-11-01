@@ -1378,17 +1378,24 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       const previous = lastRecord;
       lastRecord = written;
       return Effect.gen(function* () {
-        if (previous !== undefined) yield* Effect.exit(Deferred.await(previous));
+        if (previous !== undefined && !(yield* Deferred.isDone(previous))) {
+          yield* Effect.exit(Deferred.await(previous));
+          // On a new task: draining a backlog by nested resumption would overflow the stack.
+          yield* Effect.yieldNow;
+        }
         // An outcome whose started record failed is not written; that failure fails the call.
         if (started !== undefined && Exit.isFailure(yield* Effect.exit(Deferred.await(started)))) {
-          return yield* Deferred.succeed(written, undefined);
+          return Exit.void;
         }
-        yield* Deferred.done(written, yield* Effect.exit(logRequest(event)));
+        return yield* Effect.exit(Effect.suspend(() => logRequest(event)));
       }).pipe(
-        Effect.onInterrupt(() =>
-          Effect.sync(() => {
-            droppedRecords += 1;
-          }).pipe(Effect.andThen(Deferred.succeed(written, undefined))),
+        // Only an interrupt (the runtime closing) ends it otherwise: the record is dropped.
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit)
+            ? Deferred.done(written, exit.value)
+            : Effect.sync(() => {
+                droppedRecords += 1;
+              }).pipe(Effect.andThen(Deferred.succeed(written, undefined))),
         ),
         Effect.forkIn(recordScope, { startImmediately: true }),
         Effect.as(written),

@@ -717,6 +717,15 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
   });
 
   const PROBE = "toolu-probe";
+  class ConvertsToJson {
+    readonly #json: unknown;
+    constructor(json: unknown) {
+      this.#json = json;
+    }
+    toJSON() {
+      return this.#json;
+    }
+  }
   type Record_ = (args: ReadonlyArray<unknown>) => AbortSignal;
   type Callbacks = Pick<
     ClaudeQueryOptions,
@@ -758,6 +767,23 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       throw new TypeError("Cannot read the approval.");
     }),
     permissionCase("rejects with a string", () => Promise.reject("plain refusal")),
+    // Each of these clones without error but not as the SDK's JSON writes it.
+    permissionCase("answers with values JSON converts", () =>
+      Promise.resolve({
+        behavior: "allow",
+        updatedInput: {
+          bytes: Buffer.from([1, 2]),
+          converted: new ConvertsToJson("converted"),
+          entries: new Map([["key", "value"]]),
+        },
+      }),
+    ),
+    permissionCase("answers with a function JSON drops", () =>
+      Promise.resolve({
+        behavior: "allow",
+        updatedInput: { kept: true, dropped: () => "dropped" },
+      }),
+    ),
     [
       "onElicitation accepts",
       (record) => ({
@@ -826,6 +852,28 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
                 async (...args) => {
                   record(args);
                   return { decision: "block", reason: `blocked ${args[1]}` };
+                },
+                async (...args) => {
+                  record(args);
+                  return { continue: true };
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      [hookRequest("hook_0", "toolu-case"), hookRequest("hook_1", PROBE)],
+    ],
+    [
+      "a hook whose answer JSON converts",
+      (record) => ({
+        hooks: {
+          PreToolUse: [
+            {
+              hooks: [
+                async (...args) => {
+                  record(args);
+                  return new ConvertsToJson({ continue: false, stopReason: "converted" }) as never;
                 },
                 async (...args) => {
                   record(args);

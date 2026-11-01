@@ -232,6 +232,13 @@ export function fetchOnce(
       (incoming) => {
         response = incoming;
         headersMs = elapsed();
+        // A server that stops before the end of the body is an error, not this client's timeout.
+        const cutShort = () => finish("error", "the server closed the response before its end");
+        incoming.on("aborted", cutShort);
+        incoming.on("error", cutShort);
+        incoming.on("close", () => {
+          if (!incoming.complete) cutShort();
+        });
         if (options.read === "none") {
           incoming.pause();
           return;

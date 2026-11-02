@@ -6039,12 +6039,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         .pipe(
           // Decoded after COMMIT and in page order, so the first bad or missing item decides the error.
           Effect.flatMap(({ totalItems, matching, page, payloads }) => {
-            const payloadOf = new Map(
-              payloads.map((row) => [
-                JSON.stringify([row.thread_id, row.turn_item_id]),
-                row.payload_json,
-              ]),
-            );
+            const payloadOf = new Map<string, Map<string, string>>();
+            for (const row of payloads) {
+              const items = payloadOf.get(row.thread_id) ?? new Map<string, string>();
+              payloadOf.set(row.thread_id, items.set(row.turn_item_id, row.payload_json));
+            }
             return Effect.forEach(page, (row) =>
               Effect.gen(function* () {
                 if (row.synthetic !== undefined)
@@ -6055,9 +6054,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     visibility: row.visibility,
                     item: row.synthetic,
                   };
-                const payload = payloadOf.get(
-                  JSON.stringify([row.sourceThreadId, row.sourceItemId]),
-                );
+                const payload = payloadOf.get(row.sourceThreadId)?.get(row.sourceItemId);
                 const decoded = yield* decodeRows(
                   decodeTurnItemPayload,
                   row.sourceThreadId,

@@ -946,6 +946,30 @@ it.effect("reports the turn start context's first undecodable row in its old ord
   ),
 );
 
+// A timeline page's items are fetched together but decoded in page order: the first bad one decides.
+it.effect("reports a timeline page's first undecodable item in page order", () =>
+  withFileStore(
+    "reader-scope-timeline-order-",
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("timeline-order", 4);
+      const read = store.getTimelinePage(fixture.fork, { limit: 50, view: "activity" });
+      const tools = (yield* read).items.filter((row) => row.item.type === "dynamic_tool");
+      const first = tools.find((row) => row.sourceThreadId === fixture.source);
+      const last = tools.findLast((row) => row.sourceThreadId === fixture.fork);
+      assert.isTrue(first !== undefined && last !== undefined && first.position < last.position);
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json = 'not json'
+        WHERE turn_item_id = ${last!.sourceItemId}`;
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json = '{}'
+        WHERE turn_item_id = ${first!.sourceItemId}`;
+      const error = yield* Effect.flip(read);
+      assert.isTrue(isReadError(error));
+      assert.strictEqual(isReadError(error) ? error.threadId : undefined, fixture.source);
+    }),
+  ),
+);
+
 const isDecodeSpan = (span: Tracer.AnySpan) =>
   span._tag === "Span" && span.name.startsWith("ProjectionStore.decode");
 

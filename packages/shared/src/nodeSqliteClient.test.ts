@@ -574,6 +574,38 @@ it.effect.each([
 );
 
 it.effect(
+  "serves a history read queued behind streams of small and page reads within one round",
+  () =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const started: Array<string> = [];
+          const holder = yield* holdClassReader(sql, "holder", started);
+          yield* holder.running;
+          const queue = [
+            ...Array.from({ length: 20 }, (_, index) => ({
+              name: `small-${index}`,
+              mark: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+            })),
+            ...Array.from({ length: 20 }, (_, index) => ({
+              name: `page-${index}`,
+              mark: SqliteClient.pageRead,
+            })),
+            { name: "history", mark: SqliteClient.historyRead },
+          ];
+          const queued = yield* Effect.forEach(queue, ({ name, mark }) =>
+            classRead(sql, name, started, mark),
+          );
+          yield* holder.release;
+          yield* Effect.forEach(queued, Fiber.join);
+          // Small and page reads each pass the history read over once; then it has waited longest.
+          assert.deepEqual(started.slice(0, 4), ["holder", "small-0", "page-0", "history"]);
+        }),
+      { readerPoolSize: 1 },
+    ),
+);
+
+it.effect(
   "serves history reads past their limit after other queued reads, however long they wait",
   () =>
     withReaderClient(

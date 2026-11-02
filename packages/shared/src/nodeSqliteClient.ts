@@ -211,6 +211,7 @@ class ReaderSlots {
   }
 
   private wakeWaiters(fiber: Fiber.Fiber<unknown, unknown>) {
+    if (READ_CLASSES.every((readClass) => this.waiters[readClass].size === 0)) return;
     fiber.currentDispatcher.scheduleTask(() => {
       for (const readClass of READ_CLASSES) {
         for (const waiter of this.waiters[readClass]) {

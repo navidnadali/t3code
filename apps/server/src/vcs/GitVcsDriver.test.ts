@@ -24,7 +24,11 @@ import { gitCommandDuration, gitCommandsTotal } from "../observability/Metrics.t
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
-import { parseCommitObject, parsePackedRefs } from "./gitCheckpointRefs.ts";
+import {
+  makeCheckpointRefMemory,
+  parseCommitObject,
+  parsePackedRefs,
+} from "./gitCheckpointRefs.ts";
 import { gitConfigBool, parseGitConfigList } from "./gitConfigSnapshot.ts";
 import type * as VcsDriver from "./VcsDriver.ts";
 import * as VcsDriverRegistry from "./VcsDriverRegistry.ts";
@@ -2094,4 +2098,56 @@ it.effect.skipIf(!symlinksSupported)(
       assert.strictEqual(linked.baselineExists, true);
       assert.isTrue(linked.commands.includes("rev-parse"));
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect("packed-refs memory stays accounted under concurrent reloads", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-packed-memory-" });
+    const git = (args: ReadonlyArray<string>) =>
+      driver
+        .execute({ operation: "packed-memory-test", cwd, args, env: FIXED_COMMIT_ENV })
+        .pipe(Effect.map((result) => result.stdout.trim()));
+    yield* git(["init", "-q", "-b", "main"]);
+    yield* git(["commit", "-q", "--allow-empty", "-m", "root"]);
+    const head = yield* git(["rev-parse", "HEAD"]);
+    const commonDir = path.join(cwd, ".git");
+    const memory = makeCheckpointRefMemory();
+    const refs = Array.from({ length: 24 }, (_, index) => `refs/t3/memory/${index}`);
+    for (const ref of refs) {
+      yield* git(["update-ref", ref, head]);
+      memory.rememberRef(commonDir, ref, head);
+    }
+    const resolveAll = Effect.forEach(refs, (ref) => memory.resolveRef(commonDir, ref), {
+      concurrency: "unbounded",
+    });
+    const packedCount = Effect.map(
+      fileSystem.readFileString(path.join(commonDir, "packed-refs")),
+      (content) => parsePackedRefs(content, "refs/t3/", 1_000).refs!.size,
+    );
+
+    // Loose refs answer first; packing moves them to packed-refs, which every call reloads at once.
+    assert.deepStrictEqual(
+      yield* resolveAll,
+      refs.map(() => head),
+    );
+    assert.strictEqual(memory.packedRefsEntries(), 0);
+    yield* git(["pack-refs", "--all"]);
+    assert.deepStrictEqual(
+      yield* resolveAll,
+      refs.map(() => head),
+    );
+    assert.strictEqual(memory.packedRefsEntries(), yield* packedCount);
+    // A rewritten packed-refs is reloaded by every concurrent call; the count follows the file.
+    yield* git(["update-ref", "refs/t3/memory/extra", head]);
+    yield* git(["pack-refs", "--all"]);
+    assert.deepStrictEqual(
+      yield* resolveAll,
+      refs.map(() => head),
+    );
+    assert.strictEqual(memory.packedRefsEntries(), yield* packedCount);
+    assert.strictEqual(memory.packedRefsEntries(), refs.length + 1);
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

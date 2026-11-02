@@ -43,6 +43,8 @@ export interface CheckpointRefMemory {
     repository: CheckpointRepository,
     oid: string,
   ) => Effect.Effect<CommitFacts | null>;
+  /** Entries currently kept from packed-refs files, for tests and diagnostics. */
+  readonly packedRefsEntries: () => number;
 }
 
 // Caches, not state: an evicted entry costs the Git command it would have replaced. A turn keeps
@@ -294,12 +296,13 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const refKey = (commonDir: string, ref: string) => `${commonDir}\0${ref}`;
 
   const packedRefs = Effect.fnUntraced(function* (commonDir: string) {
-    const cached = packed.get(commonDir);
-    const current = yield* readPackedRefs(commonDir, cached);
-    if (current === null || current === cached) return current;
-    if (cached !== undefined) {
+    const current = yield* readPackedRefs(commonDir, packed.get(commonDir));
+    // Concurrent reloads of one file: account for what the map holds after the read, not before.
+    const present = packed.get(commonDir);
+    if (current === null || current === present) return current;
+    if (present !== undefined) {
       packed.delete(commonDir);
-      packedEntries -= cached.refs?.size ?? 0;
+      packedEntries -= present.refs?.size ?? 0;
     }
     const size = current.refs?.size ?? 0;
     for (const [key, entry] of packed) {
@@ -357,5 +360,6 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     resolveRef,
     rememberCommits,
     commitFacts,
+    packedRefsEntries: () => packedEntries,
   };
 };

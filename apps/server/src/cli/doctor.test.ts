@@ -162,7 +162,7 @@ it.effect("still says why compaction was skipped when the VACUUM after it fails"
     const output = printed.join("\n");
     assert.include(output, "skipped");
     assert.include(output, "/test/compaction-scratch.sqlite");
-    assert.include(output, "64 MiB");
-    assert.include(output, "12 MiB");
+    assert.include(output, "64.0 MiB");
+    assert.include(output, "12.0 MiB");
   }),
 );

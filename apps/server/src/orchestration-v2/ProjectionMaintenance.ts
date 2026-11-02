@@ -316,7 +316,13 @@ export const layer: Layer.Layer<
           yield* scratchBoundary(CompactionScratch.prepare(scratchPath));
         // Never fill the disk: the scratch store beside the database needs room for every key, and a
         // running pass stops when the disk gets low whatever the estimate said.
-        // What a stop reports as required is what stopped it: the estimate before, the floor during.
+        // Before the pass the disk must hold the estimate and the floor a running pass insists on;
+        // what a stop reports as required is what stopped it.
+        const sequenceBound = throughSequence;
+        const requiredBefore = Math.max(
+          CompactionScratch.requiredFreeBytes(sequenceBound),
+          CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR,
+        );
         const skippedFor = (stage: "before" | "during", freeBytes: number) =>
           scratchPath === undefined
             ? undefined
@@ -324,22 +330,19 @@ export const layer: Layer.Layer<
                 scratchPath,
                 requiredBytes:
                   stage === "before"
-                    ? CompactionScratch.requiredFreeBytes(throughSequence)
+                    ? requiredBefore
                     : CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR,
                 freeBytes,
                 stage,
               };
         const skipped = (stage: "before" | "during", freeBytes: number) =>
           Effect.logWarning(
-            "Compaction skipped: not enough free space beside the database for its scratch store",
-            { ...skippedFor(stage, freeBytes), events: throughSequence },
+            `Compaction ${stage === "before" ? "skipped" : "stopped early"}: not enough free space beside the database for its scratch store`,
+            { ...skippedFor(stage, freeBytes), sequenceBound },
           );
         if (scratchPath !== undefined) {
           const freeBytes = yield* CompactionScratch.freeBytesBeside(scratchPath);
-          if (
-            freeBytes !== undefined &&
-            freeBytes < CompactionScratch.requiredFreeBytes(throughSequence)
-          ) {
+          if (freeBytes !== undefined && freeBytes < requiredBefore) {
             yield* skipped("before", freeBytes);
             return {
               deletedEventCount: 0,

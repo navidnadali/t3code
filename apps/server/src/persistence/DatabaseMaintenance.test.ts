@@ -162,9 +162,18 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           deletedReceiptCount: 0,
           repairedItemCountThreads: 0,
         });
-        assert.include(
-          String(error._tag === "DatabaseCompactError" ? error.cause : ""),
-          "disk is full",
+        // The VACUUM's own error is kept underneath, however many layers wrap it.
+        const messages: Array<string> = [];
+        for (
+          let cause: unknown = error._tag === "DatabaseCompactError" ? error.cause : undefined;
+          cause !== undefined && cause !== null;
+          cause = (cause as { cause?: unknown }).cause
+        ) {
+          messages.push(String((cause as { message?: unknown }).message ?? cause));
+        }
+        assert.isTrue(
+          messages.some((message) => message.includes("disk is full")),
+          messages.join(" | "),
         );
       }).pipe(Effect.scoped),
     );

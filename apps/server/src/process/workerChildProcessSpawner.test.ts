@@ -913,8 +913,9 @@ describe("WorkerChildProcessSpawner", () => {
   for (const failure of ["throws", "is sent SIGTERM"] as const) {
     it.live.skipIf(!workerPlatform)(
       `a spawner process that ${failure} kills the children it started before it exits`,
-      () =>
-        Effect.gen(function* () {
+      () => {
+        const { logs, layer } = capturedLogs();
+        return Effect.gen(function* () {
           const nodeSpawner = yield* ChildProcessSpawner;
           const watch = yield* childWatch;
           // Only the spawner knows this child, which makes the spawner fail once it is connected.
@@ -951,7 +952,17 @@ describe("WorkerChildProcessSpawner", () => {
             method: "spawn",
             causeMessage: "The process spawner stopped",
           });
-        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+          // The log names why it stopped, not the SIGKILL it ends its own group with.
+          expect(
+            logs.map(({ level, message }) => [
+              level,
+              String((message as ReadonlyArray<unknown>)[1]),
+            ]),
+          ).toEqual([
+            ["Warn", expect.stringContaining(failure === "throws" ? "spawner bug" : "SIGTERM")],
+          ]);
+        }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
+      },
     );
   }
 

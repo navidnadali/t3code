@@ -767,6 +767,7 @@ const openSpawnerProcess =
     // Until it has said who it is, anything from the spawner other than that ends it.
     let answered = false;
     let refused: Error | undefined;
+    const outbox: Array<unknown> = [];
     const refuse = (reason: string) => {
       if (answered || refused !== undefined) return;
       refused = new Error(`The process spawner ${reason}`);
@@ -816,6 +817,9 @@ const openSpawnerProcess =
       cancelHandshake();
       handshake.onReady();
       for (const line of early.splice(0)) readLine(line);
+      for (const queued of outbox.splice(0)) {
+        if (spawner.connected) spawner.send(queued as NodeChildProcess.Serializable);
+      }
     });
     spawner.on("error", (error) => {
       if (hasExited()) cancelHandshake();
@@ -846,7 +850,10 @@ const openSpawnerProcess =
     spawner.channel?.unref();
     let terminated: Promise<void> | undefined;
     return {
+      // Nothing goes to a spawner before it has said who it is: one that is refused then has
+      // started nothing the server would not know about.
       post: (message) => {
+        if (!answered) return void outbox.push(message);
         if (spawner.connected) spawner.send(message as NodeChildProcess.Serializable);
       },
       // Held while a command runs, until its spawner's replies and start reports are drained.

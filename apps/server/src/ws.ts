@@ -144,7 +144,7 @@ import {
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
-import { isLiveStreamBufferOverflow } from "./orchestration-v2/LiveStreamBudget.ts";
+import { resyncOnLiveOverflow } from "./orchestration-v2/LiveStreamBudget.ts";
 import {
   coalesceLiveUpdatedEvents,
   coalesceThreadLiveStream,
@@ -961,12 +961,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         OrchestrationV2ThreadStreamItem,
         OrchestrationV2GetThreadProjectionError
       >,
-    ): Stream.Stream<OrchestrationV2ThreadStreamItem, OrchestrationV2GetThreadProjectionError> =>
-      segment.pipe(
-        Stream.catchIf(isLiveStreamBufferOverflow, () =>
-          resyncOnOverflow(Stream.unwrap(snapshotThenLive({ resync: true }))),
-        ),
-      );
+    ) => resyncOnLiveOverflow(segment, () => snapshotThenLive({ resync: true }));
 
     // Subscribe before reading persisted events to retain concurrent publishes; clients dedupe overlap by sequence.
     if (input.afterSequence !== undefined) {
@@ -1173,35 +1168,26 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     // between two of its pulls) gets a fresh snapshot and continues live from it; one snapshot is
     // cheaper than the replay its resubscription would ask for. It is loaded when the client
     // next pulls, so a client that never acknowledges never costs one.
-    const resyncingLiveFrom = (
-      afterSequence: number,
-    ): Stream.Stream<
-      OrchestrationV2ShellStreamItem,
-      Stream.Error<ReturnType<typeof liveFrom>> | Effect.Error<ReturnType<typeof loadSnapshot>>
-    > =>
-      liveFrom(afterSequence).pipe(
-        Stream.catchIf(isLiveStreamBufferOverflow, () =>
-          Stream.unwrap(
-            loadSnapshot().pipe(
-              Effect.provideService(
-                ProjectEnrichmentService.ProjectEnrichmentService,
-                projectEnrichment,
-              ),
-              Effect.tap((loaded) =>
-                Effect.logWarning(
-                  "orchestration shell stream resynchronized after a live buffer overflow",
-                  {
-                    snapshotSequence: loaded.snapshot.snapshotSequence,
-                  },
-                ),
-              ),
-              Effect.map((loaded) =>
-                Stream.concat(
-                  initialSnapshotItems(loaded),
-                  resyncingLiveFrom(loaded.snapshot.snapshotSequence),
-                ),
-              ),
+    const resyncingLiveFrom = (afterSequence: number) =>
+      resyncOnLiveOverflow<
+        OrchestrationV2ShellStreamItem,
+        Stream.Error<ReturnType<typeof liveFrom>>,
+        never,
+        Effect.Error<ReturnType<typeof loadSnapshot>>
+      >(liveFrom(afterSequence), () =>
+        loadSnapshot().pipe(
+          Effect.provideService(
+            ProjectEnrichmentService.ProjectEnrichmentService,
+            projectEnrichment,
+          ),
+          Effect.tap((loaded) =>
+            Effect.logWarning(
+              "orchestration shell stream resynchronized after a live buffer overflow",
+              { snapshotSequence: loaded.snapshot.snapshotSequence },
             ),
+          ),
+          Effect.map((loaded) =>
+            Stream.concat(initialSnapshotItems(loaded), liveFrom(loaded.snapshot.snapshotSequence)),
           ),
         ),
       );

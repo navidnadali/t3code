@@ -54,8 +54,8 @@ import * as CommandOutputHub from "../orchestration-v2/CommandOutputHub.ts";
 import { GUEST_FAILURE } from "../orchestration-v2/GuestShareDecider.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import {
-  isLiveStreamBufferOverflow,
   type LiveStreamBufferError,
+  resyncOnLiveOverflow,
 } from "../orchestration-v2/LiveStreamBudget.ts";
 import {
   coalesceThreadLiveStream,
@@ -587,10 +587,9 @@ const make = Effect.gen(function* () {
         coalesceThreadLiveStream,
         Stream.map(toGuestEvents),
         Stream.flattenIterable,
-        // A guest that falls more than its live buffer behind gets a fresh snapshot and goes on
-        // live from it, as the owner's subscription does, instead of a closed response.
-        Stream.catchIf(isLiveStreamBufferOverflow, () => Stream.unwrap(resync)),
       );
+    // A guest that falls more than its live buffer behind gets a fresh snapshot and goes on
+    // live from it, as the owner's subscription does, instead of a closed response.
     const resync = Effect.gen(function* () {
       const current = yield* orchestrator.getThreadSnapshotWindow(thread.id, {
         rowLimit: SNAPSHOT_ROW_LIMIT,
@@ -615,7 +614,7 @@ const make = Effect.gen(function* () {
         { type: "thread", item },
       ]).pipe(Stream.concat(liveFrom(current.snapshotSequence)));
     });
-    const live = liveFrom(snapshot.snapshotSequence).pipe(
+    const live = resyncOnLiveOverflow(liveFrom(snapshot.snapshotSequence), () => resync).pipe(
       // A failed read closes the response without `ended`: the browser reconnects, and
       // `authorize` decides whether the link still works.
       Stream.catchCause(() => Stream.empty),

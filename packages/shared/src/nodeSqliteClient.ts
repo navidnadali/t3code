@@ -84,14 +84,35 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
   );
 
 /**
- * One permit fewer than the reader workers, at least one. A read of large row sets holds one from
- * before its transaction until decoded, so such reads never hold every reader; with one reader or
- * none, other reads can wait behind one.
+ * Permits for reads of a thread's whole history, one fewer than the reader workers (at least one).
+ * Such a read holds one from before its transaction until decoded, so this bounds the history row
+ * sets held at once.
  */
 export const ReaderPermits = Context.Reference<Semaphore.Semaphore | undefined>(
   "@t3tools/shared/nodeSqliteClient/ReaderPermits",
   { defaultValue: () => undefined },
 );
+
+const readerPermitCount = (readers: number) => Math.max(1, readers - 1);
+
+const LargeRead = Context.Reference<boolean>("@t3tools/shared/nodeSqliteClient/LargeRead", {
+  defaultValue: () => false,
+});
+
+/**
+ * Marks reads of large row sets. While they hold a reader they may hold at most three quarters of
+ * the readers, all but one at most, so other reads always find one free; with a single reader,
+ * they can make other reads wait. Unlike ReaderPermits this is held only while a reader is.
+ */
+export const largeRead = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, LargeRead, true);
+
+/** largeRead for a stream. */
+export const largeReadStream = <A, E, R>(stream: Stream.Stream<A, E, R>): Stream.Stream<A, E, R> =>
+  Stream.provideService(stream, LargeRead, true);
+
+const largeReaderCount = (readers: number) =>
+  Math.max(1, Math.min(readers - 1, Math.floor((readers * 3) / 4)));
 
 interface Acquired {
   readonly connection: "writer" | "reader";
@@ -1240,6 +1261,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
       : [];
   // Counts idle reader slots, so a read waits for whichever slot frees first.
   const idleReaders = yield* Semaphore.make(readers.length);
+  // Slots that reads marked large may hold, taken before an idle slot and released with it.
+  const largeReaders = yield* Semaphore.make(largeReaderCount(readers.length));
   if (readers.length > 0) yield* Metric.update(readerPoolAvailable, 1);
 
   const writer = { name: "writer" as const, lock: semaphore, connection };
@@ -1255,7 +1278,15 @@ const make = Effect.fn("makeWithDatabase")(function* (
       if (readers.length === 0 || readerPool.unavailable || !Context.get(fiber.context, ReadOnly)) {
         return Effect.succeed(writer);
       }
-      const claim = Effect.flatMap(wait(idleReaders.take(1)), () => {
+      const large = Context.get(fiber.context, LargeRead);
+      // A large read takes its turn first; interrupted before it holds a slot, it gives it back.
+      const takeSlot = large
+        ? Effect.andThen(
+            wait(largeReaders.take(1)),
+            wait(idleReaders.take(1)).pipe(Effect.onInterrupt(() => largeReaders.release(1))),
+          )
+        : wait(idleReaders.take(1));
+      const claim = Effect.flatMap(takeSlot, () => {
         // The lowest idle slot wins, so later slots start a worker only while earlier ones are busy.
         const slot = readers.find((candidate) => !candidate.busy)!;
         slot.busy = true;
@@ -1265,7 +1296,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
           if (!held) return Effect.void;
           held = false;
           slot.busy = false;
-          return Effect.asVoid(idleReaders.release(1));
+          return Effect.asVoid(
+            Effect.andThen(
+              idleReaders.release(1),
+              large ? largeReaders.release(1) : Effect.succeed(0),
+            ),
+          );
         });
         return Effect.as(claimed(release), { slot, release });
       });
@@ -1412,7 +1448,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
     ],
   });
   const withTransaction = client.withTransaction;
-  const readerPermits = yield* Semaphore.make(Math.max(1, readers.length - 1));
+  const readerPermits = yield* Semaphore.make(readerPermitCount(readers.length));
   const transactional = Object.assign(client, {
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.uninterruptibleMask((restore) => {

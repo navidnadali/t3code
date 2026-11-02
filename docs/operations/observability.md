@@ -718,15 +718,17 @@ SIGBUS and terminates the process. CLI commands that open the database, such as 
 `t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
 as well as the server.
 
-Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers. Reads of a thread's
-history (full snapshots and projections, snapshot windows, history and timeline pages, turn starts,
-thread search, and records of turn items, nodes, messages, subagents, plans, handoffs or transfers)
-each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from before their read
-transaction until their rows are decoded. That bounds the history rows held at once and leaves a
-reader for every other read (thread shells, settlement, the thread row, runs and other bookkeeping),
-which take no permit. With a pool of 1 the one permit's holder can make those reads wait for the
-reader, and while reads fall back to the main connection they all share it. A wait for a permit is
-not part of `db.lock_wait_ms`.
+Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers, under two limits.
+Reads of a thread's whole history (full snapshots and projections, turn starts, thread search, and
+records of turn items, nodes, messages, subagents, plans, handoffs or transfers) each hold one of
+`T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from before their read transaction
+until their rows are decoded, which bounds the history rows held at once. Those reads and page reads
+(snapshot windows, history and timeline pages, which take no permit) together hold at most three
+quarters of the readers, and never the last one, while they hold a reader, so every other read
+(thread shells, settlement, the thread row, runs and other bookkeeping) finds one free. With a pool
+of 1 a large read can make those reads wait for the reader, and while reads fall back to the main
+connection they all share it. Waiting for a permit or for a large read's turn is not part of
+`db.lock_wait_ms`.
 
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for

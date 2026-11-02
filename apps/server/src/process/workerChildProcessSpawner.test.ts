@@ -1138,45 +1138,38 @@ describe("WorkerChildProcessSpawner", () => {
 
         const { VCS_SPAWN_WORKER_ENV: worker, PROCESS_SPAWNER_ENV: spawner } =
           WorkerChildProcessSpawner;
-        const unset = yield* outcome({});
-        expect(unset).toMatchObject({ mainSpawns: 5, spawnedBy: "server", errors: [] });
-        expect(unset.missing.tag).toBe("VcsProcessSpawnError");
-        expect(unset.missingCwd).toMatchObject({
+        const onNode = yield* outcome({ [spawner]: "default" });
+        expect(onNode).toMatchObject({ mainSpawns: 5, spawnedBy: "server", errors: [] });
+        expect(onNode.missing.tag).toBe("VcsProcessSpawnError");
+        expect(onNode.missingCwd).toMatchObject({
           tag: "GitCommandError",
           cause: { reason: "NotFound" },
         });
-        for (const value of ["default", "0", "false", "", " Default "]) {
-          expect(yield* outcome({ [worker]: "false", [spawner]: value })).toEqual(unset);
-        }
-        const onWorker = { ...unset, mainSpawns: workerPlatform ? 0 : 5 };
-        expect(yield* outcome({ [worker]: "true" })).toEqual(onWorker);
-        expect(yield* outcome({ [spawner]: "worker" })).toEqual(onWorker);
+        const onWorker = { ...onNode, mainSpawns: workerPlatform ? 0 : 5 };
         const onSpawnerProcess = workerPlatform
           ? { ...onWorker, spawnedBy: "spawner process" }
           : onWorker;
-        for (const value of ["child", "Child", " CHILD ", "1", "true"]) {
+        // Unset is the spawner process on Linux and macOS.
+        expect(yield* outcome({})).toEqual(onSpawnerProcess);
+        expect(yield* outcome({ [worker]: "false" })).toEqual(onSpawnerProcess);
+        for (const value of ["child", "Child", " CHILD ", "1", "true", "on", "yes"]) {
           expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(onSpawnerProcess);
         }
-        // A value it does not know keeps today's spawner and says so, rather than stopping the server.
-        const unknown = {
-          ...unset,
-          errors: [expect.stringContaining(`${spawner}=\\"childs\\"`)],
-        };
-        expect(yield* outcome({ [spawner]: "childs" })).toEqual(unknown);
-        for (const value of ["constructor", "__proto__"]) {
-          expect(yield* outcome({ [spawner]: value })).toEqual({
-            ...unset,
+        expect(yield* outcome({ [worker]: "true" })).toEqual(onWorker);
+        expect(yield* outcome({ [spawner]: "worker" })).toEqual(onWorker);
+        // Effect's config reads an empty variable as unset, as for every T3CODE_* setting.
+        expect(yield* outcome({ [worker]: "true", [spawner]: "" })).toEqual(onWorker);
+        // Explicit off values keep Node's spawner, whatever the worker knob says.
+        for (const value of ["0", "false", "off", "no", " Default ", "  "]) {
+          expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(onNode);
+        }
+        // A value it does not know keeps Node's spawner and says so, rather than stopping the server.
+        for (const value of ["childs", "constructor", "__proto__"]) {
+          expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual({
+            ...onNode,
             errors: [expect.stringContaining(`${spawner}=\\"${value}\\"`)],
           });
         }
-        // Only an unset spawner knob defers to the worker knob.
-        expect(yield* outcome({ [worker]: "true", [spawner]: "childs" })).toEqual(unknown);
-        for (const value of ["default", "0", "false"]) {
-          expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(unset);
-        }
-        expect(yield* outcome({ [worker]: "true", [spawner]: "  " })).toEqual(unset);
-        // Effect's config reads an empty variable as unset, as for every T3CODE_* setting.
-        expect(yield* outcome({ [worker]: "true", [spawner]: "" })).toEqual(onWorker);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

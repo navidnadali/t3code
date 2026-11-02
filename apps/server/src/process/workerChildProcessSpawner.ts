@@ -1125,22 +1125,26 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   );
 });
 
-const processSpawnerChoices = new Map<string, "default" | "worker" | "child">([
-  ["", "default"],
-  ["default", "default"],
-  ["0", "default"],
-  ["false", "default"],
+const processSpawnerChoices = new Map<string, "node" | "worker" | "child">([
+  ["", "node"],
+  ["default", "node"],
+  ["0", "node"],
+  ["false", "node"],
+  ["off", "node"],
+  ["no", "node"],
   ["worker", "worker"],
   ["child", "child"],
   ["1", "child"],
   ["true", "child"],
+  ["on", "child"],
+  ["yes", "child"],
 ]);
 
 /**
- * Replaces the ambient ChildProcessSpawner: T3CODE_PROCESS_SPAWNER=child (or 1/true) starts commands
- * from a spawner process, =worker from a worker thread, =default (0/false) keeps it; only when it is
- * unset does T3CODE_VCS_SPAWN_WORKER=true pick the worker. Both spawn real processes, so an injected
- * (fake) spawner then only sees the command shapes they do not run. An unknown value keeps the default.
+ * Replaces the ambient ChildProcessSpawner. Unset (or child, 1, true) starts commands from a spawner
+ * process; worker (or, while it is unset, T3CODE_VCS_SPAWN_WORKER=true) from a worker thread; default,
+ * 0, false or off keep Node's spawner on the event loop, as Windows always does, and so does an
+ * unknown value, which is logged. Off-main spawners run real processes even under a fake spawner.
  */
 export const layerFromConfig = Layer.effect(
   ChildProcessSpawner,
@@ -1153,16 +1157,16 @@ export const layerFromConfig = Layer.effect(
       Effect.orDie,
     );
     let spawner = Option.match(value, {
-      onNone: () => (worker ? "worker" : "default"),
+      onNone: () => (worker ? "worker" : "child"),
       onSome: (set) => processSpawnerChoices.get(set.trim().toLowerCase()),
     });
     if (spawner === undefined) {
       yield* Effect.logError(
-        `${PROCESS_SPAWNER_ENV}="${Option.getOrElse(value, () => "")}" is not child, worker or default (or 1/0); using the default spawner`,
+        `${PROCESS_SPAWNER_ENV}="${Option.getOrElse(value, () => "")}" is not child, worker or default (on/off); keeping Node's spawner on the event loop`,
       );
-      spawner = "default";
+      spawner = "node";
     }
-    if (platform === "win32" || spawner === "default") return fallback;
+    if (platform === "win32" || spawner === "node") return fallback;
     if (spawner === "child") return yield* makeProcessSpawner(fallback);
     return yield* make(fallback);
   }),

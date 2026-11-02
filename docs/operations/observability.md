@@ -165,34 +165,37 @@ waiting. Read CPU together with page faults:
 - Many `involuntaryContextSwitches` mean other processes were competing for the CPU.
 
 Every Git command is a child process, and Node creates each one synchronously on the thread that
-spawns it (`posix_spawn` on macOS, `fork` on Linux): about a millisecond of event loop per command,
-around 30 commands per turn. `T3CODE_VCS_SPAWN_WORKER=true` starts the processes of `VcsProcess` and
-`GitVcsDriver` (checkpoints, status, refs, source control CLIs) on a worker thread instead, with the
-same output, exit codes and errors. Git run through other services, such as the cached repository
-identity lookup, still spawns on the event loop. On Linux a `fork` from the worker still write-locks
-the server's address space while page tables are copied, interrupts every CPU running the server to
-flush its TLB, and leaves copy-on-write faults for the event loop, so measure before enabling it.
+spawns it (`posix_spawn` on macOS, `fork` on Linux). On Linux each `fork` copies the page tables of
+the whole server, so its cost grows with the server's memory. On Linux and macOS the commands of
+`VcsProcess` and `GitVcsDriver` (checkpoints, status, refs, source control CLIs) therefore start from a
+small spawner process, started once while the server is small, so the server never forks for them:
+each fork copies only the spawner's page tables. Output, exit codes and errors are the same. Git run
+through other services, such as the cached repository identity lookup, still spawns on the event
+loop. macOS spawns with `posix_spawn`, which copies no page tables, so the gain there is only the
+event-loop time.
 
-`T3CODE_PROCESS_SPAWNER=child` (also `1` or `true`, any case; it takes precedence over the worker)
-starts the same commands from a small spawner process instead, started once while the server is
-small, so the server never forks for them: each fork copies only the spawner's page tables.
-`worker` selects the worker thread and `default` (`0`, `false`) neither; only when it is unset does
-`T3CODE_VCS_SPAWN_WORKER` apply. Any other value is logged as an error and keeps the default. A spawner that stops is restarted, which forks the server
-once. If it stops again before starting a command, or more than 3 times in 10 minutes, those
-commands fail with "The process spawner stopped" and an error is logged until the server restarts.
-Each command's unread output waits in the server, up to 1 MiB per stream, where it would otherwise
-wait in a 64 KiB pipe. macOS already spawns with `posix_spawn`, which copies no page tables, so the
-gain there is only the event-loop time.
+`T3CODE_PROCESS_SPAWNER` (any case) chooses where those commands start:
 
-The spawner kills its children and its own process group, then exits, when the server exits
-however it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP. Once the server has
-begun to shut down, a Git command still running or started later fails with "The process spawner
-stopped" instead of running on the server. Stop the server with systemd's `KillMode=mixed`: with
-`control-group`, the spawner gets SIGTERM while the server is still shutting down, and the server
-logs a warning and forks once more if another command arrives.
+- unset, `child`, `1`, `true` or `on`: the spawner process;
+- `worker`: a worker thread in the server, which still forks the server's address space on Linux
+  (`T3CODE_VCS_SPAWN_WORKER=true` selects it too while `T3CODE_PROCESS_SPAWNER` is unset);
+- `default`, `0`, `false` or `off`: Node's spawner on the event loop, as Windows always does.
 
-With either knob on, those services run real processes even when a test injects a fake
-`ChildProcessSpawner`. Unset spawns them on the event loop, as Windows always does.
+Any other value is logged as an error and keeps Node's spawner. A spawner process that stops is
+restarted, which forks the server once. If it stops again before starting a command, or more than 3
+times in 10 minutes, those commands fail with "The process spawner stopped" and an error is logged
+until the server restarts. Each command's unread output waits in the server, up to 1 MiB per stream,
+where it would otherwise wait in a 64 KiB pipe.
+
+The spawner kills its children and its own process group, then exits, when the server exits however
+it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP. Once the server has begun to shut
+down, a Git command still running or started later fails with "The process spawner stopped" instead of
+running on the server. Stop the server with systemd's `KillMode=mixed`: with `control-group`, the
+spawner gets SIGTERM while the server is still shutting down, and the server logs a warning and forks
+once more if another command arrives.
+
+The spawner process and the worker run real processes even when a test injects a fake
+`ChildProcessSpawner` below these services; such a test sets `T3CODE_PROCESS_SPAWNER=default`.
 
 ### Related Artifacts
 

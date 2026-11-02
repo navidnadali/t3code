@@ -43,7 +43,13 @@ import {
   splitNullSeparatedGitStdoutPaths,
 } from "./GitVcsDriverCore.ts";
 import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
-import { isObjectId, makeCheckpointRefMemory, readTextFile } from "./gitCheckpointRefs.ts";
+import {
+  type CheckpointRepository,
+  type CommitFacts,
+  isObjectId,
+  makeCheckpointRefMemory,
+  readTextFile,
+} from "./gitCheckpointRefs.ts";
 import {
   type GitConfigSnapshot,
   gitConfigBool,
@@ -611,15 +617,13 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
   });
 
   const rememberedCommitFacts = Effect.fnUntraced(function* (
-    repository: { readonly commonDir: string; readonly objectsDir: string },
+    repository: CheckpointRepository,
     revision: string,
   ) {
     const oid = isObjectId(revision)
       ? revision
       : yield* refMemory.resolveRef(repository.commonDir, revision);
-    return typeof oid === "string"
-      ? yield* refMemory.commitFacts(repository.objectsDir, oid)
-      : null;
+    return typeof oid === "string" ? yield* refMemory.commitFacts(repository, oid) : null;
   });
 
   const detectRepository: VcsDriver.VcsDriver["Service"]["detectRepository"] = Effect.fn(
@@ -1029,7 +1033,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         `${toCheckpointRef}^{commit}`,
       ],
     });
-    return heads.stdout
+    const reported: Array<readonly [string, CommitFacts]> = [];
+    const lines = heads.stdout
       .trimEnd()
       .split("\n")
       .map((line) => {
@@ -1037,10 +1042,12 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         const committerTime = rest.pop() ?? "";
         const parents = rest.filter((parent) => parent.length > 0);
         if (isObjectId(hash) && isObjectId(tree) && /^\d+$/.test(committerTime)) {
-          refMemory.rememberCommit(hash, { tree, parents, committerTime });
+          reported.push([hash, { tree, parents, committerTime }]);
         }
         return `${parents.join(" ")} ${committerTime}`;
       });
+    if (repository !== null) yield* refMemory.rememberCommits(repository, reported);
+    return lines;
   });
 
   const checkpoints: VcsDriver.VcsCheckpointOps = {

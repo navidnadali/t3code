@@ -16,6 +16,11 @@ export interface CommitFacts {
   readonly committerTime: string;
 }
 
+export interface CheckpointRepository {
+  readonly commonDir: string;
+  readonly objectsDir: string;
+}
+
 export interface CheckpointRefMemory {
   /** A ref this process wrote or resolved, so a loose file still holding `oid` answers without Git. */
   readonly rememberRef: (commonDir: string, ref: string, oid: string) => void;
@@ -25,18 +30,30 @@ export interface CheckpointRefMemory {
    * undefined when Git must answer (unknown ref, another value, a symbolic ref, an unreadable store).
    */
   readonly resolveRef: (commonDir: string, ref: string) => Effect.Effect<string | null | undefined>;
-  readonly rememberCommit: (oid: string, facts: CommitFacts) => void;
-  /** Facts from memory or the loose object; null when Git must answer (packed or missing object). */
-  readonly commitFacts: (objectsDir: string, oid: string) => Effect.Effect<CommitFacts | null>;
+  /** Keeps facts Git reported, while the repository's history is the objects' own. */
+  readonly rememberCommits: (
+    repository: CheckpointRepository,
+    facts: ReadonlyArray<readonly [oid: string, facts: CommitFacts]>,
+  ) => Effect.Effect<void>;
+  /**
+   * Facts from memory or the loose object; null when Git must answer: a packed or missing object,
+   * or a history Git reads differently from the objects (shallow, grafts, replacements).
+   */
+  readonly commitFacts: (
+    repository: CheckpointRepository,
+    oid: string,
+  ) => Effect.Effect<CommitFacts | null>;
 }
 
 // Caches, not state: an evicted entry costs the Git command it would have replaced. A turn keeps
 // two refs and two commits live, so these cover more than a thousand concurrent threads.
 const REFS_CAPACITY = 16_384;
 const COMMITS_CAPACITY = 16_384;
-const PACKED_REFS_CAPACITY = 256;
+// Entries kept from packed-refs files across repositories; a file with more is left to Git.
+const PACKED_REFS_ENTRY_BUDGET = 16_384;
 // Only refs under this prefix are kept from packed-refs; others are asked of Git.
 const PACKED_REFS_PREFIX = "refs/t3/";
+const REPLACE_REFS_PREFIX = "refs/replace/";
 
 class BoundedMap<K, V> {
   readonly #entries = new Map<K, V>();
@@ -69,22 +86,33 @@ type LooseRef =
   | { readonly kind: "missing" }
   | { readonly kind: "other" };
 
+// Git reads a symbolic link's target as a ref name, so a link is never read as a file here.
 const readLooseRef = (file: string) =>
   Effect.promise(
     () =>
       new Promise<LooseRef>((resolve) => {
         try {
-          NodeFS.readFile(file, (error, data) => {
-            if (error) {
+          NodeFS.lstat(file, (statError, stats) => {
+            if (statError) {
               resolve(
-                error.code === "ENOENT" || error.code === "ENOTDIR"
+                statError.code === "ENOENT" || statError.code === "ENOTDIR"
                   ? { kind: "missing" }
                   : { kind: "other" },
               );
               return;
             }
-            const content = data.toString("latin1").trimEnd();
-            resolve(OBJECT_ID.test(content) ? { kind: "oid", oid: content } : { kind: "other" });
+            if (!stats.isFile()) {
+              resolve({ kind: "other" });
+              return;
+            }
+            NodeFS.readFile(file, (error, data) => {
+              if (error) {
+                resolve({ kind: "other" });
+                return;
+              }
+              const content = data.toString("latin1").trimEnd();
+              resolve(OBJECT_ID.test(content) ? { kind: "oid", oid: content } : { kind: "other" });
+            });
           });
         } catch {
           resolve({ kind: "other" });
@@ -120,24 +148,38 @@ const statFingerprint = (file: string) =>
     }
   });
 
-interface PackedRefs {
-  readonly fingerprint: string;
-  readonly refs: ReadonlyMap<string, string>;
+export interface ParsedPackedRefs {
+  // Null when the file holds more refs under the prefix than `maxEntries`.
+  readonly refs: ReadonlyMap<string, string> | null;
+  readonly replaceRefs: boolean;
 }
 
 // `<oid> <name>` lines; `#` is the header and `^` the peeled object of the tag above it.
-export const parsePackedRefs = (content: string, prefix: string): ReadonlyMap<string, string> => {
-  const refs = new Map<string, string>();
+export const parsePackedRefs = (
+  content: string,
+  prefix: string,
+  maxEntries: number,
+): ParsedPackedRefs => {
+  let refs: Map<string, string> | null = new Map();
+  let replaceRefs = false;
   for (const line of content.split("\n")) {
     if (line.length === 0 || line.startsWith("#") || line.startsWith("^")) continue;
     const separator = line.indexOf(" ");
     if (separator === -1) continue;
-    const oid = line.slice(0, separator);
     const name = line.slice(separator + 1);
-    if (OBJECT_ID.test(oid) && name.startsWith(prefix)) refs.set(name, oid);
+    if (name.startsWith(REPLACE_REFS_PREFIX)) replaceRefs = true;
+    if (refs === null || !name.startsWith(prefix)) continue;
+    const oid = line.slice(0, separator);
+    if (!OBJECT_ID.test(oid)) continue;
+    if (refs.size >= maxEntries) refs = null;
+    else refs.set(name, oid);
   }
-  return refs;
+  return { refs, replaceRefs };
 };
+
+interface PackedRefs extends ParsedPackedRefs {
+  readonly fingerprint: string;
+}
 
 // Stat before reading, so a rewrite between the two is seen by the next stat; null when unreadable.
 const readPackedRefs = (commonDir: string, cached: PackedRefs | undefined) =>
@@ -145,7 +187,7 @@ const readPackedRefs = (commonDir: string, cached: PackedRefs | undefined) =>
     const file = NodePath.join(commonDir, "packed-refs");
     const fingerprint = await statFingerprint(file);
     if (cached !== undefined && cached.fingerprint === fingerprint) return cached;
-    if (fingerprint === "!ENOENT") return { fingerprint, refs: new Map() };
+    if (fingerprint === "!ENOENT") return { fingerprint, refs: new Map(), replaceRefs: false };
     if (fingerprint.startsWith("!")) return null;
     const content = await new Promise<string | null>((resolve) => {
       try {
@@ -155,7 +197,34 @@ const readPackedRefs = (commonDir: string, cached: PackedRefs | undefined) =>
       }
     });
     if (content === null) return null;
-    return { fingerprint, refs: parsePackedRefs(content, PACKED_REFS_PREFIX) };
+    return {
+      fingerprint,
+      ...parsePackedRefs(content, PACKED_REFS_PREFIX, PACKED_REFS_ENTRY_BUDGET),
+    };
+  });
+
+// Whether `git log` reports a commit as its object says: no shallow boundary, grafts or replacements
+// (replace refs are also looked for in packed-refs by the caller).
+const plainHistoryFiles = (commonDir: string) =>
+  Effect.promise(async () => {
+    if (process.env.GIT_REPLACE_REF_BASE !== undefined) return false;
+    const [shallow, grafts, replaceRefs] = await Promise.all([
+      statFingerprint(NodePath.join(commonDir, "shallow")),
+      statFingerprint(NodePath.join(commonDir, "info", "grafts")),
+      // Deleting the last replacement can leave the directory; only entries count.
+      new Promise<ReadonlyArray<string> | null>((resolve) => {
+        try {
+          NodeFS.readdir(NodePath.join(commonDir, "refs", "replace"), (error, names) =>
+            resolve(
+              error ? (error.code === "ENOENT" || error.code === "ENOTDIR" ? [] : null) : names,
+            ),
+          );
+        } catch {
+          resolve(null);
+        }
+      }),
+    ]);
+    return shallow === "!ENOENT" && grafts === "!ENOENT" && replaceRefs?.length === 0;
   });
 
 /** A commit object's header; null when it is not a well-formed commit. */
@@ -218,8 +287,29 @@ const isCheckpointRefName = (ref: string) =>
 export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const refs = new BoundedMap<string, string>(REFS_CAPACITY);
   const commits = new BoundedMap<string, CommitFacts>(COMMITS_CAPACITY);
-  const packed = new BoundedMap<string, PackedRefs>(PACKED_REFS_CAPACITY);
+  // Parsed packed-refs per common directory, their entries counted against one budget.
+  const packed = new Map<string, PackedRefs>();
+  let packedEntries = 0;
   const refKey = (commonDir: string, ref: string) => `${commonDir}\0${ref}`;
+
+  const packedRefs = Effect.fnUntraced(function* (commonDir: string) {
+    const cached = packed.get(commonDir);
+    const current = yield* readPackedRefs(commonDir, cached);
+    if (current === null || current === cached) return current;
+    if (cached !== undefined) {
+      packed.delete(commonDir);
+      packedEntries -= cached.refs?.size ?? 0;
+    }
+    const size = current.refs?.size ?? 0;
+    for (const [key, entry] of packed) {
+      if (packedEntries + size <= PACKED_REFS_ENTRY_BUDGET) break;
+      packed.delete(key);
+      packedEntries -= entry.refs?.size ?? 0;
+    }
+    packed.set(commonDir, current);
+    packedEntries += size;
+    return current;
+  });
 
   // Git's files backend: the loose file wins, then packed-refs; absent from both is absent.
   const resolveRef = Effect.fnUntraced(function* (commonDir: string, ref: string) {
@@ -228,27 +318,41 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     const loose = yield* readLooseRef(NodePath.join(commonDir, ref));
     if (loose.kind === "oid") return loose.oid === known ? known : undefined;
     if (loose.kind === "other") return undefined;
-    const packedRefs = yield* readPackedRefs(commonDir, packed.get(commonDir));
-    if (packedRefs === null) return undefined;
-    packed.set(commonDir, packedRefs);
-    const entry = packedRefs.refs.get(ref);
+    const current = yield* packedRefs(commonDir);
+    if (current === null || current.refs === null) return undefined;
+    const entry = current.refs.get(ref);
     if (entry === undefined) return null;
     return entry === known ? known : undefined;
   });
 
-  const commitFacts = Effect.fnUntraced(function* (objectsDir: string, oid: string) {
+  const plainHistory = Effect.fnUntraced(function* (commonDir: string) {
+    if (!(yield* plainHistoryFiles(commonDir))) return false;
+    const current = yield* packedRefs(commonDir);
+    return current !== null && !current.replaceRefs;
+  });
+
+  const commitFacts = Effect.fnUntraced(function* (repository: CheckpointRepository, oid: string) {
+    if (!(yield* plainHistory(repository.commonDir))) return null;
     const remembered = commits.get(oid);
     if (remembered !== undefined) return remembered;
-    const facts = yield* readLooseCommit(objectsDir, oid);
+    const facts = yield* readLooseCommit(repository.objectsDir, oid);
     if (facts !== null) commits.set(oid, facts);
     return facts;
+  });
+
+  const rememberCommits = Effect.fnUntraced(function* (
+    repository: CheckpointRepository,
+    facts: ReadonlyArray<readonly [oid: string, facts: CommitFacts]>,
+  ) {
+    if (facts.length === 0 || !(yield* plainHistory(repository.commonDir))) return;
+    for (const [oid, commit] of facts) commits.set(oid, commit);
   });
 
   return {
     rememberRef: (commonDir, ref, oid) => refs.set(refKey(commonDir, ref), oid),
     forgetRef: (commonDir, ref) => refs.delete(refKey(commonDir, ref)),
     resolveRef,
-    rememberCommit: (oid, facts) => commits.set(oid, facts),
+    rememberCommits,
     commitFacts,
   };
 };

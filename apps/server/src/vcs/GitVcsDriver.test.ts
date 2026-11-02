@@ -1976,10 +1976,122 @@ it.effect("reads commit objects and packed-refs the way git log and rev-parse re
     yield* git(["pack-refs", "--all"]);
     const packed = yield* fileSystem.readFileString(path.join(cwd, ".git", "packed-refs"));
     assert.isTrue(packed.includes("\n^"));
-    const refs = parsePackedRefs(packed, "refs/t3/");
-    assert.deepStrictEqual([...refs.entries()].sort(), [
+    const refs = parsePackedRefs(packed, "refs/t3/", 2);
+    assert.deepStrictEqual([...refs.refs!.entries()].sort(), [
       ["refs/t3/checkpoints/one", yield* git(["rev-parse", "HEAD^2"])],
       ["refs/t3/checkpoints/two", yield* git(["rev-parse", "v1"])],
     ]);
+    assert.isFalse(refs.replaceRefs);
+    // Beyond the budget the parse keeps nothing, so git answers; replace refs are still noticed.
+    const oversized = parsePackedRefs(`${packed}${"0".repeat(40)} refs/replace/x\n`, "refs/t3/", 1);
+    assert.deepStrictEqual(
+      { refs: oversized.refs, replaceRefs: oversized.replaceRefs },
+      {
+        refs: null,
+        replaceRefs: true,
+      },
+    );
   }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+// A seed repository both harness repositories fetch from, so their histories match commit for commit.
+const seedRepository = Effect.fn("test.seedRepository")(function* (
+  h: Effect.Success<ReturnType<typeof makeTurnHarness>>,
+  commits: number,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const seed = path.join(h.root, "seed");
+  yield* fileSystem.makeDirectory(seed);
+  yield* h.gitIn(seed, ["init", "-q", "-b", "main"]);
+  yield* h.gitIn(seed, ["config", "user.name", "Test"]);
+  yield* h.gitIn(seed, ["config", "user.email", "test@test.com"]);
+  for (let index = 1; index <= commits; index++) {
+    yield* fileSystem.writeFileString(path.join(seed, "file.txt"), `version ${index}\n`);
+    yield* h.gitIn(seed, ["add", "."]);
+    yield* h.gitIn(seed, ["commit", "-q", "-m", `commit ${index}`], FIXED_COMMIT_ENV);
+  }
+  return seed;
+});
+
+it.effect("checkpoint commit facts come from git while the history is shallow", () =>
+  Effect.gen(function* () {
+    const h = yield* makeTurnHarness("t3-checkpoint-shallow-");
+    const seed = yield* seedRepository(h, 3);
+    yield* h.gitBoth(["fetch", "-q", "--depth=1", seed, "main"]);
+    yield* h.gitBoth(["checkout", "-q", "-B", "main", "FETCH_HEAD"]);
+    yield* h.turn(1);
+    yield* h.turn(2);
+    // The boundary commit has parents in its object but none for git.
+    yield* h.gitBoth(["update-ref", turnRef(2), "HEAD"]);
+    const boundary = yield* h.turn(3);
+    assert.strictEqual(boundary.authored, null);
+    assert.isTrue(boundary.commands.includes("log"));
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect("checkpoint commit facts come from git while grafts or replacements apply", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const h = yield* makeTurnHarness("t3-checkpoint-replace-");
+    yield* h.writeBoth("file.txt", "initial\n");
+    yield* h.gitBoth(["add", "."]);
+    yield* h.commitBoth("initial");
+    yield* h.turn(1);
+    yield* h.writeBoth("file.txt", "edited\n");
+    yield* h.turn(2);
+    const commitOf = (cwd: string, ordinal: number) =>
+      h
+        .gitIn(cwd, ["rev-parse", `${turnRef(ordinal)}^{commit}`])
+        .pipe(Effect.map((result) => result.stdout.trim()));
+
+    // A graft removes checkpoint 2's parent for git: no authored paths for 2 → 3.
+    for (const cwd of [h.repos.warm, h.repos.cold]) {
+      yield* fileSystem.writeFileString(
+        path.join(cwd, ".git", "info", "grafts"),
+        `${yield* commitOf(cwd, 2)}\n`,
+      );
+    }
+    const grafted = yield* h.turn(3);
+    assert.strictEqual(grafted.authored, null);
+    assert.isTrue(grafted.commands.includes("log"));
+    yield* h.removeBoth(".git/info/grafts");
+
+    // Replacing checkpoint 3 by checkpoint 1 gives git the initial tree: the diff 3 → 4 is the edit.
+    for (const cwd of [h.repos.warm, h.repos.cold]) {
+      yield* h.gitIn(cwd, ["replace", "-f", yield* commitOf(cwd, 3), yield* commitOf(cwd, 1)]);
+    }
+    const replaced = yield* h.turn(4);
+    assert.strictEqual(replaced.numstat, "1\t1\tfile.txt\0");
+    for (const cwd of [h.repos.warm, h.repos.cold]) {
+      yield* h.gitIn(cwd, ["replace", "-d", yield* commitOf(cwd, 3)]);
+    }
+    const plain = yield* h.turn(5);
+    assert.deepStrictEqual(plain.commands, STEADY_TURN_COMMANDS);
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect.skipIf(!symlinksSupported)(
+  "a checkpoint ref kept as a symbolic link is resolved by git",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const h = yield* makeTurnHarness("t3-checkpoint-symref-");
+      yield* h.writeBoth("file.txt", "initial\n");
+      yield* h.gitBoth(["add", "."]);
+      yield* h.commitBoth("initial");
+      yield* h.turn(1);
+      yield* h.turn(2);
+      // Git reads a link's target as a ref name; a file read would follow it as a path and fail.
+      for (const cwd of [h.repos.warm, h.repos.cold]) {
+        const file = path.join(cwd, ".git", turnRef(2));
+        yield* fileSystem.remove(file);
+        yield* fileSystem.symlink("refs/heads/main", file);
+      }
+      const linked = yield* h.turn(3);
+      assert.strictEqual(linked.baselineExists, true);
+      assert.isTrue(linked.commands.includes("rev-parse"));
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

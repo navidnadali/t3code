@@ -79,10 +79,11 @@ export const tokenizeNodeOptions = (nodeOptions: string | undefined): ReadonlyAr
   return tokens;
 };
 
-/** Node accepts `_` for `-` in option names; compare on the dashed form. */
+/** Node accepts `_` for `-` in option names and a single leading dash; compare on the `--dashed` form. */
 const optionName = (arg: string): string => {
   const end = arg.indexOf("=");
-  return (end === -1 ? arg : arg.slice(0, end)).replaceAll("_", "-");
+  const name = (end === -1 ? arg : arg.slice(0, end)).replaceAll("_", "-");
+  return name.startsWith("-") && !name.startsWith("--") ? `-${name}` : name;
 };
 
 /** The flag's last value in args (V8 takes the last; `""` for a bare flag without a value); undefined when absent. */

@@ -81,6 +81,8 @@ describe("tokenizeNodeOptions", () => {
       '"--max-semi-space-size=16"',
       '--max-semi-space-size="16"',
       "--max_semi_space_size=16",
+      "-max-semi-space-size=16",
+      "-max_semi_space_size=16",
       "--max-semi-space-size 16",
       "--max-semi-space-size",
     ]) {
@@ -282,7 +284,10 @@ const cleanEnv = {
   [INHERITED_NODE_OPTIONS_ENV]: undefined,
 };
 
-describe("the entrypoint", () => {
+// The relaunch needs process.execve (absent on Windows); without it the entrypoint keeps Node's default by design.
+const canRelaunch = typeof process.execve === "function";
+
+describe.skipIf(!canRelaunch)("the entrypoint", () => {
   const run = Effect.fn("youngGeneration.test.run")(function* (
     env: Record<string, string | undefined>,
     args: ReadonlyArray<string> = [],

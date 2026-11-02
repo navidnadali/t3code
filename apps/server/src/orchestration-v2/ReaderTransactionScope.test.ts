@@ -1275,21 +1275,20 @@ it.effect.each(boundedReads)(
     ).pipe(Effect.map((exit) => assert.isTrue(Exit.isSuccess(exit), String(exit)))),
 );
 
-it.effect("leaves a reader for other reads while snapshot windows hold the rest", () =>
+it.effect("serves a snapshot window before history reads still waiting for a reader", () =>
   withFileStore(
-    "reader-scope-window-reader-",
+    "reader-scope-window-first-",
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
-      const fixture = yield* writeFixture("window-reader", 2);
-      // Two readers: one window holds a reader, the other waits for its turn.
-      const held = yield* holdHistoryReads(store, fixture, 2, (store, fixture) =>
-        store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
-      );
+      const fixture = yield* writeFixture("window-first", 2);
+      // Two readers: one history read holds a reader, two more wait for one.
+      const held = yield* holdHistoryReads(store, fixture, 3);
       yield* Queue.take(held.arrived);
-      const shell = yield* store.getThreadShell(fixture.fork);
-      assert.strictEqual(shell?.id, fixture.fork);
+      const window = yield* store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 });
+      assert.strictEqual(window.projection.thread.id, fixture.fork);
       assert.strictEqual(yield* Queue.size(held.arrived), 0);
       yield* Deferred.succeed(held.release, undefined);
+      yield* Queue.take(held.arrived);
       yield* Queue.take(held.arrived);
       yield* Effect.forEach(held.reads, Fiber.join);
     }),

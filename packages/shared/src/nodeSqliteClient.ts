@@ -96,9 +96,9 @@ export const ReaderPermits = Context.Reference<Semaphore.Semaphore | undefined>(
 const readerPermitCount = (readers: number) => Math.max(1, readers - 1);
 
 /**
- * Readers go to waiting reads by class: `small` (the default) first, then `page`, then `history`.
- * History reads also hold at most all readers but one, so small and page reads always find one;
- * with a single reader they can wait behind it. The class matters only while a reader is held.
+ * Readers go to waiting reads by class: `small` (the default), then `page`, then `history`. From
+ * three readers the last free one stays with small reads while none holds one and history reads
+ * hold all but two, so page reads keep one history cannot take. Pools of 1 and 2: observability.md.
  */
 export type ReadClass = "small" | "page" | "history";
 
@@ -119,7 +119,9 @@ export const historyReadStream = <A, E, R>(
   stream: Stream.Stream<A, E, R>,
 ): Stream.Stream<A, E, R> => Stream.provideService(stream, ReadClassRef, "history");
 
-const historyReaderCount = (readers: number) => Math.max(1, readers - 1);
+const smallReaderReserve = (readers: number) => (readers >= 3 ? 1 : 0);
+const historyReaderCount = (readers: number) =>
+  Math.max(1, readers - 1 - smallReaderReserve(readers));
 
 const READ_CLASSES: ReadonlyArray<ReadClass> = ["small", "page", "history"];
 
@@ -134,9 +136,10 @@ interface SlotWaiter {
 // a slot freed for it is not handed out again and no lower class passes it.
 class ReaderSlots {
   free: number;
-  heldByHistory = 0;
   woken = 0;
-  wokenHistory = 0;
+  readonly held: Record<ReadClass, number> = { small: 0, page: 0, history: 0 };
+  readonly wokenFor: Record<ReadClass, number> = { small: 0, page: 0, history: 0 };
+  readonly smallReserve: number;
   readonly historyCap: number;
   readonly waiters: Record<ReadClass, Set<SlotWaiter>> = {
     small: new Set(),
@@ -144,25 +147,36 @@ class ReaderSlots {
     history: new Set(),
   };
 
-  constructor(readers: number, historyCap: number) {
+  constructor(readers: number) {
     this.free = readers;
-    this.historyCap = historyCap;
+    this.smallReserve = smallReaderReserve(readers);
+    this.historyCap = historyReaderCount(readers);
+  }
+
+  // Whether a read of the class may have a reader now, waiters aside. Each class's limits include
+  // the one before it, so a class that does not fit means none after it fits either.
+  private fits(readClass: ReadClass): boolean {
+    const available = this.free - this.woken;
+    if (available <= 0) return false;
+    if (readClass === "small") return true;
+    const keptForSmall = this.smallReserve - this.held.small - this.wokenFor.small;
+    if (available <= keptForSmall) return false;
+    return readClass === "page" || this.held.history + this.wokenFor.history < this.historyCap;
   }
 
   private canTake(readClass: ReadClass): boolean {
-    if (this.free - this.woken <= 0) return false;
     for (const other of READ_CLASSES) {
       if (other === readClass) break;
       if (this.waiters[other].size > 0) return false;
     }
-    return readClass !== "history" || this.heldByHistory + this.wokenHistory < this.historyCap;
+    return this.fits(readClass);
   }
 
   take(readClass: ReadClass): Effect.Effect<void> {
     const take: Effect.Effect<void> = Effect.suspend(() => {
       if (!this.canTake(readClass)) return this.wait(readClass, take);
       this.free--;
-      if (readClass === "history") this.heldByHistory++;
+      this.held[readClass]++;
       return Effect.void;
     });
     return take;
@@ -198,13 +212,13 @@ class ReaderSlots {
     if (!this.waiters[waiter.readClass].delete(waiter)) return;
     if (!waiter.woken) return;
     this.woken--;
-    if (waiter.readClass === "history") this.wokenHistory--;
+    this.wokenFor[waiter.readClass]--;
   }
 
   release(readClass: ReadClass): Effect.Effect<void> {
     return Effect.withFiber((fiber) => {
       this.free++;
-      if (readClass === "history") this.heldByHistory--;
+      this.held[readClass]--;
       this.wakeWaiters(fiber);
       return Effect.void;
     });
@@ -215,12 +229,10 @@ class ReaderSlots {
     fiber.currentDispatcher.scheduleTask(() => {
       for (const readClass of READ_CLASSES) {
         for (const waiter of this.waiters[readClass]) {
-          if (this.free - this.woken <= 0) return;
           if (waiter.woken) continue;
-          if (readClass === "history" && this.heldByHistory + this.wokenHistory >= this.historyCap)
-            return;
+          if (!this.fits(readClass)) return;
           this.woken++;
-          if (readClass === "history") this.wokenHistory++;
+          this.wokenFor[readClass]++;
           waiter.wake();
         }
       }
@@ -1373,7 +1385,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           })),
         )
       : [];
-  const slots = new ReaderSlots(readers.length, historyReaderCount(readers.length));
+  const slots = new ReaderSlots(readers.length);
   if (readers.length > 0) yield* Metric.update(readerPoolAvailable, 1);
 
   const writer = { name: "writer" as const, lock: semaphore, connection };

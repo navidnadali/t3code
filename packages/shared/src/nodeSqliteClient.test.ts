@@ -465,12 +465,17 @@ it.effect("lets a page read pass history reads still waiting for a reader", () =
         // One reader frees: the page read gets it, not the history read queued before it.
         yield* holders[0]!.release;
         yield* page.running;
-        assert.deepEqual(started, ["holder-1", "holder-2", "page"]);
+        // The holders start in either order; the page read must be third, before any history read.
+        assert.deepEqual(started.slice(0, 2).toSorted(), ["holder-1", "holder-2"]);
+        assert.deepEqual(started.slice(2), ["page"]);
         yield* page.release;
         yield* holders[1]!.release;
-        yield* Effect.forEach(histories, (history) => history.running);
-        yield* Effect.forEach(histories, (history) => history.release);
-        assert.deepEqual(started, ["holder-1", "holder-2", "page", "history-1", "history-2"]);
+        // History reads hold at most one of the two readers, so they run one after the other.
+        for (const history of histories) {
+          yield* history.running;
+          yield* history.release;
+        }
+        assert.deepEqual(started.slice(3), ["history-1", "history-2"]);
       }),
     { readerPoolSize: 2 },
   ),

@@ -7313,9 +7313,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         method(...args).pipe(NodeSqliteClient.readOnly);
 
     // Reads of a thread's whole history hold a reader permit from before their transaction until
-    // decoded, which bounds those row sets. They and page reads (bounded by the page) are large
-    // reads, which leave other reads a free reader; page reads never wait for a permit. A read
-    // inside a transaction keeps that transaction's connection.
+    // decoded, which bounds those row sets, and get a reader last; page reads (bounded by the page)
+    // take no permit and get a reader before them; every other read goes first. A read inside a
+    // transaction keeps that transaction's connection.
     const permitsToTake = Effect.serviceOption(sql.transactionService).pipe(
       Effect.map((transaction) => (Option.isNone(transaction) ? readerPermits : undefined)),
     );
@@ -7328,7 +7328,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           Effect.flatMap((permits) =>
             permits === undefined ? method(...args) : permits.withPermits(1)(method(...args)),
           ),
-          NodeSqliteClient.largeRead,
+          NodeSqliteClient.historyRead,
           NodeSqliteClient.readOnly,
         );
     const pageOnReader =
@@ -7336,7 +7336,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         method: (...args: Args) => Effect.Effect<A, E, R>,
       ) =>
       (...args: Args): Effect.Effect<A, E, R> =>
-        method(...args).pipe(NodeSqliteClient.largeRead, NodeSqliteClient.readOnly);
+        method(...args).pipe(NodeSqliteClient.pageRead, NodeSqliteClient.readOnly);
     // Takes a permit for the current scope. Only the wait is interruptible: the take and its
     // release finalizer happen together, so an interruption cannot keep a permit.
     const takePermitScoped = (permits: Semaphore.Semaphore) =>
@@ -7363,7 +7363,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             Effect.flatMap((permits) =>
               permits === undefined ? Effect.void : takePermitScoped(permits),
             ),
-            Effect.as(method(...args).pipe(NodeSqliteClient.largeReadStream)),
+            Effect.as(method(...args).pipe(NodeSqliteClient.historyReadStream)),
           ),
         );
 

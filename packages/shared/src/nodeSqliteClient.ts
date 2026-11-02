@@ -95,24 +95,137 @@ export const ReaderPermits = Context.Reference<Semaphore.Semaphore | undefined>(
 
 const readerPermitCount = (readers: number) => Math.max(1, readers - 1);
 
-const LargeRead = Context.Reference<boolean>("@t3tools/shared/nodeSqliteClient/LargeRead", {
-  defaultValue: () => false,
+/**
+ * Readers go to waiting reads by class: `small` (the default) first, then `page`, then `history`.
+ * History reads also hold at most all readers but one, so small and page reads always find one;
+ * with a single reader they can wait behind it. The class matters only while a reader is held.
+ */
+export type ReadClass = "small" | "page" | "history";
+
+const ReadClassRef = Context.Reference<ReadClass>("@t3tools/shared/nodeSqliteClient/ReadClass", {
+  defaultValue: () => "small",
 });
 
-/**
- * Marks reads of large row sets. While they hold a reader they may hold at most three quarters of
- * the readers, all but one at most, so other reads always find one free; with a single reader,
- * they can make other reads wait. Unlike ReaderPermits this is held only while a reader is.
- */
-export const largeRead = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-  Effect.provideService(effect, LargeRead, true);
+/** Marks a read of one page of a thread's history, bounded by the page. */
+export const pageRead = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, ReadClassRef, "page");
 
-/** largeRead for a stream. */
-export const largeReadStream = <A, E, R>(stream: Stream.Stream<A, E, R>): Stream.Stream<A, E, R> =>
-  Stream.provideService(stream, LargeRead, true);
+/** Marks a read of a thread's whole history. */
+export const historyRead = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, ReadClassRef, "history");
 
-const largeReaderCount = (readers: number) =>
-  Math.max(1, Math.min(readers - 1, Math.floor((readers * 3) / 4)));
+/** historyRead for a stream. */
+export const historyReadStream = <A, E, R>(
+  stream: Stream.Stream<A, E, R>,
+): Stream.Stream<A, E, R> => Stream.provideService(stream, ReadClassRef, "history");
+
+const historyReaderCount = (readers: number) => Math.max(1, readers - 1);
+
+const READ_CLASSES: ReadonlyArray<ReadClass> = ["small", "page", "history"];
+
+interface SlotWaiter {
+  readonly readClass: ReadClass;
+  woken: boolean;
+  readonly wake: () => void;
+}
+
+// Reader slots handed out by class. As in effect's Semaphore, a woken waiter takes its slot itself
+// when it next runs, so one interrupted in between takes nothing; until then it keeps its place, so
+// a slot freed for it is not handed out again and no lower class passes it.
+class ReaderSlots {
+  free: number;
+  heldByHistory = 0;
+  woken = 0;
+  wokenHistory = 0;
+  readonly historyCap: number;
+  readonly waiters: Record<ReadClass, Set<SlotWaiter>> = {
+    small: new Set(),
+    page: new Set(),
+    history: new Set(),
+  };
+
+  constructor(readers: number, historyCap: number) {
+    this.free = readers;
+    this.historyCap = historyCap;
+  }
+
+  private canTake(readClass: ReadClass): boolean {
+    if (this.free - this.woken <= 0) return false;
+    for (const other of READ_CLASSES) {
+      if (other === readClass) break;
+      if (this.waiters[other].size > 0) return false;
+    }
+    return readClass !== "history" || this.heldByHistory + this.wokenHistory < this.historyCap;
+  }
+
+  take(readClass: ReadClass): Effect.Effect<void> {
+    const take: Effect.Effect<void> = Effect.suspend(() => {
+      if (!this.canTake(readClass)) return this.wait(readClass, take);
+      this.free--;
+      if (readClass === "history") this.heldByHistory++;
+      return Effect.void;
+    });
+    return take;
+  }
+
+  private wait(readClass: ReadClass, take: Effect.Effect<void>): Effect.Effect<void> {
+    return Effect.callback<void>((resume) => {
+      const waiter: SlotWaiter = {
+        readClass,
+        woken: false,
+        wake: () => {
+          waiter.woken = true;
+          resume(
+            Effect.suspend(() => {
+              this.forget(waiter);
+              return take;
+            }),
+          );
+        },
+      };
+      this.waiters[readClass].add(waiter);
+      return Effect.withFiber((fiber) => {
+        // Interrupted after being woken, it gives the slot reserved for it to the next waiter.
+        const wokenSlot = waiter.woken;
+        this.forget(waiter);
+        if (wokenSlot) this.wakeWaiters(fiber);
+        return Effect.void;
+      });
+    });
+  }
+
+  private forget(waiter: SlotWaiter) {
+    if (!this.waiters[waiter.readClass].delete(waiter)) return;
+    if (!waiter.woken) return;
+    this.woken--;
+    if (waiter.readClass === "history") this.wokenHistory--;
+  }
+
+  release(readClass: ReadClass): Effect.Effect<void> {
+    return Effect.withFiber((fiber) => {
+      this.free++;
+      if (readClass === "history") this.heldByHistory--;
+      this.wakeWaiters(fiber);
+      return Effect.void;
+    });
+  }
+
+  private wakeWaiters(fiber: Fiber.Fiber<unknown, unknown>) {
+    fiber.currentDispatcher.scheduleTask(() => {
+      for (const readClass of READ_CLASSES) {
+        for (const waiter of this.waiters[readClass]) {
+          if (this.free - this.woken <= 0) return;
+          if (waiter.woken) continue;
+          if (readClass === "history" && this.heldByHistory + this.wokenHistory >= this.historyCap)
+            return;
+          this.woken++;
+          if (readClass === "history") this.wokenHistory++;
+          waiter.wake();
+        }
+      }
+    }, 0);
+  }
+}
 
 interface Acquired {
   readonly connection: "writer" | "reader";
@@ -1259,10 +1372,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           })),
         )
       : [];
-  // Counts idle reader slots, so a read waits for whichever slot frees first.
-  const idleReaders = yield* Semaphore.make(readers.length);
-  // Slots that reads marked large may hold, taken before an idle slot and released with it.
-  const largeReaders = yield* Semaphore.make(largeReaderCount(readers.length));
+  const slots = new ReaderSlots(readers.length, historyReaderCount(readers.length));
   if (readers.length > 0) yield* Metric.update(readerPoolAvailable, 1);
 
   const writer = { name: "writer" as const, lock: semaphore, connection };
@@ -1278,14 +1388,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
       if (readers.length === 0 || readerPool.unavailable || !Context.get(fiber.context, ReadOnly)) {
         return Effect.succeed(writer);
       }
-      const large = Context.get(fiber.context, LargeRead);
-      // A large read takes its turn first; interrupted before it holds a slot, it gives it back.
-      const takeSlot = large
-        ? Effect.andThen(
-            wait(largeReaders.take(1)),
-            wait(idleReaders.take(1)).pipe(Effect.onInterrupt(() => largeReaders.release(1))),
-          )
-        : wait(idleReaders.take(1));
+      const readClass = Context.get(fiber.context, ReadClassRef);
+      const takeSlot = wait(slots.take(readClass));
       const claim = Effect.flatMap(takeSlot, () => {
         // The lowest idle slot wins, so later slots start a worker only while earlier ones are busy.
         const slot = readers.find((candidate) => !candidate.busy)!;
@@ -1296,12 +1400,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           if (!held) return Effect.void;
           held = false;
           slot.busy = false;
-          return Effect.asVoid(
-            Effect.andThen(
-              idleReaders.release(1),
-              large ? largeReaders.release(1) : Effect.succeed(0),
-            ),
-          );
+          return slots.release(readClass);
         });
         return Effect.as(claimed(release), { slot, release });
       });

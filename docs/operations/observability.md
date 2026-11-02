@@ -718,17 +718,16 @@ SIGBUS and terminates the process. CLI commands that open the database, such as 
 `t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
 as well as the server.
 
-Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers, under two limits.
-Reads of a thread's whole history (full snapshots and projections, turn starts, thread search, and
-records of turn items, nodes, messages, subagents, plans, handoffs or transfers) each hold one of
-`T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from before their read transaction
-until their rows are decoded, which bounds the history rows held at once. Those reads and page reads
-(snapshot windows, history and timeline pages, which take no permit) together hold at most three
-quarters of the readers, and never the last one, while they hold a reader, so every other read
-(thread shells, settlement, the thread row, runs and other bookkeeping) finds one free. With a pool
-of 1 a large read can make those reads wait for the reader, and while reads fall back to the main
-connection they all share it. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a
-large read's turn is, as part of the wait for a reader.
+Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers. When a reader frees,
+waiting reads get it by class: first every other read (thread shells, settlement, the thread row,
+runs and other bookkeeping), then page reads (snapshot windows, history and timeline pages), then
+reads of a thread's whole history (full snapshots and projections, turn starts, thread search, and
+records of turn items, nodes, messages, subagents, plans, handoffs or transfers). History reads also
+hold at most all readers but one, so the other classes always find one; with a pool of 1 they can
+wait behind a history read, and while reads fall back to the main connection they all share it.
+History reads each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from
+before their read transaction until their rows are decoded, which bounds the history rows held at
+once. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a reader is.
 
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for

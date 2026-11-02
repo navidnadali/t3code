@@ -267,7 +267,7 @@ export const open: (
       ),
   );
   const startupFailure = yield* Effect.promise(() => started);
-  if (startupFailure !== undefined) return yield* Effect.fail(startupFailure);
+  if (startupFailure !== undefined) return yield* startupFailure;
 
   let nextRequestId = 0;
   const broken = () => {

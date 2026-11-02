@@ -298,7 +298,10 @@ export const open: (
       }
       const id = nextRequestId++;
       pending.set(id, (reply) => {
-        if ("rows" in reply) resume(Effect.succeed(reply.rows));
+        // A queued upsert may have failed since this was posted; its answer must not pass as sound.
+        const late = broken();
+        if (late !== undefined) resume(Effect.fail(late));
+        else if ("rows" in reply) resume(Effect.succeed(reply.rows));
         else
           resume(Effect.fail(failure("error" in reply ? reply.error : "lost the scratch store")));
       });

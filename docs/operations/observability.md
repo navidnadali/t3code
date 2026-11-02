@@ -178,13 +178,15 @@ event-loop time.
 
 - unset, `child`, `1`, `true` or `on`: the spawner process;
 - `worker`: a worker thread in the server, which still forks the server's address space on Linux
-  (`T3CODE_VCS_SPAWN_WORKER=true` selects it too while `T3CODE_PROCESS_SPAWNER` is unset);
+  (`T3CODE_VCS_SPAWN_WORKER=true` selects it too while `T3CODE_PROCESS_SPAWNER` is unset, so a host
+  that still sets it keeps the worker until it is removed or `T3CODE_PROCESS_SPAWNER=child` is set);
 - `default`, `0`, `false` or `off`: Node's spawner on the event loop, as Windows always does.
 
 Any other value is logged as an error and keeps Node's spawner. A spawner process that stops is
 restarted, which forks the server once. If it stops again before starting a command, or more than 3
-times in 10 minutes, those commands fail with "The process spawner stopped" and an error is logged
-until the server restarts. Each command's unread output waits in the server, up to 1 MiB per stream,
+times in 10 minutes, an error is logged and commands fail with "The process spawner stopped" for a
+cool-down of 15 seconds, then a spawner is started again; while starts keep failing, the cool-down
+doubles up to 5 minutes. Git never falls back to Node's spawner meanwhile. Each command's unread output waits in the server, up to 1 MiB per stream,
 where it would otherwise wait in a 64 KiB pipe.
 
 The spawner kills its children and its own process group, then exits, when the server exits however

@@ -47,7 +47,8 @@ const processGroupGraceMillis = 1_000;
 const processGroupPollIntervalMillis = 10;
 // Time the spawner gets at close to kill its children before it is killed.
 const spawnerCloseGraceMillis = 1_000;
-/** Each restart forks the server; a spawner that keeps stopping is a fault, whatever the load. */
+// Each restart forks the server; a spawner that keeps stopping is a fault, whatever the load. Down,
+// it is retried after 15 s, doubling while starts keep failing, up to 5 minutes.
 export const spawnerRestartLimit = {
   restarts: 3,
   windowMillis: 10 * 60_000,
@@ -235,18 +236,26 @@ const makeRemoteHost = (options: {
   readonly closedMessage: string;
   /** Stops in a row, with no command started in between, after which the host stays down. */
   readonly restarts: number;
-  /** Stops within a rolling window after which the host stays down, started commands or not. */
+  /**
+   * Stops within a rolling window after which the host is down, started commands or not. With it,
+   * a host that is down retries after a cool-down that doubles while failures continue.
+   */
   readonly restartWindow?: {
     readonly restarts: number;
     readonly windowMillis: number;
+    readonly coolDownMillis: number;
+    readonly maxCoolDownMillis: number;
     readonly nowMillis: () => number;
   };
-  readonly onStop?: (cause: unknown, restarting: boolean) => void;
+  readonly onStop?: (cause: unknown, restarting: boolean, retryInMillis?: number) => void;
+  readonly onRetry?: () => void;
 }) => {
   let transport: Transport | undefined;
   let generation: object | undefined;
   let failure: unknown;
   let down = false;
+  let retryAt: number | undefined;
+  let coolDown = 0;
   let closing = false;
   let stopsInARow = 0;
   const recentStops: Array<number> = [];
@@ -301,17 +310,28 @@ const makeRemoteHost = (options: {
     failure = cause;
     stopsInARow += 1;
     const window = options.restartWindow;
+    const now = window?.nowMillis() ?? 0;
     if (window !== undefined) {
-      const now = window.nowMillis();
+      while (recentStops.length > 0 && recentStops[0]! <= now - window.windowMillis) {
+        recentStops.shift();
+      }
+      // A spawner that stayed up for a whole window starts its cool-downs over.
+      if (recentStops.length === 0) coolDown = 0;
       recentStops.push(now);
-      while (recentStops[0]! <= now - window.windowMillis) recentStops.shift();
     }
     const restarting =
       !closing &&
       stopsInARow <= options.restarts &&
       (window === undefined || recentStops.length <= window.restarts);
-    if (!restarting) down = true;
-    if (!closing) options.onStop?.(cause, restarting);
+    if (!restarting) {
+      down = true;
+      if (window !== undefined && !closing) {
+        coolDown =
+          coolDown === 0 ? window.coolDownMillis : Math.min(coolDown * 2, window.maxCoolDownMillis);
+        retryAt = now + coolDown;
+      }
+    }
+    if (!closing) options.onStop?.(cause, restarting, retryAt === undefined ? undefined : coolDown);
     const error = new Error(options.stoppedMessage, { cause });
     for (const { child } of stoppedEntries) child.stopError = error;
     for (const entry of stoppedEntries) {
@@ -428,7 +448,14 @@ const makeRemoteHost = (options: {
 
   // Events of a transport that already stopped must not touch its successor.
   const ensureTransport = () => {
-    if (transport !== undefined || down) return;
+    if (transport !== undefined || closing) return;
+    if (down) {
+      const window = options.restartWindow;
+      if (retryAt === undefined || window === undefined || window.nowMillis() < retryAt) return;
+      down = false;
+      retryAt = undefined;
+      options.onRetry?.();
+    }
     const current = {};
     generation = current;
     try {
@@ -1079,7 +1106,7 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
  * Starts child processes from a small spawner process, so the server itself never forks: on
  * Linux, Node forks and copies the page tables of the whole server for every command. A spawner
  * that stops is restarted; one that stops again before starting a command, or more than
- * `spawnerRestartLimit` times in its window, stays down and commands fail until the server restarts.
+ * `spawnerRestartLimit` times in its window, is down: commands fail until its cool-down has passed.
  */
 export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   fallback: ChildProcessSpawner["Service"],
@@ -1105,15 +1132,18 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
       ...spawnerRestartLimit,
       nowMillis: () => Number(clock.monotonicTimeNanosUnsafe() / 1_000_000n),
     },
-    onStop: (cause, restarting) => {
+    onStop: (cause, restarting, retryInMillis) => {
       runLog(
         restarting
           ? Effect.logWarning("Process spawner stopped; the next command restarts it", cause)
           : Effect.logError(
-              `Process spawner stopped again before starting a command, or more than ${spawnerRestartLimit.restarts} times in ${spawnerRestartLimit.windowMillis / 60_000} minutes; commands fail until the server restarts`,
+              `Process spawner stopped again before starting a command, or more than ${spawnerRestartLimit.restarts} times in ${spawnerRestartLimit.windowMillis / 60_000} minutes; commands fail for ${Math.round((retryInMillis ?? 0) / 1_000)} s, then it is started again`,
               cause,
             ),
       );
+    },
+    onRetry: () => {
+      runLog(Effect.logWarning("Process spawner starting again after its cool-down"));
     },
   });
   yield* Effect.addFinalizer(() => host.terminate());

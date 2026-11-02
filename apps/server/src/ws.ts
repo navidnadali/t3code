@@ -9,6 +9,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Base64 from "effect/encoding/Base64";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -1135,13 +1136,16 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       >(live, () =>
         Effect.gen(function* () {
           // The overflowed subscription has ended; a fresh one must exist before the snapshot
-          // it continues is read.
-          const fresh = yield* shellDeltaHub.subscribe().pipe(Scope.provide(subscriberScope));
+          // it continues is read. It lives in its own scope, closed with its segment, so a
+          // connection that resyncs many times keeps nothing of the earlier ones.
+          const segmentScope = yield* Scope.fork(subscriberScope);
+          const fresh = yield* shellDeltaHub.subscribe().pipe(Scope.provide(segmentScope));
           const loaded = yield* loadSnapshot().pipe(
             Effect.provideService(
               ProjectEnrichmentService.ProjectEnrichmentService,
               projectEnrichment,
             ),
+            Effect.onError((cause) => Scope.close(segmentScope, Exit.failCause(cause))),
           );
           yield* Effect.logWarning(
             "orchestration shell stream resynchronized after a live buffer overflow",
@@ -1160,7 +1164,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
                 Effect.map(initialEnrichmentItems),
               ),
             ),
-          ).pipe(Stream.concat(fresh.stream(loaded.snapshot.snapshotSequence)));
+          ).pipe(
+            Stream.concat(fresh.stream(loaded.snapshot.snapshotSequence)),
+            Stream.ensuring(Scope.close(segmentScope, Exit.void)),
+          );
         }),
       );
 

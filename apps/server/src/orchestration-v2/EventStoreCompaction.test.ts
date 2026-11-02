@@ -630,10 +630,11 @@ it.effect("a stale scratch file is removed before the free space it occupies is 
     // A crash left a scratch file: while it is there the disk is short of the margin, without it
     // there is plenty — what matters is that it goes before the space is judged.
     NodeFS.writeFileSync(scratchPath, "stale");
+    rmSyncInterceptor.calls.length = 0;
     rmSyncInterceptor.freeBytes = () =>
-      NodeFS.existsSync(scratchPath)
-        ? CompactionScratch.requiredFreeBytes(before.length) - 1
-        : 1 << 30;
+      rmSyncInterceptor.calls.includes(scratchPath)
+        ? 1 << 30
+        : CompactionScratch.requiredFreeBytes(before.length) - 1;
     yield* Effect.addFinalizer(() => Effect.sync(() => void (rmSyncInterceptor.freeBytes = null)));
     const summary = yield* maintenance.compactEventStore(Effect.void, { scratchPath });
     assert.equal(summary.deletedEventCount, reference.obsolete.size);

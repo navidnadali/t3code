@@ -131,7 +131,7 @@ import {
   loadOlderSettledThreadsPage,
   loadShellSnapshotParts,
   projectShellDeltas,
-  shellDeltaThreadId,
+  shellDeltaAggregate,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemsFromInitialSnapshot,
   loadSubscriberShellSnapshot,
@@ -1024,7 +1024,6 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
     const projects = yield* ProjectStore.ProjectStoreV2;
-    const projectService = yield* ProjectService.ProjectService;
     const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
     let subagentThreadIds = new Set<string>();
     const filterSubagentTranscript = (stored: ApplicationStoredEvent) =>
@@ -1032,7 +1031,8 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
 
     const enrichmentChanges = yield* projectEnrichment.subscribeChanges;
     // Subscribe before the snapshot or high-water read: the hub projects every later event once for all subscribers.
-    const shellDeltas = yield* (yield* ShellDeltaHub.ShellDeltaHub).subscribe();
+    const hub = yield* ShellDeltaHub.ShellDeltaHub;
+    const shellDeltas = yield* hub.subscribe();
     const loadProjectMetadataSnapshot = Effect.fn("ws.orchestrationV2.loadProjectMetadataSnapshot")(
       function* (snapshotSequence: number) {
         const enriched = yield* enrichProjectShells(yield* projects.listShells());
@@ -1079,22 +1079,20 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     ) {
       return yield* projectShellDeltas(events, {
         threadShell: threadManagement.getThreadShellReadForEvent,
-        projectShell: projectService.getShell,
+        projectShell: hub.readProjectShellForEvent,
       });
     });
 
-    // The replay's read ordinal per thread, so the live tail drops hub deltas read earlier.
-    const replayReads = new Map<ThreadId, number>();
+    // The replay's read ordinal per aggregate, so the live tail drops hub deltas read earlier.
+    const replayReads = new Map<string, number>();
     const toShellStream = <E, R>(stream: Stream.Stream<ShellApplicationEvent, E, R>) =>
       stream.pipe(
         Stream.groupedWithin(512, Duration.millis(50)),
         Stream.mapEffect((events) => projectShellItems(Array.from(events))),
         Stream.flatMap(Stream.fromIterable),
         Stream.map(({ item, readOrdinal }) => {
-          const threadId = shellDeltaThreadId(item);
-          if (threadId !== undefined) {
-            replayReads.set(threadId, Math.max(replayReads.get(threadId) ?? 0, readOrdinal));
-          }
+          const aggregate = shellDeltaAggregate(item);
+          replayReads.set(aggregate, Math.max(replayReads.get(aggregate) ?? 0, readOrdinal));
           return item;
         }),
         skipUnchangedThreadShells,

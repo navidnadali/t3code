@@ -103,6 +103,8 @@ const layerPersistence = EventSink.layer.pipe(
   Layer.provideMerge(OrchestrationEventStore.layer),
   Layer.provideMerge(SqlitePersistence.layerMemory),
 );
+// Like production, every shared shell read gets a later ordinal than the one before it.
+let shellReadOrdinal = 0;
 const layerManagement = Layer.unwrap(
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -121,7 +123,7 @@ const layerManagement = Layer.unwrap(
         projections.getThreadShell(input.threadId).pipe(Effect.orDie),
       getThreadShellReadForEvent: (input) =>
         projections.getThreadShell(input.threadId).pipe(
-          Effect.map((shell) => ({ shell, readOrdinal: 0 })),
+          Effect.map((shell) => ({ shell, readOrdinal: ++shellReadOrdinal })),
           Effect.orDie,
         ),
       getShellSnapshot: (options) => projections.getShellSnapshot(options).pipe(Effect.orDie),

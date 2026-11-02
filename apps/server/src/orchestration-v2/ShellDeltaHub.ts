@@ -1,4 +1,8 @@
-import type { ApplicationStoredEvent, ThreadId } from "@t3tools/contracts";
+import type {
+  ApplicationStoredEvent,
+  OrchestrationProjectShell,
+  ProjectId,
+} from "@t3tools/contracts";
 import type * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -8,6 +12,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -27,7 +32,7 @@ import {
   makeThreadShellVersions,
   projectShellDeltas,
   shellDeltaKey,
-  shellDeltaThreadId,
+  shellDeltaAggregate,
   shouldPublishShellApplicationEvent,
   toShellApplicationEvent,
   type ShellApplicationEvent,
@@ -51,12 +56,26 @@ export interface ShellDeltaSubscription {
    */
   readonly stream: (
     afterSequence: number,
-    /** The read ordinal a resume replay sent for each thread; deltas read earlier are dropped. */
-    replayReads?: ReadonlyMap<ThreadId, number>,
+    /** The read ordinal a resume replay sent per aggregate (`shellDeltaAggregate`); deltas read earlier are dropped. */
+    replayReads?: ReadonlyMap<string, number>,
   ) => Stream.Stream<ShellDelta, ShellDeltaHubError | LiveStreamBufferError>;
 }
 
+export interface SharedProjectShellRead {
+  readonly project: Option.Option<OrchestrationProjectShell>;
+  /** Creation order of the shared read; reads of one project run in this order. */
+  readonly readOrdinal: number;
+}
+
 export interface ShellDeltaHubShape {
+  /**
+   * A project's shell as of event `sequence` or later, like `getThreadShellForEvent`: shared with
+   * callers the project's latest read covers, one read per project at a time, with its ordinal.
+   */
+  readonly readProjectShellForEvent: (input: {
+    readonly projectId: ProjectId;
+    readonly sequence: number;
+  }) => Effect.Effect<SharedProjectShellRead, ProjectService.ProjectOperationError>;
   /**
    * Take the subscription before reading the snapshot it continues: every committed event the
    * hub sees from then on reaches this subscriber as a projected item. Deltas are buffered from
@@ -87,6 +106,17 @@ interface HubInstance {
 const aggregateKey = (stored: ShellApplicationEvent) =>
   "aggregateKind" in stored ? `project:${stored.aggregateId}` : `thread:${stored.event.threadId}`;
 
+interface SharedProjectRead {
+  sequence: number;
+  started: boolean;
+  settled: boolean;
+  readonly readOrdinal: number;
+  readonly result: Deferred.Deferred<
+    Option.Option<OrchestrationProjectShell>,
+    ProjectService.ProjectOperationError
+  >;
+}
+
 interface PendingShellEvent {
   readonly stored: ShellApplicationEvent;
   /** Every coalesced event is a transcript update, which focused watchers get elsewhere. */
@@ -107,6 +137,54 @@ const make = Effect.gen(function* () {
   const layerScope = yield* Effect.scope;
   const lifecycle = yield* Semaphore.make(1);
   let current: HubInstance | undefined;
+
+  // Project shells read like thread shells do (P1-021): a caller whose sequence the project's
+  // latest read covers shares it, a newer sequence starts a read after it. One entry per project.
+  const projectReads = new Map<ProjectId, SharedProjectRead>();
+  let nextProjectReadOrdinal = 0;
+  const withOrdinal = (read: SharedProjectRead) =>
+    Effect.map(Deferred.await(read.result), (project) => ({
+      project,
+      readOrdinal: read.readOrdinal,
+    }));
+  const readProjectShellForEvent: ShellDeltaHubShape["readProjectShellForEvent"] = (input) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.suspend(() => {
+        const current = projectReads.get(input.projectId);
+        if (current !== undefined && (current.sequence >= input.sequence || !current.started)) {
+          current.sequence = Math.max(current.sequence, input.sequence);
+          return restore(withOrdinal(current));
+        }
+        const read: SharedProjectRead = {
+          sequence: Math.max(input.sequence, current?.sequence ?? 0),
+          started: false,
+          settled: false,
+          readOrdinal: ++nextProjectReadOrdinal,
+          result: Deferred.makeUnsafe(),
+        };
+        projectReads.set(input.projectId, read);
+        const previous =
+          current !== undefined && !current.settled
+            ? Effect.exit(Deferred.await(current.result))
+            : Effect.void;
+        return previous.pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              read.started = true;
+            }),
+          ),
+          Effect.andThen(projectService.getShell(input.projectId)),
+          Effect.forkIn(layerScope),
+          Effect.flatMap((fiber) => {
+            fiber.addObserver((exit) => {
+              read.settled = true;
+              Deferred.doneUnsafe(read.result, exit);
+            });
+            return restore(withOrdinal(read));
+          }),
+        );
+      }),
+    );
 
   // One committed-events consumer for every shell subscriber. Events coalesce per aggregate
   // while a batch is read, so memory is bounded by the aggregates that changed, not by events.
@@ -153,7 +231,7 @@ const make = Effect.gen(function* () {
         batch.map((entry) => entry.stored),
         {
           threadShell: threadManagement.getThreadShellReadForEvent,
-          projectShell: projectService.getShell,
+          projectShell: readProjectShellForEvent,
         },
       );
       const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
@@ -262,12 +340,11 @@ const make = Effect.gen(function* () {
     >(1);
     const mutex = yield* Semaphore.make(1);
     let afterSequence: number | undefined;
-    let replayReads: ReadonlyMap<ThreadId, number> | undefined;
+    let replayReads: ReadonlyMap<string, number> | undefined;
     let closed = false;
-    // A delta read before the replay's read of the same thread carries older-or-equal content.
+    // A delta read before the replay's read of the same aggregate carries older-or-equal content.
     const behindReplay = (delta: VersionedShellDelta) => {
-      const threadId = shellDeltaThreadId(delta.item);
-      const replayRead = threadId === undefined ? undefined : replayReads?.get(threadId);
+      const replayRead = replayReads?.get(shellDeltaAggregate(delta.item));
       return replayRead !== undefined && delta.readOrdinal <= replayRead;
     };
     const close = (error?: LiveStreamBufferError) =>
@@ -320,7 +397,7 @@ const make = Effect.gen(function* () {
       ),
       Effect.forkScoped({ startImmediately: true }),
     );
-    const open = (sequence: number, reads?: ReadonlyMap<ThreadId, number>) =>
+    const open = (sequence: number, reads?: ReadonlyMap<string, number>) =>
       mutex.withPermit(
         Effect.gen(function* () {
           if (closed) return;
@@ -368,7 +445,7 @@ const make = Effect.gen(function* () {
     };
   });
 
-  return ShellDeltaHub.of({ subscribe });
+  return ShellDeltaHub.of({ readProjectShellForEvent, subscribe });
 });
 
 export const layer: Layer.Layer<

@@ -41,19 +41,21 @@ export interface VersionedShellDelta {
   readonly item: ShellDelta;
   /** `thread.updated` only: unchanged while the shell, `updatedAt` aside, matches the previous item for that thread. */
   readonly version: number | undefined;
-  /** The shared read's ordinal (0 for projects); a later read of the same thread is newer or equal. */
+  /** The shared read's ordinal; a later read of the same aggregate is newer or equal. */
   readonly readOrdinal: number;
 }
 
-/** The thread a delta is about; projects have none. */
-export function shellDeltaThreadId(item: ShellDelta): ThreadId | undefined {
+/** The aggregate a delta is about, a thread or a project, as `kind:id`. */
+export function shellDeltaAggregate(item: ShellDelta): string {
   switch (item.kind) {
     case "thread.updated":
-      return item.thread.id;
+      return `thread:${item.thread.id}`;
     case "thread.removed":
-      return item.threadId;
-    default:
-      return undefined;
+      return `thread:${item.threadId}`;
+    case "project.updated":
+      return `project:${item.project.id}`;
+    case "project.removed":
+      return `project:${item.projectId}`;
   }
 }
 
@@ -707,7 +709,7 @@ export function makeShellDeltaAdmission() {
 
 export interface ProjectedShellDelta {
   readonly item: ShellDelta;
-  /** The shared read's ordinal behind a thread item; 0 for projects. */
+  /** The shared read's ordinal behind the item. */
   readonly readOrdinal: number;
 }
 
@@ -722,9 +724,13 @@ export const projectShellDeltas = <E1, E2>(
       { readonly shell: OrchestrationV2ThreadShell | null; readonly readOrdinal: number },
       E1
     >;
-    readonly projectShell: (
-      projectId: ProjectId,
-    ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, E2>;
+    readonly projectShell: (input: {
+      readonly projectId: ProjectId;
+      readonly sequence: number;
+    }) => Effect.Effect<
+      { readonly project: Option.Option<OrchestrationProjectShell>; readonly readOrdinal: number },
+      E2
+    >;
   },
 ): Effect.Effect<ReadonlyArray<ProjectedShellDelta>, E1 | E2> =>
   Effect.forEach(
@@ -745,18 +751,18 @@ export const projectShellDeltas = <E1, E2>(
         sequence: stored.sequence,
         projectId: stored.aggregateId,
       };
-      if (stored.type === "project.deleted")
-        return Effect.succeed({ item: removed, readOrdinal: 0 });
-      return read.projectShell(stored.aggregateId).pipe(
-        Effect.map(
-          Option.match({
-            onNone: () => ({ item: removed, readOrdinal: 0 }),
-            onSome: (project) => ({
-              item: { kind: "project.updated" as const, sequence: stored.sequence, project },
-              readOrdinal: 0,
-            }),
+      // A deleted project is read too, so its removal is ordered like every other item.
+      return read.projectShell({ projectId: stored.aggregateId, sequence: stored.sequence }).pipe(
+        Effect.map(({ project, readOrdinal }) => ({
+          item: Option.match(project, {
+            onNone: () => removed,
+            onSome: (value) =>
+              stored.type === "project.deleted"
+                ? removed
+                : { kind: "project.updated" as const, sequence: stored.sequence, project: value },
           }),
-        ),
+          readOrdinal,
+        })),
       );
     },
     { concurrency: 8 },

@@ -6,6 +6,7 @@
  */
 import { isEntrypoint } from "./entrypoint.ts";
 import { enableCliCompileCache } from "./cliCompileCache.ts";
+import { applyYoungGenerationDefault, printNodeFlags } from "./youngGeneration.ts";
 
 if (
   isEntrypoint({
@@ -15,10 +16,14 @@ if (
   })
 ) {
   const command = process.argv[2];
+  // First: a server started without its young-generation cap relaunches itself here, before any work.
+  const youngGeneration = applyYoungGenerationDefault();
   // Guard sockets before either dispatch path can load outbound-capable modules.
   const { ignoreMacosTypeOfServiceEinval } = await import("./outboundHttp.ts");
   ignoreMacosTypeOfServiceEinval();
-  if (command === "__document-text") {
+  if (command === "__node-flags") {
+    printNodeFlags(youngGeneration, process.argv.slice(3));
+  } else if (command === "__document-text") {
     const { extractDocumentText } = await import("./provider/documentTextWorker.ts");
     try {
       process.stdout.write(await extractDocumentText(process.argv[3]!, process.argv[4]!));

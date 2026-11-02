@@ -51,7 +51,10 @@ describe("resolveMaxSemiSpaceMb", () => {
   it("never overrides an explicit flag in NODE_OPTIONS or execArgv", () => {
     expect(resolveMaxSemiSpaceMb({ NODE_OPTIONS: "--max-semi-space-size=16" }, [])).toBeNull();
     expect(
-      resolveMaxSemiSpaceMb({ NODE_OPTIONS: "--max-old-space-size=16384 --max-semi-space-size 32" }, []),
+      resolveMaxSemiSpaceMb(
+        { NODE_OPTIONS: "--max-old-space-size=16384 --max-semi-space-size 32" },
+        [],
+      ),
     ).toBeNull();
     expect(resolveMaxSemiSpaceMb({}, ["--max-semi-space-size=8"])).toBeNull();
     expect(resolveMaxSemiSpaceMb({ NODE_OPTIONS: "--max-old-space-size=16384" }, [])).toBe(64);
@@ -70,7 +73,10 @@ describe("nodeOptionsWithMaxSemiSpace", () => {
 
 describe("serverChildEnvironment", () => {
   it("gives a spawned server the flag and keeps the parent's NODE_OPTIONS for the server's children", () => {
-    const env = serverChildEnvironment({ PATH: "/bin", NODE_OPTIONS: "--max-old-space-size=16384" });
+    const env = serverChildEnvironment({
+      PATH: "/bin",
+      NODE_OPTIONS: "--max-old-space-size=16384",
+    });
     expect(env.NODE_OPTIONS).toBe(`--max-old-space-size=16384 ${flag}`);
     expect(env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=16384");
     expect(env.PATH).toBe("/bin");
@@ -195,15 +201,17 @@ describe("the entrypoint", () => {
     return JSON.parse(stdout) as NodeFlagsReport;
   }, Effect.scoped);
 
-  it.live("relaunches node bin.ts with the young-generation default and hides it from children", () =>
-    Effect.gen(function* () {
-      const report = yield* run({});
-      expect(report.applied).toBe(true);
-      expect(report.maxSemiSpaceMb).toBe(DEFAULT_MAX_SEMI_SPACE_MB);
-      expect(report.nodeOptionsAtStart).toBe(flag);
-      expect(report.nodeOptionsForChildren).toBeNull();
-      expect(report.execArgv).toContain("--experimental-strip-types");
-    }).pipe(Effect.provide(NodeServices.layer)),
+  it.live(
+    "relaunches node bin.ts with the young-generation default and hides it from children",
+    () =>
+      Effect.gen(function* () {
+        const report = yield* run({});
+        expect(report.applied).toBe(true);
+        expect(report.maxSemiSpaceMb).toBe(DEFAULT_MAX_SEMI_SPACE_MB);
+        expect(report.nodeOptionsAtStart).toBe(flag);
+        expect(report.nodeOptionsForChildren).toBeNull();
+        expect(report.execArgv).toContain("--experimental-strip-types");
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.live("keeps the user's NODE_OPTIONS beside the flag and gives children the original", () =>

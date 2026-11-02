@@ -29,6 +29,8 @@ import {
   SERVICE_STOP_MARKER_FILE,
 } from "./cloud/serviceProtocol.ts";
 
+import { serverChildEnvironment } from "./youngGeneration.ts";
+
 const HANDOFF_DELAY_MS = 2_000;
 /**
  * Migrations count toward it and can scale with the database: tens of GB on a cold page cache
@@ -579,7 +581,13 @@ export class Launcher {
     };
     const spawnArguments = runtimeSpawnArguments(paths);
     const child = NodeChildProcess.spawn(spawnArguments.command, spawnArguments.args, {
-      env: { ...this.#environment, [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify(context) },
+      // The server cannot relaunch itself over this IPC channel, so its young-generation cap comes from here.
+      env: {
+        ...serverChildEnvironment({
+          ...this.#environment,
+          [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify(context),
+        }),
+      },
       stdio: ["inherit", "inherit", "inherit", "ipc"],
     });
     await new Promise<void>((resolve, reject) => {

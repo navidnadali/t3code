@@ -455,16 +455,19 @@ export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellAp
     : { sequence: stored.sequence, event: { threadId: stored.event.threadId } };
 }
 
+/** The aggregate a shell event refreshes; only its newest event matters to a shell subscriber. */
+function shellApplicationEventKey(stored: ShellApplicationEvent): string {
+  return "aggregateKind" in stored
+    ? `project:${stored.aggregateId}`
+    : `thread:${stored.event.threadId}`;
+}
+
 function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
   events: ReadonlyArray<A>,
 ): ReadonlyArray<A> {
   const latestByAggregate = new Map<string, A>();
   for (const stored of events) {
-    const key =
-      "aggregateKind" in stored
-        ? `project:${stored.aggregateId}`
-        : `thread:${stored.event.threadId}`;
-    latestByAggregate.set(key, stored);
+    latestByAggregate.set(shellApplicationEventKey(stored), stored);
   }
   return Array.from(latestByAggregate.values()).sort(
     (left, right) => left.sequence - right.sequence,

@@ -17,6 +17,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import { rpcInitialItems } from "./rpcInitialItems.ts";
@@ -62,6 +63,7 @@ import {
   OrchestrationV2ThreadLaunchError,
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
+  type OrchestrationV2ShellStreamItem,
   type OrchestrationV2ThreadStreamItem,
   type ApplicationStoredEvent,
   type ProjectEntriesFailure,
@@ -140,6 +142,7 @@ import {
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
+import { resyncOnLiveOverflow } from "./orchestration-v2/LiveStreamBudget.ts";
 import {
   coalesceLiveUpdatedEvents,
   coalesceThreadLiveStream,
@@ -893,48 +896,70 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         ? Stream.make({ kind: "synchronized" as const })
         : Stream.empty;
 
-    const snapshotThenLive = Effect.fn("ws.orchestrationV2.threadSnapshotThenLive")(function* () {
-      const useBoundedSnapshot = shouldUseBoundedThreadSnapshot(input);
-      const snapshot = yield* (
-        useBoundedSnapshot
-          ? threadManagement.getThreadSnapshotWindow(input.threadId, {
-              rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
-              deferWork: input.acceptDeferredWork === true,
-              userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+    const snapshotThenLive = Effect.fn("ws.orchestrationV2.threadSnapshotThenLive")(
+      function* (options?: { readonly resync?: boolean }) {
+        const useBoundedSnapshot = shouldUseBoundedThreadSnapshot(input);
+        const snapshot = yield* (
+          useBoundedSnapshot
+            ? threadManagement.getThreadSnapshotWindow(input.threadId, {
+                rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
+                deferWork: input.acceptDeferredWork === true,
+                userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+              })
+            : threadManagement.getThreadSnapshot(input.threadId)
+        ).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestrationV2GetThreadProjectionError({
+                threadId: input.threadId,
+                message: `Failed to load orchestration V2 thread ${input.threadId}`,
+                cause,
+              }),
+          ),
+        );
+        const { snapshotSequence } = snapshot;
+        const snapshotItem = useBoundedSnapshot
+          ? buildBoundedThreadStreamSnapshot({
+              ...snapshot,
+              compactTurnItems: input.acceptCompactTurnItems === true,
+              dedupeBodies,
+              compactIds: input.acceptCompactIds === true,
             })
-          : threadManagement.getThreadSnapshot(input.threadId)
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestrationV2GetThreadProjectionError({
+          : (() => {
+              const projection = projectThreadProjectionForWire(snapshot.projection);
+              return {
+                kind: "snapshot" as const,
+                snapshotSequence,
+                projection: dedupeBodies ? dedupeSnapshotBodies(projection) : projection,
+              };
+            })();
+        if (options?.resync === true) {
+          yield* Effect.logWarning(
+            "orchestration thread stream resynchronized after a live buffer overflow",
+            {
               threadId: input.threadId,
-              message: `Failed to load orchestration V2 thread ${input.threadId}`,
-              cause,
-            }),
-        ),
-      );
-      const { snapshotSequence } = snapshot;
-      const snapshotItem = useBoundedSnapshot
-        ? buildBoundedThreadStreamSnapshot({
-            ...snapshot,
-            compactTurnItems: input.acceptCompactTurnItems === true,
-            dedupeBodies,
-            compactIds: input.acceptCompactIds === true,
-          })
-        : (() => {
-            const projection = projectThreadProjectionForWire(snapshot.projection);
-            return {
-              kind: "snapshot" as const,
               snapshotSequence,
-              projection: dedupeBodies ? dedupeSnapshotBodies(projection) : projection,
-            };
-          })();
-      return rpcInitialItems([snapshotItem]).pipe(
-        Stream.concat(completionMarker),
-        Stream.concat(eventStreamFrom(snapshotSequence)),
-        withLiveDedupe,
-      );
-    });
+            },
+          );
+        }
+        return rpcInitialItems([snapshotItem]).pipe(
+          Stream.concat(options?.resync === true ? Stream.empty : completionMarker),
+          Stream.concat(eventStreamFrom(snapshotSequence)),
+          withLiveDedupe,
+        );
+      },
+    );
+
+    // A subscriber that falls more than its live buffer behind gets a fresh snapshot and
+    // continues live from it, with a fresh body deduper for the records it now holds. The
+    // snapshot is loaded when the client next pulls, so a client that never acknowledges
+    // never costs one.
+    const resyncOnOverflow = (
+      segment: Stream.Stream<
+        OrchestrationV2ThreadStreamItem,
+        OrchestrationV2GetThreadProjectionError
+      >,
+    ) => resyncOnLiveOverflow(segment, () => snapshotThenLive({ resync: true }));
 
     // Subscribe before reading persisted events to retain concurrent publishes; clients dedupe overlap by sequence.
     if (input.afterSequence !== undefined) {
@@ -949,7 +974,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         ),
       );
       if (input.afterSequence > highWater) {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
       const stats = yield* applicationEvents
         .getAgentReplayStats({
@@ -973,7 +998,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         stats.eventCount > THREAD_RESUME_MAX_REPLAY_EVENTS ||
         !isThreadReplayRawPayloadSafe(stats.rawPayloadBytes)
       ) {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
       if (stats.hasCreateEvent) {
         const shell = yield* threadManagement.getThreadShell(input.threadId).pipe(
@@ -987,7 +1012,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
           ),
         );
         // Retained creation events may describe deleted threads; replace replay only if a snapshot exists.
-        if (shell !== null) return yield* snapshotThenLive();
+        if (shell !== null) return resyncOnOverflow(yield* snapshotThenLive());
       }
       const replay = coalesceLiveUpdatedEvents(
         yield* loadReplayThrough(input.afterSequence, highWater),
@@ -999,16 +1024,18 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         replayEncodedBytes: threadReplayEncodedBytes(replay),
       });
       if (plan.mode === "snapshot") {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
-      return rpcInitialItems(replay).pipe(
-        Stream.concat(completionMarker),
-        Stream.concat(eventStreamFrom(highWater)),
-        withLiveDedupe,
+      return resyncOnOverflow(
+        rpcInitialItems(replay).pipe(
+          Stream.concat(completionMarker),
+          Stream.concat(eventStreamFrom(highWater)),
+          withLiveDedupe,
+        ),
       );
     }
 
-    return yield* snapshotThenLive();
+    return resyncOnOverflow(yield* snapshotThenLive());
   },
 );
 
@@ -1031,7 +1058,9 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
 
     const enrichmentChanges = yield* projectEnrichment.subscribeChanges;
     // Subscribe before the snapshot or high-water read: the hub projects every later event once for all subscribers.
-    const shellDeltas = yield* (yield* ShellDeltaHub.ShellDeltaHub).subscribe();
+    const shellDeltaHub = yield* ShellDeltaHub.ShellDeltaHub;
+    const subscriberScope = yield* Effect.scope;
+    const shellDeltas = yield* shellDeltaHub.subscribe();
     const loadProjectMetadataSnapshot = Effect.fn("ws.orchestrationV2.loadProjectMetadataSnapshot")(
       function* (snapshotSequence: number) {
         const enriched = yield* enrichProjectShells(yield* projects.listShells());
@@ -1092,6 +1121,48 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       );
 
     const liveFrom = (afterSequence: number) => shellDeltas.stream(afterSequence);
+    // A subscriber whose live buffer still overflows (≥ LIVE_STREAM_MAX_ITEMS aggregates changed
+    // between two of its pulls) gets a fresh snapshot and continues live from it; one snapshot is
+    // cheaper than the replay its resubscription would ask for. It is loaded when the client
+    // next pulls, so a client that never acknowledges never costs one.
+    const resyncingLive = (live: ReturnType<typeof liveFrom>) =>
+      resyncOnLiveOverflow<
+        OrchestrationV2ShellStreamItem,
+        Stream.Error<ReturnType<typeof liveFrom>>,
+        never,
+        | Effect.Error<ReturnType<typeof loadSnapshot>>
+        | Effect.Error<ReturnType<typeof loadProjectMetadataSnapshot>>
+      >(live, () =>
+        Effect.gen(function* () {
+          // The overflowed subscription has ended; a fresh one must exist before the snapshot
+          // it continues is read.
+          const fresh = yield* shellDeltaHub.subscribe().pipe(Scope.provide(subscriberScope));
+          const loaded = yield* loadSnapshot().pipe(
+            Effect.provideService(
+              ProjectEnrichmentService.ProjectEnrichmentService,
+              projectEnrichment,
+            ),
+          );
+          yield* Effect.logWarning(
+            "orchestration shell stream resynchronized after a live buffer overflow",
+            { snapshotSequence: loaded.snapshot.snapshotSequence },
+          );
+          return Stream.concat(
+            initialSnapshotItems(loaded),
+            // Enrichment keeps flowing during a resync, so a refresh can reach the client before
+            // the snapshot that introduces its project; re-send the resolved identities after it.
+            Stream.unwrap(
+              loadProjectMetadataSnapshot(loaded.snapshot.snapshotSequence).pipe(
+                Effect.provideService(
+                  ProjectEnrichmentService.ProjectEnrichmentService,
+                  projectEnrichment,
+                ),
+                Effect.map(initialEnrichmentItems),
+              ),
+            ),
+          ).pipe(Stream.concat(fresh.stream(loaded.snapshot.snapshotSequence)));
+        }),
+      );
 
     const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
       Stream.filter((change) => change.repositoryIdentityResolved),
@@ -1151,7 +1222,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       );
     // Drain initial frames before merging enrichment with live events so marked refreshes cannot precede the initial frame.
     const completionThenLive = (afterSequence: number) =>
-      Stream.concat(completionMarker, liveFrom(afterSequence));
+      Stream.concat(completionMarker, resyncingLive(liveFrom(afterSequence)));
 
     const stream = yield* Effect.gen(function* () {
       if (input.afterSequence === undefined) {
@@ -1190,7 +1261,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       );
       return composeShellStreamWithEnrichment({
         initial: initialEnrichmentItems(loaded),
-        tail: Stream.concat(Stream.concat(replay, completionMarker), liveFrom(highWater)),
+        tail: Stream.concat(
+          Stream.concat(replay, completionMarker),
+          resyncingLive(liveFrom(highWater)),
+        ),
         enrichment: enrichmentRefreshes,
       });
     }).pipe(

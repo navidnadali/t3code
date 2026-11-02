@@ -53,7 +53,14 @@ import { CloudManagedEndpointRuntime } from "../cloud/ManagedEndpointRuntime.ts"
 import * as CommandOutputHub from "../orchestration-v2/CommandOutputHub.ts";
 import { GUEST_FAILURE } from "../orchestration-v2/GuestShareDecider.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
-import { coalesceThreadLiveStream } from "../orchestration-v2/ThreadLiveEventCoalescer.ts";
+import {
+  type LiveStreamBufferError,
+  resyncOnLiveOverflow,
+} from "../orchestration-v2/LiveStreamBudget.ts";
+import {
+  coalesceThreadLiveStream,
+  type ThreadLiveInput,
+} from "../orchestration-v2/ThreadLiveEventCoalescer.ts";
 import { buildBoundedThreadStreamSnapshot } from "../orchestration-v2/ThreadStream.ts";
 import {
   projectTurnItemForDetail,
@@ -61,6 +68,7 @@ import {
   threadStreamEventItem,
 } from "../orchestration-v2/WireProjection.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { rpcInitialItems } from "../rpcInitialItems.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import { guestShareView, guestThreadModel } from "./guestView.ts";
@@ -535,12 +543,12 @@ const make = Effect.gen(function* () {
         userTurnLimit: SNAPSHOT_USER_TURN_LIMIT,
       })
       .pipe(Effect.mapError(() => inactive));
+    const sharesWithGuest = (current: OrchestrationV2AppThread) =>
+      current.guestShare?.id === share.id &&
+      current.archivedAt === null &&
+      current.deletedAt === null;
     // The share can end between authorize and this read; the live tail starts after it.
-    if (
-      snapshot.projection.thread.guestShare?.id !== share.id ||
-      snapshot.projection.thread.archivedAt !== null ||
-      snapshot.projection.thread.deletedAt !== null
-    ) {
+    if (!sharesWithGuest(snapshot.projection.thread)) {
       return yield* inactive;
     }
     // Read once; a provider configured mid-share shows after the guest reconnects.
@@ -556,31 +564,61 @@ const make = Effect.gen(function* () {
       const updated = threadOf(event);
       return updated !== null && updated.guestShare?.id !== share.id;
     };
-    const live = orchestrator
-      .streamStoredEventsFrom({ threadId: thread.id, afterSequence: snapshot.snapshotSequence })
-      .pipe(
+    const toGuestEvents = (item: ThreadLiveInput): ReadonlyArray<GuestStreamEvent> => {
+      if (item.kind !== "event") return [];
+      if (endsShare(item.event)) return [ended];
+      if (item.event.type === "turn-item.updated") rememberSent(share.id, [item.event.payload]);
+      const updated = threadOf(item.event);
+      const view = updated === null ? null : viewOf(updated);
+      return view === null
+        ? [{ type: "thread", item }]
+        : [
+            { type: "thread", item },
+            { type: "view", view },
+          ];
+    };
+    const liveFrom = (
+      afterSequence: number,
+    ): Stream.Stream<GuestStreamEvent, Orchestrator.OrchestratorV2Error | LiveStreamBufferError> =>
+      orchestrator.streamStoredEventsFrom({ threadId: thread.id, afterSequence }).pipe(
         Stream.map(threadStreamEventItem),
         // Ending the source here flushes what the coalescer holds, so `ended` is not held back.
         Stream.takeUntil((item) => endsShare(item.event)),
         coalesceThreadLiveStream,
-        Stream.map((item): ReadonlyArray<GuestStreamEvent> => {
-          if (item.kind !== "event") return [];
-          if (endsShare(item.event)) return [ended];
-          if (item.event.type === "turn-item.updated") rememberSent(share.id, [item.event.payload]);
-          const updated = threadOf(item.event);
-          const view = updated === null ? null : viewOf(updated);
-          return view === null
-            ? [{ type: "thread", item }]
-            : [
-                { type: "thread", item },
-                { type: "view", view },
-              ];
-        }),
+        Stream.map(toGuestEvents),
         Stream.flattenIterable,
-        // A failed read closes the response without `ended`: the browser reconnects, and
-        // `authorize` decides whether the link still works.
-        Stream.catchCause(() => Stream.empty),
       );
+    // A guest that falls more than its live buffer behind gets a fresh snapshot and goes on
+    // live from it, as the owner's subscription does, instead of a closed response.
+    const resync = Effect.gen(function* () {
+      const current = yield* orchestrator.getThreadSnapshotWindow(thread.id, {
+        rowLimit: SNAPSHOT_ROW_LIMIT,
+        userTurnLimit: SNAPSHOT_USER_TURN_LIMIT,
+      });
+      if (!sharesWithGuest(current.projection.thread)) return Stream.make(ended);
+      const item = buildBoundedThreadStreamSnapshot({
+        snapshotSequence: current.snapshotSequence,
+        projection: current.projection,
+      });
+      rememberSent(
+        share.id,
+        item.projection.visibleTurnItems.map((row) => row.item),
+      );
+      yield* Effect.logWarning("guest stream resynchronized after a live buffer overflow", {
+        snapshotSequence: current.snapshotSequence,
+      });
+      const view = viewOf(current.projection.thread);
+      // concat retains its head for the tail's lifetime; release the snapshot once delivered.
+      return rpcInitialItems<GuestStreamEvent>([
+        ...(view === null ? [] : [{ type: "view" as const, view }]),
+        { type: "thread", item },
+      ]).pipe(Stream.concat(liveFrom(current.snapshotSequence)));
+    });
+    const live = resyncOnLiveOverflow(liveFrom(snapshot.snapshotSequence), () => resync).pipe(
+      // A failed read closes the response without `ended`: the browser reconnects, and
+      // `authorize` decides whether the link still works.
+      Stream.catchCause(() => Stream.empty),
+    );
     const untilExpiry = Effect.sleep(
       Math.max(0, Date.parse(share.expiresAt) - DateTime.toEpochMillis(yield* DateTime.now)),
     );

@@ -30,36 +30,50 @@ export class CompactionScratchError extends Schema.TaggedError<CompactionScratch
   },
 ) {}
 
-/** What a key costs on disk, measured at ≈ 207 bytes (8 KiB pages filled by random inserts), rounded up. */
+/**
+ * What a key costs on disk: 118–131 B measured for UUID keys and 167–172 B for the longest (pull-request
+ * links) from a thousand keys up to a million, 171–211 B on real stores; keys never outnumber events.
+ */
 const SCRATCH_BYTES_PER_KEY = 256;
-/** Free space a pass insists on: twice its worst-case scratch size. */
-const SCRATCH_FREE_SPACE_FACTOR = 2;
+/** Below a few hundred keys the two 8 KiB pages dominate; a megabyte covers any small store. */
+const SCRATCH_FREE_SPACE_FLOOR = 1024 * 1024;
+/** A running pass stops when the disk gets this low, whatever the estimate said. */
+export const SCRATCH_RUNNING_FREE_SPACE_FLOOR = 64 * 1024 * 1024;
 // SQLite keeps this much of the working set in memory; the rest lives in the file.
 const SCRATCH_CACHE_KIB = 32768;
 const SCRATCH_PAGE_SIZE = 8192;
 
-/** The scratch database and the sidecars SQLite may create beside it. */
+/** The scratch database and every sidecar SQLite may create beside it (rollback journal, WAL, WAL index). */
 const scratchFiles = (scratchPath: string): ReadonlyArray<string> => [
   scratchPath,
+  `${scratchPath}-journal`,
   `${scratchPath}-wal`,
   `${scratchPath}-shm`,
 ];
 
 /** The free space the pass needs for `keys` entities, in bytes. */
 export const requiredFreeBytes = (keys: number) =>
-  keys * SCRATCH_BYTES_PER_KEY * SCRATCH_FREE_SPACE_FACTOR;
+  Math.max(SCRATCH_FREE_SPACE_FLOOR, keys * SCRATCH_BYTES_PER_KEY);
 
-/** Whether the scratch file's filesystem can take a pass over `keys` entities; unknown counts as yes. */
-export const hasRoomFor = (scratchPath: string, keys: number) =>
-  Effect.try(() => {
+/** Why a pass did not run, or did not finish: the disk beside the database could not hold its working set. */
+export interface CompactionSkipped {
+  readonly scratchPath: string;
+  readonly requiredBytes: number;
+  readonly freeBytes: number;
+  readonly stage: "before" | "during";
+}
+
+/** The free space on the scratch file's filesystem, or nothing when it cannot be read (logged). */
+export const freeBytesBeside = (scratchPath: string) =>
+  Effect.try((): number | undefined => {
     const stats = NodeFS.statfsSync(NodePath.dirname(scratchPath));
-    return stats.bavail * stats.bsize >= requiredFreeBytes(keys);
+    return stats.bavail * stats.bsize;
   }).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("Could not read free space for the compaction scratch store", {
         scratchPath,
         cause,
-      }).pipe(Effect.as(true)),
+      }).pipe(Effect.as(undefined)),
     ),
   );
 
@@ -73,11 +87,12 @@ let select;
 let upsert;
 try {
   db = new DatabaseSync(workerData.filename);
-  // Scratch data in one transaction that is never committed: no journal, no fsync; pages beyond the
-  // cache spill to the file once. A crash leaves a file the next pass replaces.
+  // Scratch data in one transaction that is never committed: the rollback journal stays in memory
+  // (node:sqlite's defensive mode turns "OFF" into "delete"; new pages need no journal anyway), no
+  // fsync; pages beyond the cache spill to the file once. A crash leaves files the next pass replaces.
   db.exec(\`
     PRAGMA page_size = \${workerData.pageSize};
-    PRAGMA journal_mode = OFF;
+    PRAGMA journal_mode = MEMORY;
     PRAGMA synchronous = OFF;
     PRAGMA cache_size = -\${workerData.cacheKib};
     CREATE TABLE candidates (entity_key TEXT PRIMARY KEY, oldest INTEGER) WITHOUT ROWID;

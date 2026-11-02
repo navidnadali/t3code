@@ -112,7 +112,11 @@ export const runDoctor = Effect.fn("runDoctor")(function* (
                 result.repairedItemCountThreads > 0
                   ? `, item counts recounted on ${result.repairedItemCountThreads} threads`
                   : ""
-              }.`,
+              }.${
+                result.skipped === undefined
+                  ? ""
+                  : `\nCompaction of history was ${result.skipped.stage === "before" ? "skipped" : "stopped early"}: not enough free space beside the database for its working set (${result.skipped.scratchPath} needs ${formatBytes(result.skipped.requiredBytes)}, ${formatBytes(result.skipped.freeBytes)} free).`
+              }`,
             ),
           ),
         ),

@@ -499,6 +499,7 @@ it.effect("a scratch file that cannot be removed is logged, and does not fail th
     const failedAt = rmSyncInterceptor.calls.lastIndexOf(scratchPath);
     assert.isAbove(failedAt, 0);
     assert.deepEqual(rmSyncInterceptor.calls.slice(failedAt + 1), [
+      `${scratchPath}-journal`,
       `${scratchPath}-wal`,
       `${scratchPath}-shm`,
     ]);
@@ -626,11 +627,13 @@ it.effect("a stale scratch file is removed before the free space it occupies is 
     const before = yield* scanRows();
     const reference = referenceCompaction(before);
     const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
-    // A crash left a scratch file bigger than the margin the pass needs; without it there is room.
-    const needed = CompactionScratch.requiredFreeBytes(before.length);
-    NodeFS.writeFileSync(scratchPath, Buffer.alloc(needed + 4096));
+    // A crash left a scratch file: while it is there the disk is short of the margin, without it
+    // there is plenty — what matters is that it goes before the space is judged.
+    NodeFS.writeFileSync(scratchPath, "stale");
     rmSyncInterceptor.freeBytes = () =>
-      2 * needed - (NodeFS.existsSync(scratchPath) ? NodeFS.statSync(scratchPath).size : 0);
+      NodeFS.existsSync(scratchPath)
+        ? CompactionScratch.requiredFreeBytes(before.length) - 1
+        : 1 << 30;
     yield* Effect.addFinalizer(() => Effect.sync(() => void (rmSyncInterceptor.freeBytes = null)));
     const summary = yield* maintenance.compactEventStore(Effect.void, { scratchPath });
     assert.equal(summary.deletedEventCount, reference.obsolete.size);
@@ -644,6 +647,17 @@ it.effect(
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      // An older bulk of distinct entities (nothing to delete) below the seeded store: the pass deletes
+      // from the newest pages first, then runs into the full disk on its way down.
+      for (let index = 0; index < 1000; index++) {
+        yield* sql`INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          ${`bulk-${index}`}, 'thread', 'thread-bulk', ${index + 1}, 'message.updated', '2026-11-02',
+          'server', ${JSON.stringify({ id: `bulk-${index}` })}, '{}', 2
+        )`;
+      }
       yield* seedStore();
       const before = yield* scanRows();
       const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
@@ -664,7 +678,9 @@ it.effect(
     `;
       // What the first page deleted stays deleted; the rest of the store is untouched.
       assert.equal(before.length - after.length, summary.deletedEventCount);
-      assert.isBelow(summary.deletedEventCount, referenceCompaction(before).obsolete.size);
+      assert.equal(summary.deletedEventCount, referenceCompaction(before).obsolete.size);
+      assert.isAbove(summary.deletedEventCount, 0);
+      assert.equal(summary.deletedReceiptCount, 0);
       for (const file of [
         scratchPath,
         `${scratchPath}-journal`,

@@ -52,6 +52,8 @@ export interface ProjectionMaintenanceV2Shape {
       readonly reclaimableBytes: number;
       /** Keyed entities the pass saw; their state was on disk, not in the JS heap. */
       readonly trackedKeys: number;
+      /** Present when the disk could not hold the working set: nothing ran, or the pass stopped early. */
+      readonly skipped?: CompactionScratch.CompactionSkipped | undefined;
     },
     ProjectionMaintenanceError
   >;
@@ -289,6 +291,8 @@ export const layer: Layer.Layer<
     // Commanded turn items stay for command-result replay.
     // Small pages bound work on the reader worker and synchronous fallback.
     const COMPACTION_PAGE_SIZE = 50;
+    // Pages between looks at the disk's free space while a pass runs (≈ 200 KB of scratch growth).
+    const SPACE_CHECK_PAGES = 16;
 
     // Keep first/latest keyed events for replay order; page every event to bound sparse scans.
     const compactEventStore = Effect.fn("ProjectionMaintenance.compactEventStore")(
@@ -310,26 +314,39 @@ export const layer: Layer.Layer<
         // What a previous pass left behind is removed first, so it never counts against the free space.
         if (scratchPath !== undefined)
           yield* scratchBoundary(CompactionScratch.prepare(scratchPath));
-        // Never fill the disk: the scratch store beside the database needs room for every key.
-        if (
-          scratchPath !== undefined &&
-          !(yield* CompactionScratch.hasRoomFor(scratchPath, throughSequence))
-        ) {
-          yield* Effect.logWarning(
+        // Never fill the disk: the scratch store beside the database needs room for every key, and a
+        // running pass stops when the disk gets low whatever the estimate said.
+        const skippedFor = (stage: "before" | "during", freeBytes: number) =>
+          scratchPath === undefined
+            ? undefined
+            : {
+                scratchPath,
+                requiredBytes: CompactionScratch.requiredFreeBytes(throughSequence),
+                freeBytes,
+                stage,
+              };
+        const skipped = (stage: "before" | "during", freeBytes: number) =>
+          Effect.logWarning(
             "Compaction skipped: not enough free space beside the database for its scratch store",
-            {
-              scratchPath,
-              events: throughSequence,
-              requiredBytes: CompactionScratch.requiredFreeBytes(throughSequence),
-            },
+            { ...skippedFor(stage, freeBytes), events: throughSequence },
           );
-          return {
-            deletedEventCount: 0,
-            deletedReceiptCount: 0,
-            reclaimableBytes: 0,
-            trackedKeys: 0,
-          };
+        if (scratchPath !== undefined) {
+          const freeBytes = yield* CompactionScratch.freeBytesBeside(scratchPath);
+          if (
+            freeBytes !== undefined &&
+            freeBytes < CompactionScratch.requiredFreeBytes(throughSequence)
+          ) {
+            yield* skipped("before", freeBytes);
+            return {
+              deletedEventCount: 0,
+              deletedReceiptCount: 0,
+              reclaimableBytes: 0,
+              trackedKeys: 0,
+              skipped: skippedFor("before", freeBytes),
+            };
+          }
         }
+        let stoppedEarly: CompactionScratch.CompactionSkipped | undefined;
         // One entry per thread; the per-entity working set is in the scratch store's worker.
         const retainedThreadIds = new Set<string>();
         const retainedReadStateThreadIds = new Set<string>();
@@ -338,8 +355,20 @@ export const layer: Layer.Layer<
         let deletedEventCount = 0;
         let deletedReceiptCount = 0;
         let trackedKeys = 0;
+        let pagesSinceSpaceCheck = 0;
 
         while (throughSequence > 0) {
+          if (scratchPath !== undefined && pagesSinceSpaceCheck++ % SPACE_CHECK_PAGES === 0) {
+            const freeBytes = yield* CompactionScratch.freeBytesBeside(scratchPath);
+            if (
+              freeBytes !== undefined &&
+              freeBytes < CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR
+            ) {
+              yield* skipped("during", freeBytes);
+              stoppedEarly = skippedFor("during", freeBytes);
+              break;
+            }
+          }
           const rows = yield* sql<{
             readonly sequence: number;
             readonly application_event_version: number;
@@ -472,6 +501,7 @@ export const layer: Layer.Layer<
           if (throughSequence > 0 || throughReceiptRowId > 0) yield* betweenPages;
         }
 
+        if (stoppedEarly !== undefined) throughReceiptRowId = 0;
         while (throughReceiptRowId > 0) {
           const rows = yield* sql<{
             readonly row_id: number;
@@ -515,7 +545,15 @@ export const layer: Layer.Layer<
         const reclaimableBytes =
           (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
 
-        return { deletedEventCount, deletedReceiptCount, reclaimableBytes, trackedKeys };
+        return stoppedEarly === undefined
+          ? { deletedEventCount, deletedReceiptCount, reclaimableBytes, trackedKeys }
+          : {
+              deletedEventCount,
+              deletedReceiptCount,
+              reclaimableBytes,
+              trackedKeys,
+              skipped: stoppedEarly,
+            };
       },
       Effect.scoped,
       mapError("compact event store"),

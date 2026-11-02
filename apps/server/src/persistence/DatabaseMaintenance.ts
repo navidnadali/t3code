@@ -9,6 +9,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { isSqlError } from "effect/sql/SqlError";
 
+import * as CompactionScratch from "../orchestration-v2/CompactionScratch.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
@@ -91,6 +92,8 @@ export class DatabaseMaintenance extends Context.Service<
         readonly deletedReceiptCount: number;
         /** Threads whose drifted turn-item counts were recounted before compacting. */
         readonly repairedItemCountThreads: number;
+        /** Present when the disk could not hold the pass's working set. */
+        readonly skipped?: CompactionScratch.CompactionSkipped | undefined;
       },
       | DatabaseMissingError
       | DatabaseInUseError
@@ -220,6 +223,7 @@ const make = Effect.gen(function* () {
         deletedEventCount: result.deletedEventCount,
         deletedReceiptCount: result.deletedReceiptCount,
         repairedItemCountThreads: result.repairedItemCountThreads,
+        ...(result.skipped === undefined ? {} : { skipped: result.skipped }),
       };
     },
     (effect, databasePath) =>

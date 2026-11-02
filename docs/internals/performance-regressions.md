@@ -108,20 +108,21 @@ recounts them during replay, and `t3 doctor` recounts drifted counts before it c
 triggers write to that table: dropping the table while they remain makes every turn-item insert
 fail, so drop the three triggers first. They come from migration 1 of the fork's own chain,
 recorded in `t3_perf_fork_migrations` (see
-[Leaving the performance fork's schema](../operations/perf-fork-schema-exit.md)), so a build
-without that chain starts with the table and triggers in place, which go on counting. A migration
-that rebuilds the turn-item table (create, copy, drop, rename) drops the triggers with it, and the
-fork's chain never runs a recorded migration again, so such a rebuild must recreate them. A partial
-index covers nonterminal background items, including idle items. Latest user-message reads use an
-index ordered by update time.
+[Leaving the performance fork's schema](../operations/perf-fork-schema-exit.md)), so an upstream
+build starts with the table and triggers in place, which go on counting; the fork's first release
+candidate refuses a database that an upstream migration past 76 ran on. An upstream migration that
+rebuilds the turn-item table (create, copy, drop, rename) drops the triggers with it. After
+upstream's migrations, every start runs a recorded fork migration whose objects are missing again,
+so migration 1 must stay safe to re-run (it recounts). A partial index covers nonterminal background
+items, including idle items. Latest user-message reads use an index ordered by update time.
 
 A projection read that orders messages by their first user or assistant turn item groups those
 items by `$.messageId` through a partial index on that expression (the fork's migration 2), so it
 does not parse every message item's payload; the index's expression and `WHERE` must stay identical
 to the query's. That migration scans the turn-item table once on first start, and fails (so the
 server does not start) if a message item's payload is not valid JSON. Each message-item write
-re-parses the old and new payload for the index, so its cost grows with the payload. A build
-without it starts with the index in place, which writes keep current;
+re-parses the old and new payload for the index, so its cost grows with the payload. An upstream
+build starts with the index in place, which writes keep current;
 `DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx` removes it.
 Finalizing a delegated task reads only that child's tasks, and the transfers it sent to the
 parent, from the parent.

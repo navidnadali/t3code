@@ -918,7 +918,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
       destination,
       mode,
       sizeBytes: NodeFS.statSync(destination).size,
-      migrations: executed.map(([id, name]) => `${id}_${name}`),
+      migrations: executed,
       threadsWithStartupWork: live.size,
       clearedRows: neutralised.cleared,
       autoPullDisabled: neutralised.autoPull,

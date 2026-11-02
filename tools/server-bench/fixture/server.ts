@@ -24,7 +24,10 @@ import * as ProviderRuntimeRecovery from "../../../apps/server/src/orchestration
 import * as LegacyV1ThreadImporter from "../../../apps/server/src/orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import { rebuildMessageSearch } from "../../../apps/server/src/orchestration-v2/messageSearchIndex.ts";
 import { recountTurnItems } from "../../../apps/server/src/orchestration-v2/turnItemCounts.ts";
-import { runMigrations } from "../../../apps/server/src/persistence/Migrations.ts";
+import {
+  migrationRunLabels,
+  runMigrationChains,
+} from "../../../apps/server/src/persistence/Migrations.ts";
 import * as ServerSettings from "../../../apps/server/src/serverSettings.ts";
 import { assertSafeDestination } from "./guards.ts";
 
@@ -207,11 +210,11 @@ export const legacyImport = Effect.gen(function* () {
 export const withLegacyImporter = (filename: string) =>
   LegacyV1ThreadImporter.layer.pipe(Layer.provideMerge(withEventSink(filename)));
 
-/** The server's own migrations, as `migrate-dev-db` runs them on a copy. */
+/** The server's own migrations, as `migrate-dev-db` runs them on a copy: the ones that ran. */
 export const migrate = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql.unsafe("PRAGMA foreign_keys = ON").unprepared;
-  return yield* runMigrations();
+  return migrationRunLabels(yield* runMigrationChains());
 });
 
 /** Threads the server would resume, recover or deliver to on start, by its own queries. */

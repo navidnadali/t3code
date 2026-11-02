@@ -1,7 +1,11 @@
 import * as Migrator from "effect/sql/Migrator";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
-import { moveRc1PerfForkMigrations, runPerfForkMigrations } from "./PerfForkMigrations.ts";
+import {
+  moveRc1PerfForkMigrations,
+  perfForkMigrationLabel,
+  runPerfForkMigrations,
+} from "./PerfForkMigrations.ts";
 import { reconcileV2PreviewMigration } from "./reconcileV2PreviewMigration.ts";
 
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -216,7 +220,8 @@ export interface RunMigrationsOptions {
   readonly toPerfForkMigrationInclusive?: number | undefined;
 }
 
-export const runMigrations = Effect.fn("runMigrations")(function* ({
+/** Both chains' runs; `runMigrations` returns upstream's alone, as its callers expect. */
+export const runMigrationChains = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
   toPerfForkMigrationInclusive,
 }: RunMigrationsOptions = {}) {
@@ -257,8 +262,21 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
       "Database migration history diverges from this build; recorded migration ids are skipped, not reconciled by name.",
     ).pipe(Effect.annotateLogs({ divergent }));
   }
-  if (toMigrationInclusive === undefined || toMigrationInclusive >= LATEST_MIGRATION_ID) {
-    yield* runPerfForkMigrations(toPerfForkMigrationInclusive);
-  }
-  return executedMigrations;
+  const perfFork =
+    toMigrationInclusive === undefined || toMigrationInclusive >= LATEST_MIGRATION_ID
+      ? yield* runPerfForkMigrations(toPerfForkMigrationInclusive)
+      : [];
+  return { upstream: executedMigrations, perfFork };
 });
+
+export const runMigrations = (options?: RunMigrationsOptions) =>
+  runMigrationChains(options).pipe(Effect.map(({ upstream }) => upstream));
+
+/** Every migration a start ran, upstream's then the fork's, as reports list them. */
+export const migrationRunLabels = (runs: {
+  readonly upstream: ReadonlyArray<readonly [number, string]>;
+  readonly perfFork: ReadonlyArray<readonly [number, string]>;
+}) => [
+  ...runs.upstream.map(([id, name]) => `${id}_${name}`),
+  ...runs.perfFork.map(perfForkMigrationLabel),
+];

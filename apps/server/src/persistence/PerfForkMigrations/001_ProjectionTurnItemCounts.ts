@@ -22,7 +22,7 @@ export default Effect.gen(function* () {
     ) WITHOUT ROWID
   `;
   // An upstream migration that rebuilds the turn-item table (create, copy, drop, rename) drops
-  // these triggers, and this chain never runs this migration again: recreate them in a new one.
+  // these triggers; the fork's chain then runs this migration again, so it must stay re-runnable.
   yield* sql`
     CREATE TRIGGER IF NOT EXISTS orchestration_v2_turn_item_counts_insert
     AFTER INSERT ON orchestration_v2_projection_turn_items

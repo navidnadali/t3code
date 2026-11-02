@@ -3,6 +3,7 @@ import { BUILD_MIGRATION_HEAD, recordedMigrations } from "../persistence/databas
 import {
   PERF_FORK_MIGRATION_HEAD,
   PERF_FORK_MIGRATIONS_TABLE,
+  perfForkMigrationLabel,
 } from "../persistence/PerfForkMigrations.ts";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
 
@@ -71,7 +72,7 @@ function newerRecordedMigrations(databasePath: string): ReadonlyArray<string> | 
           .map(({ id, name }) => `${id}_${name}`),
         ...recordedFork
           .filter(({ id }) => id > PERF_FORK_MIGRATION_HEAD)
-          .map(({ id, name }) => `${PERF_FORK_MIGRATIONS_TABLE}:${id}_${name}`),
+          .map(({ id, name }) => perfForkMigrationLabel([id, name])),
       ];
 }
 

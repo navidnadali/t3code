@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @effect-diagnostics nodeBuiltinImport:off - Speaks the spawner protocol over Node IPC, as the server does.
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Duration from "effect/Duration";
@@ -14,8 +15,12 @@ import * as Stream from "effect/Stream";
 import { Command, Flag } from "effect/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
+import * as NodeChildProcess from "node:child_process";
+
 import * as NetService from "@t3tools/shared/Net";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { assertLinuxArm64PageCompatibility } from "./lib/linux-arm64-sea.ts";
+import { PROCESS_SPAWNER_EXECUTABLE } from "./lib/process-spawner-sea.ts";
 import { windowsSystemTar } from "./lib/windows-tar.ts";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
@@ -58,6 +63,52 @@ const runExecutable = Effect.fn("runExecutable")(function* (
   return { stdout, stderr, exitCode };
 });
 
+interface SpawnerReply {
+  readonly t?: unknown;
+  readonly s?: number;
+  readonly chunk?: Uint8Array;
+  readonly code?: number | null;
+}
+
+// Runs one command through the spawner executable over the server's protocol, after its handshake.
+const runThroughSpawner = (spawnerPath: string, command: string, args: ReadonlyArray<string>) =>
+  Effect.callback<
+    { readonly ready: unknown; readonly stdout: string; readonly code: unknown },
+    Error
+  >((resume) => {
+    const spawner = NodeChildProcess.spawn(spawnerPath, [String(64 * 1024)], {
+      stdio: ["ignore", "pipe", "inherit", "ipc"],
+      serialization: "advanced",
+      detached: true,
+    });
+    spawner.stdout?.resume();
+    let ready: unknown;
+    let stdout = "";
+    let code: unknown;
+    spawner.on("error", (error) => resume(Effect.fail(error)));
+    spawner.on("exit", () => resume(Effect.succeed({ ready, stdout, code })));
+    spawner.on("message", (message: SpawnerReply) => {
+      if (ready === undefined) {
+        ready = message;
+        spawner.send({
+          t: "spawn",
+          id: 1,
+          command,
+          args,
+          options: { env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: true },
+        });
+        return;
+      }
+      if (message.t === "data" && message.chunk !== undefined) {
+        stdout += Buffer.from(message.chunk).toString();
+        spawner.send({ t: "ack", id: 1, s: message.s, bytes: message.chunk.byteLength });
+      }
+      if (message.t === "exit") code = message.code;
+      if (message.t === "close") spawner.disconnect();
+    });
+    return Effect.sync(() => spawner.kill("SIGKILL"));
+  });
+
 const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
   readonly archive: string;
   readonly expectVersion: string;
@@ -97,10 +148,12 @@ const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
   }
   const contentDir = path.join(scratch, root);
   const executable = path.join(contentDir, platform === "win32" ? "t3.exe" : "t3");
+  const spawnerExecutable = path.join(contentDir, PROCESS_SPAWNER_EXECUTABLE);
   const bundledLibatomic = path.join(contentDir, "lib/libatomic.so.1");
   for (const required of [
     executable,
     path.join(contentDir, "client/index.html"),
+    ...(platform === "win32" ? [] : [spawnerExecutable]),
     ...(platform === "linux" ? [bundledLibatomic, `${bundledLibatomic}.LICENSE`] : []),
   ]) {
     if (!(yield* fs.exists(required))) {
@@ -127,6 +180,58 @@ const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
     }
   }
 
+  // Without its spawner executable, t3 runs the spawner from its own bundle, at about four times the memory.
+  if (platform !== "win32") {
+    for (const target of [executable, spawnerExecutable]) {
+      const mode = Number((yield* fs.stat(target)).mode) & 0o777;
+      if (mode !== 0o755) {
+        return yield* new CliArchiveSmokeError({
+          step: "checking the executables' modes",
+          detail: `${path.basename(target)} has mode ${mode.toString(8)}, not 755`,
+        });
+      }
+      if (platform === "darwin") {
+        const verify = yield* spawner
+          .spawn(ChildProcess.make("codesign", ["--verify", "--strict", target]))
+          .pipe(Effect.flatMap((child) => child.exitCode));
+        if (Number(verify) !== 0) {
+          return yield* new CliArchiveSmokeError({
+            step: "verifying the executables' signatures",
+            detail: `codesign --verify --strict ${path.basename(target)} exited with ${String(verify)}`,
+          });
+        }
+      }
+      if (platform === "linux" && (yield* HostProcess.Architecture) === "arm64") {
+        const bytes = yield* fs.readFile(target);
+        yield* Effect.try({
+          try: () => assertLinuxArm64PageCompatibility(bytes),
+          catch: (error) =>
+            new CliArchiveSmokeError({
+              step: "checking the executables' ELF pages",
+              detail: `${path.basename(target)}: ${String(error)}`,
+            }),
+        });
+      }
+    }
+    const git = yield* spawner.string(ChildProcess.make("git", ["--version"]));
+    const through = yield* runThroughSpawner(spawnerExecutable, "git", ["--version"]).pipe(
+      Effect.timeout(Duration.seconds(30)),
+      Effect.mapError(
+        (error) =>
+          new CliArchiveSmokeError({
+            step: `running git --version through ${PROCESS_SPAWNER_EXECUTABLE}`,
+            detail: String(error),
+          }),
+      ),
+    );
+    const ready = through.ready as { readonly t?: unknown } | undefined;
+    if (ready?.t !== "ready" || through.code !== 0 || through.stdout !== git) {
+      return yield* new CliArchiveSmokeError({
+        step: `running git --version through ${PROCESS_SPAWNER_EXECUTABLE}`,
+        detail: `handshake ${String(ready?.t)}, exit ${String(through.code)}, output ${through.stdout}`,
+      });
+    }
+  }
   const version = yield* runExecutable(executable, ["--version"], contentDir);
   if (version.exitCode !== 0 || !version.stdout.includes(input.expectVersion)) {
     return yield* new CliArchiveSmokeError({
@@ -191,7 +296,17 @@ const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
       detail: `no 200 from / within 30s\n${stdout}${stderr}`,
     });
   }
-  yield* Effect.log(`[cli-smoke] ${root}: --version passed and serve answered on ${String(port)}.`);
+  // The server logs either warning when it cannot use the spawner executable beside it.
+  const fallback = /No t3-process-spawner beside|falls back to the CLI entry/.exec(stdout + stderr);
+  if (platform !== "win32" && fallback !== null) {
+    return yield* new CliArchiveSmokeError({
+      step: "serving from the extracted archive",
+      detail: `the server did not use ${PROCESS_SPAWNER_EXECUTABLE}\n${stdout}${stderr}`,
+    });
+  }
+  yield* Effect.log(
+    `[cli-smoke] ${root}: ${platform === "win32" ? "" : `${PROCESS_SPAWNER_EXECUTABLE} ran git, `}--version passed and serve answered on ${String(port)}.`,
+  );
 });
 
 const command = Command.make(

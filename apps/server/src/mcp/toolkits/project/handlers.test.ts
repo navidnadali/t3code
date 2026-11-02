@@ -14,6 +14,7 @@ import {
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -411,7 +412,8 @@ it.effect("a launch binds only an existing checkout that is one of the project's
       launched,
       workspaceRoot: repo,
     });
-    const git = yield* GitVcsDriver.GitVcsDriver.pipe(Effect.provide(dependencies));
+    // Built in this test's scope: the driver runs Git after the build returns.
+    const git = Context.get(yield* Layer.build(dependencies), GitVcsDriver.GitVcsDriver);
     for (const args of [
       ["init", "-b", "main"],
       ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"],

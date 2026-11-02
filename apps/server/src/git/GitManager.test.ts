@@ -8,6 +8,7 @@ import * as NodeChildProcess from "node:child_process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -50,6 +51,7 @@ import {
 } from "@t3tools/provider-core/server/textGenerationOperations";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import { PROCESS_SPAWNER_ENV } from "../process/workerChildProcessSpawner.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "../vcs/VcsProjectConfig.ts";
 import * as GitWorkflowService from "./GitWorkflowService.ts";
@@ -650,7 +652,13 @@ function makeManager(input?: {
               );
           });
         }),
-      ).pipe(Layer.provide(NodeServices.layer))
+      ).pipe(
+        // Git is watched at this spawner: keep it here rather than on the spawner process.
+        Layer.provideMerge(
+          ConfigProvider.layer(ConfigProvider.fromUnknown({ [PROCESS_SPAWNER_ENV]: "default" })),
+        ),
+        Layer.provide(NodeServices.layer),
+      )
     : Layer.empty;
   const gitVcsDriver = input?.gitConfigReads
     ? Layer.effect(
@@ -724,9 +732,10 @@ function makeManager(input?: {
     if (input?.seed !== undefined) {
       yield* input.seed.pipe(Effect.provideContext(stores), Effect.orDie);
     }
+    // Built in the caller's scope: the manager keeps using these services after make returns.
+    const services = yield* Layer.build(layerManager).pipe(Effect.provideContext(stores));
     const manager = yield* GitManager.make.pipe(
-      Effect.provide(layerManager),
-      Effect.provideContext(stores),
+      Effect.provideContext(Context.merge(stores, services)),
     );
     return { manager, providerCalls };
   });

@@ -1089,6 +1089,185 @@ it.live.each(["eager", "stalled"] as const)(
 );
 
 it.live(
+  "a project first seen in a resync snapshot keeps the identity a refresh resolved while the snapshot loaded",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-01T00:00:00.000Z";
+      let eventCounter = 0;
+      const versions = new Map<string, number>();
+      const commit = (threadIds: ReadonlyArray<string>) =>
+        Effect.gen(function* () {
+          let first: number | undefined;
+          let last = 0;
+          for (const threadId of threadIds) {
+            const version = (versions.get(threadId) ?? -1) + 1;
+            versions.set(threadId, version);
+            const [inserted] = yield* sql<{ sequence: number }>`
+              INSERT INTO orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type,
+                occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+              ) VALUES (
+                ${`enrich-race:${eventCounter++}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+                ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:enrich", detachedAt: now })},
+                '{}', 2
+              ) RETURNING sequence
+            `;
+            first ??= inserted!.sequence;
+            last = inserted!.sequence;
+          }
+          const stored = yield* store
+            .readApplicationEvents({ afterSequence: first! - 1, throughSequence: last })
+            .pipe(Stream.runCollect);
+          yield* store.publishCommitted(Array.from(stored));
+          return last;
+        });
+      const shell = (threadId: string) =>
+        ({
+          id: threadId,
+          projectId: "project:p0",
+          archivedAt: null,
+          title: threadId,
+          status: "completed",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          pendingBackgroundTasks: [],
+          settledOverride: null,
+          settledAt: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        }) as unknown as OrchestrationV2ThreadShell;
+      const workspaceRoot = "/tmp/enrich-race";
+      const identity = { canonicalKey: "github.com/t3/enrich-race", locator: { kind: "github" } };
+      // A project created after the subscription started: the client first sees it in the
+      // resync snapshot.
+      const newProject = {
+        id: ProjectId.make("project:new"),
+        title: "New",
+        workspaceRoot,
+        repositoryIdentity: null,
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as OrchestrationProjectShell;
+      let projects: ReadonlyArray<OrchestrationProjectShell> = [];
+      let resolved = false;
+      const changes = yield* PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>();
+      const refreshSeen = yield* Deferred.make<void>();
+      let gated = false;
+      const enrichment = {
+        subscribeChanges: PubSub.subscribe(changes),
+        // The resync's first read of the new root: its identity resolves and its refresh goes
+        // out (and reaches the client) while this read still reports the root unresolved.
+        getAvailable: (root: string) =>
+          Effect.gen(function* () {
+            if (root === workspaceRoot && !gated) {
+              gated = true;
+              resolved = true;
+              yield* PubSub.publish(changes, {
+                workspaceRoot,
+                enrichment: {
+                  repositoryIdentity: identity,
+                  faviconPath: null,
+                  repositoryIdentityResolved: true,
+                },
+                repositoryIdentityResolved: true,
+              } as ProjectEnrichment.ProjectEnrichmentChange);
+              yield* Deferred.await(refreshSeen);
+              return {
+                repositoryIdentity: null,
+                faviconPath: null,
+                repositoryIdentityResolved: false,
+              };
+            }
+            return {
+              repositoryIdentity: root === workspaceRoot && resolved ? identity : null,
+              faviconPath: null,
+              repositoryIdentityResolved: root === workspaceRoot && resolved,
+            };
+          }),
+      } as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"];
+      const overflows = overflowCounter();
+      const stream = yield* subscribeOrchestrationV2Shell({ requestCompletionMarker: true }).pipe(
+        Effect.provideService(ThreadManagement.ThreadManagementService, {
+          listActiveShellIndex: () => Effect.succeed([]),
+          readShellSnapshot: () =>
+            Effect.succeed(
+              Effect.succeed({
+                schemaVersion: 1,
+                snapshotSequence: 0,
+                threads: [],
+                archivedThreads: [],
+              }),
+            ),
+          listActiveSubagentThreadIds: () => Effect.succeed([]),
+          getThreadShellForEvent: (input: { readonly threadId: string }) =>
+            Effect.succeed(shell(input.threadId)),
+        } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+        Effect.provideService(ProjectStore.ProjectStoreV2, {
+          listShells: () => Effect.sync(() => projects),
+        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+        Effect.provideService(ProjectService.ProjectService, {
+          getShell: () => Effect.succeedNone,
+        } as unknown as ProjectService.ProjectService["Service"]),
+        Effect.provideService(ProjectEnrichment.ProjectEnrichmentService, enrichment),
+        Effect.provide(Logger.layer([overflows.logger], { mergeWithExisting: true })),
+      );
+      const pull = yield* Stream.toPull(
+        stream.pipe(Stream.provide(Logger.layer([overflows.logger], { mergeWithExisting: true }))),
+      );
+      // The client: authoritative snapshots replace the projects; refreshes update known ones.
+      const known = new Map<string, unknown>();
+      const resynced = yield* Deferred.make<void>();
+      let snapshots = 0;
+      let refreshesForNew = 0;
+      const apply = (item: OrchestrationV2ShellStreamItem) => {
+        if (item.kind !== "snapshot") return;
+        if (item.resolvedRepositoryIdentityRoots === undefined) {
+          snapshots += 1;
+          known.clear();
+          for (const project of item.snapshot.projects)
+            known.set(project.id, project.repositoryIdentity);
+          if (snapshots === 2) Deferred.doneUnsafe(resynced, Effect.void);
+          return;
+        }
+        for (const project of item.snapshot.projects) {
+          if (project.id === newProject.id) {
+            refreshesForNew += 1;
+            Deferred.doneUnsafe(refreshSeen, Effect.void);
+          }
+          if (known.has(project.id)) known.set(project.id, project.repositoryIdentity);
+        }
+      };
+      const fold = makeShellFold();
+      // Project state first: the fold's waiters may resume the test on the same item.
+      const applyAll = (items: ReadonlyArray<OrchestrationV2ShellStreamItem>) => {
+        for (const item of items) {
+          apply(item);
+          fold.apply(item);
+        }
+      };
+      const consumer = yield* pull.pipe(Effect.map(applyAll), Effect.forever, Effect.forkScoped);
+      yield* fold.reach(yield* commit(["thread:seed"]));
+      // Nothing pulls while the burst overflows the buffer; the project appears meanwhile.
+      yield* Fiber.interrupt(consumer);
+      projects = [newProject];
+      yield* commit(
+        Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:d${index}`),
+      );
+      yield* overflows.reach(1);
+      yield* pull.pipe(Effect.map(applyAll), Effect.forever, Effect.forkScoped);
+      yield* Deferred.await(resynced);
+      // A live item committed after the resync snapshot follows whatever the resync sent after it.
+      yield* fold.reach(yield* commit(["thread:seed"]));
+      assert.equal(snapshots, 2);
+      assert.isAtLeast(refreshesForNew, 1);
+      assert.deepEqual(known.get(newProject.id), identity);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live(
   "a thread subscriber resyncs after every overflow: a stalled client loads no snapshot, repeats fold correctly",
   () =>
     Effect.gen(function* () {

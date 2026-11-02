@@ -44,7 +44,7 @@ const layerHub = (input: {
   readonly reads: Array<number>;
   readonly title?: () => string;
   readonly onStart?: () => void;
-  readonly beforeSubscribe?: Effect.Effect<void>;
+  readonly afterSubscribe?: Effect.Effect<void>;
   readonly onRelease?: () => void;
 }) =>
   ShellDeltaHub.layer.pipe(
@@ -65,10 +65,10 @@ const layerHub = (input: {
             const store = yield* OrchestrationEventStore.OrchestrationEventStore;
             return {
               ...store,
-              subscribeCommitted: (input.beforeSubscribe ?? Effect.void).pipe(
-                Effect.andThen(store.subscribeCommitted),
+              subscribeCommitted: store.subscribeCommitted.pipe(
                 Effect.tap(() => Effect.sync(() => input.onStart?.())),
                 Effect.tap(() => Effect.addFinalizer(() => Effect.sync(() => input.onRelease?.()))),
+                Effect.tap(() => input.afterSubscribe ?? Effect.void),
               ),
             };
           }),
@@ -267,8 +267,8 @@ it.effect(
             onStart: () => {
               starts += 1;
             },
-            // Holds the committed subscription open while the subscriber is cancelled.
-            beforeSubscribe: Deferred.succeed(subscribing, undefined).pipe(
+            // Holds the start between acquiring the committed subscription and forking the consumer.
+            afterSubscribe: Deferred.succeed(subscribing, undefined).pipe(
               Effect.andThen(Deferred.await(release)),
             ),
             onRelease: () => {
@@ -278,4 +278,45 @@ it.effect(
         ),
       );
     }).pipe(Effect.scoped),
+);
+
+it.effect("a subscriber whose scope closes while the hub starts leaves no hub behind", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    let starts = 0;
+    let releases = 0;
+    const subscribing = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const scope = yield* Scope.make();
+      const subscriber = yield* Effect.forkScoped(hub.subscribe().pipe(Scope.provide(scope)));
+      yield* Deferred.await(subscribing);
+      yield* Scope.close(scope, Exit.void);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.await(subscriber);
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 1);
+      assert.equal(releases, 1);
+      yield* Effect.scoped(hub.subscribe());
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 2);
+      assert.equal(releases, 2);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          onStart: () => {
+            starts += 1;
+          },
+          afterSubscribe: Deferred.succeed(subscribing, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+          ),
+          onRelease: () => {
+            releases += 1;
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
 );

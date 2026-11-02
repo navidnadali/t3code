@@ -307,6 +307,9 @@ export const layer: Layer.Layer<
         let throughSequence = bounds[0]?.event_sequence ?? 0;
         let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
         const scratchPath = options?.scratchPath;
+        // What a previous pass left behind is removed first, so it never counts against the free space.
+        if (scratchPath !== undefined)
+          yield* scratchBoundary(CompactionScratch.prepare(scratchPath));
         // Never fill the disk: the scratch store beside the database needs room for every key.
         if (
           scratchPath !== undefined &&

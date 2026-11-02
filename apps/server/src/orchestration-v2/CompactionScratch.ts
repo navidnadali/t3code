@@ -12,10 +12,11 @@ import * as NodeWorkerThreads from "node:worker_threads";
  * it: the store is file-backed with a fixed cache, and its statements (and the disk waits they can
  * run into beside a multi-gigabyte store) never run on the event loop. Nothing in it outlives a pass.
  */
-export interface CompactionScratch {
+interface CompactionScratch {
   readonly lookup: (
     keys: ReadonlyArray<string>,
   ) => Effect.Effect<Map<string, number | null>, CompactionScratchError>;
+  /** Queued behind the previous messages; a failure surfaces on the next lookup. */
   readonly upsert: (
     entries: ReadonlyArray<readonly [key: string, oldest: number | null]>,
   ) => Effect.Effect<void, CompactionScratchError>;
@@ -102,8 +103,8 @@ parentPort.on("message", (request) => {
     if (request.type === "lookup") {
       parentPort.postMessage({ id: request.id, rows: select.all(request.keys) });
     } else if (request.type === "upsert") {
+      // Answered only when it fails: the next lookup is queued behind it anyway.
       upsert.run(request.entries);
-      parentPort.postMessage({ id: request.id, rows: [] });
     } else if (request.type === "close") {
       db.close();
       parentPort.postMessage({ id: request.id, rows: [] });
@@ -122,8 +123,13 @@ type ScratchReply =
 
 type ScratchRequest =
   | { readonly type: "lookup"; readonly keys: string }
-  | { readonly type: "upsert"; readonly entries: string }
   | { readonly type: "close" };
+
+// The worker takes its arguments as JSON text, which SQLite's json_each reads directly.
+const encodeKeys = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
+const encodeEntries = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(Schema.Tuple([Schema.String, Schema.NullOr(Schema.Number)]))),
+);
 
 const failure = (message: string, cause?: unknown) =>
   new CompactionScratchError(cause === undefined ? { message } : { message, cause });
@@ -146,6 +152,78 @@ const clearScratchPath = (scratchPath: string) => {
   for (const file of scratchFiles(scratchPath)) NodeFS.rmSync(file, { force: true });
 };
 
+/**
+ * Removes what a previous pass left at `scratchPath` (an empty directory included; a non-empty one
+ * is reported), so that a stale scratch file never counts against the free space the pass needs.
+ */
+export const prepare = (scratchPath: string) =>
+  Effect.try({
+    try: () => clearScratchPath(scratchPath),
+    catch: (cause) =>
+      isScratchError(cause)
+        ? cause
+        : failure(`Could not prepare the compaction scratch file: ${scratchPath}`, cause),
+  });
+
+type Started = {
+  readonly worker: NodeWorkerThreads.Worker;
+  readonly started: Promise<void>;
+  readonly pending: Map<number, (reply: ScratchReply) => void>;
+  readonly stopped: () => string | undefined;
+  readonly failedUpsert: () => string | undefined;
+};
+
+/** Starts the worker with its listeners and its startup promise in one synchronous step. */
+const startWorker = (scratchPath: string | undefined): Started => {
+  const worker = new NodeWorkerThreads.Worker(scratchWorkerSource, {
+    eval: true,
+    workerData: {
+      filename: scratchPath ?? ":memory:",
+      cacheKib: SCRATCH_CACHE_KIB,
+      pageSize: SCRATCH_PAGE_SIZE,
+    },
+  });
+  const pending = new Map<number, (reply: ScratchReply) => void>();
+  let stopped: string | undefined;
+  let failedUpsert: string | undefined;
+  let announce: (reply: ScratchReply) => void = () => {};
+  const started = new Promise<void>((resolve, reject) => {
+    announce = (reply) => {
+      announce = () => {};
+      if ("type" in reply && reply.type === "ready") resolve();
+      else reject(failure("type" in reply ? reply.message : "lost the scratch store"));
+    };
+  });
+  const stop = (message: string) => {
+    stopped = message;
+    announce({ type: "failed", message });
+    for (const [id, resume] of pending) resume({ id, error: message });
+    pending.clear();
+  };
+  worker.on("message", (reply: ScratchReply) => {
+    if ("type" in reply) {
+      announce(reply);
+      return;
+    }
+    const resume = pending.get(reply.id);
+    if (resume === undefined) {
+      if ("error" in reply) failedUpsert ??= reply.error;
+      return;
+    }
+    pending.delete(reply.id);
+    resume(reply);
+  });
+  worker.on("error", (cause) => stop(`Compaction scratch store failed: ${cause.message}`));
+  worker.on("exit", (code) => stop(`Compaction scratch store exited with code ${code}`));
+  return {
+    worker,
+    started,
+    pending,
+    stopped: () => stopped,
+    failedUpsert: () => failedUpsert,
+  };
+};
+
 /** Tear-down steps, each attempted whatever the previous one did; the scratch store is disposable. */
 const cleanupSteps = (worker: NodeWorkerThreads.Worker, scratchPath: string | undefined) => [
   ["terminate", () => worker.terminate().then(() => undefined)] as const,
@@ -164,28 +242,13 @@ export const open: (
 ) => Effect.Effect<CompactionScratch, CompactionScratchError, Scope.Scope> = Effect.fn(
   "CompactionScratch.open",
 )(function* (scratchPath: string | undefined) {
-  yield* Effect.try({
-    try: () => {
-      if (scratchPath !== undefined) clearScratchPath(scratchPath);
-    },
-    catch: (cause) =>
-      isScratchError(cause)
-        ? cause
-        : failure(`Could not prepare the compaction scratch file: ${scratchPath}`, cause),
-  });
-  const worker = yield* Effect.acquireRelease(
-    Effect.sync(
-      () =>
-        new NodeWorkerThreads.Worker(scratchWorkerSource, {
-          eval: true,
-          workerData: {
-            filename: scratchPath ?? ":memory:",
-            cacheKib: SCRATCH_CACHE_KIB,
-            pageSize: SCRATCH_PAGE_SIZE,
-          },
-        }),
-    ),
-    (worker) =>
+  if (scratchPath !== undefined) yield* prepare(scratchPath);
+  const { worker, started, pending, stopped, failedUpsert } = yield* Effect.acquireRelease(
+    Effect.try({
+      try: () => startWorker(scratchPath),
+      catch: (cause) => failure("Could not start the compaction scratch store", cause),
+    }),
+    ({ worker }) =>
       Effect.forEach(
         cleanupSteps(worker, scratchPath),
         ([what, step]) =>
@@ -202,42 +265,24 @@ export const open: (
         { discard: true },
       ),
   );
+  yield* Effect.tryPromise({
+    try: () => started,
+    catch: (cause) =>
+      isScratchError(cause)
+        ? cause
+        : failure("Could not start the compaction scratch store", cause),
+  });
 
   let nextRequestId = 0;
-  let stopped: string | undefined;
-  const pending = new Map<number, (reply: ScratchReply) => void>();
-  let announce: (reply: ScratchReply) => void = () => {};
-  const stop = (message: string) => {
-    stopped = message;
-    announce({ type: "failed", message });
-    for (const [id, resume] of pending) resume({ id, error: message });
-    pending.clear();
+  const broken = () => {
+    const message = stopped() ?? failedUpsert();
+    return message === undefined ? undefined : failure(message);
   };
-  worker.on("message", (reply: ScratchReply) => {
-    if ("type" in reply) {
-      announce(reply);
-      return;
-    }
-    const resume = pending.get(reply.id);
-    if (resume === undefined) return;
-    pending.delete(reply.id);
-    resume(reply);
-  });
-  worker.on("error", (cause) => stop(`Compaction scratch store failed: ${cause.message}`));
-  worker.on("exit", (code) => stop(`Compaction scratch store exited with code ${code}`));
-
-  yield* Effect.callback<void, CompactionScratchError>((resume) => {
-    announce = (reply) => {
-      announce = () => {};
-      if ("type" in reply && reply.type === "ready") resume(Effect.void);
-      else resume(Effect.fail(failure("type" in reply ? reply.message : "lost the scratch store")));
-    };
-  });
-
   const request = (input: ScratchRequest) =>
     Effect.callback<ReadonlyArray<Record<string, unknown>>, CompactionScratchError>((resume) => {
-      if (stopped !== undefined) {
-        resume(Effect.fail(failure(stopped)));
+      const error = broken();
+      if (error !== undefined) {
+        resume(Effect.fail(error));
         return;
       }
       const id = nextRequestId++;
@@ -255,7 +300,7 @@ export const open: (
     lookup: (keys) =>
       keys.length === 0
         ? Effect.succeed(new Map<string, number | null>())
-        : Effect.map(request({ type: "lookup", keys: JSON.stringify(keys) }), (rows) => {
+        : Effect.map(request({ type: "lookup", keys: encodeKeys(keys) }), (rows) => {
             const found = new Map<string, number | null>();
             for (const row of rows) {
               found.set(String(row.entity_key), row.oldest === null ? null : Number(row.oldest));
@@ -263,8 +308,15 @@ export const open: (
             return found;
           }),
     upsert: (entries) =>
-      entries.length === 0
-        ? Effect.void
-        : Effect.asVoid(request({ type: "upsert", entries: JSON.stringify(entries) })),
+      Effect.suspend(() => {
+        const error = broken();
+        if (error !== undefined) return Effect.fail(error);
+        if (entries.length > 0) {
+          const message = { id: nextRequestId++, type: "upsert", entries: encodeEntries(entries) };
+          // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+          worker.postMessage(message);
+        }
+        return Effect.void;
+      }),
   } satisfies CompactionScratch;
 });

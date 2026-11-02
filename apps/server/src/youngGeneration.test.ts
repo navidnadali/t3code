@@ -11,6 +11,7 @@ import {
   DEFAULT_MAX_SEMI_SPACE_MB,
   INHERITED_NODE_OPTIONS_ENV,
   MAX_SEMI_SPACE_ENV,
+  describeNodeRuntime,
   isServerCommand,
   nodeOptionsWithMaxSemiSpace,
   planYoungGenerationRelaunch,
@@ -88,6 +89,46 @@ describe("serverChildEnvironment", () => {
     expect(serverChildEnvironment(disabled)).toEqual(disabled);
     const explicit = { NODE_OPTIONS: "--max-semi-space-size=16" };
     expect(serverChildEnvironment(explicit)).toEqual(explicit);
+  });
+});
+
+describe("describeNodeRuntime", () => {
+  it("reports the cap V8 saw, the heap limit in MiB and the children's NODE_OPTIONS", () => {
+    expect(
+      describeNodeRuntime({
+        execArgv: [],
+        nodeOptionsAtStart: `--max-old-space-size=16384 ${flag}`,
+        nodeOptionsForChildren: "--max-old-space-size=16384",
+        heapSizeLimitBytes: 17_280_532_480,
+        applied: true,
+      }),
+    ).toEqual({
+      execArgv: [],
+      nodeOptions: `--max-old-space-size=16384 ${flag}`,
+      nodeOptionsForChildren: "--max-old-space-size=16384",
+      heapSizeLimitMiB: 16480,
+      maxSemiSpaceMiB: 64,
+      youngGenerationDefault: true,
+    });
+    const plain = describeNodeRuntime({
+      execArgv: ["--max-semi-space-size=32"],
+      nodeOptionsAtStart: undefined,
+      nodeOptionsForChildren: undefined,
+      heapSizeLimitBytes: 4_395_630_592,
+      applied: false,
+    });
+    expect(plain.maxSemiSpaceMiB).toBe(32);
+    expect(plain.nodeOptions).toBeNull();
+    expect(plain.heapSizeLimitMiB).toBe(4192);
+    expect(
+      describeNodeRuntime({
+        execArgv: [],
+        nodeOptionsAtStart: undefined,
+        nodeOptionsForChildren: undefined,
+        heapSizeLimitBytes: 0,
+        applied: false,
+      }).maxSemiSpaceMiB,
+    ).toBe("node default");
   });
 });
 

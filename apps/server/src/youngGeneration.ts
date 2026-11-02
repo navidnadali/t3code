@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Runs first thing in bin.ts, before the CLI's Effect runtime loads.
 import * as NodeSea from "node:sea";
+import * as NodeV8 from "node:v8";
 
 // V8 reads --max-semi-space-size only at startup, so the cap travels in NODE_OPTIONS: a parent that
 // starts the server puts it there, and a server started without it relaunches itself once (execve,
@@ -149,7 +150,12 @@ export interface YoungGenerationOutcome {
  * the inherited NODE_OPTIONS for its children; any other server process relaunches itself with
  * the cap. Returns only when the process goes on without relaunching.
  */
-export const applyYoungGenerationDefault = (): YoungGenerationOutcome => {
+let lastOutcome: YoungGenerationOutcome | undefined;
+
+export const applyYoungGenerationDefault = (): YoungGenerationOutcome =>
+  (lastOutcome = applyYoungGenerationDefaultUnsafe());
+
+const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   const nodeOptionsAtStart = process.env.NODE_OPTIONS;
   const inherited = process.env[INHERITED_NODE_OPTIONS_ENV];
   if (inherited !== undefined) {
@@ -184,6 +190,44 @@ export const applyYoungGenerationDefault = (): YoungGenerationOutcome => {
   }
   return { applied: false, nodeOptionsAtStart, keptReason: "relaunch returned" };
 };
+
+export interface NodeRuntimeFlags {
+  readonly execArgv: ReadonlyArray<string>;
+  /** NODE_OPTIONS as V8 saw it at startup (the server's children see `nodeOptionsForChildren`). */
+  readonly nodeOptions: string | null;
+  readonly nodeOptionsForChildren: string | null;
+  readonly heapSizeLimitMiB: number;
+  /** The young-generation cap in effect: the flag's value, or Node's default when none was given. */
+  readonly maxSemiSpaceMiB: number | "node default";
+  readonly youngGenerationDefault: boolean;
+}
+
+export const describeNodeRuntime = (input: {
+  readonly execArgv: ReadonlyArray<string>;
+  readonly nodeOptionsAtStart: string | undefined;
+  readonly nodeOptionsForChildren: string | undefined;
+  readonly heapSizeLimitBytes: number;
+  readonly applied: boolean;
+}): NodeRuntimeFlags => ({
+  execArgv: input.execArgv,
+  nodeOptions: input.nodeOptionsAtStart ?? null,
+  nodeOptionsForChildren: input.nodeOptionsForChildren ?? null,
+  heapSizeLimitMiB: Math.round(input.heapSizeLimitBytes / 1_048_576),
+  maxSemiSpaceMiB:
+    explicitMaxSemiSpaceMb({ NODE_OPTIONS: input.nodeOptionsAtStart }, input.execArgv) ??
+    "node default",
+  youngGenerationDefault: input.applied,
+});
+
+/** What this process runs with, for the startup log; the outcome comes from bin.ts's call. */
+export const nodeRuntimeFlags = (): NodeRuntimeFlags =>
+  describeNodeRuntime({
+    execArgv: process.execArgv,
+    nodeOptionsAtStart: lastOutcome?.nodeOptionsAtStart ?? process.env.NODE_OPTIONS,
+    nodeOptionsForChildren: process.env.NODE_OPTIONS,
+    heapSizeLimitBytes: NodeV8.getHeapStatistics().heap_size_limit,
+    applied: lastOutcome?.applied ?? false,
+  });
 
 /** `t3 __node-flags`: the young-generation settings this process runs with, as JSON on stdout. */
 export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {

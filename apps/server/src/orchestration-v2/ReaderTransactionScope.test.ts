@@ -1013,6 +1013,23 @@ const smallReads: ReadonlyArray<PermitCase> = [
 const largeReads: ReadonlyArray<PermitCase> = [
   ...readCases.filter((readCase) => readCase.permit),
   {
+    name: "turn-start history",
+    read: (store, fixture) => store.getTurnStartHistory(fixture.fork),
+  },
+  {
+    name: "thread search",
+    read: (store, fixture) => store.searchThread({ threadId: fixture.fork, query: "fork" }),
+  },
+  {
+    name: "streamed thread search",
+    read: (store, fixture) =>
+      Stream.runCollect(store.searchThreadStream({ threadId: fixture.fork, query: "fork" })),
+  },
+];
+
+// Pages of a thread's history, bounded by their page size rather than the history.
+const boundedReads: ReadonlyArray<PermitCase> = [
+  {
     name: "thread snapshot window",
     read: (store, fixture) => store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
   },
@@ -1032,19 +1049,6 @@ const largeReads: ReadonlyArray<PermitCase> = [
           position: 10,
         }),
       ),
-  },
-  {
-    name: "turn-start history",
-    read: (store, fixture) => store.getTurnStartHistory(fixture.fork),
-  },
-  {
-    name: "thread search",
-    read: (store, fixture) => store.searchThread({ threadId: fixture.fork, query: "fork" }),
-  },
-  {
-    name: "streamed thread search",
-    read: (store, fixture) =>
-      Stream.runCollect(store.searchThreadStream({ threadId: fixture.fork, query: "fork" })),
   },
 ];
 
@@ -1161,27 +1165,34 @@ it.effect("lets a streamed search waiting for a reader permit be interrupted", (
   }),
 );
 
-// History reads paused at their first statement, each holding a reader permit and a reader.
-const holdHistoryReads = (store: Store, fixture: Fixture, count: number) =>
+// Reads paused at their first statement, each holding a reader (history reads also a permit).
+const holdHistoryReads = (
+  store: Store,
+  fixture: Fixture,
+  count: number,
+  read: (
+    store: Store,
+    fixture: Fixture,
+  ) => Effect.Effect<unknown, ProjectionStore.ProjectionStoreV2Error> = (store, fixture) =>
+    store.getThreadSnapshot(fixture.fork),
+) =>
   Effect.gen(function* () {
     const arrived = yield* Queue.unbounded<void>();
     const release = yield* Deferred.make<void>();
     const reads = yield* Effect.forEach(Array.from({ length: count }), () =>
       Effect.suspend(() => {
         let paused = false;
-        return store
-          .getThreadSnapshot(fixture.fork)
-          .pipe(
-            Effect.provideService(Statement.CurrentTransformer, (statement) =>
-              paused
-                ? Effect.succeed(statement)
-                : Queue.offer(arrived, undefined).pipe(
-                    Effect.andThen(Effect.sync(() => (paused = true))),
-                    Effect.andThen(Deferred.await(release)),
-                    Effect.as(statement),
-                  ),
-            ),
-          );
+        return read(store, fixture).pipe(
+          Effect.provideService(Statement.CurrentTransformer, (statement) =>
+            paused
+              ? Effect.succeed(statement)
+              : Queue.offer(arrived, undefined).pipe(
+                  Effect.andThen(Effect.sync(() => (paused = true))),
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as(statement),
+                ),
+          ),
+        );
       }).pipe(Effect.forkChild),
     );
     return { arrived, release, reads };
@@ -1234,5 +1245,35 @@ it.effect("makes other reads wait for the only reader behind a history read", ()
       yield* Effect.forEach(held.reads, Fiber.join);
     }),
     1,
+  ),
+);
+
+it.effect.each(boundedReads)(
+  "completes a $name read while full-history reads hold every reader permit",
+  (permitCase) =>
+    withHeldPermits("reader-scope-bounded-", (store, fixture) =>
+      Effect.exit(permitCase.read(store, fixture)),
+    ).pipe(Effect.map((exit) => assert.isTrue(Exit.isSuccess(exit), String(exit)))),
+);
+
+it.effect("leaves a reader for other reads while snapshot windows hold the rest", () =>
+  withFileStore(
+    "reader-scope-window-reader-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("window-reader", 2);
+      // Two readers: one window holds a reader, the other waits for its turn.
+      const held = yield* holdHistoryReads(store, fixture, 2, (store, fixture) =>
+        store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
+      );
+      yield* Queue.take(held.arrived);
+      const shell = yield* store.getThreadShell(fixture.fork);
+      assert.strictEqual(shell?.id, fixture.fork);
+      assert.strictEqual(yield* Queue.size(held.arrived), 0);
+      yield* Deferred.succeed(held.release, undefined);
+      yield* Queue.take(held.arrived);
+      yield* Effect.forEach(held.reads, Fiber.join);
+    }),
+    2,
   ),
 );

@@ -369,6 +369,66 @@ const assertPermits = (expected: number) =>
     assert.deepEqual([Option.isSome(all), Option.isSome(more)], [true, false]);
   });
 
+// A large read paused in its transaction, holding a reader; released by the returned effect.
+const holdLargeReader = (sql: SqlClient.SqlClient, name: string, started: Array<string>) =>
+  Effect.gen(function* () {
+    const release = yield* Deferred.make<void>();
+    const fiber = yield* sql
+      .withTransaction(
+        sql`SELECT ${name} AS name`.pipe(
+          Effect.andThen(Effect.sync(() => started.push(name))),
+          Effect.andThen(Deferred.await(release)),
+        ),
+      )
+      .pipe(SqliteClient.largeRead, SqliteClient.readOnly, Effect.forkChild);
+    return Deferred.succeed(release, undefined).pipe(Effect.andThen(Fiber.join(fiber)));
+  });
+
+it.effect("leaves the last reader to other reads while large reads hold the rest", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const started: Array<string> = [];
+        const first = yield* holdLargeReader(sql, "large-1", started);
+        const second = yield* holdLargeReader(sql, "large-2", started);
+        // Two readers: one large read holds a reader, the other waits for its turn.
+        const small = yield* sql
+          .withTransaction(sql`SELECT ${"small"} AS name`)
+          .pipe(SqliteClient.readOnly);
+        assert.deepEqual(small, [{ name: "small" }]);
+        assert.deepEqual(started, ["large-1"]);
+        yield* first;
+        yield* second;
+        assert.deepEqual(started, ["large-1", "large-2"]);
+      }),
+    { readerPoolSize: 2 },
+  ),
+);
+
+it.effect("gives back a large read's turn when it is interrupted waiting for a reader", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const started: Array<string> = [];
+        // One reader, held by an unmarked read; a large read takes its turn, then waits.
+        const unmarked = yield* holdReader(sql, "unmarked");
+        const waiting = yield* sql
+          .withTransaction(sql`SELECT ${"waiting"} AS name`)
+          .pipe(
+            SqliteClient.largeRead,
+            SqliteClient.readOnly,
+            Effect.forkChild({ startImmediately: true }),
+          );
+        yield* Fiber.interrupt(waiting);
+        yield* unmarked;
+        const next = yield* holdLargeReader(sql, "next", started);
+        yield* next;
+        assert.deepEqual(started, ["next"]);
+      }),
+    { readerPoolSize: 1 },
+  ),
+);
+
 // One reader is always left for reads that take no permit, unless there is only one.
 it.effect.each([
   { setting: "1", size: 1, permits: 1 },

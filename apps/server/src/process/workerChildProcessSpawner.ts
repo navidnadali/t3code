@@ -48,7 +48,12 @@ const processGroupPollIntervalMillis = 10;
 // Time the spawner gets at close to kill its children before it is killed.
 const spawnerCloseGraceMillis = 1_000;
 /** Each restart forks the server; a spawner that keeps stopping is a fault, whatever the load. */
-export const spawnerRestartLimit = { restarts: 3, windowMillis: 10 * 60_000 };
+export const spawnerRestartLimit = {
+  restarts: 3,
+  windowMillis: 10 * 60_000,
+  coolDownMillis: 15_000,
+  maxCoolDownMillis: 5 * 60_000,
+};
 
 type ExitCodeWithSignal = readonly [code: number | null, signal: NodeJS.Signals | null];
 

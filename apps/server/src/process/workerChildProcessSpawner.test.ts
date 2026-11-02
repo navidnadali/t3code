@@ -142,6 +142,26 @@ const childWatch = Effect.gen(function* () {
   };
 });
 
+// A monotonic clock the test moves by hand.
+const fakeClock = () => {
+  let nanos = 0n;
+  const clock: Clock.Clock = {
+    currentTimeMillisUnsafe: () => Number(nanos / 1_000_000n),
+    currentTimeMillis: Effect.sync(() => Number(nanos / 1_000_000n)),
+    currentTimeNanosUnsafe: () => nanos,
+    currentTimeNanos: Effect.sync(() => nanos),
+    monotonicTimeNanosUnsafe: () => nanos,
+    monotonicTimeNanos: Effect.sync(() => nanos),
+    sleep: () => Effect.void,
+  };
+  return {
+    clock,
+    advance: (millis: number) => {
+      nanos += BigInt(millis) * 1_000_000n;
+    },
+  };
+};
+
 const capturedLogs = () => {
   const logs: Array<{ readonly level: string; readonly message: unknown }> = [];
   const layer = Logger.layer(
@@ -717,16 +737,7 @@ describe("WorkerChildProcessSpawner", () => {
       const { logs, layer } = capturedLogs();
       return Effect.gen(function* () {
         const { calls, spawner } = yield* recordingSpawner;
-        let nanos = 0n;
-        const clock: Clock.Clock = {
-          currentTimeMillisUnsafe: () => Number(nanos / 1_000_000n),
-          currentTimeMillis: Effect.sync(() => Number(nanos / 1_000_000n)),
-          currentTimeNanosUnsafe: () => nanos,
-          currentTimeNanos: Effect.sync(() => nanos),
-          monotonicTimeNanosUnsafe: () => nanos,
-          monotonicTimeNanos: Effect.sync(() => nanos),
-          sleep: () => Effect.void,
-        };
+        const { clock, advance } = fakeClock();
         // Each command starts, then the spawner exits on its stdin: a crash after a success.
         const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
           'case "stdin":',
@@ -742,10 +753,11 @@ describe("WorkerChildProcessSpawner", () => {
           yield* Stream.run(Stream.make(new Uint8Array([1])), handle.stdin).pipe(Effect.ignore);
           yield* Effect.flip(handle.exitCode);
         }).pipe(Effect.scoped);
-        const { restarts, windowMillis } = WorkerChildProcessSpawner.spawnerRestartLimit;
+        const { restarts, windowMillis, coolDownMillis } =
+          WorkerChildProcessSpawner.spawnerRestartLimit;
         for (let stop = 0; stop < restarts; stop++) yield* crash;
         // Stops older than the window no longer count.
-        nanos += BigInt(windowMillis + 1) * 1_000_000n;
+        advance(windowMillis + 1);
         for (let stop = 0; stop < restarts; stop++) yield* crash;
         expect(logs.map(({ level }) => level)).toEqual(Array(2 * restarts).fill("Warn"));
         yield* crash;
@@ -754,6 +766,55 @@ describe("WorkerChildProcessSpawner", () => {
           method: "spawn",
           causeMessage: "The process spawner stopped",
         });
+        // After its cool-down the next command starts a spawner again.
+        advance(coolDownMillis);
+        expect(
+          (yield* collect(remoteSpawner, node("process.stdout.write('again')"))).stdout.toString(),
+        ).toBe("again");
+        expect(calls).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
+    },
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "retries a spawner process that cannot start after a cool-down that doubles, never on the server's spawner",
+    () => {
+      const { logs, layer } = capturedLogs();
+      return Effect.gen(function* () {
+        const { calls, spawner } = yield* recordingSpawner;
+        const { clock, advance } = fakeClock();
+        const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
+          'case "spawn":',
+          'case "spawn": if (message.args.includes("stop-spawner")) process.exit(70);',
+        );
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(spawner, {
+          source,
+        }).pipe(Effect.provideService(Clock.Clock, clock));
+        const stopping = ChildProcess.make(process.execPath, ["-e", "1", "stop-spawner"]);
+        const healthy = node("process.stdout.write('ok')");
+        const fails = (command: ChildProcess.Command) =>
+          Effect.map(spawnError(remoteSpawner, command), ({ causeMessage }) => causeMessage);
+        const runs = Effect.map(collect(remoteSpawner, healthy), ({ stdout }) => stdout.toString());
+        const { coolDownMillis } = WorkerChildProcessSpawner.spawnerRestartLimit;
+
+        // Stopped twice before starting a command: down for one cool-down.
+        expect([yield* fails(stopping), yield* fails(stopping)]).toEqual([
+          "The process spawner stopped",
+          "The process spawner stopped",
+        ]);
+        expect(logs.map(({ level }) => level)).toEqual(["Warn", "Error"]);
+        advance(coolDownMillis - 1);
+        expect(yield* fails(healthy)).toBe("The process spawner stopped");
+        expect(logs).toHaveLength(2);
+        advance(1);
+        // The retry fails again before a command: down for twice as long.
+        expect(yield* fails(stopping)).toBe("The process spawner stopped");
+        expect(logs.map(({ level }) => level)).toEqual(["Warn", "Error", "Warn", "Error"]);
+        advance(coolDownMillis);
+        expect(yield* fails(healthy)).toBe("The process spawner stopped");
+        advance(coolDownMillis);
+        expect(yield* runs).toBe("ok");
+        expect(yield* runs).toBe("ok");
         expect(calls).toEqual([]);
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
     },

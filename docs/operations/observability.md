@@ -718,16 +718,16 @@ SIGBUS and terminates the process. CLI commands that open the database, such as 
 `t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
 as well as the server.
 
-Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers. When a reader frees,
-waiting reads get it by class: first every other read (thread shells, settlement, the thread row,
-runs and other bookkeeping), then page reads (snapshot windows, history and timeline pages), then
+Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers, and an idle reader always
+takes a queued read. Reads come in three classes: small reads (thread shells, settlement, the thread
+row, runs and other bookkeeping), page reads (snapshot windows, history and timeline pages), and
 reads of a thread's whole history (full snapshots and projections, turn starts, thread search, and
-records of turn items, nodes, messages, subagents, plans, handoffs or transfers). From a pool of 3,
-the last free reader is kept for small reads while none holds one, and history reads hold at most
-all readers but two: small reads always have a reader, and page reads one that history reads cannot
-take. With a pool of 2, history reads hold at most one reader and small and
-page reads share the other; with a pool of 1 every read waits its turn; and while reads fall back to
-the main connection they all share it.
+records of turn items, nodes, messages, subagents, plans, handoffs or transfers). When reads of
+several classes queue, a freed reader goes first to a class that has been passed over once for each
+reader in the pool, so none starves; then to small or page reads whose class holds no reader; then
+to small, page and history reads in that order. History reads that already hold all readers but two
+(at least one) go after every other queued read. Within a class, reads go in the order they queued;
+while reads fall back to the main connection they all share it.
 History reads each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from
 before their read transaction until their rows are decoded, which bounds the history rows held at
 once. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a reader is.

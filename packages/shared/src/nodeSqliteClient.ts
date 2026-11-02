@@ -96,9 +96,9 @@ export const ReaderPermits = Context.Reference<Semaphore.Semaphore | undefined>(
 const readerPermitCount = (readers: number) => Math.max(1, readers - 1);
 
 /**
- * Readers go to waiting reads by class: `small` (the default), then `page`, then `history`. From
- * three readers the last free one stays with small reads while none holds one and history reads
- * hold all but two, so page reads keep one history cannot take. Pools of 1 and 2: observability.md.
+ * An idle reader always takes a queued read. When classes compete, a class passed over once per
+ * reader goes first, then `small` (the default) or `page` reads holding no reader, then small, page,
+ * history; history reads holding all readers but two (at least one) go last.
  */
 export type ReadClass = "small" | "page" | "history";
 
@@ -119,9 +119,7 @@ export const historyReadStream = <A, E, R>(
   stream: Stream.Stream<A, E, R>,
 ): Stream.Stream<A, E, R> => Stream.provideService(stream, ReadClassRef, "history");
 
-const smallReaderReserve = (readers: number) => (readers >= 3 ? 1 : 0);
-const historyReaderCount = (readers: number) =>
-  Math.max(1, readers - 1 - smallReaderReserve(readers));
+const historyReaderCount = (readers: number) => Math.max(1, readers - 2);
 
 const READ_CLASSES: ReadonlyArray<ReadClass> = ["small", "page", "history"];
 
@@ -131,16 +129,16 @@ interface SlotWaiter {
   readonly wake: () => void;
 }
 
-// Reader slots handed out by class. As in effect's Semaphore, a woken waiter takes its slot itself
-// when it next runs, so one interrupted in between takes nothing; until then it keeps its place, so
-// a slot freed for it is not handed out again and no lower class passes it.
+// Reader slots handed out by class. A woken waiter takes the slot handed to it when it runs, so one
+// interrupted in between takes nothing and passes the slot on; reads never pass queued ones.
 class ReaderSlots {
   free: number;
   woken = 0;
   readonly held: Record<ReadClass, number> = { small: 0, page: 0, history: 0 };
   readonly wokenFor: Record<ReadClass, number> = { small: 0, page: 0, history: 0 };
-  readonly smallReserve: number;
+  readonly passedOver: Record<ReadClass, number> = { small: 0, page: 0, history: 0 };
   readonly historyCap: number;
+  readonly agingLimit: number;
   readonly waiters: Record<ReadClass, Set<SlotWaiter>> = {
     small: new Set(),
     page: new Set(),
@@ -149,57 +147,63 @@ class ReaderSlots {
 
   constructor(readers: number) {
     this.free = readers;
-    this.smallReserve = smallReaderReserve(readers);
     this.historyCap = historyReaderCount(readers);
+    this.agingLimit = Math.max(1, readers);
   }
 
-  // Whether a read of the class may have a reader now, waiters aside. Each class's limits include
-  // the one before it, so a class that does not fit means none after it fits either.
-  private fits(readClass: ReadClass): boolean {
-    const available = this.free - this.woken;
-    if (available <= 0) return false;
-    if (readClass === "small") return true;
-    const keptForSmall = this.smallReserve - this.held.small - this.wokenFor.small;
-    if (available <= keptForSmall) return false;
-    return readClass === "page" || this.held.history + this.wokenFor.history < this.historyCap;
+  private queued(readClass: ReadClass): number {
+    return this.waiters[readClass].size - this.wokenFor[readClass];
   }
 
-  private canTake(readClass: ReadClass): boolean {
-    for (const other of READ_CLASSES) {
-      if (other === readClass) break;
-      if (this.waiters[other].size > 0) return false;
+  // Lowest goes first. History reads at their limit go last; a class passed over once per reader
+  // goes before the rest; then a small or page class holding no reader; then class order.
+  private rank(readClass: ReadClass, order: number): number {
+    const holding = this.held[readClass] + this.wokenFor[readClass];
+    const overLimit = readClass === "history" && holding >= this.historyCap;
+    const aged = this.passedOver[readClass] >= this.agingLimit;
+    const served = readClass === "history" || holding > 0;
+    return (overLimit ? 1000 : 0) + (aged ? 0 : 100) + (served ? 10 : 0) + order;
+  }
+
+  private firstQueued(readClass: ReadClass): SlotWaiter | undefined {
+    for (const waiter of this.waiters[readClass]) if (!waiter.woken) return waiter;
+    return undefined;
+  }
+
+  private next(): ReadClass | undefined {
+    let next: ReadClass | undefined;
+    let nextRank = Number.POSITIVE_INFINITY;
+    for (const [order, readClass] of READ_CLASSES.entries()) {
+      if (this.queued(readClass) === 0) continue;
+      const rank = this.rank(readClass, order);
+      if (rank < nextRank) [next, nextRank] = [readClass, rank];
     }
-    return this.fits(readClass);
+    return next;
   }
 
   take(readClass: ReadClass): Effect.Effect<void> {
-    const take: Effect.Effect<void> = Effect.suspend(() => {
-      if (!this.canTake(readClass)) return this.wait(readClass, take);
+    return Effect.suspend(() => {
+      if (this.free - this.woken <= 0 || READ_CLASSES.some((other) => this.queued(other) > 0))
+        return this.wait(readClass);
       this.free--;
       this.held[readClass]++;
       return Effect.void;
     });
-    return take;
   }
 
-  private wait(readClass: ReadClass, take: Effect.Effect<void>): Effect.Effect<void> {
+  private wait(readClass: ReadClass): Effect.Effect<void> {
     return Effect.callback<void>((resume) => {
       const waiter: SlotWaiter = {
         readClass,
         woken: false,
         wake: () => {
           waiter.woken = true;
-          resume(
-            Effect.suspend(() => {
-              this.forget(waiter);
-              return take;
-            }),
-          );
+          resume(Effect.suspend(() => (this.claim(waiter) ? Effect.void : this.take(readClass))));
         },
       };
       this.waiters[readClass].add(waiter);
       return Effect.withFiber((fiber) => {
-        // Interrupted after being woken, it gives the slot reserved for it to the next waiter.
+        // Interrupted after being woken, it gives the slot handed to it to the next waiter.
         const wokenSlot = waiter.woken;
         this.forget(waiter);
         if (wokenSlot) this.wakeWaiters(fiber);
@@ -208,11 +212,23 @@ class ReaderSlots {
     });
   }
 
-  private forget(waiter: SlotWaiter) {
-    if (!this.waiters[waiter.readClass].delete(waiter)) return;
-    if (!waiter.woken) return;
-    this.woken--;
-    this.wokenFor[waiter.readClass]--;
+  // A woken waiter takes the slot handed to it, whatever has queued since.
+  private claim(waiter: SlotWaiter): boolean {
+    if (!this.forget(waiter)) return false;
+    this.free--;
+    this.held[waiter.readClass]++;
+    return true;
+  }
+
+  private forget(waiter: SlotWaiter): boolean {
+    const queue = this.waiters[waiter.readClass];
+    if (!queue.delete(waiter)) return false;
+    if (queue.size === 0) this.passedOver[waiter.readClass] = 0;
+    if (waiter.woken) {
+      this.woken--;
+      this.wokenFor[waiter.readClass]--;
+    }
+    return true;
   }
 
   release(readClass: ReadClass): Effect.Effect<void> {
@@ -225,16 +241,18 @@ class ReaderSlots {
   }
 
   private wakeWaiters(fiber: Fiber.Fiber<unknown, unknown>) {
-    if (READ_CLASSES.every((readClass) => this.waiters[readClass].size === 0)) return;
+    if (READ_CLASSES.every((readClass) => this.queued(readClass) === 0)) return;
     fiber.currentDispatcher.scheduleTask(() => {
-      for (const readClass of READ_CLASSES) {
-        for (const waiter of this.waiters[readClass]) {
-          if (waiter.woken) continue;
-          if (!this.fits(readClass)) return;
-          this.woken++;
-          this.wokenFor[readClass]++;
-          waiter.wake();
-        }
+      while (this.free - this.woken > 0) {
+        const readClass = this.next();
+        if (readClass === undefined) return;
+        const waiter = this.firstQueued(readClass)!;
+        for (const other of READ_CLASSES)
+          if (other !== readClass && this.queued(other) > 0) this.passedOver[other]++;
+        this.passedOver[readClass] = 0;
+        this.woken++;
+        this.wokenFor[readClass]++;
+        waiter.wake();
       }
     }, 0);
   }

@@ -727,8 +727,8 @@ until their rows are decoded, which bounds the history rows held at once. Those 
 quarters of the readers, and never the last one, while they hold a reader, so every other read
 (thread shells, settlement, the thread row, runs and other bookkeeping) finds one free. With a pool
 of 1 a large read can make those reads wait for the reader, and while reads fall back to the main
-connection they all share it. Waiting for a permit or for a large read's turn is not part of
-`db.lock_wait_ms`.
+connection they all share it. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a
+large read's turn is, as part of the wait for a reader.
 
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for

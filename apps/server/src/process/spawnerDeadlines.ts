@@ -14,9 +14,12 @@ export const answerDeadlines = (millis: number): SpawnerTimers => ({
   schedule: (_kind, run) => {
     let immediate: NodeJS.Immediate | undefined;
     const timer = setTimeout(() => {
+      // Referenced: an unreferenced immediate does not wake a loop that waits for I/O, so the
+      // deadline would wait for whatever wakes the loop next (seconds on a quiet server).
       immediate = setImmediate(run);
-      immediate.unref();
     }, millis);
+    // A timer wakes the loop on time either way; unreferenced, a pending deadline does not keep an
+    // otherwise finished process alive.
     timer.unref();
     return () => {
       clearTimeout(timer);

@@ -338,6 +338,10 @@ const signMacArchiveContents = Effect.fn("signMacArchiveContents")(function* (in
   const identity = Option.getOrUndefined(signing.identity)?.trim() || "-";
 
   const entitlements = path.join(input.repoRoot, "apps/server/resources/cli-entitlements.plist");
+  const spawnerEntitlements = path.join(
+    input.repoRoot,
+    "apps/server/resources/spawner-entitlements.plist",
+  );
   const libraries = (yield* fs.readDirectory(input.contentDir, { recursive: true }))
     .filter(
       (entry) =>
@@ -356,7 +360,11 @@ const signMacArchiveContents = Effect.fn("signMacArchiveContents")(function* (in
         "--sign",
         identity,
         ...(identity === "-" ? [] : ["--options", "runtime", "--timestamp"]),
-        ...(executables.includes(target) ? ["--entitlements", entitlements] : []),
+        ...(target === input.executablePath
+          ? ["--entitlements", entitlements]
+          : input.otherExecutablePaths.includes(target)
+            ? ["--entitlements", spawnerEntitlements]
+            : []),
         target,
       ]),
       `codesign ${path.relative(input.contentDir, target)}`,

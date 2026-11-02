@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Runs first thing in bin.ts, before the CLI's Effect runtime loads.
 import * as NodeFS from "node:fs";
+import * as NodeInspector from "node:inspector";
 import * as NodeSea from "node:sea";
 import * as NodeV8 from "node:v8";
 
@@ -13,9 +14,30 @@ export const MAX_SEMI_SPACE_ENV = "T3CODE_V8_MAX_SEMI_SPACE_MB";
 export const INHERITED_NODE_OPTIONS_ENV = "T3CODE_INHERITED_NODE_OPTIONS";
 
 const FLAG = "--max-semi-space-size";
+/** The escape hatch accepts caps up to this (MiB); V8 would take far more, which no server needs. */
+const MAX_SEMI_SPACE_MB_LIMIT = 1024;
 const BOOTSTRAP_FD_ENV = "T3CODE_BOOTSTRAP_FD";
 const DISABLED_VALUES = new Set(["0", "off", "false", "no"]);
 const SERVER_COMMANDS = new Set(["serve", "start", "__node-flags"]);
+/** Subcommands and fast paths that never run the server here: no file-system check for them. */
+const NON_SERVER_COMMANDS = new Set([
+  "acp-mcp-bridge",
+  "acp-mcp-call",
+  "__document-text",
+  "__managed-chatgpt-token",
+  "__process-spawner",
+  "__claude-history",
+  "__service-launcher",
+  "auth",
+  "connect",
+  "doctor",
+  "project",
+  "service",
+  "thread",
+  "up",
+  "update",
+  "uninstall",
+]);
 /** Root flags that print and exit; every other root flag (`--port`, `--no-browser`, `--base-dir`…) runs the server. */
 const NON_SERVER_ROOT_FLAGS = new Set([
   "--help",
@@ -97,7 +119,10 @@ export const resolveMaxSemiSpaceMb = (
   if (DISABLED_VALUES.has(setting)) return null;
   if (explicitMaxSemiSpace(env, execArgv).present) return null;
   const requested = Number(setting);
-  return setting !== "" && Number.isInteger(requested) && requested > 0
+  return setting !== "" &&
+    Number.isInteger(requested) &&
+    requested > 0 &&
+    requested <= MAX_SEMI_SPACE_MB_LIMIT
     ? requested
     : DEFAULT_MAX_SEMI_SPACE_MB;
 };
@@ -141,6 +166,7 @@ export const isServerCommand = (
   const command = argv[2];
   if (command === undefined) return true;
   if (SERVER_COMMANDS.has(command)) return true;
+  if (NON_SERVER_COMMANDS.has(command)) return false;
   if (command.startsWith("-")) return !NON_SERVER_ROOT_FLAGS.has(command);
   if (
     command === "." ||
@@ -153,6 +179,20 @@ export const isServerCommand = (
   }
   return isDirectory(command);
 };
+
+const INSPECTOR_FLAGS = [
+  "--inspect",
+  "--inspect-brk",
+  "--inspect-port",
+  "--inspect-wait",
+  "--debug-port",
+];
+
+/** Whether Node was started with an inspector flag on the command line or in NODE_OPTIONS. */
+const inspectorRequested = (env: Environment, execArgv: ReadonlyArray<string>): boolean =>
+  [...execArgv, ...tokenizeNodeOptions(env.NODE_OPTIONS)].some((arg) =>
+    INSPECTOR_FLAGS.includes(optionName(arg)),
+  );
 
 const bootstrapFdOf = (argv: ReadonlyArray<string>, env: Environment): string | undefined => {
   for (let index = 2; index < argv.length; index++) {
@@ -182,13 +222,15 @@ export const planYoungGenerationRelaunch = (input: {
   readonly hasIpcChannel: boolean;
   readonly isSea: boolean;
   readonly canExecve: boolean;
+  readonly inspectorActive?: boolean;
   readonly isDirectory?: (path: string) => boolean;
 }): RelaunchPlan => {
-  if (input.env[INHERITED_NODE_OPTIONS_ENV] !== undefined) {
+  // The marker counts only with the flag behind it; a stray one must not hide a missing cap.
+  if (
+    input.env[INHERITED_NODE_OPTIONS_ENV] !== undefined &&
+    explicitMaxSemiSpace(input.env, input.execArgv).present
+  ) {
     return { kind: "keep", reason: "the young-generation cap is already in effect" };
-  }
-  if (!isServerCommand(input.argv, input.isDirectory)) {
-    return { kind: "keep", reason: "not a server command" };
   }
   if (input.platform === "win32" || !input.canExecve) {
     return { kind: "keep", reason: "process.execve is unavailable on this platform" };
@@ -198,8 +240,15 @@ export const planYoungGenerationRelaunch = (input: {
   if (bootstrapFdOf(input.argv, input.env) !== undefined) {
     return { kind: "keep", reason: "started with a bootstrap descriptor" };
   }
+  // A second image would open a second inspector session and drop the attached debugger.
+  if (input.inspectorActive === true || inspectorRequested(input.env, input.execArgv)) {
+    return { kind: "keep", reason: "the inspector is active" };
+  }
   const mb = resolveMaxSemiSpaceMb(input.env, input.execArgv);
   if (mb === null) return { kind: "keep", reason: "disabled or set explicitly" };
+  if (!isServerCommand(input.argv, input.isDirectory)) {
+    return { kind: "keep", reason: "not a server command" };
+  }
   return {
     kind: "relaunch",
     file: input.execPath,
@@ -232,10 +281,12 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   const nodeOptionsAtStart = process.env.NODE_OPTIONS;
   const inherited = process.env[INHERITED_NODE_OPTIONS_ENV];
   if (inherited !== undefined) {
-    if (inherited === "") delete process.env.NODE_OPTIONS;
-    else process.env.NODE_OPTIONS = inherited;
     delete process.env[INHERITED_NODE_OPTIONS_ENV];
-    return { applied: true, nodeOptionsAtStart };
+    if (explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, process.execArgv).present) {
+      if (inherited === "") delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = inherited;
+      return { applied: true, nodeOptionsAtStart };
+    }
   }
   const plan = planYoungGenerationRelaunch({
     argv: process.argv,
@@ -247,6 +298,7 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
     hasIpcChannel: process.channel !== undefined,
     isSea: NodeSea.isSea(),
     canExecve: typeof process.execve === "function",
+    inspectorActive: NodeInspector.url() !== undefined,
   });
   if (plan.kind === "keep") return { applied: false, nodeOptionsAtStart, keptReason: plan.reason };
   const execve = process.execve;
@@ -292,15 +344,24 @@ export const describeNodeRuntime = (input: {
   youngGenerationDefault: input.applied,
 });
 
-/** What this process runs with, for the startup log; the outcome comes from bin.ts's call. */
-export const nodeRuntimeFlags = (): NodeRuntimeFlags =>
-  describeNodeRuntime({
+/** What this process runs with, for the startup log: parsed sizes only, never NODE_OPTIONS verbatim. */
+export const nodeRuntimeFlags = (): Omit<
+  NodeRuntimeFlags,
+  "nodeOptions" | "nodeOptionsForChildren"
+> => {
+  const {
+    nodeOptions: _nodeOptions,
+    nodeOptionsForChildren: _forChildren,
+    ...sizes
+  } = describeNodeRuntime({
     execArgv: process.execArgv,
     nodeOptionsAtStart: lastOutcome?.nodeOptionsAtStart ?? process.env.NODE_OPTIONS,
     nodeOptionsForChildren: process.env.NODE_OPTIONS,
     heapSizeLimitBytes: NodeV8.getHeapStatistics().heap_size_limit,
     applied: lastOutcome?.applied ?? false,
   });
+  return sizes;
+};
 
 const isOpenDescriptor = (fd: string): boolean => {
   const parsed = Number(fd);

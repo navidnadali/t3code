@@ -236,7 +236,9 @@ describe("planYoungGenerationRelaunch", () => {
     expect(result.env[INHERITED_NODE_OPTIONS_ENV]).toBe("");
   });
   it("keeps the process when the default is already in effect, disabled or explicit", () => {
-    expect(plan({ env: { [INHERITED_NODE_OPTIONS_ENV]: "" } }).kind).toBe("keep");
+    expect(plan({ env: { [INHERITED_NODE_OPTIONS_ENV]: "", NODE_OPTIONS: flag } }).kind).toBe(
+      "keep",
+    );
     expect(plan({ env: { [MAX_SEMI_SPACE_ENV]: "off" } }).kind).toBe("keep");
     expect(plan({ env: { NODE_OPTIONS: "--max-semi-space-size=32" } }).kind).toBe("keep");
     expect(plan({ execArgv: ["--max-semi-space-size=32"] }).kind).toBe("keep");

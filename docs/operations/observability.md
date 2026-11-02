@@ -202,18 +202,24 @@ once more if another command arrives.
 The spawner process and the worker run real processes even when a test injects a fake
 `ChildProcessSpawner` below these services; such a test sets `T3CODE_PROCESS_SPAWNER=default`.
 
-The server runs with a 64 MiB V8 young generation (`--max-semi-space-size=64`; Node's default is
-16 MiB). At 250 sessions that halves the scavenges, cuts GC time by 42 % and the event-loop delay
-maximum by 59 %, for about 128 MiB more RSS; below 100 sessions it changes nothing measurable. V8
+The server runs with a 64 MiB V8 young generation (`--max-semi-space-size=64`; Node 26's default
+behaves like 32 MiB). At 250 sessions that halves the scavenges, cuts GC time by 42 % and the
+event-loop delay maximum by 59 %, for about 128 MiB more RSS; at 50 sessions nothing measurable
+changes. The flag is process-wide, so worker isolates share the cap and may each grow by up to 64 MiB
+under load. V8
 reads the flag only at startup, so it travels in `NODE_OPTIONS`: a `t3 serve`, `t3 start`, `t3` or
 `t3 <dir>` (with any server flags) started without it relaunches itself once (`execve`, same pid,
 before any other work), the
 background service launcher passes it to the server it starts, and the server's children (agents,
 helpers) get the `NODE_OPTIONS` the server itself was given. `T3CODE_V8_MAX_SEMI_SPACE_MB=0` keeps
 Node's default, a positive integer sets another cap, and an explicit `--max-semi-space-size` in
-`NODE_OPTIONS` or on the command line is never overridden. A server started with an IPC channel or
-a bootstrap descriptor (`--bootstrap-fd`, `T3CODE_BOOTSTRAP_FD`) by a launcher that did not set the
-flag runs with Node's default, as does Windows. `t3 __node-flags` prints what the current process runs with.
+`NODE_OPTIONS` or on the command line is never overridden (values above 1024 MiB are ignored). A server
+started with an IPC channel or a bootstrap descriptor (`--bootstrap-fd`, `T3CODE_BOOTSTRAP_FD`) by a
+launcher that did not set the flag, or with the inspector (`--inspect*`), runs with Node's default; so does
+a direct `t3 serve` on Windows (no `execve`), while a Windows server the service launcher starts gets the
+flag through its environment. A `--require` preload in `NODE_OPTIONS` runs in both images (before and after
+the relaunch). `t3 __node-flags` prints what the current process runs with; `server.v8` logs the parsed
+sizes once the server listens.
 
 ### Related Artifacts
 

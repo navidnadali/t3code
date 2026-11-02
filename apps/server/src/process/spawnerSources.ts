@@ -1,0 +1,180 @@
+// @effect-diagnostics nodeBuiltinImport:off - The handshake id is a constant computed when the module loads.
+import * as NodeCrypto from "node:crypto";
+
+import serverPackage from "../../package.json" with { type: "json" };
+
+/** The spawner executable a single-executable build ships beside `t3`. */
+export const PROCESS_SPAWNER_EXECUTABLE = "t3-process-spawner";
+
+// Inline sources also run in bundles and single-executable builds without module files.
+const spawnProtocolSource = `
+const streamNames = ["stdout", "stderr"];
+const children = new Map();
+const errorFields = (error) => {
+  if (!(error instanceof Error)) return { name: "Error", message: String(error) };
+  const fields = { name: error.name, message: error.message, stack: error.stack };
+  for (const key of ["code", "errno", "syscall", "path", "spawnargs"]) {
+    if (error[key] !== undefined) fields[key] = error[key];
+  }
+  return fields;
+};
+const start = (message) => {
+  const id = message.id;
+  let child;
+  try {
+    child = spawn(message.command, message.args, message.options);
+  } catch (error) {
+    post({ t: "throw", id, error: errorFields(error) });
+    return;
+  }
+  const entry = { child, detached: message.options.detached === true, inflight: [0, 0], paused: [false, false] };
+  children.set(id, entry);
+  if (child.pid !== undefined) started(id, child.pid);
+  child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));
+  child.on("error", (error) => post({ t: "error", id, error: errorFields(error) }));
+  child.on("exit", (code, signal) => post({ t: "exit", id, code, signal }));
+  child.on("close", () => {
+    children.delete(id);
+    post({ t: "close", id });
+  });
+  child.stdin.on("error", (error) => post({ t: "stdin-error", id, error: errorFields(error) }));
+  streamNames.forEach((name, s) => {
+    const stream = child[name];
+    stream.on("data", (chunk) => {
+      const data = new Uint8Array(chunk.byteLength);
+      data.set(chunk);
+      entry.inflight[s] += data.byteLength;
+      post({ t: "data", id, s, chunk: data }, [data.buffer]);
+      if (entry.inflight[s] >= windowBytes && !entry.paused[s]) {
+        entry.paused[s] = true;
+        stream.pause();
+      }
+    });
+    stream.on("end", () => post({ t: "end", id, s }));
+    stream.on("error", (error) => post({ t: "stream-error", id, s, error: errorFields(error) }));
+  });
+};
+const destroyedStdin = { name: "Error", message: "Cannot call write after a stream was destroyed", code: "ERR_STREAM_DESTROYED" };
+const onMessage = (message) => {
+  const entry = children.get(message.id);
+  switch (message.t) {
+    case "spawn":
+      start(message);
+      return;
+    case "stdin":
+      if (entry === undefined) return post({ t: "stdin-done", id: message.id, seq: message.seq, error: destroyedStdin });
+      entry.child.stdin.write(message.chunk, (error) =>
+        post({ t: "stdin-done", id: message.id, seq: message.seq, error: error ? errorFields(error) : undefined }),
+      );
+      return;
+    case "stdin-end":
+      if (entry === undefined) return post({ t: "stdin-done", id: message.id, seq: message.seq, error: destroyedStdin });
+      entry.child.stdin.end((error) =>
+        post({ t: "stdin-done", id: message.id, seq: message.seq, error: error ? errorFields(error) : undefined }),
+      );
+      return;
+    case "stdin-destroy":
+      if (entry !== undefined) entry.child.stdin.destroy();
+      return;
+    case "kill": {
+      if (entry === undefined) return post({ t: "kill-result", id: message.id, seq: message.seq, killed: false });
+      let killed;
+      try {
+        killed = entry.child.kill(message.signal);
+      } catch (error) {
+        return post({ t: "kill-result", id: message.id, seq: message.seq, killed: false, error: errorFields(error) });
+      }
+      return post({ t: "kill-result", id: message.id, seq: message.seq, killed });
+    }
+    case "ack":
+      if (entry === undefined) return;
+      entry.inflight[message.s] -= message.bytes;
+      if (entry.paused[message.s] && entry.inflight[message.s] < windowBytes) {
+        entry.paused[message.s] = false;
+        entry.child[streamNames[message.s]].resume();
+      }
+      return;
+  }
+};
+`;
+
+export const spawnWorkerSource = `
+"use strict";
+const { parentPort, workerData } = require("node:worker_threads");
+const { spawn } = require("node:child_process");
+const windowBytes = workerData.windowBytes;
+const post = (message, transfer) => parentPort.postMessage(message, transfer);
+const started = () => {};
+${spawnProtocolSource}
+parentPort.on("message", onMessage);
+`;
+
+const spawnerProcessBody = `
+const { spawn } = require("node:child_process");
+const windowBytes = Number(process.argv[process.argv.length - 1]);
+// A reply racing the server's disconnect must not crash the spawner before it kills its children.
+const post = (message) => {
+  if (process.connected) process.send(message, () => {});
+};
+// Written at once, before any reply, so the server can kill this child even if the spawner dies.
+const started = (id, pid) => {
+  try {
+    require("node:fs").writeSync(1, id + " " + pid + "\\n");
+  } catch {}
+};
+${spawnProtocolSource}
+process.title = "t3-process-spawner";
+process.on("message", onMessage);
+post({ t: "ready", protocol: handshake.protocol, build: handshake.build });
+const killChildren = () => {
+  for (const { child, detached } of children.values()) {
+    try {
+      if (detached && child.pid > 1) process.kill(-child.pid, "SIGKILL");
+      else child.kill("SIGKILL");
+    } catch {}
+  }
+};
+// Launched detached, the spawner leads its own process group (never the server's): ending that group
+// also ends what children spawned with detached: false left behind, and the spawner with them.
+const exitWithGroup = (code, reason) => {
+  try {
+    require("node:fs").writeSync(1, "exit " + reason.replace(/\\s+/g, " ") + "\\n");
+  } catch {}
+  killChildren();
+  try {
+    if (process.pid > 1) process.kill(-process.pid, "SIGKILL");
+  } catch {}
+  process.exit(code);
+};
+process.on("disconnect", () => exitWithGroup(0, "its channel closed"));
+process.on("uncaughtException", (error) => {
+  try {
+    require("node:fs").writeSync(2, "t3-process-spawner: " + (error && error.stack ? error.stack : String(error)) + "\\n");
+  } catch {}
+  exitWithGroup(70, "uncaught error: " + (error && error.message ? error.message : String(error)));
+});
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.once(signal, () => exitWithGroup(128 + require("node:os").constants.signals[signal], "received " + signal));
+}
+`;
+
+/** What a spawner process says first: the server kills one that says anything else. */
+export const spawnerHandshake = {
+  protocol: NodeCrypto.createHash("sha256").update(spawnerProcessBody).digest("hex").slice(0, 16),
+  build: serverPackage.version,
+};
+
+/**
+ * The spawner process: the server's IPC channel closes when the server exits, however it exits,
+ * and the spawner then kills every child it started and exits too; it does the same when it
+ * fails or is asked to stop. Only a SIGKILL of the spawner between a fork and the PID report
+ * written right after it can leave a child the server does not know (Node exposes no PDEATHSIG).
+ */
+export const spawnerProcessSource = `"use strict";
+const handshake = { protocol: "${spawnerHandshake.protocol}", build: "${spawnerHandshake.build}" };
+${spawnerProcessBody}`;
+
+/** Entry of `t3 __process-spawner <windowBytes>`: single executables cannot evaluate `-e`. */
+export const runProcessSpawner = () => {
+  new Function("require", spawnerProcessSource)((id: string) => process.getBuiltinModule(id));
+};

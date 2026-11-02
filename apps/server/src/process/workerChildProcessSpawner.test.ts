@@ -162,14 +162,69 @@ const fakeClock = () => {
   };
 };
 
+interface CapturedLog {
+  readonly level: string;
+  readonly message: unknown;
+  readonly text: string;
+}
+
 const capturedLogs = () => {
-  const logs: Array<{ readonly level: string; readonly message: unknown }> = [];
+  const logs: Array<CapturedLog> = [];
+  const waiters = new Set<{
+    match: (log: CapturedLog) => boolean;
+    done: (log: CapturedLog) => void;
+  }>();
   const layer = Logger.layer(
-    [Logger.make(({ logLevel, message }) => logs.push({ level: logLevel, message }))],
+    [
+      Logger.make(({ logLevel, message }) => {
+        const parts = Array.isArray(message) ? message : [message];
+        const log = { level: logLevel, message, text: parts.map(String).join(" ") };
+        logs.push(log);
+        for (const waiter of waiters) if (waiter.match(log)) waiter.done(log);
+      }),
+    ],
     { mergeWithExisting: false },
   );
-  return { logs, layer };
+  // Resolves on the first log, past or future, that matches.
+  const waitFor = (match: (log: CapturedLog) => boolean) =>
+    Effect.callback<CapturedLog>((resume) => {
+      const found = logs.find(match);
+      if (found !== undefined) return resume(Effect.succeed(found));
+      const waiter = {
+        match,
+        done: (log: CapturedLog) => {
+          waiters.delete(waiter);
+          resume(Effect.succeed(log));
+        },
+      };
+      waiters.add(waiter);
+      return Effect.sync(() => waiters.delete(waiter));
+    });
+  return { logs, layer, waitFor };
 };
+
+// Spawner timers the test fires by hand, announced as the spawner schedules them.
+const manualTimers = Effect.gen(function* () {
+  const handshake = yield* Queue.unbounded<() => void>();
+  const start = yield* Queue.unbounded<() => void>();
+  const timers: WorkerChildProcessSpawner.SpawnerTimers = {
+    schedule: (kind, run) => {
+      let live = true;
+      Queue.offerUnsafe(kind === "handshake" ? handshake : start, () => {
+        if (live) run();
+        live = false;
+      });
+      return () => {
+        live = false;
+      };
+    },
+  };
+  return {
+    timers,
+    fireHandshake: Effect.flatMap(Queue.take(handshake), (fire) => Effect.sync(fire)),
+    fireStart: Effect.flatMap(Queue.take(start), (fire) => Effect.sync(fire)),
+  };
+});
 
 describe("WorkerChildProcessSpawner", () => {
   for (const remote of remotes) {
@@ -819,6 +874,148 @@ describe("WorkerChildProcessSpawner", () => {
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
     },
   );
+
+  it.live.skipIf(!workerPlatform)(
+    "a spawner process that never answers is killed when its start-up handshake times out",
+    () => {
+      const { layer, waitFor } = capturedLogs();
+      return Effect.gen(function* () {
+        const { calls, spawner } = yield* recordingSpawner;
+        const { timers, fireHandshake } = yield* manualTimers;
+        // A process that never says anything.
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(spawner, {
+          source: "setInterval(() => {}, 1 << 30)",
+          timers,
+        });
+        const pending = yield* Effect.forkScoped(spawnError(remoteSpawner, node("1")));
+        yield* fireHandshake;
+        expect(yield* Fiber.join(pending)).toMatchObject({
+          method: "spawn",
+          causeMessage: "The process spawner stopped",
+        });
+        expect((yield* waitFor(({ level }) => level === "Warn")).text).toContain("did not answer");
+        expect(calls).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
+    },
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "a start the spawner process never answers fails and the spawner is restarted",
+    () => {
+      const { layer, waitFor } = capturedLogs();
+      return Effect.gen(function* () {
+        const { calls, spawner } = yield* recordingSpawner;
+        const { timers, fireStart } = yield* manualTimers;
+        const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
+          'case "spawn":',
+          'case "spawn": if (message.args.includes("ignored")) return;',
+        );
+        expect(source).not.toBe(WorkerChildProcessSpawner.spawnerProcessSource);
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(spawner, {
+          source,
+          timers,
+        });
+        const ignored = ChildProcess.make(process.execPath, ["-e", "1", "ignored"]);
+        const pending = yield* Effect.forkScoped(spawnError(remoteSpawner, ignored));
+        yield* fireStart;
+        expect(yield* Fiber.join(pending)).toMatchObject({
+          method: "spawn",
+          causeMessage: "The process spawner stopped",
+        });
+        expect((yield* waitFor(({ level }) => level === "Warn")).text).toContain(
+          "did not answer a start",
+        );
+        // The restarted spawner answers the next command.
+        expect(
+          (yield* collect(remoteSpawner, node("process.stdout.write('ok')"))).stdout.toString(),
+        ).toBe("ok");
+        expect(calls).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
+    },
+  );
+
+  it.live.skipIf(!workerPlatform)(
+    "interrupting a start the spawner process has not answered returns at once and kills the child",
+    () =>
+      Effect.gen(function* () {
+        const nodeSpawner = yield* ChildProcessSpawner;
+        const watch = yield* childWatch;
+        // The spawner starts this child but never answers its start.
+        const source = WorkerChildProcessSpawner.spawnerProcessSource.replace(
+          'child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));',
+          'child.on("spawn", () => message.args.includes("unanswered") || post({ t: "spawn", id, pid: child.pid }));',
+        );
+        expect(source).not.toBe(WorkerChildProcessSpawner.spawnerProcessSource);
+        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner, {
+          source,
+        });
+        const pending = yield* Effect.forkScoped(
+          remoteSpawner
+            .spawn(ChildProcess.make(process.execPath, ["-e", watch.connectScript(), "unanswered"]))
+            .pipe(Effect.scoped),
+        );
+        const socket = yield* watch.connected;
+        // As a command's own timeout does.
+        yield* Fiber.interrupt(pending);
+        yield* watch.closed(socket);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  for (const unusable of [
+    "not executable",
+    "exits at once",
+    "speaks another protocol",
+    "never answers",
+  ] as const) {
+    it.live.skipIf(!workerPlatform)(
+      `a single executable whose spawner executable ${unusable} falls back to the CLI entry`,
+      () => {
+        const { layer, waitFor } = capturedLogs();
+        return Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const { timers, fireHandshake } = yield* manualTimers;
+          const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-process-spawner-" });
+          const invocations = path.join(directory, "t3-invocations");
+          const executable = path.join(directory, "t3");
+          const entry = path.join(import.meta.dirname, "..", "bin.ts");
+          yield* fs.writeFileString(
+            executable,
+            `#!/bin/sh\necho "$@" >> ${JSON.stringify(invocations)}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(entry)} "$@"\n`,
+          );
+          yield* fs.chmod(executable, 0o755);
+          const node = JSON.stringify(process.execPath);
+          const script = {
+            "not executable": "#!/bin/sh\nexit 0\n",
+            "exits at once": "#!/bin/sh\nexit 3\n",
+            "speaks another protocol": `#!/bin/sh\nexec ${node} -e 'process.send({ t: "ready", protocol: "other", build: "0" }); process.on("message", () => {})'\n`,
+            "never answers": `#!/bin/sh\nexec ${node} -e 'process.on("message", () => {})'\n`,
+          }[unusable];
+          const spawnerExecutable = path.join(
+            directory,
+            WorkerChildProcessSpawner.PROCESS_SPAWNER_EXECUTABLE,
+          );
+          yield* fs.writeFileString(spawnerExecutable, script);
+          yield* fs.chmod(spawnerExecutable, unusable === "not executable" ? 0o644 : 0o755);
+          const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner, {
+            timers,
+          }).pipe(
+            Effect.provideService(HostProcess.ExecutablePath, executable),
+            Effect.provideService(HostProcess.IsExecutable, true),
+          );
+          if (unusable === "never answers") yield* fireHandshake;
+          yield* waitFor(({ text }) => text.includes("falls back to the CLI entry"));
+          const command = ChildProcess.make("git", ["--version"]);
+          expect(yield* collect(remoteSpawner, command)).toEqual(
+            yield* collect(nodeSpawner, command),
+          );
+          const ran = (yield* fs.readFileString(invocations)).trim().split("\n");
+          expect(ran).toEqual([expect.stringMatching(/^__process-spawner /)]);
+        }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
+      },
+    );
+  }
 
   it.live.skipIf(!workerPlatform)(
     "closing the spawner process kills the children it still runs and ends the spawner",

@@ -1134,9 +1134,18 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
  * that stops is restarted; one that stops again before starting a command, or more than
  * `spawnerRestartLimit` times in its window, is down: commands fail until its cool-down has passed.
  */
+/** Schedules the spawner's answer deadlines; tests fire them by hand. */
+export interface SpawnerTimers {
+  readonly schedule: (kind: "handshake" | "start", run: () => void) => () => void;
+}
+
 export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   fallback: ChildProcessSpawner["Service"],
-  options: { readonly source?: string; readonly windowBytes?: number } = {},
+  options: {
+    readonly source?: string;
+    readonly windowBytes?: number;
+    readonly timers?: SpawnerTimers;
+  } = {},
 ) {
   const windowBytes = options.windowBytes ?? STREAM_WINDOW_BYTES;
   const executable = yield* HostProcess.ExecutablePath;

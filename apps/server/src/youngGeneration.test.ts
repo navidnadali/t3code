@@ -17,6 +17,7 @@ import {
   planYoungGenerationRelaunch,
   resolveMaxSemiSpaceMb,
   serverChildEnvironment,
+  tokenizeNodeOptions,
 } from "./youngGeneration.ts";
 
 const flag = `--max-semi-space-size=${DEFAULT_MAX_SEMI_SPACE_MB}`;
@@ -59,6 +60,33 @@ describe("resolveMaxSemiSpaceMb", () => {
     ).toBeNull();
     expect(resolveMaxSemiSpaceMb({}, ["--max-semi-space-size=8"])).toBeNull();
     expect(resolveMaxSemiSpaceMb({ NODE_OPTIONS: "--max-old-space-size=16384" }, [])).toBe(64);
+  });
+});
+
+describe("tokenizeNodeOptions", () => {
+  it("splits like Node: spaces separate, double quotes group, a backslash in quotes escapes", () => {
+    expect(tokenizeNodeOptions(undefined)).toEqual([]);
+    expect(tokenizeNodeOptions("  --a   --b=1 ")).toEqual(["--a", "--b=1"]);
+    expect(tokenizeNodeOptions('--require "./my path/file.js" --c')).toEqual([
+      "--require",
+      "./my path/file.js",
+      "--c",
+    ]);
+    expect(tokenizeNodeOptions('"--max-semi-space-size=16"')).toEqual(["--max-semi-space-size=16"]);
+    expect(tokenizeNodeOptions('--max-semi-space-size="16"')).toEqual(["--max-semi-space-size=16"]);
+    expect(tokenizeNodeOptions('--title="say \\"hi\\""')).toEqual(['--title=say "hi"']);
+  });
+  it("recognises every spelling of the flag Node accepts", () => {
+    for (const nodeOptions of [
+      '"--max-semi-space-size=16"',
+      '--max-semi-space-size="16"',
+      "--max_semi_space_size=16",
+      "--max-semi-space-size 16",
+      "--max-semi-space-size",
+    ]) {
+      expect(resolveMaxSemiSpaceMb({ NODE_OPTIONS: nodeOptions }, []), nodeOptions).toBeNull();
+    }
+    expect(resolveMaxSemiSpaceMb({}, ["--max_semi_space_size=8"])).toBeNull();
   });
 });
 
@@ -141,10 +169,24 @@ describe("isServerCommand", () => {
     expect(isServerCommand(argv("."))).toBe(true);
     expect(isServerCommand(argv("./my-project"))).toBe(true);
     expect(isServerCommand(argv("C:\\work"))).toBe(true);
-    expect(isServerCommand(argv("--help"))).toBe(false);
-    expect(isServerCommand(argv("auth", "session", "issue"))).toBe(false);
-    expect(isServerCommand(argv("acp-mcp-bridge"))).toBe(false);
-    expect(isServerCommand(argv("__process-spawner"))).toBe(false);
+    const isDirectory = (path: string) => path === "my-project";
+    expect(isServerCommand(argv("my-project"), isDirectory)).toBe(true);
+    expect(isServerCommand(argv("my-project", "--port", "3773"), isDirectory)).toBe(true);
+    expect(isServerCommand(argv("nonexistent"), isDirectory)).toBe(false);
+    for (const flags of [
+      ["--no-browser"],
+      ["--port", "3773"],
+      ["--base-dir", "/tmp/t3"],
+      ["--lan"],
+    ]) {
+      expect(isServerCommand(argv(...flags), isDirectory), flags.join(" ")).toBe(true);
+    }
+    for (const flag of ["--help", "-h", "--version", "-v", "-V", "--completions", "--wizard"]) {
+      expect(isServerCommand(argv(flag), isDirectory), flag).toBe(false);
+    }
+    expect(isServerCommand(argv("auth", "session", "issue"), isDirectory)).toBe(false);
+    expect(isServerCommand(argv("acp-mcp-bridge"), isDirectory)).toBe(false);
+    expect(isServerCommand(argv("__process-spawner"), isDirectory)).toBe(false);
   });
 });
 
@@ -197,6 +239,18 @@ describe("planYoungGenerationRelaunch", () => {
     expect(plan({ hasIpcChannel: true }).kind).toBe("keep");
     expect(plan({ argv: ["node", "bin.mjs", "serve", "--bootstrap-fd", "3"] }).kind).toBe("keep");
     expect(plan({ argv: ["node", "bin.mjs", "serve", "--bootstrap-fd=3"] }).kind).toBe("keep");
+    expect(plan({ env: { T3CODE_BOOTSTRAP_FD: "3" } }).kind).toBe("keep");
+  });
+  it("relaunches root invocations that run the server with flags or an existing directory", () => {
+    expect(plan({ argv: ["node", "bin.mjs", "--no-browser"] }).kind).toBe("relaunch");
+    expect(plan({ argv: ["node", "bin.mjs", "--port", "3773"] }).kind).toBe("relaunch");
+    expect(
+      plan({
+        argv: ["node", "bin.mjs", "my-project"],
+        isDirectory: (path) => path === "my-project",
+      }).kind,
+    ).toBe("relaunch");
+    expect(plan({ argv: ["node", "bin.mjs", "--help"] }).kind).toBe("keep");
   });
 });
 
@@ -293,6 +347,58 @@ describe("the entrypoint", () => {
       expect(report.maxSemiSpaceMb).toBeNull();
       expect(report.keptReason).toContain("descriptor");
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("never overrides a quoted or underscored explicit flag either", () =>
+    Effect.gen(function* () {
+      const quoted = yield* run({ NODE_OPTIONS: '--max-semi-space-size="16"' });
+      expect(quoted.applied).toBe(false);
+      expect(quoted.maxSemiSpaceMb).toBe(16);
+      const underscored = yield* run({ NODE_OPTIONS: "--max_semi_space_size=16" });
+      expect(underscored.applied).toBe(false);
+      expect(underscored.maxSemiSpaceMb).toBe(16);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "does not relaunch a server whose bootstrap descriptor comes from the environment, and keeps it open",
+    () =>
+      Effect.promise(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            const child = NodeChildProcess.spawn(
+              process.execPath,
+              ["--experimental-strip-types", binPath, "__node-flags"],
+              {
+                env: Object.fromEntries(
+                  Object.entries({ ...process.env, ...cleanEnv, T3CODE_BOOTSTRAP_FD: "3" }).flatMap(
+                    ([name, value]) => (value === undefined ? [] : [[name, value]]),
+                  ),
+                ),
+                stdio: ["ignore", "pipe", "pipe", "pipe"],
+              },
+            );
+            let stdout = "";
+            let stderr = "";
+            child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+            child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+            child.on("error", reject);
+            child.on("exit", (code) => {
+              try {
+                expect(code, stderr).toBe(0);
+                const report = JSON.parse(stdout) as NodeFlagsReport & {
+                  readonly bootstrapFdOpen?: boolean;
+                };
+                expect(report.applied).toBe(false);
+                expect(report.keptReason).toContain("descriptor");
+                expect(report.bootstrapFdOpen).toBe(true);
+                resolve();
+              } catch (error) {
+                reject(error);
+              }
+            });
+          }),
+      ),
   );
 
   it.live("does not relaunch a server its parent talks to over IPC, and keeps the channel", () =>

@@ -432,3 +432,64 @@ it.effect("a scratch file left behind by a crash is replaced, never read", () =>
     assert.isFalse(NodeFS.existsSync(scratchPath));
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );
+
+it.effect("a scratch file that cannot be removed is logged, and does not fail the pass", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seedStore();
+    const before = yield* scanRows();
+    const reference = referenceCompaction(before);
+    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+    let replaced = false;
+    // While the pass holds the file open, a directory takes its path: unlinking it at the end fails.
+    const betweenPages = Effect.sync(() => {
+      if (replaced) return;
+      replaced = true;
+      NodeFS.rmSync(scratchPath);
+      NodeFS.mkdirSync(scratchPath);
+    });
+    const summary = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
+    assert.equal(summary.deletedEventCount, reference.obsolete.size);
+    const after = yield* sql<{ readonly sequence: number }>`
+      SELECT sequence FROM orchestration_events ORDER BY sequence
+    `;
+    const remaining = new Set(after.map((row) => row.sequence));
+    assert.deepEqual(
+      new Set(before.map((row) => row.sequence).filter((sequence) => !remaining.has(sequence))),
+      reference.obsolete,
+    );
+    assert.isTrue(NodeFS.statSync(scratchPath).isDirectory());
+    for (const file of [`${scratchPath}-wal`, `${scratchPath}-shm`]) {
+      assert.isFalse(NodeFS.existsSync(file), file);
+    }
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+it.effect("a failure while preparing the scratch store fails the pass and leaves no files", () =>
+  Effect.gen(function* () {
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seedStore();
+    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+    yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        vi.spyOn(NodeSqlite.DatabaseSync.prototype, "exec").mockImplementationOnce(() => {
+          throw new Error("scratch store setup failed");
+        }),
+      ),
+      (spy) => Effect.sync(() => spy.mockRestore()),
+    );
+    // A typed failure (never a defect), naming the scratch store underneath the pass's own error.
+    const error = yield* maintenance
+      .compactEventStore(Effect.void, { scratchPath })
+      .pipe(Effect.flip);
+    const inner = error.cause;
+    assert.isTrue(
+      inner instanceof ProjectionMaintenance.ProjectionMaintenanceError &&
+        inner.operation === "compaction scratch store",
+    );
+    for (const file of [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`]) {
+      assert.isFalse(NodeFS.existsSync(file), file);
+    }
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);

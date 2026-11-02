@@ -353,10 +353,13 @@ const make = Effect.gen(function* () {
       ),
       Effect.forkScoped({ startImmediately: true }),
     );
-    const continueFrom = (sequence: number, now: number) => {
+    // Continues from `sequence`: what it covers is released, and `keep` decides the rest. Deltas
+    // held before the stream had a position were never admitted, so opening admits them once;
+    // after a reset, what the buffer holds was admitted when offered and stays.
+    const continueFrom = (sequence: number, keep: (delta: VersionedShellDelta) => boolean) => {
       afterSequence = sequence;
       for (const [key, item] of pending) {
-        if (item.value.sequence <= sequence || !admission.admit(item.value, now)) {
+        if (item.value.sequence <= sequence || !keep(item.value)) {
           budget.release([item]);
           pending.delete(key);
         }
@@ -367,7 +370,11 @@ const make = Effect.gen(function* () {
       Effect.clockWith((clock) =>
         Effect.sync(() => {
           if (closed) return;
-          continueFrom(sequence, clock.currentTimeMillisUnsafe());
+          const now = clock.currentTimeMillisUnsafe();
+          continueFrom(sequence, (delta) => admission.admit(delta, now));
+          // A reset the snapshot covers (everything dropped is at or below its sequence) needs
+          // no resync; a later one does, and the stream starts with it.
+          if (resetThrough !== undefined && resetThrough <= sequence) resetThrough = undefined;
           if (resetThrough !== undefined) Queue.offerUnsafe(ready, undefined);
         }),
       );
@@ -381,17 +388,28 @@ const make = Effect.gen(function* () {
           if (resetThrough !== undefined) {
             return resyncBase(resetThrough).pipe(
               Effect.flatMap(({ read, base }) =>
-                Effect.clockWith((clock) =>
-                  Effect.sync(() => {
-                    // A reset the read does not cover keeps the flag: the next pull resyncs again.
-                    if (resetThrough !== undefined && resetThrough <= read.coversThrough) {
-                      resetThrough = undefined;
-                    }
-                    continueFrom(base.snapshotSequence, clock.currentTimeMillisUnsafe());
-                    const resync: ShellResync = { kind: "resync", base };
-                    return [{ value: resync, serializedBytes: 0 }] as Arr.NonEmptyArray<Delivered>;
-                  }),
-                ),
+                Effect.suspend(() => {
+                  // A started stream resets only on deltas past its position, and the base is
+                  // read after they were committed, so it is never behind the position. A store
+                  // that breaks this must not roll the subscriber back: its stream ends instead.
+                  if (afterSequence !== undefined && base.snapshotSequence < afterSequence) {
+                    return Effect.fail(
+                      new ShellDeltaHubError({
+                        message: "The shell resync base is behind the subscriber",
+                        cause: { snapshotSequence: base.snapshotSequence, afterSequence },
+                      }),
+                    );
+                  }
+                  // A reset the read does not cover keeps the flag: the next pull resyncs again.
+                  if (resetThrough !== undefined && resetThrough <= read.coversThrough) {
+                    resetThrough = undefined;
+                  }
+                  continueFrom(base.snapshotSequence, () => true);
+                  const resync: ShellResync = { kind: "resync", base };
+                  return Effect.succeed([
+                    { value: resync, serializedBytes: 0 },
+                  ] as Arr.NonEmptyArray<Delivered>);
+                }),
               ),
             );
           }

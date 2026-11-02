@@ -1304,7 +1304,7 @@ const queryPlan = Effect.fn("queryPlan")(function* (statement: string | undefine
 });
 
 // Each message's first item orders it, not the stored message order (the assistant reply is stored
-// first); the message-ordinal statement reads those ordinals through migration 78's index.
+// first); the message-ordinal statement reads those ordinals through fork migration 2's index.
 const messageOrdinalsReadThroughTheirIndex = Effect.gen(function* () {
   const store = yield* ProjectionStore.ProjectionStoreV2;
   const sql = yield* SqlClient.SqlClient;

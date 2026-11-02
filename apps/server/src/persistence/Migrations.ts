@@ -1,6 +1,7 @@
 import * as Migrator from "effect/sql/Migrator";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
+import { moveRc1PerfForkMigrations, runPerfForkMigrations } from "./PerfForkMigrations.ts";
 import { reconcileV2PreviewMigration } from "./reconcileV2PreviewMigration.ts";
 
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -79,8 +80,6 @@ import Migration0073 from "./Migrations/073_ActiveTurnItemIndexes.ts";
 import Migration0074 from "./Migrations/074_ExcludeAttachmentPlaceholdersFromSearch.ts";
 import Migration0075 from "./Migrations/075_SubagentDeliveryState.ts";
 import Migration0076 from "./Migrations/076_ProjectionProjectsPinArchive.ts";
-import Migration0077 from "./Migrations/077_ProjectionTurnItemCounts.ts";
-import Migration0078 from "./Migrations/078_TurnItemMessageOrdinalIndex.ts";
 
 const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -160,8 +159,6 @@ const migrationEntries = [
   [74, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
   [75, "SubagentDeliveryState", Migration0075],
   [76, "ProjectionProjectsPinArchive", Migration0076],
-  [77, "ProjectionTurnItemCounts", Migration0077],
-  [78, "TurnItemMessageOrdinalIndex", Migration0078],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -212,13 +209,19 @@ const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function*
 
 const run = Migrator.make({});
 
+const LATEST_MIGRATION_ID = Math.max(...migrationEntries.map(([id]) => id));
+
 export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
+  readonly toPerfForkMigrationInclusive?: number | undefined;
 }
 
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
+  toPerfForkMigrationInclusive,
 }: RunMigrationsOptions = {}) {
+  // Before upstream's chain reads its ledger: release candidate 1 recorded the fork's there.
+  yield* moveRc1PerfForkMigrations();
   const includesV2 =
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
   const previewMigrations = includesV2 ? yield* reconcileV2PreviewMigration() : [];
@@ -253,6 +256,9 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
     yield* Effect.logWarning(
       "Database migration history diverges from this build; recorded migration ids are skipped, not reconciled by name.",
     ).pipe(Effect.annotateLogs({ divergent }));
+  }
+  if (toMigrationInclusive === undefined || toMigrationInclusive >= LATEST_MIGRATION_ID) {
+    yield* runPerfForkMigrations(toPerfForkMigrationInclusive);
   }
   return executedMigrations;
 });

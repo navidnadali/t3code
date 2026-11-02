@@ -236,7 +236,7 @@ export const rebuildSearch = Effect.gen(function* () {
 });
 
 /**
- * Migration 77's recount of the turn item counts (clear, then refill from the items), when the
+ * Fork migration 1's recount of the turn item counts (clear, then refill from the items), when the
  * database has the table: the content pass runs with its triggers dropped.
  */
 export const recountTurnItemCounts = Effect.gen(function* () {

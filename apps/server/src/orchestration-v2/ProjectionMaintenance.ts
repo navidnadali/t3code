@@ -68,7 +68,7 @@ export const layer: Layer.Layer<
     const eventStore = yield* EventStore.EventStoreV2;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
 
-    // Migration 77 adds the maintained counts; maintenance also runs on older schemas.
+    // Fork migration 1 adds the maintained counts; maintenance also runs on older schemas.
     const hasTurnItemCounts = sql`
       SELECT 1 FROM sqlite_schema
       WHERE type = 'table' AND name = 'orchestration_v2_projection_turn_item_counts'

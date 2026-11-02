@@ -1,5 +1,9 @@
 import packageJson from "../../package.json" with { type: "json" };
 import { BUILD_MIGRATION_HEAD, recordedMigrations } from "../persistence/databaseMigrationHead.ts";
+import {
+  PERF_FORK_MIGRATION_HEAD,
+  PERF_FORK_MIGRATIONS_TABLE,
+} from "../persistence/PerfForkMigrations.ts";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
 
 export type ServicePreflightResult =
@@ -58,9 +62,17 @@ export function runServicePreflight(input: {
  * Startup already handles renamed ids this build knows. */
 function newerRecordedMigrations(databasePath: string): ReadonlyArray<string> | null {
   const recorded = recordedMigrations(databasePath);
-  return recorded === null
+  const recordedFork = recordedMigrations(databasePath, PERF_FORK_MIGRATIONS_TABLE);
+  return recorded === null || recordedFork === null
     ? null
-    : recorded.filter(({ id }) => id > BUILD_MIGRATION_HEAD).map(({ id, name }) => `${id}_${name}`);
+    : [
+        ...recorded
+          .filter(({ id }) => id > BUILD_MIGRATION_HEAD)
+          .map(({ id, name }) => `${id}_${name}`),
+        ...recordedFork
+          .filter(({ id }) => id > PERF_FORK_MIGRATION_HEAD)
+          .map(({ id, name }) => `${PERF_FORK_MIGRATIONS_TABLE}:${id}_${name}`),
+      ];
 }
 
 export function decodeServicePreflightResult(value: unknown): ServicePreflightResult | undefined {

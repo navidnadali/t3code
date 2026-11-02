@@ -54,7 +54,7 @@ export const CLEARED_TABLES: ReadonlyArray<string> = [
   "pull_request_review_guides",
 ];
 
-/** Turn items per thread and run (P1-014's migration 77), kept by triggers: counts and ids. */
+/** Turn items per thread and run (P1-014's fork migration 1), kept by triggers: counts and ids. */
 const TURN_ITEM_COUNTS = "orchestration_v2_projection_turn_item_counts";
 
 /**
@@ -63,6 +63,7 @@ const TURN_ITEM_COUNTS = "orchestration_v2_projection_turn_item_counts";
  */
 const STRUCTURAL_TABLES: ReadonlySet<string> = new Set([
   "effect_sql_migrations",
+  "t3_perf_fork_migrations",
   "orchestration_v2_projection_metadata",
   TURN_ITEM_COUNTS,
 ]);

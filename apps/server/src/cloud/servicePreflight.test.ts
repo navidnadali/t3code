@@ -11,6 +11,10 @@ import {
   databaseMigrationHead,
 } from "../persistence/databaseMigrationHead.ts";
 import { migrationManifest } from "../persistence/Migrations.ts";
+import {
+  PERF_FORK_MIGRATION_HEAD,
+  PERF_FORK_MIGRATIONS_TABLE,
+} from "../persistence/PerfForkMigrations.ts";
 
 import { runServicePreflight } from "./servicePreflight.ts";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
@@ -74,6 +78,43 @@ it.layer(NodeServices.layer)("service preflight database", (it) => {
       // A missing database is a fresh install.
       expect(databaseMigrationHead(path.join(path.dirname(databasePath), "missing.sqlite"))).toBe(
         BUILD_MIGRATION_HEAD,
+      );
+    }),
+  );
+
+  it.effect("passes the fork's release candidate 1 rows and blocks a newer fork migration", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const databasePath = path.join(
+        yield* fs.makeTempDirectoryScoped({ prefix: "t3-preflight-" }),
+        "state.sqlite",
+      );
+      const db = new NodeSqlite.DatabaseSync(databasePath);
+      db.exec("CREATE TABLE effect_sql_migrations (migration_id INTEGER PRIMARY KEY, name TEXT)");
+      const insert = db.prepare("INSERT INTO effect_sql_migrations VALUES (?, ?)");
+      // Release candidate 1: upstream's chain through 76, then the fork's at 77 and 78.
+      for (const [id, name] of migrationManifest) if (id <= 76) insert.run(id, name);
+      insert.run(77, "ProjectionTurnItemCounts");
+      insert.run(78, "TurnItemMessageOrdinalIndex");
+      const preflight = () =>
+        runServicePreflight({ databasePath, launcherProtocol: SERVICE_LAUNCHER_PROTOCOL });
+
+      expect(preflight().status).toBe("ready");
+      expect(databaseMigrationHead(databasePath)).toBe(BUILD_MIGRATION_HEAD);
+
+      db.exec(
+        `CREATE TABLE ${PERF_FORK_MIGRATIONS_TABLE} (migration_id INTEGER PRIMARY KEY, name TEXT)`,
+      );
+      const insertFork = db.prepare(`INSERT INTO ${PERF_FORK_MIGRATIONS_TABLE} VALUES (?, ?)`);
+      insertFork.run(1, "ProjectionTurnItemCounts");
+      expect(preflight().status).toBe("ready");
+      insertFork.run(PERF_FORK_MIGRATION_HEAD + 1, "FromNewerFork");
+      db.close();
+      const result = preflight();
+      expect(result.status).toBe("blocked");
+      expect(result.status === "blocked" ? result.reason : "").toContain(
+        `${PERF_FORK_MIGRATIONS_TABLE}:${PERF_FORK_MIGRATION_HEAD + 1}_FromNewerFork`,
       );
     }),
   );

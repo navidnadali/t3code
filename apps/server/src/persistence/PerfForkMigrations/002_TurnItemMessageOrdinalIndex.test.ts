@@ -4,7 +4,8 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
-import TurnItemMessageOrdinalIndex from "./078_TurnItemMessageOrdinalIndex.ts";
+import { PERF_FORK_MIGRATIONS_TABLE } from "../PerfForkMigrations.ts";
+import TurnItemMessageOrdinalIndex from "./002_TurnItemMessageOrdinalIndex.ts";
 
 // Upstream's statement, which the fork's (below) must answer the same over JSON payloads.
 const upstreamOrdinalsOf = (threadId: string) => `
@@ -44,6 +45,14 @@ const insertTurnItem = (
     `;
   });
 
+const forkLedger = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{ readonly migration_id: number }>`
+    SELECT migration_id FROM ${sql(PERF_FORK_MIGRATIONS_TABLE)} ORDER BY migration_id
+  `;
+  return rows.map((row) => row.migration_id);
+});
+
 const usesTheIndex = (query: string) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -59,7 +68,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 77 });
+      yield* runMigrations({ toPerfForkMigrationInclusive: 1 });
       for (const [id, threadId, ordinal, type, messageId] of [
         ["a1", "thread-a", 1, "user_message", "m1"],
         ["a2", "thread-a", 3, "assistant_message", "m2"],
@@ -85,10 +94,9 @@ it.effect(
       ];
       assert.deepEqual(yield* sql.unsafe(upstreamOrdinalsOf("thread-a")), expected);
 
-      assert.deepEqual(
-        (yield* runMigrations()).map(([id]) => id),
-        [78],
-      );
+      assert.deepEqual(yield* forkLedger, [1]);
+      yield* runMigrations();
+      assert.deepEqual(yield* forkLedger, [1, 2]);
       const index = () => sql<{ readonly sql: string }>`
       SELECT sql FROM sqlite_master
       WHERE type = 'index' AND name = 'orchestration_v2_projection_turn_items_message_ordinal_idx'
@@ -113,14 +121,12 @@ it.effect(
 it.effect("migrates over a message whose payload is not JSON, and takes one after it", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    yield* runMigrations({ toMigrationInclusive: 77 });
+    yield* runMigrations({ toPerfForkMigrationInclusive: 1 });
     yield* insertTurnItem("bad-1", "thread-a", 1, "assistant_message", "{not json");
     yield* insertTurnItem("ok-1", "thread-a", 2, "user_message", '{"messageId":"m1"}');
 
-    assert.deepEqual(
-      (yield* runMigrations()).map(([id]) => id),
-      [78],
-    );
+    yield* runMigrations();
+    assert.deepEqual(yield* forkLedger, [1, 2]);
     yield* insertTurnItem("bad-2", "thread-a", 3, "user_message", "{not json");
     yield* insertTurnItem("ok-2", "thread-a", 4, "assistant_message", '{"messageId":"m1"}');
     yield* sql`

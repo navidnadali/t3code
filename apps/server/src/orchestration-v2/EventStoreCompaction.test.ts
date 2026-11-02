@@ -475,16 +475,14 @@ it.effect("a scratch file that cannot be removed is logged, and does not fail th
     });
     yield* Effect.addFinalizer(() => Effect.sync(() => void (rmSyncInterceptor.failPath = null)));
     rmSyncInterceptor.calls.length = 0;
-    const summary = yield* maintenance
-      .compactEventStore(betweenPages, { scratchPath })
-      .pipe(
-        Effect.provide(
-          Logger.layer([Logger.make(({ logLevel, message }) => logs.push([logLevel, message]))], {
-            mergeWithExisting: false,
-          }),
-        ),
-        Effect.provideService(References.MinimumLogLevel, "Debug"),
-      );
+    const summary = yield* maintenance.compactEventStore(betweenPages, { scratchPath }).pipe(
+      Effect.provide(
+        Logger.layer([Logger.make(({ logLevel, message }) => logs.push([logLevel, message]))], {
+          mergeWithExisting: false,
+        }),
+      ),
+      Effect.provideService(References.MinimumLogLevel, "Debug"),
+    );
     assert.equal(summary.deletedEventCount, reference.obsolete.size);
     const after = yield* sql<{ readonly sequence: number }>`
       SELECT sequence FROM orchestration_events ORDER BY sequence

@@ -323,8 +323,9 @@ it.effect("gives a guest whose live buffer overflows a fresh snapshot and keeps 
       assert.isAbove(event.item.sequence, snapshot.item.snapshotSequence);
     }),
   ).pipe(
-    Effect.provide(Logger.layer([overflowLogger], { mergeWithExisting: true })),
-    Effect.provide(layerTest),
+    Effect.provide(
+      Layer.merge(layerTest, Logger.layer([overflowLogger], { mergeWithExisting: true })),
+    ),
   );
 });
 

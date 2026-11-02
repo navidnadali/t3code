@@ -444,3 +444,74 @@ describe("the entrypoint", () => {
     ),
   );
 });
+
+describe("review follow-ups", () => {
+  it("ignores a marker that is not backed by the flag (M1)", () => {
+    // A stray or stale marker must neither suppress the relaunch nor rewrite NODE_OPTIONS for children.
+    const stray = plan({
+      env: { [INHERITED_NODE_OPTIONS_ENV]: "", NODE_OPTIONS: "--max-old-space-size=16384" },
+    });
+    expect(stray.kind).toBe("relaunch");
+    if (stray.kind !== "relaunch") return;
+    expect(stray.env.NODE_OPTIONS).toBe(`--max-old-space-size=16384 ${flag}`);
+    expect(stray.env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=16384");
+    expect(plan({ env: { [INHERITED_NODE_OPTIONS_ENV]: "", NODE_OPTIONS: flag } }).kind).toBe(
+      "keep",
+    );
+  });
+  it("keeps the process when the inspector is active (M2)", () => {
+    expect(plan({ execArgv: ["--inspect"] }).kind).toBe("keep");
+    expect(plan({ execArgv: ["--inspect-brk=9230"] }).kind).toBe("keep");
+    expect(plan({ env: { NODE_OPTIONS: "--inspect-port=9229" } }).kind).toBe("keep");
+    expect(plan({ inspectorActive: true }).kind).toBe("keep");
+    expect(plan({ execArgv: ["--experimental-strip-types"] }).kind).toBe("relaunch");
+  });
+  it("never stats the file system for the fast-path and known commands, nor before the cheap keep checks (N2)", () => {
+    const calls: Array<string> = [];
+    const spy = (path: string) => {
+      calls.push(path);
+      return true;
+    };
+    for (const command of [
+      "acp-mcp-bridge",
+      "acp-mcp-call",
+      "__document-text",
+      "__managed-chatgpt-token",
+      "__process-spawner",
+      "auth",
+      "doctor",
+      "up",
+      "service",
+      "connect",
+      "project",
+      "thread",
+    ]) {
+      expect(isServerCommand(["node", "bin.mjs", command], spy), command).toBe(false);
+    }
+    expect(calls).toEqual([]);
+    expect(
+      plan({ argv: ["node", "bin.mjs", "my-project"], hasIpcChannel: true, isDirectory: spy }).kind,
+    ).toBe("keep");
+    expect(
+      plan({
+        argv: ["node", "bin.mjs", "my-project"],
+        env: { [MAX_SEMI_SPACE_ENV]: "0" },
+        isDirectory: spy,
+      }).kind,
+    ).toBe("keep");
+    expect(calls).toEqual([]);
+    expect(plan({ argv: ["node", "bin.mjs", "my-project"], isDirectory: spy }).kind).toBe(
+      "relaunch",
+    );
+    expect(calls).toEqual(["my-project"]);
+  });
+  it("bounds the escape hatch (N3)", () => {
+    expect(resolveMaxSemiSpaceMb({ [MAX_SEMI_SPACE_ENV]: "1024" }, [])).toBe(1024);
+    expect(resolveMaxSemiSpaceMb({ [MAX_SEMI_SPACE_ENV]: "1025" }, [])).toBe(
+      DEFAULT_MAX_SEMI_SPACE_MB,
+    );
+    expect(resolveMaxSemiSpaceMb({ [MAX_SEMI_SPACE_ENV]: "100000" }, [])).toBe(
+      DEFAULT_MAX_SEMI_SPACE_MB,
+    );
+  });
+});

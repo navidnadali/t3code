@@ -318,7 +318,17 @@ if (context.update?.status === "pending") {
       yield* fs.writeFileString(envPath, "T3CODE_TEST_SERVICE_TOKEN=initial\n");
       vi.stubEnv("T3CODE_HOME", root);
       vi.stubEnv("T3CODE_TEST_SERVICE_TOKEN", "inherited");
-      yield* Effect.addFinalizer(() => Effect.sync(() => vi.unstubAllEnvs()));
+      // The launcher gives the server its young-generation cap on top of the inherited NODE_OPTIONS.
+      vi.stubEnv("NODE_OPTIONS", "--max-old-space-size=4096");
+      vi.stubEnv("T3CODE_V8_MAX_SEMI_SPACE_MB", "");
+      const marker = process.env.T3CODE_INHERITED_NODE_OPTIONS;
+      delete process.env.T3CODE_INHERITED_NODE_OPTIONS;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          vi.unstubAllEnvs();
+          if (marker !== undefined) process.env.T3CODE_INHERITED_NODE_OPTIONS = marker;
+        }),
+      );
       yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
       yield* fs.writeFileString(databasePath, "before trial");
       const encodedDatabasePath = JSON.stringify(databasePath);
@@ -328,6 +338,8 @@ const context = JSON.parse(process.env.T3_SERVICE_LAUNCHER_CONTEXT);
 appendFileSync(${JSON.stringify(observationsPath)}, JSON.stringify({
   token: process.env.T3CODE_TEST_SERVICE_TOKEN,
   update: context.update?.status ?? "active",
+  nodeOptions: process.env.NODE_OPTIONS ?? null,
+  inheritedNodeOptions: process.env.T3CODE_INHERITED_NODE_OPTIONS ?? null,
 }) + "\\n");
 if (context.update?.status === "pending") {
   process.send({ type: "prepared", updateId: "wrong-update" });
@@ -372,10 +384,14 @@ if (context.update?.status === "pending") {
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));
+      const serverEnv = {
+        nodeOptions: "--max-old-space-size=4096 --max-semi-space-size=64",
+        inheritedNodeOptions: "--max-old-space-size=4096",
+      };
       assert.deepEqual(observations, [
-        { token: "initial", update: "active" },
-        { token: "initial", update: "pending" },
-        { token: "initial", update: "rolled-back" },
+        { token: "initial", update: "active", ...serverEnv },
+        { token: "initial", update: "pending", ...serverEnv },
+        { token: "initial", update: "rolled-back", ...serverEnv },
       ]);
       assert.equal(process.env.T3CODE_TEST_SERVICE_TOKEN, "inherited");
       assert.equal(yield* fs.readFileString(envPath), "T3CODE_TEST_SERVICE_TOKEN=changed\n");

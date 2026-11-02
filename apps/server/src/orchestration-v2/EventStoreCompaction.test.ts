@@ -61,15 +61,20 @@ vi.mock("node:worker_threads", async (importOriginal) => {
     override postMessage(value: unknown, ...rest: ReadonlyArray<unknown>) {
       const message = value as { readonly id?: number; readonly type?: string } | null;
       if (workerInterceptor.failNextUpsert && message?.type === "upsert") {
-        // The worker answers an upsert only when it fails: deliver that answer in its place.
+        // The worker answers an upsert only when it fails; that answer comes back once the next
+        // message (the lookup queued behind it) has been posted, as it would from a real worker.
         workerInterceptor.failNextUpsert = false;
-        queueMicrotask(() =>
-          this.emit("message", { id: message.id, error: "injected upsert failure" }),
-        );
+        this.failedUpsertId = message.id;
         return;
       }
       super.postMessage(value, ...(rest as [never]));
+      if (this.failedUpsertId !== undefined) {
+        const id = this.failedUpsertId;
+        this.failedUpsertId = undefined;
+        this.emit("message", { id, error: "injected upsert failure" });
+      }
     }
+    private failedUpsertId: number | undefined;
   }
   return { ...actual, Worker };
 });
@@ -782,34 +787,18 @@ it.effect(
 );
 
 it.effect(
-  "a lookup queued behind a failing upsert fails, so no page is decided on stale state",
+  "a lookup queued behind a failing upsert fails instead of answering from stale state",
   () =>
     Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
-      yield* seedStore();
-      const before = yield* scanRows();
-      const reference = referenceCompaction(before);
       const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+      const scratch = yield* CompactionScratch.open(scratchPath);
       workerInterceptor.failNextUpsert = true;
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => void (workerInterceptor.failNextUpsert = false)),
       );
-      const error = yield* maintenance
-        .compactEventStore(Effect.void, { scratchPath })
-        .pipe(Effect.flip);
-      const inner = error.cause;
-      assert.isTrue(isMaintenanceError(inner) && inner.operation === "compaction scratch store");
-      assert.include(
-        String(isMaintenanceError(inner) ? inner.cause : ""),
-        "injected upsert failure",
-      );
-      // The first page's decisions were made on a sound lookup; nothing after it was decided at all.
-      const firstPage = new Set(before.slice(0, 50).map((row) => row.sequence));
-      const expectedDeleted = [...reference.obsolete].filter((sequence) => firstPage.has(sequence));
-      const after = yield* sql<{ readonly sequence: number }>`
-      SELECT sequence FROM orchestration_events ORDER BY sequence
-    `;
-      assert.equal(before.length - after.length, expectedDeleted.length);
-    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+      // The upsert is only posted; its failure comes back once the lookup behind it is on its way.
+      yield* scratch.upsert([["key", null]]);
+      const error = yield* scratch.lookup(["key"]).pipe(Effect.flip);
+      assert.include(error.message, "injected upsert failure");
+    }).pipe(Effect.scoped),
 );

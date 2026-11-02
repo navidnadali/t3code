@@ -17,8 +17,11 @@ import * as NodeSqlite from "node:sqlite";
 const rmSyncInterceptor = vi.hoisted(() => ({
   failPath: null as string | null,
   calls: [] as Array<string>,
-  freeBytes: null as number | null,
+  freeBytes: null as number | (() => number) | null,
 }));
+
+// The scratch store's worker thread can be made impossible to start.
+const workerInterceptor = vi.hoisted(() => ({ failConstruction: false }));
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -36,19 +39,32 @@ vi.mock("node:fs", async (importOriginal) => {
     },
     statfsSync: (...args: Parameters<typeof actual.statfsSync>) => {
       const stats = actual.statfsSync(args[0]);
-      if (rmSyncInterceptor.freeBytes === null) return stats;
-      return {
-        ...stats,
-        bsize: 1,
-        bavail: rmSyncInterceptor.freeBytes,
-        bfree: rmSyncInterceptor.freeBytes,
-      };
+      const free = rmSyncInterceptor.freeBytes;
+      if (free === null) return stats;
+      const bavail = typeof free === "function" ? free() : free;
+      return { ...stats, bsize: 1, bavail, bfree: bavail };
     },
   };
 });
 
+vi.mock("node:worker_threads", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:worker_threads")>();
+  class Worker extends actual.Worker {
+    constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+      if (workerInterceptor.failConstruction) {
+        const error = new Error("Worker initialization failure");
+        Object.assign(error, { code: "ERR_WORKER_INIT_FAILED" });
+        throw error;
+      }
+      super(...args);
+    }
+  }
+  return { ...actual, Worker };
+});
+
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventStore from "./EventStore.ts";
+import * as CompactionScratch from "./CompactionScratch.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -573,5 +589,44 @@ it.effect("names a directory that is in the way of the scratch file, and deletes
     assert.include(message, scratchPath);
     assert.equal((yield* scanRows()).length, before.length);
     assert.isTrue(NodeFS.existsSync(NodePath.join(scratchPath, "keep")));
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+it.effect("a scratch store whose worker cannot start fails the pass with a typed error", () =>
+  Effect.gen(function* () {
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seedStore();
+    const before = yield* scanRows();
+    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+    workerInterceptor.failConstruction = true;
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => void (workerInterceptor.failConstruction = false)),
+    );
+    const error = yield* maintenance
+      .compactEventStore(Effect.void, { scratchPath })
+      .pipe(Effect.flip);
+    const inner = error.cause;
+    assert.isTrue(isMaintenanceError(inner) && inner.operation === "compaction scratch store");
+    assert.equal((yield* scanRows()).length, before.length);
+    assert.isFalse(NodeFS.existsSync(scratchPath));
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+it.effect("a stale scratch file is removed before the free space it occupies is judged", () =>
+  Effect.gen(function* () {
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seedStore();
+    const before = yield* scanRows();
+    const reference = referenceCompaction(before);
+    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+    // A crash left a scratch file bigger than the margin the pass needs; without it there is room.
+    const needed = CompactionScratch.requiredFreeBytes(before.length);
+    NodeFS.writeFileSync(scratchPath, Buffer.alloc(needed + 4096));
+    rmSyncInterceptor.freeBytes = () =>
+      2 * needed - (NodeFS.existsSync(scratchPath) ? NodeFS.statSync(scratchPath).size : 0);
+    yield* Effect.addFinalizer(() => Effect.sync(() => void (rmSyncInterceptor.freeBytes = null)));
+    const summary = yield* maintenance.compactEventStore(Effect.void, { scratchPath });
+    assert.equal(summary.deletedEventCount, reference.obsolete.size);
+    assert.isFalse(NodeFS.existsSync(scratchPath));
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );

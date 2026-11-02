@@ -186,8 +186,11 @@ Any other value is logged as an error and keeps Node's spawner. A spawner proces
 restarted, which forks the server once. If it stops again before starting a command, or more than 3
 times in 10 minutes, an error is logged and commands fail with "The process spawner stopped" for a
 cool-down of 15 seconds, then a spawner is started again; while starts keep failing, the cool-down
-doubles up to 5 minutes. Git never falls back to Node's spawner meanwhile. Each command's unread output waits in the server, up to 1 MiB per stream,
-where it would otherwise wait in a 64 KiB pipe.
+doubles up to 5 minutes. Git never falls back to Node's spawner meanwhile. Each command's unread
+output waits in the server, up to 1 MiB per stream, where it would otherwise wait in a 64 KiB pipe.
+Release archives ship the spawner as its own small executable, `t3-process-spawner`, beside `t3`;
+without it, `t3` runs the spawner from its own bundle, which takes about four times the memory, and
+logs a warning at start.
 
 The spawner kills its children and its own process group, then exits, when the server exits however
 it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP. Once the server has begun to shut

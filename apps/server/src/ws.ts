@@ -126,7 +126,6 @@ import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
 import * as ShellDeltaHub from "./orchestration-v2/ShellDeltaHub.ts";
 import {
-  bufferShellLiveStream,
   composeShellStreamWithEnrichment,
   dedupeShellEnrichment,
   loadOlderSettledThreadsPage,
@@ -1032,7 +1031,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
 
     const enrichmentChanges = yield* projectEnrichment.subscribeChanges;
     // Subscribe before the snapshot or high-water read: the hub projects every later event once for all subscribers.
-    const shellDeltas = yield* (yield* ShellDeltaHub.ShellDeltaHub).subscribe;
+    const shellDeltas = yield* (yield* ShellDeltaHub.ShellDeltaHub).subscribe();
     const loadProjectMetadataSnapshot = Effect.fn("ws.orchestrationV2.loadProjectMetadataSnapshot")(
       function* (snapshotSequence: number) {
         const enriched = yield* enrichProjectShells(yield* projects.listShells());
@@ -1092,8 +1091,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         skipUnchangedThreadShells,
       );
 
-    const liveFrom = (afterSequence: number) =>
-      bufferShellLiveStream(shellDeltas.stream(afterSequence));
+    const liveFrom = (afterSequence: number) => shellDeltas.stream(afterSequence);
 
     const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
       Stream.filter((change) => change.repositoryIdentityResolved),

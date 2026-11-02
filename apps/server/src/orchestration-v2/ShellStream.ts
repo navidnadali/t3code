@@ -38,32 +38,31 @@ import type { ActiveShellIndexEntry } from "./ProjectionStore.ts";
 export type ShellDelta = Extract<OrchestrationV2ShellStreamItem, { readonly sequence: number }>;
 
 export interface VersionedShellDelta {
+  readonly sequence: number;
   readonly item: ShellDelta;
   /** `thread.updated` only: unchanged while the shell, `updatedAt` aside, matches the previous item for that thread. */
   readonly version: number | undefined;
+}
+
+/** The aggregate a delta describes; a newer delta for it replaces an older one still buffered. */
+export function shellDeltaKey(item: ShellDelta): string {
+  switch (item.kind) {
+    case "project.updated":
+      return `project:${item.project.id}`;
+    case "project.removed":
+      return `project:${item.projectId}`;
+    case "thread.updated":
+      return `thread:${item.location}:${item.thread.id}`;
+    case "thread.removed":
+      return `thread:${item.location}:${item.threadId}`;
+  }
 }
 
 /** Snapshots, synchronization, and enrichment markers must bypass full-state coalescing. */
 export const bufferShellLiveStream = <E, R>(
   source: Stream.Stream<ShellDelta, E, R>,
   limits?: { readonly maxItems?: number; readonly maxSerializedBytes?: number },
-) =>
-  bufferLatestLiveStream(
-    source,
-    (item) => {
-      switch (item.kind) {
-        case "project.updated":
-          return `project:${item.project.id}`;
-        case "project.removed":
-          return `project:${item.projectId}`;
-        case "thread.updated":
-          return `thread:${item.location}:${item.thread.id}`;
-        case "thread.removed":
-          return `thread:${item.location}:${item.threadId}`;
-      }
-    },
-    limits,
-  );
+) => bufferLatestLiveStream(source, shellDeltaKey, limits);
 
 function buildActiveShellSnapshot(input: {
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
@@ -456,7 +455,7 @@ export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellAp
     : { sequence: stored.sequence, event: { threadId: stored.event.threadId } };
 }
 
-export function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
+function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
   events: ReadonlyArray<A>,
 ): ReadonlyArray<A> {
   const latestByAggregate = new Map<string, A>();
@@ -676,34 +675,31 @@ export function makeThreadShellVersions() {
  * resend window is skipped, as `skipUnchangedThreadShells` decides by comparing the shells.
  */
 export function skipUnchangedShellDeltas<E, R>(
-  stream: Stream.Stream<ReadonlyArray<VersionedShellDelta>, E, R>,
+  stream: Stream.Stream<VersionedShellDelta, E, R>,
 ): Stream.Stream<ShellDelta, E, R> {
   return Stream.suspend(() => {
     const lastSent = new Map<ThreadId, { readonly version: number; readonly sentAt: number }>();
     return stream.pipe(
-      Stream.mapEffect((batch) =>
+      Stream.filterEffect(({ item, version }) =>
         Effect.map(Clock.currentTimeMillis, (now) => {
-          const items: Array<ShellDelta> = [];
-          for (const { item, version } of batch) {
-            if (item.kind === "thread.removed") {
-              lastSent.delete(item.threadId);
-            } else if (item.kind === "thread.updated" && version !== undefined) {
-              const previous = lastSent.get(item.thread.id);
-              if (
-                previous !== undefined &&
-                previous.version === version &&
-                now - previous.sentAt < UNCHANGED_THREAD_SHELL_RESEND_MS
-              ) {
-                continue;
-              }
-              lastSent.set(item.thread.id, { version, sentAt: now });
-            }
-            items.push(item);
+          if (item.kind === "thread.removed") {
+            lastSent.delete(item.threadId);
+            return true;
           }
-          return items;
+          if (item.kind !== "thread.updated" || version === undefined) return true;
+          const previous = lastSent.get(item.thread.id);
+          if (
+            previous !== undefined &&
+            previous.version === version &&
+            now - previous.sentAt < UNCHANGED_THREAD_SHELL_RESEND_MS
+          ) {
+            return false;
+          }
+          lastSent.set(item.thread.id, { version, sentAt: now });
+          return true;
         }),
       ),
-      Stream.flatMap(Stream.fromIterable),
+      Stream.map((delta) => delta.item),
     );
   });
 }

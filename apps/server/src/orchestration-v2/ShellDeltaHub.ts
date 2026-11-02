@@ -15,9 +15,11 @@ import * as Stream from "effect/Stream";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import { startBufferLatestLiveStream, type LiveStreamBufferError } from "./LiveStreamBudget.ts";
 import {
   makeThreadShellVersions,
   projectShellDeltas,
+  shellDeltaKey,
   shouldPublishShellApplicationEvent,
   skipUnchangedShellDeltas,
   toShellApplicationEvent,
@@ -37,18 +39,25 @@ export class ShellDeltaHubError extends Schema.TaggedError<ShellDeltaHubError>()
 
 export interface ShellDeltaSubscription {
   /**
-   * The deltas published after the subscription was taken, without those at or below
-   * `afterSequence` (the snapshot or replay the stream continues covers them).
+   * The deltas buffered since the subscription was taken, without those at or below
+   * `afterSequence` (the snapshot or replay the stream continues covers them). Take it once.
    */
-  readonly stream: (afterSequence: number) => Stream.Stream<ShellDelta, ShellDeltaHubError>;
+  readonly stream: (
+    afterSequence: number,
+  ) => Stream.Stream<ShellDelta, ShellDeltaHubError | LiveStreamBufferError>;
 }
 
 export interface ShellDeltaHubShape {
   /**
    * Take the subscription before reading the snapshot it continues: every committed event the
-   * hub sees from then on reaches this subscriber as a projected item.
+   * hub sees from then on reaches this subscriber as a projected item. Deltas are buffered from
+   * now on, the latest per aggregate, under the live-stream budget; on overflow or a hub failure
+   * the subscription ends on its own, before the subscriber's scope closes.
    */
-  readonly subscribe: Effect.Effect<ShellDeltaSubscription, never, Scope.Scope>;
+  readonly subscribe: (limits?: {
+    readonly maxItems?: number;
+    readonly maxSerializedBytes?: number;
+  }) => Effect.Effect<ShellDeltaSubscription, never, Scope.Scope>;
 }
 
 export class ShellDeltaHub extends Context.Service<ShellDeltaHub, ShellDeltaHubShape>()(
@@ -115,7 +124,11 @@ const make = Effect.gen(function* () {
       const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
       yield* PubSub.publish(
         input.output,
-        items.map((item) => ({ item, version: versions.stamp(item, now) })),
+        items.map((item) => ({
+          sequence: item.sequence,
+          item,
+          version: versions.stamp(item, now),
+        })),
       );
     });
     const projectBatches = Effect.gen(function* () {
@@ -159,32 +172,47 @@ const make = Effect.gen(function* () {
       return Scope.close(instance.scope, Exit.void);
     });
 
-  const subscribe: ShellDeltaHubShape["subscribe"] = Effect.gen(function* () {
-    const { instance, subscription } = yield* lifecycle.withPermit(
+  const subscribe: ShellDeltaHubShape["subscribe"] = Effect.fnUntraced(function* (limits) {
+    const instance = yield* lifecycle.withPermit(
       Effect.gen(function* () {
         if (current !== undefined && current.failure !== undefined) yield* stop(current);
         const instance = current ?? (yield* start);
         current = instance;
         instance.subscribers += 1;
-        return { instance, subscription: yield* PubSub.subscribe(instance.output) };
+        return instance;
       }),
     );
-    yield* Effect.addFinalizer(() =>
+    // The subscription has its own scope: it closes with the subscriber's, or earlier when the
+    // buffer overflows or the hub fails, and only then does this subscriber stop counting.
+    const subscriptionScope = yield* Scope.fork(yield* Effect.scope);
+    yield* Scope.addFinalizer(
+      subscriptionScope,
       lifecycle.withPermit(
         Effect.suspend(() => {
           instance.subscribers -= 1;
-          return instance.subscribers === 0 && current === instance
-            ? stop(instance)
-            : Effect.void;
+          return instance.subscribers === 0 && current === instance ? stop(instance) : Effect.void;
         }),
       ),
     );
+    const subscription = yield* PubSub.subscribe(instance.output).pipe(
+      Scope.provide(subscriptionScope),
+    );
+    const source = Stream.fromSubscription(subscription).pipe(
+      Stream.flatMap(Stream.fromIterable),
+      Stream.merge(Stream.fromEffect(Deferred.await(instance.failed))),
+      Stream.ensuring(Scope.close(subscriptionScope, Exit.void)),
+    );
+    // Drained from now on, so a subscriber still loading its snapshot holds one delta per aggregate.
+    const deltas = yield* startBufferLatestLiveStream(
+      source,
+      (delta) => shellDeltaKey(delta.item),
+      limits,
+    );
     return {
       stream: (afterSequence) =>
-        Stream.fromSubscription(subscription).pipe(
-          Stream.map((batch) => batch.filter((delta) => delta.item.sequence > afterSequence)),
+        deltas.pipe(
+          Stream.filter((delta) => delta.sequence > afterSequence),
           skipUnchangedShellDeltas,
-          Stream.merge(Stream.fromEffect(Deferred.await(instance.failed))),
         ),
     };
   });

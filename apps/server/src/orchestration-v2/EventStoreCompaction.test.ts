@@ -12,10 +12,12 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 
-// Removal of one path can be made to fail (as EBUSY would on Windows while the file is open).
+// Removal of one path can be made to fail (as EBUSY would on Windows while the file is open), and
+// the filesystem's free space can be faked.
 const rmSyncInterceptor = vi.hoisted(() => ({
   failPath: null as string | null,
   calls: [] as Array<string>,
+  freeBytes: null as number | null,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -31,6 +33,16 @@ vi.mock("node:fs", async (importOriginal) => {
         throw error;
       }
       return actual.rmSync(...args);
+    },
+    statfsSync: (...args: Parameters<typeof actual.statfsSync>) => {
+      const stats = actual.statfsSync(args[0]);
+      if (rmSyncInterceptor.freeBytes === null) return stats;
+      return {
+        ...stats,
+        bsize: 1,
+        bavail: rmSyncInterceptor.freeBytes,
+        bfree: rmSyncInterceptor.freeBytes,
+      };
     },
   };
 });
@@ -534,5 +546,73 @@ it.effect("a failure while preparing the scratch store fails the pass and leaves
     for (const file of [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`]) {
       assert.isFalse(NodeFS.existsSync(file), file);
     }
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+const capturedLogs = (logs: Array<unknown>) =>
+  Logger.layer([Logger.make(({ logLevel, message }) => logs.push([logLevel, message]))], {
+    mergeWithExisting: false,
+  });
+
+const warned = (logs: ReadonlyArray<unknown>, text: string) =>
+  logs.some(
+    (entry) => Array.isArray(entry) && entry[0] === "Warn" && String(entry[1]).includes(text),
+  );
+
+it.effect("skips the pass with a warning when the disk cannot hold the scratch store", () =>
+  Effect.gen(function* () {
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seedStore();
+    const before = yield* scanRows();
+    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+    const logs: Array<unknown> = [];
+    rmSyncInterceptor.freeBytes = 1;
+    yield* Effect.addFinalizer(() => Effect.sync(() => void (rmSyncInterceptor.freeBytes = null)));
+    const summary = yield* maintenance
+      .compactEventStore(Effect.void, { scratchPath })
+      .pipe(
+        Effect.provide(capturedLogs(logs)),
+        Effect.provideService(References.MinimumLogLevel, "Debug"),
+      );
+    assert.equal(summary.deletedEventCount, 0);
+    assert.equal(summary.trackedKeys, 0);
+    const after = yield* scanRows();
+    assert.equal(after.length, before.length);
+    assert.isTrue(warned(logs, "free space"), JSON.stringify(logs));
+    assert.isFalse(NodeFS.existsSync(scratchPath));
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+it.effect("removes an empty directory at the scratch path and compacts", () =>
+  Effect.gen(function* () {
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seedStore();
+    const reference = referenceCompaction(yield* scanRows());
+    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+    NodeFS.mkdirSync(scratchPath);
+    const summary = yield* maintenance.compactEventStore(Effect.void, { scratchPath });
+    assert.equal(summary.deletedEventCount, reference.obsolete.size);
+    assert.isFalse(NodeFS.existsSync(scratchPath));
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+it.effect("names a directory that is in the way of the scratch file, and deletes nothing", () =>
+  Effect.gen(function* () {
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seedStore();
+    const before = yield* scanRows();
+    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+    NodeFS.mkdirSync(scratchPath);
+    NodeFS.writeFileSync(NodePath.join(scratchPath, "keep"), "");
+    const error = yield* maintenance
+      .compactEventStore(Effect.void, { scratchPath })
+      .pipe(Effect.flip);
+    const inner = error.cause;
+    assert.isTrue(isMaintenanceError(inner) && inner.operation === "compaction scratch store");
+    const message = String(isMaintenanceError(inner) ? inner.cause : "");
+    assert.include(message, "directory is in the way of the compaction scratch file");
+    assert.include(message, scratchPath);
+    assert.equal((yield* scanRows()).length, before.length);
+    assert.isTrue(NodeFS.existsSync(NodePath.join(scratchPath, "keep")));
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );

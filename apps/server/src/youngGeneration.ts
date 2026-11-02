@@ -63,15 +63,16 @@ const optionName = (arg: string): string => {
   return (end === -1 ? arg : arg.slice(0, end)).replaceAll("_", "-");
 };
 
-/** The flag's value in args when present (`""` for a bare flag without a value); undefined when absent. */
+/** The flag's last value in args (V8 takes the last; `""` for a bare flag without a value); undefined when absent. */
 const flagIn = (args: ReadonlyArray<string>): string | undefined => {
+  let value: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
     if (optionName(arg) !== FLAG) continue;
     const end = arg.indexOf("=");
-    return end === -1 ? (args[index + 1] ?? "") : arg.slice(end + 1);
+    value = end === -1 ? (args[index + 1] ?? "") : arg.slice(end + 1);
   }
-  return undefined;
+  return value;
 };
 
 interface ExplicitFlag {

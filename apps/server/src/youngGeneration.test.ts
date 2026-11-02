@@ -138,6 +138,15 @@ describe("describeNodeRuntime", () => {
       maxSemiSpaceMiB: 64,
       youngGenerationDefault: true,
     });
+    expect(
+      describeNodeRuntime({
+        execArgv: [],
+        nodeOptionsAtStart: "--max-semi-space-size=8 --max-semi-space-size=16",
+        nodeOptionsForChildren: undefined,
+        heapSizeLimitBytes: 0,
+        applied: false,
+      }).maxSemiSpaceMiB,
+    ).toBe(16);
     const plain = describeNodeRuntime({
       execArgv: ["--max-semi-space-size=32"],
       nodeOptionsAtStart: undefined,

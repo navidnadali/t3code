@@ -1478,3 +1478,111 @@ it.effect("thread resume across compacted history keeps message order and final 
     ),
   ),
 );
+
+// Reviewer scenario (F2): the resume replay reads a thread after the hub's held delta for it was read.
+it.effect("a resumed shell subscriber never receives a shell older than one its replay sent", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const threadId = ThreadId.make("thread:resume-order");
+    let title = "c1";
+    let version = 0;
+    let published = 0;
+    const insert = (id: ThreadId) =>
+      sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          ${`resume-order:${++version}`}, 'thread', ${id}, ${version}, 'provider-session.detached',
+          '2026-10-31T00:00:00.000Z', 'server',
+          ${JSON.stringify({ providerSessionId: "session:order", detachedAt: "2026-10-31T00:00:00.000Z" })},
+          '{}', 2
+        ) RETURNING sequence
+      `.pipe(Effect.asVoid);
+    const publishAll = Effect.gen(function* () {
+      const events = yield* store
+        .readApplicationEvents({ afterSequence: published, throughSequence: version })
+        .pipe(Stream.runCollect);
+      published = version;
+      yield* store.publishCommitted(events);
+    });
+    const settle = Effect.gen(function* () {
+      for (let round = 0; round < 4; round++) {
+        for (let step = 0; step < 200; step++) yield* Effect.yieldNow;
+        yield* TestClock.adjust(0);
+      }
+    });
+    // The replay's reads of these threads wait, so the replay outlives the 5 s shared-read TTL.
+    const replayGate = yield* Deferred.make<void>();
+    const seen: Array<string> = [];
+    for (let index = 0; index < 8; index++)
+      yield* insert(ThreadId.make(`thread:resume-slow-${index}`));
+    yield* insert(threadId);
+    published = version;
+    yield* Effect.gen(function* () {
+      const stream = yield* subscribeOrchestrationV2Shell({
+        afterSequence: 0,
+        requestCompletionMarker: true,
+      });
+      yield* stream.pipe(
+        Stream.runForEach((item) =>
+          Effect.sync(() => {
+            seen.push(
+              item.kind === "thread.updated"
+                ? `${item.sequence}:${(item.thread as { title: string }).title}`
+                : item.kind,
+            );
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settle;
+      title = "c2";
+      yield* insert(threadId);
+      yield* publishAll;
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settle;
+      yield* TestClock.adjust(ThreadManagement.SHARED_SHELL_READ_TTL_MS + 1_000);
+      yield* settle;
+      title = "c3";
+      yield* insert(threadId);
+      yield* publishAll;
+      yield* Deferred.succeed(replayGate, undefined);
+      yield* settle;
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settle;
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settle;
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: (id) =>
+            Effect.gen(function* () {
+              if (id.startsWith("thread:resume-slow-")) {
+                yield* Deferred.await(replayGate);
+                return {
+                  id,
+                  archivedAt: null,
+                  title: "slow",
+                } as unknown as OrchestrationV2ThreadShell;
+              }
+              return { id, archivedAt: null, title } as unknown as OrchestrationV2ThreadShell;
+            }),
+        }),
+      ),
+    );
+    const titles = seen
+      .filter((item) => item.includes(":") && !item.endsWith(":slow"))
+      .map((item) => item.split(":")[1]!);
+    const order = ["c1", "c2", "c3"];
+    for (let index = 1; index < titles.length; index++) {
+      assert.isTrue(
+        order.indexOf(titles[index]!) >= order.indexOf(titles[index - 1]!),
+        `shell went backwards: ${seen.join(" ")}`,
+      );
+    }
+    assert.include(titles, "c3");
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);

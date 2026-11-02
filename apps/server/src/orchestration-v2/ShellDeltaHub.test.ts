@@ -28,10 +28,10 @@ const shell = {
 } as unknown as OrchestrationV2ThreadShell;
 
 // The hub reads nothing but the sequence and thread of a live event.
-const threadEvent = (id: ThreadId, sequence: number) =>
+const threadEvent = (id: ThreadId, sequence: number, type = "provider-session.detached") =>
   ({
     sequence,
-    event: { type: "provider-session.detached", threadId: id },
+    event: { type, threadId: id },
   }) as unknown as ApplicationStoredEvent;
 
 const layerStore = OrchestrationEventStore.layer.pipe(
@@ -46,16 +46,27 @@ const layerHub = (input: {
   readonly onStart?: () => void;
   readonly afterSubscribe?: Effect.Effect<void>;
   readonly onRelease?: () => void;
+  readonly subagents?: () => ReadonlyArray<ThreadId>;
 }) =>
   ShellDeltaHub.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
-          listActiveSubagentThreadIds: () => Effect.succeed([]),
+          listActiveSubagentThreadIds: () => Effect.sync(() => [...(input.subagents?.() ?? [])]),
           getThreadShellForEvent: ({ threadId: id, sequence }) =>
             Effect.sync(() => {
               input.reads.push(sequence);
-              return { ...shell, id, title: input.title?.() ?? shell.title };
+              const subagent = input.subagents?.().includes(id) ?? false;
+              return {
+                ...shell,
+                id,
+                title: input.title?.() ?? shell.title,
+                lineage: {
+                  parentThreadId: subagent ? threadId : null,
+                  relationshipToParent: subagent ? "subagent" : null,
+                  rootThreadId: subagent ? threadId : id,
+                },
+              };
             }),
         }),
         Layer.mock(ProjectService.ProjectService)({}),
@@ -78,10 +89,10 @@ const layerHub = (input: {
     Layer.provideMerge(layerStore),
   );
 
-const publish = (id: ThreadId, sequence: number) =>
+const publish = (id: ThreadId, sequence: number, type?: string) =>
   Effect.gen(function* () {
     const store = yield* OrchestrationEventStore.OrchestrationEventStore;
-    yield* store.publishCommitted([threadEvent(id, sequence)]);
+    yield* store.publishCommitted([threadEvent(id, sequence, type)]);
     yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
   });
 
@@ -319,4 +330,31 @@ it.effect("a subscriber whose scope closes while the hub starts leaves no hub be
       ),
     );
   }).pipe(Effect.scoped),
+);
+
+// Reviewer scenario (F3): a subagent archived when the hub started and unarchived later.
+it.effect(
+  "a transcript-only update of a subagent thread is dropped whatever the hub knew at start",
+  () =>
+    Effect.gen(function* () {
+      const reads: Array<number> = [];
+      const child = ThreadId.make("thread:child");
+      let active: ReadonlyArray<ThreadId> = [];
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const subscription = yield* hub.subscribe();
+        const items = yield* Effect.forkScoped(
+          subscription.stream(0).pipe(Stream.take(1), Stream.runCollect),
+        );
+        yield* TestClock.adjust(0);
+        // The child is unarchived after the hub seeded its subagent set.
+        active = [child];
+        yield* publish(child, 1, "message.updated");
+        yield* publish(child, 2);
+        assert.deepEqual(
+          (yield* Fiber.join(items)).map((item) => item.sequence),
+          [2],
+        );
+      }).pipe(Effect.provide(layerHub({ reads, subagents: () => active })));
+    }).pipe(Effect.scoped),
 );

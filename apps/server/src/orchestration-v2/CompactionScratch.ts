@@ -167,7 +167,8 @@ export const prepare = (scratchPath: string) =>
 
 type Started = {
   readonly worker: NodeWorkerThreads.Worker;
-  readonly started: Promise<void>;
+  /** Settles with the startup failure, or with nothing; it never rejects, so nothing is ever unhandled. */
+  readonly started: Promise<CompactionScratchError | undefined>;
   readonly pending: Map<number, (reply: ScratchReply) => void>;
   readonly stopped: () => string | undefined;
   readonly failedUpsert: () => string | undefined;
@@ -187,11 +188,11 @@ const startWorker = (scratchPath: string | undefined): Started => {
   let stopped: string | undefined;
   let failedUpsert: string | undefined;
   let announce: (reply: ScratchReply) => void = () => {};
-  const started = new Promise<void>((resolve, reject) => {
+  const started = new Promise<CompactionScratchError | undefined>((resolve) => {
     announce = (reply) => {
       announce = () => {};
-      if ("type" in reply && reply.type === "ready") resolve();
-      else reject(failure("type" in reply ? reply.message : "lost the scratch store"));
+      if ("type" in reply && reply.type === "ready") resolve(undefined);
+      else resolve(failure("type" in reply ? reply.message : "lost the scratch store"));
     };
   });
   const stop = (message: string) => {
@@ -265,13 +266,8 @@ export const open: (
         { discard: true },
       ),
   );
-  yield* Effect.tryPromise({
-    try: () => started,
-    catch: (cause) =>
-      isScratchError(cause)
-        ? cause
-        : failure("Could not start the compaction scratch store", cause),
-  });
+  const startupFailure = yield* Effect.promise(() => started);
+  if (startupFailure !== undefined) return yield* Effect.fail(startupFailure);
 
   let nextRequestId = 0;
   const broken = () => {

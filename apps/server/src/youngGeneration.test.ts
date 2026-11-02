@@ -261,8 +261,8 @@ describe("the entrypoint", () => {
           const child = NodeChildProcess.fork(binPath, ["__node-flags"], {
             execArgv: ["--experimental-strip-types"],
             env: Object.fromEntries(
-              Object.entries({ ...process.env, ...cleanEnv }).filter(
-                (entry): entry is [string, string] => entry[1] !== undefined,
+              Object.entries({ ...process.env, ...cleanEnv }).flatMap(([name, value]) =>
+                value === undefined ? [] : [[name, value]],
               ),
             ),
             stdio: ["ignore", "pipe", "pipe", "ipc"],

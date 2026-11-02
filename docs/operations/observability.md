@@ -212,8 +212,7 @@ helpers) get the `NODE_OPTIONS` the server itself was given. `T3CODE_V8_MAX_SEMI
 Node's default, a positive integer sets another cap, and an explicit `--max-semi-space-size` in
 `NODE_OPTIONS` or on the command line is never overridden. A server started with an IPC channel or
 a `--bootstrap-fd` by a launcher that did not set the flag runs with Node's default, as does
-Windows. `t3 __node-flags` prints what the current process runs with (`--probe` adds the young
-generation's measured peak).
+Windows. `t3 __node-flags` prints what the current process runs with.
 
 ### Related Artifacts
 

@@ -1,6 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Runs first thing in bin.ts, before the CLI's Effect runtime loads.
 import * as NodeSea from "node:sea";
-import * as NodeV8 from "node:v8";
 
 // V8 reads --max-semi-space-size only at startup, so the cap travels in NODE_OPTIONS: a parent that
 // starts the server puts it there, and a server started without it relaunches itself once (execve,
@@ -35,7 +34,7 @@ const flagIn = (args: ReadonlyArray<string>): string | undefined => {
 };
 
 /** The cap (MiB) an explicit `--max-semi-space-size` in NODE_OPTIONS or execArgv sets, if any. */
-export const explicitMaxSemiSpaceMb = (
+const explicitMaxSemiSpaceMb = (
   env: Environment,
   execArgv: ReadonlyArray<string>,
 ): number | null => {
@@ -171,8 +170,12 @@ export const applyYoungGenerationDefault = (): YoungGenerationOutcome => {
     canExecve: typeof process.execve === "function",
   });
   if (plan.kind === "keep") return { applied: false, nodeOptionsAtStart, keptReason: plan.reason };
+  const execve = process.execve;
+  if (execve === undefined) {
+    return { applied: false, nodeOptionsAtStart, keptReason: "process.execve is unavailable" };
+  }
   try {
-    process.execve(plan.file, [...plan.args], { ...plan.env });
+    execve(plan.file, [...plan.args], { ...plan.env });
   } catch (error) {
     process.stderr.write(
       `t3: running without ${FLAG}: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -182,27 +185,8 @@ export const applyYoungGenerationDefault = (): YoungGenerationOutcome => {
   return { applied: false, nodeOptionsAtStart, keptReason: "relaunch returned" };
 };
 
-/** Young-generation peak (MiB) under a short allocation burst: how far V8 may grow it under this process's flags. */
-const probeNewSpacePeakMib = (): number => {
-  const newSpace = () =>
-    NodeV8.getHeapSpaceStatistics().find((space) => space.space_name === "new_space")?.space_size ??
-    0;
-  let peak = newSpace();
-  let retained: Array<unknown> = [];
-  for (let round = 0; round < 400; round++) {
-    for (let index = 0; index < 5_000; index++)
-      retained.push({ index, text: String(index), pair: [index, round] });
-    if (retained.length > 200_000) retained = retained.slice(-50_000);
-    peak = Math.max(peak, newSpace());
-  }
-  return Math.round((peak / 1_048_576) * 10) / 10;
-};
-
-/** `t3 __node-flags [--probe]`: the young-generation settings this process runs with, as JSON on stdout. */
-export const printNodeFlags = (
-  outcome: YoungGenerationOutcome,
-  args: ReadonlyArray<string>,
-): void => {
+/** `t3 __node-flags`: the young-generation settings this process runs with, as JSON on stdout. */
+export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {
   const report = {
     applied: outcome.applied,
     maxSemiSpaceMb: explicitMaxSemiSpaceMb(
@@ -216,7 +200,6 @@ export const printNodeFlags = (
     sea: NodeSea.isSea(),
     pid: process.pid,
     ...(outcome.keptReason === undefined ? {} : { keptReason: outcome.keptReason }),
-    ...(args.includes("--probe") ? { newSpacePeakMib: probeNewSpacePeakMib() } : {}),
   };
   process.stdout.write(`${JSON.stringify(report)}\n`);
   if (process.channel !== undefined) process.disconnect();

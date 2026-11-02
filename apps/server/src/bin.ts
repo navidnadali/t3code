@@ -22,7 +22,7 @@ if (
   const { ignoreMacosTypeOfServiceEinval } = await import("./outboundHttp.ts");
   ignoreMacosTypeOfServiceEinval();
   if (command === "__node-flags") {
-    printNodeFlags(youngGeneration, process.argv.slice(3));
+    printNodeFlags(youngGeneration);
   } else if (command === "__document-text") {
     const { extractDocumentText } = await import("./provider/documentTextWorker.ts");
     try {

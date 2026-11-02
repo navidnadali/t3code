@@ -5,12 +5,15 @@ import * as Fiber from "effect/Fiber";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { describe, expect } from "vite-plus/test";
 
 import {
   bufferLatestLiveStream,
+  LiveStreamBufferError,
   makeLiveStreamBudget,
   replayAndBufferProjectedLiveEvents,
+  resyncOnLiveOverflow,
   type RetainedLiveItem,
 } from "./LiveStreamBudget.ts";
 
@@ -133,6 +136,57 @@ describe("replayAndBufferProjectedLiveEvents", () => {
       ),
   );
 
+  it.effect("wakes a keyed consumer for every burst and delivers each key's newest event", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const pubsub = yield* PubSub.unbounded<Event>();
+        const subscribed = yield* Deferred.make<void>();
+        const pull = yield* Stream.toPull(
+          replayAndBufferProjectedLiveEvents(
+            {
+              project: (event: Event) => event,
+              subscribe: PubSub.subscribe(pubsub).pipe(
+                Effect.tap(() => Deferred.succeed(subscribed, undefined)),
+              ),
+              latestSequence: Effect.succeed(0),
+              replay: () => Stream.empty,
+              coalesceKey: (event) => event.threadId ?? "",
+            },
+            { maxItems: 8 },
+          ),
+        );
+        // The stream subscribes on its first pull; that pull then waits for the first burst.
+        const waiting = yield* pull.pipe(Effect.forkScoped);
+        yield* Deferred.await(subscribed);
+        // Bursts of varying shape, each pulled to its end before the next: a lost wake-up would
+        // leave a pull waiting forever, a lost event would leave a key behind.
+        let sequence = 0;
+        let lastSeen = 0;
+        for (let round = 1; round <= 60; round++) {
+          const burst = Array.from({ length: 1 + (round % 7) }, (_, index) => ({
+            sequence: ++sequence,
+            text: `round ${round}`,
+            threadId: `thread-${(round + index) % 4}`,
+          }));
+          yield* PubSub.publishAll(pubsub, burst);
+          const newest = new Map(burst.map((event) => [event.threadId, event.sequence]));
+          const seen = new Map<string | undefined, number>();
+          while (seen.size < newest.size || [...newest].some(([key, s]) => seen.get(key)! < s)) {
+            for (const event of yield* round === 1 && seen.size === 0
+              ? Fiber.join(waiting)
+              : pull) {
+              expect(event.sequence).toBeGreaterThan(lastSeen);
+              lastSeen = event.sequence;
+              seen.set(event.threadId, event.sequence);
+            }
+          }
+          expect(seen).toEqual(newest);
+        }
+        expect(yield* PubSub.size(pubsub)).toBe(0);
+      }),
+    ),
+  );
+
   it.effect("lets a fast reader replay a database page larger than both buffer limits", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -195,5 +249,57 @@ describe("replayAndBufferProjectedLiveEvents", () => {
           expect(yield* PubSub.size(pubsub)).toBe(0);
         }),
       ),
+  );
+});
+
+describe("resyncOnLiveOverflow", () => {
+  it.effect("follows each overflow with the next segment, backing off within a streak", () =>
+    Effect.gen(function* () {
+      const overflow = new LiveStreamBufferError({ message: "full" });
+      const collected: Array<string> = [];
+      const built: Array<Deferred.Deferred<void>> = [];
+      let builds = 0;
+      // Every segment emits its label; the first three then overflow, the fourth ends normally.
+      const segment = (label: string, overflows: boolean) =>
+        Stream.make(label).pipe(
+          overflows ? Stream.concat(Stream.fail(overflow)) : Stream.concat(Stream.empty),
+        );
+      const next = Effect.sync(() => {
+        builds += 1;
+        Deferred.doneUnsafe(built[builds - 1]!, Effect.void);
+        return segment(`resync-${builds}`, builds < 3);
+      });
+      for (let index = 0; index < 3; index++) built.push(yield* Deferred.make<void>());
+      const done = yield* resyncOnLiveOverflow(segment("first", true), () => next).pipe(
+        Stream.runForEach((label) => Effect.sync(() => void collected.push(label))),
+        Effect.forkScoped,
+      );
+      // The first resync of a streak is immediate.
+      yield* Deferred.await(built[0]!);
+      expect(collected).toEqual(["first"]);
+      // The second waits 250 ms, the third 500 ms.
+      yield* TestClock.adjust("249 millis");
+      expect(builds).toBe(1);
+      yield* TestClock.adjust("1 millis");
+      yield* Deferred.await(built[1]!);
+      yield* TestClock.adjust("499 millis");
+      expect(builds).toBe(2);
+      yield* TestClock.adjust("1 millis");
+      yield* Deferred.await(built[2]!);
+      // A segment that ends without overflowing ends the stream.
+      yield* Fiber.join(done);
+      expect(collected).toEqual(["first", "resync-1", "resync-2", "resync-3"]);
+      expect(builds).toBe(3);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("passes other failures through", () =>
+    Effect.gen(function* () {
+      const result = yield* resyncOnLiveOverflow(
+        Stream.fail("boom" as const),
+        () => Effect.succeed(Stream.empty),
+      ).pipe(Stream.runDrain, Effect.result);
+      expect(result._tag).toBe("Failure");
+    }),
   );
 });

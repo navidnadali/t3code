@@ -1,13 +1,15 @@
 import * as Schema from "effect/Schema";
 import * as Arr from "effect/Array";
 import type * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
-import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 export class LiveStreamBufferError extends Schema.TaggedError<LiveStreamBufferError>()(
@@ -145,6 +147,30 @@ export const makeLiveStreamBudget = Effect.fn("makeLiveStreamBudget")(function* 
       return Effect.succeed(next);
     });
 
+  /**
+   * `replace` of one item in one synchronous step, for a hot path that must not interleave with
+   * its consumer: the retained item, or the effect that reports the overflow (run it).
+   */
+  const swapUnsafe = <A extends object>(
+    previous: RetainedLiveItem<unknown> | undefined,
+    value: A,
+  ): RetainedLiveItem<A> | Effect.Effect<never, LiveStreamBufferError> => {
+    if (failure) return Effect.fail(failure);
+    const serializedBytes = serializedSize(value);
+    const replaces = previous !== undefined && retained.has(previous);
+    const nextItems = retained.size + (replaces ? 0 : 1);
+    const nextSerializedBytes =
+      retainedSerializedBytes + serializedBytes - (replaces ? previous.serializedBytes : 0);
+    if (nextItems > maxItems || nextSerializedBytes > maxSerializedBytes) {
+      return overflow(nextItems, nextSerializedBytes);
+    }
+    if (replaces) release([previous]);
+    const item = { value, serializedBytes };
+    retained.add(item);
+    retainedSerializedBytes += serializedBytes;
+    return item;
+  };
+
   const deliver = <A, E, R>(stream: Stream.Stream<RetainedLiveItem<A>, E, R>) =>
     Stream.fromPull(
       Effect.gen(function* () {
@@ -200,6 +226,7 @@ export const makeLiveStreamBudget = Effect.fn("makeLiveStreamBudget")(function* 
   return {
     retain,
     replace,
+    swapUnsafe,
     release,
     deliver,
     check,
@@ -252,47 +279,47 @@ const retainLiveStream = Effect.fn("LiveStreamBudget.retainLiveStream")(function
   return Stream.fromQueue(queue);
 });
 
-/** Retain only the newest waiting value per key; a pull takes them all in sequence order. */
+/**
+ * Retain only the newest waiting value per key; a pull takes them all in sequence order. Each
+ * event is one synchronous step (budget swap, map update, wake-up token), so it cannot interleave
+ * with a drain: no lock, and no event can be left waiting without a wake-up.
+ */
 const retainLatestLiveStream = Effect.fn("LiveStreamBudget.retainLatestLiveStream")(function* <
   A extends { readonly sequence: number },
   E,
   R,
 >(source: Stream.Stream<A, E, R>, key: (value: A) => string, budget: LiveStreamBudget) {
   const ready = yield* Queue.bounded<void, E | LiveStreamBufferError | Cause.Done>(1);
-  const mutex = yield* Semaphore.make(1);
   const pending = new Map<string, RetainedLiveItem<A>>();
   let closed = false;
+  const offer = (value: A): Effect.Effect<void, LiveStreamBufferError> => {
+    if (closed) return Effect.void;
+    const identity = key(value);
+    const previous = pending.get(identity);
+    if (previous !== undefined && previous.value.sequence >= value.sequence) return Effect.void;
+    const swapped = budget.swapUnsafe(previous, value);
+    // The overflow report must finish although failing the budget interrupts this producer.
+    if (Effect.isEffect(swapped)) return Effect.uninterruptible(swapped);
+    const wasEmpty = pending.size === 0;
+    pending.set(identity, swapped);
+    // Only the empty-to-nonempty transition needs a wakeup; the drain takes everything pending.
+    if (wasEmpty) Queue.offerUnsafe(ready, undefined);
+    return Effect.void;
+  };
   const close = (error?: LiveStreamBufferError) =>
-    mutex.withPermit(
-      Effect.gen(function* () {
-        if (closed) return;
-        closed = true;
-        budget.release(pending.values());
-        pending.clear();
-        if (error) yield* Queue.fail(ready, error);
-        yield* Queue.shutdown(ready);
-      }),
-    );
+    Effect.suspend(() => {
+      if (closed) return Effect.void;
+      closed = true;
+      budget.release(pending.values());
+      pending.clear();
+      return (error ? Queue.fail(ready, error) : Effect.void).pipe(
+        Effect.andThen(Queue.shutdown(ready)),
+      );
+    });
   yield* Effect.addFinalizer(() => close());
   yield* budget.failed.pipe(Effect.catchTags({ LiveStreamBufferError: close }), Effect.forkScoped);
   yield* source.pipe(
-    Stream.runForEach((value) =>
-      mutex.withPermit(
-        Effect.gen(function* () {
-          yield* budget.check;
-          if (closed) return;
-          const identity = key(value);
-          const previous = pending.get(identity);
-          if (previous && previous.value.sequence >= value.sequence) return;
-          const wasEmpty = pending.size === 0;
-          const [item] = yield* budget.replace(previous ? [previous] : [], [value]);
-          pending.set(identity, item!);
-          // Only the empty-to-nonempty transition needs a wakeup; replacements
-          // must not leave another token after this batch has drained.
-          if (wasEmpty) yield* Queue.offer(ready, undefined);
-        }).pipe(Effect.uninterruptible),
-      ),
-    ),
+    Stream.runForEach((value) => Effect.suspend(() => offer(value))),
     Effect.raceFirst(budget.failed),
     Effect.exit,
     Effect.flatMap((exit) =>
@@ -300,25 +327,67 @@ const retainLatestLiveStream = Effect.fn("LiveStreamBudget.retainLatestLiveStrea
     ),
     Effect.forkScoped({ startImmediately: true }),
   );
-  return Stream.fromPull(
-    Effect.succeed(
-      Queue.take(ready).pipe(
-        Effect.andThen(
-          mutex.withPermit(
-            Effect.sync(() => {
-              const items = Array.from(pending.values()).sort(
-                (left, right) => left.value.sequence - right.value.sequence,
-              );
-              pending.clear();
-              // Moving to delivery preserves the budget charge until ACK.
-              return items as Arr.NonEmptyArray<RetainedLiveItem<A>>;
-            }),
-          ),
-        ),
-      ),
-    ),
+  const drain: Effect.Effect<
+    Arr.NonEmptyArray<RetainedLiveItem<A>>,
+    E | LiveStreamBufferError | Cause.Done
+  > = Queue.take(ready).pipe(
+    Effect.flatMap(() => {
+      // A close can empty the map before the token is taken; the next take then ends or fails.
+      if (pending.size === 0) return drain;
+      const items = Array.from(pending.values()).sort(
+        (left, right) => left.value.sequence - right.value.sequence,
+      );
+      pending.clear();
+      // Moving to delivery preserves the budget charge until ACK.
+      return Effect.succeed(items as Arr.NonEmptyArray<RetainedLiveItem<A>>);
+    }),
   );
+  return Stream.fromPull(Effect.succeed(drain));
 });
+
+const RESYNC_BACKOFF_BASE_MS = 250;
+const RESYNC_BACKOFF_MAX_MS = 30_000;
+const RESYNC_STREAK_WINDOW_MS = 60_000;
+
+/**
+ * After each live buffer overflow, the segment `next` builds (fresh snapshot + live tail) follows
+ * `first` in one flat stream; any other end ends the stream. Resyncs under a minute apart form
+ * a streak, whose second and later snapshots wait 250 ms, 500 ms, … up to 30 s.
+ */
+export const resyncOnLiveOverflow = <A, E, R, E2 = never, R2 = never>(
+  first: Stream.Stream<A, E, R>,
+  next: () => Effect.Effect<Stream.Stream<A, E, R>, E2, R2>,
+): Stream.Stream<A, E | E2, R | R2> =>
+  Stream.suspend(() => {
+    let overflowed = false;
+    let streak = 0;
+    let lastResyncAt = Number.NEGATIVE_INFINITY;
+    const guarded = (segment: Stream.Stream<A, E, R>) =>
+      segment.pipe(
+        Stream.catchIf(isLiveStreamBufferOverflow, () => {
+          overflowed = true;
+          return Stream.empty;
+        }),
+      );
+    return Stream.paginate(0, (resyncs) => {
+      if (resyncs === 0) return Effect.succeed([[guarded(first)], Option.some(1)] as const);
+      if (!overflowed) return Effect.succeed([[], Option.none()] as const);
+      overflowed = false;
+      return Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        streak = now - lastResyncAt < RESYNC_STREAK_WINDOW_MS ? streak + 1 : 1;
+        lastResyncAt = now;
+        if (streak > 1) {
+          yield* Effect.sleep(
+            Duration.millis(
+              Math.min(RESYNC_BACKOFF_BASE_MS * 2 ** (streak - 2), RESYNC_BACKOFF_MAX_MS),
+            ),
+          );
+        }
+        return [[guarded(yield* next())], Option.some(resyncs + 1)] as const;
+      });
+    }).pipe(Stream.flatMap((segment) => segment));
+  });
 
 /** Coalesce queued full states; delivered states stay charged until the next pull ACKs them. */
 export const bufferLatestLiveStream = <A extends { readonly sequence: number }, E, R>(

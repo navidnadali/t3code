@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Predicate from "effect/Predicate";
@@ -1124,16 +1125,16 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   );
 });
 
-const processSpawnerChoices: Record<string, "default" | "worker" | "child"> = {
-  "": "default",
-  default: "default",
-  "0": "default",
-  false: "default",
-  worker: "worker",
-  child: "child",
-  "1": "child",
-  true: "child",
-};
+const processSpawnerChoices = new Map<string, "default" | "worker" | "child">([
+  ["", "default"],
+  ["default", "default"],
+  ["0", "default"],
+  ["false", "default"],
+  ["worker", "worker"],
+  ["child", "child"],
+  ["1", "child"],
+  ["true", "child"],
+]);
 
 /**
  * Replaces the ambient ChildProcessSpawner: T3CODE_PROCESS_SPAWNER=child (or 1/true) starts commands
@@ -1146,19 +1147,18 @@ export const layerFromConfig = Layer.effect(
   Effect.gen(function* () {
     const fallback = yield* ChildProcessSpawner;
     const platform = yield* HostProcess.Platform;
-    const value = yield* Config.String(PROCESS_SPAWNER_ENV).pipe(
-      Config.withDefault(""),
-      Effect.orDie,
-    );
+    const value = yield* Config.String(PROCESS_SPAWNER_ENV).pipe(Config.option, Effect.orDie);
     const worker = yield* Config.Boolean(VCS_SPAWN_WORKER_ENV).pipe(
       Config.withDefault(false),
       Effect.orDie,
     );
-    const choice = value.trim().toLowerCase();
-    let spawner = choice === "" && worker ? "worker" : processSpawnerChoices[choice];
+    let spawner = Option.match(value, {
+      onNone: () => (worker ? "worker" : "default"),
+      onSome: (set) => processSpawnerChoices.get(set.trim().toLowerCase()),
+    });
     if (spawner === undefined) {
       yield* Effect.logError(
-        `${PROCESS_SPAWNER_ENV}="${value}" is not child, worker or default (or 1/0); using the default spawner`,
+        `${PROCESS_SPAWNER_ENV}="${Option.getOrElse(value, () => "")}" is not child, worker or default (or 1/0); using the default spawner`,
       );
       spawner = "default";
     }

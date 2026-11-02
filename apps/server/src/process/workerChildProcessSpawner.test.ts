@@ -1174,9 +1174,9 @@ describe("WorkerChildProcessSpawner", () => {
         for (const value of ["default", "0", "false"]) {
           expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(unset);
         }
-        for (const value of ["", "  "]) {
-          expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(unset);
-        }
+        expect(yield* outcome({ [worker]: "true", [spawner]: "  " })).toEqual(unset);
+        // Effect's config reads an empty variable as unset, as for every T3CODE_* setting.
+        expect(yield* outcome({ [worker]: "true", [spawner]: "" })).toEqual(onWorker);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

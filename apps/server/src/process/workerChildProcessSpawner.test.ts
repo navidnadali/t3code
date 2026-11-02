@@ -900,6 +900,40 @@ describe("WorkerChildProcessSpawner", () => {
     },
   );
 
+  it.live.skipIf(!workerPlatform)(
+    "an answer deadline expires on time while the server is otherwise idle",
+    () =>
+      Effect.gen(function* () {
+        // A fresh, quiet Node process whose loop waits for nothing but a line a child writes 100
+        // times later than the deadline: the deadline must not need anything else to wake the loop.
+        // (The ratio is the tolerance; the test asserts which comes first, not a duration.)
+        const script = `
+          import { spawn } from "node:child_process";
+          const { answerDeadlines } = await import(process.argv[1]);
+          const later = spawn(process.execPath, ["-e", "setTimeout(() => process.stdout.write('later'), 10000)"], {
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+          const end = (first) => {
+            process.stdout.write(first);
+            later.kill("SIGKILL");
+            process.exit(0);
+          };
+          later.stdout.on("data", () => end("the later line"));
+          answerDeadlines(100).schedule("start", () => end("the deadline"));`;
+        const server = NodeChildProcess.spawn(
+          process.execPath,
+          ["--input-type=module", "-e", script, `${import.meta.dirname}/spawnerDeadlines.ts`],
+          { cwd: `${import.meta.dirname}/../..`, stdio: ["ignore", "pipe", "ignore"] },
+        );
+        let stdout = "";
+        server.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+        const code = yield* Effect.callback<number | null>((resume) => {
+          server.on("close", (code) => resume(Effect.succeed(code)));
+        });
+        expect({ code, first: stdout }).toEqual({ code: 0, first: "the deadline" });
+      }),
+  );
+
   it.live.skipIf(!workerPlatform)("a spawner process is sent no command before its handshake", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

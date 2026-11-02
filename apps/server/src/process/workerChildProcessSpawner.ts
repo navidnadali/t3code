@@ -32,6 +32,7 @@ import type * as NodeNet from "node:net";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 
+import { answerDeadlines, type SpawnerTimers } from "./spawnerDeadlines.ts";
 import {
   PROCESS_SPAWNER_EXECUTABLE,
   spawnerHandshake,
@@ -40,6 +41,7 @@ import {
 } from "./spawnerSources.ts";
 
 export { PROCESS_SPAWNER_EXECUTABLE, spawnerProcessSource, spawnWorkerSource };
+export type { SpawnerTimers };
 
 export const VCS_SPAWN_WORKER_ENV = "T3CODE_VCS_SPAWN_WORKER";
 export const PROCESS_SPAWNER_ENV = "T3CODE_PROCESS_SPAWNER";
@@ -1232,25 +1234,6 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
  * that stops is restarted; one that stops again before starting a command, or more than
  * `spawnerRestartLimit` times in its window, is down: commands fail until its cool-down has passed.
  */
-/** Schedules the spawner's answer deadlines; tests fire them by hand. */
-export interface SpawnerTimers {
-  readonly schedule: (kind: "handshake" | "start", run: () => void) => () => void;
-}
-
-// Expires only after pending I/O has been read: a reply that arrived during an event-loop stall
-// (a long start-up, for instance) is still in time.
-const scheduleAnswerDeadline: SpawnerTimers["schedule"] = (_kind, run) => {
-  let immediate: NodeJS.Immediate | undefined;
-  const timer = setTimeout(() => {
-    immediate = setImmediate(run);
-    immediate.unref();
-  }, spawnerAnswerMillis);
-  timer.unref();
-  return () => {
-    clearTimeout(timer);
-    if (immediate !== undefined) clearImmediate(immediate);
-  };
-};
 
 export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   fallback: ChildProcessSpawner["Service"],
@@ -1284,7 +1267,7 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   let launch = spawnerExecutable === undefined ? builtIn : launchWith(spawnerExecutable);
   const runLog = Effect.runSyncExitWith(yield* Effect.context<never>());
   const clock = yield* Clock.Clock;
-  const schedule = options.timers?.schedule ?? scheduleAnswerDeadline;
+  const { schedule } = options.timers ?? answerDeadlines(spawnerAnswerMillis);
   let answered = false;
   const host = makeRemoteHost({
     open: (events) => {

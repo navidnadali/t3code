@@ -5,6 +5,7 @@ import {
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -43,6 +44,8 @@ const layerHub = (input: {
   readonly reads: Array<number>;
   readonly title?: () => string;
   readonly onStart?: () => void;
+  readonly beforeSubscribe?: Effect.Effect<void>;
+  readonly onRelease?: () => void;
 }) =>
   ShellDeltaHub.layer.pipe(
     Layer.provide(
@@ -62,8 +65,10 @@ const layerHub = (input: {
             const store = yield* OrchestrationEventStore.OrchestrationEventStore;
             return {
               ...store,
-              subscribeCommitted: Effect.tap(store.subscribeCommitted, () =>
-                Effect.sync(() => input.onStart?.()),
+              subscribeCommitted: (input.beforeSubscribe ?? Effect.void).pipe(
+                Effect.andThen(store.subscribeCommitted),
+                Effect.tap(() => Effect.sync(() => input.onStart?.())),
+                Effect.tap(() => Effect.addFinalizer(() => Effect.sync(() => input.onRelease?.()))),
               ),
             };
           }),
@@ -227,4 +232,50 @@ it.effect("held deltas the snapshot covers are released when the stream starts",
       );
     }).pipe(Effect.provide(layerHub({ reads })));
   }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "a subscriber cancelled while the hub starts leaves no hub and no committed subscription behind",
+  () =>
+    Effect.gen(function* () {
+      const reads: Array<number> = [];
+      let starts = 0;
+      let releases = 0;
+      const subscribing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const subscriber = yield* Effect.forkScoped(
+          Effect.scoped(hub.subscribe().pipe(Effect.andThen(Effect.never))),
+        );
+        yield* Deferred.await(subscribing);
+        yield* Fiber.interrupt(subscriber).pipe(Effect.forkScoped);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.await(subscriber);
+        yield* TestClock.adjust(0);
+        assert.equal(starts, 1);
+        assert.equal(releases, 1);
+        // Nothing is left: the next subscriber starts a fresh hub.
+        yield* Effect.scoped(hub.subscribe());
+        yield* TestClock.adjust(0);
+        assert.equal(starts, 2);
+        assert.equal(releases, 2);
+      }).pipe(
+        Effect.provide(
+          layerHub({
+            reads,
+            onStart: () => {
+              starts += 1;
+            },
+            // Holds the committed subscription open while the subscriber is cancelled.
+            beforeSubscribe: Deferred.succeed(subscribing, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+            ),
+            onRelease: () => {
+              releases += 1;
+            },
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped),
 );

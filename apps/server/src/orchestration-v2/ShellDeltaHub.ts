@@ -179,27 +179,31 @@ const make = Effect.gen(function* () {
     });
 
   const subscribe: ShellDeltaHubShape["subscribe"] = Effect.fnUntraced(function* (limits) {
-    const instance = yield* lifecycle.withPermit(
-      Effect.gen(function* () {
-        if (current !== undefined && current.failure !== undefined) yield* stop(current);
-        const instance = current ?? (yield* start);
-        current = instance;
-        instance.subscribers += 1;
-        return instance;
-      }),
-    );
     // The subscription has its own scope: it closes with the subscriber's, or earlier when the
-    // buffer overflows or the hub fails, and only then does this subscriber stop counting.
+    // buffer overflows or the hub fails, and only then does this subscriber stop counting. Taking
+    // the instance and registering that release is one uninterruptible step, so a subscriber
+    // cancelled while the hub starts can neither orphan the hub nor leave a count behind.
     const subscriptionScope = yield* Scope.fork(yield* Effect.scope);
-    yield* Scope.addFinalizer(
-      subscriptionScope,
+    const instance = yield* Effect.acquireRelease(
       lifecycle.withPermit(
-        Effect.suspend(() => {
-          instance.subscribers -= 1;
-          return instance.subscribers === 0 && current === instance ? stop(instance) : Effect.void;
+        Effect.gen(function* () {
+          if (current !== undefined && current.failure !== undefined) yield* stop(current);
+          const instance = current ?? (yield* start);
+          current = instance;
+          instance.subscribers += 1;
+          return instance;
         }),
       ),
-    );
+      (instance) =>
+        lifecycle.withPermit(
+          Effect.suspend(() => {
+            instance.subscribers -= 1;
+            return instance.subscribers === 0 && current === instance
+              ? stop(instance)
+              : Effect.void;
+          }),
+        ),
+    ).pipe(Scope.provide(subscriptionScope));
     const subscription = yield* PubSub.subscribe(instance.output).pipe(
       Scope.provide(subscriptionScope),
     );

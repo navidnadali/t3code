@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -45,6 +46,8 @@ const layerHub = (input: {
   readonly onStart?: () => void;
   readonly afterSubscribe?: Effect.Effect<void>;
   readonly onRelease?: () => void;
+  /** Holds every base read for a resync until it completes. */
+  readonly readGate?: Effect.Effect<void>;
 }) =>
   ShellDeltaHub.layer.pipe(
     Layer.provide(
@@ -52,13 +55,15 @@ const layerHub = (input: {
         Layer.mock(ThreadManagementService.ThreadManagementService)({
           listActiveSubagentThreadIds: () => Effect.succeed([]),
           readShellSnapshot: () =>
-            Effect.succeed(
-              Effect.succeed({
-                schemaVersion: 1,
-                snapshotSequence: 0,
-                threads: [],
-                archivedThreads: [],
-              }),
+            (input.readGate ?? Effect.void).pipe(
+              Effect.as(
+                Effect.succeed({
+                  schemaVersion: 1,
+                  snapshotSequence: 0,
+                  threads: [],
+                  archivedThreads: [],
+                }),
+              ),
             ),
           getThreadShellForEvent: ({ threadId: id, sequence }) =>
             Effect.sync(() => {
@@ -157,6 +162,79 @@ it.effect("an overflowing subscription empties its buffer and resyncs on its nex
         }),
       ),
     );
+  }).pipe(Effect.scoped),
+);
+
+const sequences = (items: ReadonlyArray<ShellDeltaHub.ShellSubscriptionItem>) =>
+  items.flatMap((item) => (item.kind === "resync" ? [] : [item.sequence]));
+
+it.effect("deltas offered while the base is read follow the resync", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    const gate = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const scope = yield* Scope.make();
+      const stalled = yield* hub.subscribe({ maxItems: 3 }).pipe(Scope.provide(scope));
+      const pull = yield* Stream.toPull(stalled.stream(0)).pipe(Scope.provide(scope));
+      const first = yield* Effect.forkScoped(pull);
+      yield* publish(threadId, 1);
+      assert.deepEqual(sequences(yield* Fiber.join(first)), [1]);
+      // One delivered and two buffered fill the budget; the fourth empties the buffer.
+      yield* publish(ThreadId.make("thread:b"), 2);
+      yield* publish(ThreadId.make("thread:c"), 3);
+      yield* publish(ThreadId.make("thread:d"), 4);
+      const resync = yield* Effect.forkScoped(pull);
+      yield* TestClock.adjust(0);
+      // Committed while the base is read: it goes into the emptied buffer, admitted once.
+      yield* publish(ThreadId.make("thread:e"), 5);
+      yield* Deferred.succeed(gate, undefined);
+      assert.deepEqual(
+        (yield* Fiber.join(resync)).map((item) => item.kind),
+        ["resync"],
+      );
+      // What the base does not cover is still buffered, so the next pull has it at once.
+      const next = yield* Effect.forkScoped(pull.pipe(Effect.timeoutOption("1 second")));
+      yield* TestClock.adjust("1 second");
+      assert.deepEqual(Option.map(yield* Fiber.join(next), sequences), Option.some([4, 5]));
+      yield* Scope.close(scope, Exit.void);
+    }).pipe(Effect.provide(layerHub({ reads, readGate: Deferred.await(gate) })));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("a reset the opening snapshot covers needs no resync", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const scope = yield* Scope.make();
+      const held = yield* hub.subscribe({ maxItems: 2 }).pipe(Scope.provide(scope));
+      const other = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+      const otherPull = yield* Stream.toPull(other.stream(0)).pipe(Scope.provide(scope));
+      yield* publish(ThreadId.make("thread:a"), 1);
+      assert.deepEqual(sequences(yield* otherPull), [1]);
+      yield* publish(ThreadId.make("thread:b"), 2);
+      // The third held delta empties `held`; it also resets `other`, whose resync reads a base
+      // that covers sequence 3 (in this mock, one behind every sequence).
+      yield* publish(ThreadId.make("thread:c"), 3);
+      assert.deepEqual(
+        (yield* otherPull).map((item) => item.kind),
+        ["resync"],
+      );
+      // The snapshot `held` opens with was read at sequence 3: it covers what the reset dropped,
+      // so the stream continues from it instead of resyncing to the base behind it.
+      const pull = yield* Stream.toPull(held.stream(3)).pipe(Scope.provide(scope));
+      const first = yield* Effect.forkScoped(pull);
+      yield* TestClock.adjust(0);
+      yield* publish(ThreadId.make("thread:d"), 4);
+      assert.deepEqual(
+        (yield* Fiber.join(first)).map((item) =>
+          item.kind === "resync" ? "resync" : item.sequence,
+        ),
+        [4],
+      );
+      yield* Scope.close(scope, Exit.void);
+    }).pipe(Effect.provide(layerHub({ reads })));
   }).pipe(Effect.scoped),
 );
 

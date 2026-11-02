@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - inspects the pass's scratch file with Node built-ins.
 import { assert, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -335,14 +336,33 @@ const scratchDir = Effect.acquireRelease(
   (dir) => Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
 );
 
-const candidateRows = (scratchPath: string) => {
-  const db = new NodeSqlite.DatabaseSync(scratchPath, { readOnly: true });
-  try {
-    return Number(db.prepare("SELECT COUNT(*) AS n FROM candidates").get()?.n);
-  } finally {
-    db.close();
-  }
-};
+/** Statements the pass runs on the main thread, by `sourceSQL`; the scratch store's are among them. */
+const mainThreadStatements = Effect.acquireRelease(
+  Effect.sync(() => {
+    const reads: Array<string> = [];
+    const writes: Array<string> = [];
+    const all = NodeSqlite.StatementSync.prototype.all;
+    const run = NodeSqlite.StatementSync.prototype.run;
+    const readSpy = vi
+      .spyOn(NodeSqlite.StatementSync.prototype, "all")
+      .mockImplementation(function (this: NodeSqlite.StatementSync, ...params) {
+        reads.push(this.sourceSQL);
+        return all.apply(this, params);
+      });
+    const writeSpy = vi
+      .spyOn(NodeSqlite.StatementSync.prototype, "run")
+      .mockImplementation(function (this: NodeSqlite.StatementSync, ...params) {
+        writes.push(this.sourceSQL);
+        return run.apply(this, params);
+      });
+    return { reads, writes, readSpy, writeSpy };
+  }),
+  ({ readSpy, writeSpy }) =>
+    Effect.sync(() => {
+      readSpy.mockRestore();
+      writeSpy.mockRestore();
+    }),
+);
 
 it.effect(
   "keeps its working set in the scratch file, not in memory, and removes it at the end",
@@ -352,18 +372,27 @@ it.effect(
       yield* seedStore();
       const reference = referenceCompaction(yield* scanRows());
       const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
-      const seenOnDisk: Array<number> = [];
-      // After every page the entities seen so far are on disk; the JS side keeps one page's worth.
+      const statements = yield* mainThreadStatements;
+      let pages = 0;
+      let scratchSeen = 0;
       const betweenPages = Effect.sync(() => {
-        seenOnDisk.push(candidateRows(scratchPath));
+        pages += 1;
+        // The scratch database exists for the pass's duration only.
+        if (NodeFS.existsSync(scratchPath)) scratchSeen += 1;
       });
       const summary = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
-      assert.isAbove(seenOnDisk.length, 1);
-      assert.isAbove(seenOnDisk[0]!, 0);
-      assert.equal(seenOnDisk.at(-1), reference.trackedKeys);
+      assert.isAbove(pages, 1);
+      assert.equal(scratchSeen, pages);
+      // Every page of events consults the scratch store and writes its decisions back to it.
+      const lookups = statements.reads.filter((query) => /FROM candidates\b/.test(query));
+      const upserts = statements.writes.filter((query) => /INSERT INTO candidates\b/.test(query));
+      assert.isAtLeast(lookups.length, pages);
+      assert.isAtLeast(upserts.length, 1);
       assert.equal(summary.trackedKeys, reference.trackedKeys);
       assert.equal(summary.deletedEventCount, reference.obsolete.size);
-      assert.isFalse(NodeFS.existsSync(scratchPath));
+      for (const file of [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`]) {
+        assert.isFalse(NodeFS.existsSync(file), file);
+      }
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );
 

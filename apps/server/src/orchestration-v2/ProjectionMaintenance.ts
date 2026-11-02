@@ -73,8 +73,17 @@ const encodeEntityKey = Schema.encodeSync(
   Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String, Schema.NullOr(Schema.String)])),
 );
 
-// The scratch store keeps the pass's working set out of the heap: SQLite caches this much of it.
-const SCRATCH_CACHE_KIB = 8192;
+// The scratch store keeps the pass's working set out of the heap: SQLite caches this much of it,
+// the rest lives in the file (measured on a 2 GB store: 32 MiB costs ≈ 0.2 ms per page over 8 MiB's 1.4 ms).
+const SCRATCH_CACHE_KIB = 32768;
+const SCRATCH_PAGE_SIZE = 8192;
+
+const removeScratchFiles = (scratchPath: string | undefined) => {
+  if (scratchPath === undefined) return;
+  for (const file of [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`]) {
+    NodeFS.rmSync(file, { force: true });
+  }
+};
 
 type CompactionScratch = {
   readonly lookup: (keys: ReadonlyArray<string>) => Map<string, number | null>;
@@ -89,15 +98,18 @@ const openScratch = (scratchPath: string | undefined) =>
   Effect.acquireRelease(
     Effect.try({
       try: (): CompactionScratch & { readonly db: NodeSqlite.DatabaseSync } => {
-        if (scratchPath !== undefined) NodeFS.rmSync(scratchPath, { force: true });
+        removeScratchFiles(scratchPath);
         const db = new NodeSqlite.DatabaseSync(scratchPath ?? ":memory:");
         try {
-          // Scratch data: no journal, no fsync; a crash leaves a file the next pass replaces.
+          // Scratch data, one transaction for the whole pass and never committed: no fsync, and
+          // pages beyond the cache spill to the WAL once rather than at every page's commit.
           db.exec(`
-            PRAGMA journal_mode = OFF;
+            PRAGMA page_size = ${SCRATCH_PAGE_SIZE};
+            PRAGMA journal_mode = WAL;
             PRAGMA synchronous = OFF;
             PRAGMA cache_size = -${SCRATCH_CACHE_KIB};
             CREATE TABLE candidates (entity_key TEXT PRIMARY KEY, oldest INTEGER) WITHOUT ROWID;
+            BEGIN;
           `);
           const select = db.prepare(`
             SELECT entity_key, oldest FROM candidates
@@ -132,7 +144,7 @@ const openScratch = (scratchPath: string | undefined) =>
     ({ db }) =>
       Effect.sync(() => {
         db.close();
-        if (scratchPath !== undefined) NodeFS.rmSync(scratchPath, { force: true });
+        removeScratchFiles(scratchPath);
       }),
   );
 

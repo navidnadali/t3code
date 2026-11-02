@@ -2,11 +2,14 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FiberMap from "effect/FiberMap";
 import * as Option from "effect/Option";
+import type * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
@@ -18,6 +21,16 @@ import * as CodexWire from "./wire.ts";
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
 const MAX_BUFFERED_RAW_MESSAGES = 32;
+// Reads queued and not yet handled with a line offload, at most; past this, stdout waits.
+// Fewer than ~33 drain the pipeline in a burst of one-line reads and delay delivery.
+const READ_AHEAD_LIMIT = 256;
+// Raw bytes of those reads, at most (a larger read takes all of it); whichever bound comes first
+// stops reading, so the backlog stays in the pipe. Behind a stalled line pending reads hold 2.3-5.2x
+// their bytes in heap and buffers: 9.6-21 MiB at this budget, 37-83 MiB with 256 reads alone.
+const READ_AHEAD_BYTES = 4 * 1024 * 1024;
+// A worker call's outcome, kept so that a failure surfaces at its line, as it would in-thread.
+type OffloadOutcome = Exit.Exit<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
+const noOffloadedLines: Iterator<OffloadOutcome> = [][Symbol.iterator]();
 const EXIT_STATUS_GRACE = "250 millis";
 
 export interface CodexAppServerProtocolLogEvent {
@@ -399,25 +412,29 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     });
 
     const lineOffload = options.lineOffload;
+    const isOffloaded = (offload: CodexAppServerLineOffload, line: string) =>
+      line.trim().length > 0 && line.length >= offload.minChars;
+    const decodeOffloaded = (offload: CodexAppServerLineOffload, line: string) =>
+      timing === undefined
+        ? offload.decode(line)
+        : timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () => offload.decode(line));
+    const handleOffloaded = (
+      offload: CodexAppServerLineOffload,
+      line: string,
+      offloaded: CodexOffload.OffloadedLine,
+    ) =>
+      offloaded._tag === "InThread"
+        ? handleLineInThread(line)
+        : Effect.forEach(offloaded.logs ?? [], offload.writeLog, { discard: true }).pipe(
+            Effect.andThen(routeMessage(offloaded.message)),
+          );
     const handleLine = (line: string): Effect.Effect<void, CodexError.CodexAppServerError> => {
       if (line.trim().length === 0) {
         return Effect.void;
       }
-      if (lineOffload !== undefined && line.length >= lineOffload.minChars) {
-        return (
-          timing === undefined
-            ? lineOffload.decode(line)
-            : timeStage(timing, "offload", Buffer.byteLength(line, "utf8"), () =>
-                lineOffload.decode(line),
-              )
-        ).pipe(
-          Effect.flatMap((offloaded) =>
-            offloaded._tag === "InThread"
-              ? handleLineInThread(line)
-              : Effect.forEach(offloaded.logs ?? [], lineOffload.writeLog, {
-                  discard: true,
-                }).pipe(Effect.andThen(routeMessage(offloaded.message))),
-          ),
+      if (lineOffload !== undefined && isOffloaded(lineOffload, line)) {
+        return decodeOffloaded(lineOffload, line).pipe(
+          Effect.flatMap((offloaded) => handleOffloaded(lineOffload, line, offloaded)),
         );
       }
       return handleLineInThread(line);
@@ -455,32 +472,159 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         Effect.flatMap(routeMessage),
       );
 
-    yield* options.stdio.stdin.pipe(
-      Stream.interruptWhen(Deferred.await(terminationSignal)),
-      Stream.runForEach(
-        Effect.fnUntraced(function* (chunk) {
-          const startedAt = timing === undefined ? 0 : timing.now();
-          const framed = framer.push(chunk);
-          const framingMs = timing === undefined ? 0 : timing.now() - startedAt;
-          for (const line of framed.lines) {
-            yield* handleLine(line);
-          }
-          if (framed.exceeded) {
-            return yield* new CodexError.CodexAppServerTransportError({
-              operation: "read-input-stream",
-              cause: new Error(`Incoming message exceeded ${maxIncomingMessageBytes} bytes.`),
-            });
-          }
-          timing?.record("framing", framingMs, chunk.byteLength);
+    const exceededError = () =>
+      new CodexError.CodexAppServerTransportError({
+        operation: "read-input-stream",
+        cause: new Error(`Incoming message exceeded ${maxIncomingMessageBytes} bytes.`),
+      });
+
+    const handleRead = Effect.fnUntraced(function* (
+      offload: CodexAppServerLineOffload,
+      read: {
+        readonly chunk: Uint8Array;
+        readonly lines: CodexWire.FramedLines;
+        readonly framingMs: number;
+      },
+      offloaded: Iterator<OffloadOutcome>,
+    ) {
+      for (const line of read.lines.lines) {
+        if (!isOffloaded(offload, line)) {
+          yield* handleLine(line);
+          continue;
+        }
+        const outcome: OffloadOutcome = offloaded.next().value!;
+        if (Exit.isFailure(outcome)) return yield* Effect.failCause(outcome.cause);
+        yield* handleOffloaded(offload, line, outcome.value);
+      }
+      if (read.lines.exceeded) return yield* exceededError();
+      timing?.record("framing", read.framingMs, read.chunk.byteLength);
+    });
+
+    let droppedAfterTermination = false;
+
+    // A read with no long line is handled where it arrives, as in-thread, unless reads before it
+    // are still pending. A read with long lines sends them to the worker at once and waits in a
+    // queue that a second fiber handles in order, so the next reads arrive at their own pace
+    // instead of each waiting a round trip; one whose lines are back is handled at once.
+    const readAhead = (offload: CodexAppServerLineOffload) => {
+      // Reads queued and not yet handled, and a slot and their bytes for each, released once it is
+      // handled; reading waits for whichever runs out first, so stdout backs up into the pipe.
+      let pending = 0;
+      const slots = Semaphore.makeUnsafe(READ_AHEAD_LIMIT);
+      const budget = Semaphore.makeUnsafe(READ_AHEAD_BYTES);
+      return Stream.unwrap(
+        Effect.gen(function* () {
+          const reads = yield* Queue.unbounded<
+            {
+              readonly chunk: Uint8Array;
+              readonly lines: CodexWire.FramedLines;
+              readonly framingMs: number;
+              readonly offloaded: Fiber.Fiber<ReadonlyArray<OffloadOutcome>> | undefined;
+              readonly bytes: number;
+            },
+            PlatformError.PlatformError | CodexError.CodexAppServerError | Cause.Done<void>
+          >();
+          yield* options.stdio.stdin.pipe(
+            // As in-thread, termination stops stdout at its next read.
+            Stream.interruptWhen(Deferred.await(terminationSignal)),
+            Stream.runForEachWhile(
+              Effect.fnUntraced(function* (chunk) {
+                const startedAt = timing === undefined ? 0 : timing.now();
+                const lines = framer.push(chunk);
+                const read = {
+                  chunk,
+                  lines,
+                  framingMs: timing === undefined ? 0 : timing.now() - startedAt,
+                };
+                const long = lines.lines.filter((line) => isOffloaded(offload, line));
+                if (long.length === 0 && pending === 0) {
+                  yield* handleRead(offload, read, noOffloadedLines);
+                } else {
+                  // A read larger than the budget takes all of it.
+                  const bytes = Math.min(chunk.byteLength, READ_AHEAD_BYTES);
+                  yield* Semaphore.take(slots, 1);
+                  yield* Semaphore.take(budget, bytes);
+                  pending += 1;
+                  const offloaded =
+                    long.length === 0
+                      ? undefined
+                      : yield* Effect.forEach(
+                          long,
+                          (line) => Effect.exit(decodeOffloaded(offload, line)),
+                          { concurrency: "unbounded" },
+                        ).pipe(Effect.forkScoped);
+                  yield* Queue.offer(reads, { ...read, offloaded, bytes });
+                }
+                // In-thread the read stops at an oversized line.
+                return !lines.exceeded;
+              }),
+            ),
+            Effect.matchCauseEffect({
+              onSuccess: () => Queue.end(reads),
+              onFailure: (cause) => Queue.failCause(reads, cause),
+            }),
+            Effect.forkScoped,
+          );
+          return Stream.fromQueue(reads);
         }),
-      ),
+      ).pipe(
+        Stream.runForEach(({ offloaded, bytes, ...read }) =>
+          Deferred.isDone(terminationSignal).pipe(
+            Effect.flatMap((terminated) => {
+              // In-thread a read not begun by termination is never read, so it is dropped unlogged.
+              if (terminated) {
+                droppedAfterTermination = true;
+                return Effect.void;
+              }
+              return (offloaded === undefined ? Effect.succeed([]) : Fiber.join(offloaded)).pipe(
+                Effect.flatMap((results) => handleRead(offload, read, results[Symbol.iterator]())),
+              );
+            }),
+            Effect.tap(() =>
+              Effect.suspend(() => {
+                pending -= 1;
+                return Semaphore.release(slots, 1).pipe(
+                  Effect.andThen(Semaphore.release(budget, bytes)),
+                );
+              }),
+            ),
+          ),
+        ),
+      );
+    };
+
+    yield* (
+      lineOffload === undefined
+        ? options.stdio.stdin.pipe(
+            Stream.interruptWhen(Deferred.await(terminationSignal)),
+            Stream.runForEach(
+              Effect.fnUntraced(function* (chunk) {
+                const startedAt = timing === undefined ? 0 : timing.now();
+                const framed = framer.push(chunk);
+                const framingMs = timing === undefined ? 0 : timing.now() - startedAt;
+                for (const line of framed.lines) {
+                  yield* handleLine(line);
+                }
+                if (framed.exceeded) {
+                  return yield* exceededError();
+                }
+                timing?.record("framing", framingMs, chunk.byteLength);
+              }),
+            ),
+          )
+        : readAhead(lineOffload)
+    ).pipe(
       Effect.matchEffect({
         onFailure: (error) =>
           handleTermination(() =>
             Effect.succeed(normalizeIncomingError(error, "read-input-stream")),
           ),
         onSuccess: () =>
-          Effect.sync(() => framer.end()).pipe(
+          Effect.sync(() => {
+            const tail = framer.end();
+            // A dropped read's bytes end it; in-thread would log the last handled read's part.
+            return droppedAfterTermination ? "" : tail;
+          }).pipe(
             Effect.flatMap(handleLine),
             Effect.matchEffect({
               onFailure: (error) => handleTermination(() => Effect.succeed(error)),
@@ -505,7 +649,20 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       Effect.forkScoped,
     );
 
-    yield* Stream.fromQueue(outgoing).pipe(Stream.run(options.stdio.stdout()), Effect.forkScoped);
+    yield* Stream.fromQueue(outgoing).pipe(
+      Stream.run(options.stdio.stdout()),
+      Effect.catch((cause) =>
+        handleTermination(() =>
+          Effect.succeed(
+            new CodexError.CodexAppServerTransportError({
+              operation: "write-output-stream",
+              cause,
+            }),
+          ),
+        ),
+      ),
+      Effect.forkScoped,
+    );
 
     const request = Effect.fn("CodexAppServerProtocol.request")(function* (
       method: string,
@@ -515,17 +672,30 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         nextRequestId,
         (current) => [current, current + 1] as const,
       );
+      const attributes = {
+        "rpc.system": "jsonrpc",
+        "rpc.method": method,
+        "rpc.request_id": requestId,
+      };
+      yield* Effect.annotateCurrentSpan(attributes);
       const deferred = yield* Deferred.make<unknown, CodexError.CodexAppServerError>();
-      yield* Ref.update(pending, (current) =>
-        new Map(current).set(String(requestId), { deferred, method }),
-      );
-      yield* offerOutgoing({
-        id: requestId,
-        method,
-        ...(payload !== undefined ? { params: payload } : {}),
-      }).pipe(Effect.tapError(() => removePending(String(requestId))));
-      return yield* Deferred.await(deferred).pipe(
-        Effect.onInterrupt(() => removePending(String(requestId))),
+      return yield* Effect.acquireUseRelease(
+        Ref.update(pending, (current) =>
+          new Map(current).set(String(requestId), { deferred, method }),
+        ),
+        () =>
+          Effect.gen(function* () {
+            yield* offerOutgoing({
+              id: requestId,
+              method,
+              ...(payload !== undefined ? { params: payload } : {}),
+            }).pipe(Effect.withSpan("CodexAppServerProtocol.request.enqueue", { attributes }));
+            // Includes queue/stdin delivery, Codex work and response routing, not just T3 CPU.
+            return yield* Deferred.await(deferred).pipe(
+              Effect.withSpan("CodexAppServerProtocol.request.awaitResponse", { attributes }),
+            );
+          }),
+        () => removePending(String(requestId)),
       );
     });
 

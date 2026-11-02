@@ -9,15 +9,18 @@ compare  Prints one markdown table: the median of the valid runs per metric, its
          runs, and after − before. It refuses (exit 2) results that differ in, or lack, any of:
          base SHA; fixture hash; trace sampling (T3CODE_TRACE_MIN_LEVEL,
          T3CODE_TRACE_SQL_MIN_DURATION_MS, T3CODE_TRACE_TIMING_ENABLED, OTLP export interval);
-         workload (driver files, its arguments, the BENCH_* load knobs); host (hostname
-         fingerprint, CPU model); Node version; harness (git SHA and the harness files' hash);
-         server entry (built dist vs source) and the server/driver CPU pinning. Server knobs may
-         differ (that is what a knob A/B measures); the ones that do, and any other run setting
-         that differs, are listed under the table.
+         workload (driver files and their local imports, its arguments, the BENCH_* load knobs,
+         the fake providers, the transcripts they replay and the launchers the fixture's settings
+         run); host (hostname fingerprint, CPU model); Node version; harness (git SHA and the
+         harness files' hash); server entry (built dist vs source) and the server/driver CPU
+         pinning. Server knobs may differ (that is what a knob A/B measures); the ones that do,
+         and any other run setting that differs, are listed under the table.
 show     The same table for one result.
 
-A metric without data (no spans of that kind, no per-thread data on macOS, a trace that does not
-cover the window) renders n/a, never 0. result.json files are written by run.ts.`;
+Each client call type has p50, p95 and completed-call rows, plus errors and unfinished (still
+running after the driver's grace period, so its latencies leave them out) rows when a run had
+any. A metric without data (no spans of that kind, no per-thread data on macOS, a trace that does
+not cover the window) renders n/a, never 0. result.json files are written by run.ts.`;
 
 export const RESULT_SCHEMA = "t3-server-bench/result/1";
 
@@ -237,17 +240,34 @@ const TRAILING_ROWS: ReadonlyArray<Row> = [
   { label: "Spans in window", path: ["trace", "spans"] },
 ];
 
-/** The table rows; one p50 and one p95 row per client call type any result recorded. */
+/**
+ * The table rows. Per client call type any result recorded: p50, p95 and completed calls, then
+ * its errors and the calls still running after the grace period when a run had some.
+ */
 export function tableRows(results: ReadonlyArray<BenchResult>): Array<Row> {
   const callTypes = new Set<string>();
   for (const result of results) {
     const calls = (result.metrics.driver as MetricTree | null | undefined)?.calls;
     if (isTree(calls)) for (const type of Object.keys(calls)) callTypes.add(type);
   }
-  const callRows = [...callTypes].toSorted().flatMap((type) => [
-    { label: `Client \`${type}\` p50 ms`, path: ["driver", "calls", type, "p50_ms"] },
-    { label: `Client \`${type}\` p95 ms`, path: ["driver", "calls", type, "p95_ms"] },
-  ]);
+  const callRows = [...callTypes].toSorted().flatMap((type) => {
+    const row = (what: string, field: string) => ({
+      label: `Client \`${type}\` ${what}`,
+      path: ["driver", "calls", type, field],
+    });
+    const seen = (field: string) =>
+      results.some((result) =>
+        [result.metrics, result.spread?.max].some(
+          (tree) => (valueAt(tree, ["driver", "calls", type, field]) ?? 0) > 0,
+        ),
+      );
+    return [
+      row("p50 ms", "p50_ms"),
+      row("p95 ms", "p95_ms"),
+      row("completed", "count"),
+      ...["errors", "unfinished"].filter(seen).map((field) => row(field, field)),
+    ];
+  });
   return [...LEADING_ROWS, ...callRows, ...TRAILING_ROWS];
 }
 

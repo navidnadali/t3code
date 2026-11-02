@@ -57,6 +57,7 @@ import {
   type ShellSnapshot,
   Subscriber,
   type ThreadShell,
+  withArchivedThreads,
 } from "./driver/clients.ts";
 
 const RESULT_FILE = "driver.json";
@@ -709,7 +710,10 @@ class BenchRun implements RunContext {
       }
     });
     const sessionRng = this.rng.fork("session-text");
-    const { assignments, switches } = historyAssignments(options.sessionPlan, chosen);
+    const { assignments, switches, modelSwitches } = historyAssignments(
+      options.sessionPlan,
+      chosen,
+    );
     for (const { session: planned, thread, switchProvider } of assignments) {
       this.sessions.push(
         new Session({
@@ -734,6 +738,7 @@ class BenchRun implements RunContext {
         rerootedProjects: rerooted.length,
         modeChanges,
         providerSwitches: switches,
+        modelSwitches,
         sessionThreadIds: chosen.map((thread) => thread.id),
       },
       itemCounts,
@@ -803,7 +808,9 @@ class BenchRun implements RunContext {
       watcher.follow(this, control, snapshot.value.snapshotSequence);
       const workload = await this.race(
         options.mode === "history"
-          ? this.prepareHistory(snapshot.value, watcher)
+          ? withArchivedThreads(snapshot.value, control, options.callTimeoutMs).then((shells) =>
+              this.prepareHistory(shells, watcher),
+            )
           : this.prepareFresh(watcher),
       );
       for (const session of sessions) session.watch();

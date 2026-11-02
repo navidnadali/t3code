@@ -684,13 +684,16 @@ const sameMessageRowids = (left: string, right: string) => {
 
 /**
  * VACUUM INTO `destination`, created empty, private and exclusively first (SQLite fills an empty
- * file): no free pages, so nothing deleted or blanked survives on disk.
+ * file): no free pages, so nothing deleted or blanked survives on disk. `owned` takes the file
+ * only once created: a path another run made first is never this run's to remove.
  */
 export const compactInto = Effect.fn("fixture.compactInto")(function* (
   source: string,
   destination: string,
+  owned: ReturnType<typeof ownedFiles>,
 ) {
   createExclusive(destination);
+  owned.file(destination);
   const db = new NodeSqlite.DatabaseSync(source);
   try {
     db.prepare(`VACUUM INTO ?`).run(destination);
@@ -902,8 +905,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
     }
 
     yield* Console.log(`Compacting into ${destination}...`);
-    owned.file(destination);
-    yield* compactInto(scratch, destination);
+    yield* compactInto(scratch, destination, owned);
 
     yield* Console.log("Checking the result...");
     const check = yield* checkFixture(destination, mode);

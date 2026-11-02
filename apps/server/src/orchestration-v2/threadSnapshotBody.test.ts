@@ -408,6 +408,8 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
           runtimeRequests: runtimeRequests([
             { reply: { toJSON: null, text: `${TEXT}\n`.repeat(40_000) } },
             { [TEXT.repeat(40_000)]: 0 },
+            // Under a chunk before escaping, six times that after: each NUL is written as \u0000.
+            { nul: "\u0000".repeat(200_000) },
             { many: Array.from({ length: 200_000 }, (_, index) => ({ index, text: "x" })) },
             { deep: nest(TEXT.repeat(40_000)) },
             { deep: nest(TEXT) },

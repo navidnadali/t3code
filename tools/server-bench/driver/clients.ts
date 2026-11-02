@@ -69,6 +69,28 @@ export interface ShellSnapshot {
   readonly projects: ReadonlyArray<{ readonly id: string; readonly workspaceRoot: string }>;
 }
 
+/**
+ * The snapshot with the archive, which `/api/orchestration/shell` leaves out (its archivedThreads
+ * is always empty). A thread in both reads stays with the active threads.
+ */
+export async function withArchivedThreads(
+  snapshot: ShellSnapshot,
+  socket: RpcSocket,
+  timeoutMs: number,
+): Promise<ShellSnapshot> {
+  const archive = (await socket.call("orchestration.getArchivedShellSnapshot", {}, timeoutMs)) as {
+    readonly threads: ReadonlyArray<ThreadShell>;
+  };
+  const active = new Set(snapshot.threads.map((thread) => thread.id));
+  return {
+    ...snapshot,
+    archivedThreads: [
+      ...(snapshot.archivedThreads ?? []),
+      ...archive.threads.filter((thread) => !active.has(thread.id)),
+    ],
+  };
+}
+
 interface StreamItem {
   readonly kind?: string;
   readonly sequence?: number;
@@ -242,7 +264,7 @@ export class Session {
     readonly rng: Rng;
     /** The provider instance and model this session's turns run on. */
     readonly selection: { readonly instanceId: string; readonly model: string };
-    /** History mode: the seeded thread ran elsewhere, so the first turn switches it. */
+    /** History mode: the seeded thread ran on another instance or model; turn 1 switches it. */
     readonly switchProvider: boolean;
   }) {
     this.index = input.index;

@@ -853,6 +853,21 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     ),
   );
 
+  it.effect("stops a CLI whose query is closing before the pool's close returns", () =>
+    Effect.gen(function* () {
+      const cli = new FakeClaudeCli({ exitOnStdinEnd: false });
+      yield* withRunner("worker", ({ runner }) =>
+        Effect.gen(function* () {
+          const session = yield* runner.open(openInput(cli));
+          yield* session.close;
+          yield* Effect.promise(() => cli.stdinEnded);
+        }),
+      );
+      assert.deepStrictEqual(cli.kills, ["SIGTERM"]);
+      assert.strictEqual(cli.signalCode, "SIGTERM");
+    }),
+  );
+
   it.effect("keeps the query in-thread when the pool has no workers", () =>
     Effect.gen(function* () {
       const startedBefore = workers.started.length;
@@ -1781,10 +1796,12 @@ const scriptedPool = () => {
   const notified: Array<ClaudeAgentSdkWorkerRequest> = [];
   const waiters: Array<() => void> = [];
   let raise: ((event: ClaudeAgentSdkWorkerEvent) => void) | undefined;
+  let onPoolClose: Effect.Effect<void> | undefined;
   const pool: ProviderIoWorkerPool.ProviderIoWorkerPool["Service"] = {
     open: (input) =>
       Effect.sync(() => {
         raise = input.onEvent as (event: ClaudeAgentSdkWorkerEvent) => void;
+        onPoolClose = input.onPoolClose;
         return Option.some({
           write: () => Effect.void,
           end: Effect.void,
@@ -1807,10 +1824,20 @@ const scriptedPool = () => {
       };
       check();
     });
-  return { pool, raise: (event: ClaudeAgentSdkWorkerEvent) => raise?.(event), notifiedOf };
+  return {
+    pool,
+    raise: (event: ClaudeAgentSdkWorkerEvent) => raise?.(event),
+    notifiedOf,
+    closePool: Effect.suspend(() => onPoolClose ?? Effect.void),
+  };
 };
 
-const startScripted = (callbacks: Parameters<typeof startClaudeQueryInWorker>[0]["callbacks"]) =>
+const startScripted = (
+  callbacks: Parameters<typeof startClaudeQueryInWorker>[0]["callbacks"],
+  spawn: Parameters<typeof startClaudeQueryInWorker>[0]["spawn"] = () => {
+    throw new Error("No CLI in this test.");
+  },
+) =>
   Effect.gen(function* () {
     const scripted = scriptedPool();
     yield* startClaudeQueryInWorker({
@@ -1818,9 +1845,7 @@ const startScripted = (callbacks: Parameters<typeof startClaudeQueryInWorker>[0]
       stageOptions: { options: {}, callbacks: ["canUseTool"] },
       callbacks,
       prompt: (async function* () {})(),
-      spawn: () => {
-        throw new Error("No CLI in this test.");
-      },
+      spawn,
       toError: (cause, method) => new ClaudeAgentSdkQueryRunnerError({ cause, method }),
     });
     return scripted;
@@ -1840,6 +1865,33 @@ describe("startClaudeQueryInWorker callbacks", () => {
       );
       const [answer] = yield* Effect.promise(() => scripted.notifiedOf("callbackError"));
       assert.deepInclude(answer, { type: "callbackError", id: 0 });
+    }),
+  );
+
+  it.effect("kills a CLI that ignores SIGTERM before its pool's close returns", () =>
+    Effect.gen(function* () {
+      const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+      const scripted = yield* startScripted({}, cli.spawn);
+      scripted.raise({ type: "spawn", command: "claude", args: [], cwd: undefined, env: {} });
+      const closing = yield* Effect.forkChild(scripted.closePool);
+      yield* Effect.promise(() => cli.waitForKill("SIGTERM"));
+      yield* TestClock.adjust("5 seconds");
+      yield* Fiber.join(closing);
+      yield* Effect.promise(() => cli.stdinEnded);
+      assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGKILL"]);
+    }),
+  );
+
+  it.effect("spawns no CLI once its pool has started closing", () =>
+    Effect.gen(function* () {
+      const spawn = vi.fn(() => {
+        throw new Error("No CLI in this test.");
+      });
+      const scripted = yield* startScripted({}, spawn);
+      // A query still starting when the pool closes: its spawn comes after the session's cleanup.
+      yield* scripted.closePool;
+      scripted.raise({ type: "spawn", command: "claude", args: [], cwd: undefined, env: {} });
+      assert.strictEqual(spawn.mock.calls.length, 0);
     }),
   );
 

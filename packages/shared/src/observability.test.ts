@@ -7,6 +7,7 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import { cast } from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
@@ -16,10 +17,12 @@ import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
+import type { OtlpTracer } from "effect/observability";
 
 import {
   causeErrorTag,
   compactTraceAttributes,
+  decodeOtlpTraceRecords,
   errorTag,
   makeLocalFileTracer,
   makeTraceSink,
@@ -685,6 +688,55 @@ describe("observability", () => {
         }),
       ),
     );
+  });
+});
+
+describe("decodeOtlpTraceRecords", () => {
+  it("decodes spans when OTLP/JSON omits unset and empty fields", () => {
+    // Protobuf JSON leaves out unset and empty fields, so this batch is valid.
+    const payload = cast<unknown, OtlpTracer.TraceData>({
+      resourceSpans: [
+        {},
+        {
+          scopeSpans: [
+            {},
+            {
+              spans: [
+                {
+                  traceId: "trace-1",
+                  spanId: "span-1",
+                  name: "browser.request",
+                  startTimeUnixNano: "1000000",
+                  endTimeUnixNano: "3000000",
+                  attributes: [{ key: "tags", value: { arrayValue: {} } }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.deepStrictEqual(decodeOtlpTraceRecords(cast<unknown, OtlpTracer.TraceData>({})), []);
+    assert.deepStrictEqual(decodeOtlpTraceRecords(payload), [
+      {
+        type: "otlp-span",
+        name: "browser.request",
+        traceId: "trace-1",
+        spanId: "span-1",
+        sampled: true,
+        kind: "internal",
+        startTimeUnixNano: "1000000",
+        endTimeUnixNano: "3000000",
+        durationMs: 2,
+        attributes: { tags: [] },
+        resourceAttributes: {},
+        scope: { attributes: {} },
+        events: [],
+        links: [],
+        status: { code: "0" },
+      },
+    ]);
   });
 });
 

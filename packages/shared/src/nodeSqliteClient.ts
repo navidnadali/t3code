@@ -84,8 +84,9 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
   );
 
 /**
- * One permit per reader worker, or one without them. Reads that decode their rows after the read
- * transaction hold one until decoded, so the pool size still bounds how many hold rows at once.
+ * One permit fewer than the reader workers, at least one. A read of large row sets holds one from
+ * before its transaction until decoded, so such reads never hold every reader; with one reader or
+ * none, other reads can wait behind one.
  */
 export const ReaderPermits = Context.Reference<Semaphore.Semaphore | undefined>(
   "@t3tools/shared/nodeSqliteClient/ReaderPermits",
@@ -1411,7 +1412,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
     ],
   });
   const withTransaction = client.withTransaction;
-  const readerPermits = yield* Semaphore.make(Math.max(1, readers.length));
+  const readerPermits = yield* Semaphore.make(Math.max(1, readers.length - 1));
   const transactional = Object.assign(client, {
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.uninterruptibleMask((restore) => {

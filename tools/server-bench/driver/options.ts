@@ -164,9 +164,11 @@ export const USAGE = `Usage: node tools/server-bench/driver.ts --url <origin> --
 
 Drives load against a running scratch T3 server and writes <out>/driver.json. Its knobs echo
 every option but the session plan; sessionsByProvider gives the sessions per provider instance;
-in history mode workload.providerSwitches maps each instance to the seeded threads it took over;
-and with --session-mcp-credentials sessionMcp.credentialsEnvironment maps each planned instance
-to "set by the driver" or "already set". --provider defaults to claudeBench, not claudeAgent.
+in history mode workload.providerSwitches maps each instance to the seeded threads it took over
+from another instance, and workload.modelSwitches to those already on it that their first turn
+moved to the planned model; and with --session-mcp-credentials
+sessionMcp.credentialsEnvironment maps each planned instance to "set by the driver" or "already
+set". --provider defaults to claudeBench, not claudeAgent.
 Before any session opens it sets each planned bench instance's BENCH_STATE_DIR to a fresh,
 owner-only <out>/fake-state/<instance> (and fails when that is not empty), so runs restoring the
 same settings replay the same plan; fakeStateDirectories names them.
@@ -177,8 +179,9 @@ providers:manage whenever a planned instance has a settings entry (every bench i
     --scope orchestration:read --scope orchestration:operate --scope access:write \\
     --scope settings:write --scope providers:manage
 
-  --mode history|fresh      history (default): sessions continue, and readers read, seeded
-                            threads picked to match the fixture's turn-item distribution;
+  --mode history|fresh      history (default): sessions continue seeded active threads, and
+                            readers read seeded threads (archived ones too), picked to match the
+                            turn-item distribution of every fixture thread, archive included;
                             fresh: new projects and threads
   --sessions N              streaming sessions on --provider (default 80)
 ${PROVIDER_LOAD_USAGE}

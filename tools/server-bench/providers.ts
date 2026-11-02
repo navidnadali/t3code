@@ -168,12 +168,13 @@ export function planSessions(groups: ReadonlyArray<SessionGroup>): ReadonlyArray
 }
 
 /**
- * History mode: session i continues seeded thread i on the instance the plan gives it, whatever
- * that thread last ran on; such a thread switches with the session's first turn. `switches`
- * counts, per instance, the threads it takes over that way.
+ * History mode: session i continues seeded thread i on the instance and model the plan gives it,
+ * whatever that thread last ran on; such a thread switches with the session's first turn.
+ * `switches` counts, per instance, the threads it takes over from another instance, and
+ * `modelSwitches` the threads already on it that move to the planned model.
  */
 export function historyAssignments<
-  T extends { readonly modelSelection: { readonly instanceId: string } },
+  T extends { readonly modelSelection: { readonly instanceId: string; readonly model: string } },
 >(
   plan: ReadonlyArray<PlannedSession>,
   threads: ReadonlyArray<T>,
@@ -181,9 +182,11 @@ export function historyAssignments<
   readonly assignments: ReadonlyArray<{
     readonly session: PlannedSession;
     readonly thread: T;
+    /** The first turn sends the planned instance and model. */
     readonly switchProvider: boolean;
   }>;
   readonly switches: Readonly<Record<string, number>>;
+  readonly modelSwitches: Readonly<Record<string, number>>;
 } {
   if (threads.length < plan.length) {
     throw new ProviderLoadError(
@@ -191,13 +194,19 @@ export function historyAssignments<
     );
   }
   const switches: Record<string, number> = {};
+  const modelSwitches: Record<string, number> = {};
+  const count = (counts: Record<string, number>, instanceId: string) => {
+    counts[instanceId] = (counts[instanceId] ?? 0) + 1;
+  };
   const assignments = plan.map((session, index) => {
     const thread = threads[index]!;
-    const switchProvider = thread.modelSelection.instanceId !== session.instanceId;
-    if (switchProvider) switches[session.instanceId] = (switches[session.instanceId] ?? 0) + 1;
-    return { session, thread, switchProvider };
+    const otherInstance = thread.modelSelection.instanceId !== session.instanceId;
+    const otherModel = !otherInstance && thread.modelSelection.model !== session.model;
+    if (otherInstance) count(switches, session.instanceId);
+    if (otherModel) count(modelSwitches, session.instanceId);
+    return { session, thread, switchProvider: otherInstance || otherModel };
   });
-  return { assignments, switches };
+  return { assignments, switches, modelSwitches };
 }
 
 export const FAKE_STATE_DIR = "fake-state";

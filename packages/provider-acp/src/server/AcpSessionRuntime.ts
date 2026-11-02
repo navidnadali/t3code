@@ -26,7 +26,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpClient from "effect-acp/client";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/compat";
-import type * as EffectAcpProtocol from "effect-acp/protocol";
+import * as EffectAcpProtocol from "effect-acp/protocol";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { AgentScope, AgentScopeThreadId, RAISE_OOM_SCORE_LINE } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -1169,7 +1169,7 @@ export class AcpSessionRuntime extends Context.Service<
       providerId: string,
     ) => Effect.Effect<EffectAcpSchema.DisableProviderResponse, EffectAcpErrors.AcpError>;
     readonly logout: Effect.Effect<EffectAcpSchema.LogoutResponse, EffectAcpErrors.AcpError>;
-    /** options.dispatched settles when cancel can target this prompt. */
+    /** options.dispatched settles once the prompt is queued, so a later cancel follows it. */
     readonly prompt: (
       payload: Omit<EffectAcpSchema.PromptRequest, "sessionId">,
       options?: { readonly dispatched?: Deferred.Deferred<void> },
@@ -1240,7 +1240,13 @@ interface EnsureActiveAssistantSegmentResult {
 interface AcpActivePrompt {
   readonly fiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
   readonly completed: Deferred.Deferred<void>;
+  /** Settles once the prompt is queued to the agent, or its call has ended without that. */
+  readonly queued: Deferred.Deferred<void>;
 }
+
+// A fiber stopped before its call began never settles queued, so its end counts too.
+const awaitPromptQueued = (prompt: AcpActivePrompt) =>
+  Effect.raceFirst(Deferred.await(prompt.queued), Fiber.await(prompt.fiber).pipe(Effect.asVoid));
 
 export const make = Effect.fn("AcpSessionRuntime.make")(function* (
   options: AcpSessionRuntimeOptions,
@@ -2445,8 +2451,14 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       sessionId: started.sessionId,
       ...(options.cancelMeta === undefined ? {} : { _meta: options.cancelMeta }),
     } satisfies EffectAcpSchema.CancelNotification;
+    // An agent drops a cancel that comes before the prompt it targets, so it waits for the prompt
+    // to be queued. An interrupted prompt that was not queued yet is never sent.
+    const promptQueued = Option.isSome(activePrompt)
+      ? awaitPromptQueued(activePrompt.value)
+      : Effect.void;
     if (options.cancelBehavior !== "wait-for-prompt") {
       if (options.interruptPromptOnCancel === false) {
+        yield* promptQueued;
         return yield* acp.agent.cancel(cancelPayload);
       }
       if (Option.isSome(activePrompt)) {
@@ -2457,6 +2469,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       return;
     }
 
+    yield* promptQueued;
     yield* acp.agent.cancel(cancelPayload);
     if (Option.isNone(activePrompt)) {
       return;
@@ -2685,22 +2698,38 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
                 ...payload,
               } satisfies EffectAcpSchema.PromptRequest;
               const completed = yield* Deferred.make<void>();
-              // Started at once, so the prompt is queued to the agent before it counts as dispatched.
-              const fiber = yield* runLoggedRequest(
-                "session/prompt",
-                requestPayload,
-                acp.agent.prompt(requestPayload),
-              ).pipe(Effect.forkIn(runtimeScope, { startImmediately: true }));
-              const active = { fiber, completed } satisfies AcpActivePrompt;
+              const queued = yield* Deferred.make<void>();
+              // The prompt goes out only once active, so a cancel issued as it goes out waits for it.
+              const registered = yield* Deferred.make<void>();
+              const fiber = yield* Deferred.await(registered).pipe(
+                Effect.andThen(
+                  runLoggedRequest(
+                    "session/prompt",
+                    requestPayload,
+                    acp.agent
+                      .prompt(requestPayload)
+                      .pipe(
+                        Effect.provideService(EffectAcpProtocol.AcpOutgoingQueued, queued),
+                        Effect.ensuring(Deferred.succeed(queued, undefined)),
+                      ),
+                  ),
+                ),
+                Effect.forkIn(runtimeScope, { startImmediately: true }),
+              );
+              const active = { fiber, completed, queued } satisfies AcpActivePrompt;
               yield* Ref.set(activePromptRef, Option.some(active));
-              if (promptOptions?.dispatched) {
-                yield* Deferred.succeed(promptOptions.dispatched, undefined);
-              }
+              yield* Deferred.succeed(registered, undefined);
               return active;
             }).pipe(notificationSemaphore.withPermit),
           ),
           (activePrompt) =>
-            Fiber.join(activePrompt.fiber).pipe(
+            awaitPromptQueued(activePrompt).pipe(
+              Effect.andThen(
+                promptOptions?.dispatched
+                  ? Deferred.succeed(promptOptions.dispatched, undefined)
+                  : Effect.void,
+              ),
+              Effect.andThen(Fiber.join(activePrompt.fiber)),
               Effect.catchCauseIf(
                 (cause) =>
                   options.cancelBehavior !== "wait-for-prompt" && Cause.hasInterruptsOnly(cause),

@@ -121,39 +121,46 @@ const make = Effect.gen(function* () {
       }
     | undefined;
   const resyncBase = (through: number) =>
-    Effect.suspend(() => {
-      if (latestBase !== undefined && latestBase.coversThrough >= through) {
-        const read = latestBase;
-        return Deferred.await(read.result).pipe(Effect.map((base) => ({ read, base })));
-      }
-      const read = {
-        coversThrough: publishedSequence,
-        result: Deferred.makeUnsafe<ShellResyncBase, ShellDeltaHubError>(),
-      };
-      latestBase = read;
-      // The sequence is read first: the shells are at least as new, and a change between the
-      // two reads is in the snapshot and delivered live again, as the same full state.
-      return Effect.gen(function* () {
-        const snapshotSequence = yield* applicationEvents.latestApplicationSequence;
-        const snapshot = yield* yield* threadManagement.readShellSnapshot({ location: "active" });
-        return {
-          schemaVersion: snapshot.schemaVersion,
-          snapshotSequence,
-          threads: snapshot.threads,
-        } satisfies ShellResyncBase;
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ShellDeltaHubError({ message: "The shell snapshot for a resync failed", cause }),
-        ),
-        Effect.exit,
-        Effect.flatMap((exit) => Deferred.done(read.result, exit)),
-        // In the hub's scope: a subscriber interrupted mid-read must not fail the others' wait.
-        Effect.forkIn(layerScope),
-        Effect.andThen(Deferred.await(read.result)),
-        Effect.map((base) => ({ read, base })),
-      );
-    });
+    // Publishing a read to later resets and starting it is one uninterruptible step: a
+    // subscriber cancelled between the two would leave a read nobody runs, and every reset
+    // reusing it waiting forever. Only the wait for the result can be interrupted.
+    Effect.uninterruptibleMask((restore) =>
+      Effect.suspend(() => {
+        if (latestBase !== undefined && latestBase.coversThrough >= through) {
+          const read = latestBase;
+          return restore(Deferred.await(read.result)).pipe(Effect.map((base) => ({ read, base })));
+        }
+        const read = {
+          coversThrough: publishedSequence,
+          result: Deferred.makeUnsafe<ShellResyncBase, ShellDeltaHubError>(),
+        };
+        latestBase = read;
+        // The sequence is read first: the shells are at least as new, and a change between the
+        // two reads is in the snapshot and delivered live again, as the same full state.
+        return Effect.gen(function* () {
+          const snapshotSequence = yield* applicationEvents.latestApplicationSequence;
+          const snapshot = yield* yield* threadManagement.readShellSnapshot({
+            location: "active",
+          });
+          return {
+            schemaVersion: snapshot.schemaVersion,
+            snapshotSequence,
+            threads: snapshot.threads,
+          } satisfies ShellResyncBase;
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ShellDeltaHubError({ message: "The shell snapshot for a resync failed", cause }),
+          ),
+          Effect.exit,
+          Effect.flatMap((exit) => Deferred.done(read.result, exit)),
+          // In the hub's scope: a subscriber interrupted mid-read must not fail the others' wait.
+          Effect.forkIn(layerScope),
+          Effect.andThen(restore(Deferred.await(read.result))),
+          Effect.map((base) => ({ read, base })),
+        );
+      }),
+    );
 
   // One committed-events consumer for every shell subscriber. Events coalesce per aggregate
   // while a batch is read, so memory is bounded by the aggregates that changed, not by events.

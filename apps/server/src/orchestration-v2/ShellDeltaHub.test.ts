@@ -1,7 +1,9 @@
 import { assert, it } from "@effect/vitest";
 import {
+  ProjectId,
   ThreadId,
   type ApplicationStoredEvent,
+  type OrchestrationProjectShell,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -10,6 +12,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -47,6 +50,7 @@ const layerHub = (input: {
   readonly afterSubscribe?: Effect.Effect<void>;
   readonly onRelease?: () => void;
   readonly subagents?: () => ReadonlyArray<ThreadId>;
+  readonly getProjectShell?: ProjectService.ProjectService["Service"]["getShell"];
 }) =>
   ShellDeltaHub.layer.pipe(
     Layer.provide(
@@ -72,7 +76,9 @@ const layerHub = (input: {
               };
             }),
         }),
-        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(ProjectService.ProjectService)(
+          input.getProjectShell === undefined ? {} : { getShell: input.getProjectShell },
+        ),
         Layer.effect(
           OrchestrationEventStore.OrchestrationEventStore,
           Effect.gen(function* () {
@@ -360,4 +366,101 @@ it.effect(
         );
       }).pipe(Effect.provide(layerHub({ reads, subagents: () => active })));
     }).pipe(Effect.scoped),
+);
+
+const projectShell = (id: ProjectId, title: string) =>
+  Option.some({
+    id,
+    title,
+    workspaceRoot: `/tmp/${id}`,
+    defaultModelSelection: null,
+    scripts: [],
+    createdAt: "2026-10-31T00:00:00.000Z",
+    updatedAt: "2026-10-31T00:00:00.000Z",
+  } as unknown as OrchestrationProjectShell);
+
+it.effect("a failed project read is not shared with a same-sequence retry", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    const project = ProjectId.make("project:retry");
+    let calls = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const first = yield* Effect.exit(
+        hub.readProjectShellForEvent({ projectId: project, sequence: 1 }),
+      );
+      assert.isTrue(Exit.isFailure(first));
+      const second = yield* hub.readProjectShellForEvent({ projectId: project, sequence: 1 });
+      assert.isTrue(Option.isSome(second.project));
+      assert.equal(calls, 2);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          getProjectShell: (id) =>
+            Effect.suspend(() =>
+              ++calls === 1
+                ? Effect.die(new Error("reader gone"))
+                : Effect.succeed(projectShell(id, "p")),
+            ),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("a settled project read is shared until the shared-read TTL, then read again", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    const project = ProjectId.make("project:ttl");
+    let calls = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const read = { projectId: project, sequence: 1 };
+      const first = yield* hub.readProjectShellForEvent(read);
+      const shared = yield* hub.readProjectShellForEvent(read);
+      assert.equal(shared.readOrdinal, first.readOrdinal);
+      assert.equal(calls, 1);
+      yield* TestClock.adjust(ThreadManagementService.SHARED_SHELL_READ_TTL_MS);
+      const again = yield* hub.readProjectShellForEvent(read);
+      assert.isAbove(again.readOrdinal, first.readOrdinal);
+      assert.equal(calls, 2);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          getProjectShell: (id) =>
+            Effect.sync(() => (calls += 1)).pipe(Effect.as(projectShell(id, "p"))),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("settled project reads are kept to the shared-read capacity", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    const first = ProjectId.make("project:capacity-0");
+    let calls = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      for (let index = 0; index <= ThreadManagementService.SHARED_SHELL_READ_CAPACITY; index++) {
+        yield* hub.readProjectShellForEvent({
+          projectId: ProjectId.make(`project:capacity-${index}`),
+          sequence: 1,
+        });
+      }
+      const before = calls;
+      yield* hub.readProjectShellForEvent({ projectId: first, sequence: 1 });
+      assert.equal(calls, before + 1);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          getProjectShell: (id) =>
+            Effect.sync(() => (calls += 1)).pipe(Effect.as(projectShell(id, "p"))),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
 );

@@ -683,15 +683,24 @@ const openSpawnerProcess =
     let startsOpen = true;
     // Stops once every reply and start report the spawner wrote before it died has been read.
     const stopWhenDrained = () => {
-      if (exitCause !== undefined && !channelOpen && !startsOpen) events.onStop(exitCause);
+      if (exitCause !== undefined && !channelOpen && !startsOpen) events.onStop(stopCause());
     };
+    // A spawner that ends itself kills its own group, itself included: its reason says why.
+    const stopCause = () =>
+      exitReason === undefined ? exitCause : new Error(`The process spawner exited: ${exitReason}`);
     let partial = "";
+    let exitReason: string | undefined;
+    // Each child's PID as it starts, and the spawner's reason when it ends itself.
     const starts = spawner.stdout as NodeNet.Socket;
     starts.setEncoding("utf8");
     starts.on("data", (chunk: string) => {
       const lines = (partial + chunk).split("\n");
       partial = lines.pop() ?? "";
       for (const line of lines) {
+        if (line.startsWith("exit ")) {
+          exitReason = line.slice("exit ".length);
+          continue;
+        }
         const [id, pid] = line.split(" ").map(Number);
         events.onMessage({ t: "started", id, pid });
       }
@@ -713,11 +722,10 @@ const openSpawnerProcess =
       } catch {
         // No member left.
       }
-      const cause = new Error(`The process spawner exited with ${signal ?? `code ${code}`}`);
-      exitCause = cause;
+      exitCause = new Error(`The process spawner exited with ${signal ?? `code ${code}`}`);
       stopWhenDrained();
       // A descendant still holding one of its pipes must not delay the stop for long.
-      setTimeout(() => events.onStop(cause), spawnerCloseGraceMillis).unref();
+      setTimeout(() => events.onStop(stopCause()), spawnerCloseGraceMillis).unref();
     });
     // A spawner that closed its channel can no longer answer; one this host disconnects kills
     // its children first, including those whose start it has not reported yet.

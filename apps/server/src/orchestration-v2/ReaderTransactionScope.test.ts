@@ -920,6 +920,42 @@ it.effect.each(consistencyCases)(
     ),
 );
 
+// A snapshot window's reads that need only the thread id go to the reader with its thread row:
+// that read waits until they have started, which only happens if none waits for another.
+it.effect("sends a snapshot window's first reads to the reader together", () =>
+  withFileStore(
+    "reader-scope-window-first-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("window-first", 2);
+      const sequence = yield* Deferred.make<void>();
+      const todoList = yield* Deferred.make<void>();
+      const waitForThem: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          const [query, params] = statement.compile();
+          const shape = statementShape(query);
+          if (shape.startsWith("SELECT MAX(sequence) AS snapshot_sequence"))
+            yield* Deferred.succeed(sequence, undefined);
+          else if (
+            shape.startsWith("WITH latest_owner AS MATERIALIZED") &&
+            params.includes(fixture.fork)
+          )
+            yield* Deferred.succeed(todoList, undefined);
+          else if (
+            shape.startsWith("SELECT payload_json FROM orchestration_v2_projection_threads") &&
+            params.includes(fixture.fork)
+          )
+            yield* Effect.all([Deferred.await(sequence), Deferred.await(todoList)]);
+          return statement;
+        });
+      const exit = yield* store
+        .getThreadSnapshotWindow(fixture.fork, { rowLimit: 50, userTurnLimit: 10, deferWork: true })
+        .pipe(Effect.provideService(Statement.CurrentTransformer, waitForThem), Effect.exit);
+      assert.isTrue(Exit.isSuccess(exit));
+    }),
+  ),
+);
+
 const isReadError = Schema.is(ProjectionStore.ProjectionStoreReadError);
 
 // The run's root node is decoded early for its checkpoint scope, yet a bad run row still wins.

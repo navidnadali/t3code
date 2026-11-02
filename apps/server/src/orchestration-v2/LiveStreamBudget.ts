@@ -356,13 +356,13 @@ const RESYNC_STREAK_WINDOW_MS = 60_000;
  */
 export const resyncOnLiveOverflow = <A, E, R, E2 = never, R2 = never>(
   first: Stream.Stream<A, E, R>,
-  next: () => Effect.Effect<Stream.Stream<A, E, R>, E2, R2>,
+  next: () => Effect.Effect<Stream.Stream<A, E | E2, R | R2>, E2, R2>,
 ): Stream.Stream<A, E | E2, R | R2> =>
   Stream.suspend(() => {
     let overflowed = false;
     let streak = 0;
     let lastResyncAt = Number.NEGATIVE_INFINITY;
-    const guarded = (segment: Stream.Stream<A, E, R>) =>
+    const guarded = (segment: Stream.Stream<A, E | E2, R | R2>) =>
       segment.pipe(
         Stream.catchIf(isLiveStreamBufferOverflow, () => {
           overflowed = true;

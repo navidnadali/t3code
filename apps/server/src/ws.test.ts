@@ -1173,7 +1173,7 @@ it.live(
                   repositoryIdentityResolved: true,
                 },
                 repositoryIdentityResolved: true,
-              } as ProjectEnrichment.ProjectEnrichmentChange);
+              } as unknown as ProjectEnrichment.ProjectEnrichmentChange);
               yield* Deferred.await(refreshSeen);
               return {
                 repositoryIdentity: null,

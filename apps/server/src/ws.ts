@@ -1173,7 +1173,8 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         OrchestrationV2ShellStreamItem,
         Stream.Error<ReturnType<typeof liveFrom>>,
         never,
-        Effect.Error<ReturnType<typeof loadSnapshot>>
+        | Effect.Error<ReturnType<typeof loadSnapshot>>
+        | Effect.Error<ReturnType<typeof loadProjectMetadataSnapshot>>
       >(liveFrom(afterSequence), () =>
         loadSnapshot().pipe(
           Effect.provideService(
@@ -1187,7 +1188,20 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
             ),
           ),
           Effect.map((loaded) =>
-            Stream.concat(initialSnapshotItems(loaded), liveFrom(loaded.snapshot.snapshotSequence)),
+            Stream.concat(
+              initialSnapshotItems(loaded),
+              // Enrichment keeps flowing during a resync, so a refresh can reach the client before
+              // the snapshot that introduces its project; re-send the resolved identities after it.
+              Stream.unwrap(
+                loadProjectMetadataSnapshot(loaded.snapshot.snapshotSequence).pipe(
+                  Effect.provideService(
+                    ProjectEnrichmentService.ProjectEnrichmentService,
+                    projectEnrichment,
+                  ),
+                  Effect.map(initialEnrichmentItems),
+                ),
+              ),
+            ).pipe(Stream.concat(liveFrom(loaded.snapshot.snapshotSequence))),
           ),
         ),
       );

@@ -8,6 +8,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, it, describe } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -35,6 +36,7 @@ import {
 } from "@t3tools/contracts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as ServerConfig from "../config.ts";
+import { PROCESS_SPAWNER_ENV } from "../process/workerChildProcessSpawner.ts";
 import {
   makeGitVcsDriverCore,
   parseGitCheckoutProgressLine,
@@ -2407,7 +2409,12 @@ describe("rejected git refs", () => {
 
   const failWith = (stderr: string) => {
     const spawner = ChildProcessSpawner.make(() => Effect.succeed(makeFailedHandle(stderr)));
+    // The fake is the subject: keep Git on it rather than on the spawner process.
+    const nodeSpawner = ConfigProvider.layer(
+      ConfigProvider.fromUnknown({ [PROCESS_SPAWNER_ENV]: "default" }),
+    );
     const layer = GitVcsDriver.layer.pipe(
+      Layer.provide(nodeSpawner),
       Layer.provide(layerServerConfig),
       Layer.provideMerge(
         Layer.merge(

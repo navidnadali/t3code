@@ -648,6 +648,77 @@ it.effect.each(readCases)(
     ),
 );
 
+it.effect("reads a timeline page in as many statements whatever its length", () =>
+  withFileStore(
+    "reader-scope-timeline-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("timeline", 20);
+      const [short, long] = yield* Effect.forEach([1, 50], (limit) =>
+        traced(store.getTimelinePage(fixture.fork, { limit, view: "activity" })),
+      );
+      const lengths = [short!.exit, long!.exit].map((exit) =>
+        Exit.isSuccess(exit) ? exit.value.items.length : -1,
+      );
+      assert.strictEqual(lengths[0], 1);
+      assert.isAbove(lengths[1]!, 20);
+      assert.strictEqual(long!.statements.length, short!.statements.length);
+    }),
+  ),
+);
+
+// Collapses whitespace so a statement can be matched by how it starts.
+const statementShape = (query: string) => query.replace(/\s+/g, " ").trim();
+
+// A projection's table reads go to the reader together, not one round trip after another: the
+// first waits until the last has started, which only happens if neither waits for the other.
+it.effect.each([
+  {
+    name: "thread snapshot window",
+    read: (store: Store, fixture: Fixture) =>
+      store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
+  },
+  {
+    name: "thread snapshot",
+    read: (store: Store, fixture: Fixture) => store.getThreadSnapshot(fixture.fork),
+  },
+  {
+    name: "thread records",
+    read: (store: Store, fixture: Fixture) =>
+      store.getThreadRecords(fixture.fork, ["runs", "contextTransfers"]),
+  },
+])("sends the $name table reads to the reader together", ({ read }) =>
+  withFileStore(
+    "reader-scope-together-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("together", 2);
+      const lastStarted = yield* Deferred.make<void>();
+      const waitForLast: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          const [query, params] = statement.compile();
+          const shape = statementShape(query);
+          if (params.includes(fixture.fork)) {
+            if (
+              shape.startsWith(
+                "SELECT payload_json FROM orchestration_v2_projection_context_transfers",
+              )
+            )
+              yield* Deferred.succeed(lastStarted, undefined);
+            else if (shape.startsWith("SELECT payload_json FROM orchestration_v2_projection_runs"))
+              yield* Deferred.await(lastStarted);
+          }
+          return statement;
+        });
+      const exit = yield* read(store, fixture).pipe(
+        Effect.provideService(Statement.CurrentTransformer, waitForLast),
+        Effect.exit,
+      );
+      assert.isTrue(Exit.isSuccess(exit));
+    }),
+  ),
+);
+
 const toolItem = (input: {
   readonly id: string;
   readonly threadId: ThreadId;

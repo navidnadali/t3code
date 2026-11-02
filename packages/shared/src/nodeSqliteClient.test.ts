@@ -505,6 +505,98 @@ it.effect("drops a history read's place in the queue when it is interrupted wait
   ),
 );
 
+const smallRead = (sql: SqlClient.SqlClient, name: string) =>
+  sql.withTransaction(sql`SELECT ${name} AS name`).pipe(SqliteClient.readOnly);
+
+it.effect("keeps a reader for page reads while history reads hold all they may", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const started: Array<string> = [];
+        // Four readers: history reads may hold two, so a third waits with two readers free.
+        const histories = yield* Effect.forEach(["history-1", "history-2"], (name) =>
+          holdClassReader(sql, name, started, SqliteClient.historyRead),
+        );
+        yield* Effect.forEach(histories, (history) => history.running);
+        const third = yield* holdClassReader(sql, "history-3", started, SqliteClient.historyRead);
+        const page = yield* holdClassReader(sql, "page", started, SqliteClient.pageRead);
+        yield* page.running;
+        assert.deepEqual(yield* smallRead(sql, "small"), [{ name: "small" }]);
+        assert.deepEqual(started.slice(2), ["page"]);
+        yield* histories[0]!.release;
+        yield* third.running;
+        assert.deepEqual(started.slice(3), ["history-3"]);
+        yield* Effect.all([third.release, histories[1]!.release, page.release]);
+      }),
+    { readerPoolSize: 4 },
+  ),
+);
+
+it.effect("keeps a reader for small reads while page reads hold the rest", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const started: Array<string> = [];
+        const pages = yield* Effect.forEach(["page-1", "page-2", "page-3"], (name) =>
+          holdClassReader(sql, name, started, SqliteClient.pageRead),
+        );
+        yield* Effect.forEach(pages, (page) => page.running);
+        // The last reader stays free for small reads, so a fourth page read waits.
+        const fourth = yield* holdClassReader(sql, "page-4", started, SqliteClient.pageRead);
+        assert.deepEqual(yield* smallRead(sql, "small"), [{ name: "small" }]);
+        assert.sameMembers(started, ["page-1", "page-2", "page-3"]);
+        yield* pages[0]!.release;
+        yield* fourth.running;
+        assert.deepEqual(started.slice(3), ["page-4"]);
+        yield* Effect.all([fourth.release, pages[1]!.release, pages[2]!.release]);
+      }),
+    { readerPoolSize: 4 },
+  ),
+);
+
+it.effect("lets a page read take the last reader while a small read holds one", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const started: Array<string> = [];
+        const small = yield* holdClassReader(sql, "small", started);
+        yield* small.running;
+        const pages = yield* Effect.forEach(["page-1", "page-2", "page-3"], (name) =>
+          holdClassReader(sql, name, started, SqliteClient.pageRead),
+        );
+        yield* Effect.forEach(pages, (page) => page.running);
+        assert.sameMembers(started, ["small", "page-1", "page-2", "page-3"]);
+        yield* Effect.all([small.release, ...pages.map((page) => page.release)]);
+      }),
+    { readerPoolSize: 4 },
+  ),
+);
+
+it.effect("keeps a reader each for small and page reads with three readers", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const started: Array<string> = [];
+        // History reads may hold one of three readers; page reads one more, small reads the last.
+        const history = yield* holdClassReader(sql, "history-1", started, SqliteClient.historyRead);
+        yield* history.running;
+        const second = yield* holdClassReader(sql, "history-2", started, SqliteClient.historyRead);
+        const page = yield* holdClassReader(sql, "page-1", started, SqliteClient.pageRead);
+        yield* page.running;
+        const nextPage = yield* holdClassReader(sql, "page-2", started, SqliteClient.pageRead);
+        assert.deepEqual(yield* smallRead(sql, "small"), [{ name: "small" }]);
+        assert.deepEqual(started, ["history-1", "page-1"]);
+        yield* page.release;
+        yield* nextPage.running;
+        yield* history.release;
+        yield* second.running;
+        assert.deepEqual(started.slice(2), ["page-2", "history-2"]);
+        yield* Effect.all([nextPage.release, second.release]);
+      }),
+    { readerPoolSize: 3 },
+  ),
+);
+
 // One reader is always left for reads that take no permit, unless there is only one.
 it.effect.each([
   { setting: "1", size: 1, permits: 1 },

@@ -23,7 +23,7 @@ const LIVE_STREAM_MAX_SERIALIZED_BYTES = 8 * 1024 * 1024;
 const isLiveStreamBufferError = Schema.is(LiveStreamBufferError);
 
 /** Whether an error, or one it wraps as its `cause`, is a live buffer overflow. */
-export function isLiveStreamBufferOverflow(error: unknown): boolean {
+function isLiveStreamBufferOverflow(error: unknown): boolean {
   let current: unknown = error;
   for (let depth = 0; depth < 8 && typeof current === "object" && current !== null; depth++) {
     if (isLiveStreamBufferError(current)) return true;

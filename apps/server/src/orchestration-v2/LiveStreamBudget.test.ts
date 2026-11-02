@@ -295,9 +295,8 @@ describe("resyncOnLiveOverflow", () => {
 
   it.effect("passes other failures through", () =>
     Effect.gen(function* () {
-      const result = yield* resyncOnLiveOverflow(
-        Stream.fail("boom" as const),
-        () => Effect.succeed(Stream.empty),
+      const result = yield* resyncOnLiveOverflow(Stream.fail("boom" as const), () =>
+        Effect.succeed(Stream.empty),
       ).pipe(Stream.runDrain, Effect.result);
       expect(result._tag).toBe("Failure");
     }),

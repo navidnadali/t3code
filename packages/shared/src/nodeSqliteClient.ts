@@ -97,8 +97,8 @@ const readerPermitCount = (readers: number) => Math.max(1, readers - 1);
 
 /**
  * An idle reader always takes a queued read. When classes compete, a class passed over once per
- * reader goes first, then `small` (the default) or `page` reads holding no reader, then small, page,
- * history; history reads holding all readers but two (at least one) go last.
+ * reader goes first (most passed over first), then `small` (default) or `page` reads holding no
+ * reader, then small, page, history; history reads holding all readers but two (min 1) go last.
  */
 export type ReadClass = "small" | "page" | "history";
 
@@ -155,14 +155,16 @@ class ReaderSlots {
     return this.waiters[readClass].size - this.wokenFor[readClass];
   }
 
-  // Lowest goes first. History reads at their limit go last; a class passed over once per reader
-  // goes before the rest; then a small or page class holding no reader; then class order.
-  private rank(readClass: ReadClass, order: number): number {
+  // Compared in turn, lowest first: history reads at their limit go last; a class passed over once
+  // per reader goes before the rest, the most passed over first; a small or page class holding no
+  // reader next; then class order.
+  private rank(readClass: ReadClass, order: number): ReadonlyArray<number> {
     const holding = this.held[readClass] + this.wokenFor[readClass];
     const overLimit = readClass === "history" && holding >= this.historyCap;
-    const aged = this.passedOver[readClass] >= this.agingLimit;
+    const passedOver = this.passedOver[readClass];
+    const aged = passedOver >= this.agingLimit;
     const served = readClass === "history" || holding > 0;
-    return (overLimit ? 1000 : 0) + (aged ? 0 : 100) + (served ? 10 : 0) + order;
+    return [overLimit ? 1 : 0, aged ? -passedOver : 0, served ? 1 : 0, order];
   }
 
   private firstQueued(readClass: ReadClass): SlotWaiter | undefined {
@@ -172,11 +174,13 @@ class ReaderSlots {
 
   private next(): ReadClass | undefined {
     let next: ReadClass | undefined;
-    let nextRank = Number.POSITIVE_INFINITY;
+    let nextRank: ReadonlyArray<number> = [];
     for (const [order, readClass] of READ_CLASSES.entries()) {
       if (this.queued(readClass) === 0) continue;
       const rank = this.rank(readClass, order);
-      if (rank < nextRank) [next, nextRank] = [readClass, rank];
+      const first = rank.findIndex((value, index) => value !== nextRank[index]);
+      if (next === undefined || rank[first]! < nextRank[first]!)
+        [next, nextRank] = [readClass, rank];
     }
     return next;
   }

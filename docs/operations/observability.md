@@ -724,7 +724,7 @@ row, runs and other bookkeeping), page reads (snapshot windows, history and time
 reads of a thread's whole history (full snapshots and projections, turn starts, thread search, and
 records of turn items, nodes, messages, subagents, plans, handoffs or transfers). When reads of
 several classes queue, a freed reader goes first to a class that has been passed over once for each
-reader in the pool, so none starves; then to small or page reads whose class holds no reader; then
+reader in the pool, the most passed over first, so none starves; then to small or page reads whose class holds no reader; then
 to small, page and history reads in that order. History reads that already hold all readers but two
 (at least one) go after every other queued read. Within a class, reads go in the order they queued;
 while reads fall back to the main connection they all share it.

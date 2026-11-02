@@ -109,7 +109,8 @@ const aggregateKey = (stored: ShellApplicationEvent) =>
 interface SharedProjectRead {
   sequence: number;
   started: boolean;
-  settled: boolean;
+  /** Infinity while the read is in flight; a settled read expires after the shared-read TTL. */
+  expiresAt: number;
   readonly readOrdinal: number;
   readonly result: Deferred.Deferred<
     Option.Option<OrchestrationProjectShell>,
@@ -147,24 +148,45 @@ const make = Effect.gen(function* () {
       project,
       readOrdinal: read.readOrdinal,
     }));
+  // Settled reads move to the end when they settle, so they expire in map order; a pending read
+  // stays, so the project's next read still waits for it. Same limits as the thread memo.
+  const trimProjectReads = (now: number) => {
+    for (const [projectId, read] of projectReads) {
+      if (read.expiresAt === Number.POSITIVE_INFINITY) continue;
+      if (
+        projectReads.size <= ThreadManagementService.SHARED_SHELL_READ_CAPACITY &&
+        now < read.expiresAt
+      ) {
+        return;
+      }
+      projectReads.delete(projectId);
+    }
+  };
   const readProjectShellForEvent: ShellDeltaHubShape["readProjectShellForEvent"] = (input) =>
     Effect.uninterruptibleMask((restore) =>
-      Effect.suspend(() => {
+      Effect.clockWith((clock) => {
+        const now = clock.currentTimeMillisUnsafe();
         const current = projectReads.get(input.projectId);
-        if (current !== undefined && (current.sequence >= input.sequence || !current.started)) {
+        if (
+          current !== undefined &&
+          now < current.expiresAt &&
+          (current.sequence >= input.sequence || !current.started)
+        ) {
           current.sequence = Math.max(current.sequence, input.sequence);
           return restore(withOrdinal(current));
         }
         const read: SharedProjectRead = {
           sequence: Math.max(input.sequence, current?.sequence ?? 0),
           started: false,
-          settled: false,
+          expiresAt: Number.POSITIVE_INFINITY,
           readOrdinal: ++nextProjectReadOrdinal,
           result: Deferred.makeUnsafe(),
         };
+        projectReads.delete(input.projectId);
         projectReads.set(input.projectId, read);
+        trimProjectReads(now);
         const previous =
-          current !== undefined && !current.settled
+          current !== undefined && current.expiresAt === Number.POSITIVE_INFINITY
             ? Effect.exit(Deferred.await(current.result))
             : Effect.void;
         return previous.pipe(
@@ -176,8 +198,16 @@ const make = Effect.gen(function* () {
           Effect.andThen(projectService.getShell(input.projectId)),
           Effect.forkIn(layerScope),
           Effect.flatMap((fiber) => {
+            // A failed read is forgotten, so a retry at the same sequence reads again.
             fiber.addObserver((exit) => {
-              read.settled = true;
+              const isCurrent = projectReads.get(input.projectId) === read;
+              if (isCurrent) projectReads.delete(input.projectId);
+              if (Exit.isSuccess(exit)) {
+                const settledAt = clock.currentTimeMillisUnsafe();
+                read.expiresAt = settledAt + ThreadManagementService.SHARED_SHELL_READ_TTL_MS;
+                if (isCurrent) projectReads.set(input.projectId, read);
+                trimProjectReads(settledAt);
+              }
               Deferred.doneUnsafe(read.result, exit);
             });
             return restore(withOrdinal(read));

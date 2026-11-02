@@ -131,6 +131,7 @@ const childWatch = Effect.gen(function* () {
   );
   const { port } = server.address() as NodeNet.AddressInfo;
   return {
+    port,
     connectScript: (then = "") =>
       `require("node:net").connect(${port}, "127.0.0.1").on("connect", () => { process.stdout.write(String(process.ppid)); ${then} }); setInterval(() => {}, 1000)`,
     connected: Queue.take(connections),
@@ -897,6 +898,43 @@ describe("WorkerChildProcessSpawner", () => {
         expect(calls).toEqual([]);
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, layer)));
     },
+  );
+
+  it.live.skipIf(!workerPlatform)("a spawner process is sent no command before its handshake", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const { calls, spawner } = yield* recordingSpawner;
+      const { timers, fireHandshake } = yield* manualTimers;
+      const watch = yield* childWatch;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-process-spawner-" });
+      const received = path.join(directory, "received");
+      // An older spawner without a handshake starts whatever it is sent; this one records it, and
+      // connects once its first event-loop turn has read what was already waiting for it.
+      const source = WorkerChildProcessSpawner.spawnerProcessSource
+        .replace(
+          'post({ t: "ready", protocol: handshake.protocol, build: handshake.build });',
+          `setImmediate(() => require("node:net").connect(${watch.port}, "127.0.0.1"));`,
+        )
+        .replace(
+          "const onMessage = (message) => {",
+          `const onMessage = (message) => { require("node:fs").appendFileSync(${JSON.stringify(received)}, message.t + "\\n");`,
+        );
+      expect(source).toContain("appendFileSync");
+      const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(spawner, {
+        source,
+        timers,
+      });
+      const pending = yield* Effect.forkScoped(spawnError(remoteSpawner, node("1")));
+      yield* watch.connected;
+      yield* fireHandshake;
+      expect(yield* Fiber.join(pending)).toMatchObject({
+        method: "spawn",
+        causeMessage: "The process spawner stopped",
+      });
+      expect(yield* fs.exists(received)).toBe(false);
+      expect(calls).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.live.skipIf(!workerPlatform)(

@@ -316,12 +316,16 @@ export const layer: Layer.Layer<
           yield* scratchBoundary(CompactionScratch.prepare(scratchPath));
         // Never fill the disk: the scratch store beside the database needs room for every key, and a
         // running pass stops when the disk gets low whatever the estimate said.
+        // What a stop reports as required is what stopped it: the estimate before, the floor during.
         const skippedFor = (stage: "before" | "during", freeBytes: number) =>
           scratchPath === undefined
             ? undefined
             : {
                 scratchPath,
-                requiredBytes: CompactionScratch.requiredFreeBytes(throughSequence),
+                requiredBytes:
+                  stage === "before"
+                    ? CompactionScratch.requiredFreeBytes(throughSequence)
+                    : CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR,
                 freeBytes,
                 stage,
               };

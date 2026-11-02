@@ -2111,6 +2111,8 @@ it.effect("packed-refs memory stays accounted under concurrent reloads", () =>
         .execute({ operation: "packed-memory-test", cwd, args, env: FIXED_COMMIT_ENV })
         .pipe(Effect.map((result) => result.stdout.trim()));
     yield* git(["init", "-q", "-b", "main"]);
+    yield* git(["config", "user.name", "Test"]);
+    yield* git(["config", "user.email", "test@test.com"]);
     yield* git(["commit", "-q", "--allow-empty", "-m", "root"]);
     const head = yield* git(["rev-parse", "HEAD"]);
     const commonDir = path.join(cwd, ".git");

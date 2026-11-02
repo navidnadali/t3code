@@ -25,6 +25,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
@@ -45,6 +46,7 @@ import * as CommandOutputHub from "../orchestration-v2/CommandOutputHub.ts";
 import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
+import { LIVE_STREAM_MAX_ITEMS } from "../orchestration-v2/LiveStreamBudget.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -247,6 +249,84 @@ it.effect("streams the owner's thread events after the share and a snapshot", ()
     );
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect("gives a guest whose live buffer overflows a fresh snapshot and keeps streaming", () => {
+  const overflowLogged = Deferred.makeUnsafe<void>();
+  const overflowLogger = Logger.make(({ message }) => {
+    if (String(message).includes("live event buffer is full")) {
+      Deferred.doneUnsafe(overflowLogged, Effect.void);
+    }
+  });
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const { guestShares, credential } = yield* shareThread;
+      const sink = yield* EventSink.EventSinkV2;
+      const { token: session } = yield* guestShares.redeem({ credential, name: "Sam" });
+      const pull = yield* Stream.toPull(yield* guestShares.stream(session));
+      // Chunks pulled ahead before the overflow arrive first; an ended stream fails the pull.
+      const pullUntil = (found: (event: GuestStreamEvent) => boolean) =>
+        Effect.gen(function* () {
+          const events: Array<GuestStreamEvent> = [];
+          while (!events.some(found)) events.push(...(yield* pull));
+          return events;
+        });
+      const opening = yield* pull;
+      const openingSnapshot = opening.find(
+        (event) => event.type === "thread" && event.item.kind === "snapshot",
+      );
+      if (openingSnapshot?.type !== "thread" || openingSnapshot.item.kind !== "snapshot") {
+        return assert.fail("Expected the opening snapshot.");
+      }
+      const thread = openingSnapshot.item.projection.thread;
+      const now = yield* DateTime.now;
+      // More events than the live buffer holds while the guest's browser pulls nothing: the
+      // stream must not end (the browser would reconnect) but send a snapshot and go on.
+      const burst = LIVE_STREAM_MAX_ITEMS + 1;
+      yield* sink.write({
+        events: Array.from({ length: burst }, (_, index) => ({
+          id: EventId.make(`event:guest-overflow:${index}`),
+          type: "thread.metadata-updated" as const,
+          threadId,
+          occurredAt: now,
+          payload: { ...thread, title: `Updated ${index}` },
+        })),
+      });
+      yield* Deferred.await(overflowLogged);
+      const resynced = yield* pullUntil(
+        (event) => event.type === "thread" && event.item.kind === "snapshot",
+      );
+      const snapshot = resynced.find(
+        (event) => event.type === "thread" && event.item.kind === "snapshot",
+      );
+      if (snapshot?.type !== "thread" || snapshot.item.kind !== "snapshot") {
+        return assert.fail("Expected a fresh snapshot after the overflow.");
+      }
+      assert.equal(snapshot.item.projection.thread.title, `Updated ${burst - 1}`);
+      assert.isTrue(resynced.some((event) => event.type === "view"));
+      const [written] = yield* sink.write({
+        events: [
+          {
+            id: EventId.make("event:guest-overflow:after"),
+            type: "thread.metadata-updated" as const,
+            threadId,
+            occurredAt: now,
+            payload: { ...thread, title: "After the resync" },
+          },
+        ],
+      });
+      const live = yield* pullUntil((item) => item.type === "thread" && item.item.kind === "event");
+      const event = live.find((item) => item.type === "thread" && item.item.kind === "event");
+      if (event?.type !== "thread" || event.item.kind !== "event") {
+        return assert.fail("Expected a live event after the snapshot.");
+      }
+      assert.equal(event.item.sequence, written!.sequence);
+      assert.isAbove(event.item.sequence, snapshot.item.snapshotSequence);
+    }),
+  ).pipe(
+    Effect.provide(Logger.layer([overflowLogger], { mergeWithExisting: true })),
+    Effect.provide(layerTest),
+  );
+});
 
 it.effect("starts a stream with the runs and items already in the thread", () =>
   Effect.gen(function* () {

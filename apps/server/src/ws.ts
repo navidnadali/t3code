@@ -131,6 +131,7 @@ import {
   loadOlderSettledThreadsPage,
   loadShellSnapshotParts,
   projectShellDeltas,
+  shellDeltaThreadId,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemsFromInitialSnapshot,
   loadSubscriberShellSnapshot,
@@ -1063,7 +1064,6 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           omitOlderSettled: input.omitOlderSettled === true,
         },
       });
-      subagentThreadIds = forSubscriber.subagentThreadIds;
       const enriched = yield* enrichProjectShells(forSubscriber.snapshot.projects);
       return {
         snapshot: {
@@ -1083,15 +1083,24 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       });
     });
 
+    // When the replay read each thread, so the live tail drops hub deltas read earlier.
+    const replayReads = new Map<ThreadId, number>();
     const toShellStream = <E, R>(stream: Stream.Stream<ShellApplicationEvent, E, R>) =>
       stream.pipe(
         Stream.groupedWithin(512, Duration.millis(50)),
         Stream.mapEffect((events) => projectShellItems(Array.from(events))),
         Stream.flatMap(Stream.fromIterable),
+        Stream.map(({ item, readAt }) => {
+          const threadId = shellDeltaThreadId(item);
+          if (threadId !== undefined) {
+            replayReads.set(threadId, Math.max(replayReads.get(threadId) ?? 0, readAt));
+          }
+          return item;
+        }),
         skipUnchangedThreadShells,
       );
 
-    const liveFrom = (afterSequence: number) => shellDeltas.stream(afterSequence);
+    const liveFrom = (afterSequence: number) => shellDeltas.stream(afterSequence, replayReads);
 
     const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
       Stream.filter((change) => change.repositoryIdentityResolved),

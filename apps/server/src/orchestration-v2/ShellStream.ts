@@ -32,7 +32,6 @@ import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
-import { bufferLatestLiveStream } from "./LiveStreamBudget.ts";
 import type { ActiveShellIndexEntry } from "./ProjectionStore.ts";
 
 export type ShellDelta = Extract<OrchestrationV2ShellStreamItem, { readonly sequence: number }>;
@@ -42,6 +41,20 @@ export interface VersionedShellDelta {
   readonly item: ShellDelta;
   /** `thread.updated` only: unchanged while the shell, `updatedAt` aside, matches the previous item for that thread. */
   readonly version: number | undefined;
+  /** When the read behind the item completed; a later read of the same thread is newer or equal. */
+  readonly readAt: number;
+}
+
+/** The thread a delta is about; projects have none. */
+export function shellDeltaThreadId(item: ShellDelta): ThreadId | undefined {
+  switch (item.kind) {
+    case "thread.updated":
+      return item.thread.id;
+    case "thread.removed":
+      return item.threadId;
+    default:
+      return undefined;
+  }
 }
 
 /** The aggregate a delta describes; a newer delta for it replaces an older one still buffered. */
@@ -57,12 +70,6 @@ export function shellDeltaKey(item: ShellDelta): string {
       return `thread:${item.location}:${item.threadId}`;
   }
 }
-
-/** Snapshots, synchronization, and enrichment markers must bypass full-state coalescing. */
-export const bufferShellLiveStream = <E, R>(
-  source: Stream.Stream<ShellDelta, E, R>,
-  limits?: { readonly maxItems?: number; readonly maxSerializedBytes?: number },
-) => bufferLatestLiveStream(source, shellDeltaKey, limits);
 
 function buildActiveShellSnapshot(input: {
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
@@ -698,6 +705,12 @@ export function makeShellDeltaAdmission() {
   };
 }
 
+export interface ProjectedShellDelta {
+  readonly item: ShellDelta;
+  /** When the read behind the item completed. */
+  readonly readAt: number;
+}
+
 /** One item per coalesced event; each thread's or project's shell is read once for the batch. */
 export const projectShellDeltas = <E1, E2>(
   events: ReadonlyArray<ShellApplicationEvent>,
@@ -710,7 +723,7 @@ export const projectShellDeltas = <E1, E2>(
       projectId: ProjectId,
     ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, E2>;
   },
-): Effect.Effect<ReadonlyArray<ShellDelta>, E1 | E2> =>
+): Effect.Effect<ReadonlyArray<ProjectedShellDelta>, E1 | E2> =>
   Effect.forEach(
     coalesceShellApplicationEvents(events),
     (stored): Effect.Effect<ShellDelta, E1 | E2> => {
@@ -739,6 +752,10 @@ export const projectShellDeltas = <E1, E2>(
       );
     },
     { concurrency: 8 },
+  ).pipe(
+    Effect.flatMap((items) =>
+      Effect.map(Clock.currentTimeMillis, (readAt) => items.map((item) => ({ item, readAt }))),
+    ),
   );
 
 /** Resend unchanged shells after UNCHANGED_THREAD_SHELL_RESEND_MS so skipped deltas cannot leave resume cursors behind. */

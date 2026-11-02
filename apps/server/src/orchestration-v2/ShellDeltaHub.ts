@@ -1,4 +1,4 @@
-import type { ApplicationStoredEvent } from "@t3tools/contracts";
+import type { ApplicationStoredEvent, ThreadId } from "@t3tools/contracts";
 import type * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -27,6 +27,7 @@ import {
   makeThreadShellVersions,
   projectShellDeltas,
   shellDeltaKey,
+  shellDeltaThreadId,
   shouldPublishShellApplicationEvent,
   toShellApplicationEvent,
   type ShellApplicationEvent,
@@ -50,6 +51,8 @@ export interface ShellDeltaSubscription {
    */
   readonly stream: (
     afterSequence: number,
+    /** When a resume replay read each thread; held deltas read earlier are dropped. */
+    replayReads?: ReadonlyMap<ThreadId, number>,
   ) => Stream.Stream<ShellDelta, ShellDeltaHubError | LiveStreamBufferError>;
 }
 
@@ -84,6 +87,19 @@ interface HubInstance {
 const aggregateKey = (stored: ShellApplicationEvent) =>
   "aggregateKind" in stored ? `project:${stored.aggregateId}` : `thread:${stored.event.threadId}`;
 
+interface PendingShellEvent {
+  readonly stored: ShellApplicationEvent;
+  /** Every coalesced event is a transcript update, which focused watchers get elsewhere. */
+  readonly transcriptOnly: boolean;
+}
+
+const isTranscriptEvent = (stored: ApplicationStoredEvent) =>
+  !("aggregateKind" in stored) &&
+  (stored.event.type === "node.updated" ||
+    stored.event.type === "turn-item.updated" ||
+    stored.event.type === "provider-turn.updated" ||
+    stored.event.type === "message.updated");
+
 const make = Effect.gen(function* () {
   const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -101,7 +117,7 @@ const make = Effect.gen(function* () {
     const subagentThreadIds = new Set<string>(
       yield* threadManagement.listActiveSubagentThreadIds(),
     );
-    const pending = new Map<string, ShellApplicationEvent>();
+    const pending = new Map<string, PendingShellEvent>();
     const ready = yield* Queue.bounded<void>(1);
     const versions = makeThreadShellVersions();
     const drain = Effect.gen(function* () {
@@ -112,8 +128,11 @@ const make = Effect.gen(function* () {
           if (!shouldPublishShellApplicationEvent(stored, subagentThreadIds)) continue;
           const key = aggregateKey(stored);
           const previous = pending.get(key);
-          if (previous === undefined || previous.sequence < stored.sequence) {
-            pending.set(key, toShellApplicationEvent(stored));
+          const transcriptOnly = isTranscriptEvent(stored) && (previous?.transcriptOnly ?? true);
+          if (previous === undefined || previous.stored.sequence < stored.sequence) {
+            pending.set(key, { stored: toShellApplicationEvent(stored), transcriptOnly });
+          } else {
+            pending.set(key, { stored: previous.stored, transcriptOnly });
           }
         }
         // Only the empty-to-nonempty transition wakes the projection; one token is ever queued.
@@ -123,19 +142,36 @@ const make = Effect.gen(function* () {
     const project = Effect.fn("ShellDeltaHub.projectShellItems")(function* () {
       const batch = Array.from(pending.values());
       pending.clear();
-      const items = yield* projectShellDeltas(batch, {
-        threadShell: threadManagement.getThreadShellForEvent,
-        projectShell: projectService.getShell,
-      });
-      const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-      yield* PubSub.publish(
-        input.output,
-        items.map((item) => ({
-          sequence: item.sequence,
-          item,
-          version: versions.stamp(item, now),
-        })),
+      const transcriptOnly = new Set(
+        batch.flatMap((entry) =>
+          entry.transcriptOnly && !("aggregateKind" in entry.stored)
+            ? [entry.stored.event.threadId]
+            : [],
+        ),
       );
+      const projected = yield* projectShellDeltas(
+        batch.map((entry) => entry.stored),
+        {
+          threadShell: threadManagement.getThreadShellForEvent,
+          projectShell: projectService.getShell,
+        },
+      );
+      const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+      const deltas: Array<VersionedShellDelta> = [];
+      for (const { item, readAt } of projected) {
+        // A subagent's transcript updates reach its focused watchers through the thread stream;
+        // the shell, read because the subagent was unknown at hub start, shows the lineage now.
+        if (
+          item.kind === "thread.updated" &&
+          transcriptOnly.has(item.thread.id) &&
+          item.thread.lineage.relationshipToParent === "subagent"
+        ) {
+          subagentThreadIds.add(item.thread.id);
+          continue;
+        }
+        deltas.push({ sequence: item.sequence, item, version: versions.stamp(item, now), readAt });
+      }
+      if (deltas.length > 0) yield* PubSub.publish(input.output, deltas);
     });
     const projectBatches = Effect.gen(function* () {
       while (true) {
@@ -163,7 +199,9 @@ const make = Effect.gen(function* () {
             message: "The shell delta hub stopped",
             cause,
           });
-          return Deferred.fail(failed, instance.failure);
+          return Effect.logWarning("shell delta hub stopped; every shell stream ends", {
+            cause,
+          }).pipe(Effect.andThen(Deferred.fail(failed, instance.failure)));
         }),
       ),
       Scope.provide(scope),
@@ -270,14 +308,20 @@ const make = Effect.gen(function* () {
       ),
       Effect.forkScoped({ startImmediately: true }),
     );
-    const open = (sequence: number) =>
+    const open = (sequence: number, replayReads?: ReadonlyMap<ThreadId, number>) =>
       mutex.withPermit(
         Effect.gen(function* () {
           if (closed) return;
           afterSequence = sequence;
           const now = yield* Clock.currentTimeMillis;
           for (const [key, item] of pending) {
-            if (item.value.sequence <= sequence || !admission.admit(item.value, now)) {
+            const threadId = shellDeltaThreadId(item.value.item);
+            const replayReadAt = threadId === undefined ? undefined : replayReads?.get(threadId);
+            if (
+              item.value.sequence <= sequence ||
+              (replayReadAt !== undefined && item.value.readAt <= replayReadAt) ||
+              !admission.admit(item.value, now)
+            ) {
               budget.release([item]);
               pending.delete(key);
             }
@@ -306,9 +350,11 @@ const make = Effect.gen(function* () {
       ),
     );
     return {
-      stream: (sequence) =>
+      stream: (sequence, replayReads) =>
         Stream.unwrap(
-          open(sequence).pipe(Effect.as(deliver.pipe(Stream.map((delta) => delta.item)))),
+          open(sequence, replayReads).pipe(
+            Effect.as(deliver.pipe(Stream.map((delta) => delta.item))),
+          ),
         ),
     };
   });

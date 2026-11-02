@@ -29,6 +29,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
@@ -718,6 +719,7 @@ it.effect("shell subscribers share one thread shell read per event", () =>
 // The shell delta hub over mocked shell reads; `onStart` runs when the hub subscribes to committed events.
 const layerShellSubscribers = (input: {
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
+  readonly getProjectShell?: ProjectService.ProjectService["Service"]["getShell"];
   readonly onStart?: () => void;
 }) =>
   ShellDeltaHub.layer.pipe(
@@ -755,7 +757,7 @@ const layerShellSubscribers = (input: {
     ),
     Layer.provideMerge(
       Layer.succeed(ProjectService.ProjectService, {
-        getShell: () => Effect.succeedNone,
+        getShell: input.getProjectShell ?? (() => Effect.succeedNone),
       } as unknown as ProjectService.ProjectService["Service"]),
     ),
     Layer.provideMerge(
@@ -1631,7 +1633,9 @@ const subscribeInto = (afterSequence: number, seen: Array<string>) =>
           seen.push(
             item.kind === "thread.updated"
               ? `${item.thread.id}@${item.sequence}:${(item.thread as { title: string }).title}`
-              : item.kind,
+              : item.kind === "project.updated"
+                ? `project.updated@${item.sequence}:${item.project.title}`
+                : item.kind,
           );
         }),
       ),
@@ -1738,5 +1742,103 @@ it.effect(
         .filter((item) => item.startsWith(`${a}@`))
         .map((item) => item.slice(item.lastIndexOf(":") + 1));
       assert.deepEqual(titlesA, ["a2"], `older A delivered after the newer one: ${seen.join(" ")}`);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// Reviewer scenario (F2b): two project updates land while the resume replay is still reading that project.
+it.effect(
+  "a resumed shell subscriber never receives a project shell older than one its replay sent",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const threadId = ThreadId.make("thread:project-order");
+      const projectId = ProjectId.make("project:order");
+      const now = "2026-10-31T00:00:00.000Z";
+      let title = "c1";
+      let version = 0;
+      let published = 0;
+      const insertProject = () =>
+        sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          ${`project-order:${++version}`}, 'project', ${projectId}, ${version}, 'project.meta-updated',
+          ${now}, 'server', ${JSON.stringify({ projectId, title, updatedAt: now })}, '{}', 2
+        ) RETURNING sequence
+      `.pipe(Effect.map(([row]) => row!.sequence));
+      const publishAll = Effect.gen(function* () {
+        const events = yield* store
+          .readApplicationEvents({ afterSequence: published, throughSequence: 1_000 })
+          .pipe(Stream.runCollect);
+        published = events.at(-1)?.sequence ?? published;
+        yield* store.publishCommitted(events);
+      });
+      // The replay's reads of the thread and of the project wait until released.
+      const replayGate = yield* Deferred.make<void>();
+      let threadReads = 0;
+      let projectReads = 0;
+      const seen: Array<string> = [];
+      yield* insertShellEvent(sql, threadId, 0);
+      published = yield* insertProject();
+      yield* Effect.gen(function* () {
+        yield* subscribeInto(0, seen);
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        title = "c2";
+        yield* insertProject();
+        yield* publishAll;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        title = "c3";
+        yield* insertProject();
+        yield* publishAll;
+        yield* Deferred.succeed(replayGate, undefined);
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          layerShellSubscribers({
+            getThreadShell: (id) =>
+              Effect.gen(function* () {
+                if (threadReads++ === 0) yield* Deferred.await(replayGate);
+                return {
+                  id,
+                  archivedAt: null,
+                  title: "t",
+                } as unknown as OrchestrationV2ThreadShell;
+              }),
+            getProjectShell: () =>
+              Effect.gen(function* () {
+                if (projectReads++ === 0) yield* Deferred.await(replayGate);
+                return Option.some({
+                  id: projectId,
+                  title,
+                  workspaceRoot: "/tmp/project-order",
+                  defaultModelSelection: null,
+                  scripts: [],
+                  createdAt: now,
+                  updatedAt: now,
+                } as unknown as OrchestrationProjectShell);
+              }),
+          }),
+        ),
+      );
+      const titles = seen
+        .filter((item) => item.startsWith("project.updated"))
+        .map((item) => item.slice(item.lastIndexOf(":") + 1));
+      const order = ["c1", "c2", "c3"];
+      for (let index = 1; index < titles.length; index++) {
+        assert.isTrue(
+          order.indexOf(titles[index]!) >= order.indexOf(titles[index - 1]!),
+          `project went backwards: ${seen.join(" ")}`,
+        );
+      }
+      assert.include(titles, "c3", seen.join(" "));
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );

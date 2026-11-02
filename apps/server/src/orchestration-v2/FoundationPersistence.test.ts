@@ -35,6 +35,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
@@ -286,9 +287,8 @@ it.effect("discovers on the reader worker and deletes on the writer", () =>
       const result = yield* maintenance.compactEventStore();
       assert.equal(result.deletedEventCount, 148);
       assert.equal(result.deletedReceiptCount, 100);
-      // The pass's working set (the scratch store's `candidates`) is read on the main thread by design.
       assert.deepEqual(
-        reads.filter((query) => /\bSELECT\b/.test(query) && !/\bcandidates\b/.test(query)),
+        reads.filter((query) => /\bSELECT\b/.test(query)),
         [],
       );
       assert(writes.some((query) => query.includes("DELETE FROM orchestration_events")));
@@ -311,6 +311,7 @@ it.effect("paces scheduled compaction while preserving retention state and fixed
     yield* seedCompaction();
     const completed = yield* Deferred.make<void>();
     const pauseStarted = yield* Deferred.make<void>();
+    const pauseRegistered = yield* Queue.unbounded<void>();
     let activeNanos = 0n;
     let eventPages = 0;
     const pauses: number[] = [];
@@ -352,8 +353,13 @@ it.effect("paces scheduled compaction while preserving retention state and fixed
       yield* sql`INSERT INTO orchestration_command_receipts (
           command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, command_type
         ) VALUES ('after-start', 'thread', 'imported', '2026-10-17', 0, 'accepted', 'legacy')`;
-      yield* TestClock.adjust("10 seconds");
-      yield* Deferred.await(completed);
+      // The pass's working set answers from a worker thread, a real round trip between pauses: fire
+      // one pause at a time and wait for the next one (or completion) to be registered.
+      yield* Queue.take(pauseRegistered);
+      while (!(yield* Deferred.isDone(completed))) {
+        yield* TestClock.adjust("270 millis");
+        yield* Effect.raceFirst(Queue.take(pauseRegistered), Deferred.await(completed));
+      }
     }).pipe(
       Effect.provide(
         DatabaseStorage.layer.pipe(
@@ -370,6 +376,7 @@ it.effect("paces scheduled compaction while preserving retention state and fixed
           if (millis < 60_000) {
             pauses.push(millis);
             Deferred.doneUnsafe(pauseStarted, Effect.void);
+            Queue.offerUnsafe(pauseRegistered, undefined);
           } else if (millis === 6 * 60 * 60_000) {
             Deferred.doneUnsafe(completed, Effect.void);
           }

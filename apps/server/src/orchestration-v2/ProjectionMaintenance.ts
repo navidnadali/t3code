@@ -1,4 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off - the compaction scratch store is a native SQLite handle; its file is removed with it.
 import { ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
@@ -8,9 +7,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
-import * as NodeFS from "node:fs";
-import * as NodeSqlite from "node:sqlite";
 
+import * as CompactionScratch from "./CompactionScratch.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -73,106 +71,12 @@ const encodeEntityKey = Schema.encodeSync(
   Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String, Schema.NullOr(Schema.String)])),
 );
 
-// The scratch store keeps the pass's working set out of the heap: SQLite caches this much of it,
-// the rest lives in the file (measured on a 2 GB store: 32 MiB costs ≈ 0.2 ms per page over 8 MiB's 1.4 ms).
-const SCRATCH_CACHE_KIB = 32768;
-const SCRATCH_PAGE_SIZE = 8192;
-
-const scratchFiles = (scratchPath: string | undefined) =>
-  scratchPath === undefined ? [] : [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`];
-
-const removeScratchFiles = (scratchPath: string | undefined) => {
-  for (const file of scratchFiles(scratchPath)) NodeFS.rmSync(file, { force: true });
-};
-
-/** Tear-down steps, each attempted whatever the previous one did; the scratch store is disposable. */
-const scratchCleanup = (db: NodeSqlite.DatabaseSync, scratchPath: string | undefined) => [
-  ["close", () => db.close()] as const,
-  ...scratchFiles(scratchPath).map(
-    (file) => [`remove ${file}`, () => NodeFS.rmSync(file, { force: true })] as const,
-  ),
-];
-
-const quietly = (step: () => void) => {
-  try {
-    step();
-  } catch {
-    return;
-  }
-};
-
-type CompactionScratch = {
-  readonly lookup: (keys: ReadonlyArray<string>) => Map<string, number | null>;
-  readonly upsert: (entries: ReadonlyArray<readonly [string, number | null]>) => void;
-};
-
-const scratchError = (cause: unknown) =>
-  new ProjectionMaintenanceError({ operation: "compaction scratch store", cause });
-
-/** Opens the pass's working-set store; whatever a previous pass left there is replaced, never read. */
-const openScratch = (scratchPath: string | undefined) =>
-  Effect.acquireRelease(
-    Effect.try({
-      try: (): CompactionScratch & { readonly db: NodeSqlite.DatabaseSync } => {
-        removeScratchFiles(scratchPath);
-        const db = new NodeSqlite.DatabaseSync(scratchPath ?? ":memory:");
-        try {
-          // Scratch data, one transaction for the whole pass and never committed: no fsync, and
-          // pages beyond the cache spill to the WAL once rather than at every page's commit.
-          db.exec(`
-            PRAGMA page_size = ${SCRATCH_PAGE_SIZE};
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = OFF;
-            PRAGMA cache_size = -${SCRATCH_CACHE_KIB};
-            CREATE TABLE candidates (entity_key TEXT PRIMARY KEY, oldest INTEGER) WITHOUT ROWID;
-            BEGIN;
-          `);
-          const select = db.prepare(`
-            SELECT entity_key, oldest FROM candidates
-            WHERE entity_key IN (SELECT value FROM json_each(?))
-          `);
-          const upsert = db.prepare(`
-            INSERT INTO candidates (entity_key, oldest)
-            SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?) WHERE true
-            ON CONFLICT (entity_key) DO UPDATE SET oldest = excluded.oldest
-          `);
-          return {
-            db,
-            lookup: (keys) => {
-              const found = new Map<string, number | null>();
-              if (keys.length === 0) return found;
-              for (const row of select.all(JSON.stringify(keys))) {
-                found.set(String(row.entity_key), row.oldest === null ? null : Number(row.oldest));
-              }
-              return found;
-            },
-            upsert: (entries) => {
-              if (entries.length > 0) upsert.run(JSON.stringify(entries));
-            },
-          };
-        } catch (cause) {
-          // The setup failure is the one reported; nothing of the store may stay behind.
-          for (const [, step] of scratchCleanup(db, scratchPath)) quietly(step);
-          throw cause;
-        }
-      },
-      catch: scratchError,
-    }),
-    // A cleanup failure is logged, never raised: the pass's result stands and the schedule goes on.
-    ({ db }) =>
-      Effect.forEach(
-        scratchCleanup(db, scratchPath),
-        ([what, step]) =>
-          Effect.try({
-            try: step,
-            catch: (cause) => new ProjectionMaintenanceError({ operation: what, cause }),
-          }).pipe(
-            Effect.catch((error) =>
-              Effect.logWarning("Compaction scratch store cleanup failed", { cause: error }),
-            ),
-          ),
-        { discard: true },
-      ),
+const scratchBoundary = <A, R>(
+  effect: Effect.Effect<A, CompactionScratch.CompactionScratchError, R>,
+) =>
+  Effect.mapError(
+    effect,
+    (cause) => new ProjectionMaintenanceError({ operation: "compaction scratch store", cause }),
   );
 
 export const layer: Layer.Layer<
@@ -402,11 +306,32 @@ export const layer: Layer.Layer<
       `.pipe(NodeSqliteClient.readOnly);
         let throughSequence = bounds[0]?.event_sequence ?? 0;
         let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
-        // One entry per thread; the per-entity working set is on disk (`openScratch`).
+        const scratchPath = options?.scratchPath;
+        // Never fill the disk: the scratch store beside the database needs room for every key.
+        if (
+          scratchPath !== undefined &&
+          !(yield* CompactionScratch.hasRoomFor(scratchPath, throughSequence))
+        ) {
+          yield* Effect.logWarning(
+            "Compaction skipped: not enough free space beside the database for its scratch store",
+            {
+              scratchPath,
+              events: throughSequence,
+              requiredBytes: CompactionScratch.requiredFreeBytes(throughSequence),
+            },
+          );
+          return {
+            deletedEventCount: 0,
+            deletedReceiptCount: 0,
+            reclaimableBytes: 0,
+            trackedKeys: 0,
+          };
+        }
+        // One entry per thread; the per-entity working set is in the scratch store's worker.
         const retainedThreadIds = new Set<string>();
         const retainedReadStateThreadIds = new Set<string>();
         const retainedTagThreadIds = new Set<string>();
-        const scratch = yield* openScratch(options?.scratchPath);
+        const scratch = yield* scratchBoundary(CompactionScratch.open(scratchPath));
         let deletedEventCount = 0;
         let deletedReceiptCount = 0;
         let trackedKeys = 0;
@@ -470,10 +395,9 @@ export const layer: Layer.Layer<
               ? encodeEntityKey([row.event_type, row.stream_id, row.entity_id])
               : undefined;
           const keys = page.map(keyOf);
-          const oldestCandidateByEntityKey = yield* Effect.try({
-            try: () => scratch.lookup(keys.filter((key) => key !== undefined)),
-            catch: scratchError,
-          });
+          const oldestCandidateByEntityKey = yield* scratchBoundary(
+            scratch.lookup(keys.filter((key) => key !== undefined)),
+          );
           const changes = new Map<string, number | null>();
           for (const [index, row] of page.entries()) {
             if (row.imported_legacy_thread === 1) {
@@ -532,7 +456,7 @@ export const layer: Layer.Layer<
               }
             }
           }
-          yield* Effect.try({ try: () => scratch.upsert([...changes]), catch: scratchError });
+          yield* scratchBoundary(scratch.upsert([...changes]));
           // Never hold a transaction or the reader lock across a yield or a rest.
           yield* Effect.yieldNow;
           if (obsolete.length > 0) {

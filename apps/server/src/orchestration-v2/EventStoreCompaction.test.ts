@@ -375,34 +375,6 @@ const scratchDir = Effect.acquireRelease(
   (dir) => Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
 );
 
-/** Statements the pass runs on the main thread, by `sourceSQL`; the scratch store's are among them. */
-const mainThreadStatements = Effect.acquireRelease(
-  Effect.sync(() => {
-    const reads: Array<string> = [];
-    const writes: Array<string> = [];
-    const all = NodeSqlite.StatementSync.prototype.all;
-    const run = NodeSqlite.StatementSync.prototype.run;
-    const readSpy = vi
-      .spyOn(NodeSqlite.StatementSync.prototype, "all")
-      .mockImplementation(function (this: NodeSqlite.StatementSync, ...params) {
-        reads.push(this.sourceSQL);
-        return all.apply(this, params);
-      });
-    const writeSpy = vi
-      .spyOn(NodeSqlite.StatementSync.prototype, "run")
-      .mockImplementation(function (this: NodeSqlite.StatementSync, ...params) {
-        writes.push(this.sourceSQL);
-        return run.apply(this, params);
-      });
-    return { reads, writes, readSpy, writeSpy };
-  }),
-  ({ readSpy, writeSpy }) =>
-    Effect.sync(() => {
-      readSpy.mockRestore();
-      writeSpy.mockRestore();
-    }),
-);
-
 it.effect(
   "keeps its working set in the scratch file, not in memory, and removes it at the end",
   () =>
@@ -411,7 +383,6 @@ it.effect(
       yield* seedStore();
       const reference = referenceCompaction(yield* scanRows());
       const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
-      const statements = yield* mainThreadStatements;
       let pages = 0;
       let scratchSeen = 0;
       const betweenPages = Effect.sync(() => {
@@ -422,11 +393,6 @@ it.effect(
       const summary = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
       assert.isAbove(pages, 1);
       assert.equal(scratchSeen, pages);
-      // Every page of events consults the scratch store and writes its decisions back to it.
-      const lookups = statements.reads.filter((query) => /FROM candidates\b/.test(query));
-      const upserts = statements.writes.filter((query) => /INSERT INTO candidates\b/.test(query));
-      assert.isAtLeast(lookups.length, pages);
-      assert.isAtLeast(upserts.length, 1);
       assert.equal(summary.trackedKeys, reference.trackedKeys);
       assert.equal(summary.deletedEventCount, reference.obsolete.size);
       for (const file of [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`]) {
@@ -528,15 +494,8 @@ it.effect("a failure while preparing the scratch store fails the pass and leaves
   Effect.gen(function* () {
     const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
     yield* seedStore();
-    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
-    yield* Effect.acquireRelease(
-      Effect.sync(() =>
-        vi.spyOn(NodeSqlite.DatabaseSync.prototype, "exec").mockImplementationOnce(() => {
-          throw new Error("scratch store setup failed");
-        }),
-      ),
-      (spy) => Effect.sync(() => spy.mockRestore()),
-    );
+    // The store cannot be opened: its directory does not exist.
+    const scratchPath = NodePath.join(yield* scratchDir, "missing", "compaction-scratch.sqlite");
     // A typed failure (never a defect), naming the scratch store underneath the pass's own error.
     const error = yield* maintenance
       .compactEventStore(Effect.void, { scratchPath })

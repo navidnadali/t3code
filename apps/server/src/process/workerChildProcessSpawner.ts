@@ -32,9 +32,13 @@ import type * as NodeNet from "node:net";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 
-import { spawnerProcessSource, spawnWorkerSource } from "./spawnerSources.ts";
+import {
+  PROCESS_SPAWNER_EXECUTABLE,
+  spawnerProcessSource,
+  spawnWorkerSource,
+} from "./spawnerSources.ts";
 
-export { spawnerProcessSource, spawnWorkerSource };
+export { PROCESS_SPAWNER_EXECUTABLE, spawnerProcessSource, spawnWorkerSource };
 
 export const VCS_SPAWN_WORKER_ENV = "T3CODE_VCS_SPAWN_WORKER";
 export const PROCESS_SPAWNER_ENV = "T3CODE_PROCESS_SPAWNER";

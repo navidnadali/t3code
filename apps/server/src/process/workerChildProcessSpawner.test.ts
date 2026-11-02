@@ -1050,32 +1050,57 @@ describe("WorkerChildProcessSpawner", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live.skipIf(!workerPlatform)(
-    "single executables start the spawner process through the CLI entry",
-    () =>
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const nodeSpawner = yield* ChildProcessSpawner;
-        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-process-spawner-" });
-        // Runs the CLI entry the way a single executable runs itself.
-        const executable = path.join(directory, "t3");
-        const entry = path.join(import.meta.dirname, "..", "bin.ts");
-        yield* fs.writeFileString(
-          executable,
-          `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(entry)} "$@"\n`,
-        );
-        yield* fs.chmod(executable, 0o755);
-        const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner).pipe(
-          Effect.provideService(HostProcess.ExecutablePath, executable),
-          Effect.provideService(HostProcess.IsExecutable, true),
-        );
-        const command = ChildProcess.make("git", ["--version"]);
-        expect(yield* collect(remoteSpawner, command)).toEqual(
-          yield* collect(nodeSpawner, command),
-        );
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
+  for (const sibling of [false, true]) {
+    it.live.skipIf(!workerPlatform)(
+      sibling
+        ? "single executables start the spawner executable beside them, not the whole server"
+        : "single executables without a spawner executable start the spawner through the CLI entry",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-process-spawner-" });
+          const invocations = path.join(directory, "t3-invocations");
+          // Runs the CLI entry the way a single executable runs itself, and records each run.
+          const executable = path.join(directory, "t3");
+          const entry = path.join(import.meta.dirname, "..", "bin.ts");
+          yield* fs.writeFileString(
+            executable,
+            `#!/bin/sh\necho "$@" >> ${JSON.stringify(invocations)}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(entry)} "$@"\n`,
+          );
+          yield* fs.chmod(executable, 0o755);
+          if (sibling) {
+            // Stands in for the spawner executable the build puts beside the single executable.
+            const main = path.join(directory, "process-spawner.cjs");
+            yield* fs.writeFileString(main, WorkerChildProcessSpawner.spawnerProcessSource);
+            const spawnerExecutable = path.join(
+              directory,
+              WorkerChildProcessSpawner.PROCESS_SPAWNER_EXECUTABLE,
+            );
+            yield* fs.writeFileString(
+              spawnerExecutable,
+              `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(main)} "$@"\n`,
+            );
+            yield* fs.chmod(spawnerExecutable, 0o755);
+          }
+          const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(
+            nodeSpawner,
+          ).pipe(
+            Effect.provideService(HostProcess.ExecutablePath, executable),
+            Effect.provideService(HostProcess.IsExecutable, true),
+          );
+          const command = ChildProcess.make("git", ["--version"]);
+          expect(yield* collect(remoteSpawner, command)).toEqual(
+            yield* collect(nodeSpawner, command),
+          );
+          const ran = (yield* fs.exists(invocations))
+            ? (yield* fs.readFileString(invocations)).trim().split("\n")
+            : [];
+          expect(ran).toEqual(sibling ? [] : [expect.stringMatching(/^__process-spawner /)]);
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
 
   it.live.skipIf(!workerPlatform)(
     "VCS layers provided per WebSocket connection reuse the server's spawner process",

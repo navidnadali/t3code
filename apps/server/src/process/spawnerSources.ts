@@ -1,3 +1,6 @@
+/** The spawner executable a single-executable build ships beside `t3`. */
+export const PROCESS_SPAWNER_EXECUTABLE = "t3-process-spawner";
+
 // Inline sources also run in bundles and single-executable builds without module files.
 const spawnProtocolSource = `
 const streamNames = ["stdout", "stderr"];

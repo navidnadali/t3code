@@ -662,9 +662,9 @@ it.effect(
       yield* seedStore();
       const before = yield* scanRows();
       const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
-      // Plenty of room when the pass starts; nothing left after its first page.
+      // Plenty of room when the pass starts; 32 MiB left after its first page, below the running floor.
       let pages = 0;
-      rmSyncInterceptor.freeBytes = () => (pages === 0 ? 1 << 30 : 0);
+      rmSyncInterceptor.freeBytes = () => (pages === 0 ? 1 << 30 : 32 * 1024 * 1024);
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => void (rmSyncInterceptor.freeBytes = null)),
       );
@@ -672,8 +672,12 @@ it.effect(
       const summary = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
       assert.equal(summary.skipped?.stage, "during");
       assert.equal(summary.skipped?.scratchPath, scratchPath);
-      assert.equal(summary.skipped?.freeBytes, 0);
-      assert.isAbove(summary.skipped?.requiredBytes ?? 0, 0);
+      assert.equal(summary.skipped?.freeBytes, 32 * 1024 * 1024);
+      // What stopped the pass is the running floor, not the size estimate — the report must say so.
+      assert.equal(
+        summary.skipped?.requiredBytes,
+        CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR,
+      );
       const after = yield* sql<{ readonly sequence: number }>`
       SELECT sequence FROM orchestration_events ORDER BY sequence
     `;

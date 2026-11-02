@@ -193,7 +193,9 @@ const make = Effect.gen(function* () {
         if (!verification.valid) {
           return yield* new DatabaseProjectionsInvalidError({ path: databasePath });
         }
-        const summary = yield* maintenance.compactEventStore();
+        const summary = yield* maintenance.compactEventStore(Effect.void, {
+          scratchPath: path.join(path.dirname(databasePath), "compaction-scratch.sqlite"),
+        });
         if (!(yield* maintenance.verify).valid) {
           return yield* new DatabaseProjectionsInvalidError({ path: databasePath });
         }

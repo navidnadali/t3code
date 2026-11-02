@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - the compaction scratch store is a native SQLite handle; its file is removed with it.
 import { ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
@@ -7,6 +8,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeFS from "node:fs";
+import * as NodeSqlite from "node:sqlite";
 
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -30,14 +33,27 @@ export class ProjectionMaintenanceError extends Schema.TaggedError<ProjectionMai
   },
 ) {}
 
+export interface CompactEventStoreOptions {
+  /**
+   * File for the pass's working set (every keyed entity's oldest candidate so far), replaced at
+   * every pass start and removed at its end; in memory when absent. Nothing in it outlives a pass.
+   */
+  readonly scratchPath?: string | undefined;
+}
+
 export interface ProjectionMaintenanceV2Shape {
   readonly verify: Effect.Effect<ProjectionVerificationV2, ProjectionMaintenanceError>;
   readonly rebuild: Effect.Effect<ProjectionVerificationV2, ProjectionMaintenanceError>;
-  readonly compactEventStore: (betweenPages?: Effect.Effect<void>) => Effect.Effect<
+  readonly compactEventStore: (
+    betweenPages?: Effect.Effect<void>,
+    options?: CompactEventStoreOptions,
+  ) => Effect.Effect<
     {
       readonly deletedEventCount: number;
       readonly deletedReceiptCount: number;
       readonly reclaimableBytes: number;
+      /** Keyed entities the pass saw; their state was on disk, not in the JS heap. */
+      readonly trackedKeys: number;
     },
     ProjectionMaintenanceError
   >;
@@ -56,6 +72,69 @@ type ProjectionMetadataRow = {
 const encodeEntityKey = Schema.encodeSync(
   Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String, Schema.NullOr(Schema.String)])),
 );
+
+// The scratch store keeps the pass's working set out of the heap: SQLite caches this much of it.
+const SCRATCH_CACHE_KIB = 8192;
+
+type CompactionScratch = {
+  readonly lookup: (keys: ReadonlyArray<string>) => Map<string, number | null>;
+  readonly upsert: (entries: ReadonlyArray<readonly [string, number | null]>) => void;
+};
+
+const scratchError = (cause: unknown) =>
+  new ProjectionMaintenanceError({ operation: "compaction scratch store", cause });
+
+/** Opens the pass's working-set store; whatever a previous pass left there is replaced, never read. */
+const openScratch = (scratchPath: string | undefined) =>
+  Effect.acquireRelease(
+    Effect.try({
+      try: (): CompactionScratch & { readonly db: NodeSqlite.DatabaseSync } => {
+        if (scratchPath !== undefined) NodeFS.rmSync(scratchPath, { force: true });
+        const db = new NodeSqlite.DatabaseSync(scratchPath ?? ":memory:");
+        try {
+          // Scratch data: no journal, no fsync; a crash leaves a file the next pass replaces.
+          db.exec(`
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            PRAGMA cache_size = -${SCRATCH_CACHE_KIB};
+            CREATE TABLE candidates (entity_key TEXT PRIMARY KEY, oldest INTEGER) WITHOUT ROWID;
+          `);
+          const select = db.prepare(`
+            SELECT entity_key, oldest FROM candidates
+            WHERE entity_key IN (SELECT value FROM json_each(?))
+          `);
+          const upsert = db.prepare(`
+            INSERT INTO candidates (entity_key, oldest)
+            SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?) WHERE true
+            ON CONFLICT (entity_key) DO UPDATE SET oldest = excluded.oldest
+          `);
+          return {
+            db,
+            lookup: (keys) => {
+              const found = new Map<string, number | null>();
+              if (keys.length === 0) return found;
+              for (const row of select.all(JSON.stringify(keys))) {
+                found.set(String(row.entity_key), row.oldest === null ? null : Number(row.oldest));
+              }
+              return found;
+            },
+            upsert: (entries) => {
+              if (entries.length > 0) upsert.run(JSON.stringify(entries));
+            },
+          };
+        } catch (cause) {
+          db.close();
+          throw cause;
+        }
+      },
+      catch: scratchError,
+    }),
+    ({ db }) =>
+      Effect.sync(() => {
+        db.close();
+        if (scratchPath !== undefined) NodeFS.rmSync(scratchPath, { force: true });
+      }),
+  );
 
 export const layer: Layer.Layer<
   ProjectionMaintenanceV2,
@@ -269,37 +348,40 @@ export const layer: Layer.Layer<
     const COMPACTION_PAGE_SIZE = 50;
 
     // Keep first/latest keyed events for replay order; page every event to bound sparse scans.
-    const compactEventStore = Effect.fn("ProjectionMaintenance.compactEventStore")(function* (
-      betweenPages: Effect.Effect<void> = Effect.void,
-    ) {
-      const bounds = yield* sql<{
-        readonly event_sequence: number;
-        readonly receipt_row_id: number;
-      }>`
+    const compactEventStore = Effect.fn("ProjectionMaintenance.compactEventStore")(
+      function* (
+        betweenPages: Effect.Effect<void> = Effect.void,
+        options?: CompactEventStoreOptions,
+      ) {
+        const bounds = yield* sql<{
+          readonly event_sequence: number;
+          readonly receipt_row_id: number;
+        }>`
         SELECT
           COALESCE((SELECT MAX(sequence) FROM orchestration_events), 0) AS event_sequence,
           COALESCE((SELECT MAX(rowid) FROM orchestration_command_receipts), 0) AS receipt_row_id
       `.pipe(NodeSqliteClient.readOnly);
-      let throughSequence = bounds[0]?.event_sequence ?? 0;
-      let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
-      const retainedThreadIds = new Set<string>();
-      const retainedReadStateThreadIds = new Set<string>();
-      const retainedTagThreadIds = new Set<string>();
-      // Retain each key's oldest candidate, deleting it only when an older event appears.
-      const oldestCandidateByEntityKey = new Map<string, number | null>();
-      let deletedEventCount = 0;
-      let deletedReceiptCount = 0;
+        let throughSequence = bounds[0]?.event_sequence ?? 0;
+        let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
+        // One entry per thread; the per-entity working set is on disk (`openScratch`).
+        const retainedThreadIds = new Set<string>();
+        const retainedReadStateThreadIds = new Set<string>();
+        const retainedTagThreadIds = new Set<string>();
+        const scratch = yield* openScratch(options?.scratchPath);
+        let deletedEventCount = 0;
+        let deletedReceiptCount = 0;
+        let trackedKeys = 0;
 
-      while (throughSequence > 0) {
-        const rows = yield* sql<{
-          readonly sequence: number;
-          readonly application_event_version: number;
-          readonly aggregate_kind: string;
-          readonly stream_id: string;
-          readonly event_type: string;
-          readonly entity_id: string | null;
-          readonly imported_legacy_thread: number;
-        }>`
+        while (throughSequence > 0) {
+          const rows = yield* sql<{
+            readonly sequence: number;
+            readonly application_event_version: number;
+            readonly aggregate_kind: string;
+            readonly stream_id: string;
+            readonly event_type: string;
+            readonly entity_id: string | null;
+            readonly imported_legacy_thread: number;
+          }>`
           SELECT
             event.sequence,
             event.application_event_version,
@@ -336,75 +418,100 @@ export const layer: Layer.Layer<
           ORDER BY event.sequence DESC
           LIMIT ${COMPACTION_PAGE_SIZE + 1}
         `.pipe(NodeSqliteClient.readOnly);
-        const page = rows.slice(0, COMPACTION_PAGE_SIZE);
-        const obsolete: number[] = [];
-        for (const row of page) {
-          if (row.imported_legacy_thread === 1) {
-            obsolete.push(row.sequence);
-          } else if (row.application_event_version === 2) {
-            if (
-              row.aggregate_kind === "thread" &&
-              supersedableThreadEventTypes.has(row.event_type)
-            ) {
-              if (retainedThreadIds.has(row.stream_id)) obsolete.push(row.sequence);
-              else retainedThreadIds.add(row.stream_id);
-            } else if (
-              row.aggregate_kind === "thread" &&
-              readStateThreadEventTypes.has(row.event_type)
-            ) {
-              if (
-                retainedThreadIds.has(row.stream_id) ||
-                retainedReadStateThreadIds.has(row.stream_id)
-              ) {
-                obsolete.push(row.sequence);
-              } else retainedReadStateThreadIds.add(row.stream_id);
-            } else if (
-              row.aggregate_kind === "thread" &&
-              row.event_type === TAG_THREAD_EVENT_TYPE
-            ) {
-              if (retainedThreadIds.has(row.stream_id) || retainedTagThreadIds.has(row.stream_id)) {
-                obsolete.push(row.sequence);
-              } else retainedTagThreadIds.add(row.stream_id);
-            } else if (
-              row.event_type === "thread.pull-request-link-updated" &&
-              retainedThreadIds.has(row.stream_id)
-            ) {
-              // A newer whole-thread payload already carries this link's state.
-              obsolete.push(row.sequence);
-            } else if (
-              row.event_type === "thread.pull-request-link-updated" ||
+          const page = rows.slice(0, COMPACTION_PAGE_SIZE);
+          const obsolete: number[] = [];
+          // Retain each key's oldest candidate, deleting it only when an older event appears. The
+          // page's keys are read from the scratch store at once and its decisions written back at once.
+          const keyOf = (row: (typeof page)[number]) =>
+            row.application_event_version === 2 &&
+            (row.event_type === "thread.pull-request-link-updated" ||
               row.event_type === "message.updated" ||
               row.event_type === "node.updated" ||
-              (row.event_type === "turn-item.updated" && row.entity_id !== null)
-            ) {
-              const key = encodeEntityKey([row.event_type, row.stream_id, row.entity_id]);
-              const candidate = oldestCandidateByEntityKey.get(key);
-              if (candidate === undefined) oldestCandidateByEntityKey.set(key, null);
-              else {
-                if (candidate !== null) obsolete.push(candidate);
-                oldestCandidateByEntityKey.set(key, row.sequence);
+              (row.event_type === "turn-item.updated" && row.entity_id !== null))
+              ? encodeEntityKey([row.event_type, row.stream_id, row.entity_id])
+              : undefined;
+          const keys = page.map(keyOf);
+          const oldestCandidateByEntityKey = yield* Effect.try({
+            try: () => scratch.lookup(keys.filter((key) => key !== undefined)),
+            catch: scratchError,
+          });
+          const changes = new Map<string, number | null>();
+          for (const [index, row] of page.entries()) {
+            if (row.imported_legacy_thread === 1) {
+              obsolete.push(row.sequence);
+            } else if (row.application_event_version === 2) {
+              if (
+                row.aggregate_kind === "thread" &&
+                supersedableThreadEventTypes.has(row.event_type)
+              ) {
+                if (retainedThreadIds.has(row.stream_id)) obsolete.push(row.sequence);
+                else retainedThreadIds.add(row.stream_id);
+              } else if (
+                row.aggregate_kind === "thread" &&
+                readStateThreadEventTypes.has(row.event_type)
+              ) {
+                if (
+                  retainedThreadIds.has(row.stream_id) ||
+                  retainedReadStateThreadIds.has(row.stream_id)
+                ) {
+                  obsolete.push(row.sequence);
+                } else retainedReadStateThreadIds.add(row.stream_id);
+              } else if (
+                row.aggregate_kind === "thread" &&
+                row.event_type === TAG_THREAD_EVENT_TYPE
+              ) {
+                if (
+                  retainedThreadIds.has(row.stream_id) ||
+                  retainedTagThreadIds.has(row.stream_id)
+                ) {
+                  obsolete.push(row.sequence);
+                } else retainedTagThreadIds.add(row.stream_id);
+              } else if (
+                row.event_type === "thread.pull-request-link-updated" &&
+                retainedThreadIds.has(row.stream_id)
+              ) {
+                // A newer whole-thread payload already carries this link's state.
+                obsolete.push(row.sequence);
+              } else if (
+                row.event_type === "thread.pull-request-link-updated" ||
+                row.event_type === "message.updated" ||
+                row.event_type === "node.updated" ||
+                (row.event_type === "turn-item.updated" && row.entity_id !== null)
+              ) {
+                const key = keys[index]!;
+                const candidate = oldestCandidateByEntityKey.get(key);
+                let next: number | null;
+                if (candidate === undefined) {
+                  next = null;
+                  trackedKeys += 1;
+                } else {
+                  if (candidate !== null) obsolete.push(candidate);
+                  next = row.sequence;
+                }
+                oldestCandidateByEntityKey.set(key, next);
+                changes.set(key, next);
               }
             }
           }
-        }
-        // Never hold a transaction or the reader lock across a yield or a rest.
-        yield* Effect.yieldNow;
-        if (obsolete.length > 0) {
-          yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
-          deletedEventCount += obsolete.length;
+          yield* Effect.try({ try: () => scratch.upsert([...changes]), catch: scratchError });
+          // Never hold a transaction or the reader lock across a yield or a rest.
           yield* Effect.yieldNow;
+          if (obsolete.length > 0) {
+            yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
+            deletedEventCount += obsolete.length;
+            yield* Effect.yieldNow;
+          }
+          throughSequence =
+            rows.length <= COMPACTION_PAGE_SIZE ? 0 : (page.at(-1)?.sequence ?? 1) - 1;
+          if (throughSequence > 0 || throughReceiptRowId > 0) yield* betweenPages;
         }
-        throughSequence =
-          rows.length <= COMPACTION_PAGE_SIZE ? 0 : (page.at(-1)?.sequence ?? 1) - 1;
-        if (throughSequence > 0 || throughReceiptRowId > 0) yield* betweenPages;
-      }
 
-      while (throughReceiptRowId > 0) {
-        const rows = yield* sql<{
-          readonly row_id: number;
-          readonly command_id: string;
-          readonly imported_legacy_thread: number;
-        }>`
+        while (throughReceiptRowId > 0) {
+          const rows = yield* sql<{
+            readonly row_id: number;
+            readonly command_id: string;
+            readonly imported_legacy_thread: number;
+          }>`
           SELECT
             receipt.rowid AS row_id,
             receipt.command_id,
@@ -422,28 +529,31 @@ export const layer: Layer.Layer<
           ORDER BY receipt.rowid DESC
           LIMIT ${COMPACTION_PAGE_SIZE + 1}
         `.pipe(NodeSqliteClient.readOnly);
-        const page = rows.slice(0, COMPACTION_PAGE_SIZE);
-        const obsolete = page
-          .filter((row) => row.imported_legacy_thread === 1)
-          .map((row) => row.command_id);
-        yield* Effect.yieldNow;
-        if (obsolete.length > 0) {
-          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id IN ${sql.in(obsolete)}`;
-          deletedReceiptCount += obsolete.length;
+          const page = rows.slice(0, COMPACTION_PAGE_SIZE);
+          const obsolete = page
+            .filter((row) => row.imported_legacy_thread === 1)
+            .map((row) => row.command_id);
           yield* Effect.yieldNow;
+          if (obsolete.length > 0) {
+            yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id IN ${sql.in(obsolete)}`;
+            deletedReceiptCount += obsolete.length;
+            yield* Effect.yieldNow;
+          }
+          throughReceiptRowId = (page.at(-1)?.row_id ?? 1) - 1;
+          if (rows.length <= COMPACTION_PAGE_SIZE) break;
+          yield* betweenPages;
         }
-        throughReceiptRowId = (page.at(-1)?.row_id ?? 1) - 1;
-        if (rows.length <= COMPACTION_PAGE_SIZE) break;
-        yield* betweenPages;
-      }
 
-      const freelistRows = yield* sql<{ readonly freelist_count: number }>`PRAGMA freelist_count`;
-      const pageSizeRows = yield* sql<{ readonly page_size: number }>`PRAGMA page_size`;
-      const reclaimableBytes =
-        (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
+        const freelistRows = yield* sql<{ readonly freelist_count: number }>`PRAGMA freelist_count`;
+        const pageSizeRows = yield* sql<{ readonly page_size: number }>`PRAGMA page_size`;
+        const reclaimableBytes =
+          (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
 
-      return { deletedEventCount, deletedReceiptCount, reclaimableBytes };
-    }, mapError("compact event store"));
+        return { deletedEventCount, deletedReceiptCount, reclaimableBytes, trackedKeys };
+      },
+      Effect.scoped,
+      mapError("compact event store"),
+    );
 
     return ProjectionMaintenanceV2.of({
       verify: mapError("verify")(verify),

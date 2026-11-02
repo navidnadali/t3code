@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - inspects the pass's scratch file with Node built-ins.
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";

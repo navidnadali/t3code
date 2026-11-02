@@ -49,7 +49,8 @@ export interface CheckpointRefMemory {
 // two refs and two commits live, so these cover more than a thousand concurrent threads.
 const REFS_CAPACITY = 16_384;
 const COMMITS_CAPACITY = 16_384;
-// Entries kept from packed-refs files across repositories; a file with more is left to Git.
+// Parsed packed-refs files kept, and the entries they may hold in all; a file with more is left to Git.
+const PACKED_REFS_CAPACITY = 256;
 const PACKED_REFS_ENTRY_BUDGET = 16_384;
 // Only refs under this prefix are kept from packed-refs; others are asked of Git.
 const PACKED_REFS_PREFIX = "refs/t3/";
@@ -287,7 +288,7 @@ const isCheckpointRefName = (ref: string) =>
 export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const refs = new BoundedMap<string, string>(REFS_CAPACITY);
   const commits = new BoundedMap<string, CommitFacts>(COMMITS_CAPACITY);
-  // Parsed packed-refs per common directory, their entries counted against one budget.
+  // Parsed packed-refs per common directory (insertion order = age), bounded in files and entries.
   const packed = new Map<string, PackedRefs>();
   let packedEntries = 0;
   const refKey = (commonDir: string, ref: string) => `${commonDir}\0${ref}`;
@@ -302,7 +303,9 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     }
     const size = current.refs?.size ?? 0;
     for (const [key, entry] of packed) {
-      if (packedEntries + size <= PACKED_REFS_ENTRY_BUDGET) break;
+      if (packed.size < PACKED_REFS_CAPACITY && packedEntries + size <= PACKED_REFS_ENTRY_BUDGET) {
+        break;
+      }
       packed.delete(key);
       packedEntries -= entry.refs?.size ?? 0;
     }

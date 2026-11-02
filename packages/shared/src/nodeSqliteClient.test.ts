@@ -369,19 +369,28 @@ const assertPermits = (expected: number) =>
     assert.deepEqual([Option.isSome(all), Option.isSome(more)], [true, false]);
   });
 
-// A large read paused in its transaction, holding a reader; released by the returned effect.
+// A large read that runs as far as it can at once, then pauses in its transaction until released.
 const holdLargeReader = (sql: SqlClient.SqlClient, name: string, started: Array<string>) =>
   Effect.gen(function* () {
+    const running = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
     const fiber = yield* sql
       .withTransaction(
         sql`SELECT ${name} AS name`.pipe(
           Effect.andThen(Effect.sync(() => started.push(name))),
+          Effect.andThen(Deferred.succeed(running, undefined)),
           Effect.andThen(Deferred.await(release)),
         ),
       )
-      .pipe(SqliteClient.largeRead, SqliteClient.readOnly, Effect.forkChild);
-    return Deferred.succeed(release, undefined).pipe(Effect.andThen(Fiber.join(fiber)));
+      .pipe(
+        SqliteClient.largeRead,
+        SqliteClient.readOnly,
+        Effect.forkChild({ startImmediately: true }),
+      );
+    return {
+      running: Deferred.await(running),
+      release: Deferred.succeed(release, undefined).pipe(Effect.andThen(Fiber.join(fiber))),
+    };
   });
 
 it.effect("leaves the last reader to other reads while large reads hold the rest", () =>
@@ -390,15 +399,16 @@ it.effect("leaves the last reader to other reads while large reads hold the rest
       Effect.gen(function* () {
         const started: Array<string> = [];
         const first = yield* holdLargeReader(sql, "large-1", started);
+        yield* first.running;
+        // Two readers: the first large read holds one, so the second must wait for its turn.
         const second = yield* holdLargeReader(sql, "large-2", started);
-        // Two readers: one large read holds a reader, the other waits for its turn.
         const small = yield* sql
           .withTransaction(sql`SELECT ${"small"} AS name`)
           .pipe(SqliteClient.readOnly);
         assert.deepEqual(small, [{ name: "small" }]);
         assert.deepEqual(started, ["large-1"]);
-        yield* first;
-        yield* second;
+        yield* first.release;
+        yield* second.release;
         assert.deepEqual(started, ["large-1", "large-2"]);
       }),
     { readerPoolSize: 2 },
@@ -422,7 +432,7 @@ it.effect("gives back a large read's turn when it is interrupted waiting for a r
         yield* Fiber.interrupt(waiting);
         yield* unmarked;
         const next = yield* holdLargeReader(sql, "next", started);
-        yield* next;
+        yield* next.release;
         assert.deepEqual(started, ["next"]);
       }),
     { readerPoolSize: 1 },

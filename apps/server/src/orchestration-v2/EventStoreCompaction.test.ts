@@ -3,12 +3,37 @@ import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
+
+// Removal of one path can be made to fail (as EBUSY would on Windows while the file is open).
+const rmSyncInterceptor = vi.hoisted(() => ({
+  failPath: null as string | null,
+  calls: [] as Array<string>,
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    rmSync: (...args: Parameters<typeof actual.rmSync>) => {
+      const target = String(args[0]);
+      rmSyncInterceptor.calls.push(target);
+      if (target === rmSyncInterceptor.failPath) {
+        const error = new Error("resource busy or locked");
+        Object.assign(error, { code: "EBUSY" });
+        throw error;
+      }
+      return actual.rmSync(...args);
+    },
+  };
+});
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventStore from "./EventStore.ts";
@@ -443,15 +468,23 @@ it.effect("a scratch file that cannot be removed is logged, and does not fail th
     const before = yield* scanRows();
     const reference = referenceCompaction(before);
     const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
-    let replaced = false;
-    // While the pass holds the file open, a directory takes its path: unlinking it at the end fails.
+    const logs: Array<unknown> = [];
+    // Removing the database at the end fails; the pass opened it fine (the first removal, before open).
     const betweenPages = Effect.sync(() => {
-      if (replaced) return;
-      replaced = true;
-      NodeFS.rmSync(scratchPath);
-      NodeFS.mkdirSync(scratchPath);
+      rmSyncInterceptor.failPath = scratchPath;
     });
-    const summary = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
+    yield* Effect.addFinalizer(() => Effect.sync(() => void (rmSyncInterceptor.failPath = null)));
+    rmSyncInterceptor.calls.length = 0;
+    const summary = yield* maintenance
+      .compactEventStore(betweenPages, { scratchPath })
+      .pipe(
+        Effect.provide(
+          Logger.layer([Logger.make(({ logLevel, message }) => logs.push([logLevel, message]))], {
+            mergeWithExisting: false,
+          }),
+        ),
+        Effect.provideService(References.MinimumLogLevel, "Debug"),
+      );
     assert.equal(summary.deletedEventCount, reference.obsolete.size);
     const after = yield* sql<{ readonly sequence: number }>`
       SELECT sequence FROM orchestration_events ORDER BY sequence
@@ -461,10 +494,23 @@ it.effect("a scratch file that cannot be removed is logged, and does not fail th
       new Set(before.map((row) => row.sequence).filter((sequence) => !remaining.has(sequence))),
       reference.obsolete,
     );
-    assert.isTrue(NodeFS.statSync(scratchPath).isDirectory());
-    for (const file of [`${scratchPath}-wal`, `${scratchPath}-shm`]) {
-      assert.isFalse(NodeFS.existsSync(file), file);
-    }
+    // The failure is a warning, and the remaining removals still ran.
+    assert.isTrue(
+      logs.some(
+        (entry) =>
+          Array.isArray(entry) &&
+          entry[0] === "Warn" &&
+          String(entry[1]).includes("Compaction scratch store cleanup failed"),
+      ),
+      JSON.stringify(logs),
+    );
+    const failedAt = rmSyncInterceptor.calls.lastIndexOf(scratchPath);
+    assert.isAbove(failedAt, 0);
+    assert.deepEqual(rmSyncInterceptor.calls.slice(failedAt + 1), [
+      `${scratchPath}-wal`,
+      `${scratchPath}-shm`,
+    ]);
+    assert.isTrue(NodeFS.existsSync(scratchPath));
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );
 

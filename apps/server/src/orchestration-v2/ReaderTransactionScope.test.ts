@@ -1094,11 +1094,30 @@ it.effect("gives back a streamed search's reader permit however the stream ends"
   withFileStore(
     "reader-scope-search-permit-",
     Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
       const store = yield* ProjectionStore.ProjectionStoreV2;
       const fixture = yield* writeFixture("search-permit", 2);
-      const search = store.searchThreadStream({ threadId: fixture.fork, query: "fork" });
-      yield* Effect.exit(Stream.runCollect(search));
-      yield* Effect.exit(Stream.runHead(search));
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, scripts_json, created_at, updated_at
+        ) VALUES (
+          'project:reader-scope', 'Reader scope', '/tmp/reader-scope', '[]',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      const search = (query: string) => store.searchThreadStream({ threadId: fixture.fork, query });
+      // To the end, cut short after the first match (another query, so no cached scan), and failed.
+      const results = yield* Stream.runCollect(search("fork"));
+      assert.notStrictEqual(results.at(-1)?.complete, false);
+      assert.isAbove(results.at(-1)?.totalMatches ?? 0, 0);
+      const head = yield* Stream.runHead(search("user"));
+      assert.isTrue(Option.isSome(head) && head.value.complete === false);
+      const missing = yield* Effect.exit(
+        Stream.runCollect(
+          store.searchThreadStream({ threadId: ThreadId.make("thread:missing"), query: "fork" }),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(missing));
       // The pool has one permit; a kept one would leave this read waiting.
       const snapshot = yield* store.getThreadSnapshot(fixture.fork);
       assert.strictEqual(snapshot.projection.thread.id, fixture.fork);

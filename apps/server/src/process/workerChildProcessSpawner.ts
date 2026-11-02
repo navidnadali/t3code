@@ -641,21 +641,27 @@ const openWorker =
     };
   };
 
-/** How the server starts its spawner process; single executables dispatch `__process-spawner`. */
+/** How the server starts its spawner process: single executables run the spawner executable beside them, or else `t3 __process-spawner`. */
 export const spawnerProcessLaunch = (input: {
   readonly executable: string;
   readonly isExecutable: boolean;
+  /** The spawner executable beside a single executable, when its build shipped one. */
+  readonly spawnerExecutable?: string;
   readonly environment: NodeJS.ProcessEnv;
   readonly windowBytes: number;
   readonly source?: string;
 }) => {
   // Children get the server's environment with each request; the server's heap options are not the spawner's.
   const { NODE_OPTIONS: _nodeOptions, ...environment } = input.environment;
+  const windowBytes = String(input.windowBytes);
   return {
-    command: input.executable,
-    args: input.isExecutable
-      ? ["__process-spawner", String(input.windowBytes)]
-      : ["-e", input.source ?? spawnerProcessSource, String(input.windowBytes)],
+    command: input.spawnerExecutable ?? input.executable,
+    args:
+      input.spawnerExecutable !== undefined
+        ? [windowBytes]
+        : input.isExecutable
+          ? ["__process-spawner", windowBytes]
+          : ["-e", input.source ?? spawnerProcessSource, windowBytes],
     options: {
       // Its stdout reports each child's PID as soon as it starts.
       stdio: ["ignore", "pipe", "inherit", "ipc"],
@@ -667,6 +673,14 @@ export const spawnerProcessLaunch = (input: {
     } satisfies NodeChildProcess.SpawnOptions,
   };
 };
+
+const findSpawnerExecutable = Effect.fnUntraced(function* (executable: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const candidate = path.join(path.dirname(executable), PROCESS_SPAWNER_EXECUTABLE);
+  const info = yield* fs.stat(candidate).pipe(Effect.option);
+  return Option.isSome(info) && info.value.type === "File" ? candidate : undefined;
+});
 
 const openSpawnerProcess =
   (launch: ReturnType<typeof spawnerProcessLaunch>) =>
@@ -1125,9 +1139,19 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   options: { readonly source?: string; readonly windowBytes?: number } = {},
 ) {
   const windowBytes = options.windowBytes ?? STREAM_WINDOW_BYTES;
+  const executable = yield* HostProcess.ExecutablePath;
+  const isExecutable = yield* HostProcess.IsExecutable;
+  // A single executable would parse the whole server bundle to run the spawner (~4x the memory).
+  const spawnerExecutable = isExecutable ? yield* findSpawnerExecutable(executable) : undefined;
+  if (isExecutable && spawnerExecutable === undefined) {
+    yield* Effect.logWarning(
+      `No ${PROCESS_SPAWNER_EXECUTABLE} beside ${executable}; the process spawner runs the whole server bundle`,
+    );
+  }
   const launch = spawnerProcessLaunch({
-    executable: yield* HostProcess.ExecutablePath,
-    isExecutable: yield* HostProcess.IsExecutable,
+    executable,
+    isExecutable,
+    ...(spawnerExecutable === undefined ? {} : { spawnerExecutable }),
     environment: yield* HostProcess.Environment,
     windowBytes,
     ...(options.source === undefined ? {} : { source: options.source }),

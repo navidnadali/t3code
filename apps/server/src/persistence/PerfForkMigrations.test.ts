@@ -1,6 +1,8 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
+import * as Logger from "effect/Logger";
+import * as References from "effect/References";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -105,6 +107,82 @@ const toRc1 = (forkIds: ReadonlyArray<number>) =>
       `;
     }
   });
+
+const TURN_ITEMS = "orchestration_v2_projection_turn_items";
+// The fork's objects on the turn-item table, which an upstream rebuild of that table drops.
+const FORK_OBJECTS_ON_TURN_ITEMS = [
+  "orchestration_v2_projection_turn_items_message_ordinal_idx",
+  "orchestration_v2_turn_item_counts_delete",
+  "orchestration_v2_turn_item_counts_insert",
+  "orchestration_v2_turn_item_counts_update",
+];
+
+const forkObjectsOnTurnItems = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{ readonly name: string }>`
+    SELECT name FROM sqlite_master WHERE name IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)} ORDER BY name
+  `;
+  return rows.map((row) => row.name);
+});
+
+// An upstream migration that rebuilds the turn-item table (create, copy, drop, rename) and then
+// recreates upstream's own indexes and triggers on it; the fork's go with the old table.
+const rebuildTurnItems = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const [table] = yield* sql<{ readonly sql: string }>`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ${TURN_ITEMS}
+  `;
+  const upstreamDependents = yield* sql<{ readonly sql: string }>`
+    SELECT sql FROM sqlite_master
+    WHERE tbl_name = ${TURN_ITEMS} AND type IN ('index', 'trigger') AND sql IS NOT NULL
+      AND name NOT IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)}
+  `;
+  yield* sql.unsafe(table!.sql.replace(TURN_ITEMS, `${TURN_ITEMS}_rebuilt`));
+  yield* sql.unsafe(`INSERT INTO ${TURN_ITEMS}_rebuilt SELECT * FROM ${TURN_ITEMS}`);
+  yield* sql.unsafe(`DROP TABLE ${TURN_ITEMS}`);
+  yield* sql.unsafe(`ALTER TABLE ${TURN_ITEMS}_rebuilt RENAME TO ${TURN_ITEMS}`);
+  for (const dependent of upstreamDependents) yield* sql.unsafe(dependent.sql);
+});
+
+const insertMoreTurnItems = (prefix: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    for (const [index, runId] of ["run-1", "run-9", null].entries()) {
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_turn_items (
+          turn_item_id, thread_id, run_id, ordinal, type, status, updated_at, payload_json
+        ) VALUES (
+          ${`${prefix}-${index}`}, 'thread-a', ${runId}, ${index + 10}, 'user_message', 'completed',
+          '2026-11-02T00:00:00.000Z', '{"messageId":"m2"}'
+        )
+      `;
+    }
+  });
+
+const usesTheOrdinalIndex = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const plan = yield* sql<{ readonly detail: string }>`
+    EXPLAIN QUERY PLAN
+    SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
+    FROM orchestration_v2_projection_turn_items
+    WHERE thread_id = 'thread-a' AND type IN ('user_message', 'assistant_message')
+      AND json_valid(payload_json)
+    GROUP BY json_extract(payload_json, '$.messageId')
+  `;
+  assert.include(
+    plan[0]?.detail,
+    "USING INDEX orchestration_v2_projection_turn_items_message_ordinal_idx",
+  );
+});
+
+const captureWarnings = (warnings: Array<unknown>) =>
+  Logger.layer([
+    Logger.make(({ logLevel, message, fiber }) => {
+      if (logLevel === "Warn") {
+        warnings.push([message, fiber.getRef(References.CurrentLogAnnotations)]);
+      }
+    }),
+  ]);
 
 const freshSchema = Effect.gen(function* () {
   yield* runMigrations();
@@ -226,6 +304,74 @@ describe("performance fork migrations", () => {
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* ledger, [...upstreamChain, [next, "NextUpstreamMigration"]]);
       assert.deepStrictEqual(yield* forkLedger, forkRan);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect(
+    "re-applies a fork migration whose objects an upstream rebuild of their table dropped",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations();
+        const forkRan = yield* forkLedger;
+        yield* insertTurnItems;
+        const next = UPSTREAM_HEAD + 1;
+        assert.deepStrictEqual(
+          yield* Migrator.make({})({
+            loader: Migrator.fromRecord({ [`${next}_RebuildTurnItems`]: rebuildTurnItems }),
+          }),
+          [[next, "RebuildTurnItems"]],
+        );
+        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, []);
+        // Writes while the triggers are gone leave the counts behind.
+        yield* insertMoreTurnItems("while-missing");
+        assert.notDeepEqual(yield* counts, yield* countedFromItems);
+
+        const warnings: Array<unknown> = [];
+        assert.deepStrictEqual(
+          yield* runMigrations().pipe(Effect.provide(captureWarnings(warnings))),
+          [],
+        );
+        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
+        assert.deepStrictEqual(yield* forkLedger, forkRan);
+        assert.deepStrictEqual(yield* counts, yield* countedFromItems);
+        for (const missing of FORK_OBJECTS_ON_TURN_ITEMS) {
+          assert.include(JSON.stringify(warnings), missing);
+        }
+        yield* insertMoreTurnItems("after");
+        yield* sql`DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'a1'`;
+        assert.deepStrictEqual(yield* counts, yield* countedFromItems);
+        yield* usesTheOrdinalIndex;
+
+        // With every object in place, a start runs neither body again.
+        yield* sql`
+          INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
+          VALUES ('thread-stray', '', 7)
+        `;
+        const countsWithStray = yield* counts;
+        yield* runMigrations();
+        assert.deepStrictEqual(yield* counts, countsWithStray);
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("warns about fork migrations that a newer fork build recorded", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* sql`
+        INSERT INTO ${sql(FORK_TABLE)} (migration_id, name)
+        VALUES (${FORK_CHAIN.length + 1}, 'FromNewerFork')
+      `;
+      const warnings: Array<unknown> = [];
+
+      assert.deepStrictEqual(
+        yield* runMigrations().pipe(Effect.provide(captureWarnings(warnings))),
+        [],
+      );
+      assert.include(
+        JSON.stringify(warnings),
+        `${FORK_TABLE}:${FORK_CHAIN.length + 1}_FromNewerFork`,
+      );
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 });

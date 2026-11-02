@@ -1203,6 +1203,10 @@ describe("fixture CLI", () => {
     const directory = scratch("sanitise");
     const seeded = NodePath.join(directory, "seeded.sqlite");
     synthCopy(seeded);
+    // As an upstream build left it: the fork's own migrations run on the copy, and the report says so.
+    const upstreamMade = new NodeSqlite.DatabaseSync(seeded);
+    upstreamMade.exec("DROP TABLE t3_perf_fork_migrations");
+    upstreamMade.close();
     const { busy, kept, idle, running, limited, task } = seedPendingWork(seeded);
     const before = run(["scan", seeded]);
     expect(before.status).toBe(1);
@@ -1215,6 +1219,7 @@ describe("fixture CLI", () => {
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
     const summary = JSON.parse(NodeFS.readFileSync(report, "utf8")) as {
+      migrations: ReadonlyArray<string>;
       check: {
         secretHits: object;
         credentialColumns: object;
@@ -1222,6 +1227,10 @@ describe("fixture CLI", () => {
         runnable: Record<string, number>;
       };
     };
+    expect(summary.migrations).toEqual([
+      "t3_perf_fork_migrations:1_ProjectionTurnItemCounts",
+      "t3_perf_fork_migrations:2_TurnItemMessageOrdinalIndex",
+    ]);
     expect(summary.check.secretHits).toEqual({});
     expect(summary.check.credentialColumns).toEqual({});
     expect(summary.check.rawHits).toEqual({});

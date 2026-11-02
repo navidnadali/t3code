@@ -172,3 +172,59 @@ it.effect(
       }).pipe(Effect.provide(layerHub({ reads, title: () => title })));
     }).pipe(Effect.scoped),
 );
+
+it.effect("deltas held before the stream is taken count against the budget", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    let starts = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const scope = yield* Scope.make();
+      const stalled = yield* hub.subscribe({ maxItems: 2 }).pipe(Scope.provide(scope));
+      for (const [index, id] of ["thread:a", "thread:b", "thread:c"].entries()) {
+        yield* publish(ThreadId.make(id), index + 1);
+      }
+      yield* TestClock.adjust(0);
+      yield* hub.subscribe().pipe(Scope.provide(scope));
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 2);
+      const exit = yield* stalled.stream(0).pipe(Stream.runCollect, Effect.exit);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) {
+        assert.equal((Cause.squash(exit.cause) as { _tag?: string })._tag, "LiveStreamBufferError");
+      }
+      yield* Scope.close(scope, Exit.void);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          onStart: () => {
+            starts += 1;
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("held deltas the snapshot covers are released when the stream starts", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const subscription = yield* hub.subscribe({ maxItems: 2 });
+      yield* publish(ThreadId.make("thread:a"), 1);
+      yield* publish(ThreadId.make("thread:b"), 2);
+      // The snapshot read at sequence 2 covers both: starting the stream frees their budget.
+      const first = yield* Effect.forkScoped(
+        subscription.stream(2).pipe(Stream.take(1), Stream.runCollect),
+      );
+      yield* TestClock.adjust(0);
+      yield* publish(ThreadId.make("thread:c"), 3);
+      assert.deepEqual(
+        (yield* Fiber.join(first)).map((item) => item.sequence),
+        [3],
+      );
+    }).pipe(Effect.provide(layerHub({ reads })));
+  }).pipe(Effect.scoped),
+);

@@ -1,5 +1,7 @@
 import type { ApplicationStoredEvent } from "@t3tools/contracts";
+import type * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -15,13 +17,17 @@ import * as Stream from "effect/Stream";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
-import { startBufferLatestLiveStream, type LiveStreamBufferError } from "./LiveStreamBudget.ts";
 import {
+  makeLiveStreamBudget,
+  type LiveStreamBufferError,
+  type RetainedLiveItem,
+} from "./LiveStreamBudget.ts";
+import {
+  makeShellDeltaAdmission,
   makeThreadShellVersions,
   projectShellDeltas,
   shellDeltaKey,
   shouldPublishShellApplicationEvent,
-  skipUnchangedShellDeltas,
   toShellApplicationEvent,
   type ShellApplicationEvent,
   type ShellDelta,
@@ -77,40 +83,6 @@ interface HubInstance {
 
 const aggregateKey = (stored: ShellApplicationEvent) =>
   "aggregateKind" in stored ? `project:${stored.aggregateId}` : `thread:${stored.event.threadId}`;
-
-type GatedShellDelta = VersionedShellDelta | { readonly flush: number };
-
-class ShellDeltaGate {
-  afterSequence: number | undefined;
-  readonly held: Map<string, VersionedShellDelta>;
-  constructor(input: {
-    readonly afterSequence: number | undefined;
-    readonly held: Map<string, VersionedShellDelta>;
-  }) {
-    this.afterSequence = input.afterSequence;
-    this.held = input.held;
-  }
-  pass(chunk: ReadonlyArray<GatedShellDelta>): ReadonlyArray<VersionedShellDelta> {
-    const out: Array<VersionedShellDelta> = [];
-    for (const entry of chunk) {
-      if ("flush" in entry) {
-        this.afterSequence = entry.flush;
-        const held = Array.from(this.held.values()).sort((a, b) => a.sequence - b.sequence);
-        this.held.clear();
-        for (const delta of held) if (delta.sequence > entry.flush) out.push(delta);
-      } else if (this.afterSequence === undefined) {
-        const key = shellDeltaKey(entry.item);
-        const previous = this.held.get(key);
-        if (previous === undefined || previous.sequence < entry.sequence) {
-          this.held.set(key, entry);
-        }
-      } else if (entry.sequence > this.afterSequence) {
-        out.push(entry);
-      }
-    }
-    return out;
-  }
-}
 
 const make = Effect.gen(function* () {
   const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
@@ -231,36 +203,108 @@ const make = Effect.gen(function* () {
     const subscription = yield* PubSub.subscribe(instance.output).pipe(
       Scope.provide(subscriptionScope),
     );
-    const started = yield* Deferred.make<number>();
-    const source = Stream.fromSubscription(subscription).pipe(
+    // One budget for all this subscriber retains: the latest delta per aggregate, held until the
+    // stream is taken (its snapshot read runs meanwhile) and buffered after. When the stream
+    // starts, held deltas the snapshot covers or an unchanged check skips are released.
+    const budget = yield* makeLiveStreamBudget(limits);
+    const admission = makeShellDeltaAdmission();
+    const pending = new Map<string, RetainedLiveItem<VersionedShellDelta>>();
+    const ready = yield* Queue.bounded<
+      void,
+      ShellDeltaHubError | LiveStreamBufferError | Cause.Done
+    >(1);
+    const mutex = yield* Semaphore.make(1);
+    let afterSequence: number | undefined;
+    let closed = false;
+    const close = (error?: LiveStreamBufferError) =>
+      mutex.withPermit(
+        Effect.gen(function* () {
+          if (closed) return;
+          closed = true;
+          budget.release(pending.values());
+          pending.clear();
+          if (error) yield* Queue.fail(ready, error);
+          yield* Queue.shutdown(ready);
+        }),
+      );
+    yield* Effect.addFinalizer(() => close());
+    yield* budget.failed.pipe(
+      Effect.catchTags({ LiveStreamBufferError: close }),
+      Effect.forkScoped,
+    );
+    const retain = Effect.fnUntraced(function* (delta: VersionedShellDelta) {
+      const key = shellDeltaKey(delta.item);
+      const previous = pending.get(key);
+      if (previous !== undefined && previous.value.sequence >= delta.sequence) return;
+      const wasEmpty = pending.size === 0;
+      const [item] = yield* budget.replace(previous === undefined ? [] : [previous], [delta]);
+      pending.set(key, item!);
+      // Only the empty-to-nonempty transition of a started stream needs a wakeup.
+      if (wasEmpty && afterSequence !== undefined) yield* Queue.offer(ready, undefined);
+    });
+    yield* Stream.fromSubscription(subscription).pipe(
       Stream.flatMap(Stream.fromIterable),
-      Stream.merge(
-        Stream.fromEffect(Deferred.await(started)).pipe(
-          Stream.map((afterSequence): GatedShellDelta => ({ flush: afterSequence })),
-        ),
-      ),
       Stream.merge(Stream.fromEffect(Deferred.await(instance.failed))),
       Stream.ensuring(Scope.close(subscriptionScope, Exit.void)),
-      // Until the stream is taken, the latest delta per aggregate is held (the snapshot read
-      // meanwhile covers everything at or below its sequence); from then on deltas pass through.
-      Stream.mapAccumArray(
-        () => new ShellDeltaGate({ afterSequence: undefined, held: new Map() }),
-        (gate, chunk) => [gate, gate.pass(chunk)],
+      Stream.runForEach((delta) =>
+        mutex.withPermit(
+          Effect.gen(function* () {
+            yield* budget.check;
+            if (closed) return;
+            if (afterSequence !== undefined) {
+              if (delta.sequence <= afterSequence) return;
+              if (!admission.admit(delta, yield* Clock.currentTimeMillis)) return;
+            }
+            yield* retain(delta);
+          }).pipe(Effect.uninterruptible),
+        ),
       ),
-      // Skipping before the budget: an unchanged shell a subscriber already holds is never charged.
-      skipUnchangedShellDeltas,
+      Effect.raceFirst(budget.failed),
+      Effect.exit,
+      Effect.flatMap((exit) =>
+        Exit.isFailure(exit) ? Queue.failCause(ready, exit.cause) : Queue.end(ready),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
     );
-    const deltas = yield* startBufferLatestLiveStream(
-      source,
-      (delta) => shellDeltaKey(delta.item),
-      limits,
+    const open = (sequence: number) =>
+      mutex.withPermit(
+        Effect.gen(function* () {
+          if (closed) return;
+          afterSequence = sequence;
+          const now = yield* Clock.currentTimeMillis;
+          for (const [key, item] of pending) {
+            if (item.value.sequence <= sequence || !admission.admit(item.value, now)) {
+              budget.release([item]);
+              pending.delete(key);
+            }
+          }
+          if (pending.size > 0) yield* Queue.offer(ready, undefined);
+        }),
+      );
+    const deliver = budget.deliver(
+      Stream.fromPull(
+        Effect.succeed(
+          Queue.take(ready).pipe(
+            Effect.andThen(
+              mutex.withPermit(
+                Effect.sync(() => {
+                  const items = Array.from(pending.values()).sort(
+                    (left, right) => left.value.sequence - right.value.sequence,
+                  );
+                  pending.clear();
+                  // Moving to delivery preserves the budget charge until ACK.
+                  return items as Arr.NonEmptyArray<RetainedLiveItem<VersionedShellDelta>>;
+                }),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
     return {
-      stream: (afterSequence) =>
+      stream: (sequence) =>
         Stream.unwrap(
-          Deferred.succeed(started, afterSequence).pipe(
-            Effect.as(deltas.pipe(Stream.map((delta) => delta.item))),
-          ),
+          open(sequence).pipe(Effect.as(deliver.pipe(Stream.map((delta) => delta.item)))),
         ),
     };
   });

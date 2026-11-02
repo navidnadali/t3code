@@ -671,36 +671,31 @@ export function makeThreadShellVersions() {
 }
 
 /**
- * Shared deltas for one subscriber: a thread's shell it got with the same version within the
- * resend window is skipped, as `skipUnchangedThreadShells` decides by comparing the shells.
+ * A subscriber's unchanged-shell check for shared deltas: `admit` is true when the delta is sent,
+ * recording it, and false while the shell it last sent has the same version within the resend
+ * window, as `skipUnchangedThreadShells` decides by comparing the shells.
  */
-export function skipUnchangedShellDeltas<E, R>(
-  stream: Stream.Stream<VersionedShellDelta, E, R>,
-): Stream.Stream<VersionedShellDelta, E, R> {
-  return Stream.suspend(() => {
-    const lastSent = new Map<ThreadId, { readonly version: number; readonly sentAt: number }>();
-    return stream.pipe(
-      Stream.filterEffect(({ item, version }) =>
-        Effect.map(Clock.currentTimeMillis, (now) => {
-          if (item.kind === "thread.removed") {
-            lastSent.delete(item.threadId);
-            return true;
-          }
-          if (item.kind !== "thread.updated" || version === undefined) return true;
-          const previous = lastSent.get(item.thread.id);
-          if (
-            previous !== undefined &&
-            previous.version === version &&
-            now - previous.sentAt < UNCHANGED_THREAD_SHELL_RESEND_MS
-          ) {
-            return false;
-          }
-          lastSent.set(item.thread.id, { version, sentAt: now });
-          return true;
-        }),
-      ),
-    );
-  });
+export function makeShellDeltaAdmission() {
+  const lastSent = new Map<ThreadId, { readonly version: number; readonly sentAt: number }>();
+  return {
+    admit({ item, version }: VersionedShellDelta, now: number): boolean {
+      if (item.kind === "thread.removed") {
+        lastSent.delete(item.threadId);
+        return true;
+      }
+      if (item.kind !== "thread.updated" || version === undefined) return true;
+      const previous = lastSent.get(item.thread.id);
+      if (
+        previous !== undefined &&
+        previous.version === version &&
+        now - previous.sentAt < UNCHANGED_THREAD_SHELL_RESEND_MS
+      ) {
+        return false;
+      }
+      lastSent.set(item.thread.id, { version, sentAt: now });
+      return true;
+    },
+  };
 }
 
 /** One item per coalesced event; each thread's or project's shell is read once for the batch. */

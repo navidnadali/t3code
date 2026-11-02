@@ -10,6 +10,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Scheduler from "effect/Scheduler";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -199,6 +200,66 @@ it.effect("deltas offered while the base is read follow the resync", () =>
       assert.deepEqual(Option.map(yield* Fiber.join(next), sequences), Option.some([4, 5]));
       yield* Scope.close(scope, Exit.void);
     }).pipe(Effect.provide(layerHub({ reads, readGate: Deferred.await(gate) })));
+  }).pipe(Effect.scoped),
+);
+
+/**
+ * A scheduler like `base` that parks a fiber `target` accepts once, at the `at`-th op those
+ * fibers run between them, and never again.
+ */
+const yieldOnceAt = (
+  base: Scheduler.Scheduler,
+  at: number,
+  target: (fiber: Fiber.Fiber<unknown, unknown>) => boolean,
+): Scheduler.Scheduler => {
+  let ops = 0;
+  return {
+    executionMode: base.executionMode,
+    shouldYield: (fiber) => target(fiber) && ++ops === at,
+    makeDispatcher: () => base.makeDispatcher(),
+  };
+};
+
+it.effect("a subscriber cancelled as it starts the shared base read leaves no read behind", () =>
+  Effect.gen(function* () {
+    const base = yield* Scheduler.Scheduler;
+    // The pull that starts the read runs it in a fiber of its own; that fiber is parked at its
+    // n-th op and the pull cancelled there, for every n from before the read is published to the
+    // others until after it started: the other subscriber the same batch reset must get its
+    // resync, from that read or its own, every time.
+    for (let at = 1; at <= 200; at++) {
+      const reads: Array<number> = [];
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const scope = yield* Scope.make();
+        const starter = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+        const other = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+        // Armed for the pull that starts the read; the stream's own fibers run under it.
+        let armed = false;
+        const parkInside = yieldOnceAt(base, at, () => armed);
+        const pullStarter = yield* Stream.toPull(
+          starter.stream(0).pipe(Stream.provideService(Scheduler.Scheduler, parkInside)),
+        ).pipe(Effect.provideService(Scheduler.Scheduler, parkInside), Scope.provide(scope));
+        const pullOther = yield* Stream.toPull(other.stream(0)).pipe(Scope.provide(scope));
+        yield* publish(threadId, 1);
+        assert.deepEqual(sequences(yield* pullStarter), [1]);
+        assert.deepEqual(sequences(yield* pullOther), [1]);
+        // The delivered delta is still charged: one more resets both.
+        yield* publish(ThreadId.make("thread:b"), 2);
+        armed = true;
+        const starting = yield* Effect.forkScoped(pullStarter);
+        yield* Effect.yieldNow;
+        yield* Fiber.interrupt(starting);
+        const resync = yield* Effect.forkScoped(pullOther.pipe(Effect.timeoutOption("1 second")));
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual(
+          Option.map(yield* Fiber.join(resync), (items) => items.map((item) => item.kind)),
+          Option.some(["resync"]),
+          `cancelled at op ${at}`,
+        );
+        yield* Scope.close(scope, Exit.void);
+      }).pipe(Effect.provide(layerHub({ reads })), Effect.scoped);
+    }
   }).pipe(Effect.scoped),
 );
 

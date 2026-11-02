@@ -1078,22 +1078,22 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
       return yield* projectShellDeltas(events, {
-        threadShell: threadManagement.getThreadShellForEvent,
+        threadShell: threadManagement.getThreadShellReadForEvent,
         projectShell: projectService.getShell,
       });
     });
 
-    // When the replay read each thread, so the live tail drops hub deltas read earlier.
+    // The replay's read ordinal per thread, so the live tail drops hub deltas read earlier.
     const replayReads = new Map<ThreadId, number>();
     const toShellStream = <E, R>(stream: Stream.Stream<ShellApplicationEvent, E, R>) =>
       stream.pipe(
         Stream.groupedWithin(512, Duration.millis(50)),
         Stream.mapEffect((events) => projectShellItems(Array.from(events))),
         Stream.flatMap(Stream.fromIterable),
-        Stream.map(({ item, readAt }) => {
+        Stream.map(({ item, readOrdinal }) => {
           const threadId = shellDeltaThreadId(item);
           if (threadId !== undefined) {
-            replayReads.set(threadId, Math.max(replayReads.get(threadId) ?? 0, readAt));
+            replayReads.set(threadId, Math.max(replayReads.get(threadId) ?? 0, readOrdinal));
           }
           return item;
         }),

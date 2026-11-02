@@ -185,6 +185,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
         Effect.andThen(options.readShell?.(threadId) ?? Ref.get(currentShell)),
       ),
     getThreadShellForEvent: unused,
+    getThreadShellReadForEvent: unused,
     getShellSnapshot: () =>
       Effect.sync(() => {
         catchUp.shellSnapshotReads += 1;

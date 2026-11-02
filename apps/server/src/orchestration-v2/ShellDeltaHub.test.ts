@@ -53,19 +53,22 @@ const layerHub = (input: {
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
           listActiveSubagentThreadIds: () => Effect.sync(() => [...(input.subagents?.() ?? [])]),
-          getThreadShellForEvent: ({ threadId: id, sequence }) =>
+          getThreadShellReadForEvent: ({ threadId: id, sequence }) =>
             Effect.sync(() => {
               input.reads.push(sequence);
               const subagent = input.subagents?.().includes(id) ?? false;
               return {
-                ...shell,
-                id,
-                title: input.title?.() ?? shell.title,
-                lineage: {
-                  parentThreadId: subagent ? threadId : null,
-                  relationshipToParent: subagent ? "subagent" : null,
-                  rootThreadId: subagent ? threadId : id,
+                shell: {
+                  ...shell,
+                  id,
+                  title: input.title?.() ?? shell.title,
+                  lineage: {
+                    parentThreadId: subagent ? threadId : null,
+                    relationshipToParent: subagent ? "subagent" : null,
+                    rootThreadId: subagent ? threadId : id,
+                  },
                 },
+                readOrdinal: input.reads.length,
               };
             }),
         }),

@@ -51,7 +51,7 @@ export interface ShellDeltaSubscription {
    */
   readonly stream: (
     afterSequence: number,
-    /** When a resume replay read each thread; held deltas read earlier are dropped. */
+    /** The read ordinal a resume replay sent for each thread; deltas read earlier are dropped. */
     replayReads?: ReadonlyMap<ThreadId, number>,
   ) => Stream.Stream<ShellDelta, ShellDeltaHubError | LiveStreamBufferError>;
 }
@@ -152,13 +152,13 @@ const make = Effect.gen(function* () {
       const projected = yield* projectShellDeltas(
         batch.map((entry) => entry.stored),
         {
-          threadShell: threadManagement.getThreadShellForEvent,
+          threadShell: threadManagement.getThreadShellReadForEvent,
           projectShell: projectService.getShell,
         },
       );
       const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
       const deltas: Array<VersionedShellDelta> = [];
-      for (const { item, readAt } of projected) {
+      for (const { item, readOrdinal } of projected) {
         // A subagent's transcript updates reach its focused watchers through the thread stream;
         // the shell, read because the subagent was unknown at hub start, shows the lineage now.
         if (
@@ -169,7 +169,12 @@ const make = Effect.gen(function* () {
           subagentThreadIds.add(item.thread.id);
           continue;
         }
-        deltas.push({ sequence: item.sequence, item, version: versions.stamp(item, now), readAt });
+        deltas.push({
+          sequence: item.sequence,
+          item,
+          version: versions.stamp(item, now),
+          readOrdinal,
+        });
       }
       if (deltas.length > 0) yield* PubSub.publish(input.output, deltas);
     });
@@ -257,7 +262,14 @@ const make = Effect.gen(function* () {
     >(1);
     const mutex = yield* Semaphore.make(1);
     let afterSequence: number | undefined;
+    let replayReads: ReadonlyMap<ThreadId, number> | undefined;
     let closed = false;
+    // A delta read before the replay's read of the same thread carries older-or-equal content.
+    const behindReplay = (delta: VersionedShellDelta) => {
+      const threadId = shellDeltaThreadId(delta.item);
+      const replayRead = threadId === undefined ? undefined : replayReads?.get(threadId);
+      return replayRead !== undefined && delta.readOrdinal <= replayRead;
+    };
     const close = (error?: LiveStreamBufferError) =>
       mutex.withPermit(
         Effect.gen(function* () {
@@ -294,7 +306,7 @@ const make = Effect.gen(function* () {
             yield* budget.check;
             if (closed) return;
             if (afterSequence !== undefined) {
-              if (delta.sequence <= afterSequence) return;
+              if (delta.sequence <= afterSequence || behindReplay(delta)) return;
               if (!admission.admit(delta, yield* Clock.currentTimeMillis)) return;
             }
             yield* retain(delta);
@@ -308,18 +320,17 @@ const make = Effect.gen(function* () {
       ),
       Effect.forkScoped({ startImmediately: true }),
     );
-    const open = (sequence: number, replayReads?: ReadonlyMap<ThreadId, number>) =>
+    const open = (sequence: number, reads?: ReadonlyMap<ThreadId, number>) =>
       mutex.withPermit(
         Effect.gen(function* () {
           if (closed) return;
           afterSequence = sequence;
+          replayReads = reads;
           const now = yield* Clock.currentTimeMillis;
           for (const [key, item] of pending) {
-            const threadId = shellDeltaThreadId(item.value.item);
-            const replayReadAt = threadId === undefined ? undefined : replayReads?.get(threadId);
             if (
               item.value.sequence <= sequence ||
-              (replayReadAt !== undefined && item.value.readAt <= replayReadAt) ||
+              behindReplay(item.value) ||
               !admission.admit(item.value, now)
             ) {
               budget.release([item]);
@@ -350,11 +361,9 @@ const make = Effect.gen(function* () {
       ),
     );
     return {
-      stream: (sequence, replayReads) =>
+      stream: (sequence, reads) =>
         Stream.unwrap(
-          open(sequence, replayReads).pipe(
-            Effect.as(deliver.pipe(Stream.map((delta) => delta.item))),
-          ),
+          open(sequence, reads).pipe(Effect.as(deliver.pipe(Stream.map((delta) => delta.item)))),
         ),
     };
   });

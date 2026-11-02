@@ -41,8 +41,8 @@ export interface VersionedShellDelta {
   readonly item: ShellDelta;
   /** `thread.updated` only: unchanged while the shell, `updatedAt` aside, matches the previous item for that thread. */
   readonly version: number | undefined;
-  /** When the read behind the item completed; a later read of the same thread is newer or equal. */
-  readonly readAt: number;
+  /** The shared read's ordinal (0 for projects); a later read of the same thread is newer or equal. */
+  readonly readOrdinal: number;
 }
 
 /** The thread a delta is about; projects have none. */
@@ -707,8 +707,8 @@ export function makeShellDeltaAdmission() {
 
 export interface ProjectedShellDelta {
   readonly item: ShellDelta;
-  /** When the read behind the item completed. */
-  readonly readAt: number;
+  /** The shared read's ordinal behind a thread item; 0 for projects. */
+  readonly readOrdinal: number;
 }
 
 /** One item per coalesced event; each thread's or project's shell is read once for the batch. */
@@ -718,7 +718,10 @@ export const projectShellDeltas = <E1, E2>(
     readonly threadShell: (input: {
       readonly threadId: ThreadId;
       readonly sequence: number;
-    }) => Effect.Effect<OrchestrationV2ThreadShell | null, E1>;
+    }) => Effect.Effect<
+      { readonly shell: OrchestrationV2ThreadShell | null; readonly readOrdinal: number },
+      E1
+    >;
     readonly projectShell: (
       projectId: ProjectId,
     ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, E2>;
@@ -726,36 +729,37 @@ export const projectShellDeltas = <E1, E2>(
 ): Effect.Effect<ReadonlyArray<ProjectedShellDelta>, E1 | E2> =>
   Effect.forEach(
     coalesceShellApplicationEvents(events),
-    (stored): Effect.Effect<ShellDelta, E1 | E2> => {
+    (stored): Effect.Effect<ProjectedShellDelta, E1 | E2> => {
       if (!("aggregateKind" in stored)) {
         return read
           .threadShell({ threadId: stored.event.threadId, sequence: stored.sequence })
-          .pipe(Effect.map((shell) => shellStreamItemFromThreadShell({ stored, shell })));
+          .pipe(
+            Effect.map(({ shell, readOrdinal }) => ({
+              item: shellStreamItemFromThreadShell({ stored, shell }),
+              readOrdinal,
+            })),
+          );
       }
       const removed = {
         kind: "project.removed" as const,
         sequence: stored.sequence,
         projectId: stored.aggregateId,
       };
-      if (stored.type === "project.deleted") return Effect.succeed(removed);
+      if (stored.type === "project.deleted")
+        return Effect.succeed({ item: removed, readOrdinal: 0 });
       return read.projectShell(stored.aggregateId).pipe(
         Effect.map(
           Option.match({
-            onNone: () => removed,
+            onNone: () => ({ item: removed, readOrdinal: 0 }),
             onSome: (project) => ({
-              kind: "project.updated" as const,
-              sequence: stored.sequence,
-              project,
+              item: { kind: "project.updated" as const, sequence: stored.sequence, project },
+              readOrdinal: 0,
             }),
           }),
         ),
       );
     },
     { concurrency: 8 },
-  ).pipe(
-    Effect.flatMap((items) =>
-      Effect.map(Clock.currentTimeMillis, (readAt) => items.map((item) => ({ item, readAt }))),
-    ),
   );
 
 /** Resend unchanged shells after UNCHANGED_THREAD_SHELL_RESEND_MS so skipped deltas cannot leave resume cursors behind. */

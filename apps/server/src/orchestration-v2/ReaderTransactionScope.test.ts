@@ -672,22 +672,22 @@ const statementShape = (query: string) => query.replace(/\s+/g, " ").trim();
 
 // A projection's table reads go to the reader together, not one round trip after another: the
 // first waits until the last has started, which only happens if neither waits for the other.
-it.effect.each([
+const projectionReads: ReadonlyArray<PermitCase> = [
   {
     name: "thread snapshot window",
-    read: (store: Store, fixture: Fixture) =>
-      store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
+    read: (store, fixture) => store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
   },
   {
     name: "thread snapshot",
-    read: (store: Store, fixture: Fixture) => store.getThreadSnapshot(fixture.fork),
+    read: (store, fixture) => store.getThreadSnapshot(fixture.fork),
   },
   {
     name: "thread records",
-    read: (store: Store, fixture: Fixture) =>
-      store.getThreadRecords(fixture.fork, ["runs", "contextTransfers"]),
+    read: (store, fixture) => store.getThreadRecords(fixture.fork, ["runs", "contextTransfers"]),
   },
-])("sends the $name table reads to the reader together", ({ read }) =>
+];
+
+it.effect.each(projectionReads)("sends the $name table reads to the reader together", ({ read }) =>
   withFileStore(
     "reader-scope-together-",
     Effect.gen(function* () {

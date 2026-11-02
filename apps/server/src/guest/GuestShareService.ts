@@ -68,6 +68,7 @@ import {
   threadStreamEventItem,
 } from "../orchestration-v2/WireProjection.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { rpcInitialItems } from "../rpcInitialItems.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import { guestShareView, guestThreadModel } from "./guestView.ts";
@@ -608,7 +609,8 @@ const make = Effect.gen(function* () {
         snapshotSequence: current.snapshotSequence,
       });
       const view = viewOf(current.projection.thread);
-      return Stream.fromIterable<GuestStreamEvent>([
+      // concat retains its head for the tail's lifetime; release the snapshot once delivered.
+      return rpcInitialItems<GuestStreamEvent>([
         ...(view === null ? [] : [{ type: "view" as const, view }]),
         { type: "thread", item },
       ]).pipe(Stream.concat(liveFrom(current.snapshotSequence)));

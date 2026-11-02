@@ -4,7 +4,6 @@ import {
   type ApplicationStoredEvent,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
-import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -52,6 +51,15 @@ const layerHub = (input: {
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
           listActiveSubagentThreadIds: () => Effect.succeed([]),
+          readShellSnapshot: () =>
+            Effect.succeed(
+              Effect.succeed({
+                schemaVersion: 1,
+                snapshotSequence: 0,
+                threads: [],
+                archivedThreads: [],
+              }),
+            ),
           getThreadShellForEvent: ({ threadId: id, sequence }) =>
             Effect.sync(() => {
               input.reads.push(sequence);
@@ -94,7 +102,7 @@ it.effect("deltas buffered before the stream is taken keep the latest per aggreg
       for (let sequence = 1; sequence <= 5; sequence++) yield* publish(threadId, sequence);
       const items = yield* subscription.stream(0).pipe(Stream.take(1), Stream.runCollect);
       assert.deepEqual(
-        items.map((item) => item.sequence),
+        items.flatMap((item) => (item.kind === "resync" ? [] : [item.sequence])),
         [5],
       );
       assert.deepEqual(reads, [1, 2, 3, 4, 5]);
@@ -102,7 +110,7 @@ it.effect("deltas buffered before the stream is taken keep the latest per aggreg
   }).pipe(Effect.scoped),
 );
 
-it.effect("an overflowing subscription ends and stops counting before its scope closes", () =>
+it.effect("an overflowing subscription empties its buffer and resyncs on its next pull", () =>
   Effect.gen(function* () {
     const reads: Array<number> = [];
     let starts = 0;
@@ -110,25 +118,34 @@ it.effect("an overflowing subscription ends and stops counting before its scope 
       const hub = yield* ShellDeltaHub.ShellDeltaHub;
       const scope = yield* Scope.make();
       const stalled = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
-      // One delta delivered and never acknowledged; the next one overflows the budget.
+      // One delta delivered and never acknowledged; the next one would overflow the budget.
       const pull = yield* Stream.toPull(stalled.stream(0)).pipe(Scope.provide(scope));
       const first = yield* Effect.forkScoped(pull);
       yield* publish(threadId, 1);
       assert.deepEqual(
-        (yield* Fiber.join(first)).map((item) => item.sequence),
+        (yield* Fiber.join(first)).flatMap((item) =>
+          item.kind === "resync" ? [] : [item.sequence],
+        ),
         [1],
       );
       yield* publish(ThreadId.make("thread:other"), 2);
       yield* TestClock.adjust(0);
-      // The stalled subscriber no longer counts: the next one starts a fresh hub.
+      // The subscriber keeps counting: another one joins the running hub.
       yield* hub.subscribe().pipe(Scope.provide(scope));
       yield* TestClock.adjust(0);
-      assert.equal(starts, 2);
-      const exit = yield* Effect.exit(pull);
-      assert.isTrue(Exit.isFailure(exit));
-      if (Exit.isFailure(exit)) {
-        assert.equal((Cause.squash(exit.cause) as { _tag?: string })._tag, "LiveStreamBufferError");
-      }
+      assert.equal(starts, 1);
+      // Its next pull brings the base, read after the reset, which covers what was dropped;
+      // deltas after it are delivered as before.
+      assert.deepEqual(
+        (yield* pull).map((item) => item.kind),
+        ["resync"],
+      );
+      // (An unchanged shell is skipped as before; the resync covered `thread:other`.)
+      yield* publish(ThreadId.make("thread:third"), 3);
+      assert.deepEqual(
+        (yield* pull).flatMap((item) => (item.kind === "resync" ? [] : [item.sequence])),
+        [3],
+      );
       yield* Scope.close(scope, Exit.void);
     }).pipe(
       Effect.provide(
@@ -158,7 +175,7 @@ it.effect(
         yield* publish(other, 2);
         // Delivered and charged until the next pull acknowledges them.
         assert.deepEqual(
-          (yield* pull).map((item) => item.sequence),
+          (yield* pull).flatMap((item) => (item.kind === "resync" ? [] : [item.sequence])),
           [1, 2],
         );
         yield* publish(threadId, 3);
@@ -167,10 +184,11 @@ it.effect(
         yield* publish(threadId, 5);
         const next = yield* pull;
         assert.deepEqual(
-          next.map((item) => [
-            item.sequence,
-            item.kind === "thread.updated" ? item.thread.title : null,
-          ]),
+          next.flatMap((item) =>
+            item.kind === "resync"
+              ? []
+              : [[item.sequence, item.kind === "thread.updated" ? item.thread.title : null]],
+          ),
           [[5, "b"]],
         );
         assert.deepEqual(reads, [1, 2, 3, 4, 5]);
@@ -192,12 +210,13 @@ it.effect("deltas held before the stream is taken count against the budget", () 
       yield* TestClock.adjust(0);
       yield* hub.subscribe().pipe(Scope.provide(scope));
       yield* TestClock.adjust(0);
-      assert.equal(starts, 2);
-      const exit = yield* stalled.stream(0).pipe(Stream.runCollect, Effect.exit);
-      assert.isTrue(Exit.isFailure(exit));
-      if (Exit.isFailure(exit)) {
-        assert.equal((Cause.squash(exit.cause) as { _tag?: string })._tag, "LiveStreamBufferError");
-      }
+      assert.equal(starts, 1);
+      // The third delta emptied the buffer: the stream opens with a resync.
+      const pull = yield* Stream.toPull(stalled.stream(0)).pipe(Scope.provide(scope));
+      assert.deepEqual(
+        (yield* pull).map((item) => item.kind),
+        ["resync"],
+      );
       yield* Scope.close(scope, Exit.void);
     }).pipe(
       Effect.provide(
@@ -227,7 +246,9 @@ it.effect("held deltas the snapshot covers are released when the stream starts",
       yield* TestClock.adjust(0);
       yield* publish(ThreadId.make("thread:c"), 3);
       assert.deepEqual(
-        (yield* Fiber.join(first)).map((item) => item.sequence),
+        (yield* Fiber.join(first)).flatMap((item) =>
+          item.kind === "resync" ? [] : [item.sequence],
+        ),
         [3],
       );
     }).pipe(Effect.provide(layerHub({ reads })));

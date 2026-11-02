@@ -9,7 +9,6 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Base64 from "effect/encoding/Base64";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -18,7 +17,6 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
-import * as Scope from "effect/Scope";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import { rpcInitialItems } from "./rpcInitialItems.ts";
@@ -140,6 +138,7 @@ import {
   shellStreamItemsFromResumeSnapshot,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
+  trimSubscriberShellSnapshot,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
@@ -1059,9 +1058,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
 
     const enrichmentChanges = yield* projectEnrichment.subscribeChanges;
     // Subscribe before the snapshot or high-water read: the hub projects every later event once for all subscribers.
-    const shellDeltaHub = yield* ShellDeltaHub.ShellDeltaHub;
-    const subscriberScope = yield* Effect.scope;
-    const shellDeltas = yield* shellDeltaHub.subscribe();
+    const shellDeltas = yield* (yield* ShellDeltaHub.ShellDeltaHub).subscribe();
     const loadProjectMetadataSnapshot = Effect.fn("ws.orchestrationV2.loadProjectMetadataSnapshot")(
       function* (snapshotSequence: number) {
         const enriched = yield* enrichProjectShells(yield* projects.listShells());
@@ -1121,42 +1118,41 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         skipUnchangedThreadShells,
       );
 
-    const liveFrom = (afterSequence: number) => shellDeltas.stream(afterSequence);
-    // A subscriber whose live buffer still overflows (≥ LIVE_STREAM_MAX_ITEMS aggregates changed
-    // between two of its pulls) gets a fresh snapshot and continues live from it; one snapshot is
-    // cheaper than the replay its resubscription would ask for. It is loaded when the client
-    // next pulls, so a client that never acknowledges never costs one.
-    const resyncingLive = (live: ReturnType<typeof liveFrom>) =>
-      resyncOnLiveOverflow<
-        OrchestrationV2ShellStreamItem,
-        Stream.Error<ReturnType<typeof liveFrom>>,
-        never,
-        | Effect.Error<ReturnType<typeof loadSnapshot>>
-        | Effect.Error<ReturnType<typeof loadProjectMetadataSnapshot>>
-      >(live, () =>
+    // The hub emptied this subscriber's buffer and read one base for every subscriber it emptied
+    // at the same time; the subscriber's own trims and project enrichment are applied here.
+    // Enrichment keeps flowing meanwhile, so a refresh can reach the client before the snapshot
+    // that introduces its project: the resolved identities are re-sent after the snapshot.
+    const resyncItems = (base: ShellDeltaHub.ShellResyncBase) =>
+      Stream.unwrap(
         Effect.gen(function* () {
-          // The overflowed subscription has ended; a fresh one must exist before the snapshot
-          // it continues is read. It lives in its own scope, closed with its segment, so a
-          // connection that resyncs many times keeps nothing of the earlier ones.
-          const segmentScope = yield* Scope.fork(subscriberScope);
-          const fresh = yield* shellDeltaHub.subscribe().pipe(Scope.provide(segmentScope));
-          const loaded = yield* loadSnapshot().pipe(
-            Effect.provideService(
-              ProjectEnrichmentService.ProjectEnrichmentService,
-              projectEnrichment,
-            ),
-            Effect.onError((cause) => Scope.close(segmentScope, Exit.failCause(cause))),
+          const enriched = yield* enrichProjectShells(yield* projects.listShells());
+          const trimmed = trimSubscriberShellSnapshot(
+            {
+              schemaVersion: base.schemaVersion,
+              snapshotSequence: base.snapshotSequence,
+              projects: enriched.projects,
+              threads: base.threads,
+              archivedThreads: [],
+            },
+            {
+              omitIdleSubagents: input.omitIdleSubagents === true,
+              omitOlderSettled: input.omitOlderSettled === true,
+              now: yield* DateTime.now,
+            },
           );
+          subagentThreadIds = trimmed.subagentThreadIds;
           yield* Effect.logWarning(
             "orchestration shell stream resynchronized after a live buffer overflow",
-            { snapshotSequence: loaded.snapshot.snapshotSequence },
+            { snapshotSequence: base.snapshotSequence },
           );
+          const loaded = {
+            snapshot: trimmed.snapshot,
+            resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
+          };
           return Stream.concat(
             initialSnapshotItems(loaded),
-            // Enrichment keeps flowing during a resync, so a refresh can reach the client before
-            // the snapshot that introduces its project; re-send the resolved identities after it.
             Stream.unwrap(
-              loadProjectMetadataSnapshot(loaded.snapshot.snapshotSequence).pipe(
+              loadProjectMetadataSnapshot(base.snapshotSequence).pipe(
                 Effect.provideService(
                   ProjectEnrichmentService.ProjectEnrichmentService,
                   projectEnrichment,
@@ -1164,12 +1160,27 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
                 Effect.map(initialEnrichmentItems),
               ),
             ),
-          ).pipe(
-            Stream.concat(fresh.stream(loaded.snapshot.snapshotSequence)),
-            Stream.ensuring(Scope.close(segmentScope, Exit.void)),
           );
-        }),
+        }).pipe(
+          Effect.provideService(
+            ProjectEnrichmentService.ProjectEnrichmentService,
+            projectEnrichment,
+          ),
+        ),
       );
+    const liveFrom = (afterSequence: number) =>
+      shellDeltas
+        .stream(afterSequence)
+        .pipe(
+          Stream.flatMap(
+            (
+              item,
+            ): Stream.Stream<
+              OrchestrationV2ShellStreamItem,
+              Stream.Error<ReturnType<typeof resyncItems>>
+            > => (item.kind === "resync" ? resyncItems(item.base) : Stream.succeed(item)),
+          ),
+        );
 
     const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
       Stream.filter((change) => change.repositoryIdentityResolved),
@@ -1229,7 +1240,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       );
     // Drain initial frames before merging enrichment with live events so marked refreshes cannot precede the initial frame.
     const completionThenLive = (afterSequence: number) =>
-      Stream.concat(completionMarker, resyncingLive(liveFrom(afterSequence)));
+      Stream.concat(completionMarker, liveFrom(afterSequence));
 
     const stream = yield* Effect.gen(function* () {
       if (input.afterSequence === undefined) {
@@ -1268,10 +1279,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       );
       return composeShellStreamWithEnrichment({
         initial: initialEnrichmentItems(loaded),
-        tail: Stream.concat(
-          Stream.concat(replay, completionMarker),
-          resyncingLive(liveFrom(highWater)),
-        ),
+        tail: Stream.concat(Stream.concat(replay, completionMarker), liveFrom(highWater)),
         enrichment: enrichmentRefreshes,
       });
     }).pipe(

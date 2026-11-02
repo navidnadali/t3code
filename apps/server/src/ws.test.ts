@@ -1148,7 +1148,7 @@ function makeShellFold() {
 function overflowCounter() {
   const state = { count: 0, waiters: [] as Array<Deferred.Deferred<void>> };
   const logger = Logger.make(({ message }) => {
-    if (String(message).includes("live event buffer is full")) {
+    if (/live event buffer is full|live buffer reset for a resync/.test(String(message))) {
       state.count += 1;
       for (const waiter of state.waiters.splice(0)) Deferred.doneUnsafe(waiter, Effect.void);
     }
@@ -1226,8 +1226,8 @@ it.live(
         }) as unknown as OrchestrationV2ThreadShell;
       const overflows = overflowCounter();
       let snapshotLoads = 0;
-      // Committed while the resync snapshot is being decoded: after its sequence, before its
-      // live tail subscribes, so only the database catch-up can deliver them.
+      // Committed while the resync base is being read: after its sequence, so they arrive live
+      // through the subscription the hub emptied before that read.
       const raceThreads: Array<string> = [];
       const fold = makeShellFold();
       const threadManagement = {
@@ -1356,7 +1356,7 @@ it.live(
           id: threadId,
           projectId: "project:p0",
           archivedAt: null,
-          title: threadId,
+          title: `${threadId}@${versions.get(threadId)}`,
           status: "completed",
           activityRunStatus: null,
           pendingRuntimeRequest: null,

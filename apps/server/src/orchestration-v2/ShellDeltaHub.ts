@@ -1,7 +1,6 @@
-import type { ApplicationStoredEvent } from "@t3tools/contracts";
+import type { ApplicationStoredEvent, OrchestrationV2ThreadShell } from "@t3tools/contracts";
 import type * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
-import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -43,6 +42,24 @@ export class ShellDeltaHubError extends Schema.TaggedError<ShellDeltaHubError>()
   },
 ) {}
 
+/** Every active shell as of `snapshotSequence`, before a subscriber's own trims. */
+export interface ShellResyncBase {
+  readonly schemaVersion: number;
+  readonly snapshotSequence: number;
+  readonly threads: ReadonlyArray<OrchestrationV2ThreadShell>;
+}
+
+/**
+ * The subscriber fell more than its buffer behind: the deltas it held were dropped and `base`,
+ * read after that, replaces them. The stream continues above `base.snapshotSequence`.
+ */
+export interface ShellResync {
+  readonly kind: "resync";
+  readonly base: ShellResyncBase;
+}
+
+export type ShellSubscriptionItem = ShellDelta | ShellResync;
+
 export interface ShellDeltaSubscription {
   /**
    * The deltas buffered since the subscription was taken, without those at or below
@@ -50,15 +67,15 @@ export interface ShellDeltaSubscription {
    */
   readonly stream: (
     afterSequence: number,
-  ) => Stream.Stream<ShellDelta, ShellDeltaHubError | LiveStreamBufferError>;
+  ) => Stream.Stream<ShellSubscriptionItem, ShellDeltaHubError | LiveStreamBufferError>;
 }
 
 export interface ShellDeltaHubShape {
   /**
-   * Take the subscription before reading the snapshot it continues: every committed event the
-   * hub sees from then on reaches this subscriber as a projected item. Deltas are buffered from
-   * now on, the latest per aggregate, under the live-stream budget; on overflow or a hub failure
-   * the subscription ends on its own, before the subscriber's scope closes.
+   * Take the subscription before reading the snapshot it continues: every later committed event
+   * reaches it as a projected delta, the latest per aggregate, under the live-stream budget. A
+   * buffer that would overflow is emptied instead, and the stream's next pull yields a `resync`
+   * whose base is shared by every subscriber emptied before that read; a hub failure ends it.
    */
   readonly subscribe: (limits?: {
     readonly maxItems?: number;
@@ -91,6 +108,52 @@ const make = Effect.gen(function* () {
   const layerScope = yield* Effect.scope;
   const lifecycle = yield* Semaphore.make(1);
   let current: HubInstance | undefined;
+
+  // A reset drops deltas at or below the highest sequence the hub has published. A base read
+  // started after that publish covers them: the events were committed before it, and whatever
+  // is committed after reaches the emptied buffer. So one read serves every subscriber a batch
+  // resets, however the resets and their pulls interleave, instead of a snapshot per subscriber.
+  let publishedSequence = 0;
+  let latestBase:
+    | {
+        readonly coversThrough: number;
+        readonly result: Deferred.Deferred<ShellResyncBase, ShellDeltaHubError>;
+      }
+    | undefined;
+  const resyncBase = (through: number) =>
+    Effect.suspend(() => {
+      if (latestBase !== undefined && latestBase.coversThrough >= through) {
+        const read = latestBase;
+        return Deferred.await(read.result).pipe(Effect.map((base) => ({ read, base })));
+      }
+      const read = {
+        coversThrough: publishedSequence,
+        result: Deferred.makeUnsafe<ShellResyncBase, ShellDeltaHubError>(),
+      };
+      latestBase = read;
+      // The sequence is read first: the shells are at least as new, and a change between the
+      // two reads is in the snapshot and delivered live again, as the same full state.
+      return Effect.gen(function* () {
+        const snapshotSequence = yield* applicationEvents.latestApplicationSequence;
+        const snapshot = yield* yield* threadManagement.readShellSnapshot({ location: "active" });
+        return {
+          schemaVersion: snapshot.schemaVersion,
+          snapshotSequence,
+          threads: snapshot.threads,
+        } satisfies ShellResyncBase;
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ShellDeltaHubError({ message: "The shell snapshot for a resync failed", cause }),
+        ),
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.done(read.result, exit)),
+        // In the hub's scope: a subscriber interrupted mid-read must not fail the others' wait.
+        Effect.forkIn(layerScope),
+        Effect.andThen(Deferred.await(read.result)),
+        Effect.map((base) => ({ read, base })),
+      );
+    });
 
   // One committed-events consumer for every shell subscriber. Events coalesce per aggregate
   // while a batch is read, so memory is bounded by the aggregates that changed, not by events.
@@ -128,6 +191,7 @@ const make = Effect.gen(function* () {
         projectShell: projectService.getShell,
       });
       const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+      for (const item of items) publishedSequence = Math.max(publishedSequence, item.sequence);
       yield* PubSub.publish(
         input.output,
         items.map((item) => ({
@@ -217,50 +281,69 @@ const make = Effect.gen(function* () {
       void,
       ShellDeltaHubError | LiveStreamBufferError | Cause.Done
     >(1);
-    const mutex = yield* Semaphore.make(1);
     let afterSequence: number | undefined;
+    let highestOffered = 0;
+    // Set by a reset: the highest sequence the dropped deltas can have, cleared by a resync whose
+    // base covers it.
+    let resetThrough: number | undefined;
     let closed = false;
     const close = (error?: LiveStreamBufferError) =>
-      mutex.withPermit(
-        Effect.gen(function* () {
-          if (closed) return;
-          closed = true;
-          budget.release(pending.values());
-          pending.clear();
-          if (error) yield* Queue.fail(ready, error);
-          yield* Queue.shutdown(ready);
-        }),
-      );
+      Effect.suspend(() => {
+        if (closed) return Effect.void;
+        closed = true;
+        budget.release(pending.values());
+        pending.clear();
+        return (error ? Queue.fail(ready, error) : Effect.void).pipe(
+          Effect.andThen(Queue.shutdown(ready)),
+        );
+      });
     yield* Effect.addFinalizer(() => close());
     yield* budget.failed.pipe(
       Effect.catchTags({ LiveStreamBufferError: close }),
       Effect.forkScoped,
     );
-    const retain = Effect.fnUntraced(function* (delta: VersionedShellDelta) {
+    // Each delta is one synchronous step (budget swap, map update, wake-up), so it cannot
+    // interleave with a drain. A swap the budget refuses empties the buffer for a resync instead
+    // of failing it: the snapshot read after this reset replaces what was dropped.
+    const offer = (delta: VersionedShellDelta, now: number): Effect.Effect<void> => {
+      if (closed) return Effect.void;
+      if (afterSequence !== undefined) {
+        if (delta.sequence <= afterSequence) return Effect.void;
+        if (!admission.admit(delta, now)) return Effect.void;
+      }
       const key = shellDeltaKey(delta.item);
       const previous = pending.get(key);
-      if (previous !== undefined && previous.value.sequence >= delta.sequence) return;
+      if (previous !== undefined && previous.value.sequence >= delta.sequence) return Effect.void;
       const wasEmpty = pending.size === 0;
-      const [item] = yield* budget.replace(previous === undefined ? [] : [previous], [delta]);
-      pending.set(key, item!);
-      // Only the empty-to-nonempty transition of a started stream needs a wakeup.
-      if (wasEmpty && afterSequence !== undefined) yield* Queue.offer(ready, undefined);
-    });
+      highestOffered = Math.max(highestOffered, delta.sequence);
+      let swapped = budget.swapUnsafe(previous, delta);
+      let report: Effect.Effect<void> = Effect.void;
+      if (Effect.isEffect(swapped)) {
+        report = Effect.logWarning("orchestration shell live buffer reset for a resync", {
+          pendingDeltas: pending.size,
+          afterSequence,
+        });
+        budget.release(pending.values());
+        pending.clear();
+        resetThrough = highestOffered;
+        // What the client already holds stays charged until it acknowledges; this delta waits
+        // for the resync if even that leaves no room.
+        swapped = budget.swapUnsafe(undefined, delta);
+      }
+      if (!Effect.isEffect(swapped)) pending.set(key, swapped);
+      // A started stream needs a wakeup on the empty-to-nonempty transition and on a reset.
+      if (afterSequence !== undefined && (wasEmpty || resetThrough !== undefined)) {
+        Queue.offerUnsafe(ready, undefined);
+      }
+      return report;
+    };
     yield* Stream.fromSubscription(subscription).pipe(
       Stream.flatMap(Stream.fromIterable),
       Stream.merge(Stream.fromEffect(Deferred.await(instance.failed))),
       Stream.ensuring(Scope.close(subscriptionScope, Exit.void)),
       Stream.runForEach((delta) =>
-        mutex.withPermit(
-          Effect.gen(function* () {
-            yield* budget.check;
-            if (closed) return;
-            if (afterSequence !== undefined) {
-              if (delta.sequence <= afterSequence) return;
-              if (!admission.admit(delta, yield* Clock.currentTimeMillis)) return;
-            }
-            yield* retain(delta);
-          }).pipe(Effect.uninterruptible),
+        Effect.clockWith((clock) =>
+          Effect.suspend(() => offer(delta, clock.currentTimeMillisUnsafe())),
         ),
       ),
       Effect.raceFirst(budget.failed),
@@ -270,46 +353,64 @@ const make = Effect.gen(function* () {
       ),
       Effect.forkScoped({ startImmediately: true }),
     );
+    const continueFrom = (sequence: number, now: number) => {
+      afterSequence = sequence;
+      for (const [key, item] of pending) {
+        if (item.value.sequence <= sequence || !admission.admit(item.value, now)) {
+          budget.release([item]);
+          pending.delete(key);
+        }
+      }
+      if (pending.size > 0) Queue.offerUnsafe(ready, undefined);
+    };
     const open = (sequence: number) =>
-      mutex.withPermit(
-        Effect.gen(function* () {
+      Effect.clockWith((clock) =>
+        Effect.sync(() => {
           if (closed) return;
-          afterSequence = sequence;
-          const now = yield* Clock.currentTimeMillis;
-          for (const [key, item] of pending) {
-            if (item.value.sequence <= sequence || !admission.admit(item.value, now)) {
-              budget.release([item]);
-              pending.delete(key);
-            }
-          }
-          if (pending.size > 0) yield* Queue.offer(ready, undefined);
+          continueFrom(sequence, clock.currentTimeMillisUnsafe());
+          if (resetThrough !== undefined) Queue.offerUnsafe(ready, undefined);
         }),
       );
-    const deliver = budget.deliver(
-      Stream.fromPull(
-        Effect.succeed(
-          Queue.take(ready).pipe(
-            Effect.andThen(
-              mutex.withPermit(
-                Effect.sync(() => {
-                  const items = Array.from(pending.values()).sort(
-                    (left, right) => left.value.sequence - right.value.sequence,
-                  );
-                  pending.clear();
-                  // Moving to delivery preserves the budget charge until ACK.
-                  return items as Arr.NonEmptyArray<RetainedLiveItem<VersionedShellDelta>>;
-                }),
+    type Delivered = RetainedLiveItem<VersionedShellDelta | ShellResync>;
+    const drain: Effect.Effect<
+      Arr.NonEmptyArray<Delivered>,
+      ShellDeltaHubError | LiveStreamBufferError | Cause.Done
+    > = Queue.take(ready).pipe(
+      Effect.flatMap(() =>
+        Effect.suspend(() => {
+          if (resetThrough !== undefined) {
+            return resyncBase(resetThrough).pipe(
+              Effect.flatMap(({ read, base }) =>
+                Effect.clockWith((clock) =>
+                  Effect.sync(() => {
+                    // A reset the read does not cover keeps the flag: the next pull resyncs again.
+                    if (resetThrough !== undefined && resetThrough <= read.coversThrough) {
+                      resetThrough = undefined;
+                    }
+                    continueFrom(base.snapshotSequence, clock.currentTimeMillisUnsafe());
+                    const resync: ShellResync = { kind: "resync", base };
+                    return [{ value: resync, serializedBytes: 0 }] as Arr.NonEmptyArray<Delivered>;
+                  }),
+                ),
               ),
-            ),
-          ),
-        ),
+            );
+          }
+          // A close can empty the map before the token is taken; the next take then ends or fails.
+          if (pending.size === 0) return drain;
+          const items = Array.from(pending.values()).sort(
+            (left, right) => left.value.sequence - right.value.sequence,
+          );
+          pending.clear();
+          // Moving to delivery preserves the budget charge until ACK.
+          return Effect.succeed(items as Arr.NonEmptyArray<Delivered>);
+        }),
       ),
     );
+    const deliver = budget
+      .deliver(Stream.fromPull(Effect.succeed(drain)))
+      .pipe(Stream.map((value): ShellSubscriptionItem => ("item" in value ? value.item : value)));
     return {
-      stream: (sequence) =>
-        Stream.unwrap(
-          open(sequence).pipe(Effect.as(deliver.pipe(Stream.map((delta) => delta.item)))),
-        ),
+      stream: (sequence) => Stream.unwrap(open(sequence).pipe(Effect.as(deliver))),
     };
   });
 

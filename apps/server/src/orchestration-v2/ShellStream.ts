@@ -293,6 +293,24 @@ function shellSubscriberThreadIds(
 }
 
 /**
+ * The snapshot a subscriber gets from a base holding every active shell (a resync's shared read),
+ * trimmed as `loadSubscriberShellSnapshot` trims, and the subagent ids its stream drops.
+ */
+export function trimSubscriberShellSnapshot(
+  base: OrchestrationV2ShellSnapshot,
+  options: ShellSubscriberOptions & { readonly now: DateTime.Utc },
+): {
+  readonly snapshot: OrchestrationV2ShellSnapshot;
+  readonly subagentThreadIds: Set<string>;
+} {
+  const facts = shellTrimFacts(base.threads);
+  return {
+    snapshot: trimShellSnapshot(base, facts, options),
+    subagentThreadIds: facts.subagentThreadIds,
+  };
+}
+
+/**
  * A subscriber's active shell snapshot, read like `loadShellSnapshotParts`. With an opt-in, the
  * store's index decides which shells to read, so threads the trims drop are never built.
  */

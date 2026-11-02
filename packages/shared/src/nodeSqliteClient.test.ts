@@ -396,28 +396,23 @@ const holdClassReader = (
     };
   });
 
-it.effect("leaves the last reader to other reads while history reads hold the rest", () =>
+// No reader idles while a read waits: with nothing else queued, one class may use every reader.
+it.effect.each([
+  { name: "page", mark: SqliteClient.pageRead },
+  { name: "history", mark: SqliteClient.historyRead },
+])("lets $name reads use every idle reader while nothing else waits", ({ name, mark }) =>
   withReaderClient(
     (sql) =>
       Effect.gen(function* () {
         const started: Array<string> = [];
-        const first = yield* holdClassReader(sql, "history-1", started, SqliteClient.historyRead);
-        yield* first.running;
-        // Two readers: the first history read holds one, so the second must wait for its turn.
-        const second = yield* holdClassReader(sql, "history-2", started, SqliteClient.historyRead);
-        const small = yield* sql
-          .withTransaction(sql`SELECT ${"small"} AS name`)
-          .pipe(SqliteClient.readOnly);
-        const page = yield* sql
-          .withTransaction(sql`SELECT ${"page"} AS name`)
-          .pipe(SqliteClient.pageRead, SqliteClient.readOnly);
-        assert.deepEqual([small, page], [[{ name: "small" }], [{ name: "page" }]]);
-        assert.deepEqual(started, ["history-1"]);
-        yield* first.release;
-        yield* second.release;
-        assert.deepEqual(started, ["history-1", "history-2"]);
+        const reads = yield* Effect.forEach([1, 2, 3, 4], (index) =>
+          holdClassReader(sql, `${name}-${index}`, started, mark),
+        );
+        yield* Effect.forEach(reads, (read) => read.running);
+        assert.lengthOf(started, 4);
+        yield* Effect.all(reads.map((read) => read.release));
       }),
-    { readerPoolSize: 2 },
+    { readerPoolSize: 4 },
   ),
 );
 
@@ -470,7 +465,7 @@ it.effect("lets a page read pass history reads still waiting for a reader", () =
         assert.deepEqual(started.slice(2), ["page"]);
         yield* page.release;
         yield* holders[1]!.release;
-        // History reads hold at most one of the two readers, so they run one after the other.
+        // Each history read takes a reader as one frees.
         for (const history of histories) {
           yield* history.running;
           yield* history.release;
@@ -505,96 +500,122 @@ it.effect("drops a history read's place in the queue when it is interrupted wait
   ),
 );
 
-const smallRead = (sql: SqlClient.SqlClient, name: string) =>
-  sql.withTransaction(sql`SELECT ${name} AS name`).pipe(SqliteClient.readOnly);
+// A read of the given class that records when it reaches its statement, then ends.
+const classRead = (
+  sql: SqlClient.SqlClient,
+  name: string,
+  started: Array<string>,
+  mark: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R> = (effect) => effect,
+) =>
+  sql
+    .withTransaction(
+      sql`SELECT ${name} AS name`.pipe(Effect.andThen(Effect.sync(() => started.push(name)))),
+    )
+    .pipe(mark, SqliteClient.readOnly, Effect.forkChild({ startImmediately: true }));
 
-it.effect("keeps a reader for page reads while history reads hold all they may", () =>
+it.effect("gives a page read holding no reader the next one before small reads", () =>
   withReaderClient(
     (sql) =>
       Effect.gen(function* () {
         const started: Array<string> = [];
-        // Four readers: history reads may hold two, so a third waits with two readers free.
-        const histories = yield* Effect.forEach(["history-1", "history-2"], (name) =>
-          holdClassReader(sql, name, started, SqliteClient.historyRead),
+        const holders = yield* Effect.forEach(["holder-1", "holder-2"], (name) =>
+          holdClassReader(sql, name, started),
         );
-        yield* Effect.forEach(histories, (history) => history.running);
-        const third = yield* holdClassReader(sql, "history-3", started, SqliteClient.historyRead);
-        const page = yield* holdClassReader(sql, "page", started, SqliteClient.pageRead);
-        yield* page.running;
-        assert.deepEqual(yield* smallRead(sql, "small"), [{ name: "small" }]);
-        assert.deepEqual(started.slice(2), ["page"]);
-        yield* histories[0]!.release;
-        yield* third.running;
-        assert.deepEqual(started.slice(3), ["history-3"]);
-        yield* Effect.all([third.release, histories[1]!.release, page.release]);
+        yield* Effect.forEach(holders, (holder) => holder.running);
+        // A small read queues first, then a page read; small reads already hold readers.
+        const small = yield* classRead(sql, "small", started);
+        const page = yield* classRead(sql, "page", started, SqliteClient.pageRead);
+        yield* holders[0]!.release;
+        yield* Fiber.join(page);
+        yield* holders[1]!.release;
+        yield* Fiber.join(small);
+        assert.deepEqual(started.slice(2), ["page", "small"]);
       }),
-    { readerPoolSize: 4 },
+    { readerPoolSize: 2 },
   ),
 );
 
-it.effect("keeps a reader for small reads while page reads hold the rest", () =>
+// Passed over once for each reader in the pool, a waiting class goes next: no class starves.
+it.effect.each([
+  {
+    name: "a page read queued behind a stream of small reads",
+    stream: "small",
+    streamMark: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+    waiting: "page",
+    waitingMark: SqliteClient.pageRead,
+  },
+  {
+    name: "a history read queued behind a stream of page reads",
+    stream: "page",
+    streamMark: SqliteClient.pageRead,
+    waiting: "history",
+    waitingMark: SqliteClient.historyRead,
+  },
+])("serves $name within the pool size", ({ stream, streamMark, waiting, waitingMark }) =>
   withReaderClient(
     (sql) =>
       Effect.gen(function* () {
         const started: Array<string> = [];
-        const pages = yield* Effect.forEach(["page-1", "page-2", "page-3"], (name) =>
-          holdClassReader(sql, name, started, SqliteClient.pageRead),
+        const holder = yield* holdClassReader(sql, "holder", started);
+        yield* holder.running;
+        // Twenty reads of one class queue, then the other read: one of the twenty always waits.
+        const streamed = yield* Effect.forEach(
+          Array.from({ length: 20 }, (_, index) => `${stream}-${index}`),
+          (name) => classRead(sql, name, started, streamMark),
         );
-        yield* Effect.forEach(pages, (page) => page.running);
-        // The last reader stays free for small reads, so a fourth page read waits.
-        const fourth = yield* holdClassReader(sql, "page-4", started, SqliteClient.pageRead);
-        assert.deepEqual(yield* smallRead(sql, "small"), [{ name: "small" }]);
-        assert.sameMembers(started, ["page-1", "page-2", "page-3"]);
-        yield* pages[0]!.release;
-        yield* fourth.running;
-        assert.deepEqual(started.slice(3), ["page-4"]);
-        yield* Effect.all([fourth.release, pages[1]!.release, pages[2]!.release]);
+        const read = yield* classRead(sql, waiting, started, waitingMark);
+        yield* holder.release;
+        yield* Effect.forEach([...streamed, read], Fiber.join);
+        // One reader: passed over once, by the stream's first read, the other read goes next.
+        assert.strictEqual(started.indexOf(waiting), 2);
       }),
-    { readerPoolSize: 4 },
+    { readerPoolSize: 1 },
   ),
 );
 
-it.effect("lets a page read take the last reader while a small read holds one", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const started: Array<string> = [];
-        const small = yield* holdClassReader(sql, "small", started);
-        yield* small.running;
-        const pages = yield* Effect.forEach(["page-1", "page-2", "page-3"], (name) =>
-          holdClassReader(sql, name, started, SqliteClient.pageRead),
-        );
-        yield* Effect.forEach(pages, (page) => page.running);
-        assert.sameMembers(started, ["small", "page-1", "page-2", "page-3"]);
-        yield* Effect.all([small.release, ...pages.map((page) => page.release)]);
-      }),
-    { readerPoolSize: 4 },
-  ),
-);
-
-it.effect("keeps a reader each for small and page reads with three readers", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const started: Array<string> = [];
-        // History reads may hold one of three readers; page reads one more, small reads the last.
-        const history = yield* holdClassReader(sql, "history-1", started, SqliteClient.historyRead);
-        yield* history.running;
-        const second = yield* holdClassReader(sql, "history-2", started, SqliteClient.historyRead);
-        const page = yield* holdClassReader(sql, "page-1", started, SqliteClient.pageRead);
-        yield* page.running;
-        const nextPage = yield* holdClassReader(sql, "page-2", started, SqliteClient.pageRead);
-        assert.deepEqual(yield* smallRead(sql, "small"), [{ name: "small" }]);
-        assert.deepEqual(started, ["history-1", "page-1"]);
-        yield* page.release;
-        yield* nextPage.running;
-        yield* history.release;
-        yield* second.running;
-        assert.deepEqual(started.slice(2), ["page-2", "history-2"]);
-        yield* Effect.all([nextPage.release, second.release]);
-      }),
-    { readerPoolSize: 3 },
-  ),
+it.effect(
+  "serves history reads past their limit after other queued reads, however long they wait",
+  () =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const started: Array<string> = [];
+          // Four readers: two history reads (their limit) and two small reads hold them.
+          const histories = yield* Effect.forEach(["history-1", "history-2"], (name) =>
+            holdClassReader(sql, name, started, SqliteClient.historyRead),
+          );
+          let smalls = yield* Effect.forEach(["small-1", "small-2"], (name) =>
+            holdClassReader(sql, name, started),
+          );
+          yield* Effect.forEach([...histories, ...smalls], (read) => read.running);
+          const waiting = yield* holdClassReader(
+            sql,
+            "history-3",
+            started,
+            SqliteClient.historyRead,
+          );
+          // Four freed readers go to small reads, each passing over the waiting history read.
+          for (const round of [1, 2, 3, 4]) {
+            const next = yield* holdClassReader(sql, `small-${round + 2}`, started);
+            yield* smalls[0]!.release;
+            yield* next.running;
+            smalls = [...smalls.slice(1), next];
+          }
+          const page = yield* holdClassReader(sql, "page", started, SqliteClient.pageRead);
+          yield* smalls[0]!.release;
+          yield* page.running;
+          assert.notInclude(started, "history-3");
+          yield* histories[0]!.release;
+          yield* waiting.running;
+          yield* Effect.all([
+            waiting.release,
+            histories[1]!.release,
+            smalls[1]!.release,
+            page.release,
+          ]);
+        }),
+      { readerPoolSize: 4 },
+    ),
 );
 
 // One reader is always left for reads that take no permit, unless there is only one.

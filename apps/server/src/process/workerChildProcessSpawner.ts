@@ -34,6 +34,7 @@ import * as NodeStream from "node:stream";
 
 import {
   PROCESS_SPAWNER_EXECUTABLE,
+  spawnerHandshake,
   spawnerProcessSource,
   spawnWorkerSource,
 } from "./spawnerSources.ts";
@@ -51,6 +52,9 @@ const processGroupGraceMillis = 1_000;
 const processGroupPollIntervalMillis = 10;
 // Time the spawner gets at close to kill its children before it is killed.
 const spawnerCloseGraceMillis = 1_000;
+// A spawner answers its start-up and each start within milliseconds; whatever the load, a spawner
+// silent for this long is broken, and the server stops it.
+const spawnerAnswerMillis = 10_000;
 // Each restart forks the server; a spawner that keeps stopping is a fault, whatever the load. Down,
 // it is retried after 15 s, doubling while starts keep failing, up to 5 minutes.
 export const spawnerRestartLimit = {
@@ -206,6 +210,9 @@ interface Entry {
   readonly child: RemoteChild;
   readonly callbacks: SpawnCallbacks;
   spawned: boolean;
+  /** Its caller stopped waiting for the start: the child is killed as soon as its PID is known. */
+  abandoned: boolean;
+  cancelStartDeadline: (() => void) | undefined;
   holdsLoop: boolean;
   readonly unacked: [number, number];
   readonly stdinCallbacks: Map<number, (error?: Error | null) => void>;
@@ -253,6 +260,9 @@ const makeRemoteHost = (options: {
   };
   readonly onStop?: (cause: unknown, restarting: boolean, retryInMillis?: number) => void;
   readonly onRetry?: () => void;
+  /** Arms the deadline for the transport to answer a start; without it, a start may wait for ever. */
+  readonly startDeadline?: (expire: () => void) => () => void;
+  readonly startDeadlineMessage?: string;
 }) => {
   let transport: Transport | undefined;
   let generation: object | undefined;
@@ -337,7 +347,10 @@ const makeRemoteHost = (options: {
     }
     if (!closing) options.onStop?.(cause, restarting, retryAt === undefined ? undefined : coolDown);
     const error = new Error(options.stoppedMessage, { cause });
-    for (const { child } of stoppedEntries) child.stopError = error;
+    for (const entry of stoppedEntries) {
+      entry.child.stopError = error;
+      entry.cancelStartDeadline?.();
+    }
     for (const entry of stoppedEntries) {
       const { child } = entry;
       // A child whose start the transport reported but never acknowledged is killed too.
@@ -378,6 +391,18 @@ const makeRemoteHost = (options: {
     }
   };
 
+  const killAbandoned = (entry: Entry) => {
+    const { child } = entry;
+    if (child.pid === undefined || child.killedOnStop) return;
+    child.killedOnStop = true;
+    try {
+      if (child.detached) signalProcessGroup(child.pid, "SIGKILL");
+      else if (child.pid > 1) process.kill(child.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  };
+
   const onMessage = (message: WorkerMessage) => {
     const entry = entries.get(message.id);
     if (entry === undefined) return;
@@ -385,17 +410,22 @@ const makeRemoteHost = (options: {
     switch (message.t) {
       case "started":
         child.pid ??= message.pid;
+        if (entry.abandoned) killAbandoned(entry);
         return;
       case "spawn":
         stopsInARow = 0;
-        entry.spawned = true;
+        entry.cancelStartDeadline?.();
         child.pid = message.pid;
+        if (entry.abandoned) return killAbandoned(entry);
+        entry.spawned = true;
         entry.callbacks.onSpawn();
         return;
       case "error":
+        entry.cancelStartDeadline?.();
         if (!entry.spawned) entry.callbacks.onError(reviveError(message.error));
         return;
       case "throw":
+        entry.cancelStartDeadline?.();
         entry.callbacks.onThrow(reviveError(message.error));
         remove(entry);
         return;
@@ -541,6 +571,8 @@ const makeRemoteHost = (options: {
       child,
       callbacks,
       spawned: false,
+      abandoned: false,
+      cancelStartDeadline: undefined,
       holdsLoop: false,
       unacked: [0, 0],
       stdinCallbacks,
@@ -556,7 +588,22 @@ const makeRemoteHost = (options: {
     entries.set(id, entry);
     updateHold(entry);
     post({ t: "spawn", id, command, args, options: spawnOptions });
+    // An unanswered start means the transport is not working: stop it, failing what waits on it.
+    entry.cancelStartDeadline = options.startDeadline?.(() => {
+      entry.cancelStartDeadline = undefined;
+      if (entries.get(id) === entry && child.stopError === undefined && !entry.spawned) {
+        stop(new Error(options.startDeadlineMessage ?? "The transport did not answer a start"));
+      }
+    });
     return child;
+  };
+
+  // Its caller was interrupted before the start was answered.
+  const abandon = (child: RemoteChild) => {
+    const entry = entries.get(child.id);
+    if (entry === undefined || entry.spawned) return;
+    entry.abandoned = true;
+    killAbandoned(entry);
   };
 
   // Node's ChildProcess.kill returns false once the child has exited.
@@ -598,6 +645,7 @@ const makeRemoteHost = (options: {
       return failure;
     },
     spawn,
+    abandon,
     kill,
     setReferenced,
     terminate: () =>
@@ -682,8 +730,15 @@ const findSpawnerExecutable = Effect.fnUntraced(function* (executable: string) {
   return Option.isSome(info) && info.value.type === "File" ? candidate : undefined;
 });
 
+interface SpawnerHandshake {
+  readonly expected: { readonly protocol: string; readonly build: string };
+  /** Arms the deadline for the spawner's first message. */
+  readonly deadline: (expire: () => void) => () => void;
+  readonly onReady: () => void;
+}
+
 const openSpawnerProcess =
-  (launch: ReturnType<typeof spawnerProcessLaunch>) =>
+  (launch: ReturnType<typeof spawnerProcessLaunch>, handshake: SpawnerHandshake) =>
   (events: TransportEvents): Transport => {
     const spawner = NodeChildProcess.spawn(launch.command, launch.args, launch.options);
     // A spawner that failed to start reports only an error, with a negative exitCode.
@@ -705,35 +760,70 @@ const openSpawnerProcess =
     };
     // A spawner that ends itself kills its own group, itself included: its reason says why.
     const stopCause = () =>
-      exitReason === undefined ? exitCause : new Error(`The process spawner exited: ${exitReason}`);
+      refused ??
+      (exitReason === undefined
+        ? exitCause
+        : new Error(`The process spawner exited: ${exitReason}`));
+    // Until it has said who it is, anything from the spawner other than that ends it.
+    let answered = false;
+    let refused: Error | undefined;
+    const refuse = (reason: string) => {
+      if (answered || refused !== undefined) return;
+      refused = new Error(`The process spawner ${reason}`);
+      cancelHandshake();
+      if (!hasExited()) spawner.kill("SIGKILL");
+    };
+    const cancelHandshake = handshake.deadline(() =>
+      refuse(`did not answer within ${spawnerAnswerMillis / 1_000} s of starting`),
+    );
     let partial = "";
     let exitReason: string | undefined;
     // Each child's PID as it starts, and the spawner's reason when it ends itself.
     const starts = spawner.stdout as NodeNet.Socket;
     starts.setEncoding("utf8");
+    // Read apart from its replies, these may arrive before the handshake is: they wait for it.
+    const early: Array<string> = [];
+    const readLine = (line: string) => {
+      if (!answered) return void early.push(line);
+      if (line.startsWith("exit ")) {
+        exitReason = line.slice("exit ".length);
+        return;
+      }
+      const [id, pid] = line.split(" ").map(Number);
+      events.onMessage({ t: "started", id, pid });
+    };
     starts.on("data", (chunk: string) => {
       const lines = (partial + chunk).split("\n");
       partial = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.startsWith("exit ")) {
-          exitReason = line.slice("exit ".length);
-          continue;
-        }
-        const [id, pid] = line.split(" ").map(Number);
-        events.onMessage({ t: "started", id, pid });
-      }
+      for (const line of lines) readLine(line);
     });
     starts.on("close", () => {
       startsOpen = false;
       stopWhenDrained();
     });
     starts.unref();
-    spawner.on("message", events.onMessage);
+    spawner.on("message", (message: unknown) => {
+      if (answered) return events.onMessage(message);
+      const { expected } = handshake;
+      const ready = message as { t?: unknown; protocol?: unknown; build?: unknown } | null;
+      if (ready?.t !== "ready") return refuse("answered with something other than its handshake");
+      if (ready.protocol !== expected.protocol || ready.build !== expected.build) {
+        return refuse(
+          `speaks protocol ${String(ready.protocol)} of build ${String(ready.build)}, not ${expected.protocol} of ${expected.build}`,
+        );
+      }
+      answered = true;
+      cancelHandshake();
+      handshake.onReady();
+      for (const line of early.splice(0)) readLine(line);
+    });
     spawner.on("error", (error) => {
+      if (hasExited()) cancelHandshake();
       if (hasExited()) events.onStop(error);
       else if (!closing) spawner.kill("SIGKILL");
     });
     spawner.on("exit", (code, signal) => {
+      cancelHandshake();
       // Launched detached, it led its own group; while members remain, no process can take its id.
       try {
         if (launch.options.detached) signalProcessGroup(spawner.pid!, "SIGKILL");
@@ -893,7 +983,7 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
         onError: (error) => resume(Effect.fail(toPlatformError("spawn", error, command))),
         onThrow: (error) => resume(Effect.die(error)),
       });
-      return Effect.sync(() => host.kill(child, "SIGTERM", () => {}));
+      return Effect.sync(() => host.abandon(child));
     });
 
   const isProcessAlive = (child: RemoteChild): boolean => {
@@ -1004,7 +1094,8 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
     };
 
     const child = yield* Effect.acquireRelease(
-      spawnRemote(command, spawnOptions),
+      // Interruptible, so a command's own timeout ends the wait for a start that is not answered.
+      spawnRemote(command, spawnOptions).pipe(Effect.interruptible),
       Effect.fnUntraced(function* (child) {
         const exited = yield* Deferred.isDone(child.exitSignal);
         if (exited) {
@@ -1139,6 +1230,21 @@ export interface SpawnerTimers {
   readonly schedule: (kind: "handshake" | "start", run: () => void) => () => void;
 }
 
+// Expires only after pending I/O has been read: a reply that arrived during an event-loop stall
+// (a long start-up, for instance) is still in time.
+const scheduleAnswerDeadline: SpawnerTimers["schedule"] = (_kind, run) => {
+  let immediate: NodeJS.Immediate | undefined;
+  const timer = setTimeout(() => {
+    immediate = setImmediate(run);
+    immediate.unref();
+  }, spawnerAnswerMillis);
+  timer.unref();
+  return () => {
+    clearTimeout(timer);
+    if (immediate !== undefined) clearImmediate(immediate);
+  };
+};
+
 export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   fallback: ChildProcessSpawner["Service"],
   options: {
@@ -1157,18 +1263,35 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
       `No ${PROCESS_SPAWNER_EXECUTABLE} beside ${executable}; the process spawner runs the whole server bundle`,
     );
   }
-  const launch = spawnerProcessLaunch({
-    executable,
-    isExecutable,
-    ...(spawnerExecutable === undefined ? {} : { spawnerExecutable }),
-    environment: yield* HostProcess.Environment,
-    windowBytes,
-    ...(options.source === undefined ? {} : { source: options.source }),
-  });
+  const environment = yield* HostProcess.Environment;
+  const launchWith = (sibling: string | undefined) =>
+    spawnerProcessLaunch({
+      executable,
+      isExecutable,
+      ...(sibling === undefined ? {} : { spawnerExecutable: sibling }),
+      environment,
+      windowBytes,
+      ...(options.source === undefined ? {} : { source: options.source }),
+    });
+  const builtIn = launchWith(undefined);
+  let launch = spawnerExecutable === undefined ? builtIn : launchWith(spawnerExecutable);
   const runLog = Effect.runSyncExitWith(yield* Effect.context<never>());
   const clock = yield* Clock.Clock;
+  const schedule = options.timers?.schedule ?? scheduleAnswerDeadline;
+  let answered = false;
   const host = makeRemoteHost({
-    open: openSpawnerProcess(launch),
+    open: (events) => {
+      answered = false;
+      return openSpawnerProcess(launch, {
+        expected: spawnerHandshake,
+        deadline: (expire) => schedule("handshake", expire),
+        onReady: () => {
+          answered = true;
+        },
+      })(events);
+    },
+    startDeadline: (expire) => schedule("start", expire),
+    startDeadlineMessage: `The process spawner did not answer a start within ${spawnerAnswerMillis / 1_000} s`,
     windowBytes,
     stoppedMessage: SPAWNER_STOPPED_MESSAGE,
     closedMessage: "process spawner closed",
@@ -1178,6 +1301,16 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
       nowMillis: () => Number(clock.monotonicTimeNanosUnsafe() / 1_000_000n),
     },
     onStop: (cause, restarting, retryInMillis) => {
+      // A spawner executable that never got as far as its handshake is not used again.
+      if (launch !== builtIn && !answered) {
+        launch = builtIn;
+        runLog(
+          Effect.logWarning(
+            `${PROCESS_SPAWNER_EXECUTABLE} beside ${executable} did not start; the process spawner falls back to the CLI entry, which runs the whole server bundle`,
+            cause,
+          ),
+        );
+      }
       runLog(
         restarting
           ? Effect.logWarning("Process spawner stopped; the next command restarts it", cause)

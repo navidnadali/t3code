@@ -1,3 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off - The handshake id is a constant computed when the module loads.
+import * as NodeCrypto from "node:crypto";
+
+import serverPackage from "../../package.json" with { type: "json" };
+
 /** The spawner executable a single-executable build ships beside `t3`. */
 export const PROCESS_SPAWNER_EXECUTABLE = "t3-process-spawner";
 
@@ -104,14 +109,7 @@ ${spawnProtocolSource}
 parentPort.on("message", onMessage);
 `;
 
-/**
- * The spawner process: the server's IPC channel closes when the server exits, however it exits,
- * and the spawner then kills every child it started and exits too; it does the same when it
- * fails or is asked to stop. Only a SIGKILL of the spawner between a fork and the PID report
- * written right after it can leave a child the server does not know (Node exposes no PDEATHSIG).
- */
-export const spawnerProcessSource = `
-"use strict";
+const spawnerProcessBody = `
 const { spawn } = require("node:child_process");
 const windowBytes = Number(process.argv[process.argv.length - 1]);
 // A reply racing the server's disconnect must not crash the spawner before it kills its children.
@@ -127,6 +125,7 @@ const started = (id, pid) => {
 ${spawnProtocolSource}
 process.title = "t3-process-spawner";
 process.on("message", onMessage);
+post({ t: "ready", protocol: handshake.protocol, build: handshake.build });
 const killChildren = () => {
   for (const { child, detached } of children.values()) {
     try {
@@ -158,6 +157,22 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.once(signal, () => exitWithGroup(128 + require("node:os").constants.signals[signal], "received " + signal));
 }
 `;
+
+/** What a spawner process says first: the server kills one that says anything else. */
+export const spawnerHandshake = {
+  protocol: NodeCrypto.createHash("sha256").update(spawnerProcessBody).digest("hex").slice(0, 16),
+  build: serverPackage.version,
+};
+
+/**
+ * The spawner process: the server's IPC channel closes when the server exits, however it exits,
+ * and the spawner then kills every child it started and exits too; it does the same when it
+ * fails or is asked to stop. Only a SIGKILL of the spawner between a fork and the PID report
+ * written right after it can leave a child the server does not know (Node exposes no PDEATHSIG).
+ */
+export const spawnerProcessSource = `"use strict";
+const handshake = { protocol: "${spawnerHandshake.protocol}", build: "${spawnerHandshake.build}" };
+${spawnerProcessBody}`;
 
 /** Entry of `t3 __process-spawner <windowBytes>`: single executables cannot evaluate `-e`. */
 export const runProcessSpawner = () => {

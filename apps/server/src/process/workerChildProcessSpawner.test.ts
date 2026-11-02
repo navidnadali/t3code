@@ -1163,12 +1163,20 @@ describe("WorkerChildProcessSpawner", () => {
           errors: [expect.stringContaining(`${spawner}=\\"childs\\"`)],
         };
         expect(yield* outcome({ [spawner]: "childs" })).toEqual(unknown);
+        for (const value of ["constructor", "__proto__"]) {
+          expect(yield* outcome({ [spawner]: value })).toEqual({
+            ...unset,
+            errors: [expect.stringContaining(`${spawner}=\\"${value}\\"`)],
+          });
+        }
         // Only an unset spawner knob defers to the worker knob.
         expect(yield* outcome({ [worker]: "true", [spawner]: "childs" })).toEqual(unknown);
         for (const value of ["default", "0", "false"]) {
           expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(unset);
         }
-        expect(yield* outcome({ [worker]: "true", [spawner]: "" })).toEqual(onWorker);
+        for (const value of ["", "  "]) {
+          expect(yield* outcome({ [worker]: "true", [spawner]: value })).toEqual(unset);
+        }
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

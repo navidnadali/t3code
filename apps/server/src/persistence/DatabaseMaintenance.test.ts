@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
@@ -9,6 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqlite from "node:sqlite";
 
 import * as DatabaseMaintenance from "./DatabaseMaintenance.ts";
 import * as Sqlite from "./Sqlite.ts";
@@ -101,6 +103,69 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
         }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath, readonly: true })));
         assert.isNull((yield* maintenance.inspect(dbPath)).legacyDatabaseBytes);
+      }).pipe(Effect.scoped),
+    );
+
+    it.effect("reports the compaction's outcome when the VACUUM after it fails", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const maintenance = yield* DatabaseMaintenance.DatabaseMaintenance;
+        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-compact-full-" });
+        const dbPath = path.join(baseDir, "userdata", "statev2.sqlite");
+        yield* Effect.flatMap(
+          ProjectionMaintenance.ProjectionMaintenanceV2,
+          (projections) => projections.rebuild,
+        ).pipe(
+          Effect.provide(
+            ProjectionMaintenance.layer.pipe(
+              Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+              Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+            ),
+          ),
+        );
+        // VACUUM fails as it does on a full disk; everything before it ran.
+        const run = NodeSqlite.StatementSync.prototype.run;
+        const all = NodeSqlite.StatementSync.prototype.all;
+        const full = (sql: string) => {
+          if (!/\bVACUUM\b/.test(sql)) return undefined;
+          const error = new Error("database or disk is full");
+          Object.assign(error, { code: "SQLITE_FULL" });
+          return error;
+        };
+        yield* Effect.acquireRelease(
+          Effect.sync(() => [
+            vi.spyOn(NodeSqlite.StatementSync.prototype, "run").mockImplementation(function (
+              this: NodeSqlite.StatementSync,
+              ...params
+            ) {
+              const error = full(this.sourceSQL);
+              if (error !== undefined) throw error;
+              return run.apply(this, params);
+            }),
+            vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
+              this: NodeSqlite.StatementSync,
+              ...params
+            ) {
+              const error = full(this.sourceSQL);
+              if (error !== undefined) throw error;
+              return all.apply(this, params);
+            }),
+          ]),
+          (spies) => Effect.sync(() => spies.forEach((spy) => spy.mockRestore())),
+        );
+        const error = yield* maintenance.compact(dbPath).pipe(Effect.flip);
+        assert.equal(error._tag, "DatabaseCompactError");
+        const compaction = error._tag === "DatabaseCompactError" ? error.compaction : undefined;
+        assert.deepEqual(compaction, {
+          deletedEventCount: 0,
+          deletedReceiptCount: 0,
+          repairedItemCountThreads: 0,
+        });
+        assert.include(
+          String(error._tag === "DatabaseCompactError" ? error.cause : ""),
+          "disk is full",
+        );
       }).pipe(Effect.scoped),
     );
 

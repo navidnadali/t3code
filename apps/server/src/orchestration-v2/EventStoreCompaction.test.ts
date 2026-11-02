@@ -530,10 +530,20 @@ const capturedLogs = (logs: Array<unknown>) =>
     mergeWithExisting: false,
   });
 
-const warned = (logs: ReadonlyArray<unknown>, text: string) =>
-  logs.some(
-    (entry) => Array.isArray(entry) && entry[0] === "Warn" && String(entry[1]).includes(text),
-  );
+/** The fields logged with the first warning whose text includes `text`. */
+const warning = (
+  logs: ReadonlyArray<unknown>,
+  text: string,
+): Record<string, unknown> | undefined => {
+  for (const entry of logs) {
+    if (!Array.isArray(entry) || entry[0] !== "Warn" || !Array.isArray(entry[1])) continue;
+    const [message, fields] = entry[1] as ReadonlyArray<unknown>;
+    if (String(message).includes(text) && typeof fields === "object" && fields !== null) {
+      return fields as Record<string, unknown>;
+    }
+  }
+  return undefined;
+};
 
 it.effect("skips the pass with a warning when the disk cannot hold the scratch store", () =>
   Effect.gen(function* () {
@@ -555,13 +565,19 @@ it.effect("skips the pass with a warning when the disk cannot hold the scratch s
     // The result says so, for `t3 db compact` and the doctor: where, how much is needed, how much there is.
     assert.deepEqual(summary.skipped, {
       scratchPath,
-      requiredBytes: CompactionScratch.requiredFreeBytes(before.length),
+      requiredBytes: Math.max(
+        CompactionScratch.requiredFreeBytes(before.length),
+        CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR,
+      ),
       freeBytes: 1,
       stage: "before",
     });
     const after = yield* scanRows();
     assert.equal(after.length, before.length);
-    assert.isTrue(warned(logs, "free space"), JSON.stringify(logs));
+    const fields = warning(logs, "Compaction skipped");
+    assert.isDefined(fields, JSON.stringify(logs));
+    assert.equal(fields?.sequenceBound, before.length);
+    assert.notProperty(fields ?? {}, "events");
     assert.isFalse(NodeFS.existsSync(scratchPath));
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );
@@ -669,8 +685,19 @@ it.effect(
         Effect.sync(() => void (rmSyncInterceptor.freeBytes = null)),
       );
       const betweenPages = Effect.sync(() => void (pages += 1));
-      const summary = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
+      const logs: Array<unknown> = [];
+      const summary = yield* maintenance
+        .compactEventStore(betweenPages, { scratchPath })
+        .pipe(
+          Effect.provide(capturedLogs(logs)),
+          Effect.provideService(References.MinimumLogLevel, "Debug"),
+        );
       assert.equal(summary.skipped?.stage, "during");
+      // The server log says what happened: stopped early, not skipped; and it names the sequence bound.
+      const fields = warning(logs, "Compaction stopped early");
+      assert.isDefined(fields, JSON.stringify(logs));
+      assert.equal(fields?.sequenceBound, before.length);
+      assert.isUndefined(warning(logs, "Compaction skipped"));
       assert.equal(summary.skipped?.scratchPath, scratchPath);
       assert.equal(summary.skipped?.freeBytes, 32 * 1024 * 1024);
       // What stopped the pass is the running floor, not the size estimate — the report must say so.
@@ -715,3 +742,29 @@ it("needs at most 256 bytes per event, and a megabyte however small the store", 
   assert.equal(CompactionScratch.requiredFreeBytes(1000), 1024 * 1024);
   assert.equal(CompactionScratch.requiredFreeBytes(1_000_000), 256_000_000);
 });
+
+it.effect(
+  "a disk below the running floor is reported as skipped before the pass, not stopped early",
+  () =>
+    Effect.gen(function* () {
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      yield* seedStore();
+      const before = yield* scanRows();
+      const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+      // Above the size estimate, below the floor a running pass insists on: it must not start at all.
+      rmSyncInterceptor.freeBytes = 32 * 1024 * 1024;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => void (rmSyncInterceptor.freeBytes = null)),
+      );
+      const summary = yield* maintenance.compactEventStore(Effect.void, { scratchPath });
+      assert.deepEqual(summary.skipped, {
+        scratchPath,
+        requiredBytes: CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR,
+        freeBytes: 32 * 1024 * 1024,
+        stage: "before",
+      });
+      assert.equal(summary.deletedEventCount, 0);
+      assert.equal((yield* scanRows()).length, before.length);
+      assert.isFalse(NodeFS.existsSync(scratchPath));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);

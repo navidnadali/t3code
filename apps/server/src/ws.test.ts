@@ -1586,3 +1586,157 @@ it.effect("a resumed shell subscriber never receives a shell older than one its 
     assert.include(titles, "c3");
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
+
+// Shell subscribers over gated reads: the shell read of a gated thread waits until released.
+const withGatedShellReads = <A, E, R>(
+  input: {
+    readonly gates: ReadonlyMap<string, Deferred.Deferred<void>>;
+    readonly title: (id: string) => string;
+  },
+  run: Effect.Effect<A, E, R>,
+) =>
+  run.pipe(
+    Effect.provide(
+      layerShellSubscribers({
+        getThreadShell: (id) =>
+          Effect.gen(function* () {
+            const gate = input.gates.get(id);
+            if (gate !== undefined) yield* Deferred.await(gate);
+            return {
+              id,
+              archivedAt: null,
+              title: input.title(id),
+            } as unknown as OrchestrationV2ThreadShell;
+          }),
+      }),
+    ),
+  );
+
+const settleHub = Effect.gen(function* () {
+  for (let round = 0; round < 4; round++) {
+    for (let step = 0; step < 200; step++) yield* Effect.yieldNow;
+    yield* TestClock.adjust(0);
+  }
+});
+
+const subscribeInto = (afterSequence: number, seen: Array<string>) =>
+  Effect.gen(function* () {
+    const stream = yield* subscribeOrchestrationV2Shell({
+      afterSequence,
+      requestCompletionMarker: true,
+    });
+    yield* stream.pipe(
+      Stream.runForEach((item) =>
+        Effect.sync(() => {
+          seen.push(
+            item.kind === "thread.updated"
+              ? `${item.thread.id}@${item.sequence}:${(item.thread as { title: string }).title}`
+              : item.kind,
+          );
+        }),
+      ),
+      Effect.forkScoped,
+    );
+  });
+
+// Sol (hub-only, RC2 pass 2) SOL-1: the replay read A before the hub did, then waited on B; the hub's newer A must survive.
+it.effect(
+  "a hub delta read after the replay's read of its thread is delivered even if the replay finished later",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const a = ThreadId.make("thread:order-a");
+      const b = ThreadId.make("thread:order-b");
+      let titleA = "a1";
+      const gateB = yield* Deferred.make<void>();
+      const seen: Array<string> = [];
+      yield* insertShellEvent(sql, a, 0);
+      yield* insertShellEvent(sql, b, 0);
+      yield* withGatedShellReads(
+        {
+          gates: new Map([[b, gateB]]),
+          title: (id) => (id === a ? titleA : "b"),
+        },
+        Effect.gen(function* () {
+          yield* subscribeInto(0, seen);
+          yield* settleHub;
+          // The replay has read A (a1) and waits on B; the hub now reads A anew.
+          titleA = "a2";
+          yield* publishShellEvent(sql, a, 1);
+          yield* settleHub;
+          yield* Deferred.succeed(gateB, undefined);
+          yield* settleHub;
+          yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+          yield* settleHub;
+        }).pipe(Effect.scoped),
+      );
+      const afterSync = seen.slice(seen.indexOf("synchronized") + 1);
+      assert.include(seen.join(" "), `${a}@`, seen.join(" "));
+      assert.isTrue(
+        afterSync.some((item) => item.endsWith(":a2")),
+        `newer A lost: ${seen.join(" ")}`,
+      );
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// SOL-2: a hub batch that read A before the replay did (the shared read then expired) and publishes
+// after the live tail opened must not deliver the older A.
+it.effect(
+  "a hub batch published after the live tail opened cannot deliver a shell older than the replay's",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const a = ThreadId.make("thread:late-a");
+      const c = ThreadId.make("thread:late-c");
+      const slow = Array.from({ length: 9 }, (_, index) =>
+        ThreadId.make(`thread:late-slow-${index}`),
+      );
+      let titleA = "a1";
+      const gateC = yield* Deferred.make<void>();
+      const gateSlow = yield* Deferred.make<void>();
+      const keeper: Array<string> = [];
+      const seen: Array<string> = [];
+      yield* withGatedShellReads(
+        {
+          gates: new Map([[c, gateC], ...slow.map((id) => [id, gateSlow] as const)]),
+          title: (id) => (id === a ? titleA : id === c ? "c" : "slow"),
+        },
+        Effect.gen(function* () {
+          yield* subscribeInto(0, keeper);
+          yield* settleHub;
+          // The resuming subscriber's replay has nine gated threads ahead of A, so its read of A comes late.
+          for (const [index, id] of slow.entries()) yield* insertShellEvent(sql, id, index);
+          const last = yield* insertShellEvent(sql, a, 0);
+          yield* subscribeInto(0, seen);
+          yield* settleHub;
+          // Meanwhile one hub batch reads A (a1) and then waits on C, so it publishes late.
+          const cSeq = yield* insertShellEvent(sql, c, 1);
+          const aSeq = yield* insertShellEvent(sql, a, 1);
+          const events = yield* store
+            .readApplicationEvents({ afterSequence: cSeq - 1, throughSequence: aSeq })
+            .pipe(Stream.runCollect);
+          yield* store.publishCommitted(events);
+          yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+          yield* settleHub;
+          // The shared read of A expires before the replay gets to A, which then reads a2.
+          yield* TestClock.adjust(ThreadManagement.SHARED_SHELL_READ_TTL_MS + 1_000);
+          titleA = "a2";
+          yield* Deferred.succeed(gateSlow, undefined);
+          yield* settleHub;
+          assert.include(seen, "synchronized", seen.join(" "));
+          yield* Deferred.succeed(gateC, undefined);
+          yield* settleHub;
+          yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+          yield* settleHub;
+          assert.isAbove(aSeq, last);
+        }).pipe(Effect.scoped),
+      );
+      // The late batch did publish: the keeper got C and the older A.
+      assert.include(keeper.join(" "), `${c}@`, `keeper: ${keeper.join(" ")}`);
+      const titlesA = seen
+        .filter((item) => item.startsWith(`${a}@`))
+        .map((item) => item.slice(item.lastIndexOf(":") + 1));
+      assert.deepEqual(titlesA, ["a2"], `older A delivered after the newer one: ${seen.join(" ")}`);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);

@@ -27,6 +27,7 @@ import {
   STAGE_INSTALL_ARGS,
 } from "./build-desktop-artifact.ts";
 import { assertLinuxArm64PageCompatibility } from "./lib/linux-arm64-sea.ts";
+import { PROCESS_SPAWNER_EXECUTABLE } from "./lib/process-spawner-sea.ts";
 import { selectCliRuntimeExternalDependencies } from "./lib/cli-external-packages.ts";
 import { signWithJsign } from "./lib/windows-jsign.ts";
 import { windowsSystemTar } from "./lib/windows-tar.ts";
@@ -256,6 +257,7 @@ const bundleLinuxLibatomic = Effect.fn("bundleLinuxLibatomic")(function* (input:
   readonly repoRoot: string;
   readonly contentDir: string;
   readonly executablePath: string;
+  readonly otherExecutablePaths: ReadonlyArray<string>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -307,10 +309,12 @@ const bundleLinuxLibatomic = Effect.fn("bundleLinuxLibatomic")(function* (input:
   );
 
   // RUNPATH resolves through symlinks and is not inherited by child processes, unlike LD_LIBRARY_PATH.
-  yield* runCommand(
-    ChildProcess.make("patchelf", ["--set-rpath", "$ORIGIN/lib", input.executablePath]),
-    "patchelf --set-rpath",
-  );
+  for (const executablePath of [input.executablePath, ...input.otherExecutablePaths]) {
+    yield* runCommand(
+      ChildProcess.make("patchelf", ["--set-rpath", "$ORIGIN/lib", executablePath]),
+      "patchelf --set-rpath",
+    );
+  }
   yield* Effect.log(`[cli-archive] Bundled ${source} as lib/libatomic.so.1.`);
 });
 
@@ -326,6 +330,7 @@ const signMacArchiveContents = Effect.fn("signMacArchiveContents")(function* (in
   readonly repoRoot: string;
   readonly contentDir: string;
   readonly executablePath: string;
+  readonly otherExecutablePaths: ReadonlyArray<string>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -343,14 +348,15 @@ const signMacArchiveContents = Effect.fn("signMacArchiveContents")(function* (in
     )
     .map((entry) => path.join(input.contentDir, entry));
 
-  for (const target of [...libraries, input.executablePath]) {
+  const executables = [input.executablePath, ...input.otherExecutablePaths];
+  for (const target of [...libraries, ...executables]) {
     yield* runCommand(
       ChildProcess.make("codesign", [
         "--force",
         "--sign",
         identity,
         ...(identity === "-" ? [] : ["--options", "runtime", "--timestamp"]),
-        ...(target === input.executablePath ? ["--entitlements", entitlements] : []),
+        ...(executables.includes(target) ? ["--entitlements", entitlements] : []),
         target,
       ]),
       `codesign ${path.relative(input.contentDir, target)}`,
@@ -371,27 +377,30 @@ const signMacArchiveContents = Effect.fn("signMacArchiveContents")(function* (in
     return;
   }
   // notarytool requires an archive; bare executables rely on online tickets because they cannot be stapled.
-  const notarizeZip = path.join(path.dirname(input.executablePath), ".notarize-t3.zip");
-  yield* runCommand(
-    ChildProcess.make("ditto", ["-c", "-k", "--keepParent", input.executablePath, notarizeZip]),
-    "ditto (notarization zip)",
-  );
-  yield* runCommand(
-    ChildProcess.make("xcrun", [
-      "notarytool",
-      "submit",
-      notarizeZip,
-      "--key",
-      apiKey,
-      "--key-id",
-      apiKeyId,
-      "--issuer",
-      apiIssuer,
-      "--wait",
-    ]),
-    "notarytool submit",
-  ).pipe(Effect.ensuring(fs.remove(notarizeZip, { force: true }).pipe(Effect.ignore)));
-  yield* Effect.log("[cli-archive] Notarized t3.");
+  for (const executablePath of executables) {
+    const name = path.basename(executablePath);
+    const notarizeZip = path.join(path.dirname(executablePath), `.notarize-${name}.zip`);
+    yield* runCommand(
+      ChildProcess.make("ditto", ["-c", "-k", "--keepParent", executablePath, notarizeZip]),
+      "ditto (notarization zip)",
+    );
+    yield* runCommand(
+      ChildProcess.make("xcrun", [
+        "notarytool",
+        "submit",
+        notarizeZip,
+        "--key",
+        apiKey,
+        "--key-id",
+        apiKeyId,
+        "--issuer",
+        apiIssuer,
+        "--wait",
+      ]),
+      "notarytool submit",
+    ).pipe(Effect.ensuring(fs.remove(notarizeZip, { force: true }).pipe(Effect.ignore)));
+    yield* Effect.log(`[cli-archive] Notarized ${name}.`);
+  }
 });
 
 const WindowsSigningConfig = Config.all({
@@ -520,6 +529,18 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
 
   yield* Effect.log(`[cli-archive] Staging ${stem}...`);
   yield* fs.copyFile(builtExecutable, path.join(contentDir, executableName));
+  // Built for the host only; without it t3 starts its spawner from its own, much larger bundle.
+  const builtSpawner = path.join(serverDir, "dist-exe", PROCESS_SPAWNER_EXECUTABLE);
+  const otherExecutablePaths: Array<string> = [];
+  if (input.platform !== "win" && targetKey === hostKey && (yield* fs.exists(builtSpawner))) {
+    const spawnerPath = path.join(contentDir, PROCESS_SPAWNER_EXECUTABLE);
+    yield* fs.copyFile(builtSpawner, spawnerPath);
+    otherExecutablePaths.push(spawnerPath);
+  } else if (input.platform !== "win") {
+    yield* Effect.logWarning(
+      `[cli-archive] No ${PROCESS_SPAWNER_EXECUTABLE} for ${targetKey}; t3 starts its spawner from its own bundle.`,
+    );
+  }
   yield* stageWebClient(webClient, path.join(contentDir, "client"));
   yield* fs.copy(resourceMonitorDir, path.join(contentDir, "resource-monitor"));
   yield* stageRuntimeExternals({
@@ -532,20 +553,22 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
 
   const executablePath = path.join(contentDir, executableName);
   if (input.platform === "linux") {
-    yield* bundleLinuxLibatomic({ repoRoot, contentDir, executablePath });
+    yield* bundleLinuxLibatomic({ repoRoot, contentDir, executablePath, otherExecutablePaths });
   }
   // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
   if (input.platform === "linux" && input.arch === "arm64") {
-    const bytes = yield* fs.readFile(executablePath);
-    yield* Effect.try(() => assertLinuxArm64PageCompatibility(bytes));
+    for (const target of [executablePath, ...otherExecutablePaths]) {
+      const bytes = yield* fs.readFile(target);
+      yield* Effect.try(() => assertLinuxArm64PageCompatibility(bytes));
+    }
   }
   if (input.platform === "mac") {
-    yield* signMacArchiveContents({ repoRoot, contentDir, executablePath });
+    yield* signMacArchiveContents({ repoRoot, contentDir, executablePath, otherExecutablePaths });
   } else if (input.platform === "win") {
     yield* signWindowsExecutable(executablePath);
   }
   if (input.platform !== "win") {
-    yield* fs.chmod(executablePath, 0o755);
+    for (const target of [executablePath, ...otherExecutablePaths]) yield* fs.chmod(target, 0o755);
   }
 
   yield* fs.makeDirectory(input.outputDir, { recursive: true });

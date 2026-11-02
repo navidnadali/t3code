@@ -35,6 +35,7 @@ export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (
   outputPath: string;
   nodeVersion: string;
   verbose: boolean;
+  mainFormat?: "module" | "commonjs";
 }) {
   // The copied execPath is the shipped runtime; vp pack only checks its own Node.
   if (process.versions.node !== input.nodeVersion) {
@@ -52,7 +53,7 @@ export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (
     yield* encodeJson({
       main: input.bundlePath,
       output: blobPath,
-      mainFormat: "module",
+      mainFormat: input.mainFormat ?? "module",
       disableExperimentalSEAWarning: true,
       // Node SEA useCodeCache breaks import(), which the server needs.
       useCodeCache: false,

@@ -674,8 +674,7 @@ it.effect("shell subscribers share one thread shell read per event", () =>
               Layer.provide(
                 Layer.mock(Orchestrator.OrchestratorV2)({
                   listActiveSubagentThreadIds: () => Effect.succeed([]),
-                  getThreadShell: (id) =>
-                    Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
+                  getThreadShell: (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
                 }),
               ),
               Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),

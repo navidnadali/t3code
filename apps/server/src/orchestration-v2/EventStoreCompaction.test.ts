@@ -551,6 +551,13 @@ it.effect("skips the pass with a warning when the disk cannot hold the scratch s
       );
     assert.equal(summary.deletedEventCount, 0);
     assert.equal(summary.trackedKeys, 0);
+    // The result says so, for `t3 db compact` and the doctor: where, how much is needed, how much there is.
+    assert.deepEqual(summary.skipped, {
+      scratchPath,
+      requiredBytes: CompactionScratch.requiredFreeBytes(before.length),
+      freeBytes: 1,
+      stage: "before",
+    });
     const after = yield* scanRows();
     assert.equal(after.length, before.length);
     assert.isTrue(warned(logs, "free space"), JSON.stringify(logs));
@@ -630,3 +637,60 @@ it.effect("a stale scratch file is removed before the free space it occupies is 
     assert.isFalse(NodeFS.existsSync(scratchPath));
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );
+
+it.effect(
+  "stops a running pass when the disk fills up, keeping what it deleted and saying why",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      yield* seedStore();
+      const before = yield* scanRows();
+      const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+      // Plenty of room when the pass starts; nothing left after its first page.
+      let pages = 0;
+      rmSyncInterceptor.freeBytes = () => (pages === 0 ? 1 << 30 : 0);
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => void (rmSyncInterceptor.freeBytes = null)),
+      );
+      const betweenPages = Effect.sync(() => void (pages += 1));
+      const summary = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
+      assert.equal(summary.skipped?.stage, "during");
+      assert.equal(summary.skipped?.scratchPath, scratchPath);
+      assert.equal(summary.skipped?.freeBytes, 0);
+      assert.isAbove(summary.skipped?.requiredBytes ?? 0, 0);
+      const after = yield* sql<{ readonly sequence: number }>`
+      SELECT sequence FROM orchestration_events ORDER BY sequence
+    `;
+      // What the first page deleted stays deleted; the rest of the store is untouched.
+      assert.equal(before.length - after.length, summary.deletedEventCount);
+      assert.isBelow(summary.deletedEventCount, referenceCompaction(before).obsolete.size);
+      for (const file of [
+        scratchPath,
+        `${scratchPath}-journal`,
+        `${scratchPath}-wal`,
+        `${scratchPath}-shm`,
+      ]) {
+        assert.isFalse(NodeFS.existsSync(file), file);
+      }
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+it.effect("removes a rollback journal left beside the scratch file", () =>
+  Effect.gen(function* () {
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seedStore();
+    const reference = referenceCompaction(yield* scanRows());
+    const scratchPath = NodePath.join(yield* scratchDir, "compaction-scratch.sqlite");
+    NodeFS.writeFileSync(`${scratchPath}-journal`, "stale");
+    const summary = yield* maintenance.compactEventStore(Effect.void, { scratchPath });
+    assert.equal(summary.deletedEventCount, reference.obsolete.size);
+    assert.isFalse(NodeFS.existsSync(`${scratchPath}-journal`));
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);
+
+it("needs at most 256 bytes per event, and a megabyte however small the store", () => {
+  assert.equal(CompactionScratch.requiredFreeBytes(0), 1024 * 1024);
+  assert.equal(CompactionScratch.requiredFreeBytes(1000), 1024 * 1024);
+  assert.equal(CompactionScratch.requiredFreeBytes(1_000_000), 256_000_000);
+});

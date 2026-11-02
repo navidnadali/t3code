@@ -3,6 +3,7 @@ import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -21,6 +22,7 @@ const stores = Layer.mergeAll(
   ProjectionStore.layer.pipe(Layer.provideMerge(database)),
 );
 const layerTest = Layer.mergeAll(stores, ProjectionMaintenance.layer.pipe(Layer.provide(stores)));
+const isMaintenanceError = Schema.is(ProjectionMaintenance.ProjectionMaintenanceError);
 
 interface SeedEvent {
   readonly kind: string;
@@ -484,10 +486,7 @@ it.effect("a failure while preparing the scratch store fails the pass and leaves
       .compactEventStore(Effect.void, { scratchPath })
       .pipe(Effect.flip);
     const inner = error.cause;
-    assert.isTrue(
-      inner instanceof ProjectionMaintenance.ProjectionMaintenanceError &&
-        inner.operation === "compaction scratch store",
-    );
+    assert.isTrue(isMaintenanceError(inner) && inner.operation === "compaction scratch store");
     for (const file of [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`]) {
       assert.isFalse(NodeFS.existsSync(file), file);
     }

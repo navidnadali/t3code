@@ -78,10 +78,26 @@ const encodeEntityKey = Schema.encodeSync(
 const SCRATCH_CACHE_KIB = 32768;
 const SCRATCH_PAGE_SIZE = 8192;
 
+const scratchFiles = (scratchPath: string | undefined) =>
+  scratchPath === undefined ? [] : [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`];
+
 const removeScratchFiles = (scratchPath: string | undefined) => {
-  if (scratchPath === undefined) return;
-  for (const file of [scratchPath, `${scratchPath}-wal`, `${scratchPath}-shm`]) {
-    NodeFS.rmSync(file, { force: true });
+  for (const file of scratchFiles(scratchPath)) NodeFS.rmSync(file, { force: true });
+};
+
+/** Tear-down steps, each attempted whatever the previous one did; the scratch store is disposable. */
+const scratchCleanup = (db: NodeSqlite.DatabaseSync, scratchPath: string | undefined) => [
+  ["close", () => db.close()] as const,
+  ...scratchFiles(scratchPath).map(
+    (file) => [`remove ${file}`, () => NodeFS.rmSync(file, { force: true })] as const,
+  ),
+];
+
+const quietly = (step: () => void) => {
+  try {
+    step();
+  } catch {
+    return;
   }
 };
 
@@ -135,17 +151,28 @@ const openScratch = (scratchPath: string | undefined) =>
             },
           };
         } catch (cause) {
-          db.close();
+          // The setup failure is the one reported; nothing of the store may stay behind.
+          for (const [, step] of scratchCleanup(db, scratchPath)) quietly(step);
           throw cause;
         }
       },
       catch: scratchError,
     }),
+    // A cleanup failure is logged, never raised: the pass's result stands and the schedule goes on.
     ({ db }) =>
-      Effect.sync(() => {
-        db.close();
-        removeScratchFiles(scratchPath);
-      }),
+      Effect.forEach(
+        scratchCleanup(db, scratchPath),
+        ([what, step]) =>
+          Effect.try({
+            try: step,
+            catch: (cause) => new ProjectionMaintenanceError({ operation: what, cause }),
+          }).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Compaction scratch store cleanup failed", { cause: error }),
+            ),
+          ),
+        { discard: true },
+      ),
   );
 
 export const layer: Layer.Layer<

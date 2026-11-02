@@ -78,6 +78,40 @@ interface HubInstance {
 const aggregateKey = (stored: ShellApplicationEvent) =>
   "aggregateKind" in stored ? `project:${stored.aggregateId}` : `thread:${stored.event.threadId}`;
 
+type GatedShellDelta = VersionedShellDelta | { readonly flush: number };
+
+class ShellDeltaGate {
+  afterSequence: number | undefined;
+  readonly held: Map<string, VersionedShellDelta>;
+  constructor(input: {
+    readonly afterSequence: number | undefined;
+    readonly held: Map<string, VersionedShellDelta>;
+  }) {
+    this.afterSequence = input.afterSequence;
+    this.held = input.held;
+  }
+  pass(chunk: ReadonlyArray<GatedShellDelta>): ReadonlyArray<VersionedShellDelta> {
+    const out: Array<VersionedShellDelta> = [];
+    for (const entry of chunk) {
+      if ("flush" in entry) {
+        this.afterSequence = entry.flush;
+        const held = Array.from(this.held.values()).sort((a, b) => a.sequence - b.sequence);
+        this.held.clear();
+        for (const delta of held) if (delta.sequence > entry.flush) out.push(delta);
+      } else if (this.afterSequence === undefined) {
+        const key = shellDeltaKey(entry.item);
+        const previous = this.held.get(key);
+        if (previous === undefined || previous.sequence < entry.sequence) {
+          this.held.set(key, entry);
+        }
+      } else if (entry.sequence > this.afterSequence) {
+        out.push(entry);
+      }
+    }
+    return out;
+  }
+}
+
 const make = Effect.gen(function* () {
   const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -197,12 +231,25 @@ const make = Effect.gen(function* () {
     const subscription = yield* PubSub.subscribe(instance.output).pipe(
       Scope.provide(subscriptionScope),
     );
+    const started = yield* Deferred.make<number>();
     const source = Stream.fromSubscription(subscription).pipe(
       Stream.flatMap(Stream.fromIterable),
+      Stream.merge(
+        Stream.fromEffect(Deferred.await(started)).pipe(
+          Stream.map((afterSequence): GatedShellDelta => ({ flush: afterSequence })),
+        ),
+      ),
       Stream.merge(Stream.fromEffect(Deferred.await(instance.failed))),
       Stream.ensuring(Scope.close(subscriptionScope, Exit.void)),
+      // Until the stream is taken, the latest delta per aggregate is held (the snapshot read
+      // meanwhile covers everything at or below its sequence); from then on deltas pass through.
+      Stream.mapAccumArray(
+        () => new ShellDeltaGate({ afterSequence: undefined, held: new Map() }),
+        (gate, chunk) => [gate, gate.pass(chunk)],
+      ),
+      // Skipping before the budget: an unchanged shell a subscriber already holds is never charged.
+      skipUnchangedShellDeltas,
     );
-    // Drained from now on, so a subscriber still loading its snapshot holds one delta per aggregate.
     const deltas = yield* startBufferLatestLiveStream(
       source,
       (delta) => shellDeltaKey(delta.item),
@@ -210,9 +257,10 @@ const make = Effect.gen(function* () {
     );
     return {
       stream: (afterSequence) =>
-        deltas.pipe(
-          Stream.filter((delta) => delta.sequence > afterSequence),
-          skipUnchangedShellDeltas,
+        Stream.unwrap(
+          Deferred.succeed(started, afterSequence).pipe(
+            Effect.as(deltas.pipe(Stream.map((delta) => delta.item))),
+          ),
         ),
     };
   });

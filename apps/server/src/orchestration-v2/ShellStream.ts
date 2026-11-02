@@ -676,7 +676,7 @@ export function makeThreadShellVersions() {
  */
 export function skipUnchangedShellDeltas<E, R>(
   stream: Stream.Stream<VersionedShellDelta, E, R>,
-): Stream.Stream<ShellDelta, E, R> {
+): Stream.Stream<VersionedShellDelta, E, R> {
   return Stream.suspend(() => {
     const lastSent = new Map<ThreadId, { readonly version: number; readonly sentAt: number }>();
     return stream.pipe(
@@ -699,7 +699,6 @@ export function skipUnchangedShellDeltas<E, R>(
           return true;
         }),
       ),
-      Stream.map((delta) => delta.item),
     );
   });
 }

@@ -410,7 +410,7 @@ it.effect.each([
         );
         yield* Effect.forEach(reads, (read) => read.running);
         assert.lengthOf(started, 4);
-        yield* Effect.all(reads.map((read) => read.release));
+        yield* Effect.forEach(reads, (read) => read.release);
       }),
     { readerPoolSize: 4 },
   ),

@@ -683,12 +683,20 @@ const makeReader = Effect.fnUntraced(function* (
 
     const request = (input: ReaderRequest) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
-        const begins = beginsTransaction(input.sql);
+        // Only a plain control (no bindings, not raw) is answered here; with bindings SQLite has an
+        // error to return, and a raw control has a run() result.
+        const control = input.params.length === 0 && !input.raw;
+        const begins = control && beginsTransaction(input.sql);
         if (begins && !pendingBegin && !inTransaction) {
           pendingBegin = true;
           return Effect.succeed([]);
         }
-        if (!begins && endsReadTransaction(input.sql) && (pendingBegin || inTransaction)) {
+        if (
+          control &&
+          !begins &&
+          endsReadTransaction(input.sql) &&
+          (pendingBegin || inTransaction)
+        ) {
           // Ending a read transaction only drops a shared lock: it cannot fail or lose anything, so
           // nothing waits for it. The worker still runs it before the next claimant's statements.
           if (pendingBegin) pendingBegin = false;

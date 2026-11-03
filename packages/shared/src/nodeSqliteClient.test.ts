@@ -1548,10 +1548,11 @@ it.effect("leaves a transaction control with bindings or a raw result to SQLite"
       assert.deepEqual(committed, { changes: 0, lastInsertRowid: 0 });
       assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
       yield* eventLoopTurn;
+      // The raw BEGIN inside the transaction was its first statement, so it carried the folded one.
       const shapes = messageShapes(startedWorkers[before]!);
       assert.deepEqual(
         shapes.filter((shape) => shape.startsWith("begin+")),
-        ["begin+SELECT", "begin+SELECT"],
+        ["begin+SELECT", "begin+BEGIN", "begin+SELECT"],
         shapes.join(" "),
       );
     }),

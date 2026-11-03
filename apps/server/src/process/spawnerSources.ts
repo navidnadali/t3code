@@ -226,7 +226,10 @@ const startHandoff = (message) => {
   child.on("spawn", () => {
     if (cancelled) return;
     for (const fd of fds) {
-      process.send({ t: "handoff-fd", id, fd }, child.stdio[fd], { keepOpen: false }, (error) => {
+      const stream = child.stdio[fd];
+      process.send({ t: "handoff-fd", id, fd }, stream, { keepOpen: false }, (error) => {
+        // Its descriptor now travels on its own; the wrapper closes, so the child can close too.
+        stream.destroy();
         if (error === null || error === undefined || cancelled) return;
         handoffs.delete(id);
         cancel();

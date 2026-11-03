@@ -62,6 +62,7 @@ import {
   OrchestrationV2ThreadLaunchError,
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
+  type OrchestrationV2ShellStreamItem,
   type OrchestrationV2ThreadStreamItem,
   type ApplicationStoredEvent,
   type ProjectEntriesFailure,
@@ -139,10 +140,12 @@ import {
   shellStreamItemsFromResumeSnapshot,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
+  trimSubscriberShellSnapshot,
   type ShellApplicationEvent,
   type ShellDelta,
 } from "./orchestration-v2/ShellStream.ts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
+import { resyncOnLiveOverflow } from "./orchestration-v2/LiveStreamBudget.ts";
 import {
   coalesceLiveUpdatedEvents,
   coalesceThreadLiveStream,
@@ -912,48 +915,70 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         ? Stream.make({ kind: "synchronized" as const })
         : Stream.empty;
 
-    const snapshotThenLive = Effect.fn("ws.orchestrationV2.threadSnapshotThenLive")(function* () {
-      const useBoundedSnapshot = shouldUseBoundedThreadSnapshot(input);
-      const snapshot = yield* (
-        useBoundedSnapshot
-          ? threadManagement.getThreadSnapshotWindow(input.threadId, {
-              rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
-              deferWork: input.acceptDeferredWork === true,
-              userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+    const snapshotThenLive = Effect.fn("ws.orchestrationV2.threadSnapshotThenLive")(
+      function* (options?: { readonly resync?: boolean }) {
+        const useBoundedSnapshot = shouldUseBoundedThreadSnapshot(input);
+        const snapshot = yield* (
+          useBoundedSnapshot
+            ? threadManagement.getThreadSnapshotWindow(input.threadId, {
+                rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
+                deferWork: input.acceptDeferredWork === true,
+                userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+              })
+            : threadManagement.getThreadSnapshot(input.threadId)
+        ).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestrationV2GetThreadProjectionError({
+                threadId: input.threadId,
+                message: `Failed to load orchestration V2 thread ${input.threadId}`,
+                cause,
+              }),
+          ),
+        );
+        const { snapshotSequence } = snapshot;
+        const snapshotItem = useBoundedSnapshot
+          ? buildBoundedThreadStreamSnapshot({
+              ...snapshot,
+              compactTurnItems: input.acceptCompactTurnItems === true,
+              dedupeBodies,
+              compactIds: input.acceptCompactIds === true,
             })
-          : threadManagement.getThreadSnapshot(input.threadId)
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestrationV2GetThreadProjectionError({
+          : (() => {
+              const projection = projectThreadProjectionForWire(snapshot.projection);
+              return {
+                kind: "snapshot" as const,
+                snapshotSequence,
+                projection: dedupeBodies ? dedupeSnapshotBodies(projection) : projection,
+              };
+            })();
+        if (options?.resync === true) {
+          yield* Effect.logWarning(
+            "orchestration thread stream resynchronized after a live buffer overflow",
+            {
               threadId: input.threadId,
-              message: `Failed to load orchestration V2 thread ${input.threadId}`,
-              cause,
-            }),
-        ),
-      );
-      const { snapshotSequence } = snapshot;
-      const snapshotItem = useBoundedSnapshot
-        ? buildBoundedThreadStreamSnapshot({
-            ...snapshot,
-            compactTurnItems: input.acceptCompactTurnItems === true,
-            dedupeBodies,
-            compactIds: input.acceptCompactIds === true,
-          })
-        : (() => {
-            const projection = projectThreadProjectionForWire(snapshot.projection);
-            return {
-              kind: "snapshot" as const,
               snapshotSequence,
-              projection: dedupeBodies ? dedupeSnapshotBodies(projection) : projection,
-            };
-          })();
-      return rpcInitialItems([snapshotItem]).pipe(
-        Stream.concat(completionMarker),
-        Stream.concat(eventStreamFrom(snapshotSequence)),
-        withLiveDedupe,
-      );
-    });
+            },
+          );
+        }
+        return rpcInitialItems([snapshotItem]).pipe(
+          Stream.concat(options?.resync === true ? Stream.empty : completionMarker),
+          Stream.concat(eventStreamFrom(snapshotSequence)),
+          withLiveDedupe,
+        );
+      },
+    );
+
+    // A subscriber that falls more than its live buffer behind gets a fresh snapshot and
+    // continues live from it, with a fresh body deduper for the records it now holds. The
+    // snapshot is loaded when the client next pulls, so a client that never acknowledges
+    // never costs one.
+    const resyncOnOverflow = (
+      segment: Stream.Stream<
+        OrchestrationV2ThreadStreamItem,
+        OrchestrationV2GetThreadProjectionError
+      >,
+    ) => resyncOnLiveOverflow(segment, () => snapshotThenLive({ resync: true }));
 
     // Subscribe before reading persisted events to retain concurrent publishes; clients dedupe overlap by sequence.
     if (input.afterSequence !== undefined) {
@@ -968,7 +993,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         ),
       );
       if (input.afterSequence > highWater) {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
       const stats = yield* applicationEvents
         .getAgentReplayStats({
@@ -992,7 +1017,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         stats.eventCount > THREAD_RESUME_MAX_REPLAY_EVENTS ||
         !isThreadReplayRawPayloadSafe(stats.rawPayloadBytes)
       ) {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
       if (stats.hasCreateEvent) {
         const shell = yield* threadManagement.getThreadShell(input.threadId).pipe(
@@ -1006,7 +1031,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
           ),
         );
         // Retained creation events may describe deleted threads; replace replay only if a snapshot exists.
-        if (shell !== null) return yield* snapshotThenLive();
+        if (shell !== null) return resyncOnOverflow(yield* snapshotThenLive());
       }
       const replay = coalesceLiveUpdatedEvents(
         yield* loadReplayThrough(input.afterSequence, highWater),
@@ -1018,16 +1043,18 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         replayEncodedBytes: threadReplayEncodedBytes(replay),
       });
       if (plan.mode === "snapshot") {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
-      return rpcInitialItems(replay).pipe(
-        Stream.concat(completionMarker),
-        Stream.concat(eventStreamFrom(highWater)),
-        withLiveDedupe,
+      return resyncOnOverflow(
+        rpcInitialItems(replay).pipe(
+          Stream.concat(completionMarker),
+          Stream.concat(eventStreamFrom(highWater)),
+          withLiveDedupe,
+        ),
       );
     }
 
-    return yield* snapshotThenLive();
+    return resyncOnOverflow(yield* snapshotThenLive());
   },
 );
 
@@ -1051,9 +1078,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     // Subscribe before the snapshot or high-water read: the hub projects every later event once for all subscribers.
     const hub = yield* ShellDeltaHub.ShellDeltaHub;
     const shellDeltas = yield* hub.subscribe();
+    // Given `rows` (a resync base's), the projects are not listed again; only their enrichment is.
     const loadProjectMetadataSnapshot = Effect.fn("ws.orchestrationV2.loadProjectMetadataSnapshot")(
-      function* (snapshotSequence: number) {
-        const enriched = yield* enrichProjectShells(yield* projects.listShells());
+      function* (snapshotSequence: number, rows?: ReadonlyArray<OrchestrationProjectShell>) {
+        const enriched = yield* enrichProjectShells(rows ?? (yield* projects.listShells()));
         return {
           snapshot: {
             schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
@@ -1105,6 +1133,12 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
             }),
           )
         : Effect.succeed(item);
+    const withRepositoryIdentityItems = (
+      items: ReadonlyArray<ShellDelta>,
+    ): Effect.Effect<ReadonlyArray<ShellDelta>> =>
+      items.some((item) => item.kind === "project.updated")
+        ? Effect.forEach(items, withRepositoryIdentityItem)
+        : Effect.succeed(items);
     const withRepositoryIdentity = <E, R>(
       stream: Stream.Stream<ShellDelta, E, R>,
     ): Stream.Stream<ShellDelta, E, R> =>
@@ -1140,8 +1174,80 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         withRepositoryIdentity,
       );
 
+    // The hub emptied this subscriber's buffer and read one base for every subscriber it emptied
+    // at the same time; the subscriber's own trims and the base's project rows, with their
+    // identities, make its snapshot here.
+    const resyncSnapshot = Effect.fn("ws.orchestrationV2.resyncShellSnapshot")(
+      function* (base: ShellDeltaHub.ShellResyncBase) {
+        const enriched = yield* enrichProjectShells(base.projects);
+        const trimmed = trimSubscriberShellSnapshot(
+          {
+            schemaVersion: base.schemaVersion,
+            snapshotSequence: base.snapshotSequence,
+            projects: enriched.projects,
+            threads: base.threads,
+            archivedThreads: [],
+          },
+          {
+            omitIdleSubagents: input.omitIdleSubagents === true,
+            omitOlderSettled: input.omitOlderSettled === true,
+            now: yield* DateTime.now,
+          },
+        );
+        yield* Effect.logWarning(
+          "orchestration shell stream resynchronized after a live buffer overflow",
+          { snapshotSequence: base.snapshotSequence },
+        );
+        return shellStreamItemsFromInitialSnapshot({
+          snapshot: trimmed.snapshot,
+          resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
+        });
+      },
+      Effect.provideService(ProjectEnrichmentService.ProjectEnrichmentService, projectEnrichment),
+    );
+    // Enrichment keeps flowing during a resync, so a refresh can reach the client before the
+    // snapshot that introduces its project: the resolved identities are re-sent after it, read
+    // once the snapshot has been taken.
+    const resyncResend = (base: ShellDeltaHub.ShellResyncBase) =>
+      loadProjectMetadataSnapshot(base.snapshotSequence, base.projects).pipe(
+        Effect.provideService(ProjectEnrichmentService.ProjectEnrichmentService, projectEnrichment),
+        Effect.map((loaded) =>
+          shellStreamItemsFromResumeSnapshot({
+            snapshot: loaded.snapshot,
+            resolvedRepositoryIdentityRoots: loaded.resolvedRepositoryIdentityRoots,
+          }),
+        ),
+      );
+    // Every chunk the hub sends stays one chunk here (the RPC server waits for a client
+    // acknowledgement per chunk): a batch of deltas gets its repository identities; a `resync`,
+    // which the hub sends alone, becomes the snapshot chunk and then the re-sent identities.
     const liveFrom = (afterSequence: number) =>
-      withRepositoryIdentity(shellDeltas.stream(afterSequence, replayReads));
+      shellDeltas.stream(afterSequence, replayReads).pipe(
+        Stream.chunks,
+        Stream.flatMap(
+          (
+            chunk,
+          ): Stream.Stream<
+            OrchestrationV2ShellStreamItem,
+            | Effect.Error<ReturnType<typeof resyncSnapshot>>
+            | Effect.Error<ReturnType<typeof resyncResend>>
+          > => {
+            const first = chunk[0];
+            if (first.kind === "resync") {
+              return Stream.unwrap(
+                Effect.map(resyncSnapshot(first.base), (items) =>
+                  Stream.concat(
+                    Stream.fromArray(items),
+                    Stream.unwrap(Effect.map(resyncResend(first.base), Stream.fromArray)),
+                  ),
+                ),
+              );
+            }
+            const deltas = chunk.flatMap((item) => (item.kind === "resync" ? [] : [item]));
+            return Stream.unwrap(Effect.map(withRepositoryIdentityItems(deltas), Stream.fromArray));
+          },
+        ),
+      );
 
     const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
       Stream.filter((change) => change.repositoryIdentityResolved),

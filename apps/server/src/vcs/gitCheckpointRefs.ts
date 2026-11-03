@@ -79,6 +79,8 @@ const PACKED_REFS_MAX_BYTES = 8 * 1024 * 1024;
 // is larger on disk or inflates past this is left to Git, which bounds the work a planted
 // object can cause. Objects that failed are remembered by file, so one costs one read.
 const COMMIT_OBJECT_MAX_BYTES = 1024 * 1024;
+// A loose ref or HEAD is one line.
+const SMALL_FILE_MAX_BYTES = 4096;
 const OBJECT_FAILURES_CAPACITY = 4_096;
 // Only refs under this prefix are kept from packed-refs; others are asked of Git.
 const PACKED_REFS_PREFIX = "refs/t3/";
@@ -143,12 +145,12 @@ const readLooseRef = (file: string) =>
               resolve({ kind: "other" });
               return;
             }
-            NodeFS.readFile(file, (error, data) => {
-              if (error) {
+            void readBoundedFileAsync(file, SMALL_FILE_MAX_BYTES).then((read) => {
+              if (read.kind !== "bytes") {
                 resolve({ kind: "other" });
                 return;
               }
-              const content = data.toString("latin1").trimEnd();
+              const content = read.bytes.toString("latin1").trimEnd();
               resolve(OBJECT_ID.test(content) ? { kind: "oid", oid: content } : { kind: "other" });
             });
           });
@@ -158,17 +160,10 @@ const readLooseRef = (file: string) =>
       }),
   );
 
-/** The file's text, or null when it cannot be read. */
+/** A small regular file's text (a ref or HEAD), or null when it cannot be read as one. */
 export const readTextFile = (file: string): Effect.Effect<string | null> =>
-  Effect.promise(
-    () =>
-      new Promise<string | null>((resolve) => {
-        try {
-          NodeFS.readFile(file, "utf8", (error, text) => resolve(error ? null : text));
-        } catch {
-          resolve(null);
-        }
-      }),
+  Effect.map(readBoundedFile(file, SMALL_FILE_MAX_BYTES), (read) =>
+    read.kind === "bytes" ? read.bytes.toString("utf8") : null,
   );
 
 /** Whether the path is a symbolic link; null when it cannot be examined. */
@@ -204,68 +199,78 @@ export type BoundedRead =
  * read, at most `maxBytes + 1` bytes into a buffer sized by that stat, so a file swapped after the
  * check is not the one read and one that grows is not read whole.
  */
+export const readBoundedFileAsync = (
+  file: string,
+  maxBytes: number,
+  knownFingerprint?: string,
+): Promise<BoundedRead> =>
+  new Promise<BoundedRead>((resolve) => {
+    try {
+      // Non-blocking, so a FIFO or device planted at the path cannot hold a pool thread; only a
+      // regular file is then read (a FIFO, socket, device or directory is not).
+      NodeFS.open(
+        file,
+        NodeFS.constants.O_RDONLY | NodeFS.constants.O_NONBLOCK,
+        (openError, fd) => {
+          if (openError) {
+            resolve({ kind: "unreadable" });
+            return;
+          }
+          const finish = (result: BoundedRead) => NodeFS.close(fd, () => resolve(result));
+          NodeFS.fstat(fd, { bigint: true }, (statError, stats) => {
+            if (statError || !stats.isFile()) {
+              finish({ kind: "unreadable" });
+              return;
+            }
+            const fingerprint = fingerprintOf(stats);
+            if (fingerprint === knownFingerprint) {
+              finish({ kind: "unchanged", fingerprint });
+              return;
+            }
+            if (stats.size > BigInt(maxBytes)) {
+              finish({ kind: "oversize", fingerprint });
+              return;
+            }
+            // One byte past the size, so a file that grew (or a pipe) shows without reading on.
+            let buffer = Buffer.allocUnsafe(Number(stats.size) + 1);
+            let offset = 0;
+            const step = () =>
+              NodeFS.read(fd, buffer, offset, buffer.length - offset, null, (readError, read) => {
+                if (readError) {
+                  finish({ kind: "unreadable" });
+                  return;
+                }
+                offset += read;
+                if (read === 0) {
+                  finish({ kind: "bytes", fingerprint, bytes: buffer.subarray(0, offset) });
+                  return;
+                }
+                if (offset > maxBytes) {
+                  finish({ kind: "oversize", fingerprint });
+                  return;
+                }
+                if (offset === buffer.length) {
+                  const grown = Buffer.allocUnsafe(maxBytes + 1);
+                  buffer.copy(grown, 0, 0, offset);
+                  buffer = grown;
+                }
+                step();
+              });
+            step();
+          });
+        },
+      );
+    } catch {
+      resolve({ kind: "unreadable" });
+    }
+  });
+
 export const readBoundedFile = (
   file: string,
   maxBytes: number,
   knownFingerprint?: string,
 ): Effect.Effect<BoundedRead> =>
-  Effect.promise(
-    () =>
-      new Promise<BoundedRead>((resolve) => {
-        try {
-          NodeFS.open(file, "r", (openError, fd) => {
-            if (openError) {
-              resolve({ kind: "unreadable" });
-              return;
-            }
-            const finish = (result: BoundedRead) => NodeFS.close(fd, () => resolve(result));
-            NodeFS.fstat(fd, { bigint: true }, (statError, stats) => {
-              if (statError) {
-                finish({ kind: "unreadable" });
-                return;
-              }
-              const fingerprint = fingerprintOf(stats);
-              if (fingerprint === knownFingerprint) {
-                finish({ kind: "unchanged", fingerprint });
-                return;
-              }
-              if (stats.size > BigInt(maxBytes)) {
-                finish({ kind: "oversize", fingerprint });
-                return;
-              }
-              // One byte past the size, so a file that grew (or a pipe) shows without reading on.
-              let buffer = Buffer.allocUnsafe(Number(stats.size) + 1);
-              let offset = 0;
-              const step = () =>
-                NodeFS.read(fd, buffer, offset, buffer.length - offset, null, (readError, read) => {
-                  if (readError) {
-                    finish({ kind: "unreadable" });
-                    return;
-                  }
-                  offset += read;
-                  if (read === 0) {
-                    finish({ kind: "bytes", fingerprint, bytes: buffer.subarray(0, offset) });
-                    return;
-                  }
-                  if (offset > maxBytes) {
-                    finish({ kind: "oversize", fingerprint });
-                    return;
-                  }
-                  if (offset === buffer.length) {
-                    const grown = Buffer.allocUnsafe(maxBytes + 1);
-                    buffer.copy(grown, 0, 0, offset);
-                    buffer = grown;
-                  }
-                  step();
-                });
-              step();
-            });
-          });
-        } catch {
-          resolve({ kind: "unreadable" });
-        }
-      }),
-  );
+  Effect.promise(() => readBoundedFileAsync(file, maxBytes, knownFingerprint));
 
 const statInfo = (file: string) =>
   new Promise<StatInfo>((resolve) => {

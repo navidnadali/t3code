@@ -10,6 +10,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
+import { readBoundedFileAsync } from "./gitCheckpointRefs.ts";
 import type * as GitVcsDriver from "./GitVcsDriver.ts";
 
 export interface GitConfigEntry {
@@ -340,8 +341,8 @@ const readsSymbolicRef = (file: string) =>
       NodeFS.lstat(file, (statError, stats) => {
         if (statError) return resolve(false);
         if (stats.isSymbolicLink()) return resolve(true);
-        NodeFS.readFile(file, (error, data) =>
-          resolve(error === null && data.subarray(0, 4).toString("latin1") === "ref:"),
+        void readBoundedFileAsync(file, 4096).then((read) =>
+          resolve(read.kind === "bytes" && read.bytes.subarray(0, 4).toString("latin1") === "ref:"),
         );
       });
     } catch {

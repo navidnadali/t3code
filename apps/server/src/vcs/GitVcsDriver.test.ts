@@ -3092,15 +3092,34 @@ it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
       const over = path.join(directory, "over");
       yield* fileSystem.writeFile(over, new Uint8Array(bound + 1).fill(1));
       assert.strictEqual((yield* readBoundedFile(over, bound)).kind, "oversize");
-      // A pipe reports no size, so only the read itself can bound what a writer feeds.
-      const fifo = path.join(directory, "fifo");
-      NodeChildProcess.execFileSync("mkfifo", [fifo]);
-      const writer = fileSystem
-        .writeFile(fifo, new Uint8Array(64 * 1024).fill(2))
-        .pipe(Effect.ignore);
-      const [, fed] = yield* Effect.all([writer, readBoundedFile(fifo, bound)], {
-        concurrency: "unbounded",
-      });
+      // A file that grows past its stat while being read is cut at one byte past the bound.
+      const growing = path.join(directory, "growing");
+      yield* fileSystem.writeFile(growing, new Uint8Array(16).fill(3));
+      const fs = NodeModule.createRequire(import.meta.url)("node:fs") as typeof NodeFS;
+      const originalFstat = fs.fstat;
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          // The descriptor's stat sees 16 bytes; by the time it is read the file is far larger.
+          (fs as { fstat: typeof NodeFS.fstat }).fstat = ((fd: number, ...rest: unknown[]) => {
+            const callback = rest.at(-1) as (...args: unknown[]) => void;
+            return originalFstat(
+              fd,
+              rest[0] as never,
+              ((...args: unknown[]) => {
+                NodeFS.appendFileSync(growing, new Uint8Array(64 * 1024).fill(4));
+                callback(...args);
+              }) as never,
+            );
+          }) as typeof NodeFS.fstat;
+          NodeModule.syncBuiltinESMExports();
+        }),
+        () =>
+          Effect.sync(() => {
+            (fs as { fstat: typeof NodeFS.fstat }).fstat = originalFstat;
+            NodeModule.syncBuiltinESMExports();
+          }),
+      );
+      const fed = yield* readBoundedFile(growing, bound);
       assert.strictEqual(fed.kind, "oversize");
       // A known stat is answered from the descriptor without reading.
       const again = yield* readBoundedFile(

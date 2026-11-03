@@ -135,6 +135,8 @@ function threadEvents(n: number): ReadonlyArray<SeedEvent> {
     v2("turn-item.updated", item(`a-${n}`, "command_execution", 1)),
     v2("turn-item.updated", item(`sub-${n}`, "subagent", 0)),
     v2("thread.marked-unread", { id: stream }),
+    v2("thread.tags-updated", { id: stream, tags: ["a"] }),
+    v2("thread.tags-updated", { id: stream, tags: ["a", "b"] }),
     v2("turn-item.updated", item(`b-${n}`, "reasoning", 0)),
     v2("message.updated", { id: `m2-${n}`, revision: 0 }),
     v2("turn-item.updated", item(`c-${n}`, "command_execution", 0), `command-${n}`),
@@ -294,6 +296,7 @@ const SUPERSEDABLE = new Set([
   "thread.guest-share-updated",
 ]);
 const READ_STATE = new Set(["thread.visited", "thread.marked-unread"]);
+const TAG_THREAD_EVENT_TYPE = "thread.tags-updated";
 
 /** The global pass as it was: one scan of the whole store, newest first, with store-wide tracking. */
 function referenceCompaction(rows: ReadonlyArray<ScanRow>): {
@@ -303,6 +306,7 @@ function referenceCompaction(rows: ReadonlyArray<ScanRow>): {
   const obsolete = new Set<number>();
   const retainedThreadIds = new Set<string>();
   const retainedReadStateThreadIds = new Set<string>();
+  const retainedTagThreadIds = new Set<string>();
   const oldestCandidateByEntityKey = new Map<string, number | null>();
   for (const row of rows) {
     if (row.imported_legacy_thread === 1) {
@@ -315,6 +319,10 @@ function referenceCompaction(rows: ReadonlyArray<ScanRow>): {
         if (retainedThreadIds.has(row.stream_id) || retainedReadStateThreadIds.has(row.stream_id)) {
           obsolete.add(row.sequence);
         } else retainedReadStateThreadIds.add(row.stream_id);
+      } else if (row.aggregate_kind === "thread" && row.event_type === TAG_THREAD_EVENT_TYPE) {
+        if (retainedThreadIds.has(row.stream_id) || retainedTagThreadIds.has(row.stream_id)) {
+          obsolete.add(row.sequence);
+        } else retainedTagThreadIds.add(row.stream_id);
       } else if (
         row.event_type === "thread.pull-request-link-updated" &&
         retainedThreadIds.has(row.stream_id)
@@ -357,6 +365,7 @@ it.effect("deletes exactly what the store-wide pass deleted, and keeps the rest 
       "thread.message",
       "thread.archived",
       "thread.visited",
+      "thread.tags-updated",
       "thread.pull-request-link-updated",
       "message.updated",
       "node.updated",

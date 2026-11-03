@@ -307,7 +307,7 @@ export const layer: Layer.Layer<
         SELECT
           COALESCE((SELECT MAX(sequence) FROM orchestration_events), 0) AS event_sequence,
           COALESCE((SELECT MAX(rowid) FROM orchestration_command_receipts), 0) AS receipt_row_id
-      `.pipe(NodeSqliteClient.readOnly);
+      `.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.historyRead);
         let throughSequence = bounds[0]?.event_sequence ?? 0;
         let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
         const scratchPath = options?.scratchPath;
@@ -420,7 +420,9 @@ export const layer: Layer.Layer<
           WHERE event.sequence <= ${throughSequence}
           ORDER BY event.sequence DESC
           LIMIT ${COMPACTION_PAGE_SIZE + 1}
-        `.pipe(NodeSqliteClient.readOnly);
+        `.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.historyRead);
+          // Background bulk reads take the history class: last in line and capped, so a pass never
+          // competes with a client's small or page reads for a reader worker.
           const page = rows.slice(0, COMPACTION_PAGE_SIZE);
           const obsolete: number[] = [];
           // Retain each key's oldest candidate, deleting it only when an older event appears. The
@@ -531,7 +533,7 @@ export const layer: Layer.Layer<
           WHERE receipt.rowid <= ${throughReceiptRowId}
           ORDER BY receipt.rowid DESC
           LIMIT ${COMPACTION_PAGE_SIZE + 1}
-        `.pipe(NodeSqliteClient.readOnly);
+        `.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.historyRead);
           const page = rows.slice(0, COMPACTION_PAGE_SIZE);
           const obsolete = page
             .filter((row) => row.imported_legacy_thread === 1)

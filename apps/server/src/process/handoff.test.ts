@@ -292,6 +292,60 @@ describe("provider process hand-off", () => {
   );
 
   it.live.skipIf(!linux)(
+    "closes the server's ends of a handed-off process's stdio once it has exited",
+    () => {
+      const openDescriptors = () =>
+        require("node:fs").readdirSync("/proc/self/fd").length as number;
+      return Effect.gen(function* () {
+        const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        // The spawner process is up before counting.
+        yield* launcher.spawner.exitCode(node(""));
+        const before = openDescriptors();
+        for (let index = 0; index < 8; index++) {
+          // Exit only, its output never read; output read, stdin never written.
+          yield* launcher.spawner.exitCode(node("process.stdout.write('unread')"));
+          yield* launcher.spawner.string(node("process.stdout.write('read')"));
+          const child = launcher.spawn(process.execPath, ["-e", "process.stdout.write('x')"], {
+            env: process.env,
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          child.stdout!.resume();
+          child.stderr!.resume();
+          yield* Effect.callback<void>((resume) => {
+            child.once("close", () => resume(Effect.void));
+          });
+        }
+        expect(openDescriptors()).toBe(before);
+      }).pipe(Effect.provide(launcherLayer()));
+    },
+  );
+
+  it.live.skipIf(!linux)(
+    "passes a provider's closed stdin to the SDK as an error when it starts on Node's spawner",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const { stateDir } = yield* ServerConfig.ServerConfig;
+        // No socket directory: this start falls back to Node's spawner.
+        yield* fs.remove(NodePath.join(stateDir, "spawner"), { recursive: true });
+        const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        const child = launcher.spawn("/bin/sh", ["-c", "exec 0<&-; sleep 5"], {
+          env: process.env,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(() => child.kill("SIGKILL")));
+        // More than a pipe holds: the write is still pending when the shell closes its stdin.
+        const error = yield* Effect.callback<string>((resume) => {
+          child.stdin!.on("error", (cause: NodeJS.ErrnoException) =>
+            resume(Effect.succeed(cause.code ?? cause.message)),
+          );
+          child.stdin!.write(Buffer.alloc(4 * 1024 * 1024));
+        });
+        expect(error).toBe("EPIPE");
+      }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
+  );
+
+  it.live.skipIf(!linux)(
     "refuses a connection without the server's header: it never becomes a provider's stdio",
     () =>
       Effect.gen(function* () {

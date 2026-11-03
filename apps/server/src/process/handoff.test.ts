@@ -502,6 +502,24 @@ describe("provider process hand-off", () => {
     },
   );
 
+  // As Node's ChildProcess: output nobody reads is drained at exit, so close always follows.
+  it.live.skipIf(!linux)("closes a Node-style process whose output nobody reads", () =>
+    Effect.gen(function* () {
+      const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+      const child = launcher.spawn(
+        process.execPath,
+        ["-e", "process.stdout.write('x'.repeat(1000)); process.stderr.write('unread')"],
+        { env: process.env, stdio: ["pipe", "pipe", "pipe"] },
+      );
+      const closed = yield* Effect.callback<string>((resume) => {
+        child.once("close", (code: number | null) => resume(Effect.succeed(`close ${code}`)));
+      }).pipe(
+        Effect.timeoutOrElse({ duration: "3 seconds", orElse: () => Effect.succeed("no close") }),
+      );
+      expect(closed).toBe("close 0");
+    }).pipe(Effect.provide(launcherLayer())),
+  );
+
   it.live.skipIf(!linux)("gives an SDK a Node-style process with its stdio, exit and close", () =>
     Effect.gen(function* () {
       const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;

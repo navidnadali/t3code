@@ -59,11 +59,11 @@ it.effect("hands out one slot per worker and excludes nothing while a slot is fr
     assert.deepEqual(yield* admission.excludedTypes, EffectAdmission.GATED_EFFECT_TYPES);
     assert.equal((yield* admission.state).inFlight, 2);
 
-    yield* first!;
+    yield* first!.release;
     assert.deepEqual(yield* admission.excludedTypes, []);
     assert.isDefined(yield* reserve(admission));
     assert.isUndefined(yield* reserve(admission));
-    yield* second!;
+    yield* second!.release;
     assert.equal((yield* admission.state).inFlight, 1);
   }),
 );
@@ -84,10 +84,10 @@ it.effect(
       const second = yield* reserve(admission);
       assert.equal(yield* Ref.get(acquired), 1);
       assert.isTrue(yield* sampling(admission));
-      yield* second!;
+      yield* second!.release;
       assert.isFalse(yield* sampling(admission));
       assert.equal(yield* Ref.get(released), 1);
-      yield* first!;
+      yield* first!.release;
       yield* TestClock.adjust("5 seconds");
       assert.equal(yield* Ref.get(acquired), 1);
     }),
@@ -160,7 +160,7 @@ it.effect("reopens only below half the closing mark, not at or above it", () =>
     yield* Ref.set(pressure, 19);
     yield* TestClock.adjust("2 seconds");
     assert.equal((yield* admission.state).saturated, false);
-    yield* first!;
+    yield* first!.release;
   }),
 );
 
@@ -185,11 +185,11 @@ it.effect(
       assert.deepEqual(yield* admission.excludedTypes, EffectAdmission.GATED_EFFECT_TYPES);
 
       // One slot given back still leaves two in flight above the allowance of one: no wake-up yet.
-      yield* first!;
+      yield* first!.release;
       assert.isUndefined(yield* reserve(admission));
       assert.equal(yield* Ref.get(freed), 0);
       // The next one frees a slot below the allowance, which wakes one worker.
-      yield* second!;
+      yield* second!.release;
       assert.equal(yield* Ref.get(freed), 1);
       assert.deepEqual(yield* admission.excludedTypes, []);
       assert.isDefined(yield* reserve(admission));
@@ -203,10 +203,28 @@ it.effect("wakes one worker when a slot frees while gated effects were being ski
     const first = yield* reserve(admission);
     const second = yield* reserve(admission);
     assert.isUndefined(yield* reserve(admission));
-    yield* first!;
+    yield* first!.release;
     assert.equal(yield* Ref.get(freed), 1);
     // A release while a slot was already free wakes nobody: nothing was being skipped.
-    yield* second!;
+    yield* second!.release;
+    assert.equal(yield* Ref.get(freed), 1);
+  }),
+);
+
+it.effect("a slot given back unused frees nothing and wakes nobody", () =>
+  Effect.gen(function* () {
+    const { admission, freed } = yield* makeHarness(1);
+    const slot = yield* reserve(admission);
+    assert.isUndefined(yield* reserve(admission));
+    // The claim found nothing: the slot was never used, so no worker was skipped for it.
+    yield* slot!.discard;
+    assert.equal(yield* Ref.get(freed), 0);
+    assert.equal((yield* admission.state).inFlight, 0);
+    // A gated effect that ran does free the slot, and the one worker's own wake-up is bounded.
+    const used = yield* reserve(admission);
+    yield* used!.release;
+    assert.equal(yield* Ref.get(freed), 1);
+    yield* used!.discard;
     assert.equal(yield* Ref.get(freed), 1);
   }),
 );
@@ -229,10 +247,10 @@ it.effect("stops counting a slot held longer than a turn start may take", () =>
     assert.equal((yield* admission.state).inFlight, 1);
 
     // A late release of an expired slot changes nothing; the live one still counts.
-    yield* first!;
-    yield* second!;
+    yield* first!.release;
+    yield* second!.release;
     assert.equal((yield* admission.state).inFlight, 1);
-    yield* third!;
+    yield* third!.release;
     assert.equal((yield* admission.state).inFlight, 0);
   }),
 );
@@ -254,8 +272,8 @@ it.effect("stops sampling when expired slots leave the open gate nothing to act 
     });
     assert.equal(yield* Ref.get(released), 1);
     // The late releases of the expired slots change nothing.
-    yield* first!;
-    yield* second!;
+    yield* first!.release;
+    yield* second!.release;
     assert.equal(yield* Ref.get(acquired), 1);
     assert.isFalse(yield* sampling(admission));
   }),
@@ -278,8 +296,8 @@ it.effect("recovers from saturation at a small mark too", () =>
       sampling: true,
     });
     assert.equal(yield* Ref.get(restored), 1);
-    yield* first!;
-    yield* second!;
+    yield* first!.release;
+    yield* second!.release;
   }),
 );
 

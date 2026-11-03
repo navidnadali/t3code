@@ -31,17 +31,24 @@ export interface AdmissionState {
   readonly sampling: boolean;
 }
 
+export interface AdmissionSlot {
+  /** Gives the slot back after its gated effect ran; the last slot freed wakes a skipped worker. */
+  readonly release: Effect.Effect<void>;
+  /** Gives the slot back unused, because the claim found nothing: no worker is woken for it. */
+  readonly discard: Effect.Effect<void>;
+}
+
 export interface EffectAdmissionShape {
   /** Effect types a claim must skip right now: the gated ones while the allowance is used up. */
   readonly excludedTypes: Effect.Effect<ReadonlyArray<string>>;
-  /** A slot for one gated effect if one is free; the effect it carries gives the slot back. */
-  readonly reserve: Effect.Effect<Option.Option<Effect.Effect<void>>>;
+  /** A slot for one gated effect if one is free. */
+  readonly reserve: Effect.Effect<Option.Option<AdmissionSlot>>;
   readonly state: Effect.Effect<AdmissionState>;
 }
 
 const ungated: EffectAdmissionShape = {
   excludedTypes: Effect.succeed([]),
-  reserve: Effect.succeedSome(Effect.void),
+  reserve: Effect.succeedSome({ release: Effect.void, discard: Effect.void }),
   state: Effect.succeed({ allowed: Infinity, inFlight: 0, saturated: false, sampling: false }),
 };
 
@@ -63,7 +70,7 @@ export interface EffectAdmissionOptions {
   readonly pressure: Effect.Effect<Effect.Effect<number>, never, Scope.Scope>;
   /** Runs when the full allowance returns, so idle workers claim the effects they skipped. */
   readonly onAllowanceRestored: Effect.Effect<void>;
-  /** Runs when a slot frees while gated effects were being skipped, so one idle worker claims. */
+  /** Runs when a finished or expired slot frees the used-up allowance, so one idle worker claims. */
   readonly onSlotFreed: Effect.Effect<void>;
 }
 
@@ -85,6 +92,13 @@ interface Slot {
   readonly takenAtMs: number;
 }
 
+interface Sampler {
+  readonly scope: Scope.Closeable;
+  /** Cleared when this sampler is stopped, so a successor's run does not keep it sampling. */
+  active: boolean;
+  fiber?: Fiber.Fiber<void>;
+}
+
 /**
  * Gated effects run `workers` at a time; after `samplesToSwitch` samples at or above `closeAbove`
  * only `saturatedAllowance` do, until as many fall below half of it. The pressure source runs only
@@ -101,9 +115,7 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
   let highRun = 0;
   let lowRun = 0;
   let slots: Array<Slot> = [];
-  let sampler: { readonly fiber: Fiber.Fiber<void>; readonly scope: Scope.Closeable } | undefined;
-  let armed = false;
-  const isArmed = () => armed;
+  let sampler: Sampler | undefined;
 
   const prune = (nowMs: number) => {
     const before = slots.length;
@@ -113,25 +125,30 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
   const full = () => slots.length >= allowed;
   const canAct = () => saturated || slots.length >= whenSaturated;
 
-  const disarm = Effect.suspend(() => {
-    const running = sampler;
-    sampler = undefined;
-    armed = false;
+  // Stops `current` from inside its own run: the loop ends and its finalizer closes the scope.
+  const stop = (current: Sampler) => {
+    current.active = false;
+    if (sampler === current) sampler = undefined;
     highRun = 0;
     lowRun = 0;
-    return running === undefined
-      ? Effect.void
-      : Fiber.interrupt(running.fiber).pipe(
-          Effect.andThen(Scope.close(running.scope, Exit.void)),
-          Effect.asVoid,
-        );
+  };
+
+  const disarm = Effect.suspend(() => {
+    const running = sampler;
+    if (running === undefined) return Effect.void;
+    stop(running);
+    return (running.fiber === undefined ? Effect.void : Fiber.interrupt(running.fiber)).pipe(
+      Effect.andThen(Scope.close(running.scope, Exit.void)),
+      Effect.asVoid,
+    );
   });
 
   // Untraced: one sample per second while armed, inside the daemon's own scope.
-  const sample = Effect.fnUntraced(function* (next: Effect.Effect<number>) {
+  const sample = Effect.fnUntraced(function* (current: Sampler, next: Effect.Effect<number>) {
     {
       const nowMs = yield* Clock.currentTimeMillis;
       if (prune(nowMs)) yield* options.onSlotFreed;
+      if (!canAct()) return stop(current);
       const pressure = yield* next;
       if (pressure >= options.closeAbove) {
         highRun += 1;
@@ -159,57 +176,67 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
       });
       if (!saturated) {
         yield* options.onAllowanceRestored;
-        if (!canAct()) armed = false;
+        if (!canAct()) stop(current);
       }
     }
   });
 
   const arm = Effect.gen(function* () {
     if (sampler !== undefined) return;
-    armed = true;
     const scope = yield* Scope.make();
+    const current: Sampler = { scope, active: true };
+    sampler = current;
     const next = yield* options.pressure.pipe(Effect.provideService(Scope.Scope, scope));
+    const isActive = () => current.active;
     const loop = Effect.gen(function* () {
-      while (isArmed()) {
+      while (isActive()) {
         yield* Effect.sleep(options.sampleInterval);
-        if (!isArmed()) break;
-        yield* sample(next);
+        if (!isActive()) break;
+        yield* sample(current, next);
       }
     }).pipe(
       Effect.ensuring(
         Effect.suspend(() => {
-          if (sampler?.scope === scope) sampler = undefined;
+          if (sampler === current) sampler = undefined;
           return Scope.close(scope, Exit.void);
         }),
       ),
     );
-    const fiber = yield* Effect.forkIn(loop, layerScope);
-    sampler = { fiber, scope };
+    current.fiber = yield* Effect.forkIn(loop, layerScope);
   });
 
-  const release = Effect.fnUntraced(function* (slot: Slot) {
+  // The sampler runs exactly while the gate can act; called after every change to the slots.
+  const settle = Effect.suspend(() =>
+    canAct() ? (sampler === undefined ? arm : Effect.void) : disarm,
+  );
+
+  const giveBack = Effect.fnUntraced(function* (slot: Slot, ran: boolean) {
     const index = slots.indexOf(slot);
     if (index === -1) return;
     const wasFull = full();
     slots.splice(index, 1);
-    if (wasFull && !full()) yield* options.onSlotFreed;
-    if (!canAct() && sampler !== undefined) yield* disarm;
+    if (ran && wasFull && !full()) yield* options.onSlotFreed;
+    yield* settle;
   });
 
   const reserve: EffectAdmissionShape["reserve"] = Effect.gen(function* () {
     const nowMs = yield* Clock.currentTimeMillis;
     if (prune(nowMs)) yield* options.onSlotFreed;
-    if (full()) return Option.none();
+    if (full()) {
+      yield* settle;
+      return Option.none();
+    }
     const slot: Slot = { takenAtMs: nowMs };
     slots.push(slot);
-    if (canAct() && sampler === undefined) yield* arm;
-    return Option.some(release(slot));
+    yield* settle;
+    return Option.some({ release: giveBack(slot, true), discard: giveBack(slot, false) });
   });
 
   return {
     excludedTypes: Effect.gen(function* () {
       const nowMs = yield* Clock.currentTimeMillis;
       if (prune(nowMs)) yield* options.onSlotFreed;
+      yield* settle;
       return full() ? GATED_EFFECT_TYPES : [];
     }),
     reserve,

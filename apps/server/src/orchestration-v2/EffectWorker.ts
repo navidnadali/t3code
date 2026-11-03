@@ -854,13 +854,14 @@ export const layerWithOptions = (
         function* (excludeRestartContinuations = false) {
           // While the main thread is saturated a worker without a slot claims only ungated effects.
           const admission = yield* EffectAdmission.EffectAdmission;
-          const reservation = yield* admission.reserve;
-          const releaseReservation = Option.getOrElse(reservation, () => Effect.void);
+          const slot = Option.getOrUndefined(yield* admission.reserve);
+          // A slot the claim does not use goes back unused: no worker is woken for it.
+          const discardSlot = slot === undefined ? Effect.void : slot.discard;
           const claimExit = yield* Effect.exit(
             outbox.claimNext({
               workerId,
               excludeRestartContinuations,
-              ...(Option.isNone(reservation)
+              ...(slot === undefined
                 ? { excludeEffectTypes: EffectAdmission.GATED_EFFECT_TYPES }
                 : {}),
             }),
@@ -873,19 +874,19 @@ export const layerWithOptions = (
                 : "claimed",
           });
           if (Exit.isFailure(claimExit)) {
-            yield* releaseReservation;
+            yield* discardSlot;
             return yield* Effect.failCause(claimExit.cause);
           }
           const claimed = claimExit.value;
           if (Option.isNone(claimed)) {
-            yield* releaseReservation;
+            yield* discardSlot;
             return false;
           }
           const effect = claimed.value;
           const gated = EffectAdmission.isGated(effect.request.type);
-          if (!gated) yield* releaseReservation;
+          if (!gated) yield* discardSlot;
           return yield* runClaimed(effect, gated).pipe(
-            Effect.ensuring(gated ? releaseReservation : Effect.void),
+            Effect.ensuring(gated && slot !== undefined ? slot.release : Effect.void),
           );
         },
         (effect, _excludeRestartContinuations?: boolean) =>

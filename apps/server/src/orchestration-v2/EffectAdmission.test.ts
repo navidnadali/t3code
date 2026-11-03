@@ -406,6 +406,54 @@ it.effect("starts its sample counts afresh after it stops", () =>
   }),
 );
 
+/** Replays a recorded 1 Hz loop-delay p99 shape through an armed gate: the state after each sample. */
+const replay = (series: ReadonlyArray<number>) =>
+  Effect.gen(function* () {
+    const { admission, pressure } = yield* makeHarness(4);
+    const first = yield* reserve(admission);
+    const second = yield* reserve(admission);
+    const states = yield* Effect.forEach(series, (value) =>
+      Ref.set(pressure, value).pipe(
+        Effect.andThen(TestClock.adjust("1 second")),
+        Effect.andThen(admission.state),
+        Effect.map((state) => state.saturated),
+      ),
+    );
+    yield* first!.release;
+    yield* second!.release;
+    return states;
+  });
+
+it.effect(
+  "reopens within two calm samples after a spike at light load; stays closed when saturated",
+  () =>
+    Effect.gen(function* () {
+      // A 250-session loop: a 70 ms spike closes the gate, then the p99 sits in the low twenties,
+      // above half the mark; the gate must reopen within two samples, not hold for a minute.
+      assert.deepEqual(yield* replay([70, 71, 24, 25, 23, 24, 24, 25]), [
+        false,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      // An 80-session saturated loop hovers around the mark: closed, and no flapping.
+      assert.deepEqual(yield* replay([45, 44, 39, 41, 38, 42, 40, 39]), [
+        false,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+      ]);
+    }),
+);
+
 it.effect("recovers from saturation at a small mark too", () =>
   Effect.gen(function* () {
     const { admission, pressure, restored } = yield* makeHarness(4, 5);

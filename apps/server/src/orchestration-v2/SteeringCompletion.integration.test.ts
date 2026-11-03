@@ -2120,6 +2120,67 @@ it.effect("a run whose turn starts after the thread moved is checkpointed where 
   ),
 );
 
+// Run 2 is sent (and scoped) in A while run 1's session is live; the thread moves to B before run
+// 2's turn starts. A shared session (Codex) resumes the thread and starts the turn in the turn's
+// cwd, B, though its process lives on: the run is checkpointed in B.
+it.effect(
+  "a run whose turn starts in a live shared session after the thread moved is checkpointed where it works",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* nextTurnSelectionHarness("moved-before-live-turn-start");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const thread = yield* worktreeThread(harness);
+          const earlier = new Set(harness.started.map((turn) => turn.attemptId));
+          const running = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "provider-turn.updated" &&
+                event.payload.status === "running" &&
+                event.payload.runAttemptId !== null &&
+                !earlier.has(event.payload.runAttemptId),
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("second"),
+            threadId: thread.threadId,
+            messageId: MessageId.make("message:second"),
+            text: "second",
+            attachments: [],
+            modelSelection: runSelection,
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* thread.switchTo(thread.other);
+          yield* worker.drain();
+          yield* Fiber.join(running);
+          const second = harness.started[1]!;
+          yield* fs.writeFileString(path.join(thread.other, "edited-in-b.txt"), "b\n");
+          yield* endTurnOf(harness, thread.threadId, second.runId, second.runOrdinal);
+          const projection = yield* orchestrator.getThreadProjection(thread.threadId);
+          const checkpoint = projection.checkpoints.find((c) => c.runId === second.runId)!;
+          assert.deepEqual(
+            checkpoint.files.map((file) => file.path),
+            ["edited-in-b.txt"],
+          );
+          assert.equal(
+            projection.checkpointScopes.find((scope) => scope.id === checkpoint.scopeId)?.cwd,
+            thread.other,
+          );
+        }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+      }),
+    ),
+);
+
 // The same worktree under another spelling (a symlink here; on macOS, /var is /private/var).
 it.effect("the same worktree under another path spelling keeps its scope", () =>
   Effect.scoped(

@@ -530,6 +530,8 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       // With core.preferSymlinkRefs HEAD is a link whose target names the branch.
       { path: path.join(gitDir, "HEAD"), kind: "entry" },
       { path: objects, kind: "presence" },
+      // Git prints the objects path with a link resolved; the link itself can be retargeted.
+      { path: path.join(gitCommonDir, "objects"), kind: "physical" },
       { path: path.join(objects, "info", "alternates"), kind: "content" },
       { path: refs, kind: "presence" },
     );

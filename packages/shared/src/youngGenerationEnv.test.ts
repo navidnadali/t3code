@@ -15,17 +15,10 @@ describe("the single executable's build", () => {
     expect(SEA_EXEC_ARGV_EXTENSION).toBe("cli");
   });
 
-  it("bakes nothing into a Windows executable and lets it read NODE_OPTIONS itself", () => {
-    // Windows has no execve to carry NODE_OPTIONS onto the command line, so a baked cap there could
-    // never be overridden and NODE_OPTIONS would be lost; it stays as before (the launcher passes the cap).
-    expect(seaBuildOptions("win")).toEqual({ execArgv: [], execArgvExtension: "env" });
-    expect(seaBuildOptions("darwin")).toEqual({
-      execArgv: SEA_EXEC_ARGV,
-      execArgvExtension: SEA_EXEC_ARGV_EXTENSION,
-    });
-    expect(seaBuildOptions("linux")).toEqual({
-      execArgv: SEA_EXEC_ARGV,
-      execArgvExtension: SEA_EXEC_ARGV_EXTENSION,
-    });
+  it("bakes the default into every single executable and lets Node read NODE_OPTIONS itself", () => {
+    // "env": Node applies and validates NODE_OPTIONS (allowlist, AT_SECURE) and the baked cap stays;
+    // nothing is platform-dependent, a baked build is told by its flag.
+    expect(SEA_EXEC_ARGV_EXTENSION).toBe("env");
+    expect(seaBuildOptions()).toEqual({ execArgv: SEA_EXEC_ARGV, execArgvExtension: "env" });
   });
 });

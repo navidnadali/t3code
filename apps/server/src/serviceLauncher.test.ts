@@ -306,30 +306,27 @@ if (context.update?.status === "pending") {
     }),
   );
 
-  it.effect(
-    "passes NODE_OPTIONS and the cap on the command line of a runtime that takes them there",
-    () =>
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const root = yield* fs.makeTempDirectoryScoped({
-          prefix: "t3-service-launcher-node-options-",
-        });
-        const statePath = path.join(root, "runtime", "service-state.json");
-        const observationsPath = path.join(root, "observations.jsonl");
-        vi.stubEnv("NODE_OPTIONS", "--max-old-space-size=4096");
-        vi.stubEnv("T3CODE_V8_MAX_SEMI_SPACE_MB", "");
-        const marker = process.env.T3CODE_INHERITED_NODE_OPTIONS;
-        delete process.env.T3CODE_INHERITED_NODE_OPTIONS;
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            vi.unstubAllEnvs();
-            if (marker !== undefined) process.env.T3CODE_INHERITED_NODE_OPTIONS = marker;
-          }),
-        );
-        // A single executable takes Node options only on its command line (its NODE_OPTIONS are
-        // ignored); the archive says so beside it, and the launcher passes them there, untouched in env.
-        const childSource = `
+  it.effect("starts every runtime with its Node options in the environment, never on the command line", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-launcher-env-options-" });
+      const statePath = path.join(root, "runtime", "service-state.json");
+      const observationsPath = path.join(root, "observations.jsonl");
+      vi.stubEnv("NODE_OPTIONS", "--max-old-space-size=4096");
+      vi.stubEnv("T3CODE_V8_MAX_SEMI_SPACE_MB", "");
+      const marker = process.env.T3CODE_INHERITED_NODE_OPTIONS;
+      delete process.env.T3CODE_INHERITED_NODE_OPTIONS;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          vi.unstubAllEnvs();
+          if (marker !== undefined) process.env.T3CODE_INHERITED_NODE_OPTIONS = marker;
+        }),
+      );
+      // Node validates NODE_OPTIONS itself (its allowlist, AT_SECURE); a command-line
+      // `--node-options=` would bypass that, so the launcher never emits one — not even for a
+      // runtime shipping a stale exec-argv.json that asks for it.
+      const childSource = `
 import { appendFileSync } from "node:fs";
 appendFileSync(${JSON.stringify(observationsPath)}, JSON.stringify({
   args: process.argv.slice(2),
@@ -338,35 +335,29 @@ appendFileSync(${JSON.stringify(observationsPath)}, JSON.stringify({
 }) + "\\n");
 process.exit(1);
 `;
-        const versionDir = path.join(root, "runtime", "versions", "1.0.0");
-        yield* writeFakeRuntime(fs, path, versionDir, childSource);
-        yield* fs.writeFileString(
-          path.join(versionDir, "exec-argv.json"),
-          JSON.stringify({ execArgvExtension: "cli" }),
-        );
-        yield* Effect.promise(() =>
-          writeServiceState(statePath, {
-            protocol: SERVICE_LAUNCHER_PROTOCOL,
-            activeVersion: "1.0.0",
-          }),
-        );
-        const launcher = new Launcher(
-          root,
-          yield* Effect.promise(() => readServiceState(statePath)),
-        );
-        yield* Effect.promise(() =>
-          launcher.run().then(
-            () => Promise.reject(new Error("launcher unexpectedly completed")),
-            () => Promise.resolve(),
-          ),
-        );
-        const [first] = (yield* fs.readFileString(observationsPath)).trim().split("\n");
-        assert.deepEqual(JSON.parse(first!), {
-          args: ["--node-options=--max-old-space-size=4096", "serve"],
-          nodeOptions: "--max-old-space-size=4096",
-          inheritedNodeOptions: null,
-        });
-      }),
+      const versionDir = path.join(root, "runtime", "versions", "1.0.0");
+      yield* writeFakeRuntime(fs, path, versionDir, childSource);
+      yield* fs.writeFileString(
+        path.join(versionDir, "exec-argv.json"),
+        JSON.stringify({ execArgvExtension: "cli" }),
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, { protocol: SERVICE_LAUNCHER_PROTOCOL, activeVersion: "1.0.0" }),
+      );
+      const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      yield* Effect.promise(() =>
+        launcher.run().then(
+          () => Promise.reject(new Error("launcher unexpectedly completed")),
+          () => Promise.resolve(),
+        ),
+      );
+      const [first] = (yield* fs.readFileString(observationsPath)).trim().split("\n");
+      assert.deepEqual(JSON.parse(first!), {
+        args: ["serve"],
+        nodeOptions: "--max-old-space-size=4096 --max-semi-space-size=64",
+        inheritedNodeOptions: "--max-old-space-size=4096",
+      });
+    }),
   );
   it.effect("rolls back invalid trials with the startup environment", () =>
     Effect.gen(function* () {

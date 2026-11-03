@@ -68,7 +68,7 @@ describe("linuxArm64SeaConfig", () => {
     const server = linuxArm64SeaConfig({
       bundlePath: "/b/bin.mjs",
       blobPath: "/t/sea.blob",
-      sea: { execArgv: ["--max-semi-space-size=64"], execArgvExtension: "cli" },
+      sea: { execArgv: ["--max-semi-space-size=64"], execArgvExtension: "env" },
     });
     expect(server).toMatchObject({
       main: "/b/bin.mjs",
@@ -76,7 +76,7 @@ describe("linuxArm64SeaConfig", () => {
       mainFormat: "module",
       useCodeCache: false,
       execArgv: ["--max-semi-space-size=64"],
-      execArgvExtension: "cli",
+      execArgvExtension: "env",
     });
     const spawner = linuxArm64SeaConfig({
       bundlePath: "/t/process-spawner.cjs",

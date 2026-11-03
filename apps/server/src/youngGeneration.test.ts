@@ -44,8 +44,6 @@ import {
   runtimeFlagsOf,
   SERVER_COMMANDS,
   decideYoungGeneration,
-  nodeOptionsArgument,
-  nodeOptionsForSelfSpawn,
   serverChildEnvironment,
   tokenizeNodeOptions,
 } from "./youngGeneration.ts";
@@ -390,15 +388,10 @@ describe("decideYoungGeneration", () => {
     const decision = decideYoungGeneration(view());
     expect(decision.kind).toBe("relaunch");
     if (decision.kind !== "relaunch") return;
-    // Node options go on the executable's command line; its environment stays the user's.
-    expect(decision.plan.args).toEqual([
-      exe,
-      `--node-options=--max-old-space-size=12288 ${flag}`,
-      "start",
-      "--no-browser",
-    ]);
-    expect(decision.plan.env.NODE_OPTIONS).toBe("--max-old-space-size=12288");
-    expect(decision.plan.env[INHERITED_NODE_OPTIONS_ENV]).toBeUndefined();
+    // An executable without the baked flag: the cap travels in NODE_OPTIONS with the marker.
+    expect(decision.plan.args).toEqual([exe, "start", "--no-browser"]);
+    expect(decision.plan.env.NODE_OPTIONS).toBe(`--max-old-space-size=12288 ${flag}`);
+    expect(decision.plan.env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=12288");
     expect(decision.plan.env[pidEnv]).toBe("4242");
   });
 
@@ -461,29 +454,8 @@ describe("decideYoungGeneration", () => {
   });
 });
 
-describe("nodeOptionsArgument", () => {
-  it("gives a single executable the user's NODE_OPTIONS and the wanted cap on its command line", () => {
-    // The executable's own default is baked in, so the cap is passed only when another is wanted.
-    expect(nodeOptionsArgument({ NODE_OPTIONS: "--max-old-space-size=4096" })).toBe(
-      "--node-options=--max-old-space-size=4096",
-    );
-    // Nothing to pass: the executable's own default is in effect.
-    expect(nodeOptionsArgument({})).toBeUndefined();
-    expect(nodeOptionsArgument({ NODE_OPTIONS: "--max-semi-space-size=16" })).toBe(
-      "--node-options=--max-semi-space-size=16",
-    );
-    expect(nodeOptionsArgument({ [MAX_SEMI_SPACE_ENV]: "0" })).toBe(
-      "--node-options=--max-semi-space-size=0",
-    );
-    expect(nodeOptionsArgument({ [MAX_SEMI_SPACE_ENV]: "96", NODE_OPTIONS: "--no-warnings" })).toBe(
-      "--node-options=--no-warnings --max-semi-space-size=96",
-    );
-  });
-});
-
 describe("the single executable with the default baked in", () => {
   const exe = "/usr/local/bin/t3";
-  const pidEnv = "T3CODE_YOUNG_GENERATION_RELAUNCHED_PID";
   const baked = ["--max-semi-space-size=64"];
   const sea = (overrides: Partial<Parameters<typeof decideYoungGeneration>[0]> = {}) => ({
     argv: [exe, exe, "serve"],
@@ -506,176 +478,64 @@ describe("the single executable with the default baked in", () => {
     expect(decision.kind).toBe("keep");
     expect(decision.outcome.applied).toBe(true);
     expect(decision.outcome.keptReason).toBe("the young-generation cap is already in effect");
+    expect(decision.outcome.maxSemiSpaceMb).toBe(64);
   });
 
-  it("carries NODE_OPTIONS, which the executable takes only on its command line, into one relaunch", () => {
+  it("never relaunches: Node reads NODE_OPTIONS itself, and the children get it unchanged", () => {
+    // The role's heap ceiling, the common production case: applied by Node, no second image.
+    const decision = decideYoungGeneration(sea({ env: { NODE_OPTIONS: "--max-old-space-size=12288" } }));
+    expect(decision.kind).toBe("keep");
+    expect(decision.outcome.applied).toBe(true);
+    expect(decision.outcome.capSettingIneffective).toBeUndefined();
+    if (decision.kind === "keep") expect("nodeOptionsForChildren" in decision).toBe(false);
+    // A preload in NODE_OPTIONS ran in this very image; nothing to do either.
+    const preload = decideYoungGeneration(
+      sea({ env: { NODE_OPTIONS: "--require /x.cjs" }, preloadRan: true }),
+    );
+    expect(preload.kind).toBe("keep");
+    expect(preload.outcome.applied).toBe(true);
+  });
+
+  it("says, for the log, when the knob, the hatch or an explicit cap cannot change the built-in value", () => {
+    for (const env of [
+      { [MAX_SEMI_SPACE_ENV]: "96" },
+      { [MAX_SEMI_SPACE_ENV]: "0" },
+      { NODE_OPTIONS: "--max-semi-space-size=16" },
+    ]) {
+      const decision = decideYoungGeneration(sea({ env }));
+      expect(decision.kind, JSON.stringify(env)).toBe("keep");
+      expect(decision.outcome.applied).toBe(true);
+      expect(decision.outcome.maxSemiSpaceMb).toBe(64);
+      expect(decision.outcome.capSettingIneffective).toBe(true);
+    }
+  });
+
+  it("treats a --node-options argument as a plain argument", () => {
     const decision = decideYoungGeneration(
-      sea({ env: { NODE_OPTIONS: "--max-old-space-size=12288" } }),
-    );
-    expect(decision.kind).toBe("relaunch");
-    if (decision.kind !== "relaunch") return;
-    expect(decision.plan.args).toEqual([exe, "--node-options=--max-old-space-size=12288", "serve"]);
-    // The environment is untouched: children get exactly the user's NODE_OPTIONS, and no marker.
-    expect(decision.plan.env.NODE_OPTIONS).toBe("--max-old-space-size=12288");
-    expect(decision.plan.env[INHERITED_NODE_OPTIONS_ENV]).toBeUndefined();
-    expect(decision.plan.env[pidEnv]).toBe("7");
-    const after = decideYoungGeneration(
-      sea({
-        execArgv: [...baked, "--max-old-space-size=12288"],
-        env: { NODE_OPTIONS: "--max-old-space-size=12288" },
-      }),
-    );
-    expect(after.kind).toBe("keep");
-    expect(after.outcome.applied).toBe(true);
-  });
-
-  it("applies the knob and the escape hatch over the baked value by relaunch", () => {
-    const knob = decideYoungGeneration(sea({ env: { [MAX_SEMI_SPACE_ENV]: "96" } }));
-    expect(knob.kind).toBe("relaunch");
-    if (knob.kind === "relaunch") {
-      expect(knob.plan.args).toEqual([exe, "--node-options=--max-semi-space-size=96", "serve"]);
-    }
-    const off = decideYoungGeneration(sea({ env: { [MAX_SEMI_SPACE_ENV]: "0" } }));
-    expect(off.kind).toBe("relaunch");
-    if (off.kind === "relaunch") {
-      expect(off.plan.args).toEqual([exe, "--node-options=--max-semi-space-size=0", "serve"]);
-    }
-    const offDone = decideYoungGeneration(
-      sea({ execArgv: [...baked, "--max-semi-space-size=0"], env: { [MAX_SEMI_SPACE_ENV]: "0" } }),
-    );
-    expect(offDone.kind).toBe("keep");
-    expect(offDone.outcome.applied).toBe(false);
-    expect(offDone.outcome.keptReason).toBe("disabled or set explicitly");
-  });
-
-  it("honours an explicit cap, in NODE_OPTIONS or given with --node-options", () => {
-    const explicit = decideYoungGeneration(
-      sea({ env: { NODE_OPTIONS: "--max-semi-space-size=16" } }),
-    );
-    expect(explicit.kind).toBe("relaunch");
-    if (explicit.kind === "relaunch") {
-      expect(explicit.plan.args).toEqual([exe, "--node-options=--max-semi-space-size=16", "serve"]);
-    }
-    const explicitDone = decideYoungGeneration(
-      sea({
-        execArgv: [...baked, "--max-semi-space-size=16"],
-        env: { NODE_OPTIONS: "--max-semi-space-size=16" },
-      }),
-    );
-    expect(explicitDone.kind).toBe("keep");
-    expect(explicitDone.outcome.applied).toBe(false);
-    // `t3 --node-options=--max-semi-space-size=16 serve`: the user's choice, never overridden.
-    const cli = decideYoungGeneration(sea({ execArgv: [...baked, "--max-semi-space-size=16"] }));
-    expect(cli.kind).toBe("keep");
-    expect(cli.outcome.applied).toBe(false);
-    expect(cli.outcome.keptReason).toBe("disabled or set explicitly");
-  });
-
-  it("runs a NODE_OPTIONS preload once, in the relaunched image", () => {
-    // Node ignored NODE_OPTIONS in the first image, so the preload has not run yet; it must not keep.
-    const decision = decideYoungGeneration(sea({ env: { NODE_OPTIONS: "--require /x.cjs" } }));
-    expect(decision.kind).toBe("relaunch");
-    if (decision.kind === "relaunch")
-      expect(decision.plan.args[1]).toBe("--node-options=--require /x.cjs");
-    const after = decideYoungGeneration(
-      sea({
-        execArgv: [...baked, "--require", "/x.cjs"],
-        env: { NODE_OPTIONS: "--require /x.cjs" },
-        preloadRan: true,
-      }),
-    );
-    expect(after.kind).toBe("keep");
-    expect(after.outcome.applied).toBe(true);
-  });
-
-  it("keeps the user's command-line options through the relaunch, after NODE_OPTIONS as Node orders them", () => {
-    // `NODE_OPTIONS=--no-warnings t3 --node-options=--max-semi-space-size=16 serve`: Node strips the
-    // option from argv, so the relaunch must rebuild it, with the command line winning over the environment.
-    const decision = decideYoungGeneration(
-      sea({
-        execArgv: [...baked, "--max-semi-space-size=16"],
-        env: { NODE_OPTIONS: "--no-warnings" },
-      }),
-    );
-    expect(decision.kind).toBe("relaunch");
-    if (decision.kind === "relaunch") {
-      expect(decision.plan.args).toEqual([
-        exe,
-        "--node-options=--no-warnings --max-semi-space-size=16",
-        "serve",
-      ]);
-    }
-    const after = decideYoungGeneration(
-      sea({
-        execArgv: [...baked, "--no-warnings", "--max-semi-space-size=16"],
-        env: { NODE_OPTIONS: "--no-warnings" },
-      }),
-    );
-    expect(after.kind).toBe("keep");
-    expect(after.outcome.maxSemiSpaceMb).toBe(16);
-    // A value with a space survives the rebuild as one argument.
-    const quoted = decideYoungGeneration(
-      sea({ execArgv: [...baked, "--title", "t3 server"], env: { NODE_OPTIONS: "--no-warnings" } }),
-    );
-    if (quoted.kind === "relaunch") {
-      expect(quoted.plan.args[1]).toBe('--node-options=--no-warnings --title "t3 server"');
-    }
-    expect(quoted.kind).toBe("relaunch");
-  });
-
-  it("on Windows, where nothing is baked and NODE_OPTIONS is read natively, honours it without a handoff", () => {
-    const explicit = decideYoungGeneration(
-      sea({ platform: "win32", execArgv: [], env: { NODE_OPTIONS: "--max-semi-space-size=16" } }),
-    );
-    expect(explicit.kind).toBe("keep");
-    expect(explicit.outcome.keptReason).toBe("disabled or set explicitly");
-    expect(explicit.outcome.maxSemiSpaceMb).toBe(16);
-    expect(explicit.outcome.nodeOptionsPending).toBeUndefined();
-    const off = decideYoungGeneration(
-      sea({ platform: "win32", execArgv: [], env: { [MAX_SEMI_SPACE_ENV]: "0" } }),
-    );
-    expect(off.kind).toBe("keep");
-    expect(off.outcome.keptReason).toBe("disabled or set explicitly");
-  });
-
-  it("lets an inspector request in NODE_OPTIONS, which has not run yet, reach the handoff", () => {
-    const decision = decideYoungGeneration(
-      sea({ env: { NODE_OPTIONS: "--inspect-port=0 --max-semi-space-size=16" } }),
-    );
-    expect(decision.kind).toBe("relaunch");
-    if (decision.kind === "relaunch") {
-      expect(decision.plan.args[1]).toBe(
-        "--node-options=--inspect-port=0 --max-semi-space-size=16",
-      );
-    }
-    // Once on the command line, the debugger runs and the cap is in effect: nothing more to do.
-    const after = decideYoungGeneration(
-      sea({ execArgv: [...baked, "--inspect-port=0"], env: { NODE_OPTIONS: "--inspect-port=0" } }),
-    );
-    expect(after.kind).toBe("keep");
-    expect(after.outcome.applied).toBe(true);
-  });
-
-  it("keeps when a command-line preload already ran, even with NODE_OPTIONS still pending", () => {
-    // `--node-options=--require=/x.cjs` ran in this image; carrying it into a relaunch would run it twice.
-    const decision = decideYoungGeneration(
-      sea({
-        execArgv: [...baked, "--require", "/x.cjs"],
-        env: { NODE_OPTIONS: "--no-warnings" },
-        preloadRan: true,
-      }),
+      sea({ argv: [exe, exe, "--node-options=--inspect-wait=0.0.0.0", "serve"] }),
     );
     expect(decision.kind).toBe("keep");
-    expect(decision.outcome.keptReason).toBe("started with a preload");
-    // Visible on the command line is enough, with or without a trace in the module cache.
-    const visible = decideYoungGeneration(
-      sea({ execArgv: [...baked, "--require=/x.cjs"], env: { NODE_OPTIONS: "--no-warnings" } }),
-    );
-    expect(visible.kind).toBe("keep");
+    expect(decision.outcome.keptReason).toBe("the young-generation cap is already in effect");
   });
 
-  it("over IPC, reports a launcher that passes NODE_OPTIONS in the environment and accepts one that passes it on the command line", () => {
-    const old = decideYoungGeneration(
+  it("tells a baked build by its flag, not by the platform, and relaunches an unbaked one as node would", () => {
+    const windows = decideYoungGeneration(sea({ platform: "win32" }));
+    expect(windows.kind).toBe("keep");
+    expect(windows.outcome.applied).toBe(true);
+    // A single executable built without the flag (a mis-built or older artefact): the cap travels
+    // in NODE_OPTIONS with the marker, as for a node start; its arguments are the user's only.
+    const unbaked = decideYoungGeneration(
+      sea({ execArgv: [], env: { NODE_OPTIONS: "--max-old-space-size=12288" } }),
+    );
+    expect(unbaked.kind).toBe("relaunch");
+    if (unbaked.kind !== "relaunch") return;
+    expect(unbaked.plan.args).toEqual([exe, "serve"]);
+    expect(unbaked.plan.env.NODE_OPTIONS).toBe(`--max-old-space-size=12288 ${flag}`);
+    expect(unbaked.plan.env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=12288");
+  });
+
+  it("over IPC, honours a launcher's marker and gives the children the launcher's own NODE_OPTIONS", () => {
+    const launched = decideYoungGeneration(
       sea({
         hasIpcChannel: true,
         env: {
@@ -685,48 +545,11 @@ describe("the single executable with the default baked in", () => {
         },
       }),
     );
-    expect(old.kind).toBe("keep");
-    expect(old.outcome.launcherPredatesDefault).toBe(true);
-    // The cap is baked, so it is in effect; the user's heap ceiling is what waits for a restart.
-    expect(old.outcome.applied).toBe(true);
-    if (old.kind === "keep") expect(old.nodeOptionsForChildren).toBe("--max-old-space-size=12288");
-    const fresh = decideYoungGeneration(
-      sea({
-        hasIpcChannel: true,
-        execArgv: [...baked, "--max-old-space-size=12288"],
-        env: { NODE_OPTIONS: "--max-old-space-size=12288", [SERVICE_LAUNCHER_CONTEXT_ENV]: "{}" },
-      }),
-    );
-    expect(fresh.kind).toBe("keep");
-    expect(fresh.outcome.applied).toBe(true);
-    expect(fresh.outcome.launcherPredatesDefault).toBeUndefined();
-  });
-});
-
-describe("nodeOptionsForSelfSpawn", () => {
-  it("puts a helper's Node options on a single executable's command line, and in the environment otherwise", () => {
-    // The document parser's heap bound must reach the executable, which ignores NODE_OPTIONS.
-    expect(
-      nodeOptionsForSelfSpawn({
-        isExecutable: true,
-        platform: "darwin",
-        nodeOptions: "--max-old-space-size=192",
-      }),
-    ).toEqual({ args: ["--node-options=--max-old-space-size=192"], env: {} });
-    expect(
-      nodeOptionsForSelfSpawn({
-        isExecutable: false,
-        platform: "darwin",
-        nodeOptions: "--max-old-space-size=192",
-      }),
-    ).toEqual({ args: [], env: { NODE_OPTIONS: "--max-old-space-size=192" } });
-    expect(
-      nodeOptionsForSelfSpawn({
-        isExecutable: true,
-        platform: "win32",
-        nodeOptions: "--max-old-space-size=192",
-      }),
-    ).toEqual({ args: [], env: { NODE_OPTIONS: "--max-old-space-size=192" } });
+    expect(launched.kind).toBe("applied");
+    expect(launched.outcome.applied).toBe(true);
+    if (launched.kind === "applied") {
+      expect(launched.nodeOptionsForChildren).toBe("--max-old-space-size=12288");
+    }
   });
 });
 
@@ -762,6 +585,13 @@ describe("runtimeFlagsOf", () => {
       runtimeFlagsOf({ applied: true, nodeOptionsAtStart: flag }, { NODE_OPTIONS: undefined })
         .youngGenerationLost,
     ).toBeUndefined();
+    // A built-in cap the environment tried to change: said for the log, at Warn.
+    expect(
+      runtimeFlagsOf(
+        { applied: true, nodeOptionsAtStart: undefined, maxSemiSpaceMb: 64, capSettingIneffective: true },
+        { T3CODE_V8_MAX_SEMI_SPACE_MB: "0" },
+      ).capSettingIneffective,
+    ).toBe(true);
   });
 
   it("reports the startup value it knows, never the current environment in its place", () => {
@@ -854,10 +684,9 @@ describe("planYoungGenerationRelaunch", () => {
     });
     expect(result.kind).toBe("relaunch");
     if (result.kind !== "relaunch") return;
-    // Node options go on the executable's command line; its environment is untouched.
-    expect(result.args).toEqual(["/usr/local/bin/t3", `--node-options=${flag}`, "serve", "--lan"]);
-    expect(result.env.NODE_OPTIONS).toBeUndefined();
-    expect(result.env[INHERITED_NODE_OPTIONS_ENV]).toBeUndefined();
+    expect(result.args).toEqual(["/usr/local/bin/t3", "serve", "--lan"]);
+    expect(result.env.NODE_OPTIONS).toBe(flag);
+    expect(result.env[INHERITED_NODE_OPTIONS_ENV]).toBe("");
   });
   it("sees a preload in every spelling Node accepts, in execArgv and in NODE_OPTIONS", () => {
     // Node reads `_` as `-` in option names; a loader given as --experimental_loader ran twice.

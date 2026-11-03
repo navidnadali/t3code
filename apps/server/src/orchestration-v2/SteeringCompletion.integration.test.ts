@@ -2365,6 +2365,201 @@ it.effect(
     ),
 );
 
+// The thread starts in A through a symlink; the symlink is then pointed at B and the thread moves to
+// B's real path. B is another workspace: run 2 gets its own scope and lists only its own file.
+it.effect(
+  "a thread whose first workspace was a symlink, since pointed elsewhere, keeps the workspaces apart",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* nextTurnSelectionHarness("first-workspace-symlink");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const other = yield* repoWorktree(harness.cwd, "switched");
+          const link = path.join(
+            yield* fs.makeTempDirectoryScoped({ prefix: "t3-first-workspace-symlink-" }),
+            "link",
+          );
+          yield* fs.symlink(harness.cwd, link);
+          const threadId = ThreadId.make("thread:first-workspace-symlink");
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create"),
+            threadId,
+            projectId: ProjectId.make("project:first-workspace-symlink"),
+            title: "First workspace through a symlink",
+            modelSelection: runSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: link,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const startRun = (index: number, text: string) =>
+            Effect.gen(function* () {
+              const earlier = new Set(harness.started.map((turn) => turn.attemptId));
+              const running = yield* orchestrator.streamDomainEvents.pipe(
+                Stream.filter(
+                  (event) =>
+                    event.type === "provider-turn.updated" &&
+                    event.payload.status === "running" &&
+                    event.payload.runAttemptId !== null &&
+                    !earlier.has(event.payload.runAttemptId),
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+                Effect.forkScoped,
+              );
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(text),
+                threadId,
+                messageId: MessageId.make(`message:${text}`),
+                text,
+                attachments: [],
+                modelSelection: runSelection,
+                dispatchMode: { type: "start_immediately" },
+                createdBy: "user",
+                creationSource: "web",
+              });
+              yield* worker.drain();
+              yield* Fiber.join(running);
+              return harness.started[index]!;
+            });
+          const first = yield* startRun(0, "first");
+          yield* fs.writeFileString(path.join(harness.cwd, "edited-by-first.txt"), "first\n");
+          yield* endTurnOf(harness, threadId, first.runId, first.runOrdinal);
+          yield* fs.remove(link);
+          yield* fs.symlink(other, link);
+          yield* orchestrator.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make("switch"),
+            threadId,
+            worktreePath: other,
+          });
+          const second = yield* startRun(1, "second");
+          yield* fs.writeFileString(path.join(other, "edited-by-second.txt"), "second\n");
+          yield* endTurnOf(harness, threadId, second.runId, second.runOrdinal);
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          const checkpointOf = (runId: typeof first.runId) =>
+            projection.checkpoints.find((checkpoint) => checkpoint.runId === runId)!;
+          assert.notEqual(checkpointOf(second.runId).scopeId, checkpointOf(first.runId).scopeId);
+          assert.deepEqual(
+            checkpointOf(second.runId).files.map((file) => file.path),
+            ["edited-by-second.txt"],
+          );
+        }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+      }),
+    ),
+);
+
+// Recorded before the upgrade: run 1 ended in A with its capture still pending when the one root
+// scope was re-created in B. Captured after the upgrade, run 1 still has no recorded workspace, so
+// its thread start, which is A's, is not placed in B by the capture.
+it.effect("a run recorded before the upgrade, captured after it, keeps its workspace unknown", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const database = SqlitePersistence.layerMemory;
+      const harness = yield* nextTurnSelectionHarness(
+        "pending-legacy-capture",
+        false,
+        true,
+        Effect.void,
+        database,
+      );
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const other = yield* repoWorktree(harness.cwd, "switched");
+        yield* fs.writeFileString(path.join(other, "only-on-b.txt"), "b\n");
+        const threadId = yield* harness.startFirstTurn;
+        const first = harness.started[0]!;
+        yield* fs.writeFileString(path.join(harness.cwd, "edited-by-first.txt"), "first\n");
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const run = projection.runs.find((candidate) => candidate.id === first.runId)!;
+        const turn = projection.providerTurns.find(
+          (candidate) => candidate.runAttemptId === run.activeAttemptId,
+        )!;
+        const waiting = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.id === first.runId &&
+              event.payload.status === "waiting",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* Queue.offer(harness.events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: { ...turn, status: "completed", completedAt: yield* DateTime.now },
+        });
+        yield* Queue.offer(harness.events, {
+          type: "turn.terminal",
+          driver,
+          providerThreadId: turn.providerThreadId,
+          providerTurnId: turn.id,
+          runOrdinal: first.runOrdinal,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(waiting);
+        // Before the upgrade: runs kept no workspace, and the next run re-created the scope in B.
+        yield* recordedBeforeUpgrade(threadId);
+        const root = (yield* orchestrator.getThreadProjection(threadId)).checkpointScopes[0]!;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("legacy-root-scope-in-b"),
+              type: "checkpoint-scope.created",
+              threadId,
+              providerInstanceId: instanceId,
+              occurredAt: yield* DateTime.now,
+              payload: { ...root, cwd: other },
+            },
+          ],
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make("switch"),
+          threadId,
+          worktreePath: other,
+        });
+        yield* worker.drain();
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.isUndefined(
+          after.runs.find((candidate) => candidate.id === first.runId)!.workspaceCwd,
+        );
+        const threadStart = after.checkpoints.find(
+          (checkpoint) => checkpoint.ordinalWithinScope === 0 && checkpoint.appRunOrdinal === null,
+        )!;
+        const refused = yield* orchestrator
+          .dispatch({
+            type: "checkpoint.rollback",
+            commandId: CommandId.make("start-files"),
+            threadId,
+            scopeId: threadStart.scopeId,
+            checkpointId: threadStart.id,
+            restoreFiles: true,
+          })
+          .pipe(Effect.flip);
+        assert.include(String(refused.cause), "can't tell which worktree");
+        assert.isTrue(yield* fs.exists(path.join(other, "only-on-b.txt")));
+      }).pipe(Effect.provide(Layer.mergeAll(harness.layer, NodeServices.layer, database)));
+    }),
+  ),
+);
+
 it.effect("queues a plain send behind the stopped queue and releases its hold", () =>
   Effect.scoped(
     Effect.gen(function* () {

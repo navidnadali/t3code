@@ -27,6 +27,7 @@ import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import { spawnerProcessIds } from "./spawnerProcesses.ts";
 import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
 
 // Windows keeps the main-thread spawner, so the worker cases run elsewhere.
@@ -1370,6 +1371,22 @@ describe("WorkerChildProcessSpawner", () => {
         }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
   }
+
+  it.live.skipIf(!workerPlatform)("the server knows its spawner process's PID while it runs", () =>
+    Effect.gen(function* () {
+      const spawnerPid = yield* Effect.gen(function* () {
+        const spawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(
+          yield* ChildProcessSpawner,
+        );
+        const parent = Number(
+          yield* spawner.string(node("process.stdout.write(String(process.ppid))")),
+        );
+        expect(spawnerProcessIds.has(parent)).toBe(true);
+        return parent;
+      }).pipe(Effect.scoped);
+      expect(spawnerProcessIds.has(spawnerPid)).toBe(false);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 
   it.live.skipIf(!workerPlatform)(
     "VCS layers provided per WebSocket connection reuse the server's spawner process",

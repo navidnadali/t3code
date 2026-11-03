@@ -801,12 +801,20 @@ effectIt.effect("stops only a job's own process group", () =>
       { pid: 401, ppid: 400, pgid: 400 },
       { pid: 500, ppid: serverPid, pgid: 500 }, // terminal shell
       { pid: 600, ppid: 500, pgid: 600 }, // terminal job
+      { pid: 700, ppid: serverPid, pgid: 700 }, // the server's spawner process
+      { pid: 710, ppid: 700, pgid: 710 }, // an agent CLI it started for the server
+      { pid: 720, ppid: 710, pgid: 720 }, // `npm run dev &` in that agent
+      { pid: 800, ppid: serverPid, pgid: 800 }, // another child, not a spawner
+      { pid: 810, ppid: 800, pgid: 810 },
     ];
     const table = new Map(rows.map((row) => [row.pid, row]));
-    expect(PortScanner.stoppableProcessGroup(table, 401, serverPid)).toBe(400);
-    expect(PortScanner.stoppableProcessGroup(table, 600, serverPid)).toBe(600);
-    for (const pid of [20, 210, 500, 999]) {
-      expect(PortScanner.stoppableProcessGroup(table, pid, serverPid)).toBeNull();
+    const spawners = new Set([700]);
+    expect(PortScanner.stoppableProcessGroup(table, 401, serverPid, spawners)).toBe(400);
+    expect(PortScanner.stoppableProcessGroup(table, 600, serverPid, spawners)).toBe(600);
+    expect(PortScanner.stoppableProcessGroup(table, 720, serverPid, spawners)).toBe(720);
+    expect(PortScanner.stoppableProcessGroup(table, 810, serverPid, spawners)).toBe(810);
+    for (const pid of [20, 210, 500, 700, 710, 999]) {
+      expect(PortScanner.stoppableProcessGroup(table, pid, serverPid, spawners)).toBeNull();
     }
   }),
 );

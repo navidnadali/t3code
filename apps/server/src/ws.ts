@@ -622,16 +622,17 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 // Shell and thread stream items are shared across clients (the shell delta hub, projected
 // events); each object is encoded once with the JSON codec RpcServer would apply, and the
 // server-side definitions of those two streams pass the encoded items through unchanged.
-const encodedStreamItems = new WeakMap<object, unknown>();
-const encodeStreamItemOnce =
-  <A extends object>(encode: (item: A) => unknown) =>
-  (item: A): unknown => {
-    const cached = encodedStreamItems.get(item);
+// Each encoder has its own cache: an object that reached both streams is encoded per schema.
+const encodeStreamItemOnce = <A extends object>(encode: (item: A) => unknown) => {
+  const encoded = new WeakMap<A, unknown>();
+  return (item: A): unknown => {
+    const cached = encoded.get(item);
     if (cached !== undefined) return cached;
-    const encoded = encode(item);
-    encodedStreamItems.set(item, encoded);
-    return encoded;
+    const value = encode(item);
+    encoded.set(item, value);
+    return value;
   };
+};
 export const encodeShellStreamItem = encodeStreamItemOnce(
   Schema.encodeSync(Schema.toCodecJson(OrchestrationV2RpcSchemas.subscribeShell.output)),
 );

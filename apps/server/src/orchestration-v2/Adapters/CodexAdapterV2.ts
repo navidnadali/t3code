@@ -101,6 +101,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import { resolveAttachmentPath, resolveAttachmentPathById } from "../../attachmentStore.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
+import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import { ServerConfig } from "../../config.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -1461,7 +1462,11 @@ export const layerAppServerClientFactory: Layer.Layer<
 > = Layer.effect(
   CodexAppServerClientFactory,
   Effect.gen(function* () {
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    // The server's provider launcher starts it without forking the server where it can.
+    const launcher = yield* Effect.serviceOption(WorkerChildProcessSpawner.ProviderProcessLauncher);
+    const spawner = Option.isSome(launcher)
+      ? launcher.value.spawner
+      : yield* ChildProcessSpawner.ChildProcessSpawner;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
     const stageTiming = (yield* ProviderIoStageTiming)?.forProvider(CODEX_PROVIDER);

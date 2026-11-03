@@ -1461,6 +1461,162 @@ it.effect("a run records its workspace when it is scoped, before its turn starts
   ),
 );
 
+// Run 1 in worktree A, then the thread moves to worktree B of the same repo (one branch each, refs
+// shared) with a file of its own committed, and run 2 edits B. Returns what the tests read.
+const switchedWorktreeThread = (
+  harness: Effect.Success<ReturnType<typeof nextTurnSelectionHarness>>,
+) =>
+  Effect.gen(function* () {
+    const { cwd, events, started, startFirstTurn } = harness;
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const git = (dir: string, ...args: ReadonlyArray<string>) =>
+      spawner
+        .exitCode(
+          ChildProcess.make(
+            "git",
+            ["-c", "user.name=T3", "-c", "user.email=t3@example.com", ...args],
+            { cwd: dir },
+          ),
+        )
+        .pipe(Effect.map((code) => assert.equal(Number(code), 0)));
+    const other = yield* repoWorktree(cwd, "switched");
+    yield* fs.writeFileString(path.join(other, "only-on-b.txt"), "b\n");
+    yield* git(other, "add", "only-on-b.txt");
+    yield* git(other, "commit", "-qm", "only on b");
+    const endTurn = (runId: (typeof started)[number]["runId"], runOrdinal: number) =>
+      Effect.gen(function* () {
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const run = projection.runs.find((candidate) => candidate.id === runId)!;
+        const turn = projection.providerTurns.find(
+          (candidate) => candidate.runAttemptId === run.activeAttemptId,
+        )!;
+        const waiting = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.id === runId &&
+              event.payload.status === "waiting",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* Queue.offer(events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: { ...turn, status: "completed", completedAt: yield* DateTime.now },
+        });
+        yield* Queue.offer(events, {
+          type: "turn.terminal",
+          driver,
+          providerThreadId: turn.providerThreadId,
+          providerTurnId: turn.id,
+          runOrdinal,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(waiting);
+        yield* worker.drain();
+      });
+
+    const threadId = yield* startFirstTurn;
+    const first = started[0]!;
+    yield* fs.writeFileString(path.join(cwd, "edited-by-first.txt"), "first\n");
+    yield* endTurn(first.runId, first.runOrdinal);
+    yield* orchestrator.dispatch({
+      type: "thread.metadata.update",
+      commandId: CommandId.make("switch"),
+      threadId,
+      worktreePath: other,
+    });
+    const running = yield* orchestrator.streamDomainEvents.pipe(
+      Stream.filter(
+        (event) =>
+          event.type === "provider-turn.updated" &&
+          event.payload.status === "running" &&
+          event.payload.runAttemptId !== first.attemptId,
+      ),
+      Stream.take(1),
+      Stream.runDrain,
+      Effect.forkScoped,
+    );
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("next"),
+      threadId,
+      messageId: MessageId.make("message:next"),
+      text: "next",
+      attachments: [],
+      modelSelection: runSelection,
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* worker.drain();
+    yield* Fiber.join(running);
+    const second = started[1]!;
+    yield* fs.writeFileString(path.join(other, "edited-by-second.txt"), "second\n");
+    yield* endTurn(second.runId, second.runOrdinal);
+    const projection = yield* orchestrator.getThreadProjection(threadId);
+    return {
+      threadId,
+      other,
+      projection,
+      checkpointOf: (runId: (typeof started)[number]["runId"]) =>
+        projection.checkpoints.find((checkpoint) => checkpoint.runId === runId)!,
+      first,
+      second,
+    };
+  });
+
+it.effect("the run after a worktree switch lists only its own changes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* nextTurnSelectionHarness("own-changes-after-switch");
+      yield* Effect.gen(function* () {
+        const { checkpointOf, second } = yield* switchedWorktreeThread(harness);
+        assert.deepEqual(
+          checkpointOf(second.runId).files.map((file) => file.path),
+          ["edited-by-second.txt"],
+        );
+      }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+    }),
+  ),
+);
+
+it.effect("a file revert to a checkpoint taken in another worktree is refused", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* nextTurnSelectionHarness("revert-across-switch");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { threadId, other, checkpointOf, first } = yield* switchedWorktreeThread(harness);
+        const target = checkpointOf(first.runId);
+        const refused = yield* orchestrator
+          .dispatch({
+            type: "checkpoint.rollback",
+            commandId: CommandId.make("revert-files"),
+            threadId,
+            scopeId: target.scopeId,
+            checkpointId: target.id,
+            restoreFiles: true,
+          })
+          .pipe(Effect.flip);
+        assert.include(String(refused.cause), "another worktree");
+        // Worktree B keeps its own branch's file: run 1's tree is not restored over it.
+        assert.isTrue(yield* fs.exists(path.join(other, "only-on-b.txt")));
+      }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+    }),
+  ),
+);
+
 it.effect("queues a plain send behind the stopped queue and releases its hold", () =>
   Effect.scoped(
     Effect.gen(function* () {

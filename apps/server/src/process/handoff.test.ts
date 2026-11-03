@@ -301,7 +301,7 @@ describe("hand-off queue deadline", () => {
   });
 
   it.live.skipIf(!linux)(
-    "starts a provider on Node's spawner when its start waits in a queue that never moves",
+    "starts a provider on Node's spawner when its start waits in a queue that never moves, and keeps those running",
     () => {
       const { logs, layer: logLayer } = capturedLogs();
       return Effect.gen(function* () {
@@ -318,6 +318,13 @@ describe("hand-off queue deadline", () => {
           timers: answerDeadlines(500),
         });
         const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        // A provider already running from this spawner, its slot free again once it runs.
+        const watch = yield* childWatch;
+        const before = new Set(spawnerProcessIds);
+        yield* launcher.spawner.spawn(ChildProcess.make(process.execPath, ["-e", watch.script]));
+        const socket = yield* watch.connected;
+        const pid = yield* watch.pidOf(socket);
+        const [spawnerPid] = [...spawnerProcessIds].filter((each) => !before.has(each));
         const parents = yield* Effect.forEach(
           [1, 2, 3],
           () =>
@@ -339,6 +346,22 @@ describe("hand-off queue deadline", () => {
           fromServer: parents.filter((parent) => Number(parent) === process.pid).length,
           fellBack: logs.filter(({ text }) => text.includes("hand-off failed")).length,
         }).toEqual({ handedOff: 1, fromServer: 2, fellBack: 2 });
+        // A stop for a fault is no shutdown: once the spawner has gone, what it handed off runs on.
+        yield* Effect.promise(() =>
+          expect.poll(() => spawnerProcessIds.has(spawnerPid!), { timeout: 5_000 }).toBe(false),
+        );
+        const outcome = yield* watch
+          .closed(socket)
+          .pipe(
+            Effect.as("ended"),
+            Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.succeed("running") }),
+          );
+        expect({ outcome, adopted: adoptedProcessIds.has(pid) }).toEqual({
+          outcome: "running",
+          adopted: true,
+        });
+        process.kill(pid, "SIGKILL");
+        yield* watch.closed(socket);
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, logLayer)));
     },
   );

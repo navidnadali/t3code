@@ -40,45 +40,60 @@ const nodeFlags = (
   return JSON.parse(result.stdout) as NodeFlagsReport;
 };
 
+const modifiedAt = (file: string): number | undefined => {
+  try {
+    return NodeFS.statSync(file).mtimeMs;
+  } catch {
+    return undefined;
+  }
+};
+
+// Builds a 160 MB executable and needs the engine's exact Node: a release check, run on request with
+//   T3CODE_SEA_TEST=1 vp test run apps/server/scripts/youngGenerationSea.test.ts
 describe("young-generation default in the single executable", () => {
-  it.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
-    "relaunches the built t3 with the cap, directly and through a symlink",
-    () =>
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        // The release binary's argv is [exe, exe, ...arguments]; nothing else runs that shape.
-        const build = NodeChildProcess.spawnSync(
-          process.execPath,
-          ["scripts/cli.ts", "build-exe"],
-          {
-            cwd: serverDir,
-            env: { ...process.env, NODE_OPTIONS: undefined },
-            encoding: "utf8",
-            timeout: 600_000,
-          },
-        );
-        expect(build.status, build.stderr).toBe(0);
-        const executable = NodePath.join(serverDir, "dist-exe/t3");
-        const userOptions = "--max-old-space-size=12288";
-        const direct = nodeFlags(executable, { NODE_OPTIONS: userOptions });
-        expect(direct.sea).toBe(true);
-        expect(direct, direct.keptReason).toMatchObject({
-          applied: true,
-          maxSemiSpaceMb: 64,
-          nodeOptionsForChildren: userOptions,
-        });
-        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "young-generation-sea-" });
-        const link = NodePath.join(dir, "t3");
-        NodeFS.symlinkSync(executable, link);
-        expect(nodeFlags(link, { NODE_OPTIONS: userOptions })).toMatchObject({
-          applied: true,
-          maxSemiSpaceMb: 64,
-        });
-        // An explicit cap is never overridden, whatever the argument shape.
-        expect(nodeFlags(executable, { NODE_OPTIONS: "--max-semi-space-size=16" })).toMatchObject({
-          applied: false,
-          maxSemiSpaceMb: 16,
-        });
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  it.live.skipIf(
+    HostProcess.Platform.defaultValue() === "win32" || process.env.T3CODE_SEA_TEST !== "1",
+  )("relaunches the built t3 with the cap, directly and through a symlink", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "young-generation-sea-" });
+      // The release binary's argv is [exe, exe, ...arguments]; nothing else runs that shape. It is
+      // built beside the test, never over the worktree's own dist-exe.
+      const shipped = NodePath.join(serverDir, "dist-exe/t3");
+      const shippedBefore = modifiedAt(shipped);
+      const build = NodeChildProcess.spawnSync(
+        process.execPath,
+        ["scripts/cli.ts", "build-exe", "--out-dir", dir],
+        {
+          cwd: serverDir,
+          env: { ...process.env, NODE_OPTIONS: undefined },
+          encoding: "utf8",
+          timeout: 600_000,
+        },
+      );
+      expect(build.status, build.stderr).toBe(0);
+      expect(modifiedAt(shipped)).toBe(shippedBefore);
+      const executable = NodePath.join(dir, "t3");
+      const userOptions = "--max-old-space-size=12288";
+      const direct = nodeFlags(executable, { NODE_OPTIONS: userOptions });
+      expect(direct.sea).toBe(true);
+      expect(direct, direct.keptReason).toMatchObject({
+        applied: true,
+        maxSemiSpaceMb: 64,
+        nodeOptionsForChildren: userOptions,
+      });
+      const link = NodePath.join(dir, "link", "t3");
+      NodeFS.mkdirSync(NodePath.dirname(link));
+      NodeFS.symlinkSync(executable, link);
+      expect(nodeFlags(link, { NODE_OPTIONS: userOptions })).toMatchObject({
+        applied: true,
+        maxSemiSpaceMb: 64,
+      });
+      // An explicit cap is never overridden, whatever the argument shape.
+      expect(nodeFlags(executable, { NODE_OPTIONS: "--max-semi-space-size=16" })).toMatchObject({
+        applied: false,
+        maxSemiSpaceMb: 16,
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

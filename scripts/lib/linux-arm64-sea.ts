@@ -9,6 +9,8 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
+import { SEA_EXEC_ARGV, SEA_EXEC_ARGV_EXTENSION } from "@t3tools/shared/youngGenerationEnv";
+
 class LinuxArm64SeaError extends Schema.TaggedError<LinuxArm64SeaError>()("LinuxArm64SeaError", {
   message: Schema.String,
 }) {}
@@ -57,6 +59,8 @@ export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (
       disableExperimentalSEAWarning: true,
       // Node SEA useCodeCache breaks import(), which the server needs.
       useCodeCache: false,
+      execArgv: [...SEA_EXEC_ARGV],
+      execArgvExtension: SEA_EXEC_ARGV_EXTENSION,
     }),
   );
   yield* run(["--experimental-sea-config", configPath], input.verbose);

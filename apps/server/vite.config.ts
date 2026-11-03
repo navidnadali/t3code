@@ -3,6 +3,7 @@ import "vite-plus/test/config";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { defineConfig, mergeConfig } from "vite-plus";
+import { SEA_EXEC_ARGV, SEA_EXEC_ARGV_EXTENSION } from "@t3tools/shared/youngGenerationEnv";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
@@ -111,7 +112,12 @@ export default mergeConfig(
               outDir: packExecutableOutDir,
               ...(packExecutableTargets ? { targets: packExecutableTargets } : {}),
               // Node SEA useCodeCache breaks import(), which the server needs.
-              seaConfig: { useCodeCache: false },
+              seaConfig: {
+                useCodeCache: false,
+                // The young-generation default, baked in: a bare start never relaunches.
+                execArgv: [...SEA_EXEC_ARGV],
+                execArgvExtension: SEA_EXEC_ARGV_EXTENSION,
+              },
             },
           }
         : {}),

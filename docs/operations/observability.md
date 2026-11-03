@@ -207,13 +207,19 @@ behaves like 32 MiB). At 250 sessions that halves the scavenges, cuts GC time by
 event-loop delay maximum by 59 %, for about 128 MiB more RSS; at 50 sessions nothing measurable
 changes. The flag is process-wide, so worker isolates share the cap and may each grow by up to 64 MiB
 under load. V8
-reads the flag only at startup, so it travels in `NODE_OPTIONS`: a `t3 serve`, `t3 start`, `t3` or
-`t3 <dir>` (with any server flags) started without it relaunches itself once (`execve`, same pid,
-before any other work), the
-background service launcher passes it to the server it starts, and the server's children (agents,
-helpers) get the `NODE_OPTIONS` the server itself was given. `T3CODE_V8_MAX_SEMI_SPACE_MB=0` keeps
-Node's default, a positive integer sets another cap, and an explicit `--max-semi-space-size` in
-`NODE_OPTIONS` or on the command line is never overridden (values above 1024 MiB are ignored). A server
+reads the flag only at startup. The single executable has it built in (the SEA's `execArgv`, with
+`execArgvExtension: "cli"`), so a bare `t3 serve` or `t3 start` runs with it at once and never relaunches;
+that build also means the executable takes Node options only on its command line (`--node-options=…`),
+never from `NODE_OPTIONS`: a direct start with `NODE_OPTIONS` set, the escape hatch, a knob value or an
+explicit `--max-semi-space-size` in `NODE_OPTIONS` is carried there by one relaunch (`execve`, same pid,
+before any other work), the background service launcher passes them there itself (a runtime archive
+declares this in `exec-argv.json` beside the executable; an older runtime gets them in `NODE_OPTIONS` as
+before), and the desktop app hands its backend the cap in `NODE_OPTIONS` with the marker. A `node bin.mjs`
+start (an npm install) still relaunches itself once with the cap in `NODE_OPTIONS`. In every case the
+server's children (agents, helpers) get exactly the `NODE_OPTIONS` the server itself was given. `T3CODE_V8_MAX_SEMI_SPACE_MB=0` keeps
+Node's default (the single executable passes `--max-semi-space-size=0` over its built-in value), a positive
+integer sets another cap, and an explicit `--max-semi-space-size` in `NODE_OPTIONS` or on the command line
+is never overridden (values above 1024 MiB are ignored). A server
 started with an IPC channel or a bootstrap descriptor (`--bootstrap-fd`, `T3CODE_BOOTSTRAP_FD`) by a
 launcher that did not set the flag, or with the inspector (`--inspect*`), runs with Node's default; so does
 a direct `t3 serve` on Windows (no `execve`), while a Windows server the service launcher starts gets the
@@ -232,7 +238,9 @@ becomes the default — the single executable runs no `--import` preload from `N
 cannot hit it. A process relaunches at most once (the relaunch marks its own pid), whatever a preload does to
 `NODE_OPTIONS`. `t3 __node-flags` prints what the current process runs with; `server.v8` logs the parsed sizes once
 the server listens — at Warn, with the reason, whenever the server wanted the cap and lost it to something changeable
-(`youngGenerationLost`: a preload, a launcher that predates the default, a failed relaunch, a changed `NODE_OPTIONS`),
+(`youngGenerationLost`: a preload, a failed relaunch, a changed `NODE_OPTIONS`) or to a service launcher that
+predates the server (`launcherPredatesDefault`: a remote update under a launcher that still passes a single
+executable its options in `NODE_OPTIONS`, which it ignores — `nodeOptionsPending` — until the service restarts),
 and at Info when the start itself rules a relaunch out (`structuralKeep`: an IPC channel without a launcher, a bootstrap
 descriptor as the desktop app's backend uses, the inspector, no `execve`).
 

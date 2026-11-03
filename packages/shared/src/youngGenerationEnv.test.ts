@@ -1,7 +1,10 @@
 import { describe, expect, it } from "@effect/vitest";
 
-import { SEA_EXEC_ARGV, SEA_EXEC_ARGV_EXTENSION } from "./seaBuild.ts";
-import { DEFAULT_MAX_SEMI_SPACE_MB } from "./youngGeneration.ts";
+import {
+  DEFAULT_MAX_SEMI_SPACE_MB,
+  SEA_EXEC_ARGV,
+  SEA_EXEC_ARGV_EXTENSION,
+} from "./youngGenerationEnv.ts";
 
 describe("the single executable's build", () => {
   it("bakes the young-generation default into the executable and takes options on its command line", () => {
@@ -11,4 +14,3 @@ describe("the single executable's build", () => {
     expect(SEA_EXEC_ARGV_EXTENSION).toBe("cli");
   });
 });
-

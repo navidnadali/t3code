@@ -15,6 +15,10 @@ import * as Schema from "effect/Schema";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import serverPackageJson from "../../../server/package.json" with { type: "json" };
+import {
+  INHERITED_NODE_OPTIONS_ENV,
+  serverChildEnvironment,
+} from "@t3tools/shared/youngGenerationEnv";
 
 import * as DesktopBackendManager from "./DesktopBackendManager.ts";
 import * as DesktopCliShim from "../app/DesktopCliShim.ts";
@@ -118,6 +122,22 @@ const WSL_SERVER_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 const nodeBinDirOf = (nodePath: string): string => {
   const lastSlash = nodePath.lastIndexOf("/");
   return lastSlash > 0 ? nodePath.slice(0, lastSlash) : "/usr/bin";
+};
+
+/** The backend's young-generation cap, with the marker that gives its children the desktop's own NODE_OPTIONS. */
+const YOUNG_GENERATION_MB = 64;
+const youngGenerationEnv = (): {
+  readonly NODE_OPTIONS: string | undefined;
+  readonly [INHERITED_NODE_OPTIONS_ENV]: string | undefined;
+} => {
+  const given = serverChildEnvironment({
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    T3CODE_V8_MAX_SEMI_SPACE_MB: process.env.T3CODE_V8_MAX_SEMI_SPACE_MB,
+  });
+  return {
+    NODE_OPTIONS: given.NODE_OPTIONS,
+    [INHERITED_NODE_OPTIONS_ENV]: given[INHERITED_NODE_OPTIONS_ENV],
+  };
 };
 
 const backendChildEnvPatch = (): Record<string, string | undefined> =>
@@ -531,6 +551,7 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       cwd: environment.backendCwd,
       env: {
         ...backendChildEnvPatch(),
+        ...youngGenerationEnv(),
         ELECTRON_RUN_AS_NODE: "1",
         T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING: "1",
         T3CODE_CLI_PATH: Option.getOrUndefined(input.cliPath),
@@ -692,10 +713,11 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
     runtime.kind === "executable"
       ? `${WSL_SERVER_SYSTEM_PATH}:${preflight.resolvedPath}`
       : `${nodeBinDirOf(runtime.nodePath)}:${WSL_SERVER_SYSTEM_PATH}:${preflight.resolvedPath}`;
+  // The executable has its young-generation cap built in; node takes it as a flag, never relaunching.
   const command =
     runtime.kind === "executable"
       ? [runtime.entryPath]
-      : [runtime.nodePath, runtime.linuxEntryPath];
+      : [runtime.nodePath, `--max-semi-space-size=${YOUNG_GENERATION_MB}`, runtime.linuxEntryPath];
 
   return {
     ...baseConfig,

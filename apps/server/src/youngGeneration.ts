@@ -4,24 +4,43 @@ import * as NodeModule from "node:module";
 import * as NodeSea from "node:sea";
 import * as NodeV8 from "node:v8";
 
+import {
+  capSetting,
+  DEFAULT_MAX_SEMI_SPACE_MB,
+  explicitMaxSemiSpace,
+  flagIn,
+  INHERITED_NODE_OPTIONS_ENV,
+  MAX_SEMI_SPACE_ENV,
+  MAX_SEMI_SPACE_FLAG as FLAG,
+  nodeOptionSpans,
+  nodeOptionsWithMaxSemiSpace,
+  optionName,
+  resolveMaxSemiSpaceMb,
+  SEA_EXEC_ARGV,
+  tokenizeNodeOptions,
+  withFlag,
+} from "@t3tools/shared/youngGenerationEnv";
+import type { Environment, NodeOptionSpan } from "@t3tools/shared/youngGenerationEnv";
+
+export {
+  DEFAULT_MAX_SEMI_SPACE_MB,
+  INHERITED_NODE_OPTIONS_ENV,
+  MAX_SEMI_SPACE_ENV,
+  nodeOptionsWithMaxSemiSpace,
+  resolveMaxSemiSpaceMb,
+  serverChildEnvironment,
+  tokenizeNodeOptions,
+} from "@t3tools/shared/youngGenerationEnv";
+export type { Environment } from "@t3tools/shared/youngGenerationEnv";
 import { SERVICE_LAUNCHER_CONTEXT_ENV } from "./cloud/serviceProtocol.ts";
 
 // V8 reads --max-semi-space-size only at startup, so the cap travels in NODE_OPTIONS: a parent that
 // starts the server puts it there, and a server started without it relaunches itself once (execve,
 // same pid). The server's children get the NODE_OPTIONS the server itself was given.
-export const DEFAULT_MAX_SEMI_SPACE_MB = 64;
-/** Escape hatch: 0/off disables the default; a positive integer sets the cap in MiB. */
-export const MAX_SEMI_SPACE_ENV = "T3CODE_V8_MAX_SEMI_SPACE_MB";
-/** The NODE_OPTIONS the server's children must inherit (the value before the flag was added). */
-export const INHERITED_NODE_OPTIONS_ENV = "T3CODE_INHERITED_NODE_OPTIONS";
 
-const FLAG = "--max-semi-space-size";
-/** The escape hatch accepts caps up to this (MiB); V8 would take far more, which no server needs. */
-const MAX_SEMI_SPACE_MB_LIMIT = 1024;
 const BOOTSTRAP_FD_ENV = "T3CODE_BOOTSTRAP_FD";
 /** Set by the relaunch to the pid it relaunches; execve keeps the pid, so only that image matches it. */
 const RELAUNCHED_PID_ENV = "T3CODE_YOUNG_GENERATION_RELAUNCHED_PID";
-const DISABLED_VALUES = new Set(["0", "off", "false", "no"]);
 export const SERVER_COMMANDS: ReadonlySet<string> = new Set(["serve", "start", "__node-flags"]);
 /** Every top-level command that never starts a server; `youngGeneration.test.ts` checks it against the CLI's exported commands. */
 export const NON_SERVER_COMMANDS: ReadonlySet<string> = new Set([
@@ -65,104 +84,34 @@ const NON_SERVER_ROOT_FLAGS = new Set([
   "--wizard",
 ]);
 
-export type Environment = Readonly<Record<string, string | undefined>>;
-
-/** One argument of NODE_OPTIONS: its text as Node reads it, and where it sits in the string, quotes included. */
-interface NodeOptionSpan {
-  readonly start: number;
-  readonly end: number;
-  readonly text: string;
-}
-
-/** Splits NODE_OPTIONS as Node does: spaces separate, double quotes group, a backslash inside quotes escapes. */
-const nodeOptionSpans = (nodeOptions: string): ReadonlyArray<NodeOptionSpan> => {
-  const spans: Array<NodeOptionSpan> = [];
-  let text = "";
-  let start = -1;
-  let quoted = false;
-  const close = (end: number): void => {
-    if (start !== -1) spans.push({ start, end, text });
-    text = "";
-    start = -1;
-  };
-  for (let index = 0; index < nodeOptions.length; index++) {
-    let char = nodeOptions[index]!;
-    if (char === "\\" && quoted && index + 1 < nodeOptions.length) {
-      if (start === -1) start = index;
-      char = nodeOptions[++index]!;
-    } else if (char === " " && !quoted) {
-      close(index);
-      continue;
-    } else if (char === '"') {
-      if (start === -1) start = index;
-      quoted = !quoted;
-      continue;
-    }
-    if (start === -1) start = index;
-    text += char;
-  }
-  close(nodeOptions.length);
-  return spans;
-};
-
-export const tokenizeNodeOptions = (nodeOptions: string | undefined): ReadonlyArray<string> =>
-  nodeOptions === undefined ? [] : nodeOptionSpans(nodeOptions).map((span) => span.text);
-
-/** Node accepts `_` for `-` in option names and a single leading dash; compare on the `--dashed` form. */
-const optionName = (arg: string): string => {
-  const end = arg.indexOf("=");
-  const name = (end === -1 ? arg : arg.slice(0, end)).replaceAll("_", "-");
-  return name.startsWith("-") && !name.startsWith("--") ? `-${name}` : name;
-};
-
-/** The flag's last value in args (V8 takes the last; `""` for a bare flag without a value); undefined when absent. */
-const flagIn = (args: ReadonlyArray<string>): string | undefined => {
-  let value: string | undefined;
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index]!;
-    if (optionName(arg) !== FLAG) continue;
-    const end = arg.indexOf("=");
-    value = end === -1 ? (args[index + 1] ?? "") : arg.slice(end + 1);
-  }
-  return value;
-};
-
-interface ExplicitFlag {
-  readonly present: boolean;
-  /** The numeric value, or null when absent or not a number. */
-  readonly mb: number | null;
-}
-
-const explicitMaxSemiSpace = (env: Environment, execArgv: ReadonlyArray<string>): ExplicitFlag => {
-  const value = flagIn(execArgv) ?? flagIn(tokenizeNodeOptions(env.NODE_OPTIONS));
-  if (value === undefined) return { present: false, mb: null };
+/** A flag's value as a size: 0 for a bare, empty or non-numeric value (V8 then uses its default). */
+const sizeOf = (value: string | undefined): number | undefined => {
+  if (value === undefined) return undefined;
   const parsed = Number(value);
-  return { present: true, mb: value !== "" && Number.isFinite(parsed) ? parsed : null };
+  return value !== "" && Number.isFinite(parsed) ? parsed : 0;
 };
 
-/** The cap to apply, or null when the environment disables it or a flag already sets one. */
-export const resolveMaxSemiSpaceMb = (
-  env: Environment,
-  execArgv: ReadonlyArray<string>,
-): number | null => {
-  const setting = env[MAX_SEMI_SPACE_ENV]?.trim().toLowerCase() ?? "";
-  if (DISABLED_VALUES.has(setting)) return null;
-  if (explicitMaxSemiSpace(env, execArgv).present) return null;
-  const requested = Number(setting);
-  return setting !== "" &&
-    Number.isInteger(requested) &&
-    requested > 0 &&
-    requested <= MAX_SEMI_SPACE_MB_LIMIT
-    ? requested
-    : DEFAULT_MAX_SEMI_SPACE_MB;
+/**
+ * What a single executable, which takes Node options only on its command line, is to be given there:
+ * the user's NODE_OPTIONS, and the wanted cap when it is not the executable's own default; undefined
+ * when there is nothing to pass.
+ */
+export const nodeOptionsArgument = (env: Environment): string | undefined => {
+  const options = env.NODE_OPTIONS?.trim() ?? "";
+  const explicit = flagIn(tokenizeNodeOptions(options)) !== undefined;
+  const wanted = capSetting(env);
+  const cap = explicit || wanted === DEFAULT_MAX_SEMI_SPACE_MB ? "" : `${FLAG}=${wanted}`;
+  const value = [options, cap].filter((part) => part !== "").join(" ");
+  return value === "" ? undefined : `--node-options=${value}`;
 };
 
-export const nodeOptionsWithMaxSemiSpace = (
-  nodeOptions: string | undefined,
-  mb: number,
-): string => {
-  const current = nodeOptions?.trim() ?? "";
-  return current === "" ? `${FLAG}=${mb}` : `${current} ${FLAG}=${mb}`;
+/** Whether `tokens` appear in `args`, in order and adjacent. */
+const containsSequence = (args: ReadonlyArray<string>, tokens: ReadonlyArray<string>): boolean => {
+  if (tokens.length === 0) return true;
+  for (let start = 0; start + tokens.length <= args.length; start++) {
+    if (tokens.every((token, index) => args[start + index] === token)) return true;
+  }
+  return false;
 };
 
 export type StartupNodeOptions =
@@ -240,18 +189,6 @@ const withoutCapArg = (value: string | undefined, mb: number): string | undefine
   return trimmed === "" ? undefined : trimmed;
 };
 
-const withFlag = (env: Environment, mb: number): Environment => ({
-  ...env,
-  NODE_OPTIONS: nodeOptionsWithMaxSemiSpace(env.NODE_OPTIONS, mb),
-  [INHERITED_NODE_OPTIONS_ENV]: env.NODE_OPTIONS ?? "",
-});
-
-/** The environment for a server another process starts; unchanged when disabled or already explicit. */
-export const serverChildEnvironment = (env: Environment): Environment => {
-  const mb = resolveMaxSemiSpaceMb(env, []);
-  return mb === null ? env : withFlag(env, mb);
-};
-
 const isDirectorySync = (path: string): boolean => {
   try {
     return NodeFS.statSync(path).isDirectory();
@@ -324,11 +261,57 @@ export type RelaunchPlan =
   | {
       readonly kind: "keep";
       readonly reason: string;
+      /** The cap this process wanted is in effect: nothing was lost. */
+      readonly inEffect?: true;
+      /** Started over IPC by a service launcher that did not deliver what this server needs; it does once the service restarts. */
+      readonly launcherPredatesDefault?: true;
       /** How the process was started rules a relaunch out; nothing in its environment caused the keep. */
       readonly structural?: true;
-      /** The server was started over IPC by a service launcher that supplied no flag (an RC2 launcher). */
-      readonly launcherPredatesDefault?: true;
+      /** NODE_OPTIONS the single executable has not been given on its command line. */
+      readonly nodeOptionsPending?: true;
     };
+
+/** The young-generation cap as it stands: what V8 runs with, what this process wants, who chose it. */
+interface CapState {
+  /** In effect, in MiB; 0 or undefined is V8's default. */
+  readonly effective: number | undefined;
+  /** Wanted, in MiB; 0 means V8's default (disabled). */
+  readonly wanted: number;
+  /** The user chose the wanted value (a flag on the command line or in NODE_OPTIONS). */
+  readonly explicit: boolean;
+  /** A single executable's NODE_OPTIONS that are not on its command line yet, so Node ignored them. */
+  readonly pending: boolean;
+}
+
+const capState = (input: {
+  readonly execArgv: ReadonlyArray<string>;
+  readonly env: Environment;
+  readonly isSea: boolean;
+}): CapState => {
+  const inNodeOptions = flagIn(tokenizeNodeOptions(input.env.NODE_OPTIONS));
+  const inExecArgv = flagIn(input.execArgv);
+  if (!input.isSea) {
+    const explicit = inExecArgv ?? inNodeOptions;
+    return {
+      effective: sizeOf(explicit),
+      wanted: explicit === undefined ? capSetting(input.env) : (sizeOf(explicit) ?? 0),
+      explicit: explicit !== undefined,
+      pending: false,
+    };
+  }
+  // A single executable: its execArgv start with what the build baked in; anything after that came
+  // from the user through --node-options. Node ignores its NODE_OPTIONS until they are put there.
+  const baked = SEA_EXEC_ARGV.every((flag, index) => input.execArgv[index] === flag)
+    ? SEA_EXEC_ARGV.length
+    : 0;
+  const explicit = flagIn(input.execArgv.slice(baked)) ?? inNodeOptions;
+  return {
+    effective: sizeOf(inExecArgv),
+    wanted: explicit === undefined ? capSetting(input.env) : (sizeOf(explicit) ?? 0),
+    explicit: explicit !== undefined,
+    pending: !containsSequence(input.execArgv, tokenizeNodeOptions(input.env.NODE_OPTIONS)),
+  };
+};
 
 export const planYoungGenerationRelaunch = (input: {
   readonly argv: ReadonlyArray<string>;
@@ -350,66 +333,82 @@ export const planYoungGenerationRelaunch = (input: {
   if (input.pid !== undefined && input.relaunchedPid === String(input.pid)) {
     return { kind: "keep", reason: "relaunched once already" };
   }
-  // The marker counts only with the flag behind it; a stray one must not hide a missing cap.
-  if (
-    input.env[INHERITED_NODE_OPTIONS_ENV] !== undefined &&
-    explicitMaxSemiSpace(input.env, input.execArgv).present
-  ) {
-    return { kind: "keep", reason: "the young-generation cap is already in effect" };
+  const cap = capState(input);
+  const pending = cap.pending ? { nodeOptionsPending: true as const } : {};
+  if (!cap.pending && (cap.effective ?? 0) === cap.wanted) {
+    return cap.explicit || cap.wanted === 0
+      ? { kind: "keep", reason: "disabled or set explicitly" }
+      : { kind: "keep", reason: "the young-generation cap is already in effect", inEffect: true };
   }
   if (input.platform === "win32" || !input.canExecve) {
     return {
       kind: "keep",
       reason: "process.execve is unavailable on this platform",
       structural: true,
+      ...pending,
     };
   }
   // execve keeps only stdio: an IPC channel or a bootstrap descriptor would be lost.
   if (input.hasIpcChannel) {
-    // A remote update replaces the binary, not the running launcher; one that predates the default
-    // supplies no flag, and a server started over IPC cannot relaunch itself. Say so, visibly.
-    if (
-      input.env[SERVICE_LAUNCHER_CONTEXT_ENV] !== undefined &&
-      resolveMaxSemiSpaceMb(input.env, input.execArgv) !== null &&
-      !explicitMaxSemiSpace(input.env, input.execArgv).present
-    ) {
+    // A remote update replaces the binary, not the running launcher: one that predates this server
+    // did not deliver what it needs, and a server started over IPC cannot relaunch itself. Say so.
+    if (input.env[SERVICE_LAUNCHER_CONTEXT_ENV] !== undefined) {
       return {
         kind: "keep",
         reason:
           "started over IPC by a service launcher that predates the young-generation default; the cap applies once the service restarts",
         launcherPredatesDefault: true,
+        ...pending,
       };
     }
-    return { kind: "keep", reason: "started with an IPC channel", structural: true };
+    return { kind: "keep", reason: "started with an IPC channel", structural: true, ...pending };
   }
   if (bootstrapFdOf(input.argv, input.env) !== undefined) {
-    return { kind: "keep", reason: "started with a bootstrap descriptor", structural: true };
+    return {
+      kind: "keep",
+      reason: "started with a bootstrap descriptor",
+      structural: true,
+      ...pending,
+    };
   }
   // A second image would open a second inspector session and drop the attached debugger.
   if (input.inspectorActive === true || inspectorRequested(input.env, input.execArgv)) {
-    return { kind: "keep", reason: "the inspector is active", structural: true };
+    return { kind: "keep", reason: "the inspector is active", structural: true, ...pending };
   }
   // A preload runs before this code and may have rewritten NODE_OPTIONS: what it reads now is not
-  // what Node started with, so neither an explicit cap nor the user's options can be trusted.
-  if (input.preloadRan === true || preloadVisible(input.env, input.execArgv)) {
+  // what Node started with, so neither an explicit cap nor the user's options can be trusted. A
+  // single executable has not run its NODE_OPTIONS preloads at all yet; they run once, next image.
+  if (!input.isSea && (input.preloadRan === true || preloadVisible(input.env, input.execArgv))) {
     return { kind: "keep", reason: "started with a preload" };
   }
-  const mb = resolveMaxSemiSpaceMb(input.env, input.execArgv);
-  if (mb === null) return { kind: "keep", reason: "disabled or set explicitly" };
   if (!isServerCommand(input.argv, input.isDirectory)) {
-    return { kind: "keep", reason: "not a server command" };
+    return { kind: "keep", reason: "not a server command", ...pending };
   }
+  const guard = input.pid === undefined ? {} : { [RELAUNCHED_PID_ENV]: String(input.pid) };
+  if (input.isSea) {
+    // A single executable takes only user arguments, Node options first; its environment stays as
+    // it is, so its children get exactly the user's NODE_OPTIONS. The cap goes along when what is
+    // in effect is not what is wanted and the user's options do not set it themselves.
+    const given = nodeOptionsArgument(input.env);
+    const capNeeded = !cap.explicit && (cap.effective ?? 0) !== cap.wanted;
+    const options =
+      capNeeded && !(given ?? "").includes(`${FLAG}=`)
+        ? `${given ?? "--node-options="}${given === undefined ? "" : " "}${FLAG}=${cap.wanted}`
+        : (given ?? `--node-options=${FLAG}=${cap.wanted}`);
+    return {
+      kind: "relaunch",
+      file: input.execPath,
+      args: [input.execPath, options, ...input.argv.slice(2)],
+      env: { ...input.env, ...guard },
+    };
+  }
+  // Node takes its flags, the script and the arguments; the cap travels in NODE_OPTIONS with the
+  // marker that gives children the value the server was given.
   return {
     kind: "relaunch",
     file: input.execPath,
-    // A single executable takes only user arguments; Node takes its flags, the script and the arguments.
-    args: input.isSea
-      ? [input.execPath, ...input.argv.slice(2)]
-      : [input.execPath, ...input.execArgv, ...input.argv.slice(1)],
-    env: {
-      ...withFlag(input.env, mb),
-      ...(input.pid === undefined ? {} : { [RELAUNCHED_PID_ENV]: String(input.pid) }),
-    },
+    args: [input.execPath, ...input.execArgv, ...input.argv.slice(1)],
+    env: { ...withFlag(input.env, cap.wanted), ...guard },
   };
 };
 
@@ -422,6 +421,10 @@ export interface YoungGenerationOutcome {
   readonly launcherPredatesDefault?: true;
   /** How the process was started rules a relaunch out; nothing in its environment caused the keep. */
   readonly structural?: true;
+  /** NODE_OPTIONS a single executable has not been given on its command line, so Node ignored them. */
+  readonly nodeOptionsPending?: true;
+  /** The cap V8 runs with, in MiB; 0 or undefined is V8's default. */
+  readonly maxSemiSpaceMb?: number;
 }
 
 let lastOutcome: YoungGenerationOutcome | undefined;
@@ -472,7 +475,12 @@ export type YoungGenerationDecision =
       /** NODE_OPTIONS for the server's children: the value in effect minus the cap added for the server. */
       readonly nodeOptionsForChildren: string | undefined;
     }
-  | { readonly kind: "keep"; readonly outcome: YoungGenerationOutcome }
+  | {
+      readonly kind: "keep";
+      readonly outcome: YoungGenerationOutcome;
+      /** Present when the environment must change for the children (a marker was honoured). */
+      readonly nodeOptionsForChildren?: string | undefined;
+    }
   | {
       readonly kind: "relaunch";
       readonly plan: Extract<RelaunchPlan, { readonly kind: "relaunch" }>;
@@ -494,6 +502,7 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
   const { startup } = view;
   // What V8 started with, for the outcome: the record when known, else the value in effect.
   const nodeOptionsAtStart = startup.known ? startup.value : current;
+  let marked: { readonly nodeOptionsForChildren: string | undefined } | undefined;
   if (inherited !== undefined) {
     const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, view.execArgv).mb;
     const written = mb === null ? undefined : nodeOptionsWithMaxSemiSpace(inherited, mb);
@@ -507,19 +516,45 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
         current === written ||
         current?.startsWith(`${written} `) === true);
     if (mb !== null && wrote) {
-      return {
-        kind: "applied",
-        outcome: { applied: true, nodeOptionsAtStart },
-        nodeOptionsForChildren: withoutCapArg(current, mb),
-      };
+      const nodeOptionsForChildren = withoutCapArg(current, mb);
+      if (!view.isSea) {
+        return {
+          kind: "applied",
+          outcome: { applied: true, nodeOptionsAtStart, maxSemiSpaceMb: mb },
+          nodeOptionsForChildren,
+        };
+      }
+      // A single executable ignored that NODE_OPTIONS; its cap is whatever its command line says.
+      // Children still get the user's value, and the rules below decide on it.
+      marked = { nodeOptionsForChildren };
     }
   }
+  const planned = {
+    ...env,
+    ...(marked === undefined ? {} : { NODE_OPTIONS: marked.nodeOptionsForChildren }),
+  };
+  const cap = capState({ execArgv: view.execArgv, env: planned, isSea: view.isSea });
+  const base = {
+    nodeOptionsAtStart,
+    ...(cap.effective === undefined ? {} : { maxSemiSpaceMb: cap.effective }),
+  };
+  // The cap this process wanted is what V8 runs with, whoever put it there; pending NODE_OPTIONS
+  // (the user's other flags) are reported separately.
+  const capInEffect = !cap.explicit && cap.wanted !== 0 && (cap.effective ?? 0) === cap.wanted;
   const keep = (
     keptReason: string,
-    extra: { readonly launcherPredatesDefault?: true; readonly structural?: true } = {},
+    extra: Omit<Extract<RelaunchPlan, { readonly kind: "keep" }>, "kind" | "reason"> = {},
   ): YoungGenerationDecision => ({
     kind: "keep",
-    outcome: { applied: false, nodeOptionsAtStart, keptReason, ...extra },
+    outcome: {
+      applied: extra.inEffect === true || capInEffect,
+      ...base,
+      keptReason,
+      ...(extra.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
+      ...(extra.structural === undefined ? {} : { structural: true }),
+      ...(extra.nodeOptionsPending === undefined ? {} : { nodeOptionsPending: true }),
+    },
+    ...marked,
   });
   // A record that differs from the value in effect means a preload rewrote NODE_OPTIONS: what it
   // left cannot be carried into a relaunch. Without a record, the rules below decide.
@@ -527,7 +562,7 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
   const plan = planYoungGenerationRelaunch({
     argv: view.argv,
     execArgv: view.execArgv,
-    env,
+    env: planned,
     execPath: view.execPath,
     platform: view.platform,
     hasIpcChannel: view.hasIpcChannel,
@@ -540,15 +575,13 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
     ...(view.isDirectory === undefined ? {} : { isDirectory: view.isDirectory }),
   });
   if (plan.kind === "keep") {
-    return keep(plan.reason, {
-      ...(plan.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
-      ...(plan.structural === undefined ? {} : { structural: true }),
-    });
+    const { kind: _kind, reason, ...extra } = plan;
+    return keep(reason, extra);
   }
   return {
     kind: "relaunch",
     plan,
-    outcome: { applied: false, nodeOptionsAtStart, keptReason: "relaunch returned" },
+    outcome: { applied: false, ...base, keptReason: "relaunch returned" },
   };
 };
 
@@ -574,12 +607,11 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   delete process.env[INHERITED_NODE_OPTIONS_ENV];
   delete process.env[RELAUNCHED_PID_ENV];
   const decision = decideYoungGeneration(view);
-  if (decision.kind === "applied") {
+  if (decision.kind !== "relaunch" && "nodeOptionsForChildren" in decision) {
     if (decision.nodeOptionsForChildren === undefined) delete process.env.NODE_OPTIONS;
     else process.env.NODE_OPTIONS = decision.nodeOptionsForChildren;
-    return decision.outcome;
   }
-  if (decision.kind === "keep") return decision.outcome;
+  if (decision.kind !== "relaunch") return decision.outcome;
   const execve = process.execve;
   if (execve === undefined) {
     return { ...decision.outcome, keptReason: "process.execve is unavailable", structural: true };
@@ -602,6 +634,8 @@ export interface NodeRuntimeFlags {
   readonly youngGenerationLost?: true;
   /** The loss is in how the process was started (IPC channel, bootstrap descriptor, inspector, no execve), not changeable from its environment. */
   readonly structuralKeep?: true;
+  /** A single executable's NODE_OPTIONS were not on its command line, so Node ignored them. */
+  readonly nodeOptionsPending?: true;
   readonly keptReason?: string;
   readonly execArgv: ReadonlyArray<string>;
   /** NODE_OPTIONS as V8 saw it at startup (the server's children see `nodeOptionsForChildren`). */
@@ -623,6 +657,8 @@ export const describeNodeRuntime = (input: {
   readonly maxSemiSpaceSetting?: string | undefined;
   readonly keptReason?: string | undefined;
   readonly structural?: boolean | undefined;
+  /** The cap V8 runs with when the startup pass measured it; parsed from the options otherwise. */
+  readonly maxSemiSpaceMb?: number | undefined;
 }): NodeRuntimeFlags => {
   const wanted =
     resolveMaxSemiSpaceMb(
@@ -635,7 +671,9 @@ export const describeNodeRuntime = (input: {
     nodeOptionsForChildren: input.nodeOptionsForChildren ?? null,
     heapSizeLimitMiB: Math.round(input.heapSizeLimitBytes / 1_048_576),
     maxSemiSpaceMiB:
-      explicitMaxSemiSpace({ NODE_OPTIONS: input.nodeOptionsAtStart }, input.execArgv).mb ??
+      (input.maxSemiSpaceMb ??
+        explicitMaxSemiSpace({ NODE_OPTIONS: input.nodeOptionsAtStart }, input.execArgv).mb ??
+        0) ||
       "node default",
     youngGenerationDefault: input.applied,
     ...(input.applied || !wanted ? {} : { youngGenerationLost: true }),
@@ -663,10 +701,12 @@ export const runtimeFlagsOf = (
     maxSemiSpaceSetting: env[MAX_SEMI_SPACE_ENV],
     keptReason: outcome?.keptReason,
     structural: outcome?.structural,
+    maxSemiSpaceMb: outcome?.maxSemiSpaceMb,
   });
   return {
     ...sizes,
     ...(outcome?.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
+    ...(outcome?.nodeOptionsPending === undefined ? {} : { nodeOptionsPending: true }),
   };
 };
 
@@ -692,10 +732,12 @@ export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {
   const bootstrapFd = bootstrapFdOf(process.argv, process.env);
   const report = {
     applied: outcome.applied,
-    maxSemiSpaceMb: explicitMaxSemiSpace(
-      { NODE_OPTIONS: outcome.nodeOptionsAtStart },
-      process.execArgv,
-    ).mb,
+    maxSemiSpaceMb:
+      (outcome.maxSemiSpaceMb ??
+        explicitMaxSemiSpace({ NODE_OPTIONS: outcome.nodeOptionsAtStart }, process.execArgv).mb ??
+        0) ||
+      null,
+    heapSizeLimitMiB: Math.round(NodeV8.getHeapStatistics().heap_size_limit / 1_048_576),
     nodeOptionsAtStart: outcome.nodeOptionsAtStart ?? null,
     nodeOptionsForChildren: process.env.NODE_OPTIONS ?? null,
     execArgv: process.execArgv,
@@ -705,6 +747,7 @@ export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {
     ...(outcome.keptReason === undefined ? {} : { keptReason: outcome.keptReason }),
     ...(outcome.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
     ...(outcome.structural === undefined ? {} : { structural: true }),
+    ...(outcome.nodeOptionsPending === undefined ? {} : { nodeOptionsPending: true }),
     ...(bootstrapFd === undefined ? {} : { bootstrapFdOpen: isOpenDescriptor(bootstrapFd) }),
   };
   process.stdout.write(`${JSON.stringify(report)}\n`);

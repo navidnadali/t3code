@@ -956,7 +956,10 @@ function makeLocalCommandHarness(input: {
           turnCompleted: () => Effect.void,
           runSettled: (report) => Effect.sync(() => void settledRuns.push(report.status)),
         }),
-        Layer.mock(CheckpointService.CheckpointServiceV2)({}),
+        // The turn starts in the workspace its run was scoped in: the same scope.
+        Layer.mock(CheckpointService.CheckpointServiceV2)({
+          prepareRootRunScope: () => Effect.succeed(projection.checkpointScopes[0]!),
+        }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
           resolve: resolveRuntimePolicy,
         }),

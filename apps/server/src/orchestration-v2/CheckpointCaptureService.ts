@@ -115,6 +115,8 @@ export const layer: Layer.Layer<
         run.workspaceCwd ?? scope.cwd,
       );
       const runScope = { ...scope, cwd: workspace };
+      // A run recorded without its workspace keeps none: its scope may name a later one.
+      const recorded = run.workspaceCwd === undefined ? {} : { workspaceCwd: workspace };
       const baselineOrdinalWithinScope = Math.max(0, run.ordinal - 1);
       const hasReadyCheckpoint = (ordinalWithinScope: number) =>
         readyCheckpointOrdinals.includes(ordinalWithinScope);
@@ -222,14 +224,10 @@ export const layer: Layer.Layer<
             providerInstanceId: run.providerInstanceId,
             occurredAt: capturedAt,
             payload: stopped
-              ? {
-                  ...runWithoutDelegatedCompletion,
-                  workspaceCwd: workspace,
-                  checkpointId: checkpoint.id,
-                }
+              ? { ...runWithoutDelegatedCompletion, ...recorded, checkpointId: checkpoint.id }
               : {
                   ...runWithoutDelegatedCompletion,
-                  workspaceCwd: workspace,
+                  ...recorded,
                   status: "completed",
                   completedAt: capturedAt,
                   checkpointId: checkpoint.id,

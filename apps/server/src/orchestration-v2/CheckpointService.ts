@@ -215,16 +215,16 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
     (scope) => scope.kind === "root_run" && scope.parentScopeId === null,
   );
   const rootScope = rootScopes.find((scope) => scope.id === rootScopeId);
-  // The same spelling needs no file system lookup; another spelling may still be the same directory.
+  // A scope is its workspace by real path when it was created (a spelling, such as a symlink, may
+  // point elsewhere later); scopes created before that was kept resolve their spelling now.
+  const workspace = yield* input.resolve(input.cwd);
   const sameAsRoot =
     rootScope !== undefined &&
-    (rootScope.cwd === input.cwd ||
-      (yield* input.resolve(rootScope.cwd)) === (yield* input.resolve(input.cwd)));
+    (rootScope.realCwd ?? (yield* input.resolve(rootScope.cwd))) === workspace;
   const [scopeId, ordinalWithinParent] =
     rootScope === undefined || sameAsRoot
       ? ([rootScopeId, 0] as const)
       : yield* Effect.gen(function* () {
-          const workspace = yield* input.resolve(input.cwd);
           const crypto = yield* Crypto.Crypto;
           const digest = yield* crypto
             .digest("SHA-256", new TextEncoder().encode(workspace))
@@ -240,6 +240,7 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
               Math.max(...rootScopes.map((scope) => scope.ordinalWithinParent)) + 1,
           ] as const;
         });
+  const reused = rootScopes.find((scope) => scope.id === scopeId);
   return {
     id: scopeId,
     threadId: input.threadId,
@@ -250,8 +251,9 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
     kind: "root_run",
     ordinalWithinParent,
     advancesAppRunCount: true,
-    // A reused scope keeps the spelling it was created with; the run's own is the same directory.
-    cwd: rootScopes.find((scope) => scope.id === scopeId)?.cwd ?? input.cwd,
+    // A reused scope keeps the spelling it was created with; runs record their own.
+    cwd: reused?.cwd ?? input.cwd,
+    realCwd: reused?.realCwd ?? workspace,
     createdAt: input.createdAt,
   } satisfies OrchestrationV2CheckpointScope;
 });

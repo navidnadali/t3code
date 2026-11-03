@@ -1992,10 +1992,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? (resolvedForStart.success.cwd ?? projection.thread.worktreePath ?? process.cwd())
           : undefined;
       const checkpointScope =
-        storedCheckpointScope !== undefined &&
-        (workspaceNow === undefined ||
-          workspaceNow === storedCheckpointScope.cwd ||
-          workspaceNow === queuedRun.workspaceCwd)
+        storedCheckpointScope !== undefined && workspaceNow === undefined
           ? storedCheckpointScope
           : yield* Effect.gen(function* () {
               if (resolvedForStart._tag === "Failure") return yield* resolvedForStart.failure;

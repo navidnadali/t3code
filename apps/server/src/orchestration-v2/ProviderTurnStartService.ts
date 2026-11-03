@@ -812,8 +812,6 @@ export const layer: Layer.Layer<
         checkpointScope.kind !== "root_run" ||
         checkpointScope.parentScopeId !== null ||
         workspaceNow == null ||
-        workspaceNow === checkpointScope.cwd ||
-        workspaceNow === run.workspaceCwd ||
         keepsOpenedCwd
           ? checkpointScope
           : yield* Effect.gen(function* () {

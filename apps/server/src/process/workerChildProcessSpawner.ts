@@ -1734,7 +1734,8 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   return (yield* makeProcessSpawnerWithHost(fallback, options)).spawner;
 });
 
-const makeProcessSpawnerWithHost = Effect.fnUntraced(function* (
+/** The spawner and its host (hand-off), as `layerFromConfig` builds them. */
+export const makeProcessSpawnerWithHost = Effect.fnUntraced(function* (
   fallback: ChildProcessSpawner["Service"],
   options: ProcessSpawnerOptions = {},
 ) {

@@ -16,6 +16,7 @@ import * as Logger from "effect/Logger";
 import * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
 import { isPidReused, isSameProcess } from "./processIdentity.ts";
@@ -324,6 +325,66 @@ describe("provider process hand-off", () => {
       }).toEqual({ handedOff: true, warnings: 0 });
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
   });
+
+  // A hand-off start the spawner reported (its early PID line) but never answered, and then the
+  // spawner died: the server kills that start's group only while the PID still names it.
+  it.live.skipIf(!linux)(
+    "never kills the group of a process that took the PID of an unanswered hand-off start",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        // Leads its own group, as a process that took the started child's PID would.
+        const stranger = NodeChildProcess.spawn("sleep", ["30"], {
+          detached: true,
+          stdio: "ignore",
+        });
+        yield* Effect.promise(() => new Promise((resolve) => stranger.once("spawn", resolve)));
+        yield* Effect.addFinalizer(() => Effect.sync(() => stranger.kill("SIGKILL")));
+        // The spawner reports the stranger's PID for this start, then dies before answering it.
+        const reported = "if (child.pid !== undefined) started(id, child.pid";
+        const answered =
+          'child.on("spawn", () => post({ t: "spawn", id, pid: child.pid, startTime }));';
+        const source = WorkerChildProcessSpawner.spawnerProcessSource
+          .replace(
+            `const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);\n    ${reported}`,
+            `const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);\n    if (child.pid !== undefined) started(id, Number(message.args.at(-1))`,
+          )
+          .replace(
+            answered,
+            // Its PID line has long reached the server when it dies.
+            'child.on("spawn", () => setTimeout(() => process.kill(process.pid, "SIGKILL"), 500));',
+          );
+        expect(source.match(/message\.args\.at\(-1\)|process\.kill\(process\.pid/g)).toHaveLength(
+          2,
+        );
+        const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node, {
+          source,
+        });
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-" });
+        yield* fs.chmod(dir, 0o700);
+        const outcome = yield* Effect.callback<string>((resume) => {
+          host!.spawnHandoff(
+            process.execPath,
+            ["-e", "", String(stranger.pid)],
+            { env: process.env, stdio: ["ignore", "ignore", "ignore"], detached: true },
+            { dir, fds: [0, 1, 2] },
+            {
+              onSpawn: () => resume(Effect.succeed("spawned")),
+              onError: (error) => resume(Effect.succeed(`error: ${error.message}`)),
+              onUnavailable: () => resume(Effect.succeed("unavailable")),
+            },
+          );
+        });
+        // A signal sent would end it within the second.
+        const ended = yield* Effect.callback<boolean>((resume) => {
+          stranger.once("exit", () => resume(Effect.succeed(true)));
+        }).pipe(
+          Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.succeed(false) }),
+        );
+        expect({ outcome, ended }).toEqual({ outcome: "unavailable", ended: false });
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 
   it.live.skipIf(!linux)(
     "closes the server's ends of a handed-off process's stdio once it has exited",

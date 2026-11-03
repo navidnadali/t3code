@@ -2053,10 +2053,10 @@ it.effect("answers reader statements with column names and row arrays", () =>
         .get(startedWorkers[before]!)!
         .filter((reply) => "rows" in reply);
       assert.lengthOf(replies, 2);
-      for (const reply of replies) {
-        assert.deepEqual(reply.columns, ["name", "one"]);
-        assert.deepEqual(reply.rows, [["first", 1]]);
-      }
+      // Both replies carry row arrays; only the object read needs the column names.
+      assert.deepEqual(replies[0]!.columns, ["name", "one"]);
+      assert.isUndefined(replies[1]!.columns);
+      for (const reply of replies) assert.deepEqual(reply.rows, [["first", 1]]);
     }),
   ),
 );

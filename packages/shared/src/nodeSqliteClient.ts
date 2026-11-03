@@ -454,7 +454,7 @@ const prepare = (sql, cached) => {
   statements.set(sql, statement);
   return statement;
 };
-const execute = ({ id, sql, params, cached, raw, safeIntegers, begin }) => {
+const execute = ({ id, sql, params, cached, raw, values, safeIntegers, begin }) => {
   let operation = "open";
   try {
     if (db === undefined) throw new Error("database reader is unavailable");
@@ -467,13 +467,14 @@ const execute = ({ id, sql, params, cached, raw, safeIntegers, begin }) => {
     operation = "execute";
     statement.setReadBigInts(Boolean(safeIntegers));
     if (statement.columns().length > 0) {
-      // Arrays clone faster than objects; the parent restores the objects from the names, read
-      // after the statement ran, since SQLite may have reprepared it for a changed schema.
+      // Arrays clone faster than objects; unless arrays were asked for, the parent restores the
+      // objects from the names, read after the statement ran, since SQLite may have reprepared it
+      // for a changed schema.
       statement.setReturnArrays(true);
       const rows = statement.all(...params);
       return {
         id,
-        columns: statement.columns().map((column) => column.name),
+        columns: values ? undefined : statement.columns().map((column) => column.name),
         rows,
         inTransaction: db.isTransaction,
       };
@@ -495,11 +496,7 @@ const execute = ({ id, sql, params, cached, raw, safeIntegers, begin }) => {
     };
   }
 };
-parentPort.on("message", (message) => {
-  // A batch runs in order and answers in one message; a failed statement does not stop the rest.
-  if (Array.isArray(message.batch)) parentPort.postMessage({ batch: message.batch.map(execute) });
-  else parentPort.postMessage(execute(message));
-});
+parentPort.on("message", (message) => parentPort.postMessage(execute(message)));
 `;
 
 interface ReaderRequest {
@@ -561,7 +558,6 @@ const objectRows = (columns: ReadonlyArray<string>, rows: ReadonlyArray<Readonly
     return object;
   });
 
-// Read-transaction cleanup succeeds after worker exit because it can no longer change anything.
 const withoutComments = (sql: string) => sql.replace(/\/\*[\s\S]*?\*\/|--[^\n]*/g, " ");
 // Only SQLite's exact transaction statements, comments removed, with SQLite's whitespace (not
 // JavaScript's \s, which takes a no-break space or vertical tab SQLite rejects). Anything else that
@@ -660,7 +656,7 @@ const makeReader = Effect.fnUntraced(function* (
         return false;
       }
     };
-    // Bench variant V2: every message goes to the worker at once, in order (pipelined, no batch).
+    // Every message goes to the worker at once, in order; the worker answers each in that order.
     const post = (message: Record<string, unknown>) =>
       stoppedMessage === undefined && send(message);
     const stop = (message: string) => {
@@ -678,11 +674,10 @@ const makeReader = Effect.fnUntraced(function* (
         if (pending.size === 0) worker.unref();
         return;
       }
-      for (const each of "batch" in reply ? (reply.batch as ReadonlyArray<ReaderReply>) : [reply]) {
-        const resume = pending.get(each.id);
-        if (resume === undefined) continue;
-        pending.delete(each.id);
-        resume(each);
+      const resume = pending.get(reply.id);
+      if (resume !== undefined) {
+        pending.delete(reply.id);
+        resume(reply);
       }
       if (pending.size === 0) worker.unref();
     });
@@ -1675,7 +1670,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           ? Effect.succeed(result.value)
           : target.lock.withPermits(1)(
               Effect.andThen(
-                // Failed SQL also consumes the batch; cancellation hands off immediately.
+                // Failed SQL also consumes the folded BEGIN; cancellation hands off immediately.
                 Effect.suspend(() => {
                   if (writerBorrowsSinceYield < writerBorrowBatchSize) return Effect.void;
                   writerBorrowsSinceYield = 0;

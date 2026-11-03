@@ -819,6 +819,25 @@ effectIt.effect("stops only a job's own process group", () =>
   }),
 );
 
+// A handed-off agent whose spawner died is re-parented away from the server, yet still its own.
+effectIt.effect("protects an agent that outlived the server's spawner process", () =>
+  Effect.sync(() => {
+    const serverPid = 100;
+    const rows = [
+      { pid: serverPid, ppid: 1, pgid: serverPid },
+      { pid: 900, ppid: 1, pgid: 900 }, // the agent CLI, now init's child
+      { pid: 910, ppid: 900, pgid: 900 }, // a server it spawned without a group of its own
+      { pid: 920, ppid: 900, pgid: 920 }, // `npm run dev &` in that agent
+      { pid: 930, ppid: 1, pgid: 930 }, // an unrelated process re-parented the same way
+    ];
+    const table = new Map(rows.map((row) => [row.pid, row]));
+    const adopted = new Set([900]);
+    expect(PortScanner.stoppableProcessGroup(table, 910, serverPid, new Set(), adopted)).toBeNull();
+    expect(PortScanner.stoppableProcessGroup(table, 920, serverPid, new Set(), adopted)).toBe(920);
+    expect(PortScanner.stoppableProcessGroup(table, 930, serverPid, new Set(), adopted)).toBe(930);
+  }),
+);
+
 const AGENT_SERVER_SCRIPT = `
 const server = require("node:http").createServer((_, response) => {
   response.writeHead(200, { "content-type": "text/html" });

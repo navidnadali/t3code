@@ -20,7 +20,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
 import { isPidReused, isSameProcess } from "./processIdentity.ts";
-import { spawnerProcessIds } from "./spawnerProcesses.ts";
+import { adoptedProcessIds, spawnerProcessIds } from "./spawnerProcesses.ts";
 import { execAfterGoSource, spawnerProcessSource } from "./spawnerSources.ts";
 import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
 
@@ -431,8 +431,9 @@ describe("provider process hand-off", () => {
         const pid = yield* watch.pidOf(socket);
         for (const spawnerPid of spawnerProcessIds) process.kill(spawnerPid, "SIGKILL");
         yield* waitFor((text) => text.includes("keep running without the process spawner"));
-        // Its spawner is gone, it is not: still running, never reported exited.
+        // Its spawner is gone, it is not: still running, never reported exited, still the server's.
         expect(yield* handle.isRunning).toBe(true);
+        expect(adoptedProcessIds.has(pid)).toBe(true);
         expect(socket.closed).toBe(false);
         process.kill(pid, "SIGKILL");
         yield* watch.closed(socket);
@@ -442,6 +443,7 @@ describe("provider process hand-off", () => {
         expect(reason).toContain("exited; its exit status is unknown");
         expect(reason).not.toContain("signal");
         expect(yield* handle.isRunning).toBe(false);
+        expect(adoptedProcessIds.has(pid)).toBe(false);
         yield* waitFor((text) => text.includes("outlived the process spawner exited"));
       }).pipe(Effect.scoped, Effect.provide(launcherLayer().pipe(Layer.provideMerge(logLayer))));
     },

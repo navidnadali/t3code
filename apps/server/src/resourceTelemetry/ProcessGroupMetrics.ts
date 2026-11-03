@@ -65,6 +65,7 @@ export interface ProcessGroupTotals {
 export function groupProcesses(
   processes: ReadonlyArray<ResourceTelemetryProcess>,
   spawners: ReadonlySet<number> = new Set(),
+  _adopted: ReadonlySet<number> = new Set(),
 ): ReadonlyMap<string, ProcessGroupTotals> {
   const byPid = new Map(processes.map((process) => [process.identity.pid, process]));
   const serverPid = processes.find((process) => process.category === "server")?.identity.pid;

@@ -6,6 +6,14 @@ const live = new Set<number>();
  */
 export const spawnerProcessIds: ReadonlySet<number> = live;
 
+const adopted = new Set<number>();
+
+/**
+ * PIDs of handed-off providers that outlived their spawner process (re-parented elsewhere) while
+ * they run: they stay the server's own children for process attribution and the port tools.
+ */
+export const adoptedProcessIds: ReadonlySet<number> = adopted;
+
 /** Records a spawner process the server started; the returned function forgets it. */
 export const registerSpawnerProcess = (pid: number) => {
   live.add(pid);

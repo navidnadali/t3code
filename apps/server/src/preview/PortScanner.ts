@@ -456,6 +456,7 @@ export const stoppableProcessGroup = (
   pid: number,
   serverPid: number,
   spawners: ReadonlySet<number> = new Set(),
+  _adopted: ReadonlySet<number> = new Set(),
 ): number | null => {
   const group = table.get(pid)?.pgid;
   if (group === undefined || group <= 1) return null;

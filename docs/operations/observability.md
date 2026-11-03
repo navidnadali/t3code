@@ -180,14 +180,31 @@ small spawner process, started once while the server is small, so the server doe
 - the Claude and Codex instances' own commands: version checks and maintenance lookups (a few per
   health check, every 5 minutes by default) and text generation (thread titles, branch names, commit
   messages, pull request content and review guides, one or two per request);
-- document text extraction (one per document attachment).
+- document text extraction (one per document attachment);
+- Muse's checks and maintenance lookups (its SDK starts its sessions).
 
-Output, exit codes, errors, timeouts and kills are the same. Everything else the server starts still
-forks it on Linux:
+Output, exit codes, errors, timeouts and kills are the same.
 
-- provider session processes: one per Claude session start or restart (100 or 250 in a burst when as
-  many sessions start), one shared `codex app-server` per Codex instance, one per ACP agent session,
-  and the Claude capability probe the Agent SDK starts itself (2 at start-up, then on stale health
+On Linux, provider processes start from the spawner process too, by hand-off: the spawner forks each
+one with Unix sockets the server holds as its stdin, stdout and stderr, so its I/O never passes
+through the spawner, and a burst of session starts no longer holds the event loop for one fork each:
+
+- Claude sessions, through the Agent SDK's spawn hook: one per session start or restart (100 or 250 in
+  a burst when as many sessions start);
+- the shared `codex app-server` of each Codex instance;
+- OpenCode's `opencode serve` servers and commands, and Pi's RPC sessions and checks.
+
+Each of these was run with its real CLI both ways and behaves the same: its stdio are sockets in both
+cases (no terminal, blocking mode), with the same end of input, 4 MiB written and 2 MiB read,
+standard error and exit; and it keeps working when the spawner process dies.
+
+Everything else the server starts still forks it on Linux:
+
+- the sessions and checks of Grok, which exits about 2 s after its parent process dies (so a spawner
+  that died would end its sessions); of Fx and Antigravity, whose CLIs could not be run to verify
+  them; and of ACP registry agents, which can be any agent the registry or a local command names
+  (Gemini, verified, behaves);
+- the Claude capability probe the Agent SDK starts itself (2 at start-up, then on stale health
   checks);
 - terminals: one `node-pty` process per terminal opened, which needs a pseudo-terminal in the server;
 - HTML render: one headless Chrome per `html_render` or `html_preview` call, which needs extra pipes
@@ -198,8 +215,7 @@ forks it on Linux:
   is not piped or that need extra file descriptors (opening an editor or a folder, `xdg-mime`, and on
   macOS `vm_stat` and `plutil`);
 - commands other services still start on Node's spawner, each per user action, setting change or
-  health check: the other providers' checks (their drivers start sessions on the same spawner),
-  `ssh -G` for device hosts, `tailscale`, `cloudflared` and the 1Password CLI.
+  health check: `ssh -G` for device hosts, `tailscale`, `cloudflared` and the 1Password CLI.
 
 macOS spawns with `posix_spawn`, which copies no page tables, so the gain there is only the
 event-loop time.
@@ -222,12 +238,31 @@ Release archives ship the spawner as its own small executable, `t3-process-spawn
 without it, `t3` runs the spawner from its own bundle, which takes about four times the memory, and
 logs a warning at start.
 
+`T3CODE_PROVIDER_SPAWNER` (any case) chooses where provider processes start:
+
+- unset, `handoff`, `1`, `true` or `on`: hand-off from the spawner process, on Linux when
+  `T3CODE_PROCESS_SPAWNER` selects the spawner process, else Node's spawner;
+- `direct`, `default`, `0`, `false` or `off`: Node's spawner on the event loop, as before.
+
+Any other value is logged as an error and keeps Node's spawner. Unlike a command, a provider whose
+hand-off fails (the spawner stopped or cooling down, its socket directory unusable, a refused
+connection) starts on Node's spawner, with a warning, instead of failing. The hand-off sockets live in
+`<state dir>/spawner`, a directory only the server's user can enter (mode 0700, owner checked). Each
+start listens on its own unpredictable name and accepts only its own connections, each opened with a
+random 16-byte token, then closes and removes the socket; any other connection is refused and logged.
+
+If the spawner process dies, the providers it handed off keep running in their own process groups,
+their stdio still held by the server. The server then checks each one's process identity (PID and
+start time) every second and reports its exit, without an exit status, once it ends; a kill checks
+that identity first, so a reused PID is never signalled.
+
 The spawner kills its children and its own process group, then exits, when the server exits however
-it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP. Once the server has begun to shut
-down, a command still running or started later fails with "The process spawner stopped" instead of
-running on the server. Stop the server with systemd's `KillMode=mixed`: with `control-group`, the
-spawner gets SIGTERM while the server is still shutting down, and the server logs a warning and forks
-once more if another command arrives.
+it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP; providers it handed off are
+killed only in the first case. Once the server has begun to shut down, a command still running or
+started later fails with "The process spawner stopped" instead of running on the server. Stop the
+server with systemd's `KillMode=mixed`: with `control-group`, the spawner gets SIGTERM while the
+server is still shutting down, and the server logs a warning and forks once more if another command
+arrives.
 
 The spawner process and the worker run real processes even when a test injects a fake
 `ChildProcessSpawner` below these services; such a test sets `T3CODE_PROCESS_SPAWNER=default`.

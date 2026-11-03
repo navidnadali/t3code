@@ -14,10 +14,11 @@ import {
   WS_METHODS,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
+  OrchestrationV2RpcSchemas,
   type OrchestrationV2ShellStreamItem,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadProjection,
-  type OrchestrationV2ThreadShell,
+  OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadStreamItem,
   type OrchestrationProjectShell,
   type RepositoryIdentity,
@@ -36,6 +37,7 @@ import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -143,6 +145,8 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
 import {
+  encodeShellStreamItem,
+  encodeThreadStreamItem,
   layerWsRpc,
   resolveOpenDiscoveryForConfig,
   subscribeOrchestrationV2Shell,
@@ -2082,6 +2086,82 @@ it.live(
       assert.equal(title, `Events through ${marker[0]!.sequence - 1}`);
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
+const decodeThreadShellJson = Schema.decodeSync(Schema.toCodecJson(OrchestrationV2ThreadShell));
+const encodeShellChunk = Schema.encodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeShell.output)),
+);
+const encodeThreadChunk = Schema.encodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeThread.output)),
+);
+
+it("encodes a shared stream item once, as the RPC JSON codec encodes a chunk", () => {
+  const shell = decodeThreadShellJson({
+    createdBy: "user",
+    creationSource: "web",
+    id: "4fce7cfc-16ef-42bb-bca2-000000000046",
+    projectId: "d2e0512a-ce5d-42b9-b72d-000000000001",
+    title: "Synthetic thread 63",
+    providerInstanceId: "claudeAgent",
+    modelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-4-6" },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    linkedPullRequest: null,
+    pullRequests: [],
+    branchPullRequest: null,
+    lineage: {
+      parentThreadId: null,
+      relationshipToParent: null,
+      rootThreadId: "4fce7cfc-16ef-42bb-bca2-000000000046",
+    },
+    forkedFrom: null,
+    activeProviderThreadId: null,
+    latestRunId: "run:thread:4fce7cfc-16ef-42bb-bca2-000000000046:ordinal:4",
+    latestRunRequestedAt: "2025-11-09T01:43:58.436Z",
+    latestRunStartedAt: "2025-11-09T01:43:59.436Z",
+    latestRunCompletedAt: "2025-11-09T01:44:33.436Z",
+    latestRunStopRequested: false,
+    activeRunId: null,
+    activityRunStartedAt: null,
+    activityRunStatus: null,
+    blockedOnThreadWait: false,
+    status: "completed",
+    lastError: null,
+    usageLimitResetAt: null,
+    pendingRuntimeRequest: null,
+    pendingGuestMessageCount: 0,
+    latestVisibleMessage: null,
+    latestUserMessageAt: "2025-11-09T01:43:58.436Z",
+    hasActionableProposedPlan: false,
+    pendingBackgroundTasks: [],
+    providerInstanceHistory: ["claudeAgent"],
+    itemCount: 25,
+    visibleItemCount: 25,
+    createdAt: "2025-11-09T01:09:02.473Z",
+    updatedAt: "2025-11-09T01:45:33.436Z",
+    archivedAt: null,
+    settledOverride: "settled",
+    settledAt: "2025-11-09T01:45:33.436Z",
+    lastVisitedAt: "2025-11-09T01:45:33.436Z",
+    deletedAt: null,
+  });
+  const shellItems: Array<OrchestrationV2ShellStreamItem> = [
+    { kind: "thread.updated", sequence: 7, location: "active", thread: shell },
+    { kind: "thread.removed", sequence: 8, location: "archive", threadId: shell.id },
+    { kind: "synchronized" },
+  ];
+  assert.deepStrictEqual<unknown>(
+    shellItems.map(encodeShellStreamItem),
+    encodeShellChunk(shellItems),
+  );
+  assert.strictEqual(encodeShellStreamItem(shellItems[0]!), encodeShellStreamItem(shellItems[0]!));
+  const synchronized = { kind: "synchronized" as const };
+  assert.deepStrictEqual<unknown>(
+    [encodeThreadStreamItem(synchronized)],
+    encodeThreadChunk([synchronized]),
+  );
+});
 
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(

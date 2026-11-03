@@ -229,6 +229,12 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     // As Node's: stdin closes when the process exits.
     this.stdin?.destroy();
     this.emit("exit", code, signal);
+    // As Node's flushStdio: output nobody reads drains, so close follows.
+    process.nextTick(() => {
+      for (const stream of [this.stdout, this.stderr]) {
+        if (stream?.readable && stream.listenerCount("readable") === 0) stream.resume();
+      }
+    });
     this.#maybeClose();
   }
 

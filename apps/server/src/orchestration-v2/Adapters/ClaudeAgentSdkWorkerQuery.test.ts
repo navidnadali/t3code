@@ -1285,9 +1285,29 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
 
   // From SDK 0.3.284 an error response the SDK cannot write escapes its control-request handler as an
   // unhandled rejection, so in-thread is no oracle here: on a worker it must fail only that request.
-  it.effect(
-    "fails a callback whose error cannot be written with a clear error, and keeps its worker",
-    () =>
+  const unwritableErrors: ReadonlyArray<readonly [string, () => unknown, string]> = [
+    [
+      "a BigInt message",
+      () => Object.assign(new Error(), { message: 1n }),
+      "A T3 Code callback failed with an error that cannot be sent to Claude: Do not know how to serialize a BigInt",
+    ],
+    [
+      "a message whose JSON fails with an error that cannot be printed",
+      () =>
+        Object.assign(new Error(), {
+          message: {
+            toJSON: () => {
+              throw Object.assign(new Error(), { message: Symbol("unprintable") });
+            },
+          },
+        }),
+      "A T3 Code callback failed with an error that cannot be sent to Claude",
+    ],
+  ];
+
+  it.effect.each(unwritableErrors)(
+    "fails a callback whose error has %s, clearly and alone, and keeps its worker",
+    ([, rejection, expected]) =>
       withRunner(
         "worker",
         ({ runner, recorded }) =>
@@ -1295,34 +1315,32 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
             const unwritable = new FakeClaudeCli();
             const neighbour = new FakeClaudeCli();
             yield* runner.open(
-              openInput(unwritable, {
-                canUseTool: () => Promise.reject(Object.assign(new Error(), { message: 1n })),
-              }),
+              openInput(unwritable, { canUseTool: () => Promise.reject(rejection()) }),
             );
             yield* runner.open(
               openInput(neighbour, {
                 canUseTool: async () => ({ behavior: "allow", updatedInput: { allowed: true } }),
               }),
             );
-            // A dead worker kills its sessions' CLIs instead of answering.
+            // A dead worker kills its sessions' CLIs; a throw on main is an unhandled rejection there.
+            const unhandled = Promise.withResolvers<{ readonly unhandled: unknown }>();
+            const onUnhandled = (reason: unknown) => unhandled.resolve({ unhandled: reason });
+            process.on("unhandledRejection", onUnhandled);
             const outcome = (cli: FakeClaudeCli, toolUseId: string) =>
               Promise.race([
                 cli.request(permissionRequest(toolUseId)).then((response) => ({ response })),
                 new Promise<{ readonly killed: true }>((resolve) =>
                   cli.once("exit", () => resolve({ killed: true })),
                 ),
+                unhandled.promise,
               ]);
             const failed = yield* Effect.promise(() => outcome(unwritable, "toolu-unwritable"));
             const answered = yield* Effect.promise(() => outcome(neighbour, "toolu-neighbour"));
+            process.off("unhandledRejection", onUnhandled);
 
             assert.deepStrictEqual(recorded.opens, [true, true]);
             assert.deepStrictEqual(failed, {
-              response: {
-                subtype: "error",
-                request_id: "cli-0",
-                error:
-                  "A T3 Code callback failed with an error that cannot be sent to Claude: Do not know how to serialize a BigInt",
-              },
+              response: { subtype: "error", request_id: "cli-0", error: expected },
             });
             assert.deepStrictEqual(answered, {
               response: {

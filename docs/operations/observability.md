@@ -264,8 +264,9 @@ shim would load the whole server bundle.
 
 If the spawner process dies, the providers it handed off keep running in their own process groups,
 their stdio still held by the server. The server then checks each one's process identity (PID and
-start time) every second and reports its exit, without an exit status, once it ends; a kill checks
-that identity first, so a reused PID is never signalled.
+start time) every second and reports its exit once it ends, as "exit status unknown"; a kill checks
+that identity first, so a reused PID is never signalled. Until it ends, such a provider still counts
+as the server's own child for the port tools (which do not stop its group) and for telemetry.
 
 The spawner kills its children and its own process group, then exits, when the server exits however
 it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP; providers it handed off are

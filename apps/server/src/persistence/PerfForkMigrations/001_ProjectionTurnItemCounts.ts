@@ -21,8 +21,8 @@ export default Effect.gen(function* () {
       PRIMARY KEY (thread_id, run_id)
     ) WITHOUT ROWID
   `;
-  // A migration that rebuilds the turn-item table (create, copy, drop, rename) drops these
-  // triggers with it; this migration must run after such a rebuild, or the rebuild recreate them.
+  // An upstream migration that rebuilds the turn-item table (create, copy, drop, rename) drops
+  // these triggers; the fork's chain then runs this migration again, so it must stay re-runnable.
   yield* sql`
     CREATE TRIGGER IF NOT EXISTS orchestration_v2_turn_item_counts_insert
     AFTER INSERT ON orchestration_v2_projection_turn_items

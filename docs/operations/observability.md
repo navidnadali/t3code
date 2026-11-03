@@ -165,15 +165,42 @@ waiting. Read CPU together with page faults:
 - Many `involuntaryContextSwitches` mean other processes were competing for the CPU.
 
 Every Git command is a child process, and Node creates each one synchronously on the thread that
-spawns it (`posix_spawn` on macOS, `fork` on Linux): about a millisecond of event loop per command,
-around 30 commands per turn. `T3CODE_VCS_SPAWN_WORKER=true` starts the processes of `VcsProcess` and
-`GitVcsDriver` (checkpoints, status, refs, source control CLIs) on a worker thread instead, with the
-same output, exit codes and errors. Git run through other services, such as the cached repository
-identity lookup, still spawns on the event loop. On Linux a `fork` from the worker still write-locks
-the server's address space while page tables are copied, interrupts every CPU running the server to
-flush its TLB, and leaves copy-on-write faults for the event loop, so measure before enabling it.
-With the knob on, those services run real processes even when a test injects a fake
-`ChildProcessSpawner`. Unset or `false` spawns them on the event loop, as Windows always does.
+spawns it (`posix_spawn` on macOS, `fork` on Linux). On Linux each `fork` copies the page tables of
+the whole server, so its cost grows with the server's memory. On Linux and macOS the commands of
+`VcsProcess` and `GitVcsDriver` (checkpoints, status, refs, source control CLIs) therefore start from a
+small spawner process, started once while the server is small, so the server never forks for them:
+each fork copies only the spawner's page tables. Output, exit codes and errors are the same. Git run
+through other services, such as the cached repository identity lookup, still spawns on the event
+loop. macOS spawns with `posix_spawn`, which copies no page tables, so the gain there is only the
+event-loop time.
+
+`T3CODE_PROCESS_SPAWNER` (any case) chooses where those commands start:
+
+- unset, `child`, `1`, `true` or `on`: the spawner process;
+- `worker`: a worker thread in the server, which still forks the server's address space on Linux
+  (`T3CODE_VCS_SPAWN_WORKER=true` selects it too while `T3CODE_PROCESS_SPAWNER` is unset, so a host
+  that still sets it keeps the worker until it is removed or `T3CODE_PROCESS_SPAWNER=child` is set);
+- `default`, `0`, `false` or `off`: Node's spawner on the event loop, as Windows always does.
+
+Any other value is logged as an error and keeps Node's spawner. A spawner process that stops is
+restarted, which forks the server once. If it stops again before starting a command, or more than 3
+times in 10 minutes, an error is logged and commands fail with "The process spawner stopped" for a
+cool-down of 15 seconds, then a spawner is started again; while starts keep failing, the cool-down
+doubles up to 5 minutes. Git never falls back to Node's spawner meanwhile. Each command's unread
+output waits in the server, up to 1 MiB per stream, where it would otherwise wait in a 64 KiB pipe.
+Release archives ship the spawner as its own small executable, `t3-process-spawner`, beside `t3`;
+without it, `t3` runs the spawner from its own bundle, which takes about four times the memory, and
+logs a warning at start.
+
+The spawner kills its children and its own process group, then exits, when the server exits however
+it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP. Once the server has begun to shut
+down, a Git command still running or started later fails with "The process spawner stopped" instead of
+running on the server. Stop the server with systemd's `KillMode=mixed`: with `control-group`, the
+spawner gets SIGTERM while the server is still shutting down, and the server logs a warning and forks
+once more if another command arrives.
+
+The spawner process and the worker run real processes even when a test injects a fake
+`ChildProcessSpawner` below these services; such a test sets `T3CODE_PROCESS_SPAWNER=default`.
 
 ### Related Artifacts
 
@@ -717,6 +744,26 @@ gains most. While the database is mapped, an I/O error or a truncation from outs
 SIGBUS and terminates the process. CLI commands that open the database, such as `t3 project`,
 `t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
 as well as the server.
+
+Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers, and an idle reader always
+takes a queued read. Reads come in three classes: small reads (thread shells, settlement, the thread
+row, runs and other bookkeeping), page reads (snapshot windows, history and timeline pages), and
+reads of a thread's whole history (full snapshots and projections, turn starts, thread search, and
+records of turn items, nodes, messages, subagents, plans, handoffs or transfers). When reads of
+several classes queue, a freed reader goes first to a class that has been passed over once for each
+reader in the pool, the most passed over first, so none starves; then to small or page reads whose class holds no reader; then
+to small, page and history reads in that order. History reads that already hold all readers but two
+(at least one) go after every other queued read. Within a class, reads go in the order they queued.
+The order counts turns, not reader time, and no reader is kept for small reads: when history reads
+hold every reader, a small read waits for one of them to finish. In a review probe (two looping full
+snapshots of a very large thread beside history, window and small reads) small reads waited up to
+1.7 s at p95 with one reader, 0.5 s with two, 0.2-0.33 s with four and 95-209 ms with eight; before
+this order they waited 36-79 ms with four, but snapshot windows starved (6 in 8 s against 149). A
+read's statements go to a reader worker together; while reads fall back to the main connection they
+all share it and run their statements in turn.
+History reads each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from
+before their read transaction until their rows are decoded, which bounds the history rows held at
+once. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a reader is.
 
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for

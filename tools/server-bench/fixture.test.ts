@@ -166,7 +166,7 @@ const synthCopy = (destination: string) => {
 };
 
 /**
- * Migration 77's turn item counts against `COUNT(*)` of the items, both ways: rows whose count is
+ * Fork migration 1's turn item counts against `COUNT(*)` of the items, both ways: rows whose count is
  * off, plus (thread, run) pairs with items but no row.
  */
 const turnItemCountsMismatch = (path: string) => ({
@@ -1192,7 +1192,7 @@ describe("fixture CLI", () => {
     expect(Math.abs(result.sizeDeviation)).toBeLessThan(0.1);
     const off = result.tables.filter((row) => row.target > 0 && Math.abs(row.deviation ?? 1) > 0.1);
     expect(off).toEqual([]);
-    // Migration 77's turn item counts, kept by its triggers while synth writes: exact.
+    // Fork migration 1's turn item counts, kept by its triggers while synth writes: exact.
     expect(turnItemCountsMismatch(NodePath.join(directory, "example.sqlite"))).toEqual({
       rows: expect.any(Number),
       wrong: 0,
@@ -1203,6 +1203,10 @@ describe("fixture CLI", () => {
     const directory = scratch("sanitise");
     const seeded = NodePath.join(directory, "seeded.sqlite");
     synthCopy(seeded);
+    // As an upstream build left it: the fork's own migrations run on the copy, and the report says so.
+    const upstreamMade = new NodeSqlite.DatabaseSync(seeded);
+    upstreamMade.exec("DROP TABLE t3_perf_fork_migrations");
+    upstreamMade.close();
     const { busy, kept, idle, running, limited, task } = seedPendingWork(seeded);
     const before = run(["scan", seeded]);
     expect(before.status).toBe(1);
@@ -1215,6 +1219,7 @@ describe("fixture CLI", () => {
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
     const summary = JSON.parse(NodeFS.readFileSync(report, "utf8")) as {
+      migrations: ReadonlyArray<string>;
       check: {
         secretHits: object;
         credentialColumns: object;
@@ -1222,6 +1227,10 @@ describe("fixture CLI", () => {
         runnable: Record<string, number>;
       };
     };
+    expect(summary.migrations).toEqual([
+      "t3_perf_fork_migrations:1_ProjectionTurnItemCounts",
+      "t3_perf_fork_migrations:2_TurnItemMessageOrdinalIndex",
+    ]);
     expect(summary.check.secretHits).toEqual({});
     expect(summary.check.credentialColumns).toEqual({});
     expect(summary.check.rawHits).toEqual({});
@@ -1251,7 +1260,7 @@ describe("fixture CLI", () => {
         `SELECT COUNT(*) AS n FROM orchestration_v2_projection_runtime_requests WHERE status = 'pending'`,
       ),
     ).toBe(0);
-    // Migration 77's turn item counts stay, exact for the items the fixture holds.
+    // Fork migration 1's turn item counts stay, exact for the items the fixture holds.
     const counted = turnItemCountsMismatch(clean);
     expect([counted.rows > 0, counted.wrong]).toEqual([true, 0]);
     const settled = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_subagents

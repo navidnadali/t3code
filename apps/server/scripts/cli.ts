@@ -12,6 +12,11 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { DEVELOPMENT_ICON_OVERRIDES } from "../../../scripts/lib/brand-assets.ts";
 import { findEsmImportsOfExternalPackages } from "../../../scripts/lib/cli-executable-imports.ts";
 import { injectLinuxArm64Sea } from "../../../scripts/lib/linux-arm64-sea.ts";
+import {
+  buildProcessSpawnerSea,
+  PROCESS_SPAWNER_EXECUTABLE,
+} from "../../../scripts/lib/process-spawner-sea.ts";
+import { spawnerProcessSource } from "../src/process/spawnerSources.ts";
 import rootPackageJson from "../../../package.json" with { type: "json" };
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -155,6 +160,20 @@ const buildExeCmd = Command.make(
           nodeVersion: rootPackageJson.engines.node,
           verbose: config.verbose,
         });
+      }
+      // Without it the server runs its spawner as t3 __process-spawner, which parses the whole bundle.
+      if (target === undefined && (yield* HostProcess.Platform) !== "win32") {
+        yield* buildProcessSpawnerSea({
+          source: spawnerProcessSource,
+          outputPath: path.join(serverDir, "dist-exe", PROCESS_SPAWNER_EXECUTABLE),
+          nodeVersion: rootPackageJson.engines.node,
+          verbose: config.verbose,
+        });
+        yield* Effect.log(`[cli] Built dist-exe/${PROCESS_SPAWNER_EXECUTABLE}`);
+      } else {
+        yield* Effect.log(
+          `[cli] No dist-exe/${PROCESS_SPAWNER_EXECUTABLE} for a cross-target or Windows build; t3 starts its spawner itself`,
+        );
       }
       yield* Effect.log(
         "[cli] Built dist-exe/t3 (expects client/, resource-monitor/, and the runtime-external node_modules beside it; scripts/build-cli-archive.ts assembles that tree)",

@@ -2,6 +2,21 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.6-perf.2 (2026-11-03)
+
+Reader scheduling, a git spawner process and a shell delta hub
+
+Upstream base: 60aec28a9c6f.
+
+- Database: a work-conserving reader scheduler with aging and fair classes; a read's statements go to one reader worker together; the writer's page-cache size and tuning pragmas wait for another process's lock when the database opens.
+- Processes: the server process no longer forks; a small spawner process runs git (on by default on Linux and macOS).
+- Events: live shell deltas are projected once per batch and fanned out to every subscriber.
+- Migrations: the fork's own migrations run in their own chain, apart from upstream's ids.
+- Fix (upstream bug): a late checkpoint capture attributes its baselines to the run it captures.
+- ACP: stdout lines are framed in linear time.
+- Provider I/O: the Codex and ACP worker offload keeps in-thread timing and bounds pending reads by bytes.
+- Bench parameters in tools/server-bench set to chosen defaults.
+
 ## v0.1.6-perf.1 (2026-11-01)
 
 First performance release: database reads, event fan-out and provider I/O

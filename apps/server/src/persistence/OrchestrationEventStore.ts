@@ -23,6 +23,7 @@ import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { replayAndBufferProjectedLiveEvents } from "../orchestration-v2/LiveStreamBudget.ts";
@@ -104,6 +105,12 @@ export class OrchestrationEventStore extends Context.Service<
     readonly publishCommitted: (
       events: ReadonlyArray<ApplicationStoredEvent>,
     ) => Effect.Effect<void>;
+    /** Every committed event from now on, unbounded: for internal consumers that must not drop events under load. */
+    readonly subscribeCommitted: Effect.Effect<
+      PubSub.Subscription<ApplicationStoredEvent>,
+      never,
+      Scope.Scope
+    >;
 
     readonly streamApplicationEvents: (input?: {
       readonly afterSequence?: number;
@@ -749,6 +756,7 @@ const makeEventStore = Effect.gen(function* () {
     latestApplicationSequence,
     readApplicationEvents: catchUpApplicationEvents,
     publishCommitted: (events) => PubSub.publishAll(committedEvents, events).pipe(Effect.asVoid),
+    subscribeCommitted: PubSub.subscribe(committedEvents),
     streamApplicationEvents,
     streamProjectedApplicationEvents,
   } satisfies OrchestrationEventStore["Service"];

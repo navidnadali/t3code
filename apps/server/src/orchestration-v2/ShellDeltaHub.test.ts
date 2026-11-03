@@ -1,0 +1,466 @@
+import { assert, it } from "@effect/vitest";
+import {
+  ProjectId,
+  ThreadId,
+  type ApplicationStoredEvent,
+  type OrchestrationProjectShell,
+  type OrchestrationV2ThreadShell,
+} from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
+
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ProjectStore from "./ProjectStore.ts";
+import * as ShellDeltaHub from "./ShellDeltaHub.ts";
+import * as ThreadManagementService from "./ThreadManagementService.ts";
+
+const threadId = ThreadId.make("thread:hub");
+const shell = {
+  id: threadId,
+  archivedAt: null,
+  title: "a",
+} as unknown as OrchestrationV2ThreadShell;
+
+// The hub reads nothing but the sequence and thread of a live event.
+const threadEvent = (id: ThreadId, sequence: number, type = "provider-session.detached") =>
+  ({
+    sequence,
+    event: { type, threadId: id },
+  }) as unknown as ApplicationStoredEvent;
+
+const layerStore = OrchestrationEventStore.layer.pipe(
+  Layer.provideMerge(SqlitePersistence.layerMemory),
+);
+
+// The hub over mocked shell reads (`title()` names the shell read); `onStart` runs when it
+// subscribes to committed events.
+const layerHub = (input: {
+  readonly reads: Array<number>;
+  readonly title?: () => string;
+  readonly onStart?: () => void;
+  readonly afterSubscribe?: Effect.Effect<void>;
+  readonly onRelease?: () => void;
+  readonly subagents?: () => ReadonlyArray<ThreadId>;
+  readonly getProjectRow?: ProjectStore.ProjectStoreV2["Service"]["getShell"];
+}) =>
+  ShellDeltaHub.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          listActiveSubagentThreadIds: () => Effect.sync(() => [...(input.subagents?.() ?? [])]),
+          getThreadShellReadForEvent: ({ threadId: id, sequence }) =>
+            Effect.sync(() => {
+              input.reads.push(sequence);
+              const subagent = input.subagents?.().includes(id) ?? false;
+              return {
+                shell: {
+                  ...shell,
+                  id,
+                  title: input.title?.() ?? shell.title,
+                  lineage: {
+                    parentThreadId: subagent ? threadId : null,
+                    relationshipToParent: subagent ? "subagent" : null,
+                    rootThreadId: subagent ? threadId : id,
+                  },
+                },
+                readOrdinal: input.reads.length,
+              };
+            }),
+        }),
+        Layer.mock(ProjectStore.ProjectStoreV2)(
+          input.getProjectRow === undefined ? {} : { getShell: input.getProjectRow },
+        ),
+        Layer.effect(
+          OrchestrationEventStore.OrchestrationEventStore,
+          Effect.gen(function* () {
+            const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+            return {
+              ...store,
+              subscribeCommitted: store.subscribeCommitted.pipe(
+                Effect.tap(() => Effect.sync(() => input.onStart?.())),
+                Effect.tap(() => Effect.addFinalizer(() => Effect.sync(() => input.onRelease?.()))),
+                Effect.tap(() => input.afterSubscribe ?? Effect.void),
+              ),
+            };
+          }),
+        ),
+      ),
+    ),
+    Layer.provideMerge(layerStore),
+  );
+
+const publish = (id: ThreadId, sequence: number, type?: string) =>
+  Effect.gen(function* () {
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    yield* store.publishCommitted([threadEvent(id, sequence, type)]);
+    yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+  });
+
+it.effect("deltas buffered before the stream is taken keep the latest per aggregate", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const subscription = yield* hub.subscribe();
+      for (let sequence = 1; sequence <= 5; sequence++) yield* publish(threadId, sequence);
+      const items = yield* subscription.stream(0).pipe(Stream.take(1), Stream.runCollect);
+      assert.deepEqual(
+        items.map((item) => item.sequence),
+        [5],
+      );
+      assert.deepEqual(reads, [1, 2, 3, 4, 5]);
+    }).pipe(Effect.provide(layerHub({ reads })));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("an overflowing subscription ends and stops counting before its scope closes", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    let starts = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const scope = yield* Scope.make();
+      const stalled = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+      // One delta delivered and never acknowledged; the next one overflows the budget.
+      const pull = yield* Stream.toPull(stalled.stream(0)).pipe(Scope.provide(scope));
+      const first = yield* Effect.forkScoped(pull);
+      yield* publish(threadId, 1);
+      assert.deepEqual(
+        (yield* Fiber.join(first)).map((item) => item.sequence),
+        [1],
+      );
+      yield* publish(ThreadId.make("thread:other"), 2);
+      yield* TestClock.adjust(0);
+      // The stalled subscriber no longer counts: the next one starts a fresh hub.
+      yield* hub.subscribe().pipe(Scope.provide(scope));
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 2);
+      const exit = yield* Effect.exit(pull);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) {
+        assert.equal((Cause.squash(exit.cause) as { _tag?: string })._tag, "LiveStreamBufferError");
+      }
+      yield* Scope.close(scope, Exit.void);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          onStart: () => {
+            starts += 1;
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "unchanged shells are skipped before the budget, so an unacknowledged batch cannot overflow on them",
+  () =>
+    Effect.gen(function* () {
+      const reads: Array<number> = [];
+      let title = "a";
+      const other = ThreadId.make("thread:other");
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const subscription = yield* hub.subscribe({ maxItems: 3 });
+        const pull = yield* Stream.toPull(subscription.stream(0));
+        yield* publish(threadId, 1);
+        yield* publish(other, 2);
+        // Delivered and charged until the next pull acknowledges them.
+        assert.deepEqual(
+          (yield* pull).map((item) => item.sequence),
+          [1, 2],
+        );
+        yield* publish(threadId, 3);
+        yield* publish(other, 4);
+        title = "b";
+        yield* publish(threadId, 5);
+        const next = yield* pull;
+        assert.deepEqual(
+          next.map((item) => [
+            item.sequence,
+            item.kind === "thread.updated" ? item.thread.title : null,
+          ]),
+          [[5, "b"]],
+        );
+        assert.deepEqual(reads, [1, 2, 3, 4, 5]);
+      }).pipe(Effect.provide(layerHub({ reads, title: () => title })));
+    }).pipe(Effect.scoped),
+);
+
+it.effect("deltas held before the stream is taken count against the budget", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    let starts = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const scope = yield* Scope.make();
+      const stalled = yield* hub.subscribe({ maxItems: 2 }).pipe(Scope.provide(scope));
+      for (const [index, id] of ["thread:a", "thread:b", "thread:c"].entries()) {
+        yield* publish(ThreadId.make(id), index + 1);
+      }
+      yield* TestClock.adjust(0);
+      yield* hub.subscribe().pipe(Scope.provide(scope));
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 2);
+      const exit = yield* stalled.stream(0).pipe(Stream.runCollect, Effect.exit);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) {
+        assert.equal((Cause.squash(exit.cause) as { _tag?: string })._tag, "LiveStreamBufferError");
+      }
+      yield* Scope.close(scope, Exit.void);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          onStart: () => {
+            starts += 1;
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("held deltas the snapshot covers are released when the stream starts", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const subscription = yield* hub.subscribe({ maxItems: 2 });
+      yield* publish(ThreadId.make("thread:a"), 1);
+      yield* publish(ThreadId.make("thread:b"), 2);
+      // The snapshot read at sequence 2 covers both: starting the stream frees their budget.
+      const first = yield* Effect.forkScoped(
+        subscription.stream(2).pipe(Stream.take(1), Stream.runCollect),
+      );
+      yield* TestClock.adjust(0);
+      yield* publish(ThreadId.make("thread:c"), 3);
+      assert.deepEqual(
+        (yield* Fiber.join(first)).map((item) => item.sequence),
+        [3],
+      );
+    }).pipe(Effect.provide(layerHub({ reads })));
+  }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "a subscriber cancelled while the hub starts leaves no hub and no committed subscription behind",
+  () =>
+    Effect.gen(function* () {
+      const reads: Array<number> = [];
+      let starts = 0;
+      let releases = 0;
+      const subscribing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const subscriber = yield* Effect.forkScoped(
+          Effect.scoped(hub.subscribe().pipe(Effect.andThen(Effect.never))),
+        );
+        yield* Deferred.await(subscribing);
+        yield* Fiber.interrupt(subscriber).pipe(Effect.forkScoped);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.await(subscriber);
+        yield* TestClock.adjust(0);
+        assert.equal(starts, 1);
+        assert.equal(releases, 1);
+        // Nothing is left: the next subscriber starts a fresh hub.
+        yield* Effect.scoped(hub.subscribe());
+        yield* TestClock.adjust(0);
+        assert.equal(starts, 2);
+        assert.equal(releases, 2);
+      }).pipe(
+        Effect.provide(
+          layerHub({
+            reads,
+            onStart: () => {
+              starts += 1;
+            },
+            // Holds the start between acquiring the committed subscription and forking the consumer.
+            afterSubscribe: Deferred.succeed(subscribing, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+            ),
+            onRelease: () => {
+              releases += 1;
+            },
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped),
+);
+
+it.effect("a subscriber whose scope closes while the hub starts leaves no hub behind", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    let starts = 0;
+    let releases = 0;
+    const subscribing = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const scope = yield* Scope.make();
+      const subscriber = yield* Effect.forkScoped(hub.subscribe().pipe(Scope.provide(scope)));
+      yield* Deferred.await(subscribing);
+      yield* Scope.close(scope, Exit.void);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.await(subscriber);
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 1);
+      assert.equal(releases, 1);
+      yield* Effect.scoped(hub.subscribe());
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 2);
+      assert.equal(releases, 2);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          onStart: () => {
+            starts += 1;
+          },
+          afterSubscribe: Deferred.succeed(subscribing, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+          ),
+          onRelease: () => {
+            releases += 1;
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+// Reviewer scenario (F3): a subagent archived when the hub started and unarchived later.
+it.effect(
+  "a transcript-only update of a subagent thread is dropped whatever the hub knew at start",
+  () =>
+    Effect.gen(function* () {
+      const reads: Array<number> = [];
+      const child = ThreadId.make("thread:child");
+      let active: ReadonlyArray<ThreadId> = [];
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const subscription = yield* hub.subscribe();
+        const items = yield* Effect.forkScoped(
+          subscription.stream(0).pipe(Stream.take(1), Stream.runCollect),
+        );
+        yield* TestClock.adjust(0);
+        // The child is unarchived after the hub seeded its subagent set.
+        active = [child];
+        yield* publish(child, 1, "message.updated");
+        yield* publish(child, 2);
+        assert.deepEqual(
+          (yield* Fiber.join(items)).map((item) => item.sequence),
+          [2],
+        );
+      }).pipe(Effect.provide(layerHub({ reads, subagents: () => active })));
+    }).pipe(Effect.scoped),
+);
+
+const projectShell = (id: ProjectId, title: string) =>
+  Option.some({
+    id,
+    title,
+    workspaceRoot: `/tmp/${id}`,
+    defaultModelSelection: null,
+    scripts: [],
+    createdAt: "2026-10-31T00:00:00.000Z",
+    updatedAt: "2026-10-31T00:00:00.000Z",
+  } as unknown as OrchestrationProjectShell);
+
+it.effect("a failed project read is not shared with a same-sequence retry", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    const project = ProjectId.make("project:retry");
+    let calls = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const first = yield* Effect.exit(
+        hub.readProjectShellForEvent({ projectId: project, sequence: 1 }),
+      );
+      assert.isTrue(Exit.isFailure(first));
+      const second = yield* hub.readProjectShellForEvent({ projectId: project, sequence: 1 });
+      assert.isTrue(Option.isSome(second.project));
+      assert.equal(calls, 2);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          getProjectRow: (id) =>
+            Effect.suspend(() =>
+              ++calls === 1
+                ? Effect.die(new Error("reader gone"))
+                : Effect.succeed(projectShell(id, "p")),
+            ),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("a settled project read is shared until the shared-read TTL, then read again", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    const project = ProjectId.make("project:ttl");
+    let calls = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const read = { projectId: project, sequence: 1 };
+      const first = yield* hub.readProjectShellForEvent(read);
+      const shared = yield* hub.readProjectShellForEvent(read);
+      assert.equal(shared.readOrdinal, first.readOrdinal);
+      assert.equal(calls, 1);
+      yield* TestClock.adjust(ThreadManagementService.SHARED_SHELL_READ_TTL_MS);
+      const again = yield* hub.readProjectShellForEvent(read);
+      assert.isAbove(again.readOrdinal, first.readOrdinal);
+      assert.equal(calls, 2);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          getProjectRow: (id) =>
+            Effect.sync(() => (calls += 1)).pipe(Effect.as(projectShell(id, "p"))),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("settled project reads are kept to the shared-read capacity", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    const first = ProjectId.make("project:capacity-0");
+    let calls = 0;
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      for (let index = 0; index <= ThreadManagementService.SHARED_SHELL_READ_CAPACITY; index++) {
+        yield* hub.readProjectShellForEvent({
+          projectId: ProjectId.make(`project:capacity-${index}`),
+          sequence: 1,
+        });
+      }
+      const before = calls;
+      yield* hub.readProjectShellForEvent({ projectId: first, sequence: 1 });
+      assert.equal(calls, before + 1);
+    }).pipe(
+      Effect.provide(
+        layerHub({
+          reads,
+          getProjectRow: (id) =>
+            Effect.sync(() => (calls += 1)).pipe(Effect.as(projectShell(id, "p"))),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped),
+);

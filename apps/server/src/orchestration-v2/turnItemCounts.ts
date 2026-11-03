@@ -1,7 +1,7 @@
 import * as Effect from "effect/Effect";
 import type * as SqlClient from "effect/sql/SqlClient";
 
-/** Refills the maintained turn-item counts from the items: migration 77's backfill and doctor's repair. */
+/** Refills the maintained turn-item counts from the items: fork migration 1's backfill and doctor's repair. */
 export const recountTurnItems = Effect.fn("TurnItemCounts.recount")(function* (
   sql: SqlClient.SqlClient,
 ) {

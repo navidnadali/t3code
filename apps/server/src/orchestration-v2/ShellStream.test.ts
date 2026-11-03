@@ -18,16 +18,17 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   activeShellRowsForSubscriber,
-  bufferShellLiveStream,
   composeShellStreamWithEnrichment,
   dedupeShellEnrichment,
   omitIdleSubagentShells,
   omitOlderSettledShells,
+  shellDeltaKey,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemsFromInitialSnapshot,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
 } from "./ShellStream.ts";
+import { bufferLatestLiveStream } from "./LiveStreamBudget.ts";
 
 const emptyShellSnapshot = {
   schemaVersion: 1,
@@ -122,8 +123,9 @@ it.effect("coalesces a slow shell subscriber by identity and location in sequenc
         { kind: "thread.removed", sequence: 11, location: "archive", threadId: shell.id },
       ] satisfies Array<Extract<OrchestrationV2ShellStreamItem, { readonly sequence: number }>>;
       const pull = yield* Stream.toPull(
-        bufferShellLiveStream(
+        bufferLatestLiveStream(
           Stream.fromQueue(input).pipe(Stream.ensuring(Deferred.succeed(drained, undefined))),
+          shellDeltaKey,
           { maxItems: 6, maxSerializedBytes: 1_500 },
         ),
       );
@@ -421,13 +423,14 @@ describe("composeShellStreamWithEnrichment", () => {
         const pull = yield* Stream.toPull(
           composeShellStreamWithEnrichment({
             initial: Stream.empty,
-            tail: bufferShellLiveStream(
+            tail: bufferLatestLiveStream(
               Stream.concat(
                 Stream.succeed(initial),
                 Stream.fromEffect(Deferred.await(update)).pipe(
                   Stream.map(() => ({ ...initial, sequence: 2 })),
                 ),
               ).pipe(Stream.ensuring(Deferred.succeed(closed, undefined))),
+              shellDeltaKey,
               { maxItems: 1 },
             ),
             enrichment: Stream.empty,

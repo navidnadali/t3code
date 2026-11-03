@@ -391,20 +391,17 @@ it.effect("sends a guest message with the guest's files, never ones the client n
     const captured: OrchestrationV2ServerCommand[] = [];
     const layerGuestShare = Layer.mock(ThreadManagementService.ThreadManagementService)({
       dispatch: layerFailingDispatchHandler(captured),
-      // Only the share is read.
-      getThreadSnapshotWindow: () =>
+      // Only the share is read, from the thread row alone: a window read would wait for a reader
+      // permit behind large decodes, and this mock has none.
+      getThreadRecords: () =>
         Effect.succeed({
-          projection: {
-            thread: {
-              guestShare: {
-                messages: [{ id: guestMessageId, status: "pending", attachments: [guestFile] }],
-              },
+          thread: {
+            guestShare: {
+              messages: [{ id: guestMessageId, status: "pending", attachments: [guestFile] }],
             },
           },
         } as unknown as Effect.Success<
-          ReturnType<
-            ThreadManagementService.ThreadManagementServiceShape["getThreadSnapshotWindow"]
-          >
+          ReturnType<ThreadManagementService.ThreadManagementServiceShape["getThreadRecords"]>
         >),
     });
     yield* dispatchCommand({

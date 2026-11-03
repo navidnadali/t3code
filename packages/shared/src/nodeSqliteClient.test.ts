@@ -52,6 +52,9 @@ const replyHold = vi.hoisted(() => ({
 // Whether a worker keeps the process alive, as the client last told it, and that state at each reply.
 const workerRefd = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, boolean>());
 const refdAtReply = vi.hoisted(() => new Map<number, boolean>());
+// Whether a reply was awaited: the client lets go of the worker while handling the last awaited one.
+const awaitedAtReply = vi.hoisted(() => new Map<number, boolean>());
+const unrefDuring = vi.hoisted(() => ({ emit: false }));
 // Makes every reader announce itself without a statement authorizer.
 const readyRewrite = vi.hoisted(() => ({ unguarded: false }));
 // Resolves a waiter when a request whose SQL mentions its needle is posted to a worker.
@@ -111,6 +114,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
     }
     override unref() {
       workerRefd.set(this, false);
+      unrefDuring.emit = true;
       return super.unref();
     }
     override emit(event: string | symbol, ...args: Array<any>): boolean {
@@ -119,9 +123,15 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         event === "message" &&
         typeof reply === "object" &&
         reply !== null &&
-        typeof reply.id === "number"
-      )
+        typeof reply.id === "number" &&
+        !replyHold.ids.has(reply.id)
+      ) {
         refdAtReply.set(reply.id, workerRefd.get(this) ?? true);
+        unrefDuring.emit = false;
+        const delivered = super.emit(event, ...args);
+        awaitedAtReply.set(reply.id, unrefDuring.emit);
+        return delivered;
+      }
       if (event === "message" && readyRewrite.unguarded && reply?.type === "ready")
         return super.emit(event, { ...reply, guarded: false });
       if (
@@ -2013,47 +2023,52 @@ it.effect("sets up an awaited ending correctly whatever happens before it runs",
   withReaderClient(
     (sql) =>
       Effect.gen(function* () {
+        // Several yield budgets, so that the gap before the ending's callback falls at a turn
+        // boundary under at least one alignment.
         for (const happening of ["the abandoned reply arrives", "the worker stops"] as const) {
-          for (let yields = 0; yields < 32; yields++) {
-            yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
-            const worker = startedWorkers.at(-1)!;
-            const held = new Promise<void>((resolve) => replyHold.waiters.push(resolve));
-            // The transaction abandons a read whose reply is held, then ends: with a one-step
-            // budget every step of its ending, including the gap before its callback, is a turn.
-            const transaction = yield* sql
-              .withTransaction(
-                Effect.gen(function* () {
-                  const abandoned = yield* Effect.forkChild(
-                    sql`SELECT name /* hold-reply */ FROM entries`,
-                    { startImmediately: true },
-                  );
-                  yield* Effect.promise(() => held);
-                  yield* Fiber.interrupt(abandoned);
-                }),
-              )
-              .pipe(SqliteClient.readOnly, oneStepTurns, (effect) =>
-                Effect.forkChild(effect, { startImmediately: true }),
-              );
-            yield* Effect.promise(() => held);
-            for (let i = 0; i < yields; i++) yield* Effect.yieldNow;
-            if (happening === "the abandoned reply arrives")
-              for (const release of replyHold.held.splice(0)) release();
-            else worker.emit("exit", 1);
-            // The transaction ends either way, and never hangs.
-            yield* Fiber.join(transaction).pipe(Effect.exit);
-            for (const release of replyHold.held.splice(0)) release();
-            if (happening === "the abandoned reply arrives") {
-              // An ending left as the only pending request keeps the worker referenced.
-              const ending = workerMessages
-                .get(worker)!
-                .findLast((message) => /^\s*COMMIT/i.test(String(message.sql ?? "")));
-              if (ending !== undefined && refdAtReply.has(ending.id as number))
-                assert.isTrue(
-                  refdAtReply.get(ending.id as number),
-                  `after ${yields} yields: the worker was let go of before its ending was answered`,
+          for (const budget of [3, 4, 5, 6, 7]) {
+            const turns = Effect.provideService(Scheduler.MaxOpsBeforeYield, budget);
+            for (let yields = 0; yields < 24; yields++) {
+              yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
+              const worker = startedWorkers.at(-1)!;
+              const held = new Promise<void>((resolve) => replyHold.waiters.push(resolve));
+              // The transaction abandons a read whose reply is held, then ends: with a one-step
+              // budget every step of its ending, including the gap before its callback, is a turn.
+              const transaction = yield* sql
+                .withTransaction(
+                  Effect.gen(function* () {
+                    const abandoned = yield* Effect.forkChild(
+                      sql`SELECT name /* hold-reply */ FROM entries`,
+                      { startImmediately: true },
+                    );
+                    yield* Effect.promise(() => held);
+                    yield* Fiber.interrupt(abandoned);
+                  }),
+                )
+                .pipe(SqliteClient.readOnly, turns, (effect) =>
+                  Effect.forkChild(effect, { startImmediately: true }),
                 );
-            } else {
-              yield* Effect.promise(() => worker.terminate());
+              yield* Effect.promise(() => held);
+              for (let i = 0; i < yields; i++) yield* Effect.yieldNow;
+              if (happening === "the abandoned reply arrives")
+                for (const release of replyHold.held.splice(0)) release();
+              else worker.emit("exit", 1);
+              // The transaction ends either way, and never hangs.
+              yield* Fiber.join(transaction).pipe(Effect.exit);
+              for (const release of replyHold.held.splice(0)) release();
+              if (happening === "the abandoned reply arrives") {
+                // An ending left as the only pending request keeps the worker referenced.
+                const ending = workerMessages
+                  .get(worker)!
+                  .findLast((message) => /^\s*COMMIT/i.test(String(message.sql ?? "")));
+                if (ending !== undefined && awaitedAtReply.get(ending.id as number))
+                  assert.isTrue(
+                    refdAtReply.get(ending.id as number),
+                    `after ${yields} yields: the worker was let go of before its ending was answered`,
+                  );
+              } else {
+                yield* Effect.promise(() => worker.terminate());
+              }
             }
           }
         }

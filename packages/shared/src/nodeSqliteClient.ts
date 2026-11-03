@@ -446,7 +446,9 @@ try {
       (database != null &&
         database !== "main" &&
         actionCode !== c.SQLITE_READ &&
-        actionCode !== c.SQLITE_SELECT)
+        actionCode !== c.SQLITE_SELECT &&
+        // Pragmas off the main schema (metadata reads, mostly) cannot make an ending fail.
+        actionCode !== c.SQLITE_PRAGMA)
         ? c.SQLITE_DENY
         : c.SQLITE_OK,
     );
@@ -745,8 +747,22 @@ const makeReader = Effect.fnUntraced(function* (
             return Effect.succeed([]);
           }
           return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
+            // The fiber can yield before this runs: the worker may have stopped (nothing is
+            // left to end) or the outstanding replies may all have arrived (nothing to wait for).
+            if (stoppedMessage !== undefined || pending.size === 0) {
+              if (stoppedMessage === undefined && post({ id, safeIntegers: false, ...input }))
+                latestId = id;
+              resume(Effect.succeed([]));
+              return;
+            }
             pending.set(id, () => resume(Effect.succeed([])));
+            if (pending.size === 1) worker.ref();
             if (post({ id, safeIntegers: false, ...input })) latestId = id;
+            else {
+              pending.delete(id);
+              if (pending.size === 0) worker.unref();
+              resume(Effect.succeed([]));
+            }
           });
         }
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));

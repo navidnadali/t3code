@@ -1051,6 +1051,123 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }),
   );
 
+  // A file restore of a checkpoint whose run recorded no workspace (recorded before runs kept one)
+  // reads every cwd its scope was created with: compaction must keep every scope creation, or a
+  // thread that ran in two worktrees would look like it ran in one and restore the other's files.
+  it.effect(
+    "keeps every checkpoint scope creation, which places a checkpoint recorded before workspaces",
+    () =>
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+        const sql = yield* SqlClient.SqlClient;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread:foundation-compact-scopes");
+        const thread = makeThread(threadId, now);
+        const scopeId = CheckpointScopeId.make("checkpoint-scope:foundation-compact-scopes:root");
+        const nodeId = NodeId.make("node:foundation-compact-scopes");
+        const checkpointId = CheckpointId.make("checkpoint:foundation-compact-scopes:0");
+        const scopeCreated = (suffix: string, cwd: string): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`event:foundation-compact-scopes:scope:${suffix}`),
+          type: "checkpoint-scope.created",
+          threadId,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: scopeId,
+            threadId,
+            runId: null,
+            nodeId,
+            parentScopeId: null,
+            providerThreadId: null,
+            kind: "root_run",
+            ordinalWithinParent: 0,
+            advancesAppRunCount: true,
+            cwd,
+            createdAt: now,
+          },
+        });
+        const nodeUpdated = (
+          suffix: string,
+          status: "running" | "completed",
+        ): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`event:foundation-compact-scopes:node:${suffix}`),
+          type: "node.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: nodeId,
+            threadId,
+            runId: null,
+            parentNodeId: null,
+            rootNodeId: nodeId,
+            kind: "assistant_message",
+            status,
+            countsForRun: false,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: now,
+            completedAt: status === "completed" ? now : null,
+          },
+        });
+        // Before the upgrade the one root scope was re-created in each run's workspace: A, B, then A.
+        yield* eventSink.write({
+          events: [
+            threadCreatedEvent({ id: "event:foundation-compact-scopes:thread", thread, now }),
+            scopeCreated("a", "/worktrees/a"),
+            nodeUpdated("1", "running"),
+            scopeCreated("b", "/worktrees/b"),
+            nodeUpdated("2", "running"),
+            scopeCreated("a-again", "/worktrees/a"),
+            nodeUpdated("3", "completed"),
+            {
+              id: EventId.make("event:foundation-compact-scopes:checkpoint"),
+              type: "checkpoint.captured",
+              threadId,
+              nodeId,
+              providerInstanceId,
+              occurredAt: now,
+              payload: {
+                id: checkpointId,
+                threadId,
+                scopeId,
+                runId: null,
+                nodeId,
+                parentCheckpointId: null,
+                ordinalWithinScope: 0,
+                appRunOrdinal: null,
+                ref: CheckpointRef.make("refs/t3/foundation-compact-scopes/0"),
+                status: "ready",
+                files: [],
+                capturedAt: now,
+              },
+            },
+          ],
+        });
+        const summary = yield* maintenance.compactEventStore();
+        // The pass did compact this thread (a node state between its first and last goes); every
+        // scope creation stays.
+        assert.isAtLeast(summary.deletedEventCount, 1);
+        const kept = yield* sql<{ readonly event_id: string }>`
+        SELECT event_id FROM orchestration_events
+        WHERE aggregate_kind = 'thread' AND stream_id = ${threadId}
+          AND event_type = 'checkpoint-scope.created'
+        ORDER BY sequence ASC`;
+        assert.deepEqual(
+          kept.map((row) => row.event_id),
+          ["a", "b", "a-again"].map((suffix) => `event:foundation-compact-scopes:scope:${suffix}`),
+        );
+        assert.sameMembers(
+          [...(yield* projections.getCheckpointWorkspaces(threadId, checkpointId))],
+          ["/worktrees/a", "/worktrees/b"],
+        );
+      }),
+  );
+
   it.effect("verifies and rebuilds projections with cross-thread subagent relations", () =>
     Effect.gen(function* () {
       const eventSink = yield* EventSink.EventSinkV2;

@@ -2201,10 +2201,10 @@ it.effect("the same worktree under another path spelling keeps its scope", () =>
         const [first, last] = yield* Effect.forEach([thread.first, second], (run) =>
           thread.checkpointOf(run.runId),
         );
-        assert.lengthOf(
-          (yield* orchestrator.getThreadProjection(thread.threadId)).checkpointScopes,
-          1,
-        );
+        const scopes = (yield* orchestrator.getThreadProjection(thread.threadId)).checkpointScopes;
+        assert.lengthOf(scopes, 1);
+        // The scope keeps the spelling it was created with.
+        assert.equal(scopes[0]!.cwd, harness.cwd);
         assert.equal(last!.scopeId, first!.scopeId);
         assert.deepEqual(
           last!.files.map((file) => file.path),

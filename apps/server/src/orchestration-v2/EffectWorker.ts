@@ -759,18 +759,19 @@ export const layerWithOptions = (
           const cancellation = outbox
             .awaitCancellation(effect.id)
             .pipe(Effect.as("cancelled" as const));
+          const claimedAt = DateTime.toEpochMillis(yield* DateTime.now);
+          const eligibleAt = Math.max(
+            DateTime.toEpochMillis(DateTime.makeUnsafe(effect.createdAt)),
+            DateTime.toEpochMillis(DateTime.makeUnsafe(effect.availableAt)),
+          );
+          const queueWaitMs = Math.max(0, claimedAt - eligibleAt);
           const cancelledBeforeExecution = yield* Effect.gen(function* () {
-            const claimedAt = DateTime.toEpochMillis(yield* DateTime.now);
-            const eligibleAt = Math.max(
-              DateTime.toEpochMillis(DateTime.makeUnsafe(effect.createdAt)),
-              DateTime.toEpochMillis(DateTime.makeUnsafe(effect.availableAt)),
-            );
             yield* Metric.update(
               Metric.withAttributes(
                 orchestrationEffectQueueWait,
                 metricAttributes({ effect_type: effect.request.type }),
               ),
-              Duration.millis(Math.max(0, claimedAt - eligibleAt)),
+              Duration.millis(queueWaitMs),
             );
             // Recheck durable cancellation after registering the Deferred; cancellation may have committed after claim.
             if (yield* wasCancelled(effect.id)) {
@@ -783,7 +784,17 @@ export const layerWithOptions = (
 
           const execution = executor
             .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
-            .pipe(boundExecution(effect), Effect.as("executed" as const));
+            .pipe(
+              boundExecution(effect),
+              Effect.withSpan("EffectWorker.runEffect", {
+                attributes: {
+                  "effect.type": effect.request.type,
+                  "effect.queue_wait_ms": queueWaitMs,
+                  "effect.attempt": effect.attemptCount,
+                },
+              }),
+              Effect.as("executed" as const),
+            );
           const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
             Effect.ensuring(outbox.clearCancellation(effect.id)),
           );
@@ -881,7 +892,11 @@ export interface OrchestrationEffectDaemonOptions {
   readonly livenessPollIntervalMs?: number;
 }
 
+// Effects in flight at once. A turn start's history reads hold reader permits (three by default)
+// and are decoded on the main thread; more workers than that plus one moved the queue from the
+// outbox to the readers on the bench and slowed every small read, so the count stays at 4.
 const DEFAULT_EFFECT_WORKER_CONCURRENCY = 4;
+export const EFFECT_WORKER_MAX_CONCURRENCY = 256;
 const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
 
 export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions = {}) =>
@@ -892,6 +907,10 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       const concurrency = Number.isFinite(requestedConcurrency)
         ? Math.max(1, Math.floor(requestedConcurrency))
         : DEFAULT_EFFECT_WORKER_CONCURRENCY;
+      yield* Effect.logInfo("Orchestration effect worker pool", {
+        concurrency,
+        configured: options.concurrency !== undefined,
+      });
       const requestedLivenessPollIntervalMs =
         options.livenessPollIntervalMs ?? DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS;
       const livenessPollIntervalMs = Number.isFinite(requestedLivenessPollIntervalMs)

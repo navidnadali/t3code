@@ -1,3 +1,4 @@
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -65,6 +66,8 @@ export class VcsProcess extends Context.Service<
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
+// Eight git processes at once suffice: the bench measured no wait for a slot at up to 26 git
+// commands/s (170 sessions, and the 1 s turn-gap profile); `vcs.permit_wait_ms` shows any wait.
 const VCS_PROCESS_CONCURRENCY = 8;
 
 /** Shown to users when a Git command fails because another process holds the index lock. */
@@ -346,7 +349,20 @@ export const make = Effect.gen(function* () {
   });
 
   const run = Effect.fn("VcsProcess.run")(function* (input: VcsProcessInput) {
-    const bounded = vcsProcesses.withPermits(1)(runUnbounded(input));
+    // Time waiting for a slot, keyed and shared, summed over retries; a retry times only its own wait.
+    let permitWaitMs = 0;
+    let queuedAtMs: number | undefined = yield* Clock.currentTimeMillis;
+    const bounded = Effect.gen(function* () {
+      const attemptQueuedAtMs = queuedAtMs ?? (yield* Clock.currentTimeMillis);
+      queuedAtMs = undefined;
+      return yield* vcsProcesses.withPermits(1)(
+        Effect.gen(function* () {
+          permitWaitMs += (yield* Clock.currentTimeMillis) - attemptQueuedAtMs;
+          yield* Effect.annotateCurrentSpan("vcs.permit_wait_ms", permitWaitMs);
+          return yield* runUnbounded(input);
+        }),
+      );
+    });
     if (
       input.command === "git" &&
       input.operation === CHECKPOINT_CAPTURE_OPERATION &&

@@ -979,6 +979,29 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect("accepts 1 to 256 orchestration effect workers and rejects any other count", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-effect-workers-" })),
+      );
+      const resolveWorkers = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.effectWorkers),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveWorkers({})).toBeUndefined();
+      expect(yield* resolveWorkers({ T3CODE_EFFECT_WORKERS: "1" })).toBe(1);
+      expect(yield* resolveWorkers({ T3CODE_EFFECT_WORKERS: "256" })).toBe(256);
+      for (const count of ["0", "257", "2.5"]) {
+        const error = yield* resolveWorkers({ T3CODE_EFFECT_WORKERS: count }).pipe(Effect.flip);
+        expect(String(error)).toContain('at ["T3CODE_EFFECT_WORKERS"]');
+      }
+    }),
+  );
+
   it.effect("reads SQLite page cache and memory map sizes and refuses ones SQLite cannot use", () =>
     Effect.gen(function* () {
       const { join } = yield* Path.Path;

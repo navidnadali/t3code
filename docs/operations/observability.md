@@ -765,6 +765,19 @@ History reads each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at
 before their read transaction until their rows are decoded, which bounds the history rows held at
 once. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a reader is.
 
+Orchestration effect workers. Turn starts, checkpoint captures, interrupts, steers, restarts, runtime
+request answers and title generation are outbox effects that `T3CODE_EFFECT_WORKERS` (`1` to `256`,
+default `4`) fibers claim and run, one effect per thread at a time, so this is how many threads can be
+starting a turn at once. The default stays at 4 whatever the host: a turn start's history reads hold
+reader permits (three with the default reader pool) and are decoded on the main thread, and on the
+bench more workers than that moved the queue from the outbox to the readers — at 50 sessions a gain,
+from about 120 sessions on every small read (thread shells, dispatch, thread switches) waited behind
+the extra turn starts and the heap grew with the history they held. Raise it only together with more
+read capacity and watch `db.lock_wait_ms`. The trace shows each effect's wait in `EffectWorker.runEffect`
+(`effect.type`, `effect.queue_wait_ms`, `effect.attempt`) and each git command's wait for one of the 8
+process slots in `VcsProcess.run` (`vcs.permit_wait_ms`); the server also exports the timer
+`t3_orchestration_effect_queue_wait` by `effect_type`.
+
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for
 Codex, build their provider-log records. The main thread still reads and splits the output, decodes

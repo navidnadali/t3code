@@ -549,7 +549,11 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       startEffectWorker: runStartupPhase(
         "orchestration-v2.effect-worker.start",
         startEffectWorkerWithRelay({
-          runWorker: EffectWorker.runDaemon,
+          runWorker: EffectWorker.runDaemonWithOptions(
+            serverConfig.effectWorkers === undefined
+              ? {}
+              : { concurrency: serverConfig.effectWorkers },
+          ),
           startRelay: agentAwarenessRelay.start(),
           workerFiberRef: effectWorkerFiber,
         }),

@@ -1586,7 +1586,10 @@ const FIXED_COMMIT_ENV = {
 
 // A warm driver whose git commands are recorded, a fresh driver per call for comparison, and two
 // repositories with identical commits (fixed dates) so checkpoint parents match across them.
-const makeTurnHarness = Effect.fn("test.makeTurnHarness")(function* (prefix: string) {
+const makeTurnHarness = Effect.fn("test.makeTurnHarness")(function* (
+  prefix: string,
+  initArgs: ReadonlyArray<string> = [],
+) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const liveRunner = yield* ProcessRunner.ProcessRunner;
@@ -1633,9 +1636,11 @@ const makeTurnHarness = Effect.fn("test.makeTurnHarness")(function* (prefix: str
     );
   const commitBoth = (message: string) =>
     gitBoth(["commit", "-q", "-m", message], FIXED_COMMIT_ENV);
+  let initialized = true;
   for (const cwd of [repos.warm, repos.cold]) {
     yield* fileSystem.makeDirectory(cwd, { recursive: true });
-    yield* gitIn(cwd, ["init", "-q", "-b", "main"]);
+    const init = yield* gitIn(cwd, ["init", "-q", "-b", "main", ...initArgs]);
+    initialized &&= init.exitCode === 0;
     yield* gitIn(cwd, ["config", "user.name", "Test"]);
     yield* gitIn(cwd, ["config", "user.email", "test@test.com"]);
   }
@@ -1681,6 +1686,7 @@ const makeTurnHarness = Effect.fn("test.makeTurnHarness")(function* (prefix: str
     return { commands, failed: null, ...warmResult.success };
   });
   return {
+    initialized,
     root,
     repos,
     gitIn,
@@ -2152,4 +2158,34 @@ it.effect("packed-refs memory stays accounted under concurrent reloads", () =>
     assert.strictEqual(memory.packedRefsEntries(), yield* packedCount);
     assert.strictEqual(memory.packedRefsEntries(), refs.length + 1);
   }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect(
+  "checkpoint refs in a reftable repository are resolved by git even when an include claims files",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const h = yield* makeTurnHarness("t3-checkpoint-reftable-", ["--ref-format=reftable"]);
+      // Git before 2.45 cannot create a reftable repository.
+      if (!h.initialized) return;
+      // Git takes extensions from the repository's own config file only, not from includes.
+      const include = path.join(h.root, "storage.inc");
+      yield* fileSystem.writeFileString(include, "[extensions]\n\trefStorage = files\n");
+      yield* h.gitBoth(["config", "include.path", include]);
+      yield* h.writeBoth("file.txt", "initial\n");
+      yield* h.gitBoth(["add", "."]);
+      yield* h.commitBoth("initial");
+      yield* h.turn(1);
+      yield* h.turn(2);
+      const third = yield* h.turn(3);
+      assert.deepStrictEqual(
+        { baseline: third.baselineExists, previous: third.previousExists },
+        { baseline: true, previous: true },
+      );
+      assert.isTrue(third.commands.includes("rev-parse"));
+      yield* h.gitBoth(["update-ref", "-d", turnRef(3)]);
+      const recreated = yield* h.turn(4);
+      assert.strictEqual(recreated.baselineExists, false);
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

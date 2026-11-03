@@ -317,10 +317,16 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     return current;
   });
 
-  // Git's files backend: the loose file wins, then packed-refs; absent from both is absent.
+  // Git's files backend: the loose file wins, then packed-refs; absent from both is absent. A
+  // reftable store (which only the repository's own config declares, so the snapshot may still
+  // say files) keeps neither, so Git answers there.
   const resolveRef = Effect.fnUntraced(function* (commonDir: string, ref: string) {
     const known = refs.get(refKey(commonDir, ref));
     if (known === undefined || !isCheckpointRefName(ref)) return undefined;
+    const reftable = yield* Effect.promise(() =>
+      statFingerprint(NodePath.join(commonDir, "reftable")),
+    );
+    if (reftable !== "!ENOENT") return undefined;
     const loose = yield* readLooseRef(NodePath.join(commonDir, ref));
     if (loose.kind === "oid") return loose.oid === known ? known : undefined;
     if (loose.kind === "other") return undefined;

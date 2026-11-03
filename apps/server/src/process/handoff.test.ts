@@ -100,6 +100,32 @@ const childWatch = Effect.gen(function* () {
   };
 });
 
+// The spawner process alone, driven over its channel as the server drives it.
+const rawSpawner = Effect.gen(function* () {
+  const spawner = NodeChildProcess.spawn(process.execPath, ["-e", spawnerProcessSource, "65536"], {
+    stdio: ["ignore", "pipe", "inherit", "ipc"],
+    serialization: "advanced",
+    detached: true,
+  });
+  spawner.stdout!.resume();
+  yield* Effect.addFinalizer(() => Effect.sync(() => spawner.disconnect()));
+  const received: Array<Record<string, unknown>> = [];
+  const waiters: Array<{ t: string; done: () => void }> = [];
+  spawner.on("message", (message: Record<string, unknown>) => {
+    received.push(message);
+    const matching = waiters.filter((waiter) => waiter.t === message.t);
+    waiters.splice(0, waiters.length, ...waiters.filter((waiter) => waiter.t !== message.t));
+    for (const waiter of matching) waiter.done();
+  });
+  const next = (t: string) =>
+    Effect.callback<void>((resume) => {
+      if (received.some((message) => message.t === t)) return resume(Effect.void);
+      waiters.push({ t, done: () => resume(Effect.void) });
+    });
+  yield* next("ready");
+  return { spawner, next };
+});
+
 describe("provider process hand-off", () => {
   it.live.skipIf(!linux)(
     "hands off 64 concurrent processes without losing a line of their output",
@@ -440,37 +466,41 @@ describe("provider process hand-off", () => {
       }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
   );
 
+  // The server forgets a start it cancelled once the spawner's answer says it is over.
+  it.live.skipIf(!linux)("answers a hand-off cancelled before its command ran with its end", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-" });
+      const { spawner, next } = yield* rawSpawner;
+      spawner.send({
+        t: "spawn",
+        id: 1,
+        command: process.execPath,
+        args: ["-e", ""],
+        options: { env: process.env, stdio: ["ignore", "ignore", "ignore"], detached: true },
+        handoff: {
+          path: NodePath.join(directory, "provider"),
+          nonce: new Uint8Array(NodeCrypto.randomBytes(16)),
+          fds: [0, 1, 2],
+        },
+      });
+      yield* next("handoff");
+      spawner.send({ t: "handoff-cancel", id: 1 });
+      const ended = yield* next("close").pipe(
+        Effect.as(true),
+        Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.succeed(false) }),
+      );
+      expect(ended).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live.skipIf(!linux)(
     "refuses a connection without the server's header: it never becomes a provider's stdio",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-" });
-        const spawner = NodeChildProcess.spawn(
-          process.execPath,
-          ["-e", spawnerProcessSource, "65536"],
-          {
-            stdio: ["ignore", "pipe", "inherit", "ipc"],
-            serialization: "advanced",
-            detached: true,
-          },
-        );
-        spawner.stdout!.resume();
-        yield* Effect.addFinalizer(() => Effect.sync(() => spawner.disconnect()));
-        const received: Array<Record<string, unknown>> = [];
-        const waiters: Array<{ t: string; done: () => void }> = [];
-        spawner.on("message", (message: Record<string, unknown>) => {
-          received.push(message);
-          const matching = waiters.filter((waiter) => waiter.t === message.t);
-          waiters.splice(0, waiters.length, ...waiters.filter((waiter) => waiter.t !== message.t));
-          for (const waiter of matching) waiter.done();
-        });
-        const next = (t: string) =>
-          Effect.callback<void>((resume) => {
-            if (received.some((message) => message.t === t)) return resume(Effect.void);
-            waiters.push({ t, done: () => resume(Effect.void) });
-          });
-        yield* next("ready");
+        const { spawner, next } = yield* rawSpawner;
         const path = NodePath.join(directory, "provider");
         const nonce = NodeCrypto.randomBytes(16);
         spawner.send({

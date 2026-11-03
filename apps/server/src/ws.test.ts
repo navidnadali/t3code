@@ -18,6 +18,7 @@ import {
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadShell,
   type OrchestrationProjectShell,
+  type RepositoryIdentity,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerProvider,
@@ -720,6 +721,8 @@ it.effect("shell subscribers share one thread shell read per event", () =>
 const layerShellSubscribers = (input: {
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
   readonly getProjectShell?: ProjectService.ProjectService["Service"]["getShell"];
+  readonly getProjectRow?: ProjectStore.ProjectStoreV2["Service"]["getShell"];
+  readonly getAvailable?: ProjectEnrichment.ProjectEnrichmentService["Service"]["getAvailable"];
   readonly onStart?: () => void;
 }) =>
   ShellDeltaHub.layer.pipe(
@@ -753,6 +756,7 @@ const layerShellSubscribers = (input: {
     Layer.provideMerge(
       Layer.succeed(ProjectStore.ProjectStoreV2, {
         listShells: () => Effect.succeed([]),
+        getShell: input.getProjectRow ?? (() => Effect.succeedNone),
       } as unknown as ProjectStore.ProjectStoreV2["Service"]),
     ),
     Layer.provideMerge(
@@ -768,6 +772,14 @@ const layerShellSubscribers = (input: {
             (changes) =>
               ({
                 subscribeChanges: PubSub.subscribe(changes),
+                getAvailable:
+                  input.getAvailable ??
+                  (() =>
+                    Effect.succeed({
+                      repositoryIdentity: null,
+                      faviconPath: null,
+                      repositoryIdentityResolved: true,
+                    })),
               }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
           ),
         ),
@@ -1840,5 +1852,101 @@ it.effect(
         );
       }
       assert.include(titles, "c3", seen.join(" "));
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// Review R1: a project's repository identity changes without a project event. A shared project
+// read must add it per caller, or a resume replay that joins the hub's read sends an identity
+// older than the one the client's own initial items carried, until the next project event.
+it.effect(
+  "a resumed shell subscriber never receives a repository identity older than its initial items sent",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const projectId = ProjectId.make("project:identity");
+      const now = "2026-10-31T00:00:00.000Z";
+      const identity = {
+        canonicalKey: "github.com/x/y",
+        displayName: "x/y",
+      } as unknown as RepositoryIdentity;
+      let resolved = false;
+      const row = {
+        id: projectId,
+        title: "p",
+        workspaceRoot: "/tmp/project-identity",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as OrchestrationProjectShell;
+      const enrichment = () => ({
+        repositoryIdentity: resolved ? identity : null,
+        faviconPath: null,
+        repositoryIdentityResolved: resolved,
+      });
+      const [inserted] = yield* sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          'project-identity:1', 'project', ${projectId}, 1, 'project.meta-updated',
+          ${now}, 'server', ${JSON.stringify({ projectId, title: "p", updatedAt: now })}, '{}', 2
+        ) RETURNING sequence
+      `;
+      const sequence = inserted!.sequence;
+      const seen: Array<string> = [];
+      yield* Effect.gen(function* () {
+        // A live watcher keeps the hub running; the hub reads the project while its identity is unresolved.
+        yield* subscribeInto(0, []);
+        yield* settleHub;
+        const events = yield* store
+          .readApplicationEvents({ afterSequence: 0, throughSequence: sequence })
+          .pipe(Stream.runCollect);
+        yield* store.publishCommitted(events);
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        // The workspace's repository identity resolves, well inside the shared-read TTL.
+        yield* TestClock.adjust(1_000);
+        resolved = true;
+        // A client resumes from before the event; its replay joins the hub's read of the project.
+        const stream = yield* subscribeOrchestrationV2Shell({
+          afterSequence: 0,
+          requestCompletionMarker: true,
+        });
+        yield* stream.pipe(
+          Stream.runForEach((item) =>
+            Effect.sync(() => {
+              seen.push(
+                item.kind === "project.updated"
+                  ? `project.updated@${item.sequence}:${item.project.repositoryIdentity === null ? "unresolved" : "resolved"}`
+                  : item.kind,
+              );
+            }),
+          ),
+          Effect.forkScoped,
+        );
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          layerShellSubscribers({
+            getThreadShell: () => Effect.die("no thread is read"),
+            getProjectShell: () =>
+              Effect.sync(() =>
+                Option.some({ ...row, repositoryIdentity: enrichment().repositoryIdentity }),
+              ),
+            getProjectRow: () => Effect.succeedSome(row),
+            getAvailable: () => Effect.sync(enrichment),
+          }),
+        ),
+      );
+      assert.deepEqual(
+        seen.filter((item) => item.startsWith("project.updated")),
+        [`project.updated@${sequence}:resolved`],
+        seen.join(" "),
+      );
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );

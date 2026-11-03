@@ -53,6 +53,8 @@ const refdAtReply = vi.hoisted(() => new Map<number, boolean>());
 // Whether a reply was awaited: the client lets go of the worker while handling the last awaited one.
 const awaitedAtReply = vi.hoisted(() => new Map<number, boolean>());
 const unrefDuring = vi.hoisted(() => ({ emit: false }));
+// The worker's reference state at the moment each ending (ROLLBACK) was posted, by request id.
+const refdAtEnding = vi.hoisted(() => new Map<number, boolean>());
 // Makes every reader announce itself without a statement authorizer.
 const readyRewrite = vi.hoisted(() => ({ unguarded: false }));
 // Resolves a waiter when a request whose SQL mentions its needle is posted to a worker.
@@ -88,6 +90,8 @@ vi.mock("node:worker_threads", async (importOriginal) => {
           workerParams.get(this)!.push(...(request.params as ReadonlyArray<unknown>));
         if ("sql" in request && String(request.sql).includes("hold-reply"))
           replyHold.ids.add(request.id as number);
+        if ("sql" in request && /^\s*ROLLBACK/i.test(String(request.sql)))
+          refdAtEnding.set(request.id as number, workerRefd.get(this) ?? true);
         for (const waiter of postWaiters.splice(0)) {
           if ("sql" in request && String(request.sql).includes(waiter.needle)) waiter.resolve();
           else postWaiters.push(waiter);
@@ -2107,7 +2111,12 @@ it.effect(
                 assert.isTrue(Exit.isSuccess(raw));
                 assert.isTrue(Exit.isFailure(plain), "the second COMMIT had nothing to end");
                 if (Exit.isFailure(plain))
-                  assert.include(String(Cause.squash(plain.cause)), "no transaction is active");
+                  assert.include(
+                    String(
+                      (Cause.squash(plain.cause) as { reason: { cause: unknown } }).reason.cause,
+                    ),
+                    "no transaction is active",
+                  );
               }),
             )
             .pipe(SqliteClient.readOnly, Effect.exit);
@@ -2117,6 +2126,104 @@ it.effect(
             yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly),
             1,
           );
+        }),
+      { readerPoolSize: 1 },
+    ),
+);
+
+it.effect("answers an awaited ending behind an outstanding raw COMMIT with SQLite's error", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        // The raw COMMIT's reply is held back, so the managed COMMIT behind it takes the awaited
+        // path for certain; SQLite answers that one with "no transaction is active".
+        const exit = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              assert.equal(yield* countEntries(sql), 1);
+              yield* Effect.forkChild(sql.unsafe("COMMIT /* hold-reply */").raw, {
+                startImmediately: true,
+              });
+            }),
+          )
+          .pipe(SqliteClient.readOnly, Effect.exit);
+        for (const release of replyHold.held.splice(0)) release();
+        assert.isTrue(Exit.isFailure(exit), "the managed COMMIT had nothing to end");
+        if (Exit.isFailure(exit))
+          assert.include(
+            String((Cause.squash(exit.cause) as { reason: { cause: unknown } }).reason.cause),
+            "no transaction is active",
+          );
+        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+      }),
+    { readerPoolSize: 1 },
+  ),
+);
+
+it.effect(
+  "keeps its bookkeeping and the worker through a reply landing before an awaited ending runs",
+  () =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const before = startedWorkers.length;
+          yield* countEntries(sql).pipe(SqliteClient.readOnly);
+          const worker = startedWorkers[before]!;
+          // A scheduler of the test's own releases the held reply at the k-th turn; with a yield
+          // budget of three, one of those turns is the gap before the awaited ending's callback.
+          let releaseAt = -1;
+          let turns = 0;
+          const hooked = new Scheduler.MixedScheduler("async", (task) => {
+            const timer = setImmediate(() => {
+              if (releaseAt >= 0 && turns++ === releaseAt)
+                for (const release of replyHold.held.splice(0)) release();
+              task();
+            });
+            return () => clearImmediate(timer);
+          });
+          for (let k = 0; k < 24; k++) {
+            releaseAt = -1;
+            turns = 0;
+            const seen = workerMessages.get(worker)!.length;
+            const held = new Promise<void>((resolve) => replyHold.waiters.push(resolve));
+            const fiber = yield* sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  yield* countEntries(sql);
+                  yield* sql`SELECT 1 AS x /* hold-reply */`;
+                }),
+              )
+              .pipe(
+                SqliteClient.readOnly,
+                Effect.provideService(Scheduler.MaxOpsBeforeYield, 3),
+                Effect.provideService(Scheduler.Scheduler, hooked),
+                (effect) => Effect.forkChild(effect, { startImmediately: true }),
+              );
+            yield* Effect.promise(() => held);
+            releaseAt = k;
+            yield* Fiber.interrupt(fiber);
+            for (const release of replyHold.held.splice(0)) release();
+            assert.equal(
+              yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly),
+              1,
+            );
+            yield* eventLoopTurn;
+            const messages = workerMessages.get(worker)!.slice(seen);
+            const ending = messages.findIndex((message) =>
+              /^\s*ROLLBACK/i.test(String(message.sql)),
+            );
+            assert.notEqual(ending, -1, `k=${k}: no ending`);
+            // The next transaction still folds its BEGIN: the ending left no restored flag behind.
+            const shapes = messageShapes(worker).slice(seen);
+            assert.equal(shapes[ending + 1], "begin+SELECT", `k=${k}: ${shapes.join(" ")}`);
+            // And while the ending was awaited, the worker stayed referenced.
+            const endingId = messages[ending]!.id as number;
+            if (awaitedAtReply.get(endingId))
+              assert.isTrue(
+                refdAtEnding.get(endingId),
+                `k=${k}: the worker was let go of while its ending was awaited`,
+              );
+          }
         }),
       { readerPoolSize: 1 },
     ),

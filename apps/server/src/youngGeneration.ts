@@ -1,6 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Runs first thing in bin.ts, before the CLI's Effect runtime loads.
 import * as NodeFS from "node:fs";
-import * as NodeInspector from "node:inspector";
+import * as NodeModule from "node:module";
 import * as NodeSea from "node:sea";
 import * as NodeV8 from "node:v8";
 
@@ -19,9 +19,10 @@ const FLAG = "--max-semi-space-size";
 /** The escape hatch accepts caps up to this (MiB); V8 would take far more, which no server needs. */
 const MAX_SEMI_SPACE_MB_LIMIT = 1024;
 const BOOTSTRAP_FD_ENV = "T3CODE_BOOTSTRAP_FD";
+/** Set by the relaunch to the pid it relaunches; execve keeps the pid, so only that image matches it. */
+const RELAUNCHED_PID_ENV = "T3CODE_YOUNG_GENERATION_RELAUNCHED_PID";
 const DISABLED_VALUES = new Set(["0", "off", "false", "no"]);
 export const SERVER_COMMANDS: ReadonlySet<string> = new Set(["serve", "start", "__node-flags"]);
-/** Subcommands and fast paths that never run the server here: no file-system check for them. */
 /** Every top-level command that never starts a server; `youngGeneration.test.ts` checks it against the CLI's exported commands. */
 export const NON_SERVER_COMMANDS: ReadonlySet<string> = new Set([
   "acp-mcp-bridge",
@@ -39,6 +40,7 @@ export const NON_SERVER_COMMANDS: ReadonlySet<string> = new Set([
   "connect",
   "doctor",
   "environment",
+  "help",
   "pair",
   "policy",
   "project",
@@ -178,7 +180,12 @@ export const isServerCommand = (
   argv: ReadonlyArray<string>,
   isDirectory: (path: string) => boolean = isDirectorySync,
 ): boolean => {
-  const command = argv[2];
+  // Global flags may precede the command (`t3 --log-level warn doctor`); classify what follows them.
+  let index = 2;
+  while (argv[index] === "--log-level" || argv[index]?.startsWith("--log-level=") === true) {
+    index += argv[index] === "--log-level" ? 2 : 1;
+  }
+  const command = argv[index];
   if (command === undefined) return true;
   if (SERVER_COMMANDS.has(command)) return true;
   if (NON_SERVER_COMMANDS.has(command)) return false;
@@ -244,7 +251,13 @@ export const planYoungGenerationRelaunch = (input: {
   readonly canExecve: boolean;
   readonly inspectorActive?: boolean;
   readonly isDirectory?: (path: string) => boolean;
+  readonly pid?: number;
+  readonly relaunchedPid?: string;
 }): RelaunchPlan => {
+  // At most one relaunch per process, whatever a preload did to NODE_OPTIONS in the new image.
+  if (input.pid !== undefined && input.relaunchedPid === String(input.pid)) {
+    return { kind: "keep", reason: "relaunched once already" };
+  }
   // The marker counts only with the flag behind it; a stray one must not hide a missing cap.
   if (
     input.env[INHERITED_NODE_OPTIONS_ENV] !== undefined &&
@@ -292,7 +305,10 @@ export const planYoungGenerationRelaunch = (input: {
     args: input.isSea
       ? [input.execPath, ...input.argv.slice(2)]
       : [input.execPath, ...input.execArgv, ...input.argv.slice(1)],
-    env: withFlag(input.env, mb),
+    env: {
+      ...withFlag(input.env, mb),
+      ...(input.pid === undefined ? {} : { [RELAUNCHED_PID_ENV]: String(input.pid) }),
+    },
   };
 };
 
@@ -315,12 +331,29 @@ let lastOutcome: YoungGenerationOutcome | undefined;
 export const applyYoungGenerationDefault = (): YoungGenerationOutcome =>
   (lastOutcome = applyYoungGenerationDefaultUnsafe());
 
+/** Whether an inspector session is open; a Node built without one has no module to ask. */
+const inspectorActive = (): boolean => {
+  if (process.features.inspector !== true) return false;
+  try {
+    const inspector = NodeModule.createRequire(process.execPath)("node:inspector") as {
+      readonly url: () => string | undefined;
+    };
+    return inspector.url() !== undefined;
+  } catch {
+    return false;
+  }
+};
+
 const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   const nodeOptionsAtStart = process.env.NODE_OPTIONS;
   const inherited = process.env[INHERITED_NODE_OPTIONS_ENV];
+  const relaunchedPid = process.env[RELAUNCHED_PID_ENV];
+  delete process.env[RELAUNCHED_PID_ENV];
   if (inherited !== undefined) {
     delete process.env[INHERITED_NODE_OPTIONS_ENV];
-    if (explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, process.execArgv).present) {
+    const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, process.execArgv).mb;
+    // Restore only what the marker's writer appended to: children never get more than the server had.
+    if (mb !== null && nodeOptionsAtStart === nodeOptionsWithMaxSemiSpace(inherited, mb)) {
       if (inherited === "") delete process.env.NODE_OPTIONS;
       else process.env.NODE_OPTIONS = inherited;
       return { applied: true, nodeOptionsAtStart };
@@ -336,7 +369,9 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
     hasIpcChannel: process.channel !== undefined,
     isSea: NodeSea.isSea(),
     canExecve: typeof process.execve === "function",
-    inspectorActive: NodeInspector.url() !== undefined,
+    inspectorActive: inspectorActive(),
+    pid: process.pid,
+    ...(relaunchedPid === undefined ? {} : { relaunchedPid }),
   });
   if (plan.kind === "keep") {
     return plan.launcherPredatesDefault === true

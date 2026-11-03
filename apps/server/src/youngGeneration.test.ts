@@ -465,14 +465,15 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
       });
       expect(forged.applied).toBe(false);
       expect(forged.nodeOptionsForChildren).toBe(flag);
-      // A stale empty marker beside the user's explicit cap must not strip that cap from children.
-      const stale = yield* run({
+      // An empty marker beside an explicit cap is exactly what an up-to-date launcher writes when the
+      // escape hatch sets the cap, so it is honoured: children get the launcher's own NODE_OPTIONS.
+      const launched = yield* run({
         NODE_OPTIONS: "--max-semi-space-size=16",
         [INHERITED_NODE_OPTIONS_ENV]: "",
       });
-      expect(stale.applied).toBe(false);
-      expect(stale.maxSemiSpaceMb).toBe(16);
-      expect(stale.nodeOptionsForChildren).toBe("--max-semi-space-size=16");
+      expect(launched.applied).toBe(true);
+      expect(launched.maxSemiSpaceMb).toBe(16);
+      expect(launched.nodeOptionsForChildren).toBeNull();
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 

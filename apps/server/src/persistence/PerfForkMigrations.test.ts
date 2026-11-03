@@ -1,7 +1,14 @@
+// @effect-diagnostics nodeBuiltinImport:off - a second connection plays another server starting.
+import * as NodeSqlite from "node:sqlite";
+
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
+import * as Path from "effect/Path";
 import * as References from "effect/References";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -120,9 +127,24 @@ const FORK_OBJECTS_ON_TURN_ITEMS = [
 const forkObjectsOnTurnItems = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const rows = yield* sql<{ readonly name: string }>`
-    SELECT name FROM sqlite_master WHERE name IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)} ORDER BY name
+    SELECT name FROM sqlite_master
+    WHERE name IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)} AND tbl_name = ${TURN_ITEMS}
+    ORDER BY name
   `;
   return rows.map((row) => row.name);
+});
+
+// An upstream rebuild that keeps the old table aside: SQLite moves the fork's triggers and index
+// onto it, under the same names.
+const rebuildTurnItemsKeepingTheOld = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const [table] = yield* sql<{ readonly sql: string }>`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ${TURN_ITEMS}
+  `;
+  yield* sql.unsafe(table!.sql.replace(TURN_ITEMS, `${TURN_ITEMS}_next`));
+  yield* sql.unsafe(`INSERT INTO ${TURN_ITEMS}_next SELECT * FROM ${TURN_ITEMS}`);
+  yield* sql.unsafe(`ALTER TABLE ${TURN_ITEMS} RENAME TO ${TURN_ITEMS}_old`);
+  yield* sql.unsafe(`ALTER TABLE ${TURN_ITEMS}_next RENAME TO ${TURN_ITEMS}`);
 });
 
 // An upstream migration that rebuilds the turn-item table (create, copy, drop, rename) and then
@@ -373,5 +395,119 @@ describe("performance fork migrations", () => {
         `${FORK_TABLE}:${FORK_CHAIN.length + 1}_FromNewerFork`,
       );
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("does not run a fork migration again once another start restored its objects", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const filename = path.join(
+        yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-heal-" }),
+        "statev2.sqlite",
+      );
+      const atFile = NodeSqliteClient.layer({ filename });
+      const restore = yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations();
+        const created = yield* sql<{ readonly sql: string }>`
+          SELECT sql FROM sqlite_master WHERE name IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)}
+        `;
+        for (const name of FORK_OBJECTS_ON_TURN_ITEMS) {
+          yield* sql.unsafe(`DROP ${name.endsWith("_idx") ? "INDEX" : "TRIGGER"} ${name}`);
+        }
+        yield* insertMoreTurnItems("while-missing");
+        return created.map((row) => row.sql);
+      }).pipe(Effect.provide(atFile));
+
+      // Another server restores the objects between this start's check and its repair, and
+      // leaves a stray count row that running migration 1 again would recount away.
+      let restoredElsewhere = false;
+      const anotherStart = Logger.layer([
+        Logger.make(({ logLevel }) => {
+          if (logLevel !== "Warn" || restoredElsewhere) return;
+          restoredElsewhere = true;
+          const db = new NodeSqlite.DatabaseSync(filename);
+          try {
+            db.exec("BEGIN IMMEDIATE");
+            for (const statement of restore) db.exec(statement);
+            db.exec(`
+              DELETE FROM orchestration_v2_projection_turn_item_counts;
+              INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
+              SELECT thread_id, COALESCE(run_id, ''), COUNT(*)
+              FROM orchestration_v2_projection_turn_items GROUP BY thread_id, COALESCE(run_id, '');
+              INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
+              VALUES ('thread-stray', '', 7);
+            `);
+            db.exec("COMMIT");
+          } finally {
+            db.close();
+          }
+        }),
+      ]);
+
+      yield* Effect.gen(function* () {
+        const restoredCounts = yield* Effect.gen(function* () {
+          yield* runMigrations().pipe(Effect.provide(anotherStart));
+          return yield* counts;
+        });
+        assert.isTrue(restoredElsewhere);
+        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
+        assert.deepInclude(restoredCounts, {
+          thread_id: "thread-stray",
+          run_id: "",
+          item_count: 7,
+        });
+      }).pipe(Effect.provide(atFile));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("names the fork migration and its missing objects when running it again fails", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* sql`DROP TRIGGER orchestration_v2_turn_item_counts_insert`;
+      yield* insertMoreTurnItems("while-missing");
+      yield* sql`
+        CREATE TRIGGER fail_recount BEFORE INSERT ON orchestration_v2_projection_turn_item_counts
+        BEGIN SELECT RAISE(ABORT, 'recount failed'); END
+      `;
+
+      const exit = yield* Effect.exit(runMigrations());
+      assert.isTrue(Exit.isFailure(exit));
+      assert.include(String(exit), "MigrationError");
+      assert.include(String(exit), "t3_perf_fork_migrations:1_ProjectionTurnItemCounts");
+      assert.include(String(exit), "orchestration_v2_turn_item_counts_insert");
+      // Rolled back: the trigger is still missing, and a later start tries again.
+      assert.notInclude(yield* forkObjectsOnTurnItems, "orchestration_v2_turn_item_counts_insert");
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect(
+    "moves the fork's objects back from a turn-item table an upstream rebuild kept aside",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations();
+        yield* insertTurnItems;
+        const next = UPSTREAM_HEAD + 1;
+        yield* Migrator.make({})({
+          loader: Migrator.fromRecord({
+            [`${next}_RebuildTurnItemsKeepingTheOld`]: rebuildTurnItemsKeepingTheOld,
+          }),
+        });
+        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, []);
+        yield* insertMoreTurnItems("while-aside");
+
+        yield* runMigrations();
+        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
+        assert.deepStrictEqual(
+          yield* sql`SELECT name FROM sqlite_master WHERE tbl_name = ${`${TURN_ITEMS}_old`}
+          AND name IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)}`,
+          [],
+        );
+        yield* insertMoreTurnItems("after");
+        assert.deepStrictEqual(yield* counts, yield* countedFromItems);
+        yield* usesTheOrdinalIndex;
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 });

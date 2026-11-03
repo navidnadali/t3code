@@ -267,6 +267,23 @@ export interface GitConfigSnapshot {
   readonly commonDir: string | null;
   // Results of commands that read only config and refs, see runWithRefs.
   readonly refResults: Map<string, CachedGitRefResult>;
+  // Results that depend only on config and on named files, see runWithFiles.
+  readonly fileResults: Map<string, CachedFileResult>;
+  // What `git rev-parse --show-toplevel` prints, and the directory's path below it.
+  readonly toplevel: string;
+  readonly prefixSegments: ReadonlyArray<string>;
+  // Absolute: the common directory, the index, the object store, HEAD and info/exclude.
+  readonly gitCommonDir: string;
+  readonly absoluteIndexPath: string;
+  readonly objectsDir: string;
+  readonly headPath: string;
+  readonly infoExcludePath: string;
+}
+
+interface CachedFileResult {
+  readonly dependencies: ReadonlyArray<GitConfigDependency>;
+  readonly fingerprint: string;
+  readonly value: unknown;
 }
 
 interface CachedGitRefResult {
@@ -295,7 +312,8 @@ const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
 const CONFIG_SNAPSHOT_LOAD_ATTEMPTS = 3;
 const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
 const REF_RESULTS_CAPACITY = 256;
-const REPOSITORY_PATH_COUNT = 10;
+const REPOSITORY_PATH_COUNT = 12;
+const FILE_RESULTS_CAPACITY = 64;
 const REUSED_RESULTS_CAPACITY = 64;
 // Ref names whose loose file Git's files backend keeps at <common dir>/<name>: refs shared by every
 // worktree, under refs/ or (like `<remote>/<branch>` when Git resolves a short name) outside it.
@@ -354,6 +372,10 @@ const REPOSITORY_PATH_ARGS = [
   "objects",
   "--git-path",
   "refs",
+  "--git-path",
+  "index",
+  "--git-path",
+  "info/exclude",
   "--show-prefix",
 ] as const;
 
@@ -438,8 +460,33 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     ) {
       return null;
     }
-    const [toplevel, , config, configWorktree, commondir, remotes, branches, head, objects, refs] =
-      paths as [string, string, string, string, string, string, string, string, string, string];
+    const [
+      toplevel,
+      ,
+      config,
+      configWorktree,
+      commondir,
+      remotes,
+      branches,
+      head,
+      objects,
+      refs,
+      absoluteIndexPath,
+      infoExclude,
+    ] = paths as [
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+    ];
     const segments = prefix.split("/").filter((segment) => segment.length > 0);
     const [locations, listResult, remoteFiles, branchFiles, insideTopLevel] = yield* Effect.all(
       [
@@ -525,6 +572,13 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       indexPath,
       // Refs live in the common directory, the one `--git-path refs` names.
       commonDir: refStorage === undefined || refStorage === "files" ? path.dirname(refs) : null,
+      toplevel,
+      prefixSegments: segments,
+      gitCommonDir: path.dirname(refs),
+      absoluteIndexPath,
+      objectsDir: objects,
+      headPath: head,
+      infoExcludePath: infoExclude,
     };
   });
 
@@ -571,6 +625,14 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
                     indexPath: state.indexPath,
                     commonDir: state.commonDir,
                     refResults: new Map(),
+                    fileResults: new Map(),
+                    toplevel: state.toplevel,
+                    prefixSegments: state.prefixSegments,
+                    gitCommonDir: state.gitCommonDir,
+                    absoluteIndexPath: state.absoluteIndexPath,
+                    objectsDir: state.objectsDir,
+                    headPath: state.headPath,
+                    infoExcludePath: state.infoExcludePath,
                   },
           } satisfies CachedGitConfigSnapshot;
         }
@@ -646,11 +708,11 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
    * result) or from its result; null means the result cannot be reused. Untraced like read: it runs
    * for every ref probe, and the Git command it may run keeps its own span.
    */
-  const runWithRefs = Effect.fnUntraced(function* (
+  const runWithRefs = Effect.fnUntraced(function* <E>(
     snapshot: GitConfigSnapshot | null,
     args: ReadonlyArray<string>,
     refs: (result?: GitVcsDriver.ExecuteGitResult) => ReadonlyArray<string> | null,
-    run: Effect.Effect<GitVcsDriver.ExecuteGitResult, GitCommandError>,
+    run: Effect.Effect<GitVcsDriver.ExecuteGitResult, E>,
   ) {
     const commonDir = snapshot?.commonDir ?? null;
     if (snapshot === null || commonDir === null) return yield* run;
@@ -695,7 +757,40 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     return result;
   });
 
-  return { read, peek, runWithRefs };
+  /**
+   * Runs an effect whose result depends only on the snapshot and on the content of `files`, once
+   * per state of those files. Every file is stat'ed before the run, so a write during the run
+   * leaves the result stale for one read rather than wrong. Failures are not kept.
+   */
+  const runWithFiles = Effect.fnUntraced(function* <A, E, R>(
+    snapshot: GitConfigSnapshot,
+    key: string,
+    files: ReadonlyArray<string>,
+    run: Effect.Effect<A, E, R>,
+  ) {
+    const dependencies = files.map((file): GitConfigDependency => ({
+      path: file,
+      kind: "content",
+    }));
+    const fingerprint = (yield* fingerprintDependencies(dependencies)).join("\n");
+    const cached = snapshot.fileResults.get(key);
+    if (
+      cached !== undefined &&
+      cached.fingerprint === fingerprint &&
+      cached.dependencies.length === dependencies.length &&
+      cached.dependencies.every((dependency, index) => dependency.path === files[index])
+    ) {
+      return cached.value as A;
+    }
+    const value = yield* run;
+    if (!snapshot.fileResults.has(key) && snapshot.fileResults.size >= FILE_RESULTS_CAPACITY) {
+      snapshot.fileResults.delete(snapshot.fileResults.keys().next().value!);
+    }
+    snapshot.fileResults.set(key, { dependencies, fingerprint, value });
+    return value;
+  });
+
+  return { read, peek, runWithRefs, runWithFiles };
 });
 
 /**

@@ -430,8 +430,13 @@ it.effect(
         assert.equal(resetWarnings, 1);
         yield* Scope.close(scope, Exit.void);
       }).pipe(
-        Effect.provide(layerHub({ reads })),
-        Effect.provide(Logger.layer([logger], { mergeWithExisting: true })),
+        // The logger reaches the hub's fibers and this subscriber's alike.
+        Effect.provide(
+          Layer.provideMerge(
+            layerHub({ reads }),
+            Logger.layer([logger], { mergeWithExisting: true }),
+          ),
+        ),
       );
     }).pipe(Effect.scoped),
 );

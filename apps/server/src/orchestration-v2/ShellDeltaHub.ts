@@ -260,6 +260,10 @@ const make = Effect.gen(function* () {
   // is committed after reaches the emptied buffer. So one read serves every subscriber a batch
   // resets, however the resets and their pulls interleave, instead of a snapshot per subscriber.
   let publishedSequence = 0;
+  // The last batch published: a subscription taken after it cannot receive it. (Updated after
+  // the publish, unlike `publishedSequence`, so a subscription taken while a batch is being
+  // published counts as lagging until it has processed that batch.)
+  let lastPublished = 0;
   let latestBase:
     | {
         readonly coversThrough: number;
@@ -322,6 +326,17 @@ const make = Effect.gen(function* () {
               if (Exit.isFailure(exit) && latestBase === read) latestBase = undefined;
               return Deferred.done(read.result, exit);
             }),
+          ),
+          // A base pinned by a reset subscriber that never pulls goes after the shared-read TTL,
+          // like any shared read; that subscriber's late pull reads again.
+          Effect.andThen(
+            Effect.sleep(ThreadManagementService.SHARED_SHELL_READ_TTL_MS).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  if (latestBase === read) latestBase = undefined;
+                }),
+              ),
+            ),
           ),
           // In the hub's scope: a subscriber interrupted mid-read must not fail the others' wait.
           Effect.forkIn(layerScope),
@@ -401,6 +416,7 @@ const make = Effect.gen(function* () {
       }
       for (const delta of deltas) publishedSequence = Math.max(publishedSequence, delta.sequence);
       if (deltas.length > 0) yield* PubSub.publish(input.output, deltas);
+      lastPublished = publishedSequence;
     });
     const projectBatches = Effect.gen(function* () {
       while (true) {
@@ -479,7 +495,7 @@ const make = Effect.gen(function* () {
     // entry and its removal are one step, so a setup cancelled after it leaves nothing behind.
     const state = yield* Effect.acquireRelease(
       Effect.sync(() => {
-        const state: SubscriberState = { seen: publishedSequence, resetThrough: undefined };
+        const state: SubscriberState = { seen: lastPublished, resetThrough: undefined };
         subscribers.add(state);
         return state;
       }),

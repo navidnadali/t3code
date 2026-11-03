@@ -2475,3 +2475,37 @@ it("rejects or reads commit objects exactly as git log does", () => {
     );
   }
 });
+
+it.effect.skipIf(!symlinksSupported)(
+  "retargeting a symbolic link at info/exclude is seen by the next capture",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const h = yield* makeTurnHarness("t3-checkpoint-exclude-link-");
+      yield* h.writeBoth("file.txt", "initial\n");
+      yield* h.gitBoth(["add", "."]);
+      yield* h.commitBoth("initial");
+      const rules = path.join(h.root, "exclude-rules");
+      const empty = path.join(h.root, "exclude-empty");
+      yield* fileSystem.writeFileString(rules, "*\n");
+      yield* fileSystem.writeFileString(empty, "");
+      for (const cwd of [h.repos.warm, h.repos.cold]) {
+        const exclude = path.join(cwd, ".git", "info", "exclude");
+        yield* fileSystem.remove(exclude);
+        yield* fileSystem.symlink(rules, exclude);
+      }
+      yield* h.turn(1);
+      yield* h.turn(2);
+      // Git prints --git-path info/exclude with the link resolved; the link itself must count.
+      for (const cwd of [h.repos.warm, h.repos.cold]) {
+        const exclude = path.join(cwd, ".git", "info", "exclude");
+        yield* fileSystem.remove(exclude);
+        yield* fileSystem.symlink(empty, exclude);
+      }
+      yield* h.writeBoth("new.txt", "new\n");
+      const retargeted = yield* h.turn(3);
+      assert.deepStrictEqual(retargeted.commands, withProbe(STEADY_TURN_COMMANDS));
+      assert.strictEqual(retargeted.numstat, "1\t0\tnew.txt\0");
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);

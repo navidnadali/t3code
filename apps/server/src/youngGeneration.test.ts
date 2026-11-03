@@ -219,6 +219,8 @@ describe("isServerCommand", () => {
       "theme",
       "trace",
       "triage",
+      "__service-preflight",
+      "__ssh-helper",
     ]) {
       expect(isServerCommand(argv(command), everythingIsADirectory), command).toBe(false);
     }

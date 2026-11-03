@@ -7,8 +7,23 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { vi } from "vitest";
+
+// Records every synchronous spawn the module under test makes; the calls go through to the real one.
+const spawned = vi.hoisted(() => ({ files: [] as Array<string> }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawnSync: ((file: string, ...rest: ReadonlyArray<unknown>) => {
+      spawned.files.push(file);
+      return (actual.spawnSync as (...args: ReadonlyArray<unknown>) => unknown)(file, ...rest);
+    }) as typeof actual.spawnSync,
+  };
+});
 
 import {
+  applyYoungGenerationDefault,
   DEFAULT_MAX_SEMI_SPACE_MB,
   INHERITED_NODE_OPTIONS_ENV,
   MAX_SEMI_SPACE_ENV,
@@ -302,6 +317,25 @@ describe("nodeOptionsFromEnviron", () => {
     );
     expect(nodeOptionsFromEnviron(block)).toBe("--title=\u00e9t\u00e9 --no-warnings");
     expect(nodeOptionsFromEnviron(Buffer.from("HOME=/home/t3\0", "utf8"))).toBeUndefined();
+  });
+});
+
+describe("applyYoungGenerationDefault", () => {
+  it("does not read the startup environment for a command that never relaunches", () => {
+    // Helpers the server runs per tool call (`acp-mcp-call`, `__managed-chatgpt-token`) keep Node's
+    // default whatever the environment says; spawning `ps` for them on macOS is pure overhead.
+    const argv = process.argv;
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    process.argv = [process.execPath, binPath, "acp-mcp-call"];
+    spawned.files.length = 0;
+    try {
+      expect(applyYoungGenerationDefault().applied).toBe(false);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+      process.argv = argv;
+    }
+    expect(spawned.files.filter((file) => file.endsWith("/ps"))).toEqual([]);
   });
 });
 

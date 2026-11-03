@@ -1023,20 +1023,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
-  // The thread's scopes decide which root scope the run's workspace uses; a thread created in the
-  // same command has none yet. A reused scope keeps its first spelling; the run records its own cwd.
+  // The thread's scopes decide which root scope the run's workspace uses: callers pass those of the
+  // command's projection (stored, this command's pending events applied; none for a thread created
+  // in it), so the choice reads nothing in the serialized section. The run records its own cwd.
   const runWorkspaces = new WeakMap<OrchestrationV2CheckpointScope, string>();
   const prepareRootRunScope = (
-    input: Omit<Parameters<typeof checkpointService.prepareRootRunScope>[0], "threadScopes">,
+    input: Parameters<typeof checkpointService.prepareRootRunScope>[0],
   ) =>
-    projectionStore.getThreadRecords(input.threadId, ["checkpointScopes"]).pipe(
-      Effect.map(({ checkpointScopes }) => checkpointScopes),
-      Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed([]) }),
-      Effect.flatMap((threadScopes) =>
-        checkpointService.prepareRootRunScope({ ...input, threadScopes }),
-      ),
-      Effect.tap((scope) => Effect.sync(() => runWorkspaces.set(scope, input.cwd))),
-    );
+    checkpointService
+      .prepareRootRunScope(input)
+      .pipe(Effect.tap((scope) => Effect.sync(() => runWorkspaces.set(scope, input.cwd))));
   // The cwd a run was scoped with: what it works in, whatever spelling its scope keeps.
   const runWorkspaceOf = (scope: OrchestrationV2CheckpointScope) =>
     runWorkspaces.get(scope) ?? scope.cwd;
@@ -2001,6 +1997,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : yield* Effect.gen(function* () {
               if (resolvedForStart._tag === "Failure") return yield* resolvedForStart.failure;
               const prepared = yield* prepareRootRunScope({
+                threadScopes: projection.checkpointScopes,
                 threadId,
                 runId: queuedRun.id,
                 rootNodeId: rootNode.id,
@@ -4706,6 +4703,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       | "nodes"
       | "thread"
       | "turnItems"
+      | "checkpointScopes"
     >;
     readonly modelSelection: ModelSelection;
     readonly targetRunId: OrchestrationV2Run["id"];
@@ -5211,6 +5209,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
     const checkpointScope = yield* prepareRootRunScope({
+      threadScopes: input.projection.checkpointScopes,
       threadId: input.command.threadId,
       runId: targetRun.id,
       rootNodeId: nextRootNodeId,
@@ -6002,6 +6001,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : yield* runtimePolicy.resolve({ thread: projection.thread, modelSelection }).pipe(
               Effect.flatMap((resolvedRuntimePolicy) =>
                 prepareRootRunScope({
+                  threadScopes: projection.checkpointScopes,
                   threadId: command.threadId,
                   runId,
                   rootNodeId,
@@ -6380,6 +6380,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 mapDispatchError(command),
                 Effect.flatMap((resolvedRuntimePolicy) =>
                   prepareRootRunScope({
+                    threadScopes: projection.checkpointScopes,
                     threadId: command.threadId,
                     runId,
                     rootNodeId,
@@ -7120,6 +7121,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ),
             );
     const checkpointScope = yield* prepareRootRunScope({
+      threadScopes: projection.checkpointScopes,
       threadId: command.threadId,
       runId,
       rootNodeId,
@@ -9426,6 +9428,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         "turnItems",
         "runtimeRequests",
         "subagents",
+        "checkpointScopes",
       ],
       // User messages measure a restart's model switch.
       { turnItemTypes: ["user_message"], messageRoles: ["user"] },
@@ -9972,7 +9975,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       const projection = yield* loadProjectionForCommand(
         command,
-        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        ["runs", "attempts", "nodes", "providerThreads", "turnItems", "checkpointScopes"],
         { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
       );
       const state = preparedRunState(command, projection);
@@ -10011,7 +10014,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       const projection = yield* loadProjectionForCommand(
         command,
-        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        ["runs", "attempts", "nodes", "providerThreads", "turnItems", "checkpointScopes"],
         { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
       );
       const state = preparedRunState(command, projection);
@@ -10027,6 +10030,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .resolve({ thread: projection.thread, modelSelection: state.run.modelSelection })
         .pipe(mapDispatchError(command));
       const checkpointScope = yield* prepareRootRunScope({
+        threadScopes: projection.checkpointScopes,
         threadId: command.threadId,
         runId: state.run.id,
         rootNodeId: state.rootNode.id,

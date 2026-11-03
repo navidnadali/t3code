@@ -395,6 +395,21 @@ describe("decideYoungGeneration", () => {
     expect(decision.plan.env[pidEnv]).toBe("4242");
   });
 
+  it("reports the cap V8 started with, from the record, when a preload rewrote NODE_OPTIONS", () => {
+    // Linux knows the startup value: a preload that changed the cap afterwards changed nothing for V8.
+    const decision = decideYoungGeneration(
+      view({
+        platform: "linux",
+        isSea: false,
+        startup: { known: true, value: "--max-semi-space-size=16" },
+        env: { NODE_OPTIONS: "--max-semi-space-size=32" },
+      }),
+    );
+    expect(decision.kind).toBe("keep");
+    expect(decision.outcome.keptReason).toBe("NODE_OPTIONS changed since startup");
+    expect(decision.outcome.maxSemiSpaceMb).toBe(16);
+  });
+
   it("keeps only when a known record differs from the value in effect", () => {
     const changed = decideYoungGeneration(
       view({
@@ -483,7 +498,9 @@ describe("the single executable with the default baked in", () => {
 
   it("never relaunches: Node reads NODE_OPTIONS itself, and the children get it unchanged", () => {
     // The role's heap ceiling, the common production case: applied by Node, no second image.
-    const decision = decideYoungGeneration(sea({ env: { NODE_OPTIONS: "--max-old-space-size=12288" } }));
+    const decision = decideYoungGeneration(
+      sea({ env: { NODE_OPTIONS: "--max-old-space-size=12288" } }),
+    );
     expect(decision.kind).toBe("keep");
     expect(decision.outcome.applied).toBe(true);
     expect(decision.outcome.capSettingIneffective).toBeUndefined();
@@ -532,6 +549,28 @@ describe("the single executable with the default baked in", () => {
     expect(unbaked.plan.args).toEqual([exe, "serve"]);
     expect(unbaked.plan.env.NODE_OPTIONS).toBe(`--max-old-space-size=12288 ${flag}`);
     expect(unbaked.plan.env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=12288");
+  });
+
+  it("honours a launcher's marker whatever cap the launcher wrote, so no custom cap leaks to the children", () => {
+    // A launcher with the knob at 96 appends 96 to NODE_OPTIONS; the executable's baked 64 wins for
+    // V8, and the marker still names what the launcher added, so the children get the launcher's own
+    // NODE_OPTIONS and the log says the 96 could not apply.
+    const decision = decideYoungGeneration(
+      sea({
+        hasIpcChannel: true,
+        env: {
+          NODE_OPTIONS: "--max-old-space-size=12288 --max-semi-space-size=96",
+          [INHERITED_NODE_OPTIONS_ENV]: "--max-old-space-size=12288",
+          [SERVICE_LAUNCHER_CONTEXT_ENV]: "{}",
+        },
+      }),
+    );
+    expect(decision.kind).toBe("applied");
+    if (decision.kind === "applied") {
+      expect(decision.nodeOptionsForChildren).toBe("--max-old-space-size=12288");
+    }
+    expect(decision.outcome.maxSemiSpaceMb).toBe(64);
+    expect(decision.outcome.capSettingIneffective).toBe(true);
   });
 
   it("over IPC, honours a launcher's marker and gives the children the launcher's own NODE_OPTIONS", () => {
@@ -588,7 +627,12 @@ describe("runtimeFlagsOf", () => {
     // A built-in cap the environment tried to change: said for the log, at Warn.
     expect(
       runtimeFlagsOf(
-        { applied: true, nodeOptionsAtStart: undefined, maxSemiSpaceMb: 64, capSettingIneffective: true },
+        {
+          applied: true,
+          nodeOptionsAtStart: undefined,
+          maxSemiSpaceMb: 64,
+          capSettingIneffective: true,
+        },
         { T3CODE_V8_MAX_SEMI_SPACE_MB: "0" },
       ).capSettingIneffective,
     ).toBe(true);

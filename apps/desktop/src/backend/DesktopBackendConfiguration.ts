@@ -135,9 +135,16 @@ export const wslNodeFallbackCapFlags = (): ReadonlyArray<string> => {
   return flag === undefined ? [] : [flag];
 };
 
-/** Whether the user's WSLENV (`NAME[/flags]`, colon-separated) forwards a variable into WSL. */
+/**
+ * Whether the user's WSLENV (`NAME[/flags]`, colon-separated) forwards a variable into WSL: a `/w`
+ * entry travels only from WSL into Windows, unless `/u` (into WSL) is set as well; `/p`, `/l` and a
+ * bare name travel both ways.
+ */
 const wslForwards = (name: string): boolean =>
-  (process.env.WSLENV ?? "").split(":").some((entry) => entry.split("/")[0] === name);
+  (process.env.WSLENV ?? "").split(":").some((entry) => {
+    const [entryName, flags = ""] = entry.split("/");
+    return entryName === name && (!flags.includes("w") || flags.includes("u"));
+  });
 
 /**
  * What WSL sees of the desktop's young-generation settings: its NODE_OPTIONS and the escape hatch,

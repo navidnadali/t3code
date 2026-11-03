@@ -129,6 +129,15 @@ parentPort.on("message", onMessage);
 // when the server holds them all; it is then told, on descriptor 3, what to become.
 const handoffSource = `
 const handoffs = new Map();
+// Starts beyond the server's bound wait here, before their shim exists: a burst costs that many
+// shims at once, whatever its size. A slot frees when its shim becomes the command or its start ends.
+const waitingHandoffs = [];
+let startingHandoffs = 0;
+const nextHandoff = () => {
+  while (waitingHandoffs.length > 0 && startingHandoffs < waitingHandoffs[0].handoff.limit) {
+    launchHandoff(waitingHandoffs.shift());
+  }
+};
 const processStartTime = (pid) => {
   try {
     const stat = require("node:fs").readFileSync("/proc/" + pid + "/stat", "utf8");
@@ -172,12 +181,26 @@ const commandError = (error, command, args) => {
   return failure;
 };
 const cancelHandoff = (id) => {
+  const waiting = waitingHandoffs.findIndex((message) => message.id === id);
+  if (waiting !== -1) {
+    waitingHandoffs.splice(waiting, 1);
+    post({ t: "close", id });
+    return;
+  }
   const handoff = handoffs.get(id);
   if (handoff === undefined) return;
   handoffs.delete(id);
   handoff.cancel();
 };
 const startHandoff = (message) => {
+  if (startingHandoffs >= message.handoff.limit) {
+    waitingHandoffs.push(message);
+    post({ t: "handoff-queued", id: message.id });
+    return;
+  }
+  launchHandoff(message);
+};
+const launchHandoff = (message) => {
   const id = message.id;
   const { fds, shim } = message.handoff;
   const options = message.options;
@@ -192,6 +215,14 @@ const startHandoff = (message) => {
   const stdio = [...options.stdio];
   for (const fd of fds) stdio[fd] = "pipe";
   stdio[3] = "pipe";
+  startingHandoffs += 1;
+  let holdsSlot = true;
+  const freeSlot = () => {
+    if (!holdsSlot) return;
+    holdsSlot = false;
+    startingHandoffs -= 1;
+    nextHandoff();
+  };
   let child;
   try {
     // Nothing of the command's environment (NODE_OPTIONS included) applies to it; Electron's
@@ -199,16 +230,20 @@ const startHandoff = (message) => {
     child = spawn(shim.command, shim.args, { cwd: options.cwd, detached: options.detached, env: { ELECTRON_RUN_AS_NODE: "1" }, stdio, windowsHide: true });
   } catch (error) {
     post({ t: "throw", id, error: errorFields(commandError(error, message.command, message.args)) });
+    freeSlot();
     return;
   }
   const go = child.stdio[3];
   go.on("error", () => {});
+  // The shim closes it just before it becomes the command: its slot is free from then.
+  go.on("close", () => freeSlot());
   let cancelled = false;
   const cancel = () => {
     cancelled = true;
     // Never released: the shim reads end of input and exits without running the command.
     go.destroy();
     for (const fd of fds) child.stdio[fd].destroy();
+    freeSlot();
   };
   children.set(id, { child, detached: options.detached === true, handoff: true });
   // Read before this process can reap the child, so the PID still names it.
@@ -241,8 +276,12 @@ const startHandoff = (message) => {
   child.on("error", (error) => {
     handoffs.delete(id);
     post({ t: "error", id, error: errorFields(commandError(error, message.command, message.args)) });
+    freeSlot();
   });
-  child.on("exit", (code, signal) => post({ t: "exit", id, code, signal }));
+  child.on("exit", (code, signal) => {
+    freeSlot();
+    post({ t: "exit", id, code, signal });
+  });
   child.on("close", () => {
     children.delete(id);
     post({ t: "close", id });

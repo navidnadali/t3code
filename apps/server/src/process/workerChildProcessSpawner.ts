@@ -31,6 +31,7 @@ import {
 } from "effect/process/ChildProcessSpawner";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeNet from "node:net";
+import * as NodeOS from "node:os";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 
@@ -95,6 +96,7 @@ type WorkerMessage =
       readonly startTime?: string;
     }
   | { readonly t: "handoff-fd"; readonly id: number; readonly fd: number }
+  | { readonly t: "handoff-queued"; readonly id: number }
   | { readonly t: "handoff-failed"; readonly id: number; readonly error: SerializedError }
   | {
       readonly t: "error" | "throw" | "stdin-error";
@@ -154,6 +156,8 @@ const isWorkerMessage = (value: unknown): value is WorkerMessage => {
       );
     case "handoff-fd":
       return Number.isInteger(message.fd);
+    case "handoff-queued":
+      return true;
     case "handoff-failed":
       return isSerializedError(message.error);
     case "data":
@@ -280,10 +284,19 @@ interface HandoffEntry {
   closed: boolean;
   holdsLoop: boolean;
   cancelStartDeadline: (() => void) | undefined;
+  /** It waited for a slot in the spawner, without a start deadline. */
+  queued: boolean;
   readonly killCallbacks: Map<number, (outcome: KillOutcome) => void>;
 }
 
 const ORPHAN_POLL_MILLIS = 1_000;
+
+/**
+ * Hand-offs the spawner starts at once. A shim's start is CPU work (Node booting, 5–20 ms) and
+ * the channel passes one descriptor at a time: a shim per core keeps both busy, and more only
+ * wait, about 8 MiB each. The rest of a burst waits in the spawner, before its shim exists.
+ */
+const defaultHandoffLimit = () => Math.max(2, NodeOS.availableParallelism());
 
 /** Where spawn requests run: a worker thread or the spawner process. */
 interface Transport {
@@ -330,6 +343,8 @@ const makeRemoteHost = (options: {
   /** Arms the deadline for the transport to answer a start; without it, a start may wait for ever. */
   readonly startDeadline?: (expire: () => void) => () => void;
   readonly startDeadlineMessage?: string;
+  /** Hand-offs the spawner starts at once; the rest wait their turn in the spawner. */
+  readonly handoffLimit?: number;
   /** How the spawner starts a handed-off command's shim; none means no hand-off. */
   readonly handoffShim?: () =>
     | { readonly command: string; readonly args: ReadonlyArray<string> }
@@ -629,6 +644,12 @@ const makeRemoteHost = (options: {
       case "handoff-fd":
         takeHandoffEnd(entry, message.fd, handle);
         return;
+      case "handoff-queued":
+        // It answered: the start waits its turn, which is no failure to answer.
+        entry.cancelStartDeadline?.();
+        entry.cancelStartDeadline = undefined;
+        entry.queued = true;
+        return;
       case "handoff-failed":
         handoffUnavailable(entry, reviveError(message.error));
         return;
@@ -636,6 +657,10 @@ const makeRemoteHost = (options: {
         child.pid ??= message.pid;
         child.startTime ??= message.startTime;
         if (entry.abandoned) killHandoffGroup(child);
+        // Its turn came: from now on it must be answered in time again.
+        else if (entry.queued && !entry.settled && entry.cancelStartDeadline === undefined) {
+          armHandoffDeadline(entry);
+        }
         return;
       case "spawn":
         stopsInARow = 0;
@@ -941,6 +966,7 @@ const makeRemoteHost = (options: {
       closed: false,
       holdsLoop: false,
       cancelStartDeadline: undefined,
+      queued: false,
       killCallbacks: new Map(),
     };
     handoffs.set(id, entry);
@@ -952,15 +978,20 @@ const makeRemoteHost = (options: {
       args,
       // Node's spawn would pass the server's environment when none is given.
       options: { ...spawnOptions, env: spawnOptions.env ?? process.env },
-      handoff: { fds: request.fds, shim },
+      handoff: { fds: request.fds, shim, limit: options.handoffLimit ?? defaultHandoffLimit() },
     });
+    armHandoffDeadline(entry);
+    return child;
+  };
+
+  // An unanswered start means the transport is not working: stop it, failing what waits on it.
+  const armHandoffDeadline = (entry: HandoffEntry) => {
     entry.cancelStartDeadline = options.startDeadline?.(() => {
       entry.cancelStartDeadline = undefined;
-      if (handoffs.get(id) === entry && !entry.settled) {
+      if (handoffs.get(entry.child.id) === entry && !entry.settled) {
         stop(new Error(options.startDeadlineMessage ?? "The transport did not answer a start"));
       }
     });
-    return child;
   };
 
   // A hand-off child without its spawner: signal it only while it is still the same process.
@@ -1813,6 +1844,7 @@ export const makeProcessSpawnerWithHost = Effect.fnUntraced(function* (
     },
     // The spawner executable, or the server's own Node with the shim's script: never the whole
     // server bundle per command, so a single executable without the spawner executable hands off nothing.
+    ...(options.handoffLimit === undefined ? {} : { handoffLimit: options.handoffLimit }),
     // Outside single executables the shim runs on the server's own runtime, which needs execve.
     handoffShim: () =>
       launch.command !== executable

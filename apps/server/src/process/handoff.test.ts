@@ -307,12 +307,14 @@ describe("provider process hand-off", () => {
     "gives a provider the same stdio through hand-off as through Node's spawner",
     () => {
       // Each descriptor's type, terminal and open flags (blocking mode included), its other open
-      // descriptors, signal mask and dispositions, limits, then stdin's EOF.
+      // descriptors, limits, stdin's EOF, then its signal mask and dispositions. The shell's own
+      // state is read where it holds still: its descriptors by a glob (no fork, no pipe), its signal
+      // mask by the command it finally execs (the shell blocks signals while it forks).
       const probe = ChildProcess.make(
         "/bin/sh",
         [
           "-c",
-          'for fd in 0 1 2; do echo "$fd $(stat -L -c %F /proc/$$/fd/$fd) $([ -t $fd ] && echo tty || echo notty) $(grep ^flags /proc/$$/fdinfo/$fd)"; done; ls /proc/$$/fd | tr "\\n" " "; echo; grep -E "^Sig(Blk|Ign)" /proc/$$/status; cat /proc/$$/limits; wc -c; echo stderr >&2',
+          'for fd in 0 1 2; do echo "$fd $(stat -L -c %F /proc/$$/fd/$fd) $([ -t $fd ] && echo tty || echo notty) $(grep ^flags /proc/$$/fdinfo/$fd)"; done; cd /proc/$$/fd; echo *; cd /; cat /proc/$$/limits; wc -c; echo stderr >&2; exec grep -E "^Sig(Blk|Ign)" /proc/self/status',
         ],
         { stdin: Stream.make(new TextEncoder().encode("abc")) },
       );

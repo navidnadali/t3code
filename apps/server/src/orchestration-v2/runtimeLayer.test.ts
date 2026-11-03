@@ -273,16 +273,6 @@ const moveProject = (projectId: ProjectId, workspaceRoot: string, updatedAt: str
     }),
   );
 
-// The shell delta hub adds the repository identity to shared project reads from this cache.
-const layerProjectEnrichmentTest = Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({
-  getAvailable: () =>
-    Effect.succeed({
-      repositoryIdentity: null,
-      faviconPath: null,
-      repositoryIdentityResolved: false,
-    }),
-});
-
 const layerTest = Layer.mergeAll(
   RuntimeLayer.layer,
   RuntimeLayer.layerEventSink,
@@ -300,7 +290,6 @@ const layerTest = Layer.mergeAll(
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerProjectServiceTest),
-  Layer.provide(layerProjectEnrichmentTest),
   Layer.provide(layerPlatformTest),
 );
 
@@ -314,7 +303,6 @@ const layerLegacyImportTest = RuntimeLayer.layer.pipe(
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerProjectServiceTest),
-  Layer.provide(layerProjectEnrichmentTest),
   Layer.provide(layerPlatformTest),
 );
 
@@ -8419,7 +8407,6 @@ const layerQueueResumeDisabledInstanceTest = Layer.mergeAll(
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerProjectServiceTest),
-  Layer.provide(layerProjectEnrichmentTest),
   Layer.provide(layerPlatformTest),
 );
 

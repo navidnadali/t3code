@@ -139,6 +139,7 @@ import {
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
   type ShellApplicationEvent,
+  type ShellDelta,
 } from "./orchestration-v2/ShellStream.ts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
 import {
@@ -1073,6 +1074,24 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
       };
     });
+    // The hub and the replay carry the project's store row; the repository identity is added
+    // when the item is sent, so a delta delayed by its batch never carries an identity older than
+    // a refresh this subscriber already sent.
+    const withRepositoryIdentity = <E, R>(stream: Stream.Stream<ShellDelta, E, R>) =>
+      stream.pipe(
+        Stream.mapEffect((item): Effect.Effect<ShellDelta> =>
+          item.kind === "project.updated"
+            ? Effect.map(
+                projectEnrichment.getAvailable(item.project.workspaceRoot),
+                (enrichment) => ({
+                  ...item,
+                  project: { ...item.project, repositoryIdentity: enrichment.repositoryIdentity },
+                }),
+              )
+            : Effect.succeed(item),
+        ),
+      );
+
     // Replay only; the live tail comes projected from the hub.
     const projectShellItems = Effect.fn("ws.orchestrationV2.projectShellItems")(function* (
       events: ReadonlyArray<ShellApplicationEvent>,
@@ -1096,9 +1115,11 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           return item;
         }),
         skipUnchangedThreadShells,
+        withRepositoryIdentity,
       );
 
-    const liveFrom = (afterSequence: number) => shellDeltas.stream(afterSequence, replayReads);
+    const liveFrom = (afterSequence: number) =>
+      withRepositoryIdentity(shellDeltas.stream(afterSequence, replayReads));
 
     const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
       Stream.filter((change) => change.repositoryIdentityResolved),

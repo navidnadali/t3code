@@ -19,7 +19,6 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
-import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ShellDeltaHub from "./ShellDeltaHub.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -80,14 +79,6 @@ const layerHub = (input: {
         Layer.mock(ProjectStore.ProjectStoreV2)(
           input.getProjectRow === undefined ? {} : { getShell: input.getProjectRow },
         ),
-        Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({
-          getAvailable: () =>
-            Effect.succeed({
-              repositoryIdentity: null,
-              faviconPath: null,
-              repositoryIdentityResolved: true,
-            }),
-        }),
         Layer.effect(
           OrchestrationEventStore.OrchestrationEventStore,
           Effect.gen(function* () {

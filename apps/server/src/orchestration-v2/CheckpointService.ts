@@ -43,6 +43,18 @@ export class CheckpointRootScopePrepareError extends Schema.TaggedError<Checkpoi
   }
 }
 
+class CheckpointWorkspaceResolveError extends Schema.TaggedError<CheckpointWorkspaceResolveError>()(
+  "CheckpointWorkspaceResolveError",
+  {
+    cwd: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Failed to resolve the workspace ${this.cwd}.`;
+  }
+}
+
 export class CheckpointBaselineCaptureError extends Schema.TaggedError<CheckpointBaselineCaptureError>()(
   "CheckpointBaselineCaptureError",
   {
@@ -198,14 +210,17 @@ export const resolveWorkspacePath = (
 // provider output commit first (an order the product leaves open, which an equivalence test pins);
 // a synchronous realpath does not. A missing path resolves lexically.
 const resolveWorkspaceNow = (path: Path.Path, target: string) =>
-  Effect.sync(() => {
-    try {
-      return NodeFS.realpathSync(target);
-    } catch (cause) {
-      const code = (cause as { readonly code?: unknown }).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return path.resolve(target);
-      throw cause;
-    }
+  Effect.try({
+    try: () => {
+      try {
+        return NodeFS.realpathSync(target);
+      } catch (cause) {
+        const code = (cause as { readonly code?: unknown }).code;
+        if (code === "ENOENT" || code === "ENOTDIR") return path.resolve(target);
+        throw cause;
+      }
+    },
+    catch: (cause) => new CheckpointWorkspaceResolveError({ cwd: target, cause }),
   });
 
 // A thread's first workspace keeps the root scope; each later, different workspace (by real path)
@@ -220,7 +235,7 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
   readonly cwd: string;
   readonly createdAt: DateTime.Utc;
   readonly threadScopes: ReadonlyArray<OrchestrationV2CheckpointScope>;
-  readonly resolve: (cwd: string) => Effect.Effect<string>;
+  readonly resolve: (cwd: string) => Effect.Effect<string, CheckpointWorkspaceResolveError>;
 }) {
   const rootScopeId = yield* input.idAllocator.allocate.checkpointScope({
     threadId: input.threadId,

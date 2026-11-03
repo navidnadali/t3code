@@ -135,10 +135,19 @@ export const wslNodeFallbackCapFlags = (): ReadonlyArray<string> => {
   return flag === undefined ? [] : [flag];
 };
 
-/** What WSL sees of the desktop's young-generation settings: its NODE_OPTIONS and the escape hatch. */
+/** Whether the user's WSLENV (`NAME[/flags]`, colon-separated) forwards a variable into WSL. */
+const wslForwards = (name: string): boolean =>
+  (process.env.WSLENV ?? "").split(":").some((entry) => entry.split("/")[0] === name);
+
+/**
+ * What WSL sees of the desktop's young-generation settings: its NODE_OPTIONS and the escape hatch,
+ * but only those the user's WSLENV forwards — a Windows-only NODE_OPTIONS never reaches Linux.
+ */
 const wslYoungGenerationEnv = () => ({
-  NODE_OPTIONS: process.env.NODE_OPTIONS,
-  T3CODE_V8_MAX_SEMI_SPACE_MB: process.env.T3CODE_V8_MAX_SEMI_SPACE_MB,
+  NODE_OPTIONS: wslForwards("NODE_OPTIONS") ? process.env.NODE_OPTIONS : undefined,
+  T3CODE_V8_MAX_SEMI_SPACE_MB: wslForwards("T3CODE_V8_MAX_SEMI_SPACE_MB")
+    ? process.env.T3CODE_V8_MAX_SEMI_SPACE_MB
+    : undefined,
 });
 
 /**

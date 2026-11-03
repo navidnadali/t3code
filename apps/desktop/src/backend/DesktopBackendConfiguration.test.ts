@@ -483,13 +483,6 @@ describe("DesktopBackendConfiguration", () => {
           const config = yield* configuration
             .resolveWsl({ port: 5000, distro: "Ubuntu" })
             .pipe(Effect.ensuring(restore));
-          // Windows-only NODE_OPTIONS that WSLENV does not forward never reach the Linux backend.
-          process.env.NODE_OPTIONS = "--require=C:\\WindowsOnly\\hook.cjs";
-          delete process.env.WSLENV;
-          const unforwarded = yield* configuration
-            .resolveWsl({ port: 5000, distro: "Ubuntu" })
-            .pipe(Effect.ensuring(restore));
-          assert.isFalse(unforwarded.args.some((arg) => arg.startsWith("--node-options=")));
 
           assert.deepEqual(observedArchives, [
             {
@@ -518,6 +511,13 @@ describe("DesktopBackendConfiguration", () => {
           assert.equal(config.wslRuntimeId, `sha256-${archiveHash}`);
           assert.equal(legacyCleanupCount, 1);
           assert.isTrue(Option.isNone(config.preflightFailure));
+          // Windows-only NODE_OPTIONS that WSLENV does not forward never reach the Linux backend.
+          process.env.NODE_OPTIONS = "--require=C:\\WindowsOnly\\hook.cjs";
+          delete process.env.WSLENV;
+          const unforwarded = yield* configuration
+            .resolveWsl({ port: 5000, distro: "Ubuntu" })
+            .pipe(Effect.ensuring(restore));
+          assert.isFalse(unforwarded.args.some((arg) => arg.startsWith("--node-options=")));
         }),
     );
   });

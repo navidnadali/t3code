@@ -2010,6 +2010,60 @@ it.effect(
     ),
 );
 
+// Run 1 recorded its workspace (A), but the thread's one root scope was last re-created in B before
+// the upgrade; back in A, run 2 gets a scope of its own. A file revert to run 1 restores A, where run
+// 1's checkpoint was taken, not the B its scope names.
+it.effect(
+  "a checkpoint whose run recorded its workspace restores there, whatever its old scope names",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* nextTurnSelectionHarness("recorded-run-old-scope");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const thread = yield* worktreeThread(harness);
+          const root = (yield* orchestrator.getThreadProjection(thread.threadId))
+            .checkpointScopes[0]!;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("old-root-scope-in-b"),
+                type: "checkpoint-scope.created",
+                threadId: thread.threadId,
+                providerInstanceId: instanceId,
+                occurredAt: yield* DateTime.now,
+                payload: { ...root, cwd: thread.other },
+              },
+            ],
+          });
+          yield* thread.nextRun(harness.cwd, "edited-by-second.txt");
+          yield* fs.writeFileString(path.join(harness.cwd, "after.txt"), "later\n");
+          const run1 = yield* thread.checkpointOf(thread.first.runId);
+          yield* orchestrator.dispatch({
+            type: "checkpoint.rollback",
+            commandId: CommandId.make("run-1-files"),
+            threadId: thread.threadId,
+            scopeId: run1.scopeId,
+            checkpointId: run1.id,
+            restoreFiles: true,
+          });
+          yield* worker.drain();
+          assert.isNull(
+            (yield* orchestrator.getThreadProjection(thread.threadId)).thread.rollbackFailure,
+          );
+          assert.isTrue(yield* fs.exists(path.join(harness.cwd, "edited-by-first.txt")));
+          assert.isFalse(yield* fs.exists(path.join(harness.cwd, "edited-by-second.txt")));
+          assert.isFalse(yield* fs.exists(path.join(harness.cwd, "after.txt")));
+          assert.isTrue(yield* fs.exists(path.join(thread.other, "only-on-b.txt")));
+        }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+      }),
+    ),
+);
+
 // The control: recorded before the upgrade, but only ever in A, so its checkpoints are A's.
 it.effect("a thread recorded before the upgrade that never switched still restores its files", () =>
   Effect.scoped(

@@ -436,6 +436,152 @@ it.effect(
     }).pipe(Effect.scoped),
 );
 
+it.effect(
+  "a delta equal to the shell last sent, offered while the base is read, follows the resync",
+  () =>
+    Effect.gen(function* () {
+      const reads: Array<number> = [];
+      const titles = new Map<string, string>([[threadId, "X"]]);
+      const gate = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const scope = yield* Scope.make();
+        const subscription = yield* hub.subscribe({ maxItems: 2 }).pipe(Scope.provide(scope));
+        const pull = yield* Stream.toPull(subscription.stream(0)).pipe(Scope.provide(scope));
+        const first = yield* Effect.forkScoped(pull);
+        yield* publish(threadId, 1);
+        assert.deepEqual(describe(yield* Fiber.join(first)), ["thread:hub@1=X"]);
+        titles.set("thread:b", "b");
+        titles.set("thread:c", "c");
+        yield* publish(ThreadId.make("thread:b"), 2);
+        yield* publish(ThreadId.make("thread:c"), 3);
+        // The base, held here, caught the thread in a state the hub never projected. While it is
+        // read, the thread's next event projects X again: the shell last sent before the reset,
+        // which the client will not show once it has the base.
+        const resync = yield* Effect.forkScoped(pull);
+        yield* TestClock.adjust(0);
+        yield* publish(threadId, 4);
+        yield* Deferred.succeed(gate, undefined);
+        assert.deepEqual(describe(yield* Fiber.join(resync)), [
+          "resync(thread:hub=Y,thread:b=b,thread:c=c)",
+        ]);
+        const next = yield* Effect.forkScoped(pull.pipe(Effect.timeoutOption("1 second")));
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual(
+          Option.map(yield* Fiber.join(next), describe),
+          Option.some(["thread:c@3=c", "thread:hub@4=X"]),
+        );
+        yield* Scope.close(scope, Exit.void);
+      }).pipe(
+        Effect.provide(
+          layerHub({
+            reads,
+            titleOf: (id) => titles.get(id) ?? "?",
+            baseThreads: () => [
+              shellOf(threadId, "Y"),
+              shellOf("thread:b", "b"),
+              shellOf("thread:c", "c"),
+            ],
+            readGate: Deferred.await(gate),
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped),
+);
+
+/**
+ * A scheduler like `base` whose fibers, after `park()`, stop at their next op and stay stopped,
+ * with everything they schedule, until `release()`.
+ */
+const parkingScheduler = (base: Scheduler.Scheduler) => {
+  const dispatcher = base.makeDispatcher();
+  let parking = false;
+  let parked = false;
+  const held: Array<() => void> = [];
+  const scheduler: Scheduler.Scheduler = {
+    executionMode: base.executionMode,
+    shouldYield: () => {
+      if (!parking) return false;
+      parking = false;
+      parked = true;
+      return true;
+    },
+    makeDispatcher: () => ({
+      scheduleTask: (task, priority) => {
+        if (parked) held.push(task);
+        else dispatcher.scheduleTask(task, priority);
+      },
+      flush: () => dispatcher.flush(),
+    }),
+  };
+  return {
+    scheduler,
+    park: () => {
+      parking = true;
+    },
+    release: () => {
+      parked = false;
+      for (const task of held.splice(0)) dispatcher.scheduleTask(task, 0);
+    },
+  };
+};
+
+it.effect(
+  "a base is kept for a subscriber that has not yet processed the batch that reset the others",
+  () =>
+    Effect.gen(function* () {
+      const base = yield* Scheduler.Scheduler;
+      const reads: Array<number> = [];
+      let baseReads = 0;
+      const parking = parkingScheduler(base);
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const scope = yield* Scope.make();
+        const fast = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+        // The slow subscriber's consumer runs under the parking scheduler.
+        const slow = yield* hub
+          .subscribe({ maxItems: 1 })
+          .pipe(
+            Effect.provideService(Scheduler.Scheduler, parking.scheduler),
+            Scope.provide(scope),
+          );
+        const pullFast = yield* Stream.toPull(fast.stream(0)).pipe(Scope.provide(scope));
+        const pullSlow = yield* Stream.toPull(slow.stream(0)).pipe(Scope.provide(scope));
+        yield* publish(threadId, 1);
+        assert.deepEqual(sequences(yield* pullFast), [1]);
+        assert.deepEqual(sequences(yield* pullSlow), [1]);
+        // The slow consumer stops before the next batch reaches it; the fast one resets on it,
+        // reads the wave's base and is done with it.
+        parking.park();
+        yield* publish(ThreadId.make("thread:b"), 2);
+        assert.deepEqual(
+          (yield* pullFast).map((item) => item.kind),
+          ["resync"],
+        );
+        assert.equal(baseReads, 1);
+        // The slow consumer processes that batch now: its reset belongs to the same wave.
+        parking.release();
+        yield* TestClock.adjust(0);
+        assert.deepEqual(
+          (yield* pullSlow).map((item) => item.kind),
+          ["resync"],
+        );
+        assert.equal(baseReads, 1);
+        yield* Scope.close(scope, Exit.void);
+      }).pipe(
+        Effect.provide(
+          layerHub({
+            reads,
+            baseThreads: () => {
+              baseReads += 1;
+              return [];
+            },
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped),
+);
+
 it.effect("a reset the opening snapshot covers needs no resync", () =>
   Effect.gen(function* () {
     const reads: Array<number> = [];

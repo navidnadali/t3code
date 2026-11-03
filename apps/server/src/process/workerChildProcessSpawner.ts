@@ -259,6 +259,8 @@ export interface HandoffChild {
   /** Its spawner stopped while it ran: its exit is found by watching its PID and start time. */
   orphaned: boolean;
   referenced: boolean;
+  /** Its owner is done with it: its sockets close once it has exited. */
+  released: boolean;
 }
 
 export interface HandoffCallbacks {
@@ -518,6 +520,10 @@ const makeRemoteHost = (options: {
     else if (holding === 1 && holds) transport?.ref();
   };
 
+  const destroySockets = (child: HandoffChild) => {
+    for (const socket of child.sockets.values()) socket.destroy();
+  };
+
   const completeHandoffExit = (
     child: HandoffChild,
     code: number | null,
@@ -525,6 +531,9 @@ const makeRemoteHost = (options: {
   ) => {
     if (!Deferred.doneUnsafe(child.exitSignal, Exit.succeed([code, signal] as const))) return;
     for (const listener of child.exitListeners) listener(code, signal);
+    // As Node's: stdin closes when the process exits; its output once its owner is done with it.
+    child.sockets.get(0)?.destroy();
+    if (child.released) destroySockets(child);
   };
 
   const forgetHandoff = (entry: HandoffEntry) => {
@@ -532,10 +541,6 @@ const makeRemoteHost = (options: {
     if (entry.settled && entry.closed && entry.killCallbacks.size === 0) {
       handoffs.delete(entry.child.id);
     }
-  };
-
-  const destroySockets = (child: HandoffChild) => {
-    for (const socket of child.sockets.values()) socket.destroy();
   };
 
   // Hand-off itself failed before the command ran: tell the spawner and the caller.
@@ -904,6 +909,7 @@ const makeRemoteHost = (options: {
       exitListeners: new Set(),
       orphaned: false,
       referenced: true,
+      released: false,
     };
     const socketPath = NodePath.join(request.dir, NodeCrypto.randomBytes(12).toString("base64url"));
     if (transport === undefined) {
@@ -993,6 +999,12 @@ const makeRemoteHost = (options: {
     forgetHandoff(entry);
   };
 
+  // Its owner is done with it: its sockets close now if it has exited, else when it does.
+  const releaseHandoff = (child: HandoffChild) => {
+    child.released = true;
+    if (Deferred.isDoneUnsafe(child.exitSignal)) destroySockets(child);
+  };
+
   const setHandoffReferenced = (child: HandoffChild, referenced: boolean) => {
     child.referenced = referenced;
     for (const socket of child.sockets.values()) {
@@ -1057,6 +1069,7 @@ const makeRemoteHost = (options: {
     abandonHandoff,
     killHandoff,
     setHandoffReferenced,
+    releaseHandoff,
     terminate: () =>
       Effect.promise(async () => {
         const current = transport;
@@ -1379,6 +1392,8 @@ interface ChildBackend<C extends ChildView, E> {
     callback: (outcome: KillOutcome) => void,
   ) => void;
   readonly setReferenced: (child: C, referenced: boolean) => void;
+  /** Its handle's owner is done with it. */
+  readonly release?: (child: C) => void;
 }
 
 /** Handles for started children, whichever backend started them: the same kill and exit semantics. */
@@ -1528,23 +1543,24 @@ const makeChildHandles = Effect.fnUntraced(function* () {
       windowsHide: command.options.windowsHide ?? !detached,
     };
 
+    const finalize = Effect.fnUntraced(function* (child: C) {
+      const exited = yield* Deferred.isDone(child.exitSignal);
+      if (exited) {
+        const [code] = yield* Deferred.await(child.exitSignal);
+        if (code !== 0 && Predicate.isNotNull(code)) {
+          yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
+        } else if (isReferenced && platform !== "win32" && command.options.detached !== false) {
+          yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
+        }
+        return;
+      }
+      if (!isReferenced) return;
+      yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
+    });
     const child = yield* Effect.acquireRelease(
       // Interruptible, so a command's own timeout ends the wait for a start that is not answered.
       backend.start(command, spawnOptions).pipe(Effect.interruptible),
-      Effect.fnUntraced(function* (child) {
-        const exited = yield* Deferred.isDone(child.exitSignal);
-        if (exited) {
-          const [code] = yield* Deferred.await(child.exitSignal);
-          if (code !== 0 && Predicate.isNotNull(code)) {
-            yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
-          } else if (isReferenced && platform !== "win32" && command.options.detached !== false) {
-            yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
-          }
-          return;
-        }
-        if (!isReferenced) return;
-        yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
-      }),
+      (child) => finalize(child).pipe(Effect.ensuring(Effect.sync(() => backend.release?.(child)))),
     );
 
     child.exitListeners.add((code) => {
@@ -1951,6 +1967,7 @@ const makeHandoffSpawner = Effect.fnUntraced(function* (
       ),
     kill: (view, signal, callback) => host.killHandoff(view.child, signal, callback),
     setReferenced: (view, referenced) => host.setHandoffReferenced(view.child, referenced),
+    release: (view) => host.releaseHandoff(view.child),
   };
   return makeSpawner((command) =>
     Effect.gen(function* () {

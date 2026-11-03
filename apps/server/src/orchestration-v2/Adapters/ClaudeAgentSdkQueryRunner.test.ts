@@ -549,6 +549,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
             exitListeners,
             orphaned: true,
             referenced: true,
+            released: false,
           };
         },
         abandonHandoff: () => {},

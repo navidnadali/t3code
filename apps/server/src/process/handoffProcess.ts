@@ -165,6 +165,7 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
         this.#held.push(socket);
       } else if (fd === 0) {
         socket.on("error", (error) => stream.destroy(error));
+        socket.once("close", () => stream.destroy());
         stream.pipe(socket);
       } else {
         socket.on("error", (error) => stream.destroy(error));
@@ -192,11 +193,17 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     }
     this.#direct = child;
     this.pid = child.pid;
+    // Its pipes' failures and closing reach the streams the SDK holds, as with a handed-off one.
     for (const [fd, stream] of this.stdio.entries()) {
       const pipe = child.stdio[fd];
       if (stream === null || pipe === null || pipe === undefined) continue;
-      if (fd === 0) stream.pipe(pipe as NodeStream.Writable);
-      else (pipe as NodeStream.Readable).pipe(stream);
+      pipe.on("error", (error) => stream.destroy(error));
+      if (fd === 0) {
+        pipe.once("close", () => stream.destroy());
+        stream.pipe(pipe as NodeStream.Writable);
+      } else {
+        (pipe as NodeStream.Readable).pipe(stream);
+      }
     }
     child.on("spawn", () => this.emit("spawn"));
     child.on("error", (error) => this.#fail(error));
@@ -220,6 +227,8 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     this.#exited = true;
     this.exitCode = code;
     this.signalCode = signal;
+    // As Node's: stdin closes when the process exits.
+    this.stdin?.destroy();
     this.emit("exit", code, signal);
     this.#maybeClose();
   }
@@ -227,7 +236,8 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
   #maybeClose() {
     if (this.#closed || !this.#exited || this.#openOutputs > 0) return;
     this.#closed = true;
-    for (const socket of this.#held) socket.destroy();
+    // Its output has ended: the server's ends of its descriptors close with it.
+    for (const socket of this.#child?.sockets.values() ?? []) socket.destroy();
     this.emit("close", this.exitCode, this.signalCode);
   }
 

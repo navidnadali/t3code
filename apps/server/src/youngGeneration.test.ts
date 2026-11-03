@@ -553,6 +553,25 @@ describe("planYoungGenerationRelaunch", () => {
     expect(result.env.NODE_OPTIONS).toBe(flag);
     expect(result.env[INHERITED_NODE_OPTIONS_ENV]).toBe("");
   });
+  it("sees a preload in every spelling Node accepts, in execArgv and in NODE_OPTIONS", () => {
+    // Node reads `_` as `-` in option names; a loader given as --experimental_loader ran twice.
+    for (const execArgv of [
+      ["--experimental_loader", "x.mjs"],
+      ["--experimental-loader=x.mjs"],
+      ["-r", "x.cjs"],
+      ["--import=x.mjs"],
+    ]) {
+      const result = plan({ execArgv });
+      expect(result.kind, execArgv.join(" ")).toBe("keep");
+      if (result.kind === "keep") expect(result.reason).toBe("started with a preload");
+    }
+    for (const NODE_OPTIONS of ["--experimental_loader=x.mjs", "--require x.cjs", "-r x.cjs"]) {
+      const result = plan({ env: { NODE_OPTIONS } });
+      expect(result.kind, NODE_OPTIONS).toBe("keep");
+      if (result.kind === "keep") expect(result.reason).toBe("started with a preload");
+    }
+  });
+
   it("keeps the process when the default is already in effect, disabled or explicit", () => {
     expect(plan({ env: { [INHERITED_NODE_OPTIONS_ENV]: "", NODE_OPTIONS: flag } }).kind).toBe(
       "keep",

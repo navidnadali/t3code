@@ -245,6 +245,13 @@ describe("planYoungGenerationRelaunch", () => {
       kind: "keep",
       reason: "started with an IPC channel",
     });
+    // An up-to-date launcher that disabled the cap through the escape hatch is not an old launcher.
+    expect(
+      plan({
+        hasIpcChannel: true,
+        env: { [SERVICE_LAUNCHER_CONTEXT_ENV]: "{}", [MAX_SEMI_SPACE_ENV]: "0" },
+      }),
+    ).toEqual({ kind: "keep", reason: "started with an IPC channel" });
   });
 
   it("relaunches a Node entry with the flag in NODE_OPTIONS and the original kept for children", () => {

@@ -12,7 +12,9 @@ import {
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import * as CheckpointService from "./CheckpointService.ts";
@@ -52,12 +54,16 @@ export const layer: Layer.Layer<
   | EventSink.EventSinkV2
   | IdAllocator.IdAllocatorV2
   | ProjectionStore.ProjectionStoreV2
+  | FileSystem.FileSystem
+  | Path.Path
 > = Layer.effect(
   CheckpointCaptureServiceV2,
   Effect.gen(function* () {
     const checkpoints = yield* CheckpointService.CheckpointServiceV2;
     const eventSink = yield* EventSink.EventSinkV2;
     const ids = yield* IdAllocator.IdAllocatorV2;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
 
     const execute = Effect.fn("orchestrationV2.checkpointCapture.execute")(function* (input: {
@@ -100,9 +106,17 @@ export const layer: Layer.Layer<
       }
 
       const capturedAt = yield* DateTime.now;
-      // The run's checkpoints are taken where it ran: the thread's scope follows its latest root run
-      // and may name another worktree by now. Runs recorded before the run kept it use the scope's.
-      const runScope = run.workspaceCwd === undefined ? scope : { ...scope, cwd: run.workspaceCwd };
+      // The run's checkpoints are taken where it ran, by real path, which the run then keeps: a scope
+      // may name another workspace or spelling, and a spelling the run used (a symlink) may later
+      // point elsewhere. Runs recorded before the run kept its cwd use the scope's.
+      const workspace = yield* CheckpointService.resolveWorkspacePath(
+        fileSystem,
+        path,
+        run.workspaceCwd ?? scope.cwd,
+      );
+      const runScope = { ...scope, cwd: workspace };
+      // A run recorded without its workspace keeps none: its scope may name a later one.
+      const recorded = run.workspaceCwd === undefined ? {} : { workspaceCwd: workspace };
       const baselineOrdinalWithinScope = Math.max(0, run.ordinal - 1);
       const hasReadyCheckpoint = (ordinalWithinScope: number) =>
         readyCheckpointOrdinals.includes(ordinalWithinScope);
@@ -116,8 +130,10 @@ export const layer: Layer.Layer<
           capturedAt: run.requestedAt,
           forceMissing: sideChat,
         });
+      // The thread starts in its first workspace's scope; a later workspace's scope starts at the
+      // baseline of its first run there.
       const threadStartCheckpoint =
-        baselineOrdinalWithinScope === 0 || hasReadyCheckpoint(0)
+        baselineOrdinalWithinScope === 0 || hasReadyCheckpoint(0) || scope.ordinalWithinParent !== 0
           ? null
           : yield* materializeBaseline(0);
       const baselineCheckpoint = hasReadyCheckpoint(baselineOrdinalWithinScope)
@@ -208,9 +224,10 @@ export const layer: Layer.Layer<
             providerInstanceId: run.providerInstanceId,
             occurredAt: capturedAt,
             payload: stopped
-              ? { ...runWithoutDelegatedCompletion, checkpointId: checkpoint.id }
+              ? { ...runWithoutDelegatedCompletion, ...recorded, checkpointId: checkpoint.id }
               : {
                   ...runWithoutDelegatedCompletion,
+                  ...recorded,
                   status: "completed",
                   completedAt: capturedAt,
                   checkpointId: checkpoint.id,

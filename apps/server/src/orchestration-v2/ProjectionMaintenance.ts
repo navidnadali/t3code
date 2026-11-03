@@ -259,6 +259,9 @@ export const layer: Layer.Layer<
           Effect.mapError((cause) => new ProjectionMaintenanceError({ operation, cause })),
         );
 
+    // Never compact checkpoint-scope.created (here or in the keyed types below): a file restore of a
+    // checkpoint recorded before runs kept their workspace reads every cwd its scope was created with
+    // (ProjectionStore.getCheckpointWorkspaces); a lost one could restore another worktree's files.
     // Keep thread.created as the verification and replay anchor; clients recognize deletion by thread.deleted event type.
     const SUPERSEDABLE_THREAD_EVENT_TYPES = [
       "thread.archived",

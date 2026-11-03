@@ -1,4 +1,5 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointId,
@@ -268,6 +269,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
         const layerCapture = CheckpointCaptureService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              NodeServices.layer,
               IdAllocator.layer,
               refLookupFails
                 ? CheckpointService.layer.pipe(
@@ -275,6 +277,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
                       Layer.mergeAll(
                         IdAllocator.layer,
                         NodeCrypto.layer,
+                        NodeServices.layer,
                         Layer.mock(CheckpointStore.CheckpointStore)({
                           listAuthoredPaths: () => Effect.succeed(null),
                           isGitRepository: () => Effect.succeed(true),
@@ -447,6 +450,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               materializeBaselineCheckpoint: () => Effect.die("a discarded run has no baseline"),
@@ -637,12 +641,14 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
         const layerCapture = CheckpointCaptureService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              NodeServices.layer,
               IdAllocator.layer,
               CheckpointService.layer.pipe(
                 Layer.provide(
                   Layer.mergeAll(
                     IdAllocator.layer,
                     NodeCrypto.layer,
+                    NodeServices.layer,
                     Layer.mock(CheckpointStore.CheckpointStore)({
                       isGitRepository: (cwd) => inWorkspace(cwd).pipe(Effect.as(true)),
                       hasCheckpointRef: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as(true)),
@@ -875,6 +881,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               materializeBaselineCheckpoint: () =>
@@ -1067,12 +1074,14 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             CheckpointService.layer.pipe(
               Layer.provide(
                 Layer.mergeAll(
                   IdAllocator.layer,
                   NodeCrypto.layer,
+                  NodeServices.layer,
                   Layer.mock(CheckpointStore.CheckpointStore)({
                     isGitRepository: gitUnavailable,
                     captureCheckpoint: gitUnavailable,

@@ -364,7 +364,7 @@ export function layerWithRegistry<Error>(
     Layer.provide(NodeServices.layer),
   );
   const layerCheckpointServiceProvided = CheckpointService.layer.pipe(
-    Layer.provide(Layer.mergeAll(layerCheckpointStore, IdAllocator.layer)),
+    Layer.provide(Layer.mergeAll(layerCheckpointStore, IdAllocator.layer, NodeServices.layer)),
   );
   const layerContextHandoffServiceProvided = ContextHandoffService.layer.pipe(
     Layer.provide(IdAllocator.layer),
@@ -427,6 +427,7 @@ export function layerWithRegistry<Error>(
         layerRuntime,
         layerServerConfig,
         layerServerSettings,
+        layerCheckpointServiceProvided,
       ),
     ),
   );

@@ -17,7 +17,12 @@ import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
-import { isCheckpointRestoreIsolated } from "./CheckpointRestoreSafety.ts";
+import {
+  anotherWorktreeRestoreMessage,
+  checkpointRestorePlace,
+  isCheckpointRestoreIsolated,
+  UNPLACED_RESTORE_MESSAGE,
+} from "./CheckpointRestoreSafety.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
 import { EventSinkV2 } from "./EventSink.ts";
@@ -34,6 +39,8 @@ it.effect.each([
   "sibling",
   "shared-provider",
   "conversation",
+  "unplaced",
+  "recorded-run",
 ] as const)("preserves overlapping workspace files, owner=%s", (owner) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -87,6 +94,7 @@ it.effect.each([
       targetAttempt: undefined,
       rolledBackAttemptIds: [],
       staleCheckpoints: [],
+      otherRootScopes: [],
       checkpoint: { id: checkpointId, scopeId, status: "ready", appRunOrdinal: null },
       scope: { id: scopeId, cwd },
       runsToRollback: [{ id: "later-run", ordinal: 1, status: "completed", rootNodeId: null }],
@@ -104,6 +112,9 @@ it.effect.each([
             get: () => Effect.succeedSome({ workspaceRoot: parent } as never),
           }),
           Layer.mock(ProjectionStoreV2)({
+            // "unplaced": recorded before the upgrade, by a thread that ran in two worktrees.
+            getCheckpointWorkspaces: () =>
+              Effect.succeed(owner === "unplaced" ? [sibling, cwd] : [cwd]),
             getThread: () => Effect.succeed(projection.thread),
             getCheckpointRollbackContext: () => Effect.succeed(projection),
             getShellSnapshot: () =>
@@ -113,12 +124,27 @@ it.effect.each([
                 threads: [otherThread] as never,
                 archivedThreads: [],
               }),
+            // "recorded-run": the other thread's scope keeps a spelling that is gone (a removed
+            // symlink); its run recorded the path it worked in, this worktree.
             getCheckpointContext: () =>
-              Effect.succeed({
-                runs: [],
-                checkpoints: [],
-                checkpointScopes: [],
-              }),
+              Effect.succeed(
+                owner === "recorded-run"
+                  ? ({
+                      runs: [
+                        { id: "other-run", ordinal: 1, status: "completed", workspaceCwd: cwd },
+                      ],
+                      checkpoints: [],
+                      checkpointScopes: [
+                        {
+                          id: "other-scope",
+                          runId: "other-run",
+                          kind: "root_run",
+                          cwd: "/gone-link",
+                        },
+                      ],
+                    } as never)
+                  : { runs: [], checkpoints: [], checkpointScopes: [] },
+              ),
             getThreadProviderContext: () =>
               Effect.succeed({
                 thread: otherThread as never,
@@ -166,8 +192,15 @@ it.effect.each([
       Effect.provide(layerTest),
     );
     const restoreFiles = owner !== "conversation";
-    const rejected = !["sibling", "shared-provider", "conversation"].includes(owner);
-    if (rejected) {
+    const rejected = !["sibling", "shared-provider", "conversation", "unplaced"].includes(owner);
+    if (owner === "unplaced") {
+      const error = yield* service
+        .execute({ threadId, providerThreadId, checkpointId, scopeId, restoreFiles })
+        .pipe(Effect.flip);
+      assert.equal(error.reason, "another-worktree");
+      assert.include(error.message, "can't tell which worktree");
+      assert.deepEqual(calls, []);
+    } else if (rejected) {
       const error = yield* service
         .execute({ threadId, providerThreadId, checkpointId, scopeId, restoreFiles })
         .pipe(Effect.flip);
@@ -243,7 +276,7 @@ it.effect.each([
               Effect.succeed({
                 turnItems: Array.from({ length: toolItems }, () => ({ type: "command_execution" })),
               }),
-            getCheckpointContext: () => Effect.succeed({ checkpointScopes: [] }),
+            getCheckpointContext: () => Effect.succeed({ runs: [], checkpointScopes: [] }),
             getThreadProviderContext: () => Effect.succeed({ providerSessions: [] }),
           } as never,
           projects: {} as never,
@@ -251,4 +284,56 @@ it.effect.each([
       );
       assert.equal(result, isolated);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it("names the other worktree in the refusal, a long path shortened in the middle", () => {
+  assert.equal(
+    anotherWorktreeRestoreMessage("/repo/worktrees/feature"),
+    "The files from before this message are in another worktree (/repo/worktrees/feature). Restoring them here would overwrite this worktree's files. Use \u201cRevert and keep changes\u201d to rewind the conversation only.",
+  );
+  const long = `/Users/someone/${"nested/".repeat(12)}worktrees/feature-with-a-long-name`;
+  const shown = /\(([^)]*)\)/.exec(anotherWorktreeRestoreMessage(long))![1]!;
+  assert.lengthOf(Array.from(shown), 64);
+  assert.isTrue(shown.startsWith("/Users/someone/"));
+  assert.isTrue(shown.endsWith("/worktrees/feature-with-a-long-name"));
+  assert.include(shown, "\u2026");
+});
+
+// One check for admission and the rollback: where the checkpoint's files are, against this worktree.
+it.effect.each([
+  ["taken here", ["here"], null],
+  ["taken in another worktree", ["other"], "another"],
+  ["recorded before the upgrade by a thread in two worktrees", ["other", "here"], "unplaced"],
+  ["for a thread without a worktree", ["other"], null],
+] as const)("refuses a file restore of a checkpoint %s", ([name, workspaces, refusal]) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const parent = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-v2-restore-refusal-" });
+    const places = { here: path.join(parent, "here"), other: path.join(parent, "other") };
+    yield* fileSystem.makeDirectory(places.here);
+    yield* fileSystem.makeDirectory(places.other);
+    const { refusal: result } = yield* checkpointRestorePlace(
+      {
+        id: ThreadId.make("restore-refusal"),
+        worktreePath: name === "for a thread without a worktree" ? null : places.here,
+      },
+      CheckpointId.make("restore-refusal-checkpoint"),
+      {
+        fileSystem,
+        path,
+        projections: {
+          getCheckpointWorkspaces: () => Effect.succeed(workspaces.map((place) => places[place])),
+        },
+      },
+    );
+    assert.equal(
+      result,
+      refusal === null
+        ? null
+        : refusal === "another"
+          ? anotherWorktreeRestoreMessage(places.other)
+          : UNPLACED_RESTORE_MESSAGE,
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

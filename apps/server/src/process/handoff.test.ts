@@ -163,6 +163,40 @@ describe("provider process hand-off", () => {
   );
 
   it.live.skipIf(!linux)(
+    "gives a provider the same stdio through hand-off as through Node's spawner",
+    () => {
+      // Each descriptor's type, terminal and open flags (blocking mode included), then stdin's EOF.
+      const probe = ChildProcess.make(
+        "/bin/sh",
+        [
+          "-c",
+          'for fd in 0 1 2; do echo "$fd $(stat -L -c %F /proc/$$/fd/$fd) $([ -t $fd ] && echo tty || echo notty) $(grep ^flags /proc/$$/fdinfo/$fd)"; done; wc -c; echo stderr >&2',
+        ],
+        { stdin: Stream.make(new TextEncoder().encode("abc")) },
+      );
+      const seen = (knob: string) =>
+        Effect.gen(function* () {
+          const { spawner } = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+          return yield* Effect.scoped(
+            Effect.gen(function* () {
+              const handle = yield* spawner.spawn(probe);
+              const [stdout, stderr, exitCode] = yield* Effect.all(
+                [text(handle.stdout), text(handle.stderr), handle.exitCode],
+                { concurrency: "unbounded" },
+              );
+              return { stdout, stderr, exitCode };
+            }),
+          );
+        }).pipe(Effect.provide(launcherLayer({ T3CODE_PROVIDER_SPAWNER: knob })));
+      return Effect.gen(function* () {
+        const direct = yield* seen("direct");
+        expect(direct.stdout).toMatch(/^0 socket notty flags:\s+0?2\n/);
+        expect(yield* seen("handoff")).toEqual(direct);
+      });
+    },
+  );
+
+  it.live.skipIf(!linux)(
     "keeps a provider running when the spawner dies, and reports its exit once it ends",
     () => {
       const { layer: logLayer, waitFor } = capturedLogs();

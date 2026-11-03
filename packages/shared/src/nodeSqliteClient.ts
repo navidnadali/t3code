@@ -471,11 +471,17 @@ const execute = ({ id, sql, params, cached, raw, safeIntegers, begin }) => {
       // after the statement ran, since SQLite may have reprepared it for a changed schema.
       statement.setReturnArrays(true);
       const rows = statement.all(...params);
-      return { id, columns: statement.columns().map((column) => column.name), rows };
+      return {
+        id,
+        columns: statement.columns().map((column) => column.name),
+        rows,
+        inTransaction: db.isTransaction,
+      };
     }
     const result = statement.run(...params);
-    return { id, rows: raw ? result : [] };
+    return { id, rows: raw ? result : [], inTransaction: db.isTransaction };
   } catch (error) {
+    // The parent keeps its transaction bookkeeping in step with the connection from this flag.
     return {
       id,
       error: {
@@ -485,6 +491,7 @@ const execute = ({ id, sql, params, cached, raw, safeIntegers, begin }) => {
         errcode: error && error.errcode,
         errstr: error && error.errstr,
       },
+      ...(db === undefined ? {} : { inTransaction: db.isTransaction }),
     };
   }
 };
@@ -512,9 +519,11 @@ type ReaderReply =
       readonly id: number;
       readonly columns?: ReadonlyArray<string>;
       readonly rows: ReadonlyArray<any>;
+      readonly inTransaction?: boolean;
     }
   | {
       readonly id: number;
+      readonly inTransaction?: boolean;
       readonly error: {
         readonly operation: "open" | "begin" | "prepare" | "execute";
         readonly message: string;
@@ -726,6 +735,9 @@ const makeReader = Effect.fnUntraced(function* (
           if (begin) inTransaction = true;
           const id = nextRequestId++;
           pending.set(id, (reply) => {
+            // A control the worker ran itself (raw, bound, duplicate, stray, a savepoint) may have
+            // changed the connection's transaction state: the worker's word replaces the guess.
+            if (reply.inTransaction !== undefined) inTransaction = reply.inTransaction;
             if ("rows" in reply) {
               resume(
                 Effect.succeed(

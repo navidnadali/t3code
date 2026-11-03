@@ -778,6 +778,16 @@ read capacity and watch `db.lock_wait_ms`. The trace shows each effect's wait in
 process slots in `VcsProcess.run` (`vcs.permit_wait_ms`); the server also exports the timer
 `t3_orchestration_effect_queue_wait` by `effect_type`.
 
+Effect admission. While the main thread is saturated, the workers hold back the effects that start
+turn work — turn starts, restarted-run continuations, checkpoint captures and title generation — so
+that user-facing work keeps its latency: interrupts, steers, runtime request answers, detaches, stops
+and cleanups are never held. The daemon samples the event loop utilization every second; after two
+samples at or above `T3CODE_EFFECT_ADMISSION_ELU` (default `0.95`) only half the workers, at least
+one, may run such effects, and after two samples a tenth below that mark all of them may again.
+Effects already running are never stopped. `0` turns the gate off. A held effect's wait appears on its
+`EffectWorker.runEffect` span as `effect.admission_wait_ms`, and each switch is logged
+("Orchestration effect admission changed").
+
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for
 Codex, build their provider-log records. The main thread still reads and splits the output, decodes

@@ -16,13 +16,16 @@ import {
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
+import * as EffectAdmission from "./EffectAdmission.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
@@ -634,4 +637,105 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
         outcome === "confirmed" ? ["stop-child", "settle-child"] : ["stop-child"],
       );
     }),
+);
+
+it.effect("holds a second turn start for admission while an interrupt runs at once", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const workerId = "worker-admission";
+    const claimable = (index: number, request: EffectOutbox.OrchestrationEffectV2["request"]) =>
+      ({
+        id: `effect:admission-${index}`,
+        commandId: CommandId.make(`command:admission-${index}`),
+        threadId: ThreadId.make(`thread:admission-${index}`),
+        request,
+        status: "running",
+        attemptCount: 1,
+        availableAt: now,
+        leaseOwner: workerId,
+        createdAt: now,
+        updatedAt: now,
+        completedAt: null,
+        lastError: null,
+      }) satisfies EffectOutbox.OrchestrationEffectV2;
+    const pending = [
+      claimable(1, { type: "provider-turn.start", runId: RunId.make("run:admission-1") }),
+      claimable(2, { type: "provider-turn.start", runId: RunId.make("run:admission-2") }),
+      claimable(3, {
+        type: "provider-turn.interrupt",
+        providerSessionId: oldSessionId,
+        providerThreadId,
+        providerTurnId,
+      }),
+    ];
+    const started = yield* Ref.make<ReadonlyArray<string>>([]);
+    const finishTurnStarts = yield* Deferred.make<void>();
+    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () =>
+        Effect.sync(() => {
+          const next = pending.shift();
+          return next === undefined ? Option.none() : Option.some(next);
+        }),
+      get: () => Effect.succeedNone,
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      succeed: () => Effect.succeed(true),
+    });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({
+        execute: (effect) =>
+          Ref.update(started, (ids) => [...ids, effect.id]).pipe(
+            Effect.andThen(
+              effect.request.type === "provider-turn.start"
+                ? Deferred.await(finishTurnStarts)
+                : Effect.void,
+            ),
+          ),
+      }),
+    );
+    const layerWorker = EffectWorker.layerWithOptions({ workerId }).pipe(
+      Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+    );
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.provide(layerWorker),
+    );
+    const admission = yield* EffectAdmission.make({
+      workers: 1,
+      utilizationHighMark: 0.95,
+      utilizationLowMark: 0.85,
+      samplesToSwitch: 2,
+      sampleInterval: Duration.seconds(1),
+      utilization: Effect.succeed(0.2),
+    });
+    const runOnce = worker.runOnce.pipe(
+      Effect.provideService(EffectAdmission.EffectAdmission, admission),
+    );
+
+    const first = yield* Effect.forkChild(runOnce);
+    const second = yield* Effect.forkChild(runOnce);
+    yield* Effect.yieldNow;
+    assert.deepEqual(yield* Ref.get(started), ["effect:admission-1"]);
+    assert.equal((yield* admission.state).waiting, 1);
+
+    // The interrupt is not gated: it runs while the turn starts are held.
+    assert.isTrue(yield* runOnce);
+    assert.deepEqual(yield* Ref.get(started), ["effect:admission-1", "effect:admission-3"]);
+    assert.equal((yield* admission.state).waiting, 1);
+
+    yield* Deferred.succeed(finishTurnStarts, undefined);
+    assert.isTrue(yield* Fiber.join(first));
+    assert.isTrue(yield* Fiber.join(second));
+    assert.deepEqual(yield* Ref.get(started), [
+      "effect:admission-1",
+      "effect:admission-3",
+      "effect:admission-2",
+    ]);
+    assert.deepEqual(yield* admission.state, {
+      allowed: 1,
+      inFlight: 0,
+      waiting: 0,
+      saturated: false,
+    });
+  }),
 );

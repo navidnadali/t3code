@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - node:perf_hooks is the only source of the event loop utilization.
+import * as NodePerfHooks from "node:perf_hooks";
+
 import { CommandId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -18,6 +21,7 @@ import {
 } from "../observability/Metrics.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
+import * as EffectAdmission from "./EffectAdmission.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -782,19 +786,27 @@ export const layerWithOptions = (
           }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
           if (cancelledBeforeExecution) return true;
 
-          const execution = executor
-            .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
-            .pipe(
-              boundExecution(effect),
-              Effect.withSpan("EffectWorker.runEffect", {
-                attributes: {
-                  "effect.type": effect.request.type,
-                  "effect.queue_wait_ms": queueWaitMs,
-                  "effect.attempt": effect.attemptCount,
-                },
-              }),
-              Effect.as("executed" as const),
-            );
+          const admission = yield* EffectAdmission.EffectAdmission;
+          const execution = Effect.scoped(
+            Effect.gen(function* () {
+              const admitted = yield* admission.admit(effect.request.type);
+              if (admitted.gated) {
+                yield* Effect.annotateCurrentSpan("effect.admission_wait_ms", admitted.waitedMs);
+              }
+              return yield* executor
+                .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
+                .pipe(boundExecution(effect));
+            }),
+          ).pipe(
+            Effect.withSpan("EffectWorker.runEffect", {
+              attributes: {
+                "effect.type": effect.request.type,
+                "effect.queue_wait_ms": queueWaitMs,
+                "effect.attempt": effect.attemptCount,
+              },
+            }),
+            Effect.as("executed" as const),
+          );
           const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
             Effect.ensuring(outbox.clearCancellation(effect.id)),
           );
@@ -889,6 +901,8 @@ export const layer = layerWithOptions();
 
 export interface OrchestrationEffectDaemonOptions {
   readonly concurrency?: number;
+  /** Hold gated effects while the main thread is this busy; `false` admits everything. */
+  readonly admission?: { readonly utilizationHighMark: number } | false;
   readonly livenessPollIntervalMs?: number;
 }
 
@@ -898,6 +912,23 @@ export interface OrchestrationEffectDaemonOptions {
 const DEFAULT_EFFECT_WORKER_CONCURRENCY = 4;
 export const EFFECT_WORKER_MAX_CONCURRENCY = 256;
 const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
+// Past this share of the last second busy, turn starts wait for headroom; below the low mark
+// (a tenth less) they resume. Two samples either way, so a single burst switches nothing.
+const DEFAULT_EFFECT_ADMISSION_UTILIZATION = 0.95;
+const EFFECT_ADMISSION_HYSTERESIS = 0.1;
+const EFFECT_ADMISSION_SAMPLES_TO_SWITCH = 2;
+const EFFECT_ADMISSION_SAMPLE_INTERVAL = Duration.seconds(1);
+
+/** Event loop utilization since the previous call, from the process's own counters. */
+const eventLoopUtilizationSource = Effect.sync(() => {
+  let previous = NodePerfHooks.performance.eventLoopUtilization();
+  return Effect.sync(() => {
+    const next = NodePerfHooks.performance.eventLoopUtilization();
+    const { utilization } = NodePerfHooks.performance.eventLoopUtilization(next, previous);
+    previous = next;
+    return Number.isFinite(utilization) ? utilization : 0;
+  });
+});
 
 export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions = {}) =>
   Effect.scoped(
@@ -907,10 +938,30 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       const concurrency = Number.isFinite(requestedConcurrency)
         ? Math.max(1, Math.floor(requestedConcurrency))
         : DEFAULT_EFFECT_WORKER_CONCURRENCY;
+      const utilizationHighMark =
+        options.admission === false
+          ? undefined
+          : (options.admission?.utilizationHighMark ?? DEFAULT_EFFECT_ADMISSION_UTILIZATION);
       yield* Effect.logInfo("Orchestration effect worker pool", {
         concurrency,
         configured: options.concurrency !== undefined,
+        admissionUtilization: utilizationHighMark ?? null,
       });
+      const admission =
+        utilizationHighMark === undefined
+          ? undefined
+          : yield* EffectAdmission.make({
+              workers: concurrency,
+              utilizationHighMark,
+              utilizationLowMark: Math.max(0, utilizationHighMark - EFFECT_ADMISSION_HYSTERESIS),
+              samplesToSwitch: EFFECT_ADMISSION_SAMPLES_TO_SWITCH,
+              sampleInterval: EFFECT_ADMISSION_SAMPLE_INTERVAL,
+              utilization: yield* eventLoopUtilizationSource,
+            });
+      const runOnce =
+        admission === undefined
+          ? worker.runOnce
+          : worker.runOnce.pipe(Effect.provideService(EffectAdmission.EffectAdmission, admission));
       const requestedLivenessPollIntervalMs =
         options.livenessPollIntervalMs ?? DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS;
       const livenessPollIntervalMs = Number.isFinite(requestedLivenessPollIntervalMs)
@@ -919,7 +970,7 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       // Notifications wake promptly; availableAt persists retry timing, and liveness polling recovers missed wakeups.
       const runWorker = Effect.gen(function* () {
         while (true) {
-          const outcome = yield* worker.runOnce.pipe(
+          const outcome = yield* runOnce.pipe(
             Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
             Effect.catchCause((cause) =>
               Effect.logWarning("Orchestration effect worker failed", cause).pipe(

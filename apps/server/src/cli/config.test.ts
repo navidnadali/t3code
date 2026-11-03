@@ -1002,6 +1002,30 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect("accepts an effect admission utilization of 0 (off) to 1 and rejects any other", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-effect-admission-" })),
+      );
+      const resolve = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.effectAdmissionUtilization),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolve({})).toBeUndefined();
+      expect(yield* resolve({ T3CODE_EFFECT_ADMISSION_ELU: "0" })).toBe(0);
+      expect(yield* resolve({ T3CODE_EFFECT_ADMISSION_ELU: "0.95" })).toBe(0.95);
+      expect(yield* resolve({ T3CODE_EFFECT_ADMISSION_ELU: "1" })).toBe(1);
+      for (const value of ["1.5", "-0.1", "high"]) {
+        const error = yield* resolve({ T3CODE_EFFECT_ADMISSION_ELU: value }).pipe(Effect.flip);
+        expect(String(error)).toContain('at ["T3CODE_EFFECT_ADMISSION_ELU"]');
+      }
+    }),
+  );
+
   it.effect("reads SQLite page cache and memory map sizes and refuses ones SQLite cannot use", () =>
     Effect.gen(function* () {
       const { join } = yield* Path.Path;

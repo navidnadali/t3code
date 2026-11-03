@@ -226,6 +226,10 @@ const EnvServerConfig = Config.all({
     Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: EFFECT_WORKER_MAX_CONCURRENCY })),
     "T3CODE_EFFECT_WORKERS",
   ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  effectAdmissionUtilization: Config.schema(
+    Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+    "T3CODE_EFFECT_ADMISSION_ELU",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -588,6 +592,9 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
       ? {}
       : { providerIoAcpOffloadMinChars: env.providerIoAcpOffloadMinChars }),
     ...(env.effectWorkers === undefined ? {} : { effectWorkers: env.effectWorkers }),
+    ...(env.effectAdmissionUtilization === undefined
+      ? {}
+      : { effectAdmissionUtilization: env.effectAdmissionUtilization }),
     ...(env.providerIoClaudeSdk === undefined
       ? {}
       : { providerIoClaudeSdk: env.providerIoClaudeSdk }),

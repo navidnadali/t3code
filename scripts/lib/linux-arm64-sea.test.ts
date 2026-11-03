@@ -88,4 +88,3 @@ describe("linuxArm64SeaConfig", () => {
     expect(spawner).not.toHaveProperty("execArgv");
   });
 });
-

@@ -11,6 +11,12 @@ import { vi } from "vite-plus/test";
 
 // Records every synchronous spawn the module under test makes; the calls go through to the real one.
 const spawned = vi.hoisted(() => ({ files: [] as Array<string> }));
+// Lets a test present this process as the single executable, whose argv is [exe, exe, ...arguments].
+const sea = vi.hoisted(() => ({ isSea: false }));
+vi.mock("node:sea", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:sea")>();
+  return { ...actual, isSea: () => sea.isSea };
+});
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return {
@@ -36,6 +42,7 @@ import {
   nodeOptionsFromEnviron,
   runtimeFlagsOf,
   SERVER_COMMANDS,
+  decideYoungGeneration,
   startupNodeOptionsFromListing,
   startupNodeOptionsTrusted,
   serverChildEnvironment,
@@ -337,9 +344,122 @@ describe("applyYoungGenerationDefault", () => {
     }
     expect(spawned.files.filter((file) => file.endsWith("/ps"))).toEqual([]);
   });
+
+  it("reaches the relaunch rules with the single executable's argument shape, whatever the platform records", () => {
+    // The shipped binary's argv is [exe, exe, ...arguments]: Node inserts its own path at argv[1].
+    // Where no startup record exists (macOS), that must not keep the server (review R1).
+    const argv = process.argv;
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    process.argv = [process.execPath, process.execPath, "__node-flags"];
+    sea.isSea = true;
+    try {
+      const outcome = applyYoungGenerationDefault();
+      expect(outcome.applied).toBe(false);
+      expect(outcome.keptReason).not.toMatch(/startup options|since startup/);
+    } finally {
+      sea.isSea = false;
+      Object.defineProperty(process, "platform", platform);
+      process.argv = argv;
+    }
+  });
+});
+
+describe("decideYoungGeneration", () => {
+  const exe = "/usr/local/bin/t3";
+  const pidEnv = "T3CODE_YOUNG_GENERATION_RELAUNCHED_PID";
+  const view = (overrides: Partial<Parameters<typeof decideYoungGeneration>[0]> = {}) => ({
+    argv: [exe, exe, "start", "--no-browser"],
+    execArgv: [],
+    env: { NODE_OPTIONS: "--max-old-space-size=12288" },
+    execPath: exe,
+    platform: "darwin",
+    pid: 4242,
+    hasIpcChannel: false,
+    isSea: true,
+    canExecve: true,
+    inspectorActive: false,
+    preloadRan: false,
+    startup: { known: false } as StartupNodeOptions,
+    ...overrides,
+  });
+
+  it("relaunches the single executable where no startup record exists, with the user arguments only", () => {
+    const decision = decideYoungGeneration(view());
+    expect(decision.kind).toBe("relaunch");
+    if (decision.kind !== "relaunch") return;
+    expect(decision.plan.args).toEqual([exe, "start", "--no-browser"]);
+    expect(decision.plan.env.NODE_OPTIONS).toBe(`--max-old-space-size=12288 ${flag}`);
+    expect(decision.plan.env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=12288");
+    expect(decision.plan.env[pidEnv]).toBe("4242");
+  });
+
+  it("keeps only when a known record differs from the value in effect", () => {
+    const changed = decideYoungGeneration(
+      view({
+        platform: "linux",
+        startup: { known: true, value: "--max-semi-space-size=16 --import x.mjs" },
+      }),
+    );
+    expect(changed.kind).toBe("keep");
+    expect(changed.outcome.keptReason).toBe("NODE_OPTIONS changed since startup");
+    expect(changed.outcome.nodeOptionsAtStart).toBe("--max-semi-space-size=16 --import x.mjs");
+    const same = decideYoungGeneration(
+      view({ platform: "linux", startup: { known: true, value: "--max-old-space-size=12288" } }),
+    );
+    expect(same.kind).toBe("relaunch");
+  });
+
+  it("honours the marker as an exact prefix, bounds the relaunch by pid, and ignores a forged marker", () => {
+    const marker = "--max-old-space-size=12288";
+    const applied = decideYoungGeneration(
+      view({
+        env: {
+          NODE_OPTIONS: `${marker} ${flag} --trace-warnings`,
+          [INHERITED_NODE_OPTIONS_ENV]: marker,
+          [pidEnv]: "4242",
+        },
+      }),
+    );
+    expect(applied.kind).toBe("applied");
+    if (applied.kind !== "applied") return;
+    expect(applied.nodeOptionsForChildren).toBe(`${marker} --trace-warnings`);
+    expect(applied.outcome.applied).toBe(true);
+    const guarded = decideYoungGeneration(
+      view({ env: { NODE_OPTIONS: marker, [pidEnv]: "4242" } }),
+    );
+    expect(guarded.kind).toBe("keep");
+    expect(guarded.outcome.keptReason).toBe("relaunched once already");
+    const forged = decideYoungGeneration(
+      view({ env: { NODE_OPTIONS: flag, [INHERITED_NODE_OPTIONS_ENV]: "--require /nonexistent" } }),
+    );
+    expect(forged.kind).toBe("keep");
+    expect(forged.outcome.keptReason).toBe("disabled or set explicitly");
+  });
 });
 
 describe("runtimeFlagsOf", () => {
+  it("flags a server that wanted the cap and runs without it, and nothing else", () => {
+    // Info hid a dead default from the fleet's logs; the server logs this at Warn.
+    const kept = (keptReason: string, env: Record<string, string | undefined> = {}) =>
+      runtimeFlagsOf({ applied: false, nodeOptionsAtStart: env.NODE_OPTIONS, keptReason }, env);
+    expect(kept("started with a preload").youngGenerationLost).toBe(true);
+    expect(kept("started with a preload").keptReason).toBe("started with a preload");
+    expect(kept("started with a bootstrap descriptor").youngGenerationLost).toBe(true);
+    expect(kept("NODE_OPTIONS changed since startup").youngGenerationLost).toBe(true);
+    expect(
+      kept("disabled or set explicitly", { NODE_OPTIONS: "--max-semi-space-size=16" })
+        .youngGenerationLost,
+    ).toBeUndefined();
+    expect(
+      kept("disabled or set explicitly", { [MAX_SEMI_SPACE_ENV]: "0" }).youngGenerationLost,
+    ).toBeUndefined();
+    expect(
+      runtimeFlagsOf({ applied: true, nodeOptionsAtStart: flag }, { NODE_OPTIONS: undefined })
+        .youngGenerationLost,
+    ).toBeUndefined();
+  });
+
   it("reports the startup value it knows, never the current environment in its place", () => {
     // NODE_OPTIONS was absent at startup; a command-line preload set a cap afterwards. V8 runs with
     // Node's default, and the log must say so without claiming uncertainty.

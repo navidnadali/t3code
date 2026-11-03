@@ -15,6 +15,7 @@ import { makeClaudeTextGeneration } from "../../textGeneration/ClaudeTextGenerat
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as ServerConfig from "../../config.ts";
+import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
@@ -121,7 +122,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     enabled,
     config,
   }) {
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const spawner = yield* WorkerChildProcessSpawner.commandSpawner;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     // The server cwd is $HOME in packaged desktop builds, and `claude`

@@ -782,16 +782,22 @@ Effect admission. While the main thread's latency suffers, the workers leave the
 turn work — turn starts, restarted-run continuations, checkpoint captures and title generation — in the
 outbox beyond an allowance, so that user-facing work keeps its latency: interrupts, steers, runtime
 request answers, detaches, stops and cleanups are always claimed (behind an older effect of their own
-thread, as ever). The daemon measures the event loop's delay every second (the p99 of a 10 ms-resolution
-histogram, reset each second); after two seconds at or above `T3CODE_EFFECT_ADMISSION_DELAY_MS`
-(default `40`) only half the workers, at least one, may run such effects, and after two seconds below
-half that delay all of them may again. Effects already running are never stopped. `0` turns the gate
-off. The delay, not CPU time or event loop utilization, is the signal: a loop can be busy for most of a
-second yet schedule interactive work promptly, and utilization counts every moment it is not idle. The
-time an effect waited in the outbox is its queue wait (`effect.queue_wait_ms` on
-`EffectWorker.runEffect`, which also carries `effect.gated`; the timer
-`t3_orchestration_effect_queue_wait`), and each switch is logged ("Orchestration effect admission
-changed", with the delay that caused it).
+thread, as ever). The signal is the event loop's delay — the p99 of a 10 ms-resolution histogram over
+each second, or the sampler's own lateness when a block spans the whole second — not CPU time or
+event loop utilization: a loop can be busy for most of a second yet schedule interactive work
+promptly, and utilization counts every moment it is not idle. After two seconds at or above
+`T3CODE_EFFECT_ADMISSION_DELAY_MS` (default `40`; `0` turns the gate off; otherwise at least `30`, so
+that the reopen mark at half stays above the histogram's resolution and an idle loop's delay) only
+half the workers, at least one, may run such effects, and after two seconds below half that delay
+all of them may again. The histogram and its 1 Hz sampler run only while the gate can act — from the
+saturated allowance's worth of such effects in flight until the gate is open with fewer — so an idle
+server or a single session pays no wake-ups for it; the price is that the first close after the
+sampler starts takes its two samples from then. Effects already running are never stopped, a slot
+counts against the allowance for two minutes at most (longer than any turn start, so hung starts
+cannot hold it), a freed slot wakes one idle worker and a reopened gate wakes them all. The time an
+effect waited in the outbox is its queue wait (`effect.queue_wait_ms` on `EffectWorker.runEffect`,
+which also carries `effect.gated`; the timer `t3_orchestration_effect_queue_wait`), and each switch
+is logged ("Orchestration effect admission changed", with the delay that caused it).
 
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for

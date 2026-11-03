@@ -12,6 +12,7 @@ import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 
 import {
   increment,
@@ -754,13 +755,13 @@ export const layerWithOptions = (
         const cancellation = outbox
           .awaitCancellation(effect.id)
           .pipe(Effect.as("cancelled" as const));
-        const claimedAt = DateTime.toEpochMillis(yield* DateTime.now);
-        const eligibleAt = Math.max(
-          DateTime.toEpochMillis(DateTime.makeUnsafe(effect.createdAt)),
-          DateTime.toEpochMillis(DateTime.makeUnsafe(effect.availableAt)),
-        );
-        const queueWaitMs = Math.max(0, claimedAt - eligibleAt);
-        const cancelledBeforeExecution = yield* Effect.gen(function* () {
+        const { cancelledBeforeExecution, queueWaitMs } = yield* Effect.gen(function* () {
+          const claimedAt = DateTime.toEpochMillis(yield* DateTime.now);
+          const eligibleAt = Math.max(
+            DateTime.toEpochMillis(DateTime.makeUnsafe(effect.createdAt)),
+            DateTime.toEpochMillis(DateTime.makeUnsafe(effect.availableAt)),
+          );
+          const queueWaitMs = Math.max(0, claimedAt - eligibleAt);
           yield* Metric.update(
             Metric.withAttributes(
               orchestrationEffectQueueWait,
@@ -771,9 +772,9 @@ export const layerWithOptions = (
           // Recheck durable cancellation after registering the Deferred; cancellation may have committed after claim.
           if (yield* wasCancelled(effect.id)) {
             yield* outbox.clearCancellation(effect.id);
-            return true;
+            return { cancelledBeforeExecution: true, queueWaitMs };
           }
-          return false;
+          return { cancelledBeforeExecution: false, queueWaitMs };
         }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
         if (cancelledBeforeExecution) return true;
 
@@ -940,8 +941,8 @@ export interface OrchestrationEffectDaemonOptions {
   readonly concurrency?: number;
   /** Leave turn starts in the outbox while the loop delays work this much; `false` claims everything. */
   readonly admission?: { readonly delayAboveMs: number } | false;
-  /** The loop's delay p99 of the last sample interval in ms; tests inject one. */
-  readonly pressure?: Effect.Effect<number>;
+  /** The pressure source (the loop's delay p99 per sample interval, in ms); tests inject one. */
+  readonly pressure?: Effect.Effect<Effect.Effect<number>, never, Scope.Scope>;
   readonly livenessPollIntervalMs?: number;
 }
 
@@ -954,28 +955,46 @@ const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
 // From this event loop delay p99 over a second, turn starts stay in the outbox; below half of it
 // they resume. Two samples either way, so a single burst switches nothing.
 const DEFAULT_EFFECT_ADMISSION_DELAY_MS = 40;
+// The reopen mark at half must clear the histogram's resolution and an idle loop's ~11 ms p99.
+export const EFFECT_ADMISSION_MIN_DELAY_MS = 30;
+export const EFFECT_ADMISSION_MAX_DELAY_MS = 60_000;
 const EFFECT_ADMISSION_DELAY_RESOLUTION_MS = 10;
+
+/** The daemon option for a configured delay mark: unset keeps the default, 0 turns the gate off. */
+export const admissionOptionsFor = (
+  delayMs: number | undefined,
+): Pick<OrchestrationEffectDaemonOptions, "admission"> =>
+  delayMs === undefined ? {} : { admission: delayMs > 0 ? { delayAboveMs: delayMs } : false };
 const EFFECT_ADMISSION_SAMPLES_TO_SWITCH = 2;
 const EFFECT_ADMISSION_SAMPLE_INTERVAL = Duration.seconds(1);
 
-/** The event loop delay p99 in ms since the previous call, from a histogram reset at each call. */
-const eventLoopDelaySource = Effect.acquireRelease(
-  Effect.sync(() => {
-    const histogram = NodePerfHooks.monitorEventLoopDelay({
-      resolution: EFFECT_ADMISSION_DELAY_RESOLUTION_MS,
-    });
-    histogram.enable();
-    return histogram;
-  }),
-  (histogram) => Effect.sync(() => histogram.disable()),
-).pipe(
-  Effect.map((histogram) =>
-    Effect.sync(() => {
+/**
+ * The event loop's delay since the previous call, from a histogram reset at each call, or the
+ * sampler's own lateness when that is larger. Acquired only while the gate can act.
+ */
+const eventLoopDelaySource: Effect.Effect<Effect.Effect<number>, never, Scope.Scope> = Effect.gen(
+  function* () {
+    const histogram = yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        const created = NodePerfHooks.monitorEventLoopDelay({
+          resolution: EFFECT_ADMISSION_DELAY_RESOLUTION_MS,
+        });
+        created.enable();
+        return created;
+      }),
+      (created) => Effect.sync(() => created.disable()),
+    );
+    const intervalMs = Duration.toMillis(EFFECT_ADMISSION_SAMPLE_INTERVAL);
+    let previousMs = NodePerfHooks.performance.now();
+    return Effect.sync(() => {
+      const nowMs = NodePerfHooks.performance.now();
+      const latenessMs = nowMs - previousMs - intervalMs;
+      previousMs = nowMs;
       const p99Ms = histogram.percentile(99) / 1e6;
       histogram.reset();
-      return Number.isFinite(p99Ms) ? p99Ms : 0;
-    }),
-  ),
+      return EffectAdmission.latencyPressure(p99Ms, latenessMs);
+    });
+  },
 );
 
 export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions = {}) =>
@@ -1003,8 +1022,9 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
               closeAbove: delayAboveMs,
               samplesToSwitch: EFFECT_ADMISSION_SAMPLES_TO_SWITCH,
               sampleInterval: EFFECT_ADMISSION_SAMPLE_INTERVAL,
-              pressure: options.pressure ?? (yield* eventLoopDelaySource),
+              pressure: options.pressure ?? eventLoopDelaySource,
               onAllowanceRestored: worker.notifyWork(concurrency),
+              onSlotFreed: worker.notifyWork(1),
             });
       const runOnce =
         admission === undefined
@@ -1036,13 +1056,12 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             continue;
           }
 
-          // Skipped turn starts are not due work; the allowance's return wakes the workers for them,
-          // and a worker idle behind a closed gate looks again every sample in case a wake-up was lost.
-          const excludedTypes = admission === undefined ? [] : yield* admission.excludedTypes;
+          // Skipped turn starts are not due work: a freed slot or the allowance's return wakes a
+          // worker for them, so an idle worker otherwise sleeps the liveness interval.
           const nextClaimable =
             admission === undefined
               ? worker.nextClaimableAt
-              : worker.nextClaimableAtExcluding(excludedTypes);
+              : worker.nextClaimableAtExcluding(yield* admission.excludedTypes);
           const nextClaimableAt = yield* nextClaimable.pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning(
@@ -1052,18 +1071,11 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             ),
           );
           const now = DateTime.toEpochMillis(yield* DateTime.now);
-          const longestIdleMs =
-            excludedTypes.length === 0
-              ? livenessPollIntervalMs
-              : Math.min(
-                  livenessPollIntervalMs,
-                  Duration.toMillis(EFFECT_ADMISSION_SAMPLE_INTERVAL),
-                );
           const sleepMs = Option.match(nextClaimableAt, {
-            onNone: () => longestIdleMs,
+            onNone: () => livenessPollIntervalMs,
             onSome: (availableAt) => {
               const untilAvailable = DateTime.toEpochMillis(availableAt) - now;
-              return Math.min(longestIdleMs, untilAvailable > 0 ? untilAvailable : 25);
+              return Math.min(livenessPollIntervalMs, untilAvailable > 0 ? untilAvailable : 25);
             },
           });
           yield* Effect.raceFirst(

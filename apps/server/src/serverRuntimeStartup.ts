@@ -553,14 +553,7 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
             ...(serverConfig.effectWorkers === undefined
               ? {}
               : { concurrency: serverConfig.effectWorkers }),
-            ...(serverConfig.effectAdmissionDelayMs === undefined
-              ? {}
-              : {
-                  admission:
-                    serverConfig.effectAdmissionDelayMs > 0
-                      ? { delayAboveMs: serverConfig.effectAdmissionDelayMs }
-                      : false,
-                }),
+            ...EffectWorker.admissionOptionsFor(serverConfig.effectAdmissionDelayMs),
           }),
           startRelay: agentAwarenessRelay.start(),
           workerFiberRef: effectWorkerFiber,

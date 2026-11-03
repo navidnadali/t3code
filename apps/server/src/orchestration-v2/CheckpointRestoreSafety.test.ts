@@ -19,7 +19,7 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import {
   anotherWorktreeRestoreMessage,
-  checkpointRestoreRefusal,
+  checkpointRestorePlace,
   isCheckpointRestoreIsolated,
   UNPLACED_RESTORE_MESSAGE,
 } from "./CheckpointRestoreSafety.ts";
@@ -297,7 +297,7 @@ it.effect.each([
     const places = { here: path.join(parent, "here"), other: path.join(parent, "other") };
     yield* fileSystem.makeDirectory(places.here);
     yield* fileSystem.makeDirectory(places.other);
-    const result = yield* checkpointRestoreRefusal(
+    const { refusal: result } = yield* checkpointRestorePlace(
       {
         id: ThreadId.make("restore-refusal"),
         worktreePath: name === "for a thread without a worktree" ? null : places.here,

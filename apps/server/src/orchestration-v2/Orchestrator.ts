@@ -98,7 +98,7 @@ import * as Stream from "effect/Stream";
 
 import * as ProjectStore from "./ProjectStore.ts";
 import {
-  checkpointRestoreRefusal,
+  checkpointRestorePlace,
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
 } from "./CheckpointRestoreSafety.ts";
@@ -11986,7 +11986,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
       if (command.restoreFiles !== false) {
-        const refusal = yield* checkpointRestoreRefusal(projection.thread, targetCheckpoint.id, {
+        const place = yield* checkpointRestorePlace(projection.thread, targetCheckpoint.id, {
           fileSystem,
           path,
           projections: projectionStore,
@@ -12000,13 +12000,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               }),
           ),
         );
-        if (refusal !== null)
+        if (place.refusal !== null)
           return yield* new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
-            cause: refusal,
+            cause: place.refusal,
           });
-        const isolated = yield* isCheckpointRestoreIsolated(projection.thread, targetScope, {
+        const restoreScope =
+          place.workspace === undefined ? targetScope : { ...targetScope, cwd: place.workspace };
+        const isolated = yield* isCheckpointRestoreIsolated(projection.thread, restoreScope, {
           projects,
           path,
           fileSystem,

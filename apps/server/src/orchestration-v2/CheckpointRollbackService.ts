@@ -22,7 +22,7 @@ import type * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
-  checkpointRestoreRefusal,
+  checkpointRestorePlace,
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
   UNPLACED_RESTORE_MESSAGE,
@@ -242,27 +242,30 @@ export const layer: Layer.Layer<
         }
       }
 
-      // Admission checked this too; the thread may have moved to another worktree since.
-      const refusal =
+      // Admission checked this too; the thread may have moved to another worktree since. The files are
+      // restored where the checkpoint was taken, which an old root scope may not name.
+      const place =
         input.restoreFiles === false
-          ? null
-          : yield* checkpointRestoreRefusal(context.thread, input.checkpointId, {
+          ? { refusal: null, workspace: undefined }
+          : yield* checkpointRestorePlace(context.thread, input.checkpointId, {
               fileSystem,
               path,
               projections,
             });
-      if (refusal !== null) {
+      if (place.refusal !== null) {
         return yield* new CheckpointRollbackExecutionError({
           reason: "another-worktree",
           threadId: input.threadId,
           providerThreadId: input.providerThreadId,
           checkpointId: input.checkpointId,
-          refusal,
+          refusal: place.refusal,
         });
       }
+      const restoreScope =
+        place.workspace === undefined ? scope : { ...scope, cwd: place.workspace };
       if (
         input.restoreFiles !== false &&
-        !(yield* isCheckpointRestoreIsolated(context.thread, scope, {
+        !(yield* isCheckpointRestoreIsolated(context.thread, restoreScope, {
           fileSystem,
           projections,
           projects,
@@ -315,7 +318,9 @@ export const layer: Layer.Layer<
               target: rollbackTarget,
               providerThreadTurns,
             });
-      if (input.restoreFiles !== false) yield* checkpoints.restore({ scope, checkpoint });
+      if (input.restoreFiles !== false) {
+        yield* checkpoints.restore({ scope: restoreScope, checkpoint });
+      }
       // Each workspace's refs live in its repository. A removed worktree's repository may be another
       // workspace's (worktrees share refs), and a recreated one would reuse them as baselines: drop
       // them through every workspace that remains; deleting a ref a repository lacks is a no-op.

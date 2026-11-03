@@ -30,10 +30,10 @@ export const UNPLACED_RESTORE_MESSAGE =
   "T3 can't tell which worktree the files from before this message are in: this conversation ran in more than one before T3 recorded where each turn ran. Restoring them here could overwrite this worktree's files. Use “Revert and keep changes” to rewind the conversation only.";
 
 // The one check admission and the rollback make before a file restore, which writes the checkpoint's
-// tree into the thread's worktree: refused when it was taken in another worktree, or when that is
-// unknown (recorded before runs kept their workspace, by a thread that ran in more than one). A
-// thread without a worktree is a shared workspace, which the isolation check refuses.
-export const checkpointRestoreRefusal = Effect.fn("orchestrationV2.checkpointRestoreRefusal")(
+// tree: refused when it was taken in another worktree, or when that is unknown (recorded before runs
+// kept their workspace, by a thread that ran in more than one); else where it was taken, which the
+// isolation check and the restore use (an old root scope may name a later workspace).
+export const checkpointRestorePlace = Effect.fn("orchestrationV2.checkpointRestorePlace")(
   function* (
     thread: Pick<OrchestrationV2AppThread, "id" | "worktreePath">,
     checkpointId: CheckpointId,
@@ -43,19 +43,22 @@ export const checkpointRestoreRefusal = Effect.fn("orchestrationV2.checkpointRes
       readonly projections: Pick<ProjectionStoreV2["Service"], "getCheckpointWorkspaces">;
     },
   ) {
-    if (thread.worktreePath == null) return null;
+    // A thread without a worktree is a shared workspace, which the isolation check refuses.
+    if (thread.worktreePath == null) return { refusal: null, workspace: undefined };
     const { fileSystem, path, projections } = dependencies;
     const workspaces = yield* projections.getCheckpointWorkspaces(thread.id, checkpointId);
     const places = new Map<string, string>();
     for (const workspace of workspaces) {
       places.set(yield* resolveWorkspacePath(fileSystem, path, workspace), workspace);
     }
-    if (places.size > 1) return UNPLACED_RESTORE_MESSAGE;
+    if (places.size > 1) return { refusal: UNPLACED_RESTORE_MESSAGE };
     const here = yield* resolveWorkspacePath(fileSystem, path, thread.worktreePath);
     for (const [place, workspace] of places) {
-      if (place !== here) return anotherWorktreeRestoreMessage(workspace);
+      return place === here
+        ? { refusal: null, workspace }
+        : { refusal: anotherWorktreeRestoreMessage(workspace) };
     }
-    return null;
+    return { refusal: null, workspace: undefined };
   },
 );
 

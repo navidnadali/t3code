@@ -1989,6 +1989,12 @@ export class ProviderProcessLauncher extends Context.Service<
   }
 >()("t3/process/workerChildProcessSpawner/ProviderProcessLauncher") {}
 
+/** The spawner for provider processes: the server's provider launcher's, else the ambient one. */
+export const providerSpawner = Effect.gen(function* () {
+  const launcher = yield* Effect.serviceOption(ProviderProcessLauncher);
+  return Option.isSome(launcher) ? launcher.value.spawner : yield* ChildProcessSpawner;
+});
+
 const providerSpawnerChoices = new Map<string, "handoff" | "direct">([
   ["handoff", "handoff"],
   ["on", "handoff"],

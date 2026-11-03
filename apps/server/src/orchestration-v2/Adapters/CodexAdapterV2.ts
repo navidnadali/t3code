@@ -1463,10 +1463,7 @@ export const layerAppServerClientFactory: Layer.Layer<
   CodexAppServerClientFactory,
   Effect.gen(function* () {
     // The server's provider launcher starts it without forking the server where it can.
-    const launcher = yield* Effect.serviceOption(WorkerChildProcessSpawner.ProviderProcessLauncher);
-    const spawner = Option.isSome(launcher)
-      ? launcher.value.spawner
-      : yield* ChildProcessSpawner.ChildProcessSpawner;
+    const spawner = yield* WorkerChildProcessSpawner.providerSpawner;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
     const stageTiming = (yield* ProviderIoStageTiming)?.forProvider(CODEX_PROVIDER);

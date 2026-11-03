@@ -21,7 +21,10 @@ const PERMISSION_FIXTURES = new Set([
 // Races outside the SDK that the worker's extra hop tips the other way (adapter events match): two
 // commandless writers interleave differently, and a frame sent after the result reaches the adapter
 // a round trip later, after teardown stopped the reader.
-const INTERLEAVED_WRITERS = new Set(["claude_background_subagent_lifecycle"]);
+const INTERLEAVED_WRITERS = new Set([
+  "claude_background_subagent_lifecycle",
+  "claude_background_wake_before_queued_prompt",
+]);
 const TRAILING_FRAME_RACE = new Set(["claude_compact_after_peer_turn"]);
 
 const CLAUDE_FIXTURES = ORCHESTRATOR_REPLAY_FIXTURES.flatMap((fixture) =>

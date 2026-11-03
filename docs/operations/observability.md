@@ -249,7 +249,9 @@ Any other value is logged as an error and keeps Node's spawner. Unlike a command
 hand-off fails (the spawner stopped or cooling down, a descriptor it could not pass) starts on Node's
 spawner, with a warning, instead of failing. No path or name leads to a provider's stdio: only the
 spawner, briefly, and then the server hold them, so no other process, of this user or another, can
-read or write them.
+read or write them. The one exception is a process of the same user that may trace them (`ptrace`,
+which Yama's `ptrace_scope` 0 allows any process of that user): it can reach the spawner's channel,
+as it can reach the server's own memory, so hand-off gives it nothing it did not already have.
 
 Each provider starts as a small shim, the spawner executable itself (`t3-process-spawner
 __exec-after-go`, or the server's Node with the shim's script outside single executables), with an
@@ -263,8 +265,8 @@ shim costs about 8 MiB of private memory and 10–20 ms of CPU, outside the serv
 provider. The spawner runs at most one shim per core at a time; further starts in a burst (sessions
 resuming after a restart) wait in the spawner before their shim exists, so 1,000 simultaneous starts
 hold about 150 MiB of shims rather than 8.6 GiB, and are all handed off in 12–14 s on 16 cores (the
-channel passes one descriptor at a time, about 75 starts a second). A single executable without `t3-process-spawner` beside it hands off nothing, since its
-shim would load the whole server bundle.
+channel passes one descriptor at a time, about 75 starts a second). A single executable without
+`t3-process-spawner` beside it hands off nothing, since its shim would load the whole server bundle.
 
 If the spawner process dies, the providers it handed off keep running in their own process groups,
 their stdio still held by the server. The server then checks each one's process identity (PID and

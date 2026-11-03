@@ -602,8 +602,12 @@ const makeReader = Effect.fnUntraced(function* (
     let ready = false;
     let stoppedMessage: string | undefined;
     const pending = new Map<number, (reply: ReaderReply) => void>();
-    // A read transaction's BEGIN waits for its first statement and travels with it.
+    // A read transaction's BEGIN waits for its first statement and travels with it; once it has
+    // left, the reader is in a transaction until its ending statement leaves. A BEGIN or an ending
+    // statement that does not fit that state goes to the worker as an ordinary statement and brings
+    // back SQLite's error, as it always did, without touching this bookkeeping.
     let pendingBegin = false;
+    let inTransaction = false;
     // A message the worker cannot receive, such as one with an uncloneable binding, fails its
     // own statement; an ending statement with nothing waiting on it is dropped.
     const send = (message: Record<string, unknown>) => {
@@ -613,7 +617,10 @@ const makeReader = Effect.fnUntraced(function* (
         return true;
       } catch (cause) {
         // A BEGIN travelling with the message goes with the next statement instead.
-        if (message.begin === true) pendingBegin = true;
+        if (message.begin === true) {
+          pendingBegin = true;
+          inTransaction = false;
+        }
         const id = message.id as number;
         const resume = pending.get(id);
         if (resume === undefined) return false;
@@ -664,16 +671,20 @@ const makeReader = Effect.fnUntraced(function* (
 
     const request = (input: ReaderRequest) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
-        if (/^\s*BEGIN\b/i.test(input.sql)) {
+        const begins = /^\s*BEGIN\b/i.test(input.sql);
+        if (begins && !pendingBegin && !inTransaction) {
           pendingBegin = true;
           return Effect.succeed([]);
         }
-        if (endsReadTransaction(input.sql)) {
+        if (!begins && endsReadTransaction(input.sql) && (pendingBegin || inTransaction)) {
           // Ending a read transaction only drops a shared lock: it cannot fail or lose anything, so
           // nothing waits for it. The worker still runs it before the next claimant's statements.
           if (pendingBegin) pendingBegin = false;
-          else if (stoppedMessage === undefined)
-            post({ id: nextRequestId++, safeIntegers: false, ...input });
+          else {
+            inTransaction = false;
+            if (stoppedMessage === undefined)
+              post({ id: nextRequestId++, safeIntegers: false, ...input });
+          }
           return Effect.succeed([]);
         }
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
@@ -692,6 +703,7 @@ const makeReader = Effect.fnUntraced(function* (
           }
           const begin = pendingBegin;
           pendingBegin = false;
+          if (begin) inTransaction = true;
           const id = nextRequestId++;
           pending.set(id, (reply) => {
             if ("rows" in reply) {

@@ -569,6 +569,53 @@ describe("provider process hand-off", () => {
     }).pipe(Effect.provide(launcherLayer())),
   );
 
+  // As Node's ChildProcess: a command that cannot start reports its error, then closes with the
+  // negative errno as its exit code, and never exits.
+  it.live.skipIf(!linux)(
+    "closes a Node-style process whose command cannot start as Node's does",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-cannot-start-" });
+        const notExecutable = NodePath.join(dir, "not-executable");
+        yield* fs.writeFileString(notExecutable, "#!/bin/sh\n");
+        yield* fs.chmod(notExecutable, 0o644);
+        const events = (child: NodeChildProcess.ChildProcess) =>
+          Effect.callback<ReadonlyArray<string>>((resume) => {
+            const seen: Array<string> = [];
+            child.on("error", (error: NodeJS.ErrnoException) =>
+              seen.push(`error ${error.code} ${error.errno}`),
+            );
+            child.on("exit", (code, signal) => seen.push(`exit ${code} ${signal}`));
+            child.once("close", (code, signal) => {
+              seen.push(`close ${code} ${signal}`, `exitCode ${child.exitCode}`);
+              resume(Effect.succeed(seen));
+            });
+          });
+        const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        const refusing = yield* refusingLauncher;
+        const options = {
+          env: process.env,
+          stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"],
+        };
+        for (const command of ["t3-no-such-command-p1073", notExecutable]) {
+          const viaNode = yield* events(NodeChildProcess.spawn(command, [], options));
+          expect(viaNode).toContainEqual(expect.stringMatching(/^close -(2|13) null$/));
+          const handedOff = yield* events(
+            launcher.spawn(command, [], options) as unknown as NodeChildProcess.ChildProcess,
+          );
+          const fellBack = yield* events(
+            refusing.spawn(command, [], options) as unknown as NodeChildProcess.ChildProcess,
+          );
+          expect({ command, handedOff, fellBack }).toEqual({
+            command,
+            handedOff: viaNode,
+            fellBack: viaNode,
+          });
+        }
+      }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
+  );
+
   it.live.skipIf(!linux)("gives an SDK a Node-style process with its stdio, exit and close", () =>
     Effect.gen(function* () {
       const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;

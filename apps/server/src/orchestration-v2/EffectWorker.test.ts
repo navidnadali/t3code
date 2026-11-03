@@ -1148,3 +1148,64 @@ it.effect("an empty claim gives its slot back without waking a worker", () =>
     yield* Fiber.interrupt(daemon);
   }),
 );
+
+it.effect(
+  "an ungated claim frees its slot for a skipped worker; an empty claim returns it unused",
+  () =>
+    Effect.gen(function* () {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const workerId = "worker-ungated-claim";
+      const pending = [
+        admissionEffect(1, now, workerId, {
+          type: "provider-turn.interrupt",
+          providerSessionId: oldSessionId,
+          providerThreadId,
+          providerTurnId,
+        }),
+      ];
+      const freed = yield* Ref.make(0);
+      const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+        claimNext: () => Effect.sync(() => Option.fromUndefinedOr(pending.shift())),
+        get: () => Effect.succeedNone,
+        awaitCancellation: () => Effect.never,
+        clearCancellation: () => Effect.void,
+        succeed: () => Effect.succeed(true),
+      });
+      const layerExecutor = Layer.succeed(
+        EffectWorker.OrchestrationEffectExecutorV2,
+        EffectWorker.OrchestrationEffectExecutorV2.of({ execute: () => Effect.void }),
+      );
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+        Effect.provide(
+          EffectWorker.layerWithOptions({ workerId }).pipe(
+            Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+          ),
+        ),
+      );
+      // One worker, so its slot is the whole allowance: a worker refused the slot while this claim
+      // was out skipped the turn starts, and the ungated effect's claim must wake it for them.
+      const admission = yield* EffectAdmission.make({
+        workers: 1,
+        closeAbove: 40,
+        samplesToSwitch: 2,
+        sampleInterval: Duration.seconds(1),
+        pressure: Effect.succeed(Effect.succeed(5)),
+        onAllowanceRestored: Effect.void,
+        onSlotFreed: Ref.update(freed, (count) => count + 1),
+      });
+      const runOnce = worker.runOnce.pipe(
+        Effect.provideService(EffectAdmission.EffectAdmission, admission),
+      );
+      assert.isTrue(yield* runOnce);
+      assert.equal(yield* Ref.get(freed), 1);
+      // A claim that finds nothing returns the slot unused: nobody was skipped for work it holds.
+      assert.isFalse(yield* runOnce);
+      assert.equal(yield* Ref.get(freed), 1);
+      assert.deepEqual(yield* admission.state, {
+        allowed: 1,
+        inFlight: 0,
+        saturated: false,
+        sampling: false,
+      });
+    }),
+);

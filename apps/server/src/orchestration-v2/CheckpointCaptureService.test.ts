@@ -551,6 +551,8 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
             completedAt: stoppedAt,
             checkpointId: null,
             contextHandoffId: null,
+            // The workspace it ran in; the next run's scope names another.
+            ...({ workspaceCwd: "/repo" } as {}),
           },
         });
         yield* projectionStore.apply({
@@ -624,12 +626,14 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
             kind: "root_run",
             ordinalWithinParent: 0,
             advancesAppRunCount: true,
-            cwd: "/repo",
+            cwd: "/repo-next",
             createdAt: rescopedAt,
           },
         });
 
         const committed = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
+        const workspaces = new Set<string>();
+        const inWorkspace = (cwd: string) => Effect.sync(() => workspaces.add(cwd));
         const layerCapture = CheckpointCaptureService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
@@ -640,11 +644,11 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
                     IdAllocator.layer,
                     NodeCrypto.layer,
                     Layer.mock(CheckpointStore.CheckpointStore)({
-                      isGitRepository: () => Effect.succeed(true),
-                      hasCheckpointRef: () => Effect.succeed(true),
-                      captureCheckpoint: () => Effect.void,
-                      diffCheckpoints: () => Effect.succeed(""),
-                      listAuthoredPaths: () => Effect.succeed(null),
+                      isGitRepository: (cwd) => inWorkspace(cwd).pipe(Effect.as(true)),
+                      hasCheckpointRef: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as(true)),
+                      captureCheckpoint: ({ cwd }) => inWorkspace(cwd).pipe(Effect.asVoid),
+                      diffCheckpoints: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as("")),
+                      listAuthoredPaths: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as(null)),
                     }),
                   ),
                 ),
@@ -672,6 +676,8 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
           assert.equal(baseline.payload.nodeId, lateRootNodeId);
           assert.deepEqual(baseline.payload.capturedAt, requestedAt);
         }
+        // Its checkpoint and baselines are taken in its own workspace, not the thread's latest.
+        assert.deepEqual([...workspaces], ["/repo"]);
       }),
   );
 

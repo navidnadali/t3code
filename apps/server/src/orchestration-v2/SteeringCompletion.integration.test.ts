@@ -2560,6 +2560,65 @@ it.effect("a run recorded before the upgrade, captured after it, keeps its works
   ),
 );
 
+// B is reached through a symlink for runs 2 and 3; back in A, B is removed and the symlink pointed at
+// another repository. A rewind to run 1 must still drop B's stale refs, through A (one repository).
+it.effect(
+  "a rewind drops a removed worktree's stale refs though its symlink now names another repository",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* nextTurnSelectionHarness("rewind-removed-symlinked-worktree");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const thread = yield* worktreeThread(harness);
+          const link = path.join(
+            yield* fs.makeTempDirectoryScoped({ prefix: "t3-rewind-symlinked-" }),
+            "link",
+          );
+          yield* fs.symlink(thread.other, link);
+          yield* thread.switchTo(link);
+          yield* thread.nextRun(link, "edited-by-second.txt");
+          yield* thread.nextRun(link, "edited-by-third.txt");
+          yield* thread.switchTo(harness.cwd);
+          assert.equal(
+            yield* thread.git(harness.cwd, "worktree", "remove", "--force", thread.other),
+            0,
+          );
+          yield* fs.remove(link);
+          yield* fs.symlink(yield* checkpointWorkspace("rewind-removed-symlinked-elsewhere"), link);
+          const target = yield* thread.checkpointOf(thread.first.runId);
+          const laterInB = (yield* orchestrator.getThreadProjection(
+            thread.threadId,
+          )).checkpoints.filter(
+            (checkpoint) =>
+              checkpoint.status === "ready" &&
+              checkpoint.scopeId !== target.scopeId &&
+              checkpoint.ordinalWithinScope > 1,
+          );
+          assert.lengthOf(laterInB, 2);
+          yield* orchestrator.dispatch({
+            type: "checkpoint.rollback",
+            commandId: CommandId.make("revert-conversation"),
+            threadId: thread.threadId,
+            scopeId: target.scopeId,
+            checkpointId: target.id,
+            restoreFiles: false,
+          });
+          yield* worker.drain();
+          for (const checkpoint of laterInB) {
+            assert.notEqual(
+              yield* thread.git(harness.cwd, "rev-parse", "--verify", "--quiet", checkpoint.ref),
+              0,
+            );
+          }
+        }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+      }),
+    ),
+);
+
 it.effect("queues a plain send behind the stopped queue and releases its hold", () =>
   Effect.scoped(
     Effect.gen(function* () {

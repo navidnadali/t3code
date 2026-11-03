@@ -30,20 +30,18 @@ import {
   ProcessId,
 } from "effect/process/ChildProcessSpawner";
 import * as NodeChildProcess from "node:child_process";
-import * as NodeCrypto from "node:crypto";
-import * as NodeFS from "node:fs";
 import * as NodeNet from "node:net";
-import * as NodePath from "node:path";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 
 import * as ProcessRunner from "../processRunner.ts";
-import * as ServerConfig from "../config.ts";
 import { HandoffProcess, type ProviderSpawnOptions } from "./handoffProcess.ts";
 import { isPidReused, isSameProcess } from "./processIdentity.ts";
 import { answerDeadlines, type SpawnerTimers } from "./spawnerDeadlines.ts";
 import { registerSpawnerProcess } from "./spawnerProcesses.ts";
 import {
+  EXEC_AFTER_GO,
+  execAfterGoSource,
   PROCESS_SPAWNER_EXECUTABLE,
   spawnerHandshake,
   spawnerProcessSource,
@@ -96,7 +94,7 @@ type WorkerMessage =
       readonly pid: number;
       readonly startTime?: string;
     }
-  | { readonly t: "handoff" | "handoff-refused"; readonly id: number }
+  | { readonly t: "handoff-fd"; readonly id: number; readonly fd: number }
   | { readonly t: "handoff-failed"; readonly id: number; readonly error: SerializedError }
   | {
       readonly t: "error" | "throw" | "stdin-error";
@@ -154,9 +152,8 @@ const isWorkerMessage = (value: unknown): value is WorkerMessage => {
         isChildPid(message.pid) &&
         (message.startTime === undefined || typeof message.startTime === "string")
       );
-    case "handoff":
-    case "handoff-refused":
-      return true;
+    case "handoff-fd":
+      return Number.isInteger(message.fd);
     case "handoff-failed":
       return isSerializedError(message.error);
     case "data":
@@ -274,8 +271,6 @@ export interface HandoffCallbacks {
 interface HandoffEntry {
   readonly child: HandoffChild;
   readonly callbacks: HandoffCallbacks;
-  readonly socketPath: string;
-  readonly nonce: Uint8Array;
   readonly fds: ReadonlyArray<number>;
   spawned: boolean;
   settled: boolean;
@@ -288,23 +283,6 @@ interface HandoffEntry {
 
 const ORPHAN_POLL_MILLIS = 1_000;
 
-/**
- * A Unix socket path holds 107 bytes on Linux, which a state directory can exceed. Reached through
- * a descriptor of its directory, only the socket's own name counts; the kernel resolves the path
- * while the call is made, so the descriptor closes right after.
- */
-const throughDirectory = <A>(socketPath: string, use: (path: string) => A): A => {
-  const directory = NodeFS.openSync(
-    NodePath.dirname(socketPath),
-    NodeFS.constants.O_RDONLY | NodeFS.constants.O_DIRECTORY,
-  );
-  try {
-    return use(`/proc/self/fd/${directory}/${NodePath.basename(socketPath)}`);
-  } finally {
-    NodeFS.closeSync(directory);
-  }
-};
-
 /** Where spawn requests run: a worker thread or the spawner process. */
 interface Transport {
   readonly post: (message: unknown, transfer?: ReadonlyArray<ArrayBuffer>) => void;
@@ -314,7 +292,8 @@ interface Transport {
 }
 
 interface TransportEvents {
-  readonly onMessage: (message: unknown) => void;
+  /** `handle`: a descriptor the spawner passed with the message (a hand-off's stdio end). */
+  readonly onMessage: (message: unknown, handle?: unknown) => void;
   readonly onStop: (cause: unknown) => void;
 }
 
@@ -349,8 +328,10 @@ const makeRemoteHost = (options: {
   /** Arms the deadline for the transport to answer a start; without it, a start may wait for ever. */
   readonly startDeadline?: (expire: () => void) => () => void;
   readonly startDeadlineMessage?: string;
-  /** A connection to a hand-off socket did not present this server's header and was closed. */
-  readonly onHandoffRefused?: () => void;
+  /** How the spawner starts a handed-off command's shim; none means no hand-off. */
+  readonly handoffShim?: () =>
+    | { readonly command: string; readonly args: ReadonlyArray<string> }
+    | undefined;
   /** Children started by hand-off kept running when the spawner stopped; then each exit. */
   readonly onHandoffOrphans?: (count: number) => void;
   readonly onHandoffOrphanExit?: () => void;
@@ -618,42 +599,30 @@ const makeRemoteHost = (options: {
     checkOrphans();
   };
 
-  const connectHandoff = (entry: HandoffEntry) => {
+  // One stdio end of a handed-off command, passed by the spawner, which kept no copy. The command
+  // runs only once the server holds every end and says so.
+  const takeHandoffEnd = (entry: HandoffEntry, fd: number, handle: unknown) => {
     const { child } = entry;
-    let sockets: ReadonlyArray<NodeNet.Socket>;
-    try {
-      sockets = throughDirectory(entry.socketPath, (path) =>
-        entry.fds.map(() => NodeNet.connect({ path })),
-      );
-    } catch (error) {
-      return handoffUnavailable(entry, toError(error));
+    if (!(handle instanceof NodeNet.Socket)) {
+      return handoffUnavailable(entry, new Error("The process spawner passed no descriptor"));
     }
-    for (const [index, fd] of entry.fds.entries()) {
-      const socket = sockets[index]!;
-      child.sockets.set(fd, socket);
-      // Output waits for its reader; stdin and held descriptors are never read.
-      socket.pause();
-      if (!child.referenced) socket.unref();
-      socket.once("connect", () => {
-        const header = new Uint8Array(entry.nonce.byteLength + 1);
-        header.set(entry.nonce);
-        header[entry.nonce.byteLength] = fd;
-        socket.write(header);
-      });
-      socket.on("error", (error) => {
-        if (!entry.spawned) handoffUnavailable(entry, error);
-      });
+    if (entry.settled || !entry.fds.includes(fd) || child.sockets.has(fd)) {
+      handle.destroy();
+      return;
     }
+    // Output waits for its reader; stdin and held descriptors are never read.
+    handle.pause();
+    if (!child.referenced) handle.unref();
+    handle.on("error", () => {});
+    child.sockets.set(fd, handle);
+    if (child.sockets.size === entry.fds.length) post({ t: "handoff-go", id: child.id });
   };
 
-  const onHandoffMessage = (entry: HandoffEntry, message: WorkerMessage) => {
+  const onHandoffMessage = (entry: HandoffEntry, message: WorkerMessage, handle: unknown) => {
     const { child } = entry;
     switch (message.t) {
-      case "handoff":
-        if (!entry.settled) connectHandoff(entry);
-        return;
-      case "handoff-refused":
-        options.onHandoffRefused?.();
+      case "handoff-fd":
+        takeHandoffEnd(entry, message.fd, handle);
         return;
       case "handoff-failed":
         handoffUnavailable(entry, reviveError(message.error));
@@ -722,9 +691,11 @@ const makeRemoteHost = (options: {
     }
   };
 
-  const onMessage = (message: WorkerMessage) => {
+  const onMessage = (message: WorkerMessage, handle: unknown) => {
     const handoff = handoffs.get(message.id);
-    if (handoff !== undefined) return onHandoffMessage(handoff, message);
+    if (handoff !== undefined) return onHandoffMessage(handoff, message, handle);
+    // A descriptor for a start the server no longer waits for.
+    if (handle instanceof NodeNet.Socket) handle.destroy();
     const entry = entries.get(message.id);
     if (entry === undefined) return;
     const { child } = entry;
@@ -815,9 +786,12 @@ const makeRemoteHost = (options: {
     generation = current;
     try {
       const opened = options.open({
-        onMessage: (message) => {
-          if (generation !== current) return;
-          if (isWorkerMessage(message)) onMessage(message);
+        onMessage: (message, handle) => {
+          if (generation !== current) {
+            if (handle instanceof NodeNet.Socket) handle.destroy();
+            return;
+          }
+          if (isWorkerMessage(message)) onMessage(message, handle);
           else stop(new Error("The spawner sent a malformed message"));
         },
         onStop: (cause) => {
@@ -927,7 +901,7 @@ const makeRemoteHost = (options: {
     command: string,
     args: ReadonlyArray<string>,
     spawnOptions: Record<string, unknown>,
-    request: { readonly dir: string; readonly fds: ReadonlyArray<number> },
+    request: { readonly fds: ReadonlyArray<number> },
     callbacks: HandoffCallbacks,
   ): HandoffChild => {
     ensureTransport();
@@ -943,16 +917,18 @@ const makeRemoteHost = (options: {
       referenced: true,
       released: false,
     };
-    const socketPath = NodePath.join(request.dir, NodeCrypto.randomBytes(12).toString("base64url"));
     if (transport === undefined) {
       callbacks.onUnavailable(new Error(options.stoppedMessage, { cause: failure }));
+      return child;
+    }
+    const shim = options.handoffShim?.();
+    if (shim === undefined) {
+      callbacks.onUnavailable(new Error("This process spawner hands off no commands"));
       return child;
     }
     const entry: HandoffEntry = {
       child,
       callbacks,
-      socketPath,
-      nonce: NodeCrypto.randomBytes(16),
       fds: request.fds,
       spawned: false,
       settled: false,
@@ -969,8 +945,9 @@ const makeRemoteHost = (options: {
       id,
       command,
       args,
-      options: spawnOptions,
-      handoff: { path: socketPath, nonce: entry.nonce, fds: request.fds },
+      // Node's spawn would pass the server's environment when none is given.
+      options: { ...spawnOptions, env: spawnOptions.env ?? process.env },
+      handoff: { fds: request.fds, shim },
     });
     entry.cancelStartDeadline = options.startDeadline?.(() => {
       entry.cancelStartDeadline = undefined;
@@ -1260,8 +1237,9 @@ const openSpawnerProcess =
       stopWhenDrained();
     });
     starts.unref();
-    spawner.on("message", (message: unknown) => {
-      if (answered) return events.onMessage(message);
+    spawner.on("message", (message: unknown, handle: unknown) => {
+      if (answered) return events.onMessage(message, handle);
+      if (handle instanceof NodeNet.Socket) handle.destroy();
       const { expected } = handshake;
       const ready = message as { t?: unknown; protocol?: unknown; build?: unknown } | null;
       if (ready?.t !== "ready") return refuse("answered with something other than its handshake");
@@ -1823,13 +1801,14 @@ export const makeProcessSpawnerWithHost = Effect.fnUntraced(function* (
     onRetry: () => {
       runLog(Effect.logWarning("Process spawner starting again after its cool-down"));
     },
-    onHandoffRefused: () => {
-      runLog(
-        Effect.logWarning(
-          "A connection to a provider hand-off socket did not present this server's header; it was closed",
-        ),
-      );
-    },
+    // The spawner executable, or the server's own Node with the shim's script: never the whole
+    // server bundle per command, so a single executable without the spawner executable hands off nothing.
+    handoffShim: () =>
+      launch.command !== executable
+        ? { command: launch.command, args: [EXEC_AFTER_GO] }
+        : isExecutable
+          ? undefined
+          : { command: executable, args: ["-e", execAfterGoSource] },
     onHandoffOrphans: (count) => {
       runLog(
         Effect.logWarning(
@@ -1977,7 +1956,6 @@ const handoffView = (child: HandoffChild): HandoffView => {
 const makeHandoffSpawner = Effect.fnUntraced(function* (
   node: ChildProcessSpawner["Service"],
   host: RemoteHost,
-  dir: string,
   warn: (reason: Error) => Effect.Effect<void>,
 ) {
   const { platform, spawnWith } = yield* makeChildHandles();
@@ -1989,7 +1967,7 @@ const makeHandoffSpawner = Effect.fnUntraced(function* (
             command.command,
             command.args,
             { ...spawnOptions, stdio: ["ignore", "ignore", "ignore"] },
-            { dir, fds: [0, 1, 2] },
+            { fds: [0, 1, 2] },
             {
               onSpawn: () => resume(Effect.succeed(handoffView(child))),
               onError: (error) => resume(Effect.fail(toPlatformError("spawn", error, command))),
@@ -2005,8 +1983,14 @@ const makeHandoffSpawner = Effect.fnUntraced(function* (
   };
   return makeSpawner((command) =>
     Effect.gen(function* () {
-      // Its own group: a spawner that stops ends its own group, never a running provider's.
-      if (platform !== "linux" || !runsOnWorker(command) || command.options.detached === false) {
+      // Its own group: a spawner that stops ends its own group, never a running provider's. A
+      // shell command is not resolved the way the spawner resolves a handed-off one.
+      if (
+        platform !== "linux" ||
+        !runsOnWorker(command) ||
+        command.options.detached === false ||
+        command.options.shell
+      ) {
         return yield* node.spawn(command);
       }
       return yield* spawnWith(command, handedOff).pipe(
@@ -2069,9 +2053,31 @@ const directLauncher = (node: ChildProcessSpawner["Service"]) =>
   });
 
 /**
+ * The provider launcher over a spawner process's host: hand-off where it can, else Node's spawner
+ * with a warning. `layerProviderLauncher` builds it over the server's own spawner process.
+ */
+export const makeProviderLauncher = Effect.fnUntraced(function* (
+  node: ChildProcessSpawner["Service"],
+  host: RemoteHost,
+) {
+  const runLog = Effect.runSyncExitWith(yield* Effect.context<never>());
+  const warn = (reason: Error) =>
+    Effect.logWarning(
+      "Provider process hand-off failed; this one starts on Node's spawner",
+      reason,
+    );
+  const spawner = yield* makeHandoffSpawner(node, host, warn);
+  return ProviderProcessLauncher.of({
+    spawn: (command, args, options) =>
+      new HandoffProcess(host, command, args, options, (reason) => runLog(warn(reason))),
+    spawner,
+  });
+});
+
+/**
  * Provider processes start by hand-off from the spawner process (Linux, when the process
  * spawner is on) unless `T3CODE_PROVIDER_SPAWNER` says direct: Node's spawner on the event loop,
- * as before. Hand-off sockets live in a directory only the server's user can enter.
+ * as before. Their stdio pass from the spawner to the server over its channel, never by a path.
  */
 export const layerProviderLauncher = Layer.effect(
   ProviderProcessLauncher,
@@ -2091,33 +2097,6 @@ export const layerProviderLauncher = Layer.effect(
     if (choice !== "handoff" || host === undefined || platform !== "linux") {
       return directLauncher(node);
     }
-    const { stateDir } = yield* ServerConfig.ServerConfig;
-    const dir = NodePath.join(stateDir, "spawner");
-    const prepared = yield* Effect.try(() => {
-      NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      NodeFS.chmodSync(dir, 0o700);
-      const info = NodeFS.statSync(dir);
-      if (!info.isDirectory() || info.uid !== globalThis.process.getuid?.()) {
-        throw new Error(`${dir} is not a directory this user owns`);
-      }
-    }).pipe(Effect.option);
-    if (Option.isNone(prepared)) {
-      yield* Effect.logWarning(
-        `Provider processes start on Node's spawner: the hand-off directory ${dir} is unusable`,
-      );
-      return directLauncher(node);
-    }
-    const runLog = Effect.runSyncExitWith(yield* Effect.context<never>());
-    const warn = (reason: Error) =>
-      Effect.logWarning(
-        "Provider process hand-off failed; this one starts on Node's spawner",
-        reason,
-      );
-    const spawner = yield* makeHandoffSpawner(node, host, dir, warn);
-    return ProviderProcessLauncher.of({
-      spawn: (command, args, options) =>
-        new HandoffProcess(host, dir, command, args, options, (reason) => runLog(warn(reason))),
-      spawner,
-    });
+    return yield* makeProviderLauncher(node, host);
   }),
 ).pipe(Layer.provide(layerFromConfig));

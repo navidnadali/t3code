@@ -2,6 +2,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeNet from "node:net";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -21,7 +22,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as ServerConfig from "../config.ts";
 import { isPidReused, isSameProcess } from "./processIdentity.ts";
 import { spawnerProcessIds } from "./spawnerProcesses.ts";
-import { spawnerProcessSource } from "./spawnerSources.ts";
+import { execAfterGoSource, spawnerProcessSource } from "./spawnerSources.ts";
 import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
 
 // Hand-off identifies a provider by /proc start time, so it runs on Linux only.
@@ -108,22 +109,63 @@ const rawSpawner = Effect.gen(function* () {
     detached: true,
   });
   spawner.stdout!.resume();
-  yield* Effect.addFinalizer(() => Effect.sync(() => spawner.disconnect()));
-  const received: Array<Record<string, unknown>> = [];
-  const waiters: Array<{ t: string; done: () => void }> = [];
-  spawner.on("message", (message: Record<string, unknown>) => {
-    received.push(message);
-    const matching = waiters.filter((waiter) => waiter.t === message.t);
-    waiters.splice(0, waiters.length, ...waiters.filter((waiter) => waiter.t !== message.t));
-    for (const waiter of matching) waiter.done();
+  const received: Array<{ readonly message: Record<string, unknown>; readonly handle: unknown }> =
+    [];
+  const waiters = new Set<() => void>();
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      spawner.disconnect();
+      for (const { handle } of received) if (handle instanceof NodeNet.Socket) handle.destroy();
+    }),
+  );
+  spawner.on("message", (message: Record<string, unknown>, handle: unknown) => {
+    received.push({ message, handle });
+    for (const wake of waiters) wake();
   });
-  const next = (t: string) =>
-    Effect.callback<void>((resume) => {
-      if (received.some((message) => message.t === t)) return resume(Effect.void);
-      waiters.push({ t, done: () => resume(Effect.void) });
+  const until = <A>(pick: () => A | undefined) =>
+    Effect.callback<A>((resume) => {
+      const check = () => {
+        const found = pick();
+        if (found === undefined) return;
+        waiters.delete(check);
+        resume(Effect.succeed(found));
+      };
+      waiters.add(check);
+      check();
+      return Effect.sync(() => waiters.delete(check));
+    });
+  const next = (t: string, id?: number) =>
+    until(
+      () =>
+        received.find(({ message }) => message.t === t && (id === undefined || message.id === id))
+          ?.message,
+    );
+  // The stdio ends the spawner passed for a start, by descriptor, once there are `count`.
+  const ends = (id: number, count: number) =>
+    until(() => {
+      const passed = received.filter(
+        ({ message, handle }) =>
+          message.t === "handoff-fd" && message.id === id && handle instanceof NodeNet.Socket,
+      );
+      if (passed.length < count) return undefined;
+      return new Map(
+        passed.map(({ message, handle }) => [message.fd as number, handle as NodeNet.Socket]),
+      );
     });
   yield* next("ready");
-  return { spawner, next };
+  return { spawner, next, ends };
+});
+
+// A launcher over a spawner that refuses every hand-off: each start falls back to Node's spawner.
+const refusingLauncher = Effect.gen(function* () {
+  const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const source = spawnerProcessSource.replace(
+    "const startHandoff = (message) => {",
+    'const startHandoff = (message) => {\n  if (message) return post({ t: "handoff-failed", id: message.id, error: { name: "Error", message: "no hand-off here" } });',
+  );
+  expect(source).not.toBe(spawnerProcessSource);
+  const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node, { source });
+  return yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
 });
 
 // A process of the server's own user that races every socket appearing under the state directory:
@@ -222,12 +264,13 @@ describe("provider process hand-off", () => {
   it.live.skipIf(!linux)(
     "gives a provider the same stdio through hand-off as through Node's spawner",
     () => {
-      // Each descriptor's type, terminal and open flags (blocking mode included), then stdin's EOF.
+      // Each descriptor's type, terminal and open flags (blocking mode included), its other open
+      // descriptors, signal mask and dispositions, limits, then stdin's EOF.
       const probe = ChildProcess.make(
         "/bin/sh",
         [
           "-c",
-          'for fd in 0 1 2; do echo "$fd $(stat -L -c %F /proc/$$/fd/$fd) $([ -t $fd ] && echo tty || echo notty) $(grep ^flags /proc/$$/fdinfo/$fd)"; done; wc -c; echo stderr >&2',
+          'for fd in 0 1 2; do echo "$fd $(stat -L -c %F /proc/$$/fd/$fd) $([ -t $fd ] && echo tty || echo notty) $(grep ^flags /proc/$$/fdinfo/$fd)"; done; ls /proc/$$/fd | tr "\\n" " "; echo; grep -E "^Sig(Blk|Ign)" /proc/$$/status; cat /proc/$$/limits; wc -c; echo stderr >&2',
         ],
         { stdin: Stream.make(new TextEncoder().encode("abc")) },
       );
@@ -251,6 +294,130 @@ describe("provider process hand-off", () => {
         expect(yield* seen("handoff")).toEqual(direct);
       });
     },
+  );
+
+  // Exactly its environment, names a shell would drop or values it would reset included.
+  it.live.skipIf(!linux)("gives a provider exactly its environment through hand-off", () => {
+    const env = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      "my-var": "1",
+      "A.B": "2",
+      IFS: "x",
+      OPTIND: "3",
+      PPID: "123",
+      _: "/not/the/command",
+      PWD: "/not/the/cwd",
+      NODE_OPTIONS: "",
+      MULTI_LINE: "one\ntwo\n",
+    };
+    const seen = (knob: string) =>
+      Effect.gen(function* () {
+        const { spawner } = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        return JSON.parse(
+          yield* spawner.string(
+            ChildProcess.make(
+              process.execPath,
+              ["-e", "process.stdout.write(JSON.stringify(process.env))"],
+              { env, extendEnv: false, cwd: NodeOS.tmpdir() },
+            ),
+          ),
+        ) as Record<string, string>;
+      }).pipe(Effect.provide(launcherLayer({ T3CODE_PROVIDER_SPAWNER: knob })));
+    return Effect.gen(function* () {
+      const direct = yield* seen("direct");
+      expect(direct).toEqual(env);
+      expect(yield* seen("handoff")).toEqual(direct);
+    });
+  });
+
+  // A secret in a provider's environment is readable by its own user only (/proc/<pid>/environ),
+  // never by everyone (/proc/<pid>/cmdline), at any point of a hand-off.
+  it.live.skipIf(!linux)("never puts a provider's environment on any process's argv", () =>
+    Effect.gen(function* () {
+      const secret = `t3-secret-${NodeCrypto.randomUUID()}`;
+      // Reads every process's argv until stdin closes, then says whether the secret was there.
+      const watcher = NodeChildProcess.spawn(
+        process.execPath,
+        [
+          "-e",
+          `const fs = require("node:fs"); let seen = 0, scans = 0, open = true;
+           process.stdin.on("end", () => (open = false)).resume();
+           const scan = () => {
+             for (const pid of fs.readdirSync("/proc")) {
+               if (!/^\\d+$/.test(pid)) continue;
+               try { if (fs.readFileSync("/proc/" + pid + "/cmdline", "latin1").includes(process.env.T3_WATCH_FOR)) seen += 1; } catch {}
+             }
+             scans += 1;
+             if (open) setImmediate(scan); else process.stdout.write(JSON.stringify({ seen, scans }));
+           };
+           scan();`,
+        ],
+        // In its environment, not on its argv: it looks for the secret in every argv.
+        { stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, T3_WATCH_FOR: secret } },
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => watcher.kill("SIGKILL")));
+      const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+      const env = { ...process.env, T3_TEST_SECRET: secret };
+      const script =
+        "process.stdout.write(process.env.T3_TEST_SECRET === undefined ? 'missing' : 'present')";
+      const outputs: Array<string> = [];
+      for (let index = 0; index < 6; index++) {
+        outputs.push(
+          yield* launcher.spawner.string(
+            ChildProcess.make(process.execPath, ["-e", script], { env, extendEnv: false }),
+          ),
+        );
+        const nodeStyle = launcher.spawn(process.execPath, ["-e", script], {
+          env,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        outputs.push(
+          yield* Effect.callback<string>((resume) => {
+            let output = "";
+            nodeStyle.stdout!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+            nodeStyle.stderr!.resume();
+            nodeStyle.once("close", () => resume(Effect.succeed(output)));
+          }),
+        );
+      }
+      const watched = yield* Effect.callback<{ seen: number; scans: number }>((resume) => {
+        let output = "";
+        watcher.stdout!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+        watcher.stdout!.on("end", () => resume(Effect.succeed(JSON.parse(output))));
+        watcher.stdin!.end();
+      });
+      expect(outputs).toEqual(Array.from({ length: 12 }, () => "present"));
+      expect(watched.seen).toBe(0);
+      expect(watched.scans).toBeGreaterThan(0);
+    }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
+  );
+
+  // The provider's NODE_OPTIONS (a --require, V8 flags) applies to the provider, never to the shim
+  // that becomes it.
+  it.live.skipIf(!linux)("applies a provider's NODE_OPTIONS to the provider alone", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-require-" });
+      const log = NodePath.join(directory, "required.log");
+      const marker = NodePath.join(directory, "marker.cjs");
+      yield* fs.writeFileString(
+        marker,
+        `require("node:fs").appendFileSync(${JSON.stringify(log)}, process.argv.slice(1).join(" ") + "\\n");`,
+      );
+      const { spawner } = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+      const output = yield* spawner.string(
+        ChildProcess.make(
+          process.execPath,
+          ["-e", "process.stdout.write('provider')", "the-provider"],
+          {
+            env: { ...process.env, NODE_OPTIONS: `--require ${marker}` },
+            extendEnv: false,
+          },
+        ),
+      );
+      expect(output).toBe("provider");
+      expect(yield* fs.readFileString(log)).toBe("the-provider\n");
+    }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
   );
 
   it.live.skipIf(!linux)(
@@ -308,15 +475,29 @@ describe("provider process hand-off", () => {
           ),
         );
         expect(direct).toBe(process.pid);
-        // Its socket directory gone: this hand-off fails, the start does not.
-        const fallback = yield* Effect.gen(function* () {
-          const fs = yield* FileSystem.FileSystem;
-          const { stateDir } = yield* ServerConfig.ServerConfig;
-          yield* fs.remove(NodePath.join(stateDir, "spawner"), { recursive: true });
-          return yield* parentOf;
-        }).pipe(Effect.provide(launcherLayer()));
-        expect(fallback).toBe(process.pid);
-        expect(logs.some(({ text }) => text.includes("hand-off failed"))).toBe(true);
+        // A spawner that cannot hand off: each start fails over to Node's spawner, both kinds.
+        const launcher = yield* refusingLauncher;
+        const fallback = Number(
+          yield* launcher.spawner.string(
+            ChildProcess.make(process.execPath, [
+              "-e",
+              "process.stdout.write(String(process.ppid))",
+            ]),
+          ),
+        );
+        const nodeStyle = launcher.spawn(
+          process.execPath,
+          ["-e", "process.stdout.write(String(process.ppid))"],
+          { env: process.env, stdio: ["pipe", "pipe", "pipe"] },
+        );
+        const nodeStyleParent = yield* Effect.callback<number>((resume) => {
+          let output = "";
+          nodeStyle.stdout!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+          nodeStyle.stderr!.resume();
+          nodeStyle.once("close", () => resume(Effect.succeed(Number(output))));
+        });
+        expect([fallback, nodeStyleParent]).toEqual([process.pid, process.pid]);
+        expect(logs.filter(({ text }) => text.includes("hand-off failed")).length).toBe(2);
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, logLayer)));
     },
   );
@@ -387,7 +568,6 @@ describe("provider process hand-off", () => {
     "never kills the group of a process that took the PID of an unanswered hand-off start",
     () =>
       Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
         const node = yield* ChildProcessSpawner.ChildProcessSpawner;
         // Leads its own group, as a process that took the started child's PID would.
         const stranger = NodeChildProcess.spawn("sleep", ["30"], {
@@ -398,17 +578,16 @@ describe("provider process hand-off", () => {
         yield* Effect.addFinalizer(() => Effect.sync(() => stranger.kill("SIGKILL")));
         // The spawner reports the stranger's PID for this start, then dies before answering it.
         const reported = "if (child.pid !== undefined) started(id, child.pid";
-        const answered =
-          'child.on("spawn", () => post({ t: "spawn", id, pid: child.pid, startTime }));';
+        const answered = 'child.on("spawn", () => {\n    if (cancelled) return;';
         const source = WorkerChildProcessSpawner.spawnerProcessSource
           .replace(
-            `const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);\n    ${reported}`,
-            `const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);\n    if (child.pid !== undefined) started(id, Number(message.args.at(-1))`,
+            `const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);\n  ${reported}`,
+            `const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);\n  if (child.pid !== undefined) started(id, Number(message.args.at(-1))`,
           )
           .replace(
             answered,
-            // Its PID line has long reached the server when it dies.
-            'child.on("spawn", () => setTimeout(() => process.kill(process.pid, "SIGKILL"), 500));',
+            // Its PID line has long reached the server when it dies, before passing any descriptor.
+            'child.on("spawn", () => {\n    setTimeout(() => process.kill(process.pid, "SIGKILL"), 500);\n    return;',
           );
         expect(source.match(/message\.args\.at\(-1\)|process\.kill\(process\.pid/g)).toHaveLength(
           2,
@@ -416,14 +595,12 @@ describe("provider process hand-off", () => {
         const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node, {
           source,
         });
-        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-" });
-        yield* fs.chmod(dir, 0o700);
         const outcome = yield* Effect.callback<string>((resume) => {
           host!.spawnHandoff(
             process.execPath,
             ["-e", "", String(stranger.pid)],
             { env: process.env, stdio: ["ignore", "ignore", "ignore"], detached: true },
-            { dir, fds: [0, 1, 2] },
+            { fds: [0, 1, 2] },
             {
               onSpawn: () => resume(Effect.succeed("spawned")),
               onError: (error) => resume(Effect.succeed(`error: ${error.message}`)),
@@ -515,11 +692,8 @@ describe("provider process hand-off", () => {
     "passes a provider's closed stdin to the SDK as an error when it starts on Node's spawner",
     () =>
       Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const { stateDir } = yield* ServerConfig.ServerConfig;
-        // No socket directory: this start falls back to Node's spawner.
-        yield* fs.remove(NodePath.join(stateDir, "spawner"), { recursive: true });
-        const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        // This start falls back to Node's spawner.
+        const launcher = yield* refusingLauncher;
         const child = launcher.spawn("/bin/sh", ["-c", "exec 0<&-; sleep 5"], {
           env: process.env,
           stdio: ["pipe", "pipe", "pipe"],
@@ -533,95 +707,59 @@ describe("provider process hand-off", () => {
           child.stdin!.write(Buffer.alloc(4 * 1024 * 1024));
         });
         expect(error).toBe("EPIPE");
-      }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  // The server forgets a start it cancelled once the spawner's answer says it is over.
-  it.live.skipIf(!linux)("answers a hand-off cancelled before its command ran with its end", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-" });
-      const { spawner, next } = yield* rawSpawner;
-      spawner.send({
-        t: "spawn",
-        id: 1,
-        command: process.execPath,
-        args: ["-e", ""],
-        options: { env: process.env, stdio: ["ignore", "ignore", "ignore"], detached: true },
-        handoff: {
-          path: NodePath.join(directory, "provider"),
-          nonce: new Uint8Array(NodeCrypto.randomBytes(16)),
-          fds: [0, 1, 2],
-        },
-      });
-      yield* next("handoff");
-      spawner.send({ t: "handoff-cancel", id: 1 });
-      const ended = yield* next("close").pipe(
-        Effect.as(true),
-        Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.succeed(false) }),
-      );
-      expect(ended).toBe(true);
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
-
+  // The spawner passes each stdio end over its channel and keeps none; the command runs only once
+  // the server says it holds them all, and a start cancelled before that never runs.
   it.live.skipIf(!linux)(
-    "refuses a connection without the server's header: it never becomes a provider's stdio",
+    "passes a hand-off's stdio over its channel and runs it only when told",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-" });
-        const { spawner, next } = yield* rawSpawner;
-        const path = NodePath.join(directory, "provider");
-        const nonce = NodeCrypto.randomBytes(16);
-        spawner.send({
-          t: "spawn",
-          id: 1,
-          command: process.execPath,
-          args: ["-e", "process.stdin.pipe(process.stdout)"],
-          options: { env: process.env, stdio: ["ignore", "ignore", "ignore"], detached: true },
-          handoff: { path, nonce: new Uint8Array(nonce), fds: [0, 1] },
-        });
-        yield* next("handoff");
-        const connect = (header: Buffer | undefined) =>
-          Effect.callback<NodeNet.Socket>((resume) => {
-            const socket = NodeNet.connect({ path }, () => {
-              if (header !== undefined) socket.write(header);
-              resume(Effect.succeed(socket));
-            });
-            socket.on("error", () => {});
+        const { spawner, next, ends } = yield* rawSpawner;
+        const start = (id: number, marker: string) =>
+          spawner.send({
+            t: "spawn",
+            id,
+            command: process.execPath,
+            args: [
+              "-e",
+              `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran"); process.stdin.pipe(process.stdout);`,
+            ],
+            options: { env: process.env, stdio: ["ignore", "ignore", "ignore"], detached: true },
+            handoff: {
+              fds: [0, 1, 2],
+              shim: { command: process.execPath, args: ["-e", execAfterGoSource] },
+            },
           });
-        const closed = (socket: NodeNet.Socket) =>
-          Effect.callback<void>((resume) => {
-            if (socket.closed) return resume(Effect.void);
-            socket.once("close", () => resume(Effect.void));
-          });
-        // Another nonce, then nothing at all: one is refused at once, the other when the start completes.
-        const forged = yield* connect(
-          Buffer.concat([NodeCrypto.randomBytes(16), Buffer.from([0])]),
-        );
-        yield* next("handoff-refused");
-        yield* closed(forged);
-        const silent = yield* connect(undefined);
-        const stdin = yield* connect(Buffer.concat([nonce, Buffer.from([0])]));
-        const stdout = yield* connect(Buffer.concat([nonce, Buffer.from([1])]));
+        const ranMarker = NodePath.join(directory, "ran");
+        start(1, ranMarker);
+        const held = yield* ends(1, 3);
+        expect([...held.keys()].toSorted()).toEqual([0, 1, 2]);
+        expect(yield* fs.exists(ranMarker)).toBe(false);
+        spawner.send({ t: "handoff-go", id: 1 });
         yield* next("spawn");
-        yield* closed(silent);
         const echoed = yield* Effect.callback<string>((resume) => {
           let output = "";
-          stdout.on("data", (chunk: Buffer) => (output += chunk.toString()));
-          stdout.on("end", () => resume(Effect.succeed(output)));
-          stdin.end("only the server's own connections reach the provider");
+          held.get(1)!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+          held.get(1)!.on("end", () => resume(Effect.succeed(output)));
+          held.get(2)!.resume();
+          held.get(0)!.end("only the server holds this provider's stdio");
         });
-        expect(echoed).toBe("only the server's own connections reach the provider");
-        // The listener is gone once the start completed.
-        const late = yield* Effect.callback<string>((resume) => {
-          const socket = NodeNet.connect({ path });
-          socket.on("connect", () => resume(Effect.succeed("connected")));
-          socket.on("error", (error: NodeJS.ErrnoException) =>
-            resume(Effect.succeed(String(error.code))),
-          );
+        expect(echoed).toBe("only the server holds this provider's stdio");
+        // Cancelled once its ends were passed, before the go: it ends without running.
+        const cancelledMarker = NodePath.join(directory, "cancelled");
+        start(2, cancelledMarker);
+        for (const end of (yield* ends(2, 3)).values()) end.destroy();
+        spawner.send({ t: "handoff-cancel", id: 2 });
+        const exit = yield* next("exit", 2);
+        yield* next("close", 2);
+        expect({ code: exit.code, ran: yield* fs.exists(cancelledMarker) }).toEqual({
+          code: 125,
+          ran: false,
         });
-        expect(late).toBe("ENOENT");
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

@@ -185,9 +185,10 @@ small spawner process, started once while the server is small, so the server doe
 
 Output, exit codes, errors, timeouts and kills are the same.
 
-On Linux, provider processes start from the spawner process too, by hand-off: the spawner forks each
-one with Unix sockets the server holds as its stdin, stdout and stderr, so its I/O never passes
-through the spawner, and a burst of session starts no longer holds the event loop for one fork each:
+On Linux, provider processes start from the spawner process too, by hand-off: the spawner starts each
+one with ordinary pipes as its stdin, stdout and stderr and passes their ends to the server over its
+channel, keeping no copy, so the provider's I/O never passes through the spawner, and a burst of
+session starts no longer holds the event loop for one fork each:
 
 - Claude sessions, through the Agent SDK's spawn hook: one per session start or restart (100 or 250 in
   a burst when as many sessions start);
@@ -245,11 +246,21 @@ logs a warning at start.
 - `direct`, `default`, `0`, `false` or `off`: Node's spawner on the event loop, as before.
 
 Any other value is logged as an error and keeps Node's spawner. Unlike a command, a provider whose
-hand-off fails (the spawner stopped or cooling down, its socket directory unusable, a refused
-connection) starts on Node's spawner, with a warning, instead of failing. The hand-off sockets live in
-`<state dir>/spawner`, a directory only the server's user can enter (mode 0700, owner checked). Each
-start listens on its own unpredictable name and accepts only its own connections, each opened with a
-random 16-byte token, then closes and removes the socket; any other connection is refused and logged.
+hand-off fails (the spawner stopped or cooling down, a descriptor it could not pass) starts on Node's
+spawner, with a warning, instead of failing. No path or name leads to a provider's stdio: only the
+spawner, briefly, and then the server hold them, so no other process, of this user or another, can
+read or write them.
+
+Each provider starts as a small shim, the spawner executable itself (`t3-process-spawner
+__exec-after-go`, or the server's Node with the shim's script outside single executables), with an
+empty environment, so nothing of the provider's own (`NODE_OPTIONS` included) applies to it. The shim
+waits until the server holds every end, then receives the file, argv and environment on descriptor 3
+and becomes the provider with `execve`: same PID and process group, exactly its environment,
+descriptor 3 closed, and SIGPIPE and SIGXFSZ at their defaults, as after Node's spawn. The
+environment is never on any process's argv (`/proc/<pid>/cmdline`, which every user can read). Each
+shim costs about 8 MiB of private memory and 10–20 ms of CPU, outside the server, until it becomes the
+provider. A single executable without `t3-process-spawner` beside it hands off nothing, since its
+shim would load the whole server bundle.
 
 If the spawner process dies, the providers it handed off keep running in their own process groups,
 their stdio still held by the server. The server then checks each one's process identity (PID and

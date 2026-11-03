@@ -26,7 +26,7 @@ export interface HandoffHost {
     command: string,
     args: ReadonlyArray<string>,
     spawnOptions: Record<string, unknown>,
-    request: { readonly dir: string; readonly fds: ReadonlyArray<number> },
+    request: { readonly fds: ReadonlyArray<number> },
     callbacks: HandoffCallbacks,
   ) => HandoffChild;
   readonly abandonHandoff: (child: HandoffChild) => void;
@@ -76,7 +76,6 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
 
   constructor(
     host: HandoffHost,
-    dir: string,
     command: string,
     args: ReadonlyArray<string>,
     options: ProviderSpawnOptions,
@@ -115,7 +114,7 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
       command,
       args,
       { cwd: options.cwd, env: options.env, stdio: placeholders, detached: true },
-      { dir, fds },
+      { fds },
       {
         onSpawn: () => this.#joinHandedOff(host),
         onError: (error) => this.#fail(error),

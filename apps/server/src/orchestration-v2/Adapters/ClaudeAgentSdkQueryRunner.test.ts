@@ -571,7 +571,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
         undefined,
         WorkerChildProcessSpawner.ProviderProcessLauncher.of({
           spawn: (command, args, options) =>
-            new HandoffProcess(host, NodeOS.tmpdir(), command, args, options, () => {}),
+            new HandoffProcess(host, command, args, options, () => {}),
           spawner: undefined as never,
         }),
       );

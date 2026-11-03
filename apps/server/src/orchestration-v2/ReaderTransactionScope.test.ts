@@ -648,6 +648,77 @@ it.effect.each(readCases)(
     ),
 );
 
+it.effect("reads a timeline page in as many statements whatever its length", () =>
+  withFileStore(
+    "reader-scope-timeline-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("timeline", 20);
+      const [short, long] = yield* Effect.forEach([1, 50], (limit) =>
+        traced(store.getTimelinePage(fixture.fork, { limit, view: "activity" })),
+      );
+      const lengths = [short!.exit, long!.exit].map((exit) =>
+        Exit.isSuccess(exit) ? exit.value.items.length : -1,
+      );
+      assert.strictEqual(lengths[0], 1);
+      assert.isAbove(lengths[1]!, 20);
+      assert.strictEqual(long!.statements.length, short!.statements.length);
+    }),
+  ),
+);
+
+// Collapses whitespace so a statement can be matched by how it starts.
+const statementShape = (query: string) => query.replace(/\s+/g, " ").trim();
+
+// A projection's table reads go to the reader together, not one round trip after another: the
+// first waits until the last has started, which only happens if neither waits for the other.
+const projectionReads: ReadonlyArray<PermitCase> = [
+  {
+    name: "thread snapshot window",
+    read: (store, fixture) => store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
+  },
+  {
+    name: "thread snapshot",
+    read: (store, fixture) => store.getThreadSnapshot(fixture.fork),
+  },
+  {
+    name: "thread records",
+    read: (store, fixture) => store.getThreadRecords(fixture.fork, ["runs", "contextTransfers"]),
+  },
+];
+
+it.effect.each(projectionReads)("sends the $name table reads to the reader together", ({ read }) =>
+  withFileStore(
+    "reader-scope-together-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("together", 2);
+      const lastStarted = yield* Deferred.make<void>();
+      const waitForLast: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          const [query, params] = statement.compile();
+          const shape = statementShape(query);
+          if (params.includes(fixture.fork)) {
+            if (
+              shape.startsWith(
+                "SELECT payload_json FROM orchestration_v2_projection_context_transfers",
+              )
+            )
+              yield* Deferred.succeed(lastStarted, undefined);
+            else if (shape.startsWith("SELECT payload_json FROM orchestration_v2_projection_runs"))
+              yield* Deferred.await(lastStarted);
+          }
+          return statement;
+        });
+      const exit = yield* read(store, fixture).pipe(
+        Effect.provideService(Statement.CurrentTransformer, waitForLast),
+        Effect.exit,
+      );
+      assert.isTrue(Exit.isSuccess(exit));
+    }),
+  ),
+);
+
 const toolItem = (input: {
   readonly id: string;
   readonly threadId: ThreadId;
@@ -849,6 +920,115 @@ it.effect.each(consistencyCases)(
     ),
 );
 
+// A snapshot window's reads that need only the thread id go to the reader with its thread row:
+// that read waits until they have started, which only happens if none waits for another.
+it.effect("sends a snapshot window's first reads to the reader together", () =>
+  withFileStore(
+    "reader-scope-window-first-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("window-first", 2);
+      const sequence = yield* Deferred.make<void>();
+      const todoList = yield* Deferred.make<void>();
+      const waitForThem: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          const [query, params] = statement.compile();
+          const shape = statementShape(query);
+          if (shape.startsWith("SELECT MAX(sequence) AS snapshot_sequence"))
+            yield* Deferred.succeed(sequence, undefined);
+          else if (
+            shape.startsWith("WITH latest_owner AS MATERIALIZED") &&
+            params.includes(fixture.fork)
+          )
+            yield* Deferred.succeed(todoList, undefined);
+          else if (
+            shape.startsWith("SELECT payload_json FROM orchestration_v2_projection_threads") &&
+            params.includes(fixture.fork)
+          )
+            yield* Effect.all([Deferred.await(sequence), Deferred.await(todoList)]);
+          return statement;
+        });
+      const exit = yield* store
+        .getThreadSnapshotWindow(fixture.fork, { rowLimit: 50, userTurnLimit: 10, deferWork: true })
+        .pipe(Effect.provideService(Statement.CurrentTransformer, waitForThem), Effect.exit);
+      assert.isTrue(Exit.isSuccess(exit));
+    }),
+  ),
+);
+
+// The store on the writer alone: readers off, or the fallback after reader workers fail to start.
+const withWriterStore = <A, E>(
+  mode: "off" | "fallback",
+  body: Effect.Effect<
+    A,
+    E,
+    | EventSink.EventSinkV2
+    | ProjectionStore.ProjectionStoreV2
+    | EventStore.EventStoreV2
+    | SqlClient.SqlClient
+  >,
+) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: `reader-scope-writer-${mode}-` });
+    const sqlLayer =
+      mode === "off"
+        ? SqlitePersistence.layerMemory
+        : SqlitePersistence.layerFromPath(path.join(directory, "statev2.sqlite"), {
+            readerPoolSize: 4,
+          });
+    // Readers refuse a database outside WAL, so every read falls back to the writer.
+    const run =
+      mode === "off"
+        ? body
+        : Effect.andThen(
+            Effect.flatMap(SqlClient.SqlClient, (sql) =>
+              sql.unsafe("PRAGMA journal_mode = DELETE"),
+            ),
+            body,
+          );
+    return yield* run.pipe(
+      Effect.provide(
+        EventSink.layer.pipe(
+          Layer.provideMerge(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+          Layer.provideMerge(sqlLayer),
+        ),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+// On the writer (readers off, or the fallback after reader workers fail to start) a read's
+// statements run in turn on the reading fiber. Forked, they gained nothing there and let a looping
+// window client take the writer again before reads waiting for it, which then starved.
+it.effect.each(
+  (["off", "fallback"] as const).flatMap((mode) =>
+    projectionReads.map((readCase) => ({ ...readCase, mode })),
+  ),
+)("runs the $name statements in turn on the writer ($mode)", ({ read, mode }) =>
+  withWriterStore(
+    mode,
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("writer", 2);
+      const { transactions } = yield* traced(store.getThreadShell(fixture.fork));
+      assert.strictEqual(transactions[0]?.attributes.get("db.connection"), "writer");
+      const fibers = new Set<number>();
+      const exit = yield* read(store, fixture).pipe(
+        Effect.provideService(Statement.CurrentTransformer, (statement, _sql, fiber) =>
+          Effect.sync(() => {
+            fibers.add(fiber.id);
+            return statement;
+          }),
+        ),
+        Effect.exit,
+      );
+      assert.isTrue(Exit.isSuccess(exit));
+      assert.strictEqual(fibers.size, 1);
+    }),
+  ),
+);
+
 const isReadError = Schema.is(ProjectionStore.ProjectionStoreReadError);
 
 // The run's root node is decoded early for its checkpoint scope, yet a bad run row still wins.
@@ -871,6 +1051,30 @@ it.effect("reports the turn start context's first undecodable row in its old ord
         (cause as { readonly message?: string }).message,
         'Missing key\n  at ["id"]',
       );
+    }),
+  ),
+);
+
+// A timeline page's items are fetched together but decoded in page order: the first bad one decides.
+it.effect("reports a timeline page's first undecodable item in page order", () =>
+  withFileStore(
+    "reader-scope-timeline-order-",
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("timeline-order", 4);
+      const read = store.getTimelinePage(fixture.fork, { limit: 50, view: "activity" });
+      const tools = (yield* read).items.filter((row) => row.item.type === "dynamic_tool");
+      const first = tools.find((row) => row.sourceThreadId === fixture.source);
+      const last = tools.findLast((row) => row.sourceThreadId === fixture.fork);
+      assert.isTrue(first !== undefined && last !== undefined && first.position < last.position);
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json = 'not json'
+        WHERE turn_item_id = ${last!.sourceItemId}`;
+      yield* sql`UPDATE orchestration_v2_projection_turn_items SET payload_json = '{}'
+        WHERE turn_item_id = ${first!.sourceItemId}`;
+      const error = yield* Effect.flip(read);
+      assert.isTrue(isReadError(error));
+      assert.strictEqual(isReadError(error) ? error.threadId : undefined, fixture.source);
     }),
   ),
 );
@@ -1013,6 +1217,23 @@ const smallReads: ReadonlyArray<PermitCase> = [
 const largeReads: ReadonlyArray<PermitCase> = [
   ...readCases.filter((readCase) => readCase.permit),
   {
+    name: "turn-start history",
+    read: (store, fixture) => store.getTurnStartHistory(fixture.fork),
+  },
+  {
+    name: "thread search",
+    read: (store, fixture) => store.searchThread({ threadId: fixture.fork, query: "fork" }),
+  },
+  {
+    name: "streamed thread search",
+    read: (store, fixture) =>
+      Stream.runCollect(store.searchThreadStream({ threadId: fixture.fork, query: "fork" })),
+  },
+];
+
+// Pages of a thread's history, bounded by their page size rather than the history.
+const boundedReads: ReadonlyArray<PermitCase> = [
+  {
     name: "thread snapshot window",
     read: (store, fixture) => store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 }),
   },
@@ -1032,19 +1253,6 @@ const largeReads: ReadonlyArray<PermitCase> = [
           position: 10,
         }),
       ),
-  },
-  {
-    name: "turn-start history",
-    read: (store, fixture) => store.getTurnStartHistory(fixture.fork),
-  },
-  {
-    name: "thread search",
-    read: (store, fixture) => store.searchThread({ threadId: fixture.fork, query: "fork" }),
-  },
-  {
-    name: "streamed thread search",
-    read: (store, fixture) =>
-      Stream.runCollect(store.searchThreadStream({ threadId: fixture.fork, query: "fork" })),
   },
 ];
 
@@ -1090,11 +1298,30 @@ it.effect("gives back a streamed search's reader permit however the stream ends"
   withFileStore(
     "reader-scope-search-permit-",
     Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
       const store = yield* ProjectionStore.ProjectionStoreV2;
       const fixture = yield* writeFixture("search-permit", 2);
-      const search = store.searchThreadStream({ threadId: fixture.fork, query: "fork" });
-      yield* Effect.exit(Stream.runCollect(search));
-      yield* Effect.exit(Stream.runHead(search));
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, scripts_json, created_at, updated_at
+        ) VALUES (
+          'project:reader-scope', 'Reader scope', '/tmp/reader-scope', '[]',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      const search = (query: string) => store.searchThreadStream({ threadId: fixture.fork, query });
+      // To the end, cut short after the first match (another query, so no cached scan), and failed.
+      const results = yield* Stream.runCollect(search("fork"));
+      assert.notStrictEqual(results.at(-1)?.complete, false);
+      assert.isAbove(results.at(-1)?.totalMatches ?? 0, 0);
+      const head = yield* Stream.runHead(search("user"));
+      assert.isTrue(Option.isSome(head) && head.value.complete === false);
+      const missing = yield* Effect.exit(
+        Stream.runCollect(
+          store.searchThreadStream({ threadId: ThreadId.make("thread:missing"), query: "fork" }),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(missing));
       // The pool has one permit; a kept one would leave this read waiting.
       const snapshot = yield* store.getThreadSnapshot(fixture.fork);
       assert.strictEqual(snapshot.projection.thread.id, fixture.fork);
@@ -1161,27 +1388,34 @@ it.effect("lets a streamed search waiting for a reader permit be interrupted", (
   }),
 );
 
-// History reads paused at their first statement, each holding a reader permit and a reader.
-const holdHistoryReads = (store: Store, fixture: Fixture, count: number) =>
+// Reads paused at their first statement, each holding a reader (history reads also a permit).
+const holdHistoryReads = (
+  store: Store,
+  fixture: Fixture,
+  count: number,
+  read: (
+    store: Store,
+    fixture: Fixture,
+  ) => Effect.Effect<unknown, ProjectionStore.ProjectionStoreV2Error> = (store, fixture) =>
+    store.getThreadSnapshot(fixture.fork),
+) =>
   Effect.gen(function* () {
     const arrived = yield* Queue.unbounded<void>();
     const release = yield* Deferred.make<void>();
     const reads = yield* Effect.forEach(Array.from({ length: count }), () =>
       Effect.suspend(() => {
         let paused = false;
-        return store
-          .getThreadSnapshot(fixture.fork)
-          .pipe(
-            Effect.provideService(Statement.CurrentTransformer, (statement) =>
-              paused
-                ? Effect.succeed(statement)
-                : Queue.offer(arrived, undefined).pipe(
-                    Effect.andThen(Effect.sync(() => (paused = true))),
-                    Effect.andThen(Deferred.await(release)),
-                    Effect.as(statement),
-                  ),
-            ),
-          );
+        return read(store, fixture).pipe(
+          Effect.provideService(Statement.CurrentTransformer, (statement) =>
+            paused
+              ? Effect.succeed(statement)
+              : Queue.offer(arrived, undefined).pipe(
+                  Effect.andThen(Effect.sync(() => (paused = true))),
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as(statement),
+                ),
+          ),
+        );
       }).pipe(Effect.forkChild),
     );
     return { arrived, release, reads };
@@ -1234,5 +1468,34 @@ it.effect("makes other reads wait for the only reader behind a history read", ()
       yield* Effect.forEach(held.reads, Fiber.join);
     }),
     1,
+  ),
+);
+
+it.effect.each(boundedReads)(
+  "completes a $name read while full-history reads hold every reader permit",
+  (permitCase) =>
+    withHeldPermits("reader-scope-bounded-", (store, fixture) =>
+      Effect.exit(permitCase.read(store, fixture)),
+    ).pipe(Effect.map((exit) => assert.isTrue(Exit.isSuccess(exit), String(exit)))),
+);
+
+it.effect("serves a snapshot window before history reads still waiting for a reader", () =>
+  withFileStore(
+    "reader-scope-window-first-",
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("window-first", 2);
+      // Two readers: one history read holds a reader, two more wait for one.
+      const held = yield* holdHistoryReads(store, fixture, 3);
+      yield* Queue.take(held.arrived);
+      const window = yield* store.getThreadSnapshotWindow(fixture.fork, { rowLimit: 50 });
+      assert.strictEqual(window.projection.thread.id, fixture.fork);
+      assert.strictEqual(yield* Queue.size(held.arrived), 0);
+      yield* Deferred.succeed(held.release, undefined);
+      yield* Queue.take(held.arrived);
+      yield* Queue.take(held.arrived);
+      yield* Effect.forEach(held.reads, Fiber.join);
+    }),
+    2,
   ),
 );

@@ -1600,12 +1600,15 @@ it.effect.each(["on a branch", "detached", "unborn"] as const)(
         const driver = yield* makeGitVcsDriverCore().pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         );
+        // The fork's config snapshot (P1-065/067) fills itself with one batched probe per path;
+        // its own tests count that, so only the driver's discoveries are counted here.
         const discoveries = () => {
           const commands = spawnedArgs.filter(
             (args) =>
-              args.includes("--show-toplevel") ||
-              args.includes("--git-common-dir") ||
-              (args.includes("symbolic-ref") && args.includes("HEAD")),
+              !args.includes("--absolute-git-dir") &&
+              (args.includes("--show-toplevel") ||
+                args.includes("--git-common-dir") ||
+                (args.includes("symbolic-ref") && args.includes("HEAD"))),
           );
           spawnedArgs.length = 0;
           return commands.length;

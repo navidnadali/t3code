@@ -13,6 +13,7 @@ import {
   MAX_SEMI_SPACE_ENV,
   MAX_SEMI_SPACE_FLAG as FLAG,
   nodeOptionSpans,
+  quoteNodeOption,
   nodeOptionsWithMaxSemiSpace,
   optionName,
   resolveMaxSemiSpaceMb,
@@ -96,14 +97,32 @@ const sizeOf = (value: string | undefined): number | undefined => {
  * the user's NODE_OPTIONS, and the wanted cap when it is not the executable's own default; undefined
  * when there is nothing to pass.
  */
-export const nodeOptionsArgument = (env: Environment): string | undefined => {
+export const nodeOptionsArgument = (
+  env: Environment,
+  commandLine: ReadonlyArray<string> = [],
+): string | undefined => {
   const options = env.NODE_OPTIONS?.trim() ?? "";
-  const explicit = flagIn(tokenizeNodeOptions(options)) !== undefined;
+  // The command line follows NODE_OPTIONS, as Node orders them, so it keeps winning.
+  const given = [options, ...commandLine.map(quoteNodeOption)].filter((part) => part !== "");
+  const explicit = (flagIn(commandLine) ?? flagIn(tokenizeNodeOptions(options))) !== undefined;
   const wanted = capSetting(env);
   const cap = explicit || wanted === DEFAULT_MAX_SEMI_SPACE_MB ? "" : `${FLAG}=${wanted}`;
-  const value = [options, cap].filter((part) => part !== "").join(" ");
+  const value = [...given, cap].filter((part) => part !== "").join(" ");
   return value === "" ? undefined : `--node-options=${value}`;
 };
+
+/**
+ * How a helper the server starts from its own executable gets its Node options: on the command
+ * line when the executable takes them there (it ignores NODE_OPTIONS), in NODE_OPTIONS otherwise.
+ */
+export const nodeOptionsForSelfSpawn = (input: {
+  readonly isExecutable: boolean;
+  readonly platform: string;
+  readonly nodeOptions: string;
+}): { readonly args: ReadonlyArray<string>; readonly env: { readonly NODE_OPTIONS?: string } } =>
+  input.isExecutable && input.platform !== "win32"
+    ? { args: [`--node-options=${input.nodeOptions}`], env: {} }
+    : { args: [], env: { NODE_OPTIONS: input.nodeOptions } };
 
 /** Whether `tokens` appear in `args`, in order and adjacent. */
 const containsSequence = (args: ReadonlyArray<string>, tokens: ReadonlyArray<string>): boolean => {
@@ -281,22 +300,31 @@ interface CapState {
   readonly explicit: boolean;
   /** A single executable's NODE_OPTIONS that are not on its command line yet, so Node ignored them. */
   readonly pending: boolean;
+  /** What the user gave a single executable through --node-options, beyond the baked prefix. */
+  readonly commandLine: ReadonlyArray<string>;
 }
+
+/** Whether this single executable takes Node options on its command line and ignores NODE_OPTIONS. */
+const takesOptionsOnCommandLine = (input: { readonly isSea: boolean; readonly platform: string }) =>
+  input.isSea && input.platform !== "win32";
 
 const capState = (input: {
   readonly execArgv: ReadonlyArray<string>;
   readonly env: Environment;
   readonly isSea: boolean;
+  readonly platform: string;
 }): CapState => {
   const inNodeOptions = flagIn(tokenizeNodeOptions(input.env.NODE_OPTIONS));
   const inExecArgv = flagIn(input.execArgv);
-  if (!input.isSea) {
+  if (!takesOptionsOnCommandLine(input)) {
+    // Node read NODE_OPTIONS itself: a node start, or a Windows executable with nothing baked.
     const explicit = inExecArgv ?? inNodeOptions;
     return {
       effective: sizeOf(explicit),
       wanted: explicit === undefined ? capSetting(input.env) : (sizeOf(explicit) ?? 0),
       explicit: explicit !== undefined,
       pending: false,
+      commandLine: [],
     };
   }
   // A single executable: its execArgv start with what the build baked in; anything after that came
@@ -304,12 +332,14 @@ const capState = (input: {
   const baked = SEA_EXEC_ARGV.every((flag, index) => input.execArgv[index] === flag)
     ? SEA_EXEC_ARGV.length
     : 0;
-  const explicit = flagIn(input.execArgv.slice(baked)) ?? inNodeOptions;
+  const commandLine = input.execArgv.slice(baked);
+  const explicit = flagIn(commandLine) ?? inNodeOptions;
   return {
     effective: sizeOf(inExecArgv),
     wanted: explicit === undefined ? capSetting(input.env) : (sizeOf(explicit) ?? 0),
     explicit: explicit !== undefined,
     pending: !containsSequence(input.execArgv, tokenizeNodeOptions(input.env.NODE_OPTIONS)),
+    commandLine,
   };
 };
 
@@ -371,25 +401,31 @@ export const planYoungGenerationRelaunch = (input: {
       ...pending,
     };
   }
-  // A second image would open a second inspector session and drop the attached debugger.
-  if (input.inspectorActive === true || inspectorRequested(input.env, input.execArgv)) {
+  // A second image would open a second inspector session and drop the attached debugger. Options
+  // the executable has not taken yet are not an inspector: they reach it with the handoff.
+  const cliOptions = takesOptionsOnCommandLine(input);
+  if (
+    input.inspectorActive === true ||
+    inspectorRequested(cliOptions ? {} : input.env, input.execArgv)
+  ) {
     return { kind: "keep", reason: "the inspector is active", structural: true, ...pending };
   }
   // A preload runs before this code and may have rewritten NODE_OPTIONS: what it reads now is not
   // what Node started with, so neither an explicit cap nor the user's options can be trusted. A
   // single executable has not run its NODE_OPTIONS preloads at all yet; they run once, next image.
-  if (!input.isSea && (input.preloadRan === true || preloadVisible(input.env, input.execArgv))) {
+  if (!cliOptions && (input.preloadRan === true || preloadVisible(input.env, input.execArgv))) {
     return { kind: "keep", reason: "started with a preload" };
   }
   if (!isServerCommand(input.argv, input.isDirectory)) {
     return { kind: "keep", reason: "not a server command", ...pending };
   }
   const guard = input.pid === undefined ? {} : { [RELAUNCHED_PID_ENV]: String(input.pid) };
-  if (input.isSea) {
+  if (cliOptions) {
     // A single executable takes only user arguments, Node options first; its environment stays as
-    // it is, so its children get exactly the user's NODE_OPTIONS. The cap goes along when what is
-    // in effect is not what is wanted and the user's options do not set it themselves.
-    const given = nodeOptionsArgument(input.env);
+    // it is, so its children get exactly the user's NODE_OPTIONS. What the user gave on the command
+    // line goes along (Node stripped it from argv), and the cap when what is in effect is not what
+    // is wanted and neither source sets it.
+    const given = nodeOptionsArgument(input.env, cap.commandLine);
     const capNeeded = !cap.explicit && (cap.effective ?? 0) !== cap.wanted;
     const options =
       capNeeded && !(given ?? "").includes(`${FLAG}=`)
@@ -517,7 +553,7 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
         current?.startsWith(`${written} `) === true);
     if (mb !== null && wrote) {
       const nodeOptionsForChildren = withoutCapArg(current, mb);
-      if (!view.isSea) {
+      if (!takesOptionsOnCommandLine(view)) {
         return {
           kind: "applied",
           outcome: { applied: true, nodeOptionsAtStart, maxSemiSpaceMb: mb },
@@ -533,7 +569,12 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
     ...env,
     ...(marked === undefined ? {} : { NODE_OPTIONS: marked.nodeOptionsForChildren }),
   };
-  const cap = capState({ execArgv: view.execArgv, env: planned, isSea: view.isSea });
+  const cap = capState({
+    execArgv: view.execArgv,
+    env: planned,
+    isSea: view.isSea,
+    platform: view.platform,
+  });
   const base = {
     nodeOptionsAtStart,
     ...(cap.effective === undefined ? {} : { maxSemiSpaceMb: cap.effective }),

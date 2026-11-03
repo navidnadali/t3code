@@ -17,6 +17,7 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 import serverPackageJson from "../../../server/package.json" with { type: "json" };
 import {
   INHERITED_NODE_OPTIONS_ENV,
+  nodeCapFlag,
   serverChildEnvironment,
 } from "@t3tools/shared/youngGenerationEnv";
 
@@ -124,8 +125,19 @@ const nodeBinDirOf = (nodePath: string): string => {
   return lastSlash > 0 ? nodePath.slice(0, lastSlash) : "/usr/bin";
 };
 
+/**
+ * The WSL node fallback's young-generation cap as node flags, from the environment WSL sees (the
+ * desktop's): none when NODE_OPTIONS sets one or the hatch disables it, so nothing is overridden.
+ */
+export const wslNodeFallbackCapFlags = (): ReadonlyArray<string> => {
+  const flag = nodeCapFlag({
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    T3CODE_V8_MAX_SEMI_SPACE_MB: process.env.T3CODE_V8_MAX_SEMI_SPACE_MB,
+  });
+  return flag === undefined ? [] : [flag];
+};
+
 /** The backend's young-generation cap, with the marker that gives its children the desktop's own NODE_OPTIONS. */
-const YOUNG_GENERATION_MB = 64;
 const youngGenerationEnv = (): {
   readonly NODE_OPTIONS: string | undefined;
   readonly [INHERITED_NODE_OPTIONS_ENV]: string | undefined;
@@ -717,7 +729,7 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
   const command =
     runtime.kind === "executable"
       ? [runtime.entryPath]
-      : [runtime.nodePath, `--max-semi-space-size=${YOUNG_GENERATION_MB}`, runtime.linuxEntryPath];
+      : [runtime.nodePath, ...wslNodeFallbackCapFlags(), runtime.linuxEntryPath];
 
   return {
     ...baseConfig,

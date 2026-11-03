@@ -215,7 +215,10 @@ explicit `--max-semi-space-size` in `NODE_OPTIONS` is carried there by one relau
 before any other work), the background service launcher passes them there itself (a runtime archive
 declares this in `exec-argv.json` beside the executable; an older runtime gets them in `NODE_OPTIONS` as
 before), and the desktop app hands its backend the cap in `NODE_OPTIONS` with the marker. A `node bin.mjs`
-start (an npm install) still relaunches itself once with the cap in `NODE_OPTIONS`. In every case the
+start (an npm install) still relaunches itself once with the cap in `NODE_OPTIONS`. The Windows executable has
+nothing baked and reads `NODE_OPTIONS` itself, as before (no `execve` could carry them): a direct start there
+runs Node's default, the launcher passes the cap. Helpers the server starts from its own executable get their
+Node options the same way (`__document-text`'s heap bound goes on the command line). In every case the
 server's children (agents, helpers) get exactly the `NODE_OPTIONS` the server itself was given. `T3CODE_V8_MAX_SEMI_SPACE_MB=0` keeps
 Node's default (the single executable passes `--max-semi-space-size=0` over its built-in value), a positive
 integer sets another cap, and an explicit `--max-semi-space-size` in `NODE_OPTIONS` or on the command line

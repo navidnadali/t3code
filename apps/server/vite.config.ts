@@ -3,7 +3,7 @@ import "vite-plus/test/config";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { defineConfig, mergeConfig } from "vite-plus";
-import { SEA_EXEC_ARGV, SEA_EXEC_ARGV_EXTENSION } from "@t3tools/shared/youngGenerationEnv";
+import { seaBuildOptions } from "@t3tools/shared/youngGenerationEnv";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
@@ -61,6 +61,12 @@ if (packExecutableTarget && !Object.hasOwn(SEA_TARGETS, packExecutableTarget)) {
     `T3CODE_PACK_EXE_TARGET must be one of ${Object.keys(SEA_TARGETS).join(", ")}, got "${packExecutableTarget}".`,
   );
 }
+const packSeaOptions = seaBuildOptions(
+  packExecutableTarget
+    ? SEA_TARGETS[packExecutableTarget as keyof typeof SEA_TARGETS].platform
+    : // oxlint-disable-next-line t3code/no-global-process-runtime -- A build config has no Effect runtime.
+      process.platform,
+);
 const packExecutableTargets = packExecutableTarget
   ? [
       {
@@ -114,9 +120,10 @@ export default mergeConfig(
               // Node SEA useCodeCache breaks import(), which the server needs.
               seaConfig: {
                 useCodeCache: false,
-                // The young-generation default, baked in: a bare start never relaunches.
-                execArgv: [...SEA_EXEC_ARGV],
-                execArgvExtension: SEA_EXEC_ARGV_EXTENSION,
+                // The young-generation default, baked in: a bare start never relaunches (not on
+                // Windows, which has no execve to carry NODE_OPTIONS onto the command line).
+                execArgv: [...packSeaOptions.execArgv],
+                execArgvExtension: packSeaOptions.execArgvExtension,
               },
             },
           }

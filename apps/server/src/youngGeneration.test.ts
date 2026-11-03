@@ -592,11 +592,18 @@ describe("the single executable with the default baked in", () => {
     // `NODE_OPTIONS=--no-warnings t3 --node-options=--max-semi-space-size=16 serve`: Node strips the
     // option from argv, so the relaunch must rebuild it, with the command line winning over the environment.
     const decision = decideYoungGeneration(
-      sea({ execArgv: [...baked, "--max-semi-space-size=16"], env: { NODE_OPTIONS: "--no-warnings" } }),
+      sea({
+        execArgv: [...baked, "--max-semi-space-size=16"],
+        env: { NODE_OPTIONS: "--no-warnings" },
+      }),
     );
     expect(decision.kind).toBe("relaunch");
     if (decision.kind === "relaunch") {
-      expect(decision.plan.args).toEqual([exe, "--node-options=--no-warnings --max-semi-space-size=16", "serve"]);
+      expect(decision.plan.args).toEqual([
+        exe,
+        "--node-options=--no-warnings --max-semi-space-size=16",
+        "serve",
+      ]);
     }
     const after = decideYoungGeneration(
       sea({
@@ -637,14 +644,16 @@ describe("the single executable with the default baked in", () => {
     );
     expect(decision.kind).toBe("relaunch");
     if (decision.kind === "relaunch") {
-      expect(decision.plan.args[1]).toBe("--node-options=--inspect-port=0 --max-semi-space-size=16");
+      expect(decision.plan.args[1]).toBe(
+        "--node-options=--inspect-port=0 --max-semi-space-size=16",
+      );
     }
-    // Once on the command line, the inspector keeps the process as before.
+    // Once on the command line, the debugger runs and the cap is in effect: nothing more to do.
     const after = decideYoungGeneration(
       sea({ execArgv: [...baked, "--inspect-port=0"], env: { NODE_OPTIONS: "--inspect-port=0" } }),
     );
     expect(after.kind).toBe("keep");
-    expect(after.outcome.keptReason).toBe("the inspector is active");
+    expect(after.outcome.applied).toBe(true);
   });
 
   it("over IPC, reports a launcher that passes NODE_OPTIONS in the environment and accepts one that passes it on the command line", () => {
@@ -680,13 +689,25 @@ describe("nodeOptionsForSelfSpawn", () => {
   it("puts a helper's Node options on a single executable's command line, and in the environment otherwise", () => {
     // The document parser's heap bound must reach the executable, which ignores NODE_OPTIONS.
     expect(
-      nodeOptionsForSelfSpawn({ isExecutable: true, platform: "darwin", nodeOptions: "--max-old-space-size=192" }),
+      nodeOptionsForSelfSpawn({
+        isExecutable: true,
+        platform: "darwin",
+        nodeOptions: "--max-old-space-size=192",
+      }),
     ).toEqual({ args: ["--node-options=--max-old-space-size=192"], env: {} });
     expect(
-      nodeOptionsForSelfSpawn({ isExecutable: false, platform: "darwin", nodeOptions: "--max-old-space-size=192" }),
+      nodeOptionsForSelfSpawn({
+        isExecutable: false,
+        platform: "darwin",
+        nodeOptions: "--max-old-space-size=192",
+      }),
     ).toEqual({ args: [], env: { NODE_OPTIONS: "--max-old-space-size=192" } });
     expect(
-      nodeOptionsForSelfSpawn({ isExecutable: true, platform: "win32", nodeOptions: "--max-old-space-size=192" }),
+      nodeOptionsForSelfSpawn({
+        isExecutable: true,
+        platform: "win32",
+        nodeOptions: "--max-old-space-size=192",
+      }),
     ).toEqual({ args: [], env: { NODE_OPTIONS: "--max-old-space-size=192" } });
   });
 });

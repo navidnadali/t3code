@@ -166,3 +166,34 @@ export const SEA_EXEC_ARGV_EXTENSION = "cli";
 
 /** Beside the executable in a runtime archive: tells a launcher to pass Node options on the command line. */
 export const RUNTIME_EXEC_ARGV_FILE = "exec-argv.json";
+
+/** How a single executable is built for a platform ("win" or "win32" for Windows). */
+export interface SeaBuildOptions {
+  readonly execArgv: ReadonlyArray<string>;
+  readonly execArgvExtension: "cli" | "env" | "none";
+}
+
+/**
+ * Windows has no `execve` to carry NODE_OPTIONS onto the command line, so a baked cap there could
+ * never be overridden and NODE_OPTIONS would be lost: nothing is baked and the executable reads
+ * NODE_OPTIONS itself, as before (the service launcher passes the cap). Everywhere else the default
+ * is baked and options are taken on the command line.
+ */
+export const seaBuildOptions = (platform: string): SeaBuildOptions =>
+  platform === "win" || platform === "win32"
+    ? { execArgv: [], execArgvExtension: "env" }
+    : { execArgv: SEA_EXEC_ARGV, execArgvExtension: SEA_EXEC_ARGV_EXTENSION };
+
+/**
+ * The cap as a node flag for a process started with the environment's NODE_OPTIONS in force:
+ * nothing when NODE_OPTIONS sets one or the hatch disables it, else the knob's value or the default.
+ */
+export const nodeCapFlag = (env: Environment): string | undefined => {
+  if (flagIn(tokenizeNodeOptions(env.NODE_OPTIONS)) !== undefined) return undefined;
+  const wanted = capSetting(env);
+  return wanted === 0 ? undefined : `${MAX_SEMI_SPACE_FLAG}=${wanted}`;
+};
+
+/** One argument as NODE_OPTIONS text: double quotes around spaces and quotes, which Node unquotes. */
+export const quoteNodeOption = (token: string): string =>
+  /[\s"]/.test(token) ? `"${token.replaceAll(/(["\\])/g, "\\$1")}"` : token;

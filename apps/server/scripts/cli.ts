@@ -27,6 +27,7 @@ import {
   ServerCliDevelopmentIconTargetMissingError,
   ServerCliExecutableImportError,
 } from "./cliErrors.ts";
+import { seaBuildOptions } from "@t3tools/shared/youngGenerationEnv";
 
 const RepoRoot = Effect.service(Path.Path).pipe(
   Effect.flatMap((path) => path.fromFileUrl(new URL("../../..", import.meta.url))),
@@ -169,6 +170,7 @@ const buildExeCmd = Command.make(
           outputPath: path.join(outDir, "t3"),
           nodeVersion: rootPackageJson.engines.node,
           verbose: config.verbose,
+          sea: seaBuildOptions("linux"),
         });
       }
       // Without it the server runs its spawner as t3 __process-spawner, which parses the whole bundle.

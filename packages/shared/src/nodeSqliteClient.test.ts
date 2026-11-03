@@ -1489,6 +1489,23 @@ it.effect(
     ),
 );
 
+it.effect("forwards statements that merely start with a transaction keyword to SQLite", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      for (const form of ["BEGIN2", "COMMIT2", "BEGIN 1", "ROLLBACK x", "END 2"]) {
+        const error = yield* sql.unsafe(form).pipe(SqliteClient.readOnly, Effect.flip);
+        assert.include(String(error.reason.cause), "syntax error", form);
+      }
+      // Inside a transaction too, and the reader stays usable afterwards.
+      const inside = yield* sql
+        .withTransaction(sql.unsafe("BEGIN2").pipe(Effect.flip))
+        .pipe(SqliteClient.readOnly);
+      assert.include(String(inside.reason.cause), "syntax error");
+      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+    }),
+  ),
+);
+
 it.effect("sends statements issued together as one batch and answers each on its own", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {

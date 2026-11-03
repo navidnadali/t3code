@@ -288,6 +288,19 @@ const make = Effect.gen(function* () {
     }
     latestBase = undefined;
   };
+  // A base pinned by a reset subscriber that never pulls goes after the shared-read TTL, like any
+  // shared read; that subscriber's late pull reads again. The timer runs as its own fiber built
+  // here, where only the read's generation is in scope: a base released earlier (its wave served,
+  // the hub stopped) is not kept alive by a closure over the read.
+  const expireBaseAfterTtl = (generation: number) =>
+    Effect.sleep(ThreadManagementService.SHARED_SHELL_READ_TTL_MS).pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          if (latestBase?.generation === generation) latestBase = undefined;
+        }),
+      ),
+      Effect.forkIn(layerScope),
+    );
   const resyncBase = (through: number) =>
     // Publishing a read to later resets and starting it is one uninterruptible step: a
     // subscriber cancelled between the two would leave a read nobody runs, and every reset
@@ -331,18 +344,7 @@ const make = Effect.gen(function* () {
               return Deferred.done(read.result, exit);
             }),
           ),
-          // A base pinned by a reset subscriber that never pulls goes after the shared-read TTL,
-          // like any shared read; that subscriber's late pull reads again. The timer holds the
-          // read's generation only, so a base released earlier is not kept alive by it.
-          Effect.andThen(
-            Effect.sleep(ThreadManagementService.SHARED_SHELL_READ_TTL_MS).pipe(
-              Effect.andThen(
-                Effect.sync(() => {
-                  if (latestBase?.generation === generation) latestBase = undefined;
-                }),
-              ),
-            ),
-          ),
+          Effect.andThen(expireBaseAfterTtl(generation)),
           // In the hub's scope: a subscriber interrupted mid-read must not fail the others' wait.
           Effect.forkIn(layerScope),
           Effect.andThen(restore(Deferred.await(read.result))),

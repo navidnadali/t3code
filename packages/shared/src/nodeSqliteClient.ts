@@ -431,6 +431,9 @@ try {
     allowExtension: workerData.allowExtension,
   });
   next.exec("PRAGMA busy_timeout = 5000;");
+  // Temporary tables are writable through a read-only open; query_only closes that too, so no
+  // statement on a reader can write and no ending can fail on a constraint.
+  next.exec("PRAGMA query_only = ON;");
   if (workerData.pragmas) next.exec(workerData.pragmas);
   // Without WAL a reader's shared lock blocks the writer's commits, so refuse.
   const mode = String(next.prepare("PRAGMA journal_mode").get().journal_mode).toLowerCase();
@@ -675,11 +678,16 @@ const makeReader = Effect.fnUntraced(function* (
         return;
       }
       const resume = pending.get(reply.id);
-      if (resume !== undefined) {
-        pending.delete(reply.id);
-        resume(reply);
+      if (resume === undefined) {
+        // An unattended ending's reply still tells the connection's state.
+        if (reply.inTransaction !== undefined && reply.id >= latestId)
+          inTransaction = reply.inTransaction;
+        return;
       }
+      pending.delete(reply.id);
+      // The fiber runs on inside resume and may start cleanup that references the worker again.
       if (pending.size === 0) worker.unref();
+      resume(reply);
     });
     worker.on("error", (cause) => stop(`Database reader failed: ${cause.message}`));
     worker.on("exit", (code) => stop(`Database reader exited with code ${code}`));

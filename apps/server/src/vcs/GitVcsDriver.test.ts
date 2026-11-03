@@ -2814,3 +2814,48 @@ it.effect.skipIf(!symlinksSupported)(
       assert.isFalse(warm);
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
+
+it.effect.skipIf(!symlinksSupported)(
+  "a relative objects directory is read per command directory, so git answers",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const h = yield* makeTurnHarness("t3-checkpoint-relative-objects-");
+      yield* h.writeBoth("file.txt", "initial\n");
+      yield* h.gitBoth(["add", "."]);
+      yield* h.commitBoth("initial");
+      yield* h.turn(1);
+      yield* h.turn(2);
+      // `store` is the real object store from the main worktree and an empty one from a linked
+      // worktree, where git resolves a relative GIT_OBJECT_DIRECTORY.
+      const worktrees = { warm: path.join(h.root, "wt-warm"), cold: path.join(h.root, "wt-cold") };
+      for (const [name, cwd] of Object.entries(h.repos)) {
+        const worktree = worktrees[name as "warm" | "cold"];
+        yield* h.gitIn(cwd, ["worktree", "add", "-q", worktree, "-b", "wt"]);
+        yield* fileSystem.symlink(path.join(cwd, ".git", "objects"), path.join(cwd, "store"));
+        for (const sub of ["info", "pack"]) {
+          yield* fileSystem.makeDirectory(path.join(worktree, "store", sub), { recursive: true });
+        }
+      }
+      const serverCwd = process.cwd();
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          process.chdir(h.repos.warm);
+          process.env.GIT_OBJECT_DIRECTORY = "store";
+        }),
+        () =>
+          Effect.sync(() => {
+            delete process.env.GIT_OBJECT_DIRECTORY;
+            process.chdir(serverCwd);
+          }),
+      );
+      const probe = (driver: VcsDriver.VcsDriver["Service"], cwd: string) =>
+        driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef: turnRef(2) });
+      const cold = yield* GitVcsDriver.makeVcsDriverShape();
+      // The directory's first read runs git; the second has the snapshot and the remembered ref.
+      const answers = [yield* probe(h.warm, worktrees.warm), yield* probe(h.warm, worktrees.warm)];
+      assert.deepStrictEqual(answers, [false, false]);
+      assert.isFalse(yield* probe(cold, worktrees.cold));
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);

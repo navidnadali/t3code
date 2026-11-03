@@ -291,6 +291,40 @@ describe("provider process hand-off", () => {
     }).pipe(Effect.provide(launcherLayer())),
   );
 
+  // A Unix socket path holds 107 bytes on Linux; a state directory can be longer.
+  it.live.skipIf(!linux)("hands off whatever the length of the server's state directory", () => {
+    const { logs, layer: logLayer } = capturedLogs();
+    return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const base = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-long-" });
+      const baseDir = NodePath.join(base, "a-state-directory-".repeat(6));
+      const handedOff = yield* Effect.gen(function* () {
+        const { stateDir } = yield* ServerConfig.ServerConfig;
+        expect(
+          Buffer.byteLength(NodePath.join(stateDir, "spawner", "x".repeat(16))),
+        ).toBeGreaterThan(108);
+        const { spawner } = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        const ppid = Number(
+          yield* spawner.string(node("process.stdout.write(String(process.ppid))")),
+        );
+        // While the spawner runs: the server forgets its PID once it exits.
+        return spawnerProcessIds.has(ppid);
+      }).pipe(
+        Effect.provide(
+          WorkerChildProcessSpawner.layerProviderLauncher.pipe(
+            Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))),
+            Layer.provideMerge(logLayer),
+          ),
+        ),
+      );
+      expect({
+        handedOff,
+        warnings: logs.filter(({ text }) => text.includes("hand-off failed")).length,
+      }).toEqual({ handedOff: true, warnings: 0 });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+  });
+
   it.live.skipIf(!linux)(
     "closes the server's ends of a handed-off process's stdio once it has exited",
     () => {

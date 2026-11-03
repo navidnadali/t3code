@@ -17,6 +17,7 @@ import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
+import * as CheckpointRestoreSafety from "./CheckpointRestoreSafety.ts";
 import { isCheckpointRestoreIsolated } from "./CheckpointRestoreSafety.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
@@ -252,3 +253,19 @@ it.effect.each([
       assert.equal(result, isolated);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
+
+it("names the other worktree in the refusal, a long path shortened in the middle", () => {
+  const message = Reflect.get(CheckpointRestoreSafety, "anotherWorktreeRestoreMessage") as (
+    workspace: string,
+  ) => string;
+  assert.equal(
+    message("/repo/worktrees/feature"),
+    "This checkpoint was taken in another worktree (/repo/worktrees/feature). Restoring its files would overwrite this worktree's branch. Use \u201cRevert and keep changes\u201d to rewind the conversation only.",
+  );
+  const long = `/Users/someone/${"nested/".repeat(12)}worktrees/feature-with-a-long-name`;
+  const shown = /\(([^)]*)\)/.exec(message(long))![1]!;
+  assert.lengthOf(Array.from(shown), 64);
+  assert.isTrue(shown.startsWith("/Users/someone/"));
+  assert.isTrue(shown.endsWith("/worktrees/feature-with-a-long-name"));
+  assert.include(shown, "\u2026");
+});

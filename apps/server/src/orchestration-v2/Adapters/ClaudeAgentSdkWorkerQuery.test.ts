@@ -1303,7 +1303,7 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
         }),
       "A T3 Code callback failed with an error that cannot be sent to Claude",
     ],
-    // JSON-escaped, this reason would pass V8's longest string; only its first KiB is named.
+    // JSON-escaped, this reason would pass V8's longest string; only its first 1,024 characters are named.
     [
       "a message whose JSON fails with a huge error",
       () =>

@@ -203,17 +203,26 @@ const errorJson = (error: unknown): string => {
   try {
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   } catch (cause) {
-    return JSON.stringify({ error: `${UNSENDABLE_ERROR}${unsendableReason(cause)}` });
+    try {
+      return JSON.stringify({ error: `${UNSENDABLE_ERROR}${unsendableReason(cause)}` });
+    } catch {
+      return UNSENDABLE_ERROR_JSON;
+    }
   }
 };
 
 const UNSENDABLE_ERROR = "A T3 Code callback failed with an error that cannot be sent to Claude";
+const UNSENDABLE_ERROR_JSON = JSON.stringify({ error: UNSENDABLE_ERROR });
+const UNSENDABLE_REASON_CHARS = 1024;
 
-// Why JSON failed, when that can be read as text; reading it must not throw on main.
+// Why JSON failed, when that can be read as text, cut to 1,024 characters; reading it must not throw.
 const unsendableReason = (cause: unknown) => {
   try {
     const message: unknown = cause instanceof Error ? cause.message : undefined;
-    return typeof message === "string" ? `: ${message}` : "";
+    if (typeof message !== "string") return "";
+    return message.length > UNSENDABLE_REASON_CHARS
+      ? `: ${message.slice(0, UNSENDABLE_REASON_CHARS)} [truncated]`
+      : `: ${message}`;
   } catch {
     return "";
   }

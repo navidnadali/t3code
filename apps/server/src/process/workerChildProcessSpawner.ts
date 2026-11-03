@@ -1367,7 +1367,6 @@ const runsOnWorker = (command: ChildProcess.Command): command is ChildProcess.St
   );
 };
 
-/** Handles keep `NodeChildProcessSpawner`'s semantics; other command shapes use `fallback`. */
 /** What a handle needs of a started child, wherever its stdio are. */
 interface ChildView {
   readonly pid: number | undefined;
@@ -1626,6 +1625,7 @@ const makeChildHandles = Effect.fnUntraced(function* () {
   return { platform, spawnWith };
 });
 
+/** Handles keep `NodeChildProcessSpawner`'s semantics; other command shapes use `fallback`. */
 const makeRemoteSpawner = Effect.fnUntraced(function* (
   fallback: ChildProcessSpawner["Service"],
   host: RemoteHost,

@@ -1604,6 +1604,8 @@ it.live.each([20, 100])(
         readonly pull: Effect.Success<ReturnType<typeof pullInto>>;
         consumer: Fiber.Fiber<unknown, unknown>;
       }> = [];
+      // Project rows a subscriber reads itself (its initial snapshot); a resync has them in the base.
+      let projectListReads = 0;
       for (let index = 0; index < subscribers; index++) {
         const fold = makeShellFold();
         folds.push(fold);
@@ -1611,7 +1613,11 @@ it.live.each([20, 100])(
           Effect.provide(hub),
           Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
           Effect.provideService(ProjectStore.ProjectStoreV2, {
-            listShells: () => Effect.succeed([]),
+            listShells: () =>
+              Effect.sync(() => {
+                projectListReads += 1;
+                return [];
+              }),
           } as unknown as ProjectStore.ProjectStoreV2["Service"]),
           Effect.provideService(ProjectService.ProjectService, projectService),
           Effect.provideServiceEffect(
@@ -1644,6 +1650,7 @@ it.live.each([20, 100])(
       // holds empties every buffer at once, and the pulling half resyncs.
       for (const entry of stalled) yield* Fiber.interrupt(entry.consumer);
       const readsBefore = snapshotReads;
+      const projectListReadsBefore = projectListReads;
       yield* commit(
         Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:bulk${index}`),
       );
@@ -1679,6 +1686,9 @@ it.live.each([20, 100])(
       assert.equal(readsForPulling, 1);
       assert.equal(baseReads, 1);
       assert.equal(overflows.count, subscribers);
+      // The resync's project rows, and the identities re-sent after its snapshot, come from the
+      // base: no subscriber lists the projects again.
+      assert.equal(projectListReads, projectListReadsBefore);
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 

@@ -573,6 +573,35 @@ it.effect.each([
   ),
 );
 
+// Aging scales with the pool: a waiting class goes next once passed over once per reader.
+it.effect.each([{ readers: 1 }, { readers: 2 }, { readers: 4 }, { readers: 8 }])(
+  "serves a history read behind a stream of page reads after one per reader ($readers readers)",
+  ({ readers }) =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const started: Array<string> = [];
+          const holders = yield* Effect.forEach(
+            Array.from({ length: readers }, (_, index) => `holder-${index}`),
+            (name) => holdClassReader(sql, name, started, SqliteClient.pageRead),
+          );
+          yield* Effect.forEach(holders, (holder) => holder.running);
+          const pages = yield* Effect.forEach(
+            Array.from({ length: 3 * readers }, (_, index) => `page-${index}`),
+            (name) => classRead(sql, name, started, SqliteClient.pageRead),
+          );
+          const history = yield* classRead(sql, "history", started, SqliteClient.historyRead);
+          // One reader frees and cycles through the queue while the other holders keep theirs.
+          yield* holders[0]!.release;
+          yield* Fiber.join(history);
+          assert.strictEqual(started.indexOf("history"), 2 * readers);
+          yield* Effect.forEach(holders.slice(1), (holder) => holder.release);
+          yield* Effect.forEach(pages, Fiber.join);
+        }),
+      { readerPoolSize: readers },
+    ),
+);
+
 it.effect(
   "serves a history read queued behind streams of small and page reads within one round",
   () =>

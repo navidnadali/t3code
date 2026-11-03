@@ -726,8 +726,14 @@ records of turn items, nodes, messages, subagents, plans, handoffs or transfers)
 several classes queue, a freed reader goes first to a class that has been passed over once for each
 reader in the pool, the most passed over first, so none starves; then to small or page reads whose class holds no reader; then
 to small, page and history reads in that order. History reads that already hold all readers but two
-(at least one) go after every other queued read. Within a class, reads go in the order they queued;
-while reads fall back to the main connection they all share it.
+(at least one) go after every other queued read. Within a class, reads go in the order they queued.
+The order counts turns, not reader time, and no reader is kept for small reads: when history reads
+hold every reader, a small read waits for one of them to finish. In a review probe (two looping full
+snapshots of an 86,755-item thread beside history, window and small reads) small reads waited up to
+1.7 s at p95 with one reader, 0.5 s with two, 0.2-0.33 s with four and 95-209 ms with eight; before
+this order they waited 36-79 ms with four, but snapshot windows starved (6 in 8 s against 149). A
+read's statements go to a reader worker together; while reads fall back to the main connection they
+all share it and run their statements in turn.
 History reads each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from
 before their read transaction until their rows are decoded, which bounds the history rows held at
 once. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a reader is.

@@ -1656,6 +1656,35 @@ it.effect("ignores a reply that arrives after a newer transaction transition", (
   ),
 );
 
+it.effect(
+  "forwards a BEGIN while an earlier statement on the same reader is still outstanding",
+  () =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        const [savepoint, begin] = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              // Ends the managed transaction before it began, leaving the reserved reader idle.
+              yield* sql.unsafe("ROLLBACK");
+              return yield* Effect.all(
+                [
+                  sql.unsafe("SAVEPOINT outer").pipe(Effect.exit),
+                  sql.unsafe("BEGIN").pipe(Effect.exit),
+                ],
+                { concurrency: "unbounded" },
+              );
+            }),
+          )
+          .pipe(SqliteClient.readOnly);
+        assert.isTrue(Exit.isSuccess(savepoint));
+        // The BEGIN reached SQLite behind the savepoint, which had opened a transaction.
+        assert.isTrue(Exit.isFailure(begin), "BEGIN behind a savepoint");
+        // The managed COMMIT ended the savepoint's transaction: the reader is free again.
+        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+      }),
+    ),
+);
+
 it.effect("sends statements issued together as one batch and answers each on its own", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {

@@ -422,6 +422,7 @@ const hasLargeBinding = (params: ReadonlyArray<unknown>): boolean => {
 const readerWorkerSource = `
 const { parentPort, workerData } = require("node:worker_threads");
 const { DatabaseSync } = require("node:sqlite");
+const sqlite = require("node:sqlite");
 let db;
 let permanent = false;
 try {
@@ -431,9 +432,20 @@ try {
     allowExtension: workerData.allowExtension,
   });
   next.exec("PRAGMA busy_timeout = 5000;");
-  // Temporary tables are writable through a read-only open; query_only closes that too, so no
-  // statement on a reader can write and no ending can fail on a constraint.
+  // Temporary tables are writable through a read-only open; query_only closes that too, and the
+  // authorizer refuses what the open does not: temporary-database writes and query_only itself.
+  // Main-database writes still fail as SQLite's read-only open makes them fail. Nothing on a
+  // reader can write, so no ending can fail on a constraint. Without an authorizer, query_only.
   next.exec("PRAGMA query_only = ON;");
+  if (typeof next.setAuthorizer === "function") {
+    const c = sqlite.constants;
+    next.setAuthorizer((actionCode, action, _argument, database) =>
+      (actionCode === c.SQLITE_PRAGMA && action === "query_only") ||
+      (database === "temp" && actionCode !== c.SQLITE_READ && actionCode !== c.SQLITE_SELECT)
+        ? c.SQLITE_DENY
+        : c.SQLITE_OK,
+    );
+  }
   if (workerData.pragmas) next.exec(workerData.pragmas);
   // Without WAL a reader's shared lock blocks the writer's commits, so refuse.
   const mode = String(next.prepare("PRAGMA journal_mode").get().journal_mode).toLowerCase();

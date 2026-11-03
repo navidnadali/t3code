@@ -902,13 +902,14 @@ it.effect("rejects a write in a read-only transaction", () =>
   ),
 );
 
-it.effect("keeps the reader read-only even if a statement turns query_only off", () =>
+it.effect("keeps the reader read-only even if a statement tries to turn query_only off", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {
       const error = yield* sql
         .withTransaction(
           Effect.gen(function* () {
-            yield* sql`PRAGMA query_only = OFF`;
+            // Refused by the reader's authorizer; the open keeps the database read-only anyway.
+            yield* sql`PRAGMA query_only = OFF`.pipe(Effect.ignore);
             yield* sql`INSERT INTO entries VALUES ('blocked')`;
           }),
         )
@@ -1909,7 +1910,7 @@ it.effect("refuses a write on a reader, temporary tables included", () =>
       const error = yield* sql
         .unsafe("CREATE TEMP TABLE scratch(x)")
         .pipe(SqliteClient.readOnly, Effect.flip);
-      assert.match(String(error.reason.cause), /readonly|query_only|read-only/i);
+      assert.match(String(error.reason.cause), /readonly|query_only|read-only|not authorized/i);
       assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
     }),
   ),

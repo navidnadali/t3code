@@ -1020,7 +1020,8 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       Promise.reject(Object.assign(new Error(), { message: new KeyedJson() })),
     ),
     // No "throws an Error whose message JSON cannot write" case: from SDK 0.3.284 the failed
-    // write escapes the SDK's control-request handler as an unhandled rejection in-thread.
+    // write escapes the SDK's control-request handler as an unhandled rejection in-thread. A
+    // worker-only test below pins what a worker does instead.
     // Each of these clones without error but not as the SDK's JSON writes it.
     permissionCase("answers with values JSON converts", () =>
       Promise.resolve({

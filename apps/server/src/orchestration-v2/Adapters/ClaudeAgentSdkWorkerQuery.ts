@@ -197,13 +197,16 @@ const answerJson = (call: ClaudeAgentSdkCallbackCall, value: unknown): string | 
 };
 
 // The SDK's error field for a callback that throws, as it writes it (an Error's message whatever its
-// type, else the error as a string), or undefined when it cannot and sends nothing. In-thread, a
-// rejection whose string form throws is also an unhandled rejection in the SDK; here it is not.
-const errorJson = (error: unknown): string | undefined => {
+// type, else the error as a string). One it cannot write escapes the SDK (0.3.284) as an unhandled
+// rejection that would end the worker, so that request fails with a clear error instead.
+const errorJson = (error: unknown): string => {
   try {
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
-  } catch {
-    return undefined;
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : "unknown";
+    return JSON.stringify({
+      error: `A T3 Code callback failed with an error that cannot be sent to Claude: ${reason}`,
+    });
   }
 };
 

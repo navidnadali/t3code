@@ -167,22 +167,6 @@ function parsePiRecord(line: string): PiRpcRecord | undefined {
   }
 }
 
-/**
- * `hasExited` is consulted before each signal. Once the original child is
- * gone its pid/pgid can be recycled by the OS, so escalating blindly could
- * deliver SIGKILL to an unrelated process.
- */
-const terminatePiProcess = Effect.fn("PiRpc.terminatePiProcess")(function* (
-  kill: (signal: NodeJS.Signals) => boolean,
-  hasExited: () => boolean,
-) {
-  if (hasExited()) return;
-  if (!kill("SIGTERM")) return;
-  yield* Effect.sleep(TERMINATION_GRACE);
-  if (hasExited()) return;
-  kill("SIGKILL");
-});
-
 export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSpawnOptions) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const platform = yield* HostProcess.Platform;
@@ -206,19 +190,6 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
   let childExited = false;
   let diagnosingStdoutClose = false;
 
-  const killProcessGroup = (signal: NodeJS.Signals): boolean => {
-    try {
-      if (platform === "win32") {
-        process.kill(Number(child.pid), signal);
-      } else {
-        signalProcessGroup(Number(child.pid), signal);
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   const hasExited = (): boolean => {
     if (childExited) return true;
     try {
@@ -239,8 +210,16 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     yield* taskkill.exitCode;
   }).pipe(Effect.scoped, Effect.ignore);
 
+  // Once pi is gone its PID can name another process: the handle signals pi's group (SIGTERM, then
+  // SIGKILL after the grace) only while its PID is still pi's, as far as its spawner can tell.
   const terminateProcess =
-    platform === "win32" ? terminateWindowsTree : terminatePiProcess(killProcessGroup, hasExited);
+    platform === "win32"
+      ? terminateWindowsTree
+      : Effect.suspend(() =>
+          hasExited()
+            ? Effect.void
+            : child.kill({ killSignal: "SIGTERM", forceKillAfter: TERMINATION_GRACE }),
+        ).pipe(Effect.ignore);
 
   // Register teardown immediately after spawn so interrupted setup cannot leak a detached process.
   yield* Scope.addFinalizer(scope, terminateProcess.pipe(Effect.ignore, Effect.uninterruptible));

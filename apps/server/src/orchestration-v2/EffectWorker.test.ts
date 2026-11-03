@@ -661,6 +661,32 @@ const admissionEffect = (
   lastError: null,
 });
 
+/** The sampler interval the admission tests run at, the unit of every deadline below. */
+const SAMPLE = Duration.seconds(1);
+
+/**
+ * Awaits `effect`, which needs no clock, for at most `samples` sampler intervals of test-clock
+ * time: each step lets the fibers the clock readied run to their next suspension, so a regression
+ * that parks the awaited work fails here at once, not at the suite's timeout.
+ */
+const within = <A, E>(effect: Effect.Effect<A, E>, samples: number, what: string) =>
+  Effect.gen(function* () {
+    const done = yield* Deferred.make<Exit.Exit<A, E>>();
+    const fiber = yield* Effect.forkChild(
+      Effect.exit(effect).pipe(Effect.tap((exit) => Deferred.succeed(done, exit))),
+    );
+    yield* Effect.replicateEffect(TestClock.adjust(SAMPLE), samples, { discard: true });
+    if (!(yield* Deferred.isDone(done))) {
+      yield* Fiber.interrupt(fiber);
+      assert.fail(`${what} did not happen within ${samples} sampler intervals of test-clock time`);
+    }
+    return yield* yield* Deferred.await(done);
+  });
+
+/** Awaits `count` starts from the executor's queue within a few sampler intervals. */
+const startsWithin = (queue: Queue.Queue<string>, count: number, what: string) =>
+  within(Effect.all(Array.from({ length: count }, () => Queue.take(queue))), 3, what);
+
 it.effect("claims only ungated effects once the admission slots are taken", () =>
   Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
@@ -736,7 +762,7 @@ it.effect("claims only ungated effects once the admission slots are taken", () =
     yield* Effect.yieldNow;
     assert.deepEqual(yield* Ref.get(started), ["effect:admission-1"]);
     // The slot is taken, so this claim skips the second turn start and takes the interrupt.
-    assert.isTrue(yield* runOnce);
+    assert.isTrue(yield* within(runOnce, 3, "the interrupt's claim"));
     assert.deepEqual(yield* Ref.get(started), ["effect:admission-1", "effect:admission-3"]);
     assert.deepEqual(yield* Ref.get(exclusions), [[], EffectAdmission.GATED_EFFECT_TYPES]);
     assert.equal(pending.length, 1);
@@ -845,7 +871,7 @@ const saturatedDaemon = (options: {
       // No gate: every worker claims whatever is due, saturated or not.
       pending.push(startEffect(1), startEffect(2), startEffect(3), startEffect(4), interruptEffect);
       yield* Queue.offerAll(available, [undefined, undefined, undefined, undefined, undefined]);
-      const all = yield* Effect.all(Array.from({ length: 4 }, () => Queue.take(started)));
+      const all = yield* startsWithin(started, 4, "the four turn starts");
       assert.deepEqual([...all].toSorted(), [
         "effect:admission-1",
         "effect:admission-2",
@@ -853,7 +879,7 @@ const saturatedDaemon = (options: {
         "effect:admission-4",
       ]);
       yield* Deferred.succeed(finishTurnStarts, undefined);
-      assert.equal(yield* Queue.take(started), "effect:admission-5");
+      assert.deepEqual(yield* startsWithin(started, 1, "the interrupt"), ["effect:admission-5"]);
       yield* Fiber.interrupt(daemon);
       return;
     }
@@ -861,12 +887,12 @@ const saturatedDaemon = (options: {
     // allowance to two, so the other starts stay in the outbox while the interrupt runs.
     pending.push(startEffect(1), startEffect(2));
     yield* Queue.offerAll(available, [undefined, undefined]);
-    const firstTwo = yield* Effect.all([Queue.take(started), Queue.take(started)]);
+    const firstTwo = yield* startsWithin(started, 2, "the first two turn starts");
     assert.deepEqual([...firstTwo].toSorted(), ["effect:admission-1", "effect:admission-2"]);
     yield* TestClock.adjust("2 seconds");
     pending.push(startEffect(3), startEffect(4), interruptEffect);
     yield* Queue.offerAll(available, [undefined, undefined, undefined]);
-    assert.equal(yield* Queue.take(started), "effect:admission-5");
+    assert.deepEqual(yield* startsWithin(started, 1, "the interrupt"), ["effect:admission-5"]);
     yield* TestClock.adjust("10 seconds");
     assert.deepEqual(
       pending.map((effect) => effect.id),
@@ -878,7 +904,7 @@ const saturatedDaemon = (options: {
     // Headroom returns: the idle workers are woken and take the remaining turn starts.
     yield* Ref.set(pressure, 5);
     yield* TestClock.adjust("2 seconds");
-    const secondWave = yield* Effect.all([Queue.take(started), Queue.take(started)]);
+    const secondWave = yield* startsWithin(started, 2, "the turn starts after reopening");
     assert.deepEqual([...secondWave].toSorted(), ["effect:admission-3", "effect:admission-4"]);
     assert.equal(pending.length, 0);
 
@@ -1048,7 +1074,7 @@ it.effect("a freed slot wakes one worker, which claims the next turn start", () 
     );
     // Both starts are claimed while the gate is open; that arms the source.
     yield* Queue.offerAll(available, [undefined, undefined]);
-    const first = yield* Effect.all([Queue.take(started), Queue.take(started)]);
+    const first = yield* startsWithin(started, 2, "the first two turn starts");
     assert.deepEqual([...first].toSorted(), ["effect:admission-1", "effect:admission-2"]);
     // Two saturated samples close the gate to one slot; a third start then waits for a slot.
     yield* TestClock.adjust("2 seconds");
@@ -1063,7 +1089,9 @@ it.effect("a freed slot wakes one worker, which claims the next turn start", () 
     assert.equal(pending.length, 1);
     // The first start finishes: its slot frees and wakes one worker, which claims the third.
     yield* Deferred.succeed(finishFirst, undefined);
-    assert.equal(yield* Queue.take(started), "effect:admission-3");
+    assert.deepEqual(yield* startsWithin(started, 1, "the third turn start"), [
+      "effect:admission-3",
+    ]);
     yield* Fiber.interrupt(daemon);
   }),
 );

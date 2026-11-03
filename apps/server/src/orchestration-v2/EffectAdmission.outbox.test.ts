@@ -8,12 +8,15 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EffectAdmission from "./EffectAdmission.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EffectWorker from "./EffectWorker.ts";
 
 const layerTest = Layer.fresh(
   EffectOutbox.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
@@ -41,6 +44,28 @@ const idOf = (claim: Option.Option<EffectOutbox.OrchestrationEffectV2>) =>
   Option.match(claim, { onNone: () => null, onSome: (effect) => effect.id });
 
 it.layer(layerTest)("claim-time exclusion on the real outbox", (it) => {
+  it.effect("wakes every worker of the largest pool with one call", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const workers = EffectWorker.EFFECT_WORKER_MAX_CONCURRENCY;
+      const woken = yield* Ref.make(0);
+      // The whole pool waits for work; a reopened gate then wakes it with one notification.
+      const takers = yield* Effect.forkChild(
+        Effect.all(
+          Array.from({ length: workers }, () =>
+            outbox.awaitAvailable.pipe(Effect.andThen(Ref.update(woken, (count) => count + 1))),
+          ),
+          { concurrency: "unbounded", discard: true },
+        ),
+      );
+      yield* Effect.replicateEffect(Effect.yieldNow, 4, { discard: true });
+      yield* outbox.notifyAvailable(workers);
+      yield* Effect.replicateEffect(Effect.yieldNow, 8, { discard: true });
+      assert.equal(yield* Ref.get(woken), workers);
+      yield* Fiber.join(takers);
+    }),
+  );
+
   it.effect("skips gated effects, keeps thread order, and leaves held rows claimable", () =>
     Effect.gen(function* () {
       const outbox = yield* EffectOutbox.EffectOutboxV2;

@@ -440,11 +440,23 @@ it.effect("sizes the saturated allowance, the reopen mark and the pressure readi
     assert.isTrue(EffectAdmission.isGated("checkpoint.capture"));
     assert.isFalse(EffectAdmission.isGated("provider-turn.interrupt"));
     assert.isFalse(EffectAdmission.isGated("runtime-request.respond"));
-    // The histogram drops the first gap after a reset: a block spanning the whole interval reads
-    // as calm there, so the sampler's own lateness stands in.
-    assert.equal(EffectAdmission.latencyPressure(0, 200), 200);
-    assert.equal(EffectAdmission.latencyPressure(45, 3), 45);
-    assert.equal(EffectAdmission.latencyPressure(Number.NaN, -2), 0);
+    // The histogram drops the first gap after a reset: a block spanning most of the interval
+    // leaves it few samples and reading calm, so then the sampler's own lateness stands in.
+    assert.equal(EffectAdmission.MIN_HISTOGRAM_SAMPLES, 10);
+    assert.equal(EffectAdmission.latencyPressure(0, 200, 3), 200);
+    assert.equal(EffectAdmission.latencyPressure(0, 200, 100), 0);
+    assert.equal(EffectAdmission.latencyPressure(45, 3, 100), 45);
+    assert.equal(EffectAdmission.latencyPressure(45, 60, 9), 60);
+    assert.equal(EffectAdmission.latencyPressure(Number.NaN, -2, 0), 0);
+    assert.equal(EffectAdmission.samplerLateness(1_250, 0, 1_000), 250);
+    assert.equal(EffectAdmission.samplerLateness(990, 0, 1_000), -10);
+    const reading = { p99Ns: 5e6, nowMs: 1_250, previousMs: 0, intervalMs: 1_000 };
+    assert.equal(EffectAdmission.histogramReading({ ...reading, samples: 100 }), 5);
+    assert.equal(EffectAdmission.histogramReading({ ...reading, samples: 3 }), 250);
+    assert.equal(
+      EffectAdmission.histogramReading({ ...reading, p99Ns: Number.NaN, samples: 0 }),
+      250,
+    );
     assert.equal(Duration.toMillis(EffectAdmission.SLOT_MAX_HOLD), 600_000);
   }),
 );

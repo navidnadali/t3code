@@ -990,11 +990,16 @@ const eventLoopDelaySource: Effect.Effect<Effect.Effect<number>, never, Scope.Sc
     let previousMs = NodePerfHooks.performance.now();
     return Effect.sync(() => {
       const nowMs = NodePerfHooks.performance.now();
-      const latenessMs = nowMs - previousMs - intervalMs;
+      const pressure = EffectAdmission.histogramReading({
+        p99Ns: histogram.percentile(99),
+        samples: histogram.count,
+        nowMs,
+        previousMs,
+        intervalMs,
+      });
       previousMs = nowMs;
-      const p99Ms = histogram.percentile(99) / 1e6;
       histogram.reset();
-      return EffectAdmission.latencyPressure(p99Ms, latenessMs);
+      return pressure;
     });
   },
 );
@@ -1011,13 +1016,18 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
         options.admission === false
           ? undefined
           : (options.admission?.delayAboveMs ?? DEFAULT_EFFECT_ADMISSION_DELAY_MS);
+      // With one worker the saturated allowance is the worker count: a gate could hold nothing
+      // back, so none is built and no pressure source ever runs.
+      const gateCanAct = EffectAdmission.saturatedAllowance(concurrency) < concurrency;
       yield* Effect.logInfo("Orchestration effect worker pool", {
         concurrency,
         configured: options.concurrency !== undefined,
         admissionDelayMs: delayAboveMs ?? null,
+        admissionGate:
+          delayAboveMs === undefined ? "off" : gateCanAct ? "on" : "off: a single worker",
       });
       const admission =
-        delayAboveMs === undefined
+        delayAboveMs === undefined || !gateCanAct
           ? undefined
           : yield* EffectAdmission.make({
               workers: concurrency,

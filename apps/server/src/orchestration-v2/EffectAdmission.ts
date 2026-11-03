@@ -20,8 +20,12 @@ export const GATED_EFFECT_TYPES: ReadonlyArray<OrchestrationEffectRequestV2["typ
 export const isGated = (effectType: string): boolean =>
   (GATED_EFFECT_TYPES as ReadonlyArray<string>).includes(effectType);
 
-/** A slot counts for this long at most, longer than any turn start, so hung starts free the allowance. */
-export const SLOT_MAX_HOLD = Duration.minutes(2);
+/**
+ * A slot counts for this long at most. A safety valve against hung starts, not a tuning value:
+ * production turn starts run about 92 s on average, so the bound sits well past their slow tail —
+ * a slot that expired would let the gate drift back towards the worker count.
+ */
+export const SLOT_MAX_HOLD = Duration.minutes(10);
 
 export interface AdmissionState {
   readonly allowed: number;
@@ -84,12 +88,39 @@ export const saturatedAllowance = (workers: number): number => Math.max(1, Math.
 export const openMarkFor = (closeAbove: number): number => closeAbove / 2;
 
 /**
- * The loop's delay over the last interval: the histogram's p99, or the sampler's own lateness
- * when it is larger — the histogram drops the first gap after a reset, so a block that spans a
- * whole interval would otherwise read as calm.
+ * A second at 10 ms resolution records about a hundred histogram samples; fewer than this many
+ * means a block spanned most of its ticks, and the histogram, which drops the first gap after a
+ * reset, would read the second as calm.
  */
-export const latencyPressure = (p99Ms: number, latenessMs: number): number =>
-  Math.max(Number.isFinite(p99Ms) ? p99Ms : 0, Number.isFinite(latenessMs) ? latenessMs : 0, 0);
+export const MIN_HISTOGRAM_SAMPLES = 10;
+
+/** The sampler's own lateness: how far past its interval the sample came. */
+export const samplerLateness = (nowMs: number, previousMs: number, intervalMs: number): number =>
+  nowMs - previousMs - intervalMs;
+
+/**
+ * The loop's delay over the last interval: the histogram's p99, or, when the histogram holds
+ * fewer than `MIN_HISTOGRAM_SAMPLES`, the sampler's own lateness if that is larger.
+ */
+export const latencyPressure = (p99Ms: number, latenessMs: number, samples: number): number => {
+  const p99 = Number.isFinite(p99Ms) ? Math.max(p99Ms, 0) : 0;
+  if (samples >= MIN_HISTOGRAM_SAMPLES) return p99;
+  return Math.max(p99, Number.isFinite(latenessMs) ? latenessMs : 0);
+};
+
+/** One reading of the event loop delay source, from its histogram and the sampler's clock. */
+export const histogramReading = (reading: {
+  readonly p99Ns: number;
+  readonly samples: number;
+  readonly nowMs: number;
+  readonly previousMs: number;
+  readonly intervalMs: number;
+}): number =>
+  latencyPressure(
+    reading.p99Ns / 1e6,
+    samplerLateness(reading.nowMs, reading.previousMs, reading.intervalMs),
+    reading.samples,
+  );
 
 interface Slot {
   readonly takenAtMs: number;
@@ -186,16 +217,18 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
 
   const arm = Effect.gen(function* () {
     if (sampler !== undefined) return;
-    const scope = yield* Scope.make();
+    // Claimed before the first yield: a settle that runs meanwhile must not arm a second one.
+    const scope = Scope.makeUnsafe();
     const current: Sampler = { scope, active: true };
     sampler = current;
     const next = yield* options.pressure.pipe(Effect.provideService(Scope.Scope, scope));
     const isActive = () => current.active;
+    // A sample runs to its end: a stop requested meanwhile lands after its wake-ups went out.
     const loop = Effect.gen(function* () {
       while (isActive()) {
         yield* Effect.sleep(options.sampleInterval);
         if (!isActive()) break;
-        yield* sample(current, next);
+        yield* Effect.uninterruptible(sample(current, next));
       }
     }).pipe(
       Effect.ensuring(

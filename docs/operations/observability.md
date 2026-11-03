@@ -783,18 +783,21 @@ turn work — turn starts, restarted-run continuations, checkpoint captures and 
 outbox beyond an allowance, so that user-facing work keeps its latency: interrupts, steers, runtime
 request answers, detaches, stops and cleanups are always claimed (behind an older effect of their own
 thread, as ever). The signal is the event loop's delay — the p99 of a 10 ms-resolution histogram over
-each second, or the sampler's own lateness when a block spans the whole second — not CPU time or
+each second, or the sampler's own lateness when the histogram holds fewer than ten samples because
+a block spanned its ticks — not CPU time or
 event loop utilization: a loop can be busy for most of a second yet schedule interactive work
 promptly, and utilization counts every moment it is not idle. After two seconds at or above
 `T3CODE_EFFECT_ADMISSION_DELAY_MS` (default `40`; `0` turns the gate off; otherwise at least `30`, so
 that the reopen mark at half stays above the histogram's resolution and an idle loop's delay) only
 half the workers, at least one, may run such effects, and after two seconds below half that delay
-all of them may again. The histogram and its 1 Hz sampler run only while the gate can act — from the
+all of them may again. With one worker no gate is built: the saturated allowance equals the worker
+count, so it could change nothing. The histogram and its 1 Hz sampler run only while the gate can act — from the
 saturated allowance's worth of such effects in flight until the gate is open with fewer — so an idle
 server or a single session pays no wake-ups for it; the price is that the first close after the
 sampler starts takes its two samples from then. Effects already running are never stopped, a slot
-counts against the allowance for two minutes at most (longer than any turn start, so hung starts
-cannot hold it), the last slot given back wakes one idle worker — after its claim took work, gated
+counts against the allowance for ten minutes at most (a safety valve against hung starts, well past
+the slow tail of production turn starts, which average about 92 s — not a tuning value), the last
+slot given back wakes one idle worker — after its claim took work, gated
 or not, or when it expired; a claim that found nothing returns it without a wake-up — and a
 reopened gate wakes them all. The time an
 effect waited in the outbox is its queue wait (`effect.queue_wait_ms` on `EffectWorker.runEffect`,

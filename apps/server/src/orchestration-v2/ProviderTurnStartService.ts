@@ -808,10 +808,12 @@ export const layer: Layer.Layer<
               .supportsMultipleProviderThreadsPerSession !== true,
         }),
       );
+      // A scope created at the turn's cwd as its real path is that workspace: no read, no lookup.
       const runScope =
         checkpointScope.kind !== "root_run" ||
         checkpointScope.parentScopeId !== null ||
         workspaceNow == null ||
+        (workspaceNow === checkpointScope.cwd && workspaceNow === checkpointScope.realCwd) ||
         keepsOpenedCwd
           ? checkpointScope
           : yield* Effect.gen(function* () {

@@ -208,7 +208,7 @@ export const resolveWorkspacePath = (
 
 // The scope choice runs on the command path, where an asynchronous lookup yields the fiber and lets
 // provider output commit first (an order the product leaves open, which an equivalence test pins);
-// a synchronous realpath does not. A missing path resolves lexically.
+// a synchronous realpath does not. Only spellings that were not real paths get here. Missing: lexical.
 const resolveWorkspaceNow = (path: Path.Path, target: string) =>
   Effect.try({
     try: () => {
@@ -246,30 +246,37 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
   );
   const rootScope = rootScopes.find((scope) => scope.id === rootScopeId);
   // A scope is its workspace by real path when it was created (a spelling, such as a symlink, may
-  // point elsewhere later); scopes created before that was kept resolve their spelling now.
-  const workspace = yield* input.resolve(input.cwd);
+  // point elsewhere later). A spelling that was already its real path then needs no lookup now (only
+  // a directory replaced by a symlink could move it); others, and older scopes' spellings, are resolved.
+  const atRealPath = rootScopes.find(
+    (scope) => scope.cwd === input.cwd && scope.realCwd === input.cwd,
+  );
+  const workspace = atRealPath?.realCwd ?? (yield* input.resolve(input.cwd));
   const sameAsRoot =
+    atRealPath === undefined &&
     rootScope !== undefined &&
     (rootScope.realCwd ?? (yield* input.resolve(rootScope.cwd))) === workspace;
   const [scopeId, ordinalWithinParent] =
-    rootScope === undefined || sameAsRoot
-      ? ([rootScopeId, 0] as const)
-      : yield* Effect.gen(function* () {
-          const crypto = yield* Crypto.Crypto;
-          const digest = yield* crypto
-            .digest("SHA-256", new TextEncoder().encode(workspace))
-            .pipe(Effect.orDie);
-          const workspaceScopeId = yield* input.idAllocator.allocate.checkpointScope({
-            threadId: input.threadId,
-            name: `${ROOT_CHECKPOINT_SCOPE_NAME}@${Hex.encode(digest).slice(0, 16)}`,
+    atRealPath !== undefined
+      ? ([atRealPath.id, atRealPath.ordinalWithinParent] as const)
+      : rootScope === undefined || sameAsRoot
+        ? ([rootScopeId, 0] as const)
+        : yield* Effect.gen(function* () {
+            const crypto = yield* Crypto.Crypto;
+            const digest = yield* crypto
+              .digest("SHA-256", new TextEncoder().encode(workspace))
+              .pipe(Effect.orDie);
+            const workspaceScopeId = yield* input.idAllocator.allocate.checkpointScope({
+              threadId: input.threadId,
+              name: `${ROOT_CHECKPOINT_SCOPE_NAME}@${Hex.encode(digest).slice(0, 16)}`,
+            });
+            const existing = rootScopes.find((scope) => scope.id === workspaceScopeId);
+            return [
+              workspaceScopeId,
+              existing?.ordinalWithinParent ??
+                Math.max(...rootScopes.map((scope) => scope.ordinalWithinParent)) + 1,
+            ] as const;
           });
-          const existing = rootScopes.find((scope) => scope.id === workspaceScopeId);
-          return [
-            workspaceScopeId,
-            existing?.ordinalWithinParent ??
-              Math.max(...rootScopes.map((scope) => scope.ordinalWithinParent)) + 1,
-          ] as const;
-        });
   const reused = rootScopes.find((scope) => scope.id === scopeId);
   return {
     id: scopeId,

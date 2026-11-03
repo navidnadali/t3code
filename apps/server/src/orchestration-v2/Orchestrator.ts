@@ -1991,8 +1991,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         resolvedForStart._tag === "Success"
           ? (resolvedForStart.success.cwd ?? projection.thread.worktreePath ?? process.cwd())
           : undefined;
+      // A stored scope created at this cwd as its real path is that workspace without a lookup.
       const checkpointScope =
-        storedCheckpointScope !== undefined && workspaceNow === undefined
+        storedCheckpointScope !== undefined &&
+        (workspaceNow === undefined ||
+          (workspaceNow === storedCheckpointScope.cwd &&
+            workspaceNow === storedCheckpointScope.realCwd))
           ? storedCheckpointScope
           : yield* Effect.gen(function* () {
               if (resolvedForStart._tag === "Failure") return yield* resolvedForStart.failure;

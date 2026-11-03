@@ -14,7 +14,6 @@ import { ChildProcessSpawner } from "effect/process";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopManagedPolicy from "../app/DesktopManagedPolicy.ts";
 import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
-import { wslNodeFallbackCapFlags } from "./DesktopBackendConfiguration.ts";
 import * as DesktopShellEnvironment from "../shell/DesktopShellEnvironment.ts";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopServerExposure from "./DesktopServerExposure.ts";
@@ -327,53 +326,6 @@ describe("DesktopBackendConfiguration", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect(
-    "resolveWsl gives the node fallback no cap when the desktop's environment sets one or disables it",
-    () =>
-      Effect.gen(function* () {
-        // The desktop's NODE_OPTIONS and the escape hatch are what WSL sees; a forced 64 would override them.
-        const nodeOptions = process.env.NODE_OPTIONS;
-        const hatch = process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
-            else process.env.NODE_OPTIONS = nodeOptions;
-            if (hatch === undefined) delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
-            else process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = hatch;
-          }),
-        );
-        const wslEnv = process.env.WSLENV;
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            if (wslEnv === undefined) delete process.env.WSLENV;
-            else process.env.WSLENV = wslEnv;
-          }),
-        );
-        process.env.WSLENV = "NODE_OPTIONS/u:T3CODE_V8_MAX_SEMI_SPACE_MB";
-        process.env.NODE_OPTIONS = "--max-semi-space-size=16";
-        delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
-        assert.notInclude(wslNodeFallbackCapFlags(), "--max-semi-space-size=64");
-        delete process.env.NODE_OPTIONS;
-        process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "0";
-        assert.deepEqual(wslNodeFallbackCapFlags(), []);
-        process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "96";
-        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=96"]);
-        delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
-        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
-        // Not forwarded by WSLENV: WSL never sees them, so they decide nothing.
-        delete process.env.WSLENV;
-        process.env.NODE_OPTIONS = "--max-semi-space-size=16";
-        process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "0";
-        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
-        // `/w` forwards only into Windows; `/u` and a bare name forward into WSL.
-        process.env.WSLENV = "NODE_OPTIONS/w:T3CODE_V8_MAX_SEMI_SPACE_MB/w";
-        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
-        process.env.WSLENV = "NODE_OPTIONS/uw:T3CODE_V8_MAX_SEMI_SPACE_MB/wu";
-        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
-        process.env.WSLENV = "NODE_OPTIONS/u:T3CODE_V8_MAX_SEMI_SPACE_MB/p";
-        assert.deepEqual(wslNodeFallbackCapFlags(), []);
-      }).pipe(Effect.scoped),
-  );
   it.effect("resolveWsl pins a default-tracking run to the concrete default distro", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -474,19 +426,23 @@ describe("DesktopBackendConfiguration", () => {
         Effect.gen(function* () {
           const path = yield* Path.Path;
           const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
-          // The Linux executable takes Node options only on its command line, and a bootstrap
-          // descriptor rules out a corrective relaunch: the desktop passes them itself — but only
-          // what WSL actually receives, which is what the user's WSLENV forwards.
+          // The WSL backend gets nothing new from the young-generation default: whatever the
+          // desktop's NODE_OPTIONS, hatch or WSLENV say, its arguments are what they were (the Linux
+          // executable has the cap built in; its bootstrap descriptor rules a relaunch out).
           const nodeOptions = process.env.NODE_OPTIONS;
+          const hatch = process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
           const wslEnv = process.env.WSLENV;
           const restore = Effect.sync(() => {
             if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
             else process.env.NODE_OPTIONS = nodeOptions;
+            if (hatch === undefined) delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+            else process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = hatch;
             if (wslEnv === undefined) delete process.env.WSLENV;
             else process.env.WSLENV = wslEnv;
           });
           process.env.NODE_OPTIONS = "--max-semi-space-size=16";
-          process.env.WSLENV = "NODE_OPTIONS";
+          process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "96";
+          process.env.WSLENV = "NODE_OPTIONS/u:T3CODE_V8_MAX_SEMI_SPACE_MB/u";
           const config = yield* configuration
             .resolveWsl({ port: 5000, distro: "Ubuntu" })
             .pipe(Effect.ensuring(restore));
@@ -510,7 +466,6 @@ describe("DesktopBackendConfiguration", () => {
             "env",
             `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${resolvedPath}`,
             `${linuxAppRoot}/t3`,
-            "--node-options=--max-semi-space-size=16",
             "--bootstrap-fd",
             "0",
           ]);
@@ -518,27 +473,6 @@ describe("DesktopBackendConfiguration", () => {
           assert.equal(config.wslRuntimeId, `sha256-${archiveHash}`);
           assert.equal(legacyCleanupCount, 1);
           assert.isTrue(Option.isNone(config.preflightFailure));
-          // Windows-only NODE_OPTIONS that WSLENV does not forward never reach the Linux backend.
-          process.env.NODE_OPTIONS = "--require=C:\\WindowsOnly\\hook.cjs";
-          delete process.env.WSLENV;
-          const unforwarded = yield* configuration
-            .resolveWsl({ port: 5000, distro: "Ubuntu" })
-            .pipe(Effect.ensuring(restore));
-          assert.isFalse(unforwarded.args.some((arg) => arg.startsWith("--node-options=")));
-          // A `/w` entry forwards only into Windows: the Linux backend does not receive it either.
-          process.env.NODE_OPTIONS = "--require=C:\\WindowsOnly\\hook.cjs";
-          process.env.WSLENV = "NODE_OPTIONS/w";
-          const windowsOnly = yield* configuration
-            .resolveWsl({ port: 5000, distro: "Ubuntu" })
-            .pipe(Effect.ensuring(restore));
-          assert.isFalse(windowsOnly.args.some((arg) => arg.startsWith("--node-options=")));
-          // WSL drops any entry carrying `w` in this direction, `/uw` included.
-          process.env.NODE_OPTIONS = "--require=C:\\WindowsOnly\\hook.cjs";
-          process.env.WSLENV = "NODE_OPTIONS/uw";
-          const bothWays = yield* configuration
-            .resolveWsl({ port: 5000, distro: "Ubuntu" })
-            .pipe(Effect.ensuring(restore));
-          assert.isFalse(bothWays.args.some((arg) => arg.startsWith("--node-options=")));
         }),
     );
   });
@@ -747,7 +681,6 @@ describe("DesktopBackendConfiguration", () => {
           "env",
           "PATH=/home/test user's/.nvm/versions/node/v22.0.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/test user/bin:/opt/test's tools/bin:/usr/bin:/bin",
           nodePath,
-          "--max-semi-space-size=64",
           linuxEntryPath,
           "--bootstrap-fd",
           "0",

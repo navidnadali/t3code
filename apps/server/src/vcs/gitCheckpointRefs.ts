@@ -359,13 +359,18 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const packed = new Map<string, PackedRefs>();
   let packedEntries = 0;
   // The store a ref was resolved against: its objects directory, alternates file and the
-  // alternates named by the environment; a different store may lack the commit.
+  // alternates named by the environment; a different store may lack the commit. Git reads a
+  // relative alternate from each command's own directory, so such a store has no one key.
   const refKey = (repository: CheckpointRepository, ref: string) =>
     Effect.promise(async () => {
+      const environment = process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? "";
+      const relative = environment
+        .split(NodePath.delimiter)
+        .some((entry) => entry.length > 0 && !NodePath.isAbsolute(entry));
+      if (relative) return null;
       const alternates = await statFingerprint(
         NodePath.join(repository.objectsDir, "info", "alternates"),
       );
-      const environment = process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? "";
       return `${repository.commonDir}\0${repository.objectsDir}\0${alternates}\0${environment}\0${ref}`;
     });
 
@@ -397,7 +402,8 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const resolveRef = Effect.fnUntraced(function* (repository: CheckpointRepository, ref: string) {
     const { commonDir } = repository;
     if (!CHECKPOINT_REF_NAME.test(ref) || !environmentPlain()) return undefined;
-    const known = refs.get(yield* refKey(repository, ref));
+    const key = yield* refKey(repository, ref);
+    const known = key === null ? undefined : refs.get(key);
     if (known === undefined) return undefined;
     const reftable = yield* Effect.promise(() =>
       statFingerprint(NodePath.join(commonDir, "reftable")),
@@ -444,8 +450,13 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
 
   return {
     rememberRef: (repository, ref, oid) =>
-      Effect.map(refKey(repository, ref), (key) => refs.set(key, oid)),
-    forgetRef: (repository, ref) => Effect.map(refKey(repository, ref), (key) => refs.delete(key)),
+      Effect.map(refKey(repository, ref), (key) => {
+        if (key !== null) refs.set(key, oid);
+      }),
+    forgetRef: (repository, ref) =>
+      Effect.map(refKey(repository, ref), (key) => {
+        if (key !== null) refs.delete(key);
+      }),
     resolveRef,
     historyState,
     rememberCommits,

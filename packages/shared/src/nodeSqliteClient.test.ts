@@ -1747,17 +1747,24 @@ it.effect(
           const before = startedWorkers.length;
           yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
           const worker = startedWorkers[before]!;
-          const arrived = posting("long-1");
-          const long = yield* sql
-            .withTransaction(sql.unsafe(longRead("long-1", 1_500_000)))
-            .pipe(SqliteClient.readOnly, (effect) =>
-              Effect.forkChild(effect, { startImmediately: true }),
-            );
-          yield* arrived;
-          yield* Fiber.interrupt(long);
-          // The interruption completed only once the worker had answered the abandoned read, so
-          // the reader it frees is idle, as it was before the ending stopped being awaited.
-          assert.equal(repliesTo(worker, "long-1"), 1);
+          // Abandoned as the first statement (its reply still pending, so the ending is an
+          // ordinary awaited statement) and as a later one (the ending itself is awaited).
+          for (const [tag, body] of [
+            ["long-1", (read: string) => sql.unsafe(read)],
+            ["long-2", (read: string) => Effect.andThen(countEntries(sql), sql.unsafe(read))],
+          ] as const) {
+            const arrived = posting(tag);
+            const long = yield* sql
+              .withTransaction(body(longRead(tag, 1_500_000)))
+              .pipe(SqliteClient.readOnly, (effect) =>
+                Effect.forkChild(effect, { startImmediately: true }),
+              );
+            yield* arrived;
+            yield* Fiber.interrupt(long);
+            // The interruption completed only once the worker had answered the abandoned read,
+            // so the reader it frees is idle, as it was before the ending stopped being awaited.
+            assert.equal(repliesTo(worker, tag), 1, tag);
+          }
           assert.deepEqual(yield* sql`SELECT ${"short-1"} AS tag`.pipe(SqliteClient.readOnly), [
             { tag: "short-1" },
           ]);
@@ -1968,7 +1975,10 @@ it.effect("refuses what the read-only open does not, whatever the spelling or th
   withReaderClient(
     (sql) =>
       Effect.gen(function* () {
-        yield* sql.unsafe("PRAGMA QUERY_ONLY = OFF").pipe(SqliteClient.readOnly, Effect.ignore);
+        const pragma = yield* sql
+          .unsafe("PRAGMA QUERY_ONLY = OFF")
+          .pipe(SqliteClient.readOnly, Effect.exit);
+        assert.isTrue(Exit.isFailure(pragma), "query_only stays on, whatever the spelling");
         const write = yield* sql
           .unsafe("CREATE TEMP TABLE scratch(x)")
           .pipe(SqliteClient.readOnly, Effect.flip);
@@ -2073,6 +2083,43 @@ it.effect("sets up an awaited ending correctly whatever happens before it runs",
       }),
     { readerPoolSize: 1 },
   ),
+);
+
+it.effect(
+  "answers an awaited ending with SQLite's error when a control it waited behind ended first",
+  () =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const outer = yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                assert.equal(yield* countEntries(sql), 1);
+                // The raw COMMIT is still outstanding when the plain one leaves, so that one waits
+                // for its answer: SQLite's, not a guess.
+                const [raw, plain] = yield* Effect.all(
+                  [
+                    sql.unsafe("COMMIT").raw.pipe(Effect.exit),
+                    sql.unsafe("COMMIT").pipe(Effect.exit),
+                  ],
+                  { concurrency: "unbounded" },
+                );
+                assert.isTrue(Exit.isSuccess(raw));
+                assert.isTrue(Exit.isFailure(plain), "the second COMMIT had nothing to end");
+                if (Exit.isFailure(plain))
+                  assert.include(String(Cause.squash(plain.cause)), "no transaction is active");
+              }),
+            )
+            .pipe(SqliteClient.readOnly, Effect.exit);
+          // The managed COMMIT has nothing to end either, as on RC2.
+          assert.isTrue(Exit.isFailure(outer));
+          assert.equal(
+            yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly),
+            1,
+          );
+        }),
+      { readerPoolSize: 1 },
+    ),
 );
 
 it.effect("reads the temporary schema's metadata on a reader", () =>

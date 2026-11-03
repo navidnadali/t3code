@@ -15,6 +15,7 @@ import {
   WS_METHODS,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
+  AuthOrchestrationReadScope,
   ORCHESTRATION_V2_WS_METHODS,
   OrchestrationProjectShell,
   OrchestrationV2RpcSchemas,
@@ -146,6 +147,7 @@ import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
 import {
   encodeShellStreamItem,
   encodeThreadStreamItem,
@@ -2204,9 +2206,9 @@ const decodeThreadChunk = Schema.decodeUnknownSync(
 
 // RpcServer over an in-memory protocol with the JSON codec: the frames it sends are collected,
 // each chunk acknowledged as the websocket client would.
-const serveStreamRequest = <Rpcs extends Rpc.Any>(
+const serveStreamRequest = <Rpcs extends Rpc.Any, R>(
   group: RpcGroup.RpcGroup<Rpcs>,
-  handlers: Layer.Layer<Rpc.ToHandler<Rpcs>>,
+  handlers: Layer.Layer<Rpc.ToHandler<Rpcs>, never, R>,
   request: { readonly tag: string; readonly payload: unknown },
 ) =>
   Effect.gen(function* () {
@@ -2235,7 +2237,7 @@ const serveStreamRequest = <Rpcs extends Rpc.Any>(
     );
     yield* RpcServer.make(group, WS_RPC_SERVER_OPTIONS).pipe(
       Effect.provideService(RpcServer.Protocol, protocol),
-      Effect.provide(handlers),
+      Effect.provide(Layer.merge(handlers, RpcAuthorization.layer([AuthOrchestrationReadScope]))),
       Effect.forkScoped,
     );
     const toServer = (data: RpcMessage.FromClientEncoded) =>
@@ -2406,8 +2408,8 @@ it.live(
         threadItems.map((item) => item.kind),
         ["event", "synchronized"],
       );
-      const event = threadItems.find((item) => item.kind === "event");
-      assert.equal(event?.kind === "event" ? event.event.occurredAt : undefined, now);
+      // The event's timestamps travel as the contract encodes them.
+      assert.include(threadChunks.join("\n"), `"occurredAt":"${now}"`);
       assert.deepEqual(
         threadChunks,
         yield* serveStreamRequest(ContractStreamRpcGroup, contractHandlers, threadRequest),

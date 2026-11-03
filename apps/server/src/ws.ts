@@ -650,18 +650,22 @@ const wsRpc = <Tag extends WsRpc["_tag"]>(tag: Tag) =>
 const subscribeShellRpc = wsRpc(ORCHESTRATION_V2_WS_METHODS.subscribeShell);
 const subscribeThreadRpc = wsRpc(ORCHESTRATION_V2_WS_METHODS.subscribeThread);
 type EncodedStreamWsRpc = typeof subscribeShellRpc | typeof subscribeThreadRpc;
-// Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
-const ServerWsRpcGroup = RpcGroup.make(
-  ...Array.from(WsRpcGroup.requests.values()).filter(
-    (rpc): rpc is Exclude<WsRpc, EncodedStreamWsRpc> =>
-      rpc !== subscribeShellRpc && rpc !== subscribeThreadRpc,
-  ),
+/** The two stream RPCs as the server defines them: encoded items pass through. Exported for RpcServer-level tests. */
+export const ServerWsStreamRpcGroup = RpcGroup.make(
   subscribeShellRpc.setSuccess(
     RpcSchema.Stream(EncodedStreamItem, subscribeShellRpc.successSchema.error),
   ),
   subscribeThreadRpc.setSuccess(
     RpcSchema.Stream(EncodedStreamItem, subscribeThreadRpc.successSchema.error),
   ),
+);
+// Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
+const ServerWsRpcGroup = RpcGroup.make(
+  ...Array.from(WsRpcGroup.requests.values()).filter(
+    (rpc): rpc is Exclude<WsRpc, EncodedStreamWsRpc> =>
+      rpc !== subscribeShellRpc && rpc !== subscribeThreadRpc,
+  ),
+  ...Array.from(ServerWsStreamRpcGroup.requests.values()),
 ).middleware(RpcInstrumentation);
 
 // RpcGroup.toLayer derives each handler's requirements by scanning every RPC in
@@ -1414,6 +1418,19 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     );
   },
 );
+
+/** The stream handlers as `layerWsRpc` registers them: each item encoded once, shared across clients. */
+export const subscribeShellRpcHandler = (
+  input: Parameters<typeof subscribeOrchestrationV2Shell>[0],
+) => Stream.unwrap(subscribeOrchestrationV2Shell(input)).pipe(Stream.map(encodeShellStreamItem));
+export const subscribeThreadRpcHandler = (
+  input: Parameters<typeof subscribeOrchestrationV2Thread>[0],
+) =>
+  Stream.unwrap(
+    Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
+      Effect.andThen(subscribeOrchestrationV2Thread(input)),
+    ),
+  ).pipe(Stream.map(encodeThreadStreamItem));
 
 export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
@@ -2331,16 +2348,8 @@ export const layerWsRpc = (
                 ),
             ),
           ),
-        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input) =>
-          Stream.unwrap(subscribeOrchestrationV2Shell(input)).pipe(
-            Stream.map(encodeShellStreamItem),
-          ),
-        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
-          Stream.unwrap(
-            Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-              Effect.andThen(subscribeOrchestrationV2Thread(input)),
-            ),
-          ).pipe(Stream.map(encodeThreadStreamItem)),
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: subscribeShellRpcHandler,
+        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: subscribeThreadRpcHandler,
         [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: (input) =>
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(

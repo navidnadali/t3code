@@ -184,16 +184,6 @@ export const seaBuildOptions = (platform: string): SeaBuildOptions =>
     ? { execArgv: [], execArgvExtension: "env" }
     : { execArgv: SEA_EXEC_ARGV, execArgvExtension: SEA_EXEC_ARGV_EXTENSION };
 
-/**
- * The cap as a node flag for a process started with the environment's NODE_OPTIONS in force:
- * nothing when NODE_OPTIONS sets one or the hatch disables it, else the knob's value or the default.
- */
-export const nodeCapFlag = (env: Environment): string | undefined => {
-  if (flagIn(tokenizeNodeOptions(env.NODE_OPTIONS)) !== undefined) return undefined;
-  const wanted = capSetting(env);
-  return wanted === 0 ? undefined : `${MAX_SEMI_SPACE_FLAG}=${wanted}`;
-};
-
 /** One argument as NODE_OPTIONS text: double quotes around spaces and quotes, which Node unquotes. */
 const quoteNodeOption = (token: string): string =>
   /[\s"]/.test(token) ? `"${token.replaceAll(/(["\\])/g, "\\$1")}"` : token;

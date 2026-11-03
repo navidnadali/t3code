@@ -17,8 +17,6 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 import serverPackageJson from "../../../server/package.json" with { type: "json" };
 import {
   INHERITED_NODE_OPTIONS_ENV,
-  nodeCapFlag,
-  nodeOptionsArgument,
   serverChildEnvironment,
 } from "@t3tools/shared/youngGenerationEnv";
 
@@ -124,46 +122,6 @@ const WSL_SERVER_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 const nodeBinDirOf = (nodePath: string): string => {
   const lastSlash = nodePath.lastIndexOf("/");
   return lastSlash > 0 ? nodePath.slice(0, lastSlash) : "/usr/bin";
-};
-
-/**
- * The WSL node fallback's young-generation cap as node flags, from the environment WSL sees (the
- * desktop's): none when NODE_OPTIONS sets one or the hatch disables it, so nothing is overridden.
- */
-export const wslNodeFallbackCapFlags = (): ReadonlyArray<string> => {
-  const flag = nodeCapFlag(wslYoungGenerationEnv());
-  return flag === undefined ? [] : [flag];
-};
-
-/**
- * Whether the user's WSLENV (`NAME[/flags]`, colon-separated) forwards a variable into WSL: WSL
- * drops any entry whose flags contain `w` in this direction (`/w`, `/uw`, `/wu`); `/u`, `/p`, `/l`
- * and a bare name travel into WSL.
- */
-const wslForwards = (name: string): boolean =>
-  (process.env.WSLENV ?? "").split(":").some((entry) => {
-    const [entryName, flags = ""] = entry.split("/");
-    return entryName === name && !flags.includes("w");
-  });
-
-/**
- * What WSL sees of the desktop's young-generation settings: its NODE_OPTIONS and the escape hatch,
- * but only those the user's WSLENV forwards — a Windows-only NODE_OPTIONS never reaches Linux.
- */
-const wslYoungGenerationEnv = () => ({
-  NODE_OPTIONS: wslForwards("NODE_OPTIONS") ? process.env.NODE_OPTIONS : undefined,
-  T3CODE_V8_MAX_SEMI_SPACE_MB: wslForwards("T3CODE_V8_MAX_SEMI_SPACE_MB")
-    ? process.env.T3CODE_V8_MAX_SEMI_SPACE_MB
-    : undefined,
-});
-
-/**
- * The packaged WSL executable takes Node options only on its command line (it ignores NODE_OPTIONS),
- * and its bootstrap descriptor rules out a corrective relaunch: the desktop passes them itself.
- */
-const wslExecutableNodeOptions = (): ReadonlyArray<string> => {
-  const argument = nodeOptionsArgument(wslYoungGenerationEnv());
-  return argument === undefined ? [] : [argument];
 };
 
 /** The backend's young-generation cap, with the marker that gives its children the desktop's own NODE_OPTIONS. */
@@ -754,11 +712,13 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
     runtime.kind === "executable"
       ? `${WSL_SERVER_SYSTEM_PATH}:${preflight.resolvedPath}`
       : `${nodeBinDirOf(runtime.nodePath)}:${WSL_SERVER_SYSTEM_PATH}:${preflight.resolvedPath}`;
-  // The executable has its young-generation cap built in; node takes it as a flag, never relaunching.
+  // The WSL backend gets nothing from the young-generation default (RC3 scope cut): the Linux
+  // executable has the cap built in, the node fallback runs Node's default, and the bootstrap
+  // descriptor rules a relaunch out either way.
   const command =
     runtime.kind === "executable"
-      ? [runtime.entryPath, ...wslExecutableNodeOptions()]
-      : [runtime.nodePath, ...wslNodeFallbackCapFlags(), runtime.linuxEntryPath];
+      ? [runtime.entryPath]
+      : [runtime.nodePath, runtime.linuxEntryPath];
 
   return {
     ...baseConfig,

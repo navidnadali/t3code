@@ -214,7 +214,9 @@ never from `NODE_OPTIONS`: a direct start with `NODE_OPTIONS` set, the escape ha
 explicit `--max-semi-space-size` in `NODE_OPTIONS` is carried there by one relaunch (`execve`, same pid,
 before any other work), the background service launcher passes them there itself (a runtime archive
 declares this in `exec-argv.json` beside the executable; an older runtime gets them in `NODE_OPTIONS` as
-before), and the desktop app hands its backend the cap in `NODE_OPTIONS` with the marker. A `node bin.mjs`
+before), and the desktop app hands its backend the cap in `NODE_OPTIONS` with the marker (on macOS, Linux and native
+Windows; the WSL backend gets nothing from the default — its Linux executable has the cap built in, its node
+fallback runs Node's default, and the bootstrap descriptor rules a relaunch out — see the follow-up). A `node bin.mjs`
 start (an npm install) still relaunches itself once with the cap in `NODE_OPTIONS`. The Windows executable has
 nothing baked and reads `NODE_OPTIONS` itself, as before (no `execve` could carry them): a direct start there
 runs Node's default, the launcher passes the cap. Helpers the server starts from its own executable get their

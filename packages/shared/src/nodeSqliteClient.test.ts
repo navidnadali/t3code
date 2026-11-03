@@ -1520,6 +1520,44 @@ it.effect("forwards statements that merely start with a transaction keyword to S
   ),
 );
 
+it.effect("leaves a transaction control with bindings or a raw result to SQLite", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const before = startedWorkers.length;
+      // A BEGIN with a binding is SQLite's error, not a folded BEGIN.
+      const bound = yield* sql.unsafe("BEGIN", [1]).pipe(SqliteClient.readOnly, Effect.flip);
+      assert.include(String(bound.reason.cause), "column index out of range");
+      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+      // Raw controls keep the run() result, as before.
+      const raw = yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const begun = yield* sql.unsafe("BEGIN").raw.pipe(Effect.flip);
+            assert.include(String(begun.reason.cause), "within a transaction");
+            assert.equal(yield* countEntries(sql), 1);
+            return yield* sql.unsafe("RELEASE SAVEPOINT missing").raw.pipe(Effect.flip);
+          }),
+        )
+        .pipe(SqliteClient.readOnly);
+      assert.include(String(raw.reason.cause), "no such savepoint");
+      const committed = yield* Effect.gen(function* () {
+        yield* sql.unsafe("BEGIN").raw;
+        assert.equal(yield* countEntries(sql), 1);
+        return yield* sql.unsafe("COMMIT").raw;
+      }).pipe(SqliteClient.readOnly);
+      assert.deepEqual(committed, { changes: 0, lastInsertRowid: 0 });
+      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+      yield* eventLoopTurn;
+      const shapes = messageShapes(startedWorkers[before]!);
+      assert.deepEqual(
+        shapes.filter((shape) => shape.startsWith("begin+")),
+        ["begin+SELECT", "begin+SELECT"],
+        shapes.join(" "),
+      );
+    }),
+  ),
+);
+
 it.effect("sends statements issued together as one batch and answers each on its own", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {

@@ -160,6 +160,18 @@ const preloadVisible = (env: Environment, execArgv: ReadonlyArray<string>): bool
       PRELOAD_FLAGS.has(token) || [...PRELOAD_FLAGS].some((flag) => token.startsWith(`${flag}=`)),
   );
 
+/**
+ * Whether a CommonJS module already ran before this entry: a `--require` preload that removed
+ * itself from NODE_OPTIONS still sits in the module cache. (An `--import` preload leaves no trace.)
+ */
+const preloadRan = (): boolean => {
+  try {
+    return Object.keys(NodeModule.createRequire(process.execPath).cache).length > 0;
+  } catch {
+    return false;
+  }
+};
+
 /** `value` with the cap this process was given removed, when `value` starts with `prefix` + the cap. */
 const withoutAppendedCap = (value: string, prefix: string, mb: number): string | undefined => {
   const written = nodeOptionsWithMaxSemiSpace(prefix, mb);
@@ -270,6 +282,8 @@ export const planYoungGenerationRelaunch = (input: {
   readonly isDirectory?: (path: string) => boolean;
   readonly pid?: number;
   readonly relaunchedPid?: string;
+  /** A preload already ran in this process, whatever NODE_OPTIONS says now. */
+  readonly preloadRan?: boolean;
 }): RelaunchPlan => {
   // At most one relaunch per process, whatever a preload did to NODE_OPTIONS in the new image.
   if (input.pid !== undefined && input.relaunchedPid === String(input.pid)) {
@@ -312,7 +326,7 @@ export const planYoungGenerationRelaunch = (input: {
   }
   // A preload runs before this code and may have rewritten NODE_OPTIONS: what it reads now is not
   // what Node started with, so neither an explicit cap nor the user's options can be trusted.
-  if (preloadVisible(input.env, input.execArgv)) {
+  if (input.preloadRan === true || preloadVisible(input.env, input.execArgv)) {
     return { kind: "keep", reason: "started with a preload" };
   }
   const mb = resolveMaxSemiSpaceMb(input.env, input.execArgv);
@@ -400,6 +414,7 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
     inspectorActive: inspectorActive(),
     pid: process.pid,
     ...(relaunchedPid === undefined ? {} : { relaunchedPid }),
+    preloadRan: preloadRan(),
   });
   if (plan.kind === "keep") {
     return plan.launcherPredatesDefault === true

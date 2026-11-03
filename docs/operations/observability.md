@@ -217,9 +217,13 @@ Node's default, a positive integer sets another cap, and an explicit `--max-semi
 started with an IPC channel or a bootstrap descriptor (`--bootstrap-fd`, `T3CODE_BOOTSTRAP_FD`) by a
 launcher that did not set the flag, or with the inspector (`--inspect*`), runs with Node's default; so does
 a direct `t3 serve` on Windows (no `execve`), while a Windows server the service launcher starts gets the
-flag through its environment. A `--require` preload in `NODE_OPTIONS` runs in both images (before and after
-the relaunch). `t3 __node-flags` prints what the current process runs with; `server.v8` logs the parsed
-sizes once the server listens.
+flag through its environment. A direct start with a preload (`--require`, `--import`, `--loader` on the
+command line or in `NODE_OPTIONS`) keeps Node's default too, with the reason "started with a preload": what
+`NODE_OPTIONS` says after a preload ran is not what Node started with, so neither an explicit cap nor the
+user's options could be carried into a relaunch; a server the launcher starts gets the flag regardless. A
+process relaunches at most once (the relaunch marks its own pid), whatever a preload does to `NODE_OPTIONS`.
+`t3 __node-flags` prints what the current process runs with; `server.v8` logs the parsed sizes once the
+server listens.
 
 ### Related Artifacts
 

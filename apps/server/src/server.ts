@@ -848,9 +848,10 @@ const layerMakeServer = Layer.unwrap(
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
         yield* startup.markHttpListening;
         const runtimeFlags = nodeRuntimeFlags();
-        // A server that wanted the young-generation cap and runs without it says so where it is
-        // seen: an Info line hid a dead default from the fleet's logs.
-        yield* runtimeFlags.youngGenerationLost === true
+        // A server that wanted the young-generation cap and lost it to something changeable (a
+        // preload, an old launcher, a failed relaunch) says so where it is seen; a start that rules a
+        // relaunch out by its shape (IPC, bootstrap descriptor, inspector) is not for the user to fix.
+        yield* runtimeFlags.youngGenerationLost === true && runtimeFlags.structuralKeep !== true
           ? Effect.logWarning("server.v8", runtimeFlags)
           : Effect.logInfo("server.v8", runtimeFlags);
       }),

@@ -49,10 +49,11 @@ const modifiedAt = (file: string): number | undefined => {
 };
 
 // Builds a 160 MB executable and needs the engine's exact Node: a release check, run on request with
-//   T3CODE_SEA_TEST=1 vp test run apps/server/scripts/youngGenerationSea.test.ts
+//   T3_SEA_TEST=1 vp test run apps/server/scripts/youngGenerationSea.test.ts
+// (test workers drop every T3CODE_-prefixed variable, so the gate is a T3_ name).
 describe("young-generation default in the single executable", () => {
   it.live.skipIf(
-    HostProcess.Platform.defaultValue() === "win32" || process.env.T3CODE_SEA_TEST !== "1",
+    HostProcess.Platform.defaultValue() === "win32" || process.env.T3_SEA_TEST !== "1",
   )("relaunches the built t3 with the cap, directly and through a symlink", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

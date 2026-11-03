@@ -324,6 +324,8 @@ export type RelaunchPlan =
   | {
       readonly kind: "keep";
       readonly reason: string;
+      /** How the process was started rules a relaunch out; nothing in its environment caused the keep. */
+      readonly structural?: true;
       /** The server was started over IPC by a service launcher that supplied no flag (an RC2 launcher). */
       readonly launcherPredatesDefault?: true;
     };
@@ -356,7 +358,11 @@ export const planYoungGenerationRelaunch = (input: {
     return { kind: "keep", reason: "the young-generation cap is already in effect" };
   }
   if (input.platform === "win32" || !input.canExecve) {
-    return { kind: "keep", reason: "process.execve is unavailable on this platform" };
+    return {
+      kind: "keep",
+      reason: "process.execve is unavailable on this platform",
+      structural: true,
+    };
   }
   // execve keeps only stdio: an IPC channel or a bootstrap descriptor would be lost.
   if (input.hasIpcChannel) {
@@ -374,14 +380,14 @@ export const planYoungGenerationRelaunch = (input: {
         launcherPredatesDefault: true,
       };
     }
-    return { kind: "keep", reason: "started with an IPC channel" };
+    return { kind: "keep", reason: "started with an IPC channel", structural: true };
   }
   if (bootstrapFdOf(input.argv, input.env) !== undefined) {
-    return { kind: "keep", reason: "started with a bootstrap descriptor" };
+    return { kind: "keep", reason: "started with a bootstrap descriptor", structural: true };
   }
   // A second image would open a second inspector session and drop the attached debugger.
   if (input.inspectorActive === true || inspectorRequested(input.env, input.execArgv)) {
-    return { kind: "keep", reason: "the inspector is active" };
+    return { kind: "keep", reason: "the inspector is active", structural: true };
   }
   // A preload runs before this code and may have rewritten NODE_OPTIONS: what it reads now is not
   // what Node started with, so neither an explicit cap nor the user's options can be trusted.
@@ -414,6 +420,8 @@ export interface YoungGenerationOutcome {
   readonly keptReason?: string;
   /** Started over IPC by a service launcher that supplied no flag; the cap waits for a service restart. */
   readonly launcherPredatesDefault?: true;
+  /** How the process was started rules a relaunch out; nothing in its environment caused the keep. */
+  readonly structural?: true;
 }
 
 let lastOutcome: YoungGenerationOutcome | undefined;
@@ -508,7 +516,7 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
   }
   const keep = (
     keptReason: string,
-    extra: { readonly launcherPredatesDefault?: true } = {},
+    extra: { readonly launcherPredatesDefault?: true; readonly structural?: true } = {},
   ): YoungGenerationDecision => ({
     kind: "keep",
     outcome: { applied: false, nodeOptionsAtStart, keptReason, ...extra },
@@ -532,10 +540,10 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
     ...(view.isDirectory === undefined ? {} : { isDirectory: view.isDirectory }),
   });
   if (plan.kind === "keep") {
-    return keep(
-      plan.reason,
-      plan.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true },
-    );
+    return keep(plan.reason, {
+      ...(plan.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
+      ...(plan.structural === undefined ? {} : { structural: true }),
+    });
   }
   return {
     kind: "relaunch",
@@ -574,7 +582,7 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   if (decision.kind === "keep") return decision.outcome;
   const execve = process.execve;
   if (execve === undefined) {
-    return { ...decision.outcome, keptReason: "process.execve is unavailable" };
+    return { ...decision.outcome, keptReason: "process.execve is unavailable", structural: true };
   }
   try {
     execve(decision.plan.file, [...decision.plan.args], { ...decision.plan.env });
@@ -592,6 +600,8 @@ export interface NodeRuntimeFlags {
   readonly launcherPredatesDefault?: true;
   /** The process wanted the cap (neither disabled nor set explicitly) and runs without it; `keptReason` says why. */
   readonly youngGenerationLost?: true;
+  /** The loss is in how the process was started (IPC channel, bootstrap descriptor, inspector, no execve), not changeable from its environment. */
+  readonly structuralKeep?: true;
   readonly keptReason?: string;
   readonly execArgv: ReadonlyArray<string>;
   /** NODE_OPTIONS as V8 saw it at startup (the server's children see `nodeOptionsForChildren`). */
@@ -612,6 +622,7 @@ export const describeNodeRuntime = (input: {
   /** The escape hatch's value, to tell a cap nobody wanted from one that was lost. */
   readonly maxSemiSpaceSetting?: string | undefined;
   readonly keptReason?: string | undefined;
+  readonly structural?: boolean | undefined;
 }): NodeRuntimeFlags => {
   const wanted =
     resolveMaxSemiSpaceMb(
@@ -628,6 +639,7 @@ export const describeNodeRuntime = (input: {
       "node default",
     youngGenerationDefault: input.applied,
     ...(input.applied || !wanted ? {} : { youngGenerationLost: true }),
+    ...(input.structural === true ? { structuralKeep: true } : {}),
     ...(input.keptReason === undefined ? {} : { keptReason: input.keptReason }),
   };
 };
@@ -650,6 +662,7 @@ export const runtimeFlagsOf = (
     applied: outcome?.applied ?? false,
     maxSemiSpaceSetting: env[MAX_SEMI_SPACE_ENV],
     keptReason: outcome?.keptReason,
+    structural: outcome?.structural,
   });
   return {
     ...sizes,
@@ -691,6 +704,7 @@ export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {
     pid: process.pid,
     ...(outcome.keptReason === undefined ? {} : { keptReason: outcome.keptReason }),
     ...(outcome.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
+    ...(outcome.structural === undefined ? {} : { structural: true }),
     ...(bootstrapFd === undefined ? {} : { bootstrapFdOpen: isOpenDescriptor(bootstrapFd) }),
   };
   process.stdout.write(`${JSON.stringify(report)}\n`);

@@ -223,14 +223,18 @@ command line or in `NODE_OPTIONS`) keeps Node's default too, with the reason "st
 user's options could be carried into a relaunch; a server the launcher starts gets the flag regardless. On Linux the
 decision also checks `NODE_OPTIONS` as Node started with, read from `/proc/self/environ`: when that record differs
 from `NODE_OPTIONS` as it reads, a preload rewrote it and the process keeps Node's default ("NODE_OPTIONS changed
-since startup"). macOS and Windows keep no exact record, so the rules above decide on their own; the one case they
+since startup"); a `node --env-file` that supplies `NODE_OPTIONS` reads the same way (Node applies the file after
+exec, so the record lacks it), so such a server keeps Node's default — safe but lossy; put the cap in the file or the
+environment instead. macOS and Windows keep no exact record, so the rules above decide on their own; the one case they
 cannot see is an ES-module preload (`--import`, `--loader`) in `NODE_OPTIONS` that deletes its own entry: a `node`
 start (an npm install) is then relaunched once without that preload, and an explicit cap the preload also deleted
 becomes the default — the single executable runs no `--import` preload from `NODE_OPTIONS`, so the release binary
 cannot hit it. A process relaunches at most once (the relaunch marks its own pid), whatever a preload does to
 `NODE_OPTIONS`. `t3 __node-flags` prints what the current process runs with; `server.v8` logs the parsed sizes once
-the server listens — at Warn, with the reason, whenever the server wanted the cap and runs without it
-(`youngGenerationLost`).
+the server listens — at Warn, with the reason, whenever the server wanted the cap and lost it to something changeable
+(`youngGenerationLost`: a preload, a launcher that predates the default, a failed relaunch, a changed `NODE_OPTIONS`),
+and at Info when the start itself rules a relaunch out (`structuralKeep`: an IPC channel without a launcher, a bootstrap
+descriptor as the desktop app's backend uses, the inspector, no `execve`).
 
 ### Related Artifacts
 

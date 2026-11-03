@@ -158,52 +158,21 @@ export const SEA_EXEC_ARGV: ReadonlyArray<string> = [
 ];
 
 /**
- * Node applies NODE_OPTIONS before the baked execArgv, so a baked cap could never be changed from
- * the environment; "cli" lets `--node-options` extend and override it. It also makes Node ignore
- * NODE_OPTIONS, which the server then carries onto its own command line.
+ * "env": Node reads NODE_OPTIONS itself, with its own guards (the allowlist, AT_SECURE), and the
+ * baked cap stays whatever NODE_OPTIONS says — the packaged executable's 64 MiB cannot be changed
+ * or turned off, by decision. A "cli" build would let a `--node-options=` argument carry anything
+ * past those guards.
  */
-export const SEA_EXEC_ARGV_EXTENSION = "cli";
+export const SEA_EXEC_ARGV_EXTENSION = "env";
 
-/** Beside the executable in a runtime archive: tells a launcher to pass Node options on the command line. */
-export const RUNTIME_EXEC_ARGV_FILE = "exec-argv.json";
-
-/** How a single executable is built for a platform ("win" or "win32" for Windows). */
+/** How a single executable is built. */
 export interface SeaBuildOptions {
   readonly execArgv: ReadonlyArray<string>;
   readonly execArgvExtension: "cli" | "env" | "none";
 }
 
-/**
- * Windows has no `execve` to carry NODE_OPTIONS onto the command line, so a baked cap there could
- * never be overridden and NODE_OPTIONS would be lost: nothing is baked and the executable reads
- * NODE_OPTIONS itself, as before (the service launcher passes the cap). Everywhere else the default
- * is baked and options are taken on the command line.
- */
-export const seaBuildOptions = (platform: string): SeaBuildOptions =>
-  platform === "win" || platform === "win32"
-    ? { execArgv: [], execArgvExtension: "env" }
-    : { execArgv: SEA_EXEC_ARGV, execArgvExtension: SEA_EXEC_ARGV_EXTENSION };
-
-/** One argument as NODE_OPTIONS text: double quotes around spaces and quotes, which Node unquotes. */
-const quoteNodeOption = (token: string): string =>
-  /[\s"]/.test(token) ? `"${token.replaceAll(/(["\\])/g, "\\$1")}"` : token;
-
-/**
- * What a single executable, which takes Node options only on its command line, is to be given there:
- * the user's NODE_OPTIONS, and the wanted cap when it is not the executable's own default; undefined
- * when there is nothing to pass.
- */
-export const nodeOptionsArgument = (
-  env: Environment,
-  commandLine: ReadonlyArray<string> = [],
-): string | undefined => {
-  const options = env.NODE_OPTIONS?.trim() ?? "";
-  // The command line follows NODE_OPTIONS, as Node orders them, so it keeps winning.
-  const given = [options, ...commandLine.map(quoteNodeOption)].filter((part) => part !== "");
-  const explicit = (flagIn(commandLine) ?? flagIn(tokenizeNodeOptions(options))) !== undefined;
-  const wanted = capSetting(env);
-  const cap =
-    explicit || wanted === DEFAULT_MAX_SEMI_SPACE_MB ? "" : `${MAX_SEMI_SPACE_FLAG}=${wanted}`;
-  const value = [...given, cap].filter((part) => part !== "").join(" ");
-  return value === "" ? undefined : `--node-options=${value}`;
-};
+/** How every single executable is built: the default baked in, NODE_OPTIONS read by Node. */
+export const seaBuildOptions = (): SeaBuildOptions => ({
+  execArgv: SEA_EXEC_ARGV,
+  execArgvExtension: SEA_EXEC_ARGV_EXTENSION,
+});

@@ -29,9 +29,7 @@ import {
   SERVICE_STOP_MARKER_FILE,
 } from "./cloud/serviceProtocol.ts";
 
-import { RUNTIME_EXEC_ARGV_FILE } from "@t3tools/shared/youngGenerationEnv";
-
-import { nodeOptionsArgument, serverChildEnvironment } from "./youngGeneration.ts";
+import { serverChildEnvironment } from "./youngGeneration.ts";
 
 const HANDOFF_DELAY_MS = 2_000;
 /**
@@ -60,35 +58,16 @@ const runtimePaths = (baseDir: string, version: string) => {
     versionDir,
     entryPath: NodePath.join(versionDir, executableName),
     sentinelPath: NodePath.join(versionDir, ".install-complete"),
-    execArgvPath: NodePath.join(versionDir, RUNTIME_EXEC_ARGV_FILE),
   };
 };
 
-/** Whether a runtime takes Node options on its command line (a single executable built so says it beside itself). */
-const takesNodeOptionsOnCommandLine = (execArgvPath: string): boolean => {
-  try {
-    const declared = JSON.parse(NodeFS.readFileSync(execArgvPath, "utf8")) as {
-      readonly execArgvExtension?: unknown;
-    };
-    return declared.execArgvExtension === "cli";
-  } catch {
-    return false;
-  }
-};
-
-const runtimeSpawnArguments = (paths: ReturnType<typeof runtimePaths>, env: NodeJS.ProcessEnv) => {
-  // A runtime that takes Node options on its command line gets the user's NODE_OPTIONS and the cap
-  // there, its environment untouched; any other gets them in NODE_OPTIONS with the marker.
-  if (takesNodeOptionsOnCommandLine(paths.execArgvPath)) {
-    const options = nodeOptionsArgument(env);
-    return {
-      command: paths.entryPath,
-      args: [...(options === undefined ? [] : [options]), "serve"],
-      env,
-    };
-  }
-  return { command: paths.entryPath, args: ["serve"], env: serverChildEnvironment(env) };
-};
+// Node options reach every runtime through NODE_OPTIONS, which Node validates itself (its
+// allowlist, AT_SECURE); a command-line `--node-options=` would bypass that, so none is ever passed.
+const runtimeSpawnArguments = (paths: ReturnType<typeof runtimePaths>, env: NodeJS.ProcessEnv) => ({
+  command: paths.entryPath,
+  args: ["serve"],
+  env: serverChildEnvironment(env),
+});
 
 const DB_FILE_SUFFIXES = ["", "-wal", "-shm"] as const;
 const RESTORE_MARKER = ".restore-pending";

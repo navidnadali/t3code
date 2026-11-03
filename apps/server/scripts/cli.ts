@@ -170,7 +170,7 @@ const buildExeCmd = Command.make(
           outputPath: path.join(outDir, "t3"),
           nodeVersion: rootPackageJson.engines.node,
           verbose: config.verbose,
-          sea: seaBuildOptions("linux"),
+          sea: seaBuildOptions(),
         });
       }
       // Without it the server runs its spawner as t3 __process-spawner, which parses the whole bundle.

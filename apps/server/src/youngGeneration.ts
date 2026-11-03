@@ -12,7 +12,6 @@ import {
   MAX_SEMI_SPACE_ENV,
   MAX_SEMI_SPACE_FLAG as FLAG,
   nodeOptionSpans,
-  nodeOptionsArgument,
   nodeOptionsWithMaxSemiSpace,
   optionName,
   resolveMaxSemiSpaceMb,
@@ -26,7 +25,6 @@ export {
   DEFAULT_MAX_SEMI_SPACE_MB,
   INHERITED_NODE_OPTIONS_ENV,
   MAX_SEMI_SPACE_ENV,
-  nodeOptionsArgument,
   nodeOptionsWithMaxSemiSpace,
   resolveMaxSemiSpaceMb,
   serverChildEnvironment,
@@ -90,28 +88,6 @@ const sizeOf = (value: string | undefined): number | undefined => {
   if (value === undefined) return undefined;
   const parsed = Number(value);
   return value !== "" && Number.isFinite(parsed) ? parsed : 0;
-};
-
-/**
- * How a helper the server starts from its own executable gets its Node options: on the command
- * line when the executable takes them there (it ignores NODE_OPTIONS), in NODE_OPTIONS otherwise.
- */
-export const nodeOptionsForSelfSpawn = (input: {
-  readonly isExecutable: boolean;
-  readonly platform: string;
-  readonly nodeOptions: string;
-}): { readonly args: ReadonlyArray<string>; readonly env: { readonly NODE_OPTIONS?: string } } =>
-  input.isExecutable && input.platform !== "win32"
-    ? { args: [`--node-options=${input.nodeOptions}`], env: {} }
-    : { args: [], env: { NODE_OPTIONS: input.nodeOptions } };
-
-/** Whether `tokens` appear in `args`, in order and adjacent. */
-const containsSequence = (args: ReadonlyArray<string>, tokens: ReadonlyArray<string>): boolean => {
-  if (tokens.length === 0) return true;
-  for (let start = 0; start + tokens.length <= args.length; start++) {
-    if (tokens.every((token, index) => args[start + index] === token)) return true;
-  }
-  return false;
 };
 
 export type StartupNodeOptions =
@@ -267,8 +243,8 @@ export type RelaunchPlan =
       readonly launcherPredatesDefault?: true;
       /** How the process was started rules a relaunch out; nothing in its environment caused the keep. */
       readonly structural?: true;
-      /** NODE_OPTIONS the single executable has not been given on its command line. */
-      readonly nodeOptionsPending?: true;
+      /** The executable's cap is built in; the knob, the hatch or an explicit value in NODE_OPTIONS cannot change it. */
+      readonly capSettingIneffective?: true;
     };
 
 /** The young-generation cap as it stands: what V8 runs with, what this process wants, who chose it. */
@@ -279,48 +255,43 @@ interface CapState {
   readonly wanted: number;
   /** The user chose the wanted value (a flag on the command line or in NODE_OPTIONS). */
   readonly explicit: boolean;
-  /** A single executable's NODE_OPTIONS that are not on its command line yet, so Node ignored them. */
-  readonly pending: boolean;
-  /** What the user gave a single executable through --node-options, beyond the baked prefix. */
-  readonly commandLine: ReadonlyArray<string>;
+  /** A single executable built with the cap: it never relaunches and the cap cannot be changed. */
+  readonly baked: boolean;
+  /** The environment asked for another cap, or none, which the built-in one does not allow. */
+  readonly ineffective: boolean;
 }
 
-/** Whether this single executable takes Node options on its command line and ignores NODE_OPTIONS. */
-const takesOptionsOnCommandLine = (input: { readonly isSea: boolean; readonly platform: string }) =>
-  input.isSea && input.platform !== "win32";
+/** A single executable built with the default: told by its flag, not by the platform. */
+const isBaked = (input: { readonly isSea: boolean; readonly execArgv: ReadonlyArray<string> }) =>
+  input.isSea && SEA_EXEC_ARGV.every((flag, index) => input.execArgv[index] === flag);
 
 const capState = (input: {
   readonly execArgv: ReadonlyArray<string>;
   readonly env: Environment;
   readonly isSea: boolean;
-  readonly platform: string;
 }): CapState => {
   const inNodeOptions = flagIn(tokenizeNodeOptions(input.env.NODE_OPTIONS));
   const inExecArgv = flagIn(input.execArgv);
-  if (!takesOptionsOnCommandLine(input)) {
-    // Node read NODE_OPTIONS itself: a node start, or a Windows executable with nothing baked.
-    const explicit = inExecArgv ?? inNodeOptions;
+  // Node applies NODE_OPTIONS first and the command line (a baked flag included) after: the last wins.
+  const explicit = inExecArgv ?? inNodeOptions;
+  const effective = sizeOf(explicit);
+  if (isBaked(input)) {
+    const setting = input.env[MAX_SEMI_SPACE_ENV]?.trim() ?? "";
     return {
-      effective: sizeOf(explicit),
-      wanted: explicit === undefined ? capSetting(input.env) : (sizeOf(explicit) ?? 0),
-      explicit: explicit !== undefined,
-      pending: false,
-      commandLine: [],
+      effective,
+      wanted: effective ?? 0,
+      explicit: false,
+      baked: true,
+      ineffective:
+        setting !== "" || (inNodeOptions !== undefined && sizeOf(inNodeOptions) !== effective),
     };
   }
-  // A single executable: its execArgv start with what the build baked in; anything after that came
-  // from the user through --node-options. Node ignores its NODE_OPTIONS until they are put there.
-  const baked = SEA_EXEC_ARGV.every((flag, index) => input.execArgv[index] === flag)
-    ? SEA_EXEC_ARGV.length
-    : 0;
-  const commandLine = input.execArgv.slice(baked);
-  const explicit = flagIn(commandLine) ?? inNodeOptions;
   return {
-    effective: sizeOf(inExecArgv),
+    effective,
     wanted: explicit === undefined ? capSetting(input.env) : (sizeOf(explicit) ?? 0),
     explicit: explicit !== undefined,
-    pending: !containsSequence(input.execArgv, tokenizeNodeOptions(input.env.NODE_OPTIONS)),
-    commandLine,
+    baked: false,
+    ineffective: false,
   };
 };
 
@@ -345,8 +316,16 @@ export const planYoungGenerationRelaunch = (input: {
     return { kind: "keep", reason: "relaunched once already" };
   }
   const cap = capState(input);
-  const pending = cap.pending ? { nodeOptionsPending: true as const } : {};
-  if (!cap.pending && (cap.effective ?? 0) === cap.wanted) {
+  // A packaged executable never relaunches: its cap is built in and Node read NODE_OPTIONS itself.
+  if (cap.baked) {
+    return {
+      kind: "keep",
+      reason: "the young-generation cap is already in effect",
+      inEffect: true,
+      ...(cap.ineffective ? { capSettingIneffective: true } : {}),
+    };
+  }
+  if ((cap.effective ?? 0) === cap.wanted) {
     return cap.explicit || cap.wanted === 0
       ? { kind: "keep", reason: "disabled or set explicitly" }
       : { kind: "keep", reason: "the young-generation cap is already in effect", inEffect: true };
@@ -356,7 +335,6 @@ export const planYoungGenerationRelaunch = (input: {
       kind: "keep",
       reason: "process.execve is unavailable on this platform",
       structural: true,
-      ...pending,
     };
   }
   // execve keeps only stdio: an IPC channel or a bootstrap descriptor would be lost.
@@ -369,64 +347,39 @@ export const planYoungGenerationRelaunch = (input: {
         reason:
           "started over IPC by a service launcher that predates the young-generation default; the cap applies once the service restarts",
         launcherPredatesDefault: true,
-        ...pending,
       };
     }
-    return { kind: "keep", reason: "started with an IPC channel", structural: true, ...pending };
+    return { kind: "keep", reason: "started with an IPC channel", structural: true };
   }
   if (bootstrapFdOf(input.argv, input.env) !== undefined) {
-    return {
-      kind: "keep",
-      reason: "started with a bootstrap descriptor",
-      structural: true,
-      ...pending,
-    };
+    return { kind: "keep", reason: "started with a bootstrap descriptor", structural: true };
   }
-  // A second image would open a second inspector session and drop the attached debugger. Options
-  // the executable has not taken yet are not an inspector: they reach it with the handoff.
-  const cliOptions = takesOptionsOnCommandLine(input);
-  if (
-    input.inspectorActive === true ||
-    inspectorRequested(cliOptions ? {} : input.env, input.execArgv)
-  ) {
-    return { kind: "keep", reason: "the inspector is active", structural: true, ...pending };
+  // A second image would open a second inspector session and drop the attached debugger.
+  if (input.inspectorActive === true || inspectorRequested(input.env, input.execArgv)) {
+    return { kind: "keep", reason: "the inspector is active", structural: true };
   }
   // A preload runs before this code and may have rewritten NODE_OPTIONS: what it reads now is not
   // what Node started with, so neither an explicit cap nor the user's options can be trusted, and
-  // carrying it into a relaunch would run it twice. A single executable has not run the preloads
-  // in its NODE_OPTIONS yet (they run once, next image); one on its command line has run.
-  if (input.preloadRan === true || preloadVisible(cliOptions ? {} : input.env, input.execArgv)) {
-    return { kind: "keep", reason: "started with a preload", ...pending };
+  // carrying it into a relaunch would run it twice.
+  if (input.preloadRan === true || preloadVisible(input.env, input.execArgv)) {
+    return { kind: "keep", reason: "started with a preload" };
   }
   if (!isServerCommand(input.argv, input.isDirectory)) {
-    return { kind: "keep", reason: "not a server command", ...pending };
+    return { kind: "keep", reason: "not a server command" };
   }
-  const guard = input.pid === undefined ? {} : { [RELAUNCHED_PID_ENV]: String(input.pid) };
-  if (cliOptions) {
-    // A single executable takes only user arguments, Node options first; its environment stays as
-    // it is, so its children get exactly the user's NODE_OPTIONS. What the user gave on the command
-    // line goes along (Node stripped it from argv), and the cap when what is in effect is not what
-    // is wanted and neither source sets it.
-    const given = nodeOptionsArgument(input.env, cap.commandLine);
-    const capNeeded = !cap.explicit && (cap.effective ?? 0) !== cap.wanted;
-    const options =
-      capNeeded && !(given ?? "").includes(`${FLAG}=`)
-        ? `${given ?? "--node-options="}${given === undefined ? "" : " "}${FLAG}=${cap.wanted}`
-        : (given ?? `--node-options=${FLAG}=${cap.wanted}`);
-    return {
-      kind: "relaunch",
-      file: input.execPath,
-      args: [input.execPath, options, ...input.argv.slice(2)],
-      env: { ...input.env, ...guard },
-    };
-  }
-  // Node takes its flags, the script and the arguments; the cap travels in NODE_OPTIONS with the
-  // marker that gives children the value the server was given.
+  // The cap travels in NODE_OPTIONS, which Node validates, with the marker that gives children the
+  // value the server was given. A single executable takes only user arguments; node takes its
+  // flags, the script and the arguments.
   return {
     kind: "relaunch",
     file: input.execPath,
-    args: [input.execPath, ...input.execArgv, ...input.argv.slice(1)],
-    env: { ...withFlag(input.env, cap.wanted), ...guard },
+    args: input.isSea
+      ? [input.execPath, ...input.argv.slice(2)]
+      : [input.execPath, ...input.execArgv, ...input.argv.slice(1)],
+    env: {
+      ...withFlag(input.env, cap.wanted),
+      ...(input.pid === undefined ? {} : { [RELAUNCHED_PID_ENV]: String(input.pid) }),
+    },
   };
 };
 
@@ -439,8 +392,8 @@ export interface YoungGenerationOutcome {
   readonly launcherPredatesDefault?: true;
   /** How the process was started rules a relaunch out; nothing in its environment caused the keep. */
   readonly structural?: true;
-  /** NODE_OPTIONS a single executable has not been given on its command line, so Node ignored them. */
-  readonly nodeOptionsPending?: true;
+  /** The executable's cap is built in; the knob, the hatch or an explicit value in NODE_OPTIONS cannot change it. */
+  readonly capSettingIneffective?: true;
   /** The cap V8 runs with, in MiB; 0 or undefined is V8's default. */
   readonly maxSemiSpaceMb?: number;
 }
@@ -520,7 +473,6 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
   const { startup } = view;
   // What V8 started with, for the outcome: the record when known, else the value in effect.
   const nodeOptionsAtStart = startup.known ? startup.value : current;
-  let marked: { readonly nodeOptionsForChildren: string | undefined } | undefined;
   if (inherited !== undefined) {
     const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, view.execArgv).mb;
     const written = mb === null ? undefined : nodeOptionsWithMaxSemiSpace(inherited, mb);
@@ -534,29 +486,14 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
         current === written ||
         current?.startsWith(`${written} `) === true);
     if (mb !== null && wrote) {
-      const nodeOptionsForChildren = withoutCapArg(current, mb);
-      if (!takesOptionsOnCommandLine(view)) {
-        return {
-          kind: "applied",
-          outcome: { applied: true, nodeOptionsAtStart, maxSemiSpaceMb: mb },
-          nodeOptionsForChildren,
-        };
-      }
-      // A single executable ignored that NODE_OPTIONS; its cap is whatever its command line says.
-      // Children still get the user's value, and the rules below decide on it.
-      marked = { nodeOptionsForChildren };
+      return {
+        kind: "applied",
+        outcome: { applied: true, nodeOptionsAtStart, maxSemiSpaceMb: mb },
+        nodeOptionsForChildren: withoutCapArg(current, mb),
+      };
     }
   }
-  const planned = {
-    ...env,
-    ...(marked === undefined ? {} : { NODE_OPTIONS: marked.nodeOptionsForChildren }),
-  };
-  const cap = capState({
-    execArgv: view.execArgv,
-    env: planned,
-    isSea: view.isSea,
-    platform: view.platform,
-  });
+  const cap = capState({ execArgv: view.execArgv, env, isSea: view.isSea });
   const base = {
     nodeOptionsAtStart,
     ...(cap.effective === undefined ? {} : { maxSemiSpaceMb: cap.effective }),
@@ -575,9 +512,8 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
       keptReason,
       ...(extra.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
       ...(extra.structural === undefined ? {} : { structural: true }),
-      ...(extra.nodeOptionsPending === undefined ? {} : { nodeOptionsPending: true }),
+      ...(extra.capSettingIneffective === undefined ? {} : { capSettingIneffective: true }),
     },
-    ...marked,
   });
   // A record that differs from the value in effect means a preload rewrote NODE_OPTIONS: what it
   // left cannot be carried into a relaunch. Without a record, the rules below decide.
@@ -585,7 +521,7 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
   const plan = planYoungGenerationRelaunch({
     argv: view.argv,
     execArgv: view.execArgv,
-    env: planned,
+    env,
     execPath: view.execPath,
     platform: view.platform,
     hasIpcChannel: view.hasIpcChannel,
@@ -657,8 +593,8 @@ export interface NodeRuntimeFlags {
   readonly youngGenerationLost?: true;
   /** The loss is in how the process was started (IPC channel, bootstrap descriptor, inspector, no execve), not changeable from its environment. */
   readonly structuralKeep?: true;
-  /** A single executable's NODE_OPTIONS were not on its command line, so Node ignored them. */
-  readonly nodeOptionsPending?: true;
+  /** The executable's cap is built in; the knob, the hatch or an explicit value in NODE_OPTIONS cannot change it. */
+  readonly capSettingIneffective?: true;
   readonly keptReason?: string;
   readonly execArgv: ReadonlyArray<string>;
   /** NODE_OPTIONS as V8 saw it at startup (the server's children see `nodeOptionsForChildren`). */
@@ -729,7 +665,7 @@ export const runtimeFlagsOf = (
   return {
     ...sizes,
     ...(outcome?.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
-    ...(outcome?.nodeOptionsPending === undefined ? {} : { nodeOptionsPending: true }),
+    ...(outcome?.capSettingIneffective === undefined ? {} : { capSettingIneffective: true }),
   };
 };
 
@@ -770,7 +706,7 @@ export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {
     ...(outcome.keptReason === undefined ? {} : { keptReason: outcome.keptReason }),
     ...(outcome.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
     ...(outcome.structural === undefined ? {} : { structural: true }),
-    ...(outcome.nodeOptionsPending === undefined ? {} : { nodeOptionsPending: true }),
+    ...(outcome.capSettingIneffective === undefined ? {} : { capSettingIneffective: true }),
     ...(bootstrapFd === undefined ? {} : { bootstrapFdOpen: isOpenDescriptor(bootstrapFd) }),
   };
   process.stdout.write(`${JSON.stringify(report)}\n`);

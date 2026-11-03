@@ -9,7 +9,6 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { nodeOptionsForSelfSpawn } from "../youngGeneration.ts";
 
 const extensions = new Set(["docx", "xlsx", "pptx", "odt", "ods", "odp", "rtf", "epub", "ipynb"]);
 
@@ -47,7 +46,6 @@ const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const executable = yield* HostProcess.ExecutablePath;
   const isExecutable = yield* HostProcess.IsExecutable;
-  const platform = yield* HostProcess.Platform;
   const environment = yield* HostProcess.Environment;
   const clock = yield* Clock.Clock;
   const lock = yield* Semaphore.make(1);
@@ -65,21 +63,9 @@ const make = Effect.gen(function* () {
     const content = yield* Effect.tryPromise({
       try: (signal) =>
         new Promise<string>((resolve, reject) => {
-          // The parser's heap bound reaches a single executable only on its command line.
-          const options = nodeOptionsForSelfSpawn({
-            isExecutable,
-            platform,
-            nodeOptions: `${environment.NODE_OPTIONS ?? ""} --max-old-space-size=192`.trim(),
-          });
           NodeChildProcess.execFile(
             executable,
-            [
-              ...options.args,
-              ...(isExecutable ? [] : [entry]),
-              "__document-text",
-              path,
-              `.${extension}`,
-            ],
+            [...(isExecutable ? [] : [entry]), "__document-text", path, `.${extension}`],
             {
               signal,
               timeout: 15_000,
@@ -89,7 +75,7 @@ const make = Effect.gen(function* () {
               env: {
                 ...environment,
                 ELECTRON_RUN_AS_NODE: "1",
-                ...options.env,
+                NODE_OPTIONS: `${environment.NODE_OPTIONS ?? ""} --max-old-space-size=192`,
               },
             },
             (error, stdout) => (error ? reject(error) : resolve(stdout)),

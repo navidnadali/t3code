@@ -13,7 +13,6 @@ import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import { Command, Flag } from "effect/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
-import { RUNTIME_EXEC_ARGV_FILE, seaBuildOptions } from "@t3tools/shared/youngGenerationEnv";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { fromYaml } from "@t3tools/shared/schemaYaml";
@@ -538,11 +537,6 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
 
   yield* Effect.log(`[cli-archive] Staging ${stem}...`);
   yield* fs.copyFile(builtExecutable, path.join(contentDir, executableName));
-  // Tells a service launcher that this executable takes Node options on its command line.
-  yield* fs.writeFileString(
-    path.join(contentDir, RUNTIME_EXEC_ARGV_FILE),
-    `${yield* encodeJsonString(seaBuildOptions(input.platform))}\n`,
-  );
   // Built for the host only; without it t3 starts its spawner from its own, much larger bundle.
   const builtSpawner = path.join(serverDir, "dist-exe", PROCESS_SPAWNER_EXECUTABLE);
   const otherExecutablePaths: Array<string> = [];

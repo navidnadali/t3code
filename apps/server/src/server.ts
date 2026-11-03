@@ -849,11 +849,13 @@ const layerMakeServer = Layer.unwrap(
         yield* startup.markHttpListening;
         const runtimeFlags = nodeRuntimeFlags();
         // A server that wanted the young-generation cap and lost it to something changeable (a
-        // preload, an old launcher, a failed relaunch) says so where it is seen; a start that rules a
+        // preload, an old launcher, a failed relaunch) says so where it is seen, as does a packaged
+        // executable whose built-in cap the environment tried to change; a start that rules a
         // relaunch out by its shape (IPC, bootstrap descriptor, inspector) is not for the user to fix.
         yield* (runtimeFlags.youngGenerationLost === true &&
           runtimeFlags.structuralKeep !== true) ||
-        runtimeFlags.launcherPredatesDefault === true
+        runtimeFlags.launcherPredatesDefault === true ||
+        runtimeFlags.capSettingIneffective === true
           ? Effect.logWarning("server.v8", runtimeFlags)
           : Effect.logInfo("server.v8", runtimeFlags);
       }),

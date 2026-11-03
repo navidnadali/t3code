@@ -105,7 +105,7 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
       this.#startDirect(command, args, options);
     };
     if (options.signal?.aborted) {
-      queueMicrotask(() => this.#fail(abortError()));
+      queueMicrotask(() => this.#cancel());
       return;
     }
     options.signal?.addEventListener("abort", () => this.#abort(), { once: true });
@@ -251,8 +251,24 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
 
   #abort() {
     if (this.#exited) return;
+    // Not started yet (waiting its turn in the spawner, say).
+    if (this.#direct === undefined && this.pid === undefined) return this.#cancel();
     this.kill("SIGTERM");
     this.emit("error", abortError());
+  }
+
+  /**
+   * Aborted before it started: as the Effect path's cancel, its start is abandoned (and leaves the
+   * spawner's queue), so it never runs. Its events are those of Node's, whose process the abort
+   * kills at once: the abort error, then exit and close by SIGTERM.
+   */
+  #cancel() {
+    if (this.#exited) return;
+    this.killed = true;
+    if (this.#child !== undefined) this.#host?.abandonHandoff(this.#child);
+    this.emit("error", abortError());
+    for (const stream of [this.stdout, this.stderr]) stream?.end();
+    process.nextTick(() => this.#exit(null, "SIGTERM"));
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {

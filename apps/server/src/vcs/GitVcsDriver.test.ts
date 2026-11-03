@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - the fallback-log race hooks must change files synchronously inside a command.
 import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
 import * as NodeZlib from "node:zlib";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
@@ -2996,4 +2997,80 @@ it.effect(
         committerTime: time,
       });
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect("a loose object with bytes after its zlib stream is left to git", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeObjectStoreFixture("t3-loose-trailing-");
+    assert.isNotNull(fixture);
+    const memory = makeCheckpointRefMemory();
+    const file = NodePath_join(
+      fixture!.objectsDir,
+      fixture!.head.slice(0, 2),
+      fixture!.head.slice(2),
+    );
+    // The real stream, hash intact, followed by garbage git refuses as a corrupt object.
+    const stream = NodeFS.readFileSync(file);
+    NodeFS.rmSync(file, { force: true });
+    NodeFS.writeFileSync(file, Buffer.concat([stream, Buffer.from("garbage")]));
+    assert.isNull(yield* memory.commitFacts(fixture!.repository, fixture!.head));
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect("a file swapped between the size check and the read is not what gets read", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeObjectStoreFixture("t3-loose-swap-");
+    assert.isNotNull(fixture);
+    const memory = makeCheckpointRefMemory();
+    const file = NodePath_join(
+      fixture!.objectsDir,
+      fixture!.head.slice(0, 2),
+      fixture!.head.slice(2),
+    );
+    // A same-user process replaces the object right after its size was checked by path: the
+    // replacement must neither be loaded whole nor answer; the descriptor already open decides.
+    const fs = NodeModule.createRequire(import.meta.url)("node:fs") as typeof NodeFS;
+    const originalStat = fs.stat;
+    let swaps = 0;
+    const swap = () => {
+      swaps++;
+      const big = Buffer.concat([
+        Buffer.from(`commit ${8 * 1024 * 1024}\0`),
+        Buffer.alloc(8 * 1024 * 1024, 0x61),
+      ]);
+      NodeFS.rmSync(file, { force: true });
+      NodeFS.writeFileSync(file, NodeZlib.deflateSync(big, { level: 1 }));
+    };
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        (fs as { stat: typeof NodeFS.stat }).stat = ((path: unknown, ...rest: unknown[]) => {
+          if (typeof path === "string" && path === file) {
+            const callback = rest.at(-1) as (...args: unknown[]) => void;
+            return originalStat(
+              path,
+              rest[0] as never,
+              ((...args: unknown[]) => {
+                swap();
+                callback(...args);
+              }) as never,
+            );
+          }
+          return (originalStat as (...args: unknown[]) => unknown)(path, ...rest);
+        }) as typeof NodeFS.stat;
+        NodeModule.syncBuiltinESMExports();
+      }),
+      () =>
+        Effect.sync(() => {
+          (fs as { stat: typeof NodeFS.stat }).stat = originalStat;
+          NodeModule.syncBuiltinESMExports();
+        }),
+    );
+    const [tree, time] = [fixture!.facts.split(" ")[0]!, fixture!.facts.split(" ").at(-1)!];
+    assert.deepStrictEqual(yield* memory.commitFacts(fixture!.repository, fixture!.head), {
+      tree,
+      parents: [],
+      committerTime: time,
+    });
+    assert.strictEqual(swaps, 0);
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

@@ -364,10 +364,13 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const refKey = (repository: CheckpointRepository, ref: string) =>
     Effect.promise(async () => {
       if ((process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? "") !== "") return null;
+      const configured = process.env.GIT_OBJECT_DIRECTORY;
+      // Git reads a relative one from each command's own directory.
+      if (configured !== undefined && !NodePath.isAbsolute(configured)) return null;
       const store = await new Promise<string | null>((resolve) => {
         try {
           NodeFS.realpath.native(
-            process.env.GIT_OBJECT_DIRECTORY ?? NodePath.join(repository.commonDir, "objects"),
+            configured ?? NodePath.join(repository.commonDir, "objects"),
             (error, resolved) => resolve(error ? null : resolved),
           );
         } catch {

@@ -1990,14 +1990,19 @@ it.effect("reads commit objects and packed-refs the way git log and rev-parse re
     yield* git(["pack-refs", "--all"]);
     const packed = yield* fileSystem.readFileString(path.join(cwd, ".git", "packed-refs"));
     assert.isTrue(packed.includes("\n^"));
-    const refs = parsePackedRefs(packed, "refs/t3/", 2);
+    const refs = parsePackedRefs(packed, "refs/t3/", 2, packed.length);
     assert.deepStrictEqual([...refs.refs!.entries()].sort(), [
       ["refs/t3/checkpoints/one", yield* git(["rev-parse", "HEAD^2"])],
       ["refs/t3/checkpoints/two", yield* git(["rev-parse", "v1"])],
     ]);
     assert.isFalse(refs.replaceRefs);
     // Beyond the budget the parse keeps nothing, so git answers; replace refs are still noticed.
-    const oversized = parsePackedRefs(`${packed}${"0".repeat(40)} refs/replace/x\n`, "refs/t3/", 1);
+    const oversized = parsePackedRefs(
+      `${packed}${"0".repeat(40)} refs/replace/x\n`,
+      "refs/t3/",
+      1,
+      Number.POSITIVE_INFINITY,
+    );
     assert.deepStrictEqual(
       { refs: oversized.refs, replaceRefs: oversized.replaceRefs },
       {
@@ -2137,7 +2142,7 @@ it.effect("packed-refs memory stays accounted under concurrent reloads", () =>
     });
     const packedCount = Effect.map(
       fileSystem.readFileString(path.join(commonDir, "packed-refs")),
-      (content) => parsePackedRefs(content, "refs/t3/", 1_000).refs!.size,
+      (content) => parsePackedRefs(content, "refs/t3/", 1_000, content.length).refs!.size,
     );
 
     // Loose refs answer first; packing moves them to packed-refs, which every call reloads at once.
@@ -2529,14 +2534,23 @@ const makeHookedDriver = Effect.fn("test.makeHookedDriver")(function* () {
     Effect.provideService(ProcessRunner.ProcessRunner, {
       run: (input) => {
         spawned.push(input.args);
+        // The hooks fire around one git log, then clear, so the next log runs unhooked.
         const isLog = input.args.includes("--no-walk=unsorted");
         return Effect.sync(() => {
-          if (isLog && hooks.before !== null) hooks.before();
+          if (isLog && hooks.before !== null) {
+            const before = hooks.before;
+            hooks.before = null;
+            before();
+          }
         }).pipe(
           Effect.andThen(liveRunner.run(input)),
           Effect.tap(() =>
             Effect.sync(() => {
-              if (isLog && hooks.after !== null) hooks.after();
+              if (isLog && hooks.after !== null) {
+                const after = hooks.after;
+                hooks.after = null;
+                after();
+              }
             }),
           ),
         );
@@ -2566,13 +2580,12 @@ it.effect.each(["graft", "shallow", "loose replace"] as const)(
       // Packed objects force the git log fallback for a driver that has not read these commits.
       yield* h.gitBoth(["gc", "-q", "--prune=now"]);
       const cwd = h.repos.warm;
-      const [first, second] = yield* Effect.all(
-        [1, 2].map((ordinal) =>
-          h
-            .gitIn(cwd, ["rev-parse", `${turnRef(ordinal)}^{commit}`])
-            .pipe(Effect.map((result) => result.stdout.trim())),
-        ),
-      );
+      const commitOf = (ordinal: number) =>
+        h
+          .gitIn(cwd, ["rev-parse", `${turnRef(ordinal)}^{commit}`])
+          .pipe(Effect.map((result) => result.stdout.trim()));
+      const first = yield* commitOf(1);
+      const second = yield* commitOf(2);
       const later = yield* makeHookedDriver();
       for (const ref of [turnRef(1), turnRef(2), turnRef(1), turnRef(2)]) {
         yield* later.driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef: ref });

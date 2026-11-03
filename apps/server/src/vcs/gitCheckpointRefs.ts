@@ -194,15 +194,19 @@ const statFingerprint = (file: string) => statInfo(file).then((info) => info.fin
 export interface ParsedPackedRefs {
   // Null when the file holds more refs under the prefix than `maxEntries`.
   readonly refs: ReadonlyMap<string, string> | null;
-  readonly replaceRefs: boolean;
+  // Null when the content was not parsed (more than `maxBytes`), so replacements are unknown.
+  readonly replaceRefs: boolean | null;
 }
 
-// `<oid> <name>` lines; `#` is the header and `^` the peeled object of the tag above it.
+// `<oid> <name>` lines; `#` is the header and `^` the peeled object of the tag above it. The
+// content is latin1, one byte per character, so its length is the file's size as read.
 export const parsePackedRefs = (
   content: string,
   prefix: string,
   maxEntries: number,
+  maxBytes: number,
 ): ParsedPackedRefs => {
+  if (content.length > maxBytes) return { refs: null, replaceRefs: null };
   let refs: Map<string, string> | null = new Map();
   let replaceRefs = false;
   for (const line of content.split("\n")) {
@@ -220,11 +224,8 @@ export const parsePackedRefs = (
   return { refs, replaceRefs };
 };
 
-interface PackedRefs {
+interface PackedRefs extends ParsedPackedRefs {
   readonly fingerprint: string;
-  readonly refs: ReadonlyMap<string, string> | null;
-  // Null when the file was not parsed (too large), so whether it holds replacements is unknown.
-  readonly replaceRefs: boolean | null;
 }
 
 // Stat before reading, so a rewrite between the two is seen by the next stat; null when unreadable.
@@ -244,19 +245,27 @@ const readPackedRefs = (commonDir: string, cached: PackedRefs | undefined) =>
       }
     });
     if (content === null) return null;
+    // The file may have grown between the stat and the read; the bytes read decide.
     return {
       fingerprint,
-      ...parsePackedRefs(content, PACKED_REFS_PREFIX, PACKED_REFS_ENTRY_BUDGET),
+      ...parsePackedRefs(
+        content,
+        PACKED_REFS_PREFIX,
+        PACKED_REFS_ENTRY_BUDGET,
+        PACKED_REFS_MAX_BYTES,
+      ),
     };
   });
 
 const environmentPlain = () => HISTORY_ENVIRONMENT.every((name) => process.env[name] === undefined);
 
 // The shallow file, grafts and loose replacements as one string, or null when any is present
-// (deleting the last replacement can leave its directory; only entries count).
+// (deleting the last replacement can leave its directory; only entries count). The directories
+// that would hold them are part of the string: their mtime and inode move on every entry added or
+// removed, so a file that existed only between two readings still shows.
 const historyFiles = (commonDir: string) =>
   Effect.promise(async () => {
-    const [shallow, grafts, replaceRefs] = await Promise.all([
+    const [shallow, grafts, replaceRefs, ...directories] = await Promise.all([
       statFingerprint(NodePath.join(commonDir, "shallow")),
       statFingerprint(NodePath.join(commonDir, "info", "grafts")),
       new Promise<ReadonlyArray<string> | null>((resolve) => {
@@ -270,9 +279,12 @@ const historyFiles = (commonDir: string) =>
           resolve(null);
         }
       }),
+      ...[".", "info", "refs", NodePath.join("refs", "replace")].map((directory) =>
+        statFingerprint(NodePath.resolve(commonDir, directory)),
+      ),
     ]);
     return shallow === "!ENOENT" && grafts === "!ENOENT" && replaceRefs?.length === 0
-      ? `${shallow}\n${grafts}\n`
+      ? `${shallow}\n${grafts}\n${directories.join("\n")}\n`
       : null;
   });
 

@@ -358,20 +358,17 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   // Parsed packed-refs per common directory (insertion order = age), bounded in files and entries.
   const packed = new Map<string, PackedRefs>();
   let packedEntries = 0;
-  // The store a ref was resolved against: its objects directory, alternates file and the
-  // alternates named by the environment; a different store may lack the commit. Git reads a
-  // relative alternate from each command's own directory, so such a store has no one key.
+  // The store a ref was resolved against: a different objects directory may lack the commit. A
+  // store with alternates (its info/alternates file, or the environment) borrows objects through
+  // a chain whose every link can change, so such a store has no key and Git answers.
   const refKey = (repository: CheckpointRepository, ref: string) =>
     Effect.promise(async () => {
-      const environment = process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? "";
-      const relative = environment
-        .split(NodePath.delimiter)
-        .some((entry) => entry.length > 0 && !NodePath.isAbsolute(entry));
-      if (relative) return null;
+      if ((process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? "") !== "") return null;
       const alternates = await statFingerprint(
         NodePath.join(repository.objectsDir, "info", "alternates"),
       );
-      return `${repository.commonDir}\0${repository.objectsDir}\0${alternates}\0${environment}\0${ref}`;
+      if (alternates !== "!ENOENT") return null;
+      return `${repository.commonDir}\0${repository.objectsDir}\0${ref}`;
     });
 
   const packedRefs = Effect.fnUntraced(function* (commonDir: string) {

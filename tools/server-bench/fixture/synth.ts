@@ -59,7 +59,7 @@ export interface TableComparison {
 
 // Kept by the server itself (migrations, search index, positions, P1-014's turn item counts).
 const DERIVED_TABLES =
-  /^(?:effect_sql_migrations|sqlite_.*|orchestration_v2_message_search(?:_.*)?|orchestration_v2_projection_metadata|orchestration_v2_projection_turn_item_counts)$/;
+  /^(?:effect_sql_migrations|t3_perf_fork_migrations|sqlite_.*|orchestration_v2_message_search(?:_.*)?|orchestration_v2_projection_metadata|orchestration_v2_projection_turn_item_counts)$/;
 
 /** Rows and bytes per table of a built database against the shape scaled, and against the plan. */
 export const compare = (shape: Shape, plan: SynthPlan, actual: Shape): Array<TableComparison> => {
@@ -161,17 +161,17 @@ const writeDatabase = Effect.fn("fixture.synth.write")(function* (
 });
 
 /**
- * The two columns the server stamps with the wall clock (when each migration ran, when the
- * projection last moved) set to the synth's own `now`, so the same shape and seed give the same
- * bytes. Kept in the formats the server writes.
+ * The columns the server stamps with the wall clock (when each migration ran, in either migration
+ * table; when the projection last moved) set to the synth's own `now`, so the same shape and seed
+ * give the same bytes. Kept in the formats the server writes.
  */
 const pinWallClock = (path: string, now: number) => {
   const iso = DateTime.formatIso(DateTime.makeUnsafe(now));
   const db = new NodeSqlite.DatabaseSync(path);
   try {
-    db.prepare(`UPDATE effect_sql_migrations SET created_at = ?`).run(
-      iso.slice(0, 19).replace("T", " "),
-    );
+    for (const ledger of ["effect_sql_migrations", "t3_perf_fork_migrations"]) {
+      db.prepare(`UPDATE ${ledger} SET created_at = ?`).run(iso.slice(0, 19).replace("T", " "));
+    }
     db.prepare(`UPDATE orchestration_v2_projection_metadata SET updated_at = ?`).run(iso);
   } finally {
     db.close();

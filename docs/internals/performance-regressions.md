@@ -106,21 +106,26 @@ and run that triggers on the turn-item table keep exact, so a shell read never c
 items. `ProjectionMaintenance.verify` reports counts that drifted from their items, `rebuild`
 recounts them during replay, and `t3 doctor` recounts drifted counts before it compacts. The
 triggers write to that table: dropping the table while they remain makes every turn-item insert
-fail, so drop the three triggers first. Rolling back to a build without migration 77 can instead
-delete its `effect_sql_migrations` row and keep the table and triggers, which go on counting. A
-migration that rebuilds the turn-item table (create, copy, drop, rename) drops the triggers with
-it, so migration 77 must run after any such rebuild, or the rebuild must recreate them. A partial
-index covers nonterminal background items, including idle items. Latest user-message reads use an
-index ordered by update time.
+fail, so drop the three triggers first. They come from migration 1 of the fork's own chain,
+recorded in `t3_perf_fork_migrations` (see
+[Leaving the performance fork's schema](../operations/perf-fork-schema-exit.md)), so an upstream
+build starts with the table and triggers in place, which go on counting; the fork's first release
+candidate refuses a database that an upstream migration past 76 ran on. An upstream migration that
+rebuilds the turn-item table (create, copy, drop, rename) drops the triggers with it, or leaves them
+on an old table it keeps aside. After upstream's migrations, every start runs a recorded fork
+migration whose objects are not on their table again, checking again under the write lock so that
+concurrent starts run it once; migration 1 must stay safe to re-run (it recounts). A partial index
+covers nonterminal background items, including idle items. Latest user-message reads use an index
+ordered by update time.
 
 A projection read that orders messages by their first user or assistant turn item groups those
-items by `$.messageId` through a partial index on that expression (migration 78), so it does not
-parse every message item's payload; the index's expression and `WHERE` must stay identical to the
-query's. Migration 78 scans the turn-item table once on first start, and fails (so the server
-does not start) if a message item's payload is not valid JSON. Each message-item write re-parses
-the old and new payload for the index, so its cost grows with the payload. Rolling back to a build
-without it can delete its `effect_sql_migrations` row and keep the index, which writes keep
-current; `DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx` removes it.
+items by `$.messageId` through a partial index on that expression (the fork's migration 2), so it
+does not parse every message item's payload; the index's expression and `WHERE` must stay identical
+to the query's. That migration scans the turn-item table once on first start, and fails (so the
+server does not start) if a message item's payload is not valid JSON. Each message-item write
+re-parses the old and new payload for the index, so its cost grows with the payload. An upstream
+build starts with the index in place, which writes keep current;
+`DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx` removes it.
 Finalizing a delegated task reads only that child's tasks, and the transfers it sent to the
 parent, from the parent.
 

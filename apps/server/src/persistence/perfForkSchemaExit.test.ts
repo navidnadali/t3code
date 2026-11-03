@@ -9,14 +9,16 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import { runMigrations } from "./Migrations.ts";
+import { migrationManifest, runMigrations, type RunMigrationsOptions } from "./Migrations.ts";
+import { PERF_FORK_MIGRATIONS_TABLE } from "./PerfForkMigrations.ts";
 
 const EXIT_SCRIPT = new URL("../../../../scripts/perf-fork-schema-exit.sql", import.meta.url);
-const UPSTREAM_HEAD = 76;
+// Upstream's last migration when release candidate 1 recorded the fork's at 77 and 78.
+const RC1_UPSTREAM_HEAD = 76;
 const COUNTS_TABLE = "orchestration_v2_projection_turn_item_counts";
 
-const migrate = (filename: string, toMigrationInclusive?: number) =>
-  runMigrations({ toMigrationInclusive }).pipe(
+const migrate = (filename: string, options?: RunMigrationsOptions) =>
+  runMigrations(options).pipe(
     Effect.map((ran) => ran.map(([id]) => id)),
     Effect.provide(NodeSqliteClient.layer({ filename })),
   );
@@ -51,7 +53,10 @@ const forkObjects = (db: NodeSqlite.DatabaseSync) =>
     .prepare(
       `SELECT type, name FROM sqlite_master
        WHERE name LIKE 'orchestration_v2_turn_item_counts_%'
-          OR name IN ('${COUNTS_TABLE}', 'orchestration_v2_projection_turn_items_message_ordinal_idx')
+          OR name IN (
+            '${COUNTS_TABLE}', 'orchestration_v2_projection_turn_items_message_ordinal_idx',
+            '${PERF_FORK_MIGRATIONS_TABLE}'
+          )
        ORDER BY name`,
     )
     .all()
@@ -71,6 +76,23 @@ const insertTurnItem = (
        ) VALUES (?, ?, ?, 1, 'assistant_message', 'completed', '2026-11-01T00:00:00.000Z', ?)`,
     )
     .run(id, threadId, runId, payloadJson);
+
+const ledgerIds = (db: NodeSqlite.DatabaseSync) =>
+  db
+    .prepare("SELECT migration_id FROM effect_sql_migrations ORDER BY migration_id")
+    .all()
+    .map(({ migration_id }) => Number(migration_id));
+
+const forkLedger = (db: NodeSqlite.DatabaseSync) =>
+  db
+    .prepare(`SELECT migration_id, name FROM ${PERF_FORK_MIGRATIONS_TABLE} ORDER BY migration_id`)
+    .all()
+    .map(({ migration_id, name }) => [Number(migration_id), String(name)]);
+
+const FORK_CHAIN = [
+  [1, "ProjectionTurnItemCounts"],
+  [2, "TurnItemMessageOrdinalIndex"],
+];
 
 const countsAsStored = (db: NodeSqlite.DatabaseSync) =>
   db
@@ -98,8 +120,12 @@ it.effect(
       );
       const exitScript = NodeFS.readFileSync(EXIT_SCRIPT, "utf8");
 
-      assert.deepEqual((yield* migrate(filename)).slice(-2), [77, 78]);
+      assert.deepEqual(
+        yield* migrate(filename),
+        migrationManifest.map(([id]) => id),
+      );
       const expected = yield* withDatabase(filename, (db) => {
+        assert.deepEqual(forkLedger(db), FORK_CHAIN);
         insertTurnItem(db, "a1", "thread-a", "run-1");
         insertTurnItem(db, "a2", "thread-a", "run-1");
         insertTurnItem(db, "a3", "thread-a", null);
@@ -111,13 +137,12 @@ it.effect(
           "DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'a1'",
         ).run();
         assert.deepEqual(countsAsStored(db), countsFromItems(db));
-        const { [COUNTS_TABLE]: _counts, ...rest } = contents(db);
-        return {
-          ...rest,
-          effect_sql_migrations: rest.effect_sql_migrations!.filter(
-            (row) => (JSON.parse(row) as { migration_id: number }).migration_id <= UPSTREAM_HEAD,
-          ),
-        };
+        const {
+          [COUNTS_TABLE]: _counts,
+          [PERF_FORK_MIGRATIONS_TABLE]: _forkLedger,
+          ...rest
+        } = contents(db);
+        return rest;
       });
 
       yield* withDatabase(filename, (db) => {
@@ -128,24 +153,62 @@ it.effect(
         assert.deepEqual(contents(db), expected);
       });
 
-      assert.deepEqual(yield* migrate(filename, UPSTREAM_HEAD), []);
+      // Upstream's chain alone, as an upstream build runs it.
+      assert.deepEqual(yield* migrate(filename, { toPerfForkMigrationInclusive: 0 }), []);
       yield* withDatabase(filename, (db) => {
         assert.deepEqual(contents(db), expected);
         insertTurnItem(db, "c1", "thread-c", "run-4");
       });
 
-      assert.deepEqual(yield* migrate(filename), [77, 78]);
+      assert.deepEqual(yield* migrate(filename), []);
       yield* withDatabase(filename, (db) => {
+        assert.deepEqual(forkLedger(db), FORK_CHAIN);
         assert.deepEqual(forkObjects(db), [
           `table:${COUNTS_TABLE}`,
           "index:orchestration_v2_projection_turn_items_message_ordinal_idx",
           "trigger:orchestration_v2_turn_item_counts_delete",
           "trigger:orchestration_v2_turn_item_counts_insert",
           "trigger:orchestration_v2_turn_item_counts_update",
+          `table:${PERF_FORK_MIGRATIONS_TABLE}`,
         ]);
         assert.deepEqual(countsAsStored(db), countsFromItems(db));
         insertTurnItem(db, "c2", "thread-c", "run-4");
         assert.deepEqual(countsAsStored(db), countsFromItems(db));
       });
     }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("leaves release candidate 1's schema so upstream's migrations start on it", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const filename = path.join(
+      yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-exit-" }),
+      "statev2.sqlite",
+    );
+    const exitScript = NodeFS.readFileSync(EXIT_SCRIPT, "utf8");
+    const upstreamIds = migrationManifest.map(([id]) => id);
+
+    yield* migrate(filename);
+    yield* withDatabase(filename, (db) => {
+      db.exec(`
+        DROP TABLE ${PERF_FORK_MIGRATIONS_TABLE};
+        DELETE FROM effect_sql_migrations WHERE migration_id > ${RC1_UPSTREAM_HEAD};
+        INSERT INTO effect_sql_migrations (migration_id, name)
+        VALUES (77, 'ProjectionTurnItemCounts'), (78, 'TurnItemMessageOrdinalIndex');
+      `);
+      db.exec(exitScript);
+      assert.deepEqual(forkObjects(db), []);
+      assert.deepEqual(
+        ledgerIds(db),
+        upstreamIds.filter((id) => id <= RC1_UPSTREAM_HEAD),
+      );
+    });
+
+    yield* migrate(filename, { toPerfForkMigrationInclusive: 0 });
+    yield* withDatabase(filename, (db) => {
+      assert.deepEqual(ledgerIds(db), upstreamIds);
+      assert.deepEqual(forkObjects(db), []);
+    });
+  }).pipe(Effect.provide(NodeServices.layer)),
 );

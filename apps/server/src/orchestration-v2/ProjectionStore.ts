@@ -3645,7 +3645,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ],
           { concurrency: yield* NodeSqliteClient.readConcurrency },
         );
-        // Migration 78 indexes exactly this expression, type list and json_valid term: changing
+        // Fork migration 2 indexes exactly this expression, type list and json_valid term: changing
         // any, even the IN order, silently drops the index. ProjectionStore.test.ts asserts the plan.
         const messageOrdinalRows =
           fields !== undefined && fields.includes("messages") && messageRows.length > 1
@@ -6431,7 +6431,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             WHERE thread_id IN (SELECT value FROM json_each(${encodeIdList(threadIds)}))
           `;
 
-    // Maintained counts (migration 77) hold one row per thread and run; '' is run-less.
+    // Maintained counts (fork migration 1) hold one row per thread and run; '' is run-less.
     const selectShellRunItemCounts = (threadIds: ReadonlyArray<ThreadId>) =>
       sql<ShellRunItemCountRow>`
         SELECT thread_id, run_id, item_count

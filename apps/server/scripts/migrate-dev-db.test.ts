@@ -250,6 +250,10 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
         { sharedHome: sourceDir },
       );
       assert.include(result.executedMigrations, "55_OrchestrationV2");
+      assert.include(
+        result.executedMigrations,
+        "t3_perf_fork_migrations:1_ProjectionTurnItemCounts",
+      );
     }),
   );
 

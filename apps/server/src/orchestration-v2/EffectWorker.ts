@@ -617,12 +617,17 @@ const isOrchestrationEffectWorkerError = Schema.is(OrchestrationEffectWorkerErro
 
 export interface OrchestrationEffectWorkerV2Shape {
   readonly awaitWork: Effect.Effect<void>;
+  /** Wakes up to `count` idle workers to claim again, as new outbox rows do. */
+  readonly notifyWork: (count?: number) => Effect.Effect<void>;
   readonly runOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runRecoveryOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly nextClaimableAt: Effect.Effect<
     Option.Option<DateTime.Utc>,
     OrchestrationEffectWorkerError
   >;
+  readonly nextClaimableAtExcluding: (
+    excludeEffectTypes: ReadonlyArray<string>,
+  ) => Effect.Effect<Option.Option<DateTime.Utc>, OrchestrationEffectWorkerError>;
   readonly drain: (maxEffects?: number) => Effect.Effect<number, OrchestrationEffectWorkerError>;
 }
 
@@ -740,11 +745,124 @@ export const layerWithOptions = (
           ? requeueClaim(effect, cause)
           : terminalizeClaim(effect, cause);
 
+      // Untraced: the claimed effect's own EffectWorker.runEffect span covers its execution.
+      const runClaimed = Effect.fnUntraced(function* (
+        effect: EffectOutbox.OrchestrationEffectV2,
+        gated: boolean,
+      ) {
+        // Arm cancellation before rereading durable state to close the read-to-registration race.
+        const cancellation = outbox
+          .awaitCancellation(effect.id)
+          .pipe(Effect.as("cancelled" as const));
+        const claimedAt = DateTime.toEpochMillis(yield* DateTime.now);
+        const eligibleAt = Math.max(
+          DateTime.toEpochMillis(DateTime.makeUnsafe(effect.createdAt)),
+          DateTime.toEpochMillis(DateTime.makeUnsafe(effect.availableAt)),
+        );
+        const queueWaitMs = Math.max(0, claimedAt - eligibleAt);
+        const cancelledBeforeExecution = yield* Effect.gen(function* () {
+          yield* Metric.update(
+            Metric.withAttributes(
+              orchestrationEffectQueueWait,
+              metricAttributes({ effect_type: effect.request.type }),
+            ),
+            Duration.millis(queueWaitMs),
+          );
+          // Recheck durable cancellation after registering the Deferred; cancellation may have committed after claim.
+          if (yield* wasCancelled(effect.id)) {
+            yield* outbox.clearCancellation(effect.id);
+            return true;
+          }
+          return false;
+        }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
+        if (cancelledBeforeExecution) return true;
+
+        const execution = executor
+          .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
+          .pipe(
+            boundExecution(effect),
+            Effect.withSpan("EffectWorker.runEffect", {
+              attributes: {
+                "effect.type": effect.request.type,
+                "effect.queue_wait_ms": queueWaitMs,
+                "effect.attempt": effect.attemptCount,
+                "effect.gated": gated,
+              },
+            }),
+            Effect.as("executed" as const),
+          );
+        const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
+          Effect.ensuring(outbox.clearCancellation(effect.id)),
+        );
+        if (Exit.isSuccess(exit) && exit.value === "cancelled") {
+          return true;
+        }
+        if (Exit.isSuccess(exit)) {
+          return yield* Effect.gen(function* () {
+            const completed = yield* outbox.succeed({ effectId: effect.id, workerId });
+            if (!completed) {
+              if (yield* wasCancelled(effect.id)) return true;
+              return yield* new OrchestrationEffectWorkerError({
+                operation: "complete",
+                effectId: effect.id,
+                cause: "The worker no longer owns the effect lease.",
+              });
+            }
+            return true;
+          }).pipe(Effect.onError((cause) => recoverPostSuccessSettlement(effect, cause)));
+        }
+
+        const error = Cause.pretty(exit.cause);
+        const nonRetryable = isNonRetryableProviderTurnControlFailure(effect.request.type, error);
+        yield* Effect.logWarning("Orchestration effect execution failed", {
+          effectId: effect.id,
+          effectType: effect.request.type,
+          attemptCount: effect.attemptCount,
+          nonRetryable,
+          error,
+        });
+        const updated = nonRetryable
+          ? yield* outbox
+              .succeed({ effectId: effect.id, workerId })
+              .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
+          : effect.attemptCount >= maxAttempts
+            ? yield* outbox
+                .fail({ effectId: effect.id, workerId, error })
+                .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
+            : yield* outbox
+                .retry({
+                  effectId: effect.id,
+                  workerId,
+                  error,
+                  delayMs: Math.min(30_000, 100 * 2 ** Math.max(0, effect.attemptCount - 1)),
+                })
+                .pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
+        if (!updated) {
+          if (yield* wasCancelled(effect.id)) return true;
+          return yield* new OrchestrationEffectWorkerError({
+            operation: "reschedule",
+            effectId: effect.id,
+            cause: "The worker no longer owns the effect lease.",
+          });
+        }
+        return true;
+      });
+
       // The worker probes for work repeatedly, including when the outbox is empty.
       const runOnce = Effect.fnUntraced(
         function* (excludeRestartContinuations = false) {
+          // While the main thread is saturated a worker without a slot claims only ungated effects.
+          const admission = yield* EffectAdmission.EffectAdmission;
+          const reservation = yield* admission.reserve;
+          const releaseReservation = Option.getOrElse(reservation, () => Effect.void);
           const claimExit = yield* Effect.exit(
-            outbox.claimNext({ workerId, excludeRestartContinuations }),
+            outbox.claimNext({
+              workerId,
+              excludeRestartContinuations,
+              ...(Option.isNone(reservation)
+                ? { excludeEffectTypes: EffectAdmission.GATED_EFFECT_TYPES }
+                : {}),
+            }),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
             result: Exit.isFailure(claimExit)
@@ -753,115 +871,21 @@ export const layerWithOptions = (
                 ? "empty"
                 : "claimed",
           });
-          if (Exit.isFailure(claimExit)) return yield* Effect.failCause(claimExit.cause);
+          if (Exit.isFailure(claimExit)) {
+            yield* releaseReservation;
+            return yield* Effect.failCause(claimExit.cause);
+          }
           const claimed = claimExit.value;
           if (Option.isNone(claimed)) {
+            yield* releaseReservation;
             return false;
           }
           const effect = claimed.value;
-          // Arm cancellation before rereading durable state to close the read-to-registration race.
-          const cancellation = outbox
-            .awaitCancellation(effect.id)
-            .pipe(Effect.as("cancelled" as const));
-          const claimedAt = DateTime.toEpochMillis(yield* DateTime.now);
-          const eligibleAt = Math.max(
-            DateTime.toEpochMillis(DateTime.makeUnsafe(effect.createdAt)),
-            DateTime.toEpochMillis(DateTime.makeUnsafe(effect.availableAt)),
+          const gated = EffectAdmission.isGated(effect.request.type);
+          if (!gated) yield* releaseReservation;
+          return yield* runClaimed(effect, gated).pipe(
+            Effect.ensuring(gated ? releaseReservation : Effect.void),
           );
-          const queueWaitMs = Math.max(0, claimedAt - eligibleAt);
-          const cancelledBeforeExecution = yield* Effect.gen(function* () {
-            yield* Metric.update(
-              Metric.withAttributes(
-                orchestrationEffectQueueWait,
-                metricAttributes({ effect_type: effect.request.type }),
-              ),
-              Duration.millis(queueWaitMs),
-            );
-            // Recheck durable cancellation after registering the Deferred; cancellation may have committed after claim.
-            if (yield* wasCancelled(effect.id)) {
-              yield* outbox.clearCancellation(effect.id);
-              return true;
-            }
-            return false;
-          }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
-          if (cancelledBeforeExecution) return true;
-
-          const admission = yield* EffectAdmission.EffectAdmission;
-          const execution = Effect.scoped(
-            Effect.gen(function* () {
-              const admitted = yield* admission.admit(effect.request.type);
-              if (admitted.gated) {
-                yield* Effect.annotateCurrentSpan("effect.admission_wait_ms", admitted.waitedMs);
-              }
-              return yield* executor
-                .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
-                .pipe(boundExecution(effect));
-            }),
-          ).pipe(
-            Effect.withSpan("EffectWorker.runEffect", {
-              attributes: {
-                "effect.type": effect.request.type,
-                "effect.queue_wait_ms": queueWaitMs,
-                "effect.attempt": effect.attemptCount,
-              },
-            }),
-            Effect.as("executed" as const),
-          );
-          const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
-            Effect.ensuring(outbox.clearCancellation(effect.id)),
-          );
-          if (Exit.isSuccess(exit) && exit.value === "cancelled") {
-            return true;
-          }
-          if (Exit.isSuccess(exit)) {
-            return yield* Effect.gen(function* () {
-              const completed = yield* outbox.succeed({ effectId: effect.id, workerId });
-              if (!completed) {
-                if (yield* wasCancelled(effect.id)) return true;
-                return yield* new OrchestrationEffectWorkerError({
-                  operation: "complete",
-                  effectId: effect.id,
-                  cause: "The worker no longer owns the effect lease.",
-                });
-              }
-              return true;
-            }).pipe(Effect.onError((cause) => recoverPostSuccessSettlement(effect, cause)));
-          }
-
-          const error = Cause.pretty(exit.cause);
-          const nonRetryable = isNonRetryableProviderTurnControlFailure(effect.request.type, error);
-          yield* Effect.logWarning("Orchestration effect execution failed", {
-            effectId: effect.id,
-            effectType: effect.request.type,
-            attemptCount: effect.attemptCount,
-            nonRetryable,
-            error,
-          });
-          const updated = nonRetryable
-            ? yield* outbox
-                .succeed({ effectId: effect.id, workerId })
-                .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
-              ? yield* outbox
-                  .fail({ effectId: effect.id, workerId, error })
-                  .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-              : yield* outbox
-                  .retry({
-                    effectId: effect.id,
-                    workerId,
-                    error,
-                    delayMs: Math.min(30_000, 100 * 2 ** Math.max(0, effect.attemptCount - 1)),
-                  })
-                  .pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
-          if (!updated) {
-            if (yield* wasCancelled(effect.id)) return true;
-            return yield* new OrchestrationEffectWorkerError({
-              operation: "reschedule",
-              effectId: effect.id,
-              cause: "The worker no longer owns the effect lease.",
-            });
-          }
-          return true;
         },
         (effect, _excludeRestartContinuations?: boolean) =>
           effect.pipe(
@@ -875,9 +899,22 @@ export const layerWithOptions = (
 
       return OrchestrationEffectWorkerV2.of({
         awaitWork: outbox.awaitAvailable,
+        notifyWork: outbox.notifyAvailable,
         runOnce: runOnce(),
         runRecoveryOnce: runOnce(true),
         nextClaimableAt: outbox.nextClaimableAt.pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestrationEffectWorkerError({
+                operation: "next-claimable",
+                cause,
+              }),
+          ),
+        ),
+        nextClaimableAtExcluding: Effect.fnUntraced(
+          function* (excludeEffectTypes: ReadonlyArray<string>) {
+            return yield* outbox.nextClaimableAtExcluding(excludeEffectTypes);
+          },
           Effect.mapError(
             (cause) =>
               new OrchestrationEffectWorkerError({
@@ -901,8 +938,10 @@ export const layer = layerWithOptions();
 
 export interface OrchestrationEffectDaemonOptions {
   readonly concurrency?: number;
-  /** Hold gated effects while the main thread is this busy; `false` admits everything. */
+  /** Leave turn starts in the outbox while the main thread is this busy; `false` claims everything. */
   readonly admission?: { readonly utilizationHighMark: number } | false;
+  /** Event loop utilization of the last sample interval; tests inject one. */
+  readonly utilization?: Effect.Effect<number>;
   readonly livenessPollIntervalMs?: number;
 }
 
@@ -912,10 +951,9 @@ export interface OrchestrationEffectDaemonOptions {
 const DEFAULT_EFFECT_WORKER_CONCURRENCY = 4;
 export const EFFECT_WORKER_MAX_CONCURRENCY = 256;
 const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
-// Past this share of the last second busy, turn starts wait for headroom; below the low mark
-// (a tenth less) they resume. Two samples either way, so a single burst switches nothing.
+// Past this share of the last second busy, turn starts stay in the outbox; a tenth below it they
+// resume. Two samples either way, so a single burst switches nothing.
 const DEFAULT_EFFECT_ADMISSION_UTILIZATION = 0.95;
-const EFFECT_ADMISSION_HYSTERESIS = 0.1;
 const EFFECT_ADMISSION_SAMPLES_TO_SWITCH = 2;
 const EFFECT_ADMISSION_SAMPLE_INTERVAL = Duration.seconds(1);
 
@@ -953,10 +991,10 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
           : yield* EffectAdmission.make({
               workers: concurrency,
               utilizationHighMark,
-              utilizationLowMark: Math.max(0, utilizationHighMark - EFFECT_ADMISSION_HYSTERESIS),
               samplesToSwitch: EFFECT_ADMISSION_SAMPLES_TO_SWITCH,
               sampleInterval: EFFECT_ADMISSION_SAMPLE_INTERVAL,
-              utilization: yield* eventLoopUtilizationSource,
+              utilization: options.utilization ?? (yield* eventLoopUtilizationSource),
+              onAllowanceRestored: worker.notifyWork(concurrency),
             });
       const runOnce =
         admission === undefined
@@ -988,7 +1026,12 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             continue;
           }
 
-          const nextClaimableAt = yield* worker.nextClaimableAt.pipe(
+          // Skipped turn starts are not due work; the allowance's return wakes the workers for them.
+          const nextClaimable =
+            admission === undefined
+              ? worker.nextClaimableAt
+              : worker.nextClaimableAtExcluding(yield* admission.excludedTypes);
+          const nextClaimableAt = yield* nextClaimable.pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning(
                 "Failed to read the next orchestration effect deadline",

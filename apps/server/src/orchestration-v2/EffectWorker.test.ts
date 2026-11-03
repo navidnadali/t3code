@@ -22,7 +22,9 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as EffectAdmission from "./EffectAdmission.ts";
@@ -639,43 +641,59 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
     }),
 );
 
-it.effect("holds a second turn start for admission while an interrupt runs at once", () =>
+const admissionEffect = (
+  index: number,
+  now: string,
+  workerId: string,
+  request: EffectOutbox.OrchestrationEffectV2["request"],
+): EffectOutbox.OrchestrationEffectV2 => ({
+  id: `effect:admission-${index}`,
+  commandId: CommandId.make(`command:admission-${index}`),
+  threadId: ThreadId.make(`thread:admission-${index}`),
+  request,
+  status: "running",
+  attemptCount: 1,
+  availableAt: now,
+  leaseOwner: workerId,
+  createdAt: now,
+  updatedAt: now,
+  completedAt: null,
+  lastError: null,
+});
+
+it.effect("claims only ungated effects once the admission slots are taken", () =>
   Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
-    const workerId = "worker-admission";
-    const claimable = (index: number, request: EffectOutbox.OrchestrationEffectV2["request"]) =>
-      ({
-        id: `effect:admission-${index}`,
-        commandId: CommandId.make(`command:admission-${index}`),
-        threadId: ThreadId.make(`thread:admission-${index}`),
-        request,
-        status: "running",
-        attemptCount: 1,
-        availableAt: now,
-        leaseOwner: workerId,
-        createdAt: now,
-        updatedAt: now,
-        completedAt: null,
-        lastError: null,
-      }) satisfies EffectOutbox.OrchestrationEffectV2;
+    const workerId = "worker-admission-claims";
     const pending = [
-      claimable(1, { type: "provider-turn.start", runId: RunId.make("run:admission-1") }),
-      claimable(2, { type: "provider-turn.start", runId: RunId.make("run:admission-2") }),
-      claimable(3, {
+      admissionEffect(1, now, workerId, {
+        type: "provider-turn.start",
+        runId: RunId.make("run:admission-1"),
+      }),
+      admissionEffect(2, now, workerId, {
+        type: "provider-turn.start",
+        runId: RunId.make("run:admission-2"),
+      }),
+      admissionEffect(3, now, workerId, {
         type: "provider-turn.interrupt",
         providerSessionId: oldSessionId,
         providerThreadId,
         providerTurnId,
       }),
     ];
+    const exclusions = yield* Ref.make<ReadonlyArray<ReadonlyArray<string>>>([]);
     const started = yield* Ref.make<ReadonlyArray<string>>([]);
     const finishTurnStarts = yield* Deferred.make<void>();
     const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
-      claimNext: () =>
-        Effect.sync(() => {
-          const next = pending.shift();
-          return next === undefined ? Option.none() : Option.some(next);
-        }),
+      claimNext: ({ excludeEffectTypes = [] }) =>
+        Ref.update(exclusions, (seen) => [...seen, excludeEffectTypes]).pipe(
+          Effect.map(() => {
+            const index = pending.findIndex(
+              (effect) => !excludeEffectTypes.includes(effect.request.type),
+            );
+            return index === -1 ? Option.none() : Option.some(pending.splice(index, 1)[0]!);
+          }),
+        ),
       get: () => Effect.succeedNone,
       awaitCancellation: () => Effect.never,
       clearCancellation: () => Effect.void,
@@ -694,48 +712,152 @@ it.effect("holds a second turn start for admission while an interrupt runs at on
           ),
       }),
     );
-    const layerWorker = EffectWorker.layerWithOptions({ workerId }).pipe(
-      Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
-    );
     const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
-      Effect.provide(layerWorker),
+      Effect.provide(
+        EffectWorker.layerWithOptions({ workerId }).pipe(
+          Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+        ),
+      ),
     );
     const admission = yield* EffectAdmission.make({
       workers: 1,
       utilizationHighMark: 0.95,
-      utilizationLowMark: 0.85,
       samplesToSwitch: 2,
       sampleInterval: Duration.seconds(1),
       utilization: Effect.succeed(0.2),
+      onAllowanceRestored: Effect.void,
     });
     const runOnce = worker.runOnce.pipe(
       Effect.provideService(EffectAdmission.EffectAdmission, admission),
     );
 
     const first = yield* Effect.forkChild(runOnce);
-    const second = yield* Effect.forkChild(runOnce);
     yield* Effect.yieldNow;
     assert.deepEqual(yield* Ref.get(started), ["effect:admission-1"]);
-    assert.equal((yield* admission.state).waiting, 1);
-
-    // The interrupt is not gated: it runs while the turn starts are held.
+    // The slot is taken, so this claim skips the second turn start and takes the interrupt.
     assert.isTrue(yield* runOnce);
     assert.deepEqual(yield* Ref.get(started), ["effect:admission-1", "effect:admission-3"]);
-    assert.equal((yield* admission.state).waiting, 1);
+    assert.deepEqual(yield* Ref.get(exclusions), [[], EffectAdmission.GATED_EFFECT_TYPES]);
+    assert.equal(pending.length, 1);
 
     yield* Deferred.succeed(finishTurnStarts, undefined);
     assert.isTrue(yield* Fiber.join(first));
-    assert.isTrue(yield* Fiber.join(second));
+    assert.isTrue(yield* runOnce);
     assert.deepEqual(yield* Ref.get(started), [
       "effect:admission-1",
       "effect:admission-3",
       "effect:admission-2",
     ]);
-    assert.deepEqual(yield* admission.state, {
-      allowed: 1,
-      inFlight: 0,
-      waiting: 0,
-      saturated: false,
+    assert.deepEqual(yield* admission.state, { allowed: 1, inFlight: 0, saturated: false });
+  }),
+);
+
+it.effect("a saturated daemon runs an interrupt while turn starts beyond the allowance wait", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const workerId = "worker-admission-daemon";
+    const pending: Array<EffectOutbox.OrchestrationEffectV2> = [];
+    const available = yield* Queue.unbounded<void>();
+    const started = yield* Queue.unbounded<string>();
+    const finishTurnStarts = yield* Deferred.make<void>();
+    const claimable = (excludeEffectTypes: ReadonlyArray<string>) =>
+      pending.filter((effect) => !excludeEffectTypes.includes(effect.request.type));
+    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: ({ excludeEffectTypes = [] }) =>
+        Effect.sync(() => {
+          const next = claimable(excludeEffectTypes)[0];
+          if (next === undefined) return Option.none();
+          pending.splice(pending.indexOf(next), 1);
+          return Option.some(next);
+        }),
+      nextClaimableAt: Effect.sync(() =>
+        claimable([]).length === 0 ? Option.none() : Option.some(DateTime.makeUnsafe(now)),
+      ),
+      nextClaimableAtExcluding: (excludeEffectTypes) =>
+        Effect.sync(() =>
+          claimable(excludeEffectTypes).length === 0
+            ? Option.none()
+            : Option.some(DateTime.makeUnsafe(now)),
+        ),
+      awaitAvailable: Queue.take(available),
+      notifyAvailable: (count = 1) =>
+        Queue.offerAll(
+          available,
+          Array.from({ length: count }, () => undefined),
+        ).pipe(Effect.asVoid),
+      get: () => Effect.succeedNone,
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      succeed: () => Effect.succeed(true),
     });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({
+        execute: (effect) =>
+          Queue.offer(started, effect.id).pipe(
+            Effect.andThen(
+              effect.request.type === "provider-turn.start"
+                ? Deferred.await(finishTurnStarts)
+                : Effect.void,
+            ),
+          ),
+      }),
+    );
+    const utilization = yield* Ref.make(0.99);
+    const daemon = yield* EffectWorker.runDaemonWithOptions({
+      concurrency: 4,
+      admission: { utilizationHighMark: 0.95 },
+      utilization: Ref.get(utilization),
+      livenessPollIntervalMs: 60_000,
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layerWithOptions({ workerId }).pipe(
+          Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+        ),
+      ),
+      Effect.forkChild,
+    );
+    // Two saturated samples halve the allowance to two before any work arrives.
+    yield* TestClock.adjust("2 seconds");
+
+    pending.push(
+      ...[1, 2, 3, 4].map((index) =>
+        admissionEffect(index, now, workerId, {
+          type: "provider-turn.start",
+          runId: RunId.make(`run:admission-${index}`),
+        }),
+      ),
+      admissionEffect(5, now, workerId, {
+        type: "provider-turn.interrupt",
+        providerSessionId: oldSessionId,
+        providerThreadId,
+        providerTurnId,
+      }),
+    );
+    yield* Queue.offerAll(available, [undefined, undefined, undefined, undefined, undefined]);
+    const firstWave = yield* Effect.all([
+      Queue.take(started),
+      Queue.take(started),
+      Queue.take(started),
+    ]);
+    assert.deepEqual([...firstWave].toSorted(), [
+      "effect:admission-1",
+      "effect:admission-2",
+      "effect:admission-5",
+    ]);
+    assert.deepEqual(
+      pending.map((effect) => effect.id),
+      ["effect:admission-3", "effect:admission-4"],
+    );
+
+    // Headroom returns: the idle workers are woken and take the remaining turn starts.
+    yield* Ref.set(utilization, 0.2);
+    yield* TestClock.adjust("2 seconds");
+    const secondWave = yield* Effect.all([Queue.take(started), Queue.take(started)]);
+    assert.deepEqual([...secondWave].toSorted(), ["effect:admission-3", "effect:admission-4"]);
+    assert.equal(pending.length, 0);
+
+    yield* Deferred.succeed(finishTurnStarts, undefined);
+    yield* Fiber.interrupt(daemon);
   }),
 );

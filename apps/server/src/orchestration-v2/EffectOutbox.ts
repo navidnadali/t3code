@@ -224,8 +224,13 @@ export interface EffectOutboxV2Shape {
   readonly claimNext: (input: {
     readonly workerId: string;
     readonly excludeRestartContinuations?: boolean;
+    /** Effect types left in the outbox for now; an older one still blocks its thread's newer effects. */
+    readonly excludeEffectTypes?: ReadonlyArray<string>;
   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
   readonly nextClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
+  readonly nextClaimableAtExcluding: (
+    excludeEffectTypes: ReadonlyArray<string>,
+  ) => Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly succeed: (input: {
     readonly effectId: string;
     readonly workerId: string;
@@ -314,6 +319,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
     const claimableCandidatePredicate = (
       availableBefore?: string,
       excludeRestartContinuations = false,
+      excludeEffectTypes: ReadonlyArray<string> = [],
     ) =>
       sql`
         ${
@@ -322,6 +328,11 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             : sql`candidate.available_at <= ${availableBefore}`
         }
         AND candidate.status = 'pending'
+        AND ${
+          excludeEffectTypes.length === 0
+            ? sql`1 = 1`
+            : sql`candidate.effect_type NOT IN ${sql.in(excludeEffectTypes)}`
+        }
         AND NOT EXISTS (
           SELECT 1
           FROM orchestration_v2_effect_outbox AS active
@@ -364,6 +375,32 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       Effect.forEach(rows, rowToEffect).pipe(
         Effect.mapError((cause) => new EffectOutboxError({ operation, cause })),
       );
+
+    // Untraced: the workers ask on every idle poll, and the statement itself is kept out of traces.
+    const nextClaimableAtFor = Effect.fnUntraced(
+      function* (excludeEffectTypes: ReadonlyArray<string>) {
+        const rows = yield* sql<{ readonly available_at: string | null }>`
+          SELECT MIN(candidate.available_at) AS available_at
+          FROM orchestration_v2_effect_outbox AS candidate
+          WHERE ${claimableCandidatePredicate(undefined, false, excludeEffectTypes)}
+        `.pipe(NodeSqliteClient.readOnly, Effect.withTracerEnabled(false));
+        const availableAt = rows[0]?.available_at;
+        if (availableAt === undefined || availableAt === null) return Option.none();
+        const parsed = DateTime.make(availableAt);
+        if (Option.isNone(parsed)) {
+          return yield* new EffectOutboxError({
+            operation: "next-claimable",
+            cause: `Invalid available_at timestamp: ${availableAt}`,
+          });
+        }
+        return parsed;
+      },
+      Effect.mapError((cause) =>
+        isEffectOutboxError(cause)
+          ? cause
+          : new EffectOutboxError({ operation: "next-claimable", cause }),
+      ),
+    );
 
     const service: EffectOutboxV2Shape = {
       enqueue: Effect.fn("EffectOutbox.enqueue")(
@@ -519,7 +556,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       ),
       // The worker polls for the next effect even when there is no work to claim.
       claimNext: Effect.fnUntraced(
-        function* ({ workerId, excludeRestartContinuations = false }) {
+        function* ({ workerId, excludeRestartContinuations = false, excludeEffectTypes = [] }) {
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);
           // Idle claims return empty; tracing their full SQL on every poll overwhelms useful traces.
@@ -534,7 +571,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             WHERE effect_id = (
               SELECT candidate.effect_id
               FROM orchestration_v2_effect_outbox AS candidate
-              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations)}
+              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations, excludeEffectTypes)}
                 AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
               ORDER BY candidate.available_at ASC, candidate.created_at ASC, candidate.effect_id ASC
               LIMIT 1
@@ -549,29 +586,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "claim", cause })),
       ),
-      nextClaimableAt: Effect.gen(function* () {
-        const rows = yield* sql<{ readonly available_at: string | null }>`
-          SELECT MIN(candidate.available_at) AS available_at
-          FROM orchestration_v2_effect_outbox AS candidate
-          WHERE ${claimableCandidatePredicate()}
-        `.pipe(NodeSqliteClient.readOnly, Effect.withTracerEnabled(false));
-        const availableAt = rows[0]?.available_at;
-        if (availableAt === undefined || availableAt === null) return Option.none();
-        const parsed = DateTime.make(availableAt);
-        if (Option.isNone(parsed)) {
-          return yield* new EffectOutboxError({
-            operation: "next-claimable",
-            cause: `Invalid available_at timestamp: ${availableAt}`,
-          });
-        }
-        return parsed;
-      }).pipe(
-        Effect.mapError((cause) =>
-          isEffectOutboxError(cause)
-            ? cause
-            : new EffectOutboxError({ operation: "next-claimable", cause }),
-        ),
-      ),
+      nextClaimableAt: nextClaimableAtFor([]),
+      nextClaimableAtExcluding: nextClaimableAtFor,
       succeed: Effect.fn("EffectOutbox.succeed")(
         function* ({ effectId, workerId }) {
           const now = DateTime.formatIso(yield* DateTime.now);

@@ -1,6 +1,8 @@
 import { assert, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
@@ -279,6 +281,131 @@ it.effect("stops sampling when expired slots leave the open gate nothing to act 
   }),
 );
 
+it.effect("keeps counting a slot through the longest ordinary turn start", () =>
+  Effect.gen(function* () {
+    const { admission } = yield* makeHarness(2);
+    const first = yield* reserve(admission);
+    const second = yield* reserve(admission);
+    // Production turn starts average about 92 s: their slow tail must not expire the slot, or
+    // the gate would drift back towards the worker count under exactly the load it is for.
+    yield* TestClock.adjust("5 minutes");
+    assert.deepEqual(yield* admission.excludedTypes, EffectAdmission.GATED_EFFECT_TYPES);
+    assert.equal((yield* admission.state).inFlight, 2);
+    yield* first!.release;
+    yield* second!.release;
+  }),
+);
+
+it.effect("arms one sampler when reserves race while the source is being acquired", () =>
+  Effect.gen(function* () {
+    const acquired = yield* Ref.make(0);
+    const acquiring = yield* Deferred.make<void>();
+    const admission = yield* EffectAdmission.make({
+      workers: 4,
+      closeAbove: 40,
+      samplesToSwitch: 2,
+      sampleInterval: Duration.seconds(1),
+      pressure: Effect.acquireRelease(
+        Deferred.await(acquiring).pipe(
+          Effect.andThen(Ref.update(acquired, (count) => count + 1)),
+          Effect.as(Effect.succeed(5)),
+        ),
+        () => Effect.void,
+      ),
+      onAllowanceRestored: Effect.void,
+      onSlotFreed: Effect.void,
+    });
+    const first = yield* reserve(admission);
+    // The second reserve arms the sampler and waits for the source; the third must not arm another.
+    const second = yield* Effect.forkChild(admission.reserve);
+    yield* Effect.yieldNow;
+    const third = yield* reserve(admission);
+    assert.isTrue(yield* sampling(admission));
+    yield* Deferred.succeed(acquiring, undefined);
+    const secondSlot = Option.getOrUndefined(yield* Fiber.join(second));
+    assert.equal(yield* Ref.get(acquired), 1);
+    assert.isTrue(yield* sampling(admission));
+    yield* first!.release;
+    yield* secondSlot!.release;
+    yield* third!.release;
+    assert.isFalse(yield* sampling(admission));
+  }),
+);
+
+it.effect("lets a stop requested during the reopening sample wait for its wake-up", () =>
+  Effect.gen(function* () {
+    const pressure = yield* Ref.make(60);
+    const restored = yield* Ref.make(0);
+    const released = yield* Ref.make(0);
+    const unblock = yield* Deferred.make<void>();
+    const admission = yield* EffectAdmission.make({
+      workers: 4,
+      closeAbove: 40,
+      samplesToSwitch: 2,
+      sampleInterval: Duration.seconds(1),
+      pressure: Effect.acquireRelease(Effect.succeed(Ref.get(pressure)), () =>
+        Ref.update(released, (count) => count + 1),
+      ),
+      // The wake-up takes a while: the window in which a worker may ask the sampler to stop.
+      onAllowanceRestored: Deferred.await(unblock).pipe(
+        Effect.andThen(Ref.update(restored, (count) => count + 1)),
+      ),
+      onSlotFreed: Effect.void,
+    });
+    const first = yield* reserve(admission);
+    const second = yield* reserve(admission);
+    yield* TestClock.adjust("2 seconds");
+    assert.isTrue((yield* admission.state).saturated);
+    yield* first!.release;
+    yield* second!.release;
+    yield* Ref.set(pressure, 5);
+    yield* TestClock.adjust("2 seconds");
+    // The gate has reopened and the sampler sits in the wake-up; nothing is in flight, so a
+    // worker consulting the gate now asks the sampler to stop. The wake-up must still arrive.
+    assert.isFalse((yield* admission.state).saturated);
+    const stopping = yield* Effect.forkChild(admission.excludedTypes);
+    yield* Effect.yieldNow;
+    yield* Deferred.succeed(unblock, undefined);
+    yield* Fiber.join(stopping);
+    assert.equal(yield* Ref.get(restored), 1);
+    assert.deepEqual(yield* admission.state, {
+      allowed: 4,
+      inFlight: 0,
+      saturated: false,
+      sampling: false,
+    });
+    assert.equal(yield* Ref.get(released), 1);
+  }),
+);
+
+it.effect("starts its sample counts afresh after it stops", () =>
+  Effect.gen(function* () {
+    const { admission, pressure } = yield* makeHarness(4);
+    yield* Ref.set(pressure, 60);
+    const first = yield* reserve(admission);
+    const second = yield* reserve(admission);
+    // One saturated sample, then nothing in flight: the sampler stops.
+    yield* TestClock.adjust("1 second");
+    yield* first!.release;
+    yield* second!.release;
+    assert.isFalse(yield* sampling(admission));
+    // One saturated sample after re-arming is not two in a row.
+    const third = yield* reserve(admission);
+    const fourth = yield* reserve(admission);
+    yield* TestClock.adjust("1 second");
+    assert.deepEqual(yield* admission.state, {
+      allowed: 4,
+      inFlight: 2,
+      saturated: false,
+      sampling: true,
+    });
+    yield* TestClock.adjust("1 second");
+    assert.isTrue((yield* admission.state).saturated);
+    yield* third!.release;
+    yield* fourth!.release;
+  }),
+);
+
 it.effect("recovers from saturation at a small mark too", () =>
   Effect.gen(function* () {
     const { admission, pressure, restored } = yield* makeHarness(4, 5);
@@ -318,6 +445,6 @@ it.effect("sizes the saturated allowance, the reopen mark and the pressure readi
     assert.equal(EffectAdmission.latencyPressure(0, 200), 200);
     assert.equal(EffectAdmission.latencyPressure(45, 3), 45);
     assert.equal(EffectAdmission.latencyPressure(Number.NaN, -2), 0);
-    assert.equal(Duration.toMillis(EffectAdmission.SLOT_MAX_HOLD), 120_000);
+    assert.equal(Duration.toMillis(EffectAdmission.SLOT_MAX_HOLD), 600_000);
   }),
 );

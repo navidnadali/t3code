@@ -70,7 +70,8 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
   #pendingKill: NodeJS.Signals | undefined;
   #exited = false;
   #closed = false;
-  #openOutputs = 0;
+  /** Outputs not closed yet: close follows exit once none is left, however each closed. */
+  readonly #openOutputs = new Set<NodeStream.PassThrough>();
   readonly #held: Array<NodeNet.Socket> = [];
   #host: HandoffHost | undefined;
 
@@ -92,9 +93,10 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     );
     for (const [fd, stream] of this.stdio.entries()) {
       if (stream === null || fd === 0) continue;
-      this.#openOutputs += 1;
-      stream.once("end", () => {
-        this.#openOutputs -= 1;
+      // Ended, destroyed or errored: each closes once, as a Node child's output does.
+      this.#openOutputs.add(stream);
+      stream.once("close", () => {
+        this.#openOutputs.delete(stream);
         this.#maybeClose();
       });
     }
@@ -162,14 +164,8 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
         socket.unref();
         socket.on("error", () => {});
         this.#held.push(socket);
-      } else if (fd === 0) {
-        socket.on("error", (error) => stream.destroy(error));
-        socket.once("close", () => stream.destroy());
-        stream.pipe(socket);
       } else {
-        socket.on("error", (error) => stream.destroy(error));
-        socket.pipe(stream);
-        socket.resume();
+        this.#connect(fd, stream, socket);
       }
     }
     child.exitListeners.add((code, signal) => this.#exit(code, signal));
@@ -192,22 +188,45 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     }
     this.#direct = child;
     this.pid = child.pid;
-    // Its pipes' failures and closing reach the streams the SDK holds, as with a handed-off one.
     for (const [fd, stream] of this.stdio.entries()) {
       const pipe = child.stdio[fd];
       if (stream === null || pipe === null || pipe === undefined) continue;
-      pipe.on("error", (error) => stream.destroy(error));
-      if (fd === 0) {
-        pipe.once("close", () => stream.destroy());
-        stream.pipe(pipe as NodeStream.Writable);
-      } else {
-        (pipe as NodeStream.Readable).pipe(stream);
-      }
+      this.#connect(fd, stream, pipe);
     }
     child.on("spawn", () => this.emit("spawn"));
     child.on("error", (error) => this.#fail(error));
     child.on("exit", (code, signal) => this.#exit(code, signal));
     if (this.#pendingKill !== undefined) child.kill(this.#pendingKill);
+  }
+
+  /**
+   * A stdio stream joined both ways to its descriptor (handed-off socket or Node's pipe), as a Node
+   * child's stream is that descriptor: its failures and closing reach the SDK's stream, and the SDK
+   * destroying the stream closes the descriptor (the provider sees end of input or a closed pipe).
+   */
+  #connect(
+    fd: number,
+    stream: NodeStream.PassThrough,
+    end: NodeStream.Readable | NodeStream.Writable,
+  ) {
+    end.on("error", (error) => stream.destroy(error));
+    if (fd === 0) {
+      const input = end as NodeStream.Writable;
+      // Destroyed before its end: what it held is discarded and the descriptor closes.
+      const abandon = () => {
+        if (!stream.readableEnded) input.destroy();
+      };
+      if (stream.destroyed) return abandon();
+      input.once("close", () => stream.destroy());
+      stream.once("close", abandon);
+      stream.pipe(input);
+      return;
+    }
+    const output = end as NodeStream.Readable;
+    if (stream.destroyed) return void output.destroy();
+    stream.once("close", () => output.destroy());
+    output.pipe(stream);
+    output.resume();
   }
 
   #fail(error: Error) {
@@ -219,7 +238,7 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
       const errno = (error as NodeJS.ErrnoException).errno;
       if (typeof errno === "number" && errno < 0) this.exitCode = errno;
       for (const stream of this.stdio) stream?.destroy();
-      this.#openOutputs = 0;
+      this.#openOutputs.clear();
       this.#maybeClose();
     }
   }
@@ -242,7 +261,7 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
   }
 
   #maybeClose() {
-    if (this.#closed || !this.#exited || this.#openOutputs > 0) return;
+    if (this.#closed || !this.#exited || this.#openOutputs.size > 0) return;
     this.#closed = true;
     // Its output has ended: the server's ends of its descriptors close with it.
     for (const socket of this.#child?.sockets.values() ?? []) socket.destroy();

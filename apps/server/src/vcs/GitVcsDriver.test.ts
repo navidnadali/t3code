@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - the fallback-log race hooks must change files synchronously inside a command.
 import * as NodeFS from "node:fs";
+import * as NodeZlib from "node:zlib";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -2857,5 +2858,138 @@ it.effect.skipIf(!symlinksSupported)(
       const answers = [yield* probe(h.warm, worktrees.warm), yield* probe(h.warm, worktrees.warm)];
       assert.deepStrictEqual(answers, [false, false]);
       assert.isFalse(yield* probe(cold, worktrees.cold));
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+// A loose object as git stores it, at the path git would read it from, whatever its hash is.
+const plantLooseObject = (objectsDir: string, oid: string, body: Buffer) => {
+  const object = Buffer.concat([Buffer.from(`commit ${body.length}\0`), body]);
+  NodeFS.mkdirSync(NodePath_join(objectsDir, oid.slice(0, 2)), { recursive: true });
+  NodeFS.writeFileSync(
+    NodePath_join(objectsDir, oid.slice(0, 2), oid.slice(2)),
+    NodeZlib.deflateSync(object, { level: 9 }),
+  );
+};
+const NodePath_join = (...parts: ReadonlyArray<string>) => parts.join("/");
+
+const makeObjectStoreFixture = Effect.fn("test.makeObjectStoreFixture")(function* (
+  prefix: string,
+  initArgs: ReadonlyArray<string> = [],
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const driver = yield* GitVcsDriver.makeVcsDriverShape();
+  const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix });
+  const git = (args: ReadonlyArray<string>) =>
+    driver
+      .execute({
+        operation: "object-store-test",
+        cwd,
+        args,
+        env: FIXED_COMMIT_ENV,
+        allowNonZeroExit: true,
+      })
+      .pipe(Effect.map((result) => ({ ok: result.exitCode === 0, out: result.stdout.trim() })));
+  const init = yield* git(["init", "-q", "-b", "main", ...initArgs]);
+  if (!init.ok) return null;
+  yield* git(["config", "user.name", "Test"]);
+  yield* git(["config", "user.email", "test@test.com"]);
+  yield* fileSystem.writeFileString(path.join(cwd, "file.txt"), "initial\n");
+  yield* git(["add", "."]);
+  yield* git(["commit", "-q", "-m", "initial"]);
+  const head = (yield* git(["rev-parse", "HEAD"])).out;
+  const commonDir = path.join(cwd, ".git");
+  const objectsDir = path.join(commonDir, "objects");
+  const facts = (yield* git(["log", "-1", "--format=%T %P %ct", head])).out;
+  return { cwd, git, head, commonDir, objectsDir, repository: { commonDir, objectsDir }, facts };
+});
+
+it.effect("an oversized loose object is left to git", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeObjectStoreFixture("t3-loose-oversized-");
+    assert.isNotNull(fixture);
+    const memory = makeCheckpointRefMemory();
+    // A few KiB on disk that inflate far past any commit object.
+    const bomb = "d".repeat(40);
+    plantLooseObject(
+      fixture!.objectsDir,
+      bomb,
+      Buffer.concat([
+        Buffer.from(
+          `tree ${"b".repeat(40)}\nauthor x <x> 1 +0000\ncommitter x <x> 1700000000 +0000\n\n`,
+        ),
+        Buffer.alloc(64 * 1024 * 1024, 0x61),
+      ]),
+    );
+    assert.isNull(yield* memory.commitFacts(fixture!.repository, bomb));
+    assert.isNull(yield* memory.commitFacts(fixture!.repository, bomb));
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect.each(["sha1", "sha256"] as const)(
+  "a forged loose object is rejected in a %s repository",
+  (format) =>
+    Effect.gen(function* () {
+      const fixture = yield* makeObjectStoreFixture(`t3-loose-forged-${format}-`, [
+        `--object-format=${format}`,
+      ]);
+      // Git before 2.29 cannot create a sha256 repository.
+      if (fixture === null) return;
+      const memory = makeCheckpointRefMemory();
+      const width = format === "sha1" ? 40 : 64;
+      // The real commit reads back as git log prints it.
+      const [tree, parents, time] = [
+        fixture.facts.split(" ")[0]!,
+        [],
+        fixture.facts.split(" ").at(-1)!,
+      ];
+      assert.deepStrictEqual(yield* memory.commitFacts(fixture.repository, fixture.head), {
+        tree,
+        parents,
+        committerTime: time,
+      });
+      // A planted object at another id's path is not that object.
+      const forged = "a".repeat(width);
+      plantLooseObject(
+        fixture.objectsDir,
+        forged,
+        Buffer.from(
+          `tree ${"b".repeat(width)}\nparent ${"c".repeat(width)}\nauthor x <x> 1 +0000\ncommitter x <x> 1700000000 +0000\n\nforged\n`,
+        ),
+      );
+      assert.isNull(yield* memory.commitFacts(fixture.repository, forged));
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect(
+  "a mismatching loose object is not remembered, and the real one is read once restored",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeObjectStoreFixture("t3-loose-mismatch-");
+      assert.isNotNull(fixture);
+      const memory = makeCheckpointRefMemory();
+      const file = NodePath_join(
+        fixture!.objectsDir,
+        fixture!.head.slice(0, 2),
+        fixture!.head.slice(2),
+      );
+      const real = NodeFS.readFileSync(file);
+      // The commit's object replaced by another valid commit: git calls it corrupt, so no facts.
+      plantLooseObject(
+        fixture!.objectsDir,
+        fixture!.head,
+        Buffer.from(
+          `tree ${"b".repeat(40)}\nauthor x <x> 1 +0000\ncommitter x <x> 1700000000 +0000\n\nforged\n`,
+        ),
+      );
+      assert.isNull(yield* memory.commitFacts(fixture!.repository, fixture!.head));
+      assert.isNull(yield* memory.commitFacts(fixture!.repository, fixture!.head));
+      NodeFS.writeFileSync(file, real);
+      const [tree, time] = [fixture!.facts.split(" ")[0]!, fixture!.facts.split(" ").at(-1)!];
+      assert.deepStrictEqual(yield* memory.commitFacts(fixture!.repository, fixture!.head), {
+        tree,
+        parents: [],
+        committerTime: time,
+      });
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

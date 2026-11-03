@@ -49,6 +49,8 @@ const replyHold = vi.hoisted(() => ({
   held: [] as Array<() => void>,
   waiters: [] as Array<() => void>,
 }));
+// Makes every reader announce itself without a statement authorizer.
+const readyRewrite = vi.hoisted(() => ({ unguarded: false }));
 // Resolves a waiter when a request whose SQL mentions its needle is posted to a worker.
 const postWaiters = vi.hoisted(() => [] as Array<{ needle: string; resolve: () => void }>);
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
@@ -102,6 +104,8 @@ vi.mock("node:worker_threads", async (importOriginal) => {
     }
     override emit(event: string | symbol, ...args: Array<any>): boolean {
       const reply = args[0];
+      if (event === "message" && readyRewrite.unguarded && reply?.type === "ready")
+        return super.emit(event, { ...reply, guarded: false });
       if (
         event === "message" &&
         typeof reply === "object" &&
@@ -1932,6 +1936,58 @@ it.effect("keeps a reader from turning its writes back on", () =>
       }),
     { readerPoolSize: 1 },
   ),
+);
+
+it.effect("refuses what the read-only open does not, whatever the spelling or the database", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        yield* sql.unsafe("PRAGMA QUERY_ONLY = OFF").pipe(SqliteClient.readOnly, Effect.ignore);
+        const write = yield* sql
+          .unsafe("CREATE TEMP TABLE scratch(x)")
+          .pipe(SqliteClient.readOnly, Effect.flip);
+        assert.match(String(write.reason.cause), /readonly|query_only|read-only|not authorized/i);
+        const attach = yield* sql
+          .unsafe("ATTACH DATABASE 'file:extra?mode=memory' AS extra")
+          .pipe(SqliteClient.readOnly, Effect.flip);
+        assert.include(String(attach.reason.cause), "not authorized");
+        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+      }),
+    { readerPoolSize: 1 },
+  ),
+);
+
+it.effect("awaits a read transaction's ending on a reader without an authorizer", () =>
+  Effect.gen(function* () {
+    readyRewrite.unguarded = true;
+    commitHold.on = true;
+    try {
+      yield* withReaderClient((sql) =>
+        Effect.gen(function* () {
+          const committing = posting("COMMIT");
+          const fiber = yield* sql
+            .withTransaction(countEntries(sql))
+            .pipe(SqliteClient.readOnly, (effect) =>
+              Effect.forkChild(effect, { startImmediately: true }),
+            );
+          yield* committing;
+          yield* eventLoopTurn;
+          // Without an authorizer a write could have happened, so the ending's answer is waited for.
+          assert.isUndefined(fiber.pollUnsafe(), "ended before the COMMIT was answered");
+          for (const release of commitHold.held.splice(0)) release();
+          assert.equal(yield* Fiber.join(fiber), 1);
+          assert.equal(
+            yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly),
+            1,
+          );
+        }),
+      );
+    } finally {
+      readyRewrite.unguarded = false;
+      commitHold.on = false;
+      for (const release of commitHold.held.splice(0)) release();
+    }
+  }),
 );
 
 it.effect("lets a process exit cleanly after a one-shot read transaction", () =>

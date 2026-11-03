@@ -253,13 +253,17 @@ read or write them.
 
 Each provider starts as a small shim, the spawner executable itself (`t3-process-spawner
 __exec-after-go`, or the server's Node with the shim's script outside single executables), with an
-empty environment, so nothing of the provider's own (`NODE_OPTIONS` included) applies to it. The shim
+environment holding only `ELECTRON_RUN_AS_NODE=1`, so nothing of the provider's own (`NODE_OPTIONS`
+included) applies to it. The shim
 waits until the server holds every end, then receives the file, argv and environment on descriptor 3
 and becomes the provider with `execve`: same PID and process group, exactly its environment,
 descriptor 3 closed, and SIGPIPE and SIGXFSZ at their defaults, as after Node's spawn. The
 environment is never on any process's argv (`/proc/<pid>/cmdline`, which every user can read). Each
 shim costs about 8 MiB of private memory and 10–20 ms of CPU, outside the server, until it becomes the
-provider. A single executable without `t3-process-spawner` beside it hands off nothing, since its
+provider. The spawner runs at most one shim per core at a time; further starts in a burst (sessions
+resuming after a restart) wait in the spawner before their shim exists, so 1,000 simultaneous starts
+hold about 150 MiB of shims rather than 8.6 GiB, and are all handed off in 12–14 s on 16 cores (the
+channel passes one descriptor at a time, about 75 starts a second). A single executable without `t3-process-spawner` beside it hands off nothing, since its
 shim would load the whole server bundle.
 
 If the spawner process dies, the providers it handed off keep running in their own process groups,

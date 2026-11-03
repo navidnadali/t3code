@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as CompactionScratch from "./CompactionScratch.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -30,14 +31,29 @@ export class ProjectionMaintenanceError extends Schema.TaggedError<ProjectionMai
   },
 ) {}
 
+export interface CompactEventStoreOptions {
+  /**
+   * File for the pass's working set (every keyed entity's oldest candidate so far), replaced at
+   * every pass start and removed at its end; in memory when absent. Nothing in it outlives a pass.
+   */
+  readonly scratchPath?: string | undefined;
+}
+
 export interface ProjectionMaintenanceV2Shape {
   readonly verify: Effect.Effect<ProjectionVerificationV2, ProjectionMaintenanceError>;
   readonly rebuild: Effect.Effect<ProjectionVerificationV2, ProjectionMaintenanceError>;
-  readonly compactEventStore: (betweenPages?: Effect.Effect<void>) => Effect.Effect<
+  readonly compactEventStore: (
+    betweenPages?: Effect.Effect<void>,
+    options?: CompactEventStoreOptions,
+  ) => Effect.Effect<
     {
       readonly deletedEventCount: number;
       readonly deletedReceiptCount: number;
       readonly reclaimableBytes: number;
+      /** Keyed entities the pass saw; their state was on disk, not in the JS heap. */
+      readonly trackedKeys: number;
+      /** Present when the disk could not hold the working set: nothing ran, or the pass stopped early. */
+      readonly skipped?: CompactionScratch.CompactionSkipped | undefined;
     },
     ProjectionMaintenanceError
   >;
@@ -56,6 +72,14 @@ type ProjectionMetadataRow = {
 const encodeEntityKey = Schema.encodeSync(
   Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String, Schema.NullOr(Schema.String)])),
 );
+
+const scratchBoundary = <A, R>(
+  effect: Effect.Effect<A, CompactionScratch.CompactionScratchError, R>,
+) =>
+  Effect.mapError(
+    effect,
+    (cause) => new ProjectionMaintenanceError({ operation: "compaction scratch store", cause }),
+  );
 
 export const layer: Layer.Layer<
   ProjectionMaintenanceV2,
@@ -267,39 +291,100 @@ export const layer: Layer.Layer<
     // Commanded turn items stay for command-result replay.
     // Small pages bound work on the reader worker and synchronous fallback.
     const COMPACTION_PAGE_SIZE = 50;
+    // Pages between looks at the disk's free space while a pass runs (≈ 200 KB of scratch growth).
+    const SPACE_CHECK_PAGES = 16;
 
     // Keep first/latest keyed events for replay order; page every event to bound sparse scans.
-    const compactEventStore = Effect.fn("ProjectionMaintenance.compactEventStore")(function* (
-      betweenPages: Effect.Effect<void> = Effect.void,
-    ) {
-      const bounds = yield* sql<{
-        readonly event_sequence: number;
-        readonly receipt_row_id: number;
-      }>`
+    const compactEventStore = Effect.fn("ProjectionMaintenance.compactEventStore")(
+      function* (
+        betweenPages: Effect.Effect<void> = Effect.void,
+        options?: CompactEventStoreOptions,
+      ) {
+        const bounds = yield* sql<{
+          readonly event_sequence: number;
+          readonly receipt_row_id: number;
+        }>`
         SELECT
           COALESCE((SELECT MAX(sequence) FROM orchestration_events), 0) AS event_sequence,
           COALESCE((SELECT MAX(rowid) FROM orchestration_command_receipts), 0) AS receipt_row_id
-      `.pipe(NodeSqliteClient.readOnly);
-      let throughSequence = bounds[0]?.event_sequence ?? 0;
-      let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
-      const retainedThreadIds = new Set<string>();
-      const retainedReadStateThreadIds = new Set<string>();
-      const retainedTagThreadIds = new Set<string>();
-      // Retain each key's oldest candidate, deleting it only when an older event appears.
-      const oldestCandidateByEntityKey = new Map<string, number | null>();
-      let deletedEventCount = 0;
-      let deletedReceiptCount = 0;
+      `.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.historyRead);
+        let throughSequence = bounds[0]?.event_sequence ?? 0;
+        let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
+        const scratchPath = options?.scratchPath;
+        // What a previous pass left behind is removed first, so it never counts against the free space.
+        if (scratchPath !== undefined)
+          yield* scratchBoundary(CompactionScratch.prepare(scratchPath));
+        // Never fill the disk: the scratch store beside the database needs room for every key, and a
+        // running pass stops when the disk gets low whatever the estimate said.
+        // Before the pass the disk must hold the estimate and the floor a running pass insists on;
+        // what a stop reports as required is what stopped it.
+        const sequenceBound = throughSequence;
+        const requiredBefore = Math.max(
+          CompactionScratch.requiredFreeBytes(sequenceBound),
+          CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR,
+        );
+        const skippedFor = (stage: "before" | "during", freeBytes: number) =>
+          scratchPath === undefined
+            ? undefined
+            : {
+                scratchPath,
+                requiredBytes:
+                  stage === "before"
+                    ? requiredBefore
+                    : CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR,
+                freeBytes,
+                stage,
+              };
+        const skipped = (stage: "before" | "during", freeBytes: number) =>
+          Effect.logWarning(
+            `Compaction ${stage === "before" ? "skipped" : "stopped early"}: not enough free space beside the database for its scratch store`,
+            { ...skippedFor(stage, freeBytes), sequenceBound },
+          );
+        if (scratchPath !== undefined) {
+          const freeBytes = yield* CompactionScratch.freeBytesBeside(scratchPath);
+          if (freeBytes !== undefined && freeBytes < requiredBefore) {
+            yield* skipped("before", freeBytes);
+            return {
+              deletedEventCount: 0,
+              deletedReceiptCount: 0,
+              reclaimableBytes: 0,
+              trackedKeys: 0,
+              skipped: skippedFor("before", freeBytes),
+            };
+          }
+        }
+        let stoppedEarly: CompactionScratch.CompactionSkipped | undefined;
+        // One entry per thread; the per-entity working set is in the scratch store's worker.
+        const retainedThreadIds = new Set<string>();
+        const retainedReadStateThreadIds = new Set<string>();
+        const retainedTagThreadIds = new Set<string>();
+        const scratch = yield* scratchBoundary(CompactionScratch.open(scratchPath));
+        let deletedEventCount = 0;
+        let deletedReceiptCount = 0;
+        let trackedKeys = 0;
+        let pagesSinceSpaceCheck = 0;
 
-      while (throughSequence > 0) {
-        const rows = yield* sql<{
-          readonly sequence: number;
-          readonly application_event_version: number;
-          readonly aggregate_kind: string;
-          readonly stream_id: string;
-          readonly event_type: string;
-          readonly entity_id: string | null;
-          readonly imported_legacy_thread: number;
-        }>`
+        while (throughSequence > 0) {
+          if (scratchPath !== undefined && pagesSinceSpaceCheck++ % SPACE_CHECK_PAGES === 0) {
+            const freeBytes = yield* CompactionScratch.freeBytesBeside(scratchPath);
+            if (
+              freeBytes !== undefined &&
+              freeBytes < CompactionScratch.SCRATCH_RUNNING_FREE_SPACE_FLOOR
+            ) {
+              yield* skipped("during", freeBytes);
+              stoppedEarly = skippedFor("during", freeBytes);
+              break;
+            }
+          }
+          const rows = yield* sql<{
+            readonly sequence: number;
+            readonly application_event_version: number;
+            readonly aggregate_kind: string;
+            readonly stream_id: string;
+            readonly event_type: string;
+            readonly entity_id: string | null;
+            readonly imported_legacy_thread: number;
+          }>`
           SELECT
             event.sequence,
             event.application_event_version,
@@ -335,76 +420,103 @@ export const layer: Layer.Layer<
           WHERE event.sequence <= ${throughSequence}
           ORDER BY event.sequence DESC
           LIMIT ${COMPACTION_PAGE_SIZE + 1}
-        `.pipe(NodeSqliteClient.readOnly);
-        const page = rows.slice(0, COMPACTION_PAGE_SIZE);
-        const obsolete: number[] = [];
-        for (const row of page) {
-          if (row.imported_legacy_thread === 1) {
-            obsolete.push(row.sequence);
-          } else if (row.application_event_version === 2) {
-            if (
-              row.aggregate_kind === "thread" &&
-              supersedableThreadEventTypes.has(row.event_type)
-            ) {
-              if (retainedThreadIds.has(row.stream_id)) obsolete.push(row.sequence);
-              else retainedThreadIds.add(row.stream_id);
-            } else if (
-              row.aggregate_kind === "thread" &&
-              readStateThreadEventTypes.has(row.event_type)
-            ) {
-              if (
-                retainedThreadIds.has(row.stream_id) ||
-                retainedReadStateThreadIds.has(row.stream_id)
-              ) {
-                obsolete.push(row.sequence);
-              } else retainedReadStateThreadIds.add(row.stream_id);
-            } else if (
-              row.aggregate_kind === "thread" &&
-              row.event_type === TAG_THREAD_EVENT_TYPE
-            ) {
-              if (retainedThreadIds.has(row.stream_id) || retainedTagThreadIds.has(row.stream_id)) {
-                obsolete.push(row.sequence);
-              } else retainedTagThreadIds.add(row.stream_id);
-            } else if (
-              row.event_type === "thread.pull-request-link-updated" &&
-              retainedThreadIds.has(row.stream_id)
-            ) {
-              // A newer whole-thread payload already carries this link's state.
-              obsolete.push(row.sequence);
-            } else if (
-              row.event_type === "thread.pull-request-link-updated" ||
+        `.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.historyRead);
+          // Background bulk reads take the history class: last in line and capped, so a pass never
+          // competes with a client's small or page reads for a reader worker.
+          const page = rows.slice(0, COMPACTION_PAGE_SIZE);
+          const obsolete: number[] = [];
+          // Retain each key's oldest candidate, deleting it only when an older event appears. The
+          // page's keys are read from the scratch store at once and its decisions written back at once.
+          const keyOf = (row: (typeof page)[number]) =>
+            row.application_event_version === 2 &&
+            (row.event_type === "thread.pull-request-link-updated" ||
               row.event_type === "message.updated" ||
               row.event_type === "node.updated" ||
-              (row.event_type === "turn-item.updated" && row.entity_id !== null)
-            ) {
-              const key = encodeEntityKey([row.event_type, row.stream_id, row.entity_id]);
-              const candidate = oldestCandidateByEntityKey.get(key);
-              if (candidate === undefined) oldestCandidateByEntityKey.set(key, null);
-              else {
-                if (candidate !== null) obsolete.push(candidate);
-                oldestCandidateByEntityKey.set(key, row.sequence);
+              (row.event_type === "turn-item.updated" && row.entity_id !== null))
+              ? encodeEntityKey([row.event_type, row.stream_id, row.entity_id])
+              : undefined;
+          const keys = page.map(keyOf);
+          const oldestCandidateByEntityKey = yield* scratchBoundary(
+            scratch.lookup(keys.filter((key) => key !== undefined)),
+          );
+          const changes = new Map<string, number | null>();
+          for (const [index, row] of page.entries()) {
+            if (row.imported_legacy_thread === 1) {
+              obsolete.push(row.sequence);
+            } else if (row.application_event_version === 2) {
+              if (
+                row.aggregate_kind === "thread" &&
+                supersedableThreadEventTypes.has(row.event_type)
+              ) {
+                if (retainedThreadIds.has(row.stream_id)) obsolete.push(row.sequence);
+                else retainedThreadIds.add(row.stream_id);
+              } else if (
+                row.aggregate_kind === "thread" &&
+                readStateThreadEventTypes.has(row.event_type)
+              ) {
+                if (
+                  retainedThreadIds.has(row.stream_id) ||
+                  retainedReadStateThreadIds.has(row.stream_id)
+                ) {
+                  obsolete.push(row.sequence);
+                } else retainedReadStateThreadIds.add(row.stream_id);
+              } else if (
+                row.aggregate_kind === "thread" &&
+                row.event_type === TAG_THREAD_EVENT_TYPE
+              ) {
+                if (
+                  retainedThreadIds.has(row.stream_id) ||
+                  retainedTagThreadIds.has(row.stream_id)
+                ) {
+                  obsolete.push(row.sequence);
+                } else retainedTagThreadIds.add(row.stream_id);
+              } else if (
+                row.event_type === "thread.pull-request-link-updated" &&
+                retainedThreadIds.has(row.stream_id)
+              ) {
+                // A newer whole-thread payload already carries this link's state.
+                obsolete.push(row.sequence);
+              } else if (
+                row.event_type === "thread.pull-request-link-updated" ||
+                row.event_type === "message.updated" ||
+                row.event_type === "node.updated" ||
+                (row.event_type === "turn-item.updated" && row.entity_id !== null)
+              ) {
+                const key = keys[index]!;
+                const candidate = oldestCandidateByEntityKey.get(key);
+                let next: number | null;
+                if (candidate === undefined) {
+                  next = null;
+                  trackedKeys += 1;
+                } else {
+                  if (candidate !== null) obsolete.push(candidate);
+                  next = row.sequence;
+                }
+                oldestCandidateByEntityKey.set(key, next);
+                changes.set(key, next);
               }
             }
           }
-        }
-        // Never hold a transaction or the reader lock across a yield or a rest.
-        yield* Effect.yieldNow;
-        if (obsolete.length > 0) {
-          yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
-          deletedEventCount += obsolete.length;
+          yield* scratchBoundary(scratch.upsert([...changes]));
+          // Never hold a transaction or the reader lock across a yield or a rest.
           yield* Effect.yieldNow;
+          if (obsolete.length > 0) {
+            yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
+            deletedEventCount += obsolete.length;
+            yield* Effect.yieldNow;
+          }
+          throughSequence =
+            rows.length <= COMPACTION_PAGE_SIZE ? 0 : (page.at(-1)?.sequence ?? 1) - 1;
+          if (throughSequence > 0 || throughReceiptRowId > 0) yield* betweenPages;
         }
-        throughSequence =
-          rows.length <= COMPACTION_PAGE_SIZE ? 0 : (page.at(-1)?.sequence ?? 1) - 1;
-        if (throughSequence > 0 || throughReceiptRowId > 0) yield* betweenPages;
-      }
 
-      while (throughReceiptRowId > 0) {
-        const rows = yield* sql<{
-          readonly row_id: number;
-          readonly command_id: string;
-          readonly imported_legacy_thread: number;
-        }>`
+        if (stoppedEarly !== undefined) throughReceiptRowId = 0;
+        while (throughReceiptRowId > 0) {
+          const rows = yield* sql<{
+            readonly row_id: number;
+            readonly command_id: string;
+            readonly imported_legacy_thread: number;
+          }>`
           SELECT
             receipt.rowid AS row_id,
             receipt.command_id,
@@ -421,29 +533,40 @@ export const layer: Layer.Layer<
           WHERE receipt.rowid <= ${throughReceiptRowId}
           ORDER BY receipt.rowid DESC
           LIMIT ${COMPACTION_PAGE_SIZE + 1}
-        `.pipe(NodeSqliteClient.readOnly);
-        const page = rows.slice(0, COMPACTION_PAGE_SIZE);
-        const obsolete = page
-          .filter((row) => row.imported_legacy_thread === 1)
-          .map((row) => row.command_id);
-        yield* Effect.yieldNow;
-        if (obsolete.length > 0) {
-          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id IN ${sql.in(obsolete)}`;
-          deletedReceiptCount += obsolete.length;
+        `.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.historyRead);
+          const page = rows.slice(0, COMPACTION_PAGE_SIZE);
+          const obsolete = page
+            .filter((row) => row.imported_legacy_thread === 1)
+            .map((row) => row.command_id);
           yield* Effect.yieldNow;
+          if (obsolete.length > 0) {
+            yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id IN ${sql.in(obsolete)}`;
+            deletedReceiptCount += obsolete.length;
+            yield* Effect.yieldNow;
+          }
+          throughReceiptRowId = (page.at(-1)?.row_id ?? 1) - 1;
+          if (rows.length <= COMPACTION_PAGE_SIZE) break;
+          yield* betweenPages;
         }
-        throughReceiptRowId = (page.at(-1)?.row_id ?? 1) - 1;
-        if (rows.length <= COMPACTION_PAGE_SIZE) break;
-        yield* betweenPages;
-      }
 
-      const freelistRows = yield* sql<{ readonly freelist_count: number }>`PRAGMA freelist_count`;
-      const pageSizeRows = yield* sql<{ readonly page_size: number }>`PRAGMA page_size`;
-      const reclaimableBytes =
-        (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
+        const freelistRows = yield* sql<{ readonly freelist_count: number }>`PRAGMA freelist_count`;
+        const pageSizeRows = yield* sql<{ readonly page_size: number }>`PRAGMA page_size`;
+        const reclaimableBytes =
+          (freelistRows[0]?.freelist_count ?? 0) * (pageSizeRows[0]?.page_size ?? 0);
 
-      return { deletedEventCount, deletedReceiptCount, reclaimableBytes };
-    }, mapError("compact event store"));
+        return stoppedEarly === undefined
+          ? { deletedEventCount, deletedReceiptCount, reclaimableBytes, trackedKeys }
+          : {
+              deletedEventCount,
+              deletedReceiptCount,
+              reclaimableBytes,
+              trackedKeys,
+              skipped: stoppedEarly,
+            };
+      },
+      Effect.scoped,
+      mapError("compact event store"),
+    );
 
     return ProjectionMaintenanceV2.of({
       verify: mapError("verify")(verify),

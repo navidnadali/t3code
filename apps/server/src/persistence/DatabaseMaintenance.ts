@@ -9,6 +9,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { isSqlError } from "effect/sql/SqlError";
 
+import * as CompactionScratch from "../orchestration-v2/CompactionScratch.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
@@ -51,9 +52,24 @@ export class DatabaseInspectError extends Schema.TaggedError<DatabaseInspectErro
   }
 }
 
+/** What a compaction did before a later step failed, so a failure never hides it. */
+const CompactionOutcome = Schema.Struct({
+  deletedEventCount: Schema.Number,
+  deletedReceiptCount: Schema.Number,
+  repairedItemCountThreads: Schema.Number,
+  skipped: Schema.optional(
+    Schema.Struct({
+      scratchPath: Schema.String,
+      requiredBytes: Schema.Number,
+      freeBytes: Schema.Number,
+      stage: Schema.Literals(["before", "during"]),
+    }),
+  ),
+});
+
 export class DatabaseCompactError extends Schema.TaggedError<DatabaseCompactError>()(
   "DatabaseCompactError",
-  { path: Schema.String, cause: Schema.Defect() },
+  { path: Schema.String, cause: Schema.Defect(), compaction: Schema.optional(CompactionOutcome) },
 ) {
   override get message() {
     return "Database compaction failed. Check that no other process has the database open and enough disk space is available.";
@@ -91,6 +107,8 @@ export class DatabaseMaintenance extends Context.Service<
         readonly deletedReceiptCount: number;
         /** Threads whose drifted turn-item counts were recounted before compacting. */
         readonly repairedItemCountThreads: number;
+        /** Present when the disk could not hold the pass's working set. */
+        readonly skipped?: CompactionScratch.CompactionSkipped | undefined;
       },
       | DatabaseMissingError
       | DatabaseInUseError
@@ -107,6 +125,7 @@ export class DatabaseMaintenance extends Context.Service<
 const isDomainError = Schema.is(
   Schema.Union([DatabaseMissingError, DatabaseInUseError, DatabaseProjectionsInvalidError]),
 );
+const isCompactError = Schema.is(DatabaseCompactError);
 
 const readStorage = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -193,16 +212,33 @@ const make = Effect.gen(function* () {
         if (!verification.valid) {
           return yield* new DatabaseProjectionsInvalidError({ path: databasePath });
         }
-        const summary = yield* maintenance.compactEventStore();
-        if (!(yield* maintenance.verify).valid) {
-          return yield* new DatabaseProjectionsInvalidError({ path: databasePath });
-        }
-        // VACUUM is required to enable incremental auto_vacuum on existing databases.
-        yield* sql`PRAGMA auto_vacuum = INCREMENTAL`;
-        yield* sql`VACUUM`;
-        yield* rebuildMessageSearch(sql);
-        yield* sql`PRAGMA wal_checkpoint(TRUNCATE)`;
-        return { ...summary, repairedItemCountThreads };
+        const summary = yield* maintenance.compactEventStore(Effect.void, {
+          scratchPath: path.join(path.dirname(databasePath), "compaction-scratch.sqlite"),
+        });
+        const compaction = {
+          deletedEventCount: summary.deletedEventCount,
+          deletedReceiptCount: summary.deletedReceiptCount,
+          repairedItemCountThreads,
+          ...(summary.skipped === undefined ? {} : { skipped: summary.skipped }),
+        };
+        // What follows can fail on the very disk the compaction ran out of; its outcome travels with the failure.
+        yield* Effect.gen(function* () {
+          if (!(yield* maintenance.verify).valid) {
+            return yield* new DatabaseProjectionsInvalidError({ path: databasePath });
+          }
+          // VACUUM is required to enable incremental auto_vacuum on existing databases.
+          yield* sql`PRAGMA auto_vacuum = INCREMENTAL`;
+          yield* sql`VACUUM`;
+          yield* rebuildMessageSearch(sql);
+          yield* sql`PRAGMA wal_checkpoint(TRUNCATE)`;
+        }).pipe(
+          Effect.mapError((cause) =>
+            isDomainError(cause)
+              ? cause
+              : new DatabaseCompactError({ path: databasePath, cause, compaction }),
+          ),
+        );
+        return compaction;
       }).pipe(
         Effect.provide(
           ProjectionMaintenance.layer.pipe(
@@ -218,12 +254,15 @@ const make = Effect.gen(function* () {
         deletedEventCount: result.deletedEventCount,
         deletedReceiptCount: result.deletedReceiptCount,
         repairedItemCountThreads: result.repairedItemCountThreads,
+        ...(result.skipped === undefined ? {} : { skipped: result.skipped }),
       };
     },
     (effect, databasePath) =>
       effect.pipe(
         Effect.mapError((cause) =>
-          isDomainError(cause) ? cause : new DatabaseCompactError({ path: databasePath, cause }),
+          isDomainError(cause) || isCompactError(cause)
+            ? cause
+            : new DatabaseCompactError({ path: databasePath, cause }),
         ),
       ),
   );

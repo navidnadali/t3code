@@ -341,8 +341,10 @@ const readsSymbolicRef = (file: string) =>
       NodeFS.lstat(file, (statError, stats) => {
         if (statError) return resolve(false);
         if (stats.isSymbolicLink()) return resolve(true);
+        // A file the bounded read cannot classify (too large, not regular) counts as symbolic:
+        // Git may still follow it, so its result is not reused.
         void readBoundedFileAsync(file, 4096).then((read) =>
-          resolve(read.kind === "bytes" && read.bytes.subarray(0, 4).toString("latin1") === "ref:"),
+          resolve(read.kind !== "bytes" || read.bytes.subarray(0, 4).toString("latin1") === "ref:"),
         );
       });
     } catch {

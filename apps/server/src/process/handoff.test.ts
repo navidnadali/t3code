@@ -19,6 +19,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
+import { answerDeadlines } from "./spawnerDeadlines.ts";
 import { isPidReused, isSameProcess } from "./processIdentity.ts";
 import { adoptedProcessIds, spawnerProcessIds } from "./spawnerProcesses.ts";
 import { execAfterGoSource, spawnerProcessSource } from "./spawnerSources.ts";
@@ -755,6 +756,73 @@ describe("provider process hand-off", () => {
       }).pipe(Effect.provideService(HostProcess.ExecutablePath, electron));
       expect(handedOff).toBe(true);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // A burst of starts (a restart resuming every session) costs a bounded number of waiting shims,
+  // and a start waiting its turn is not a start the spawner failed to answer.
+  it.live.skipIf(!linux)(
+    "hands off a burst with a bounded number of shims at once, all in time",
+    () => {
+      const { logs, layer: logLayer } = capturedLogs();
+      return Effect.gen(function* () {
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        // Counts the shims alive at once (the shim's script is on its argv; the spawner's own script
+        // holds it too, and names itself) until stdin closes.
+        const watcher = NodeChildProcess.spawn(
+          process.execPath,
+          [
+            "-e",
+            `const fs = require("node:fs"); let peak = 0, open = true;
+           process.stdin.on("end", () => (open = false)).resume();
+           const scan = () => {
+             let alive = 0;
+             for (const pid of fs.readdirSync("/proc")) {
+               if (!/^\\d+$/.test(pid) || pid === String(process.pid)) continue;
+               try {
+                 const cmdline = fs.readFileSync("/proc/" + pid + "/cmdline", "latin1");
+                 if (cmdline.includes("process.execve") && !cmdline.includes("t3-process-spawner")) alive += 1;
+               } catch {}
+             }
+             peak = Math.max(peak, alive);
+             if (open) setImmediate(scan); else process.stdout.write(String(peak));
+           };
+           scan();`,
+          ],
+          { stdio: ["pipe", "pipe", "ignore"] },
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(() => watcher.kill("SIGKILL")));
+        const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node, {
+          handoffLimit: 4,
+          // Far longer than one start takes, far shorter than the whole burst.
+          timers: answerDeadlines(2_000),
+        });
+        const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        const parents = yield* Effect.forEach(
+          Array.from({ length: 160 }, (_, index) => index),
+          () =>
+            launcher.spawner.string(
+              ChildProcess.make(process.execPath, [
+                "-e",
+                "setTimeout(() => process.stdout.write(String(process.ppid)), 200)",
+              ]),
+            ),
+          { concurrency: "unbounded" },
+        );
+        const peak = yield* Effect.callback<number>((resume) => {
+          let output = "";
+          watcher.stdout!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+          watcher.stdout!.on("end", () => resume(Effect.succeed(Number(output))));
+          watcher.stdin!.end();
+        });
+        expect({
+          handedOff: parents.filter((parent) => Number(parent) !== process.pid).length,
+          failed: logs.filter(({ text }) => text.includes("hand-off failed")).length,
+          // A slot frees as its shim closes descriptor 3, a moment before it becomes the command.
+          withinBound: peak <= 4 + 2,
+          peak,
+        }).toEqual({ handedOff: 160, failed: 0, withinBound: true, peak });
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, logLayer)));
+    },
   );
 
   // The spawner passes each stdio end over its channel and keeps none; the command runs only once

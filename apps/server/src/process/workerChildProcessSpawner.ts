@@ -1725,6 +1725,8 @@ interface ProcessSpawnerOptions {
   readonly source?: string;
   readonly windowBytes?: number;
   readonly timers?: SpawnerTimers;
+  /** Hand-offs the spawner starts at once; the rest wait their turn. */
+  readonly handoffLimit?: number;
 }
 
 export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (

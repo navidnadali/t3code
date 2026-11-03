@@ -554,15 +554,18 @@ const objectRows = (columns: ReadonlyArray<string>, rows: ReadonlyArray<Readonly
 
 // Read-transaction cleanup succeeds after worker exit because it can no longer change anything.
 const withoutComments = (sql: string) => sql.replace(/\/\*[\s\S]*?\*\/|--[^\n]*/g, " ");
-// Exactly SQLite's transaction statements, comments removed. Anything else that starts like one
-// (BEGIN2, BEGIN 1, ROLLBACK TO a savepoint, trailing text) is an ordinary statement for the
-// worker, which answers as SQLite does, and leaves this bookkeeping alone.
+// Only SQLite's exact transaction statements, comments removed, with SQLite's whitespace (not
+// JavaScript's \s, which takes a no-break space or vertical tab SQLite rejects). Anything else that
+// starts like one (BEGIN2, BEGIN 1, ROLLBACK TO a savepoint) is an ordinary statement for the
+// worker, which answers as SQLite does, and leaves the bookkeeping alone.
 const beginsTransaction = (sql: string) =>
-  /^\s*BEGIN(?:\s+(?:DEFERRED|IMMEDIATE|EXCLUSIVE))?(?:\s+TRANSACTION)?\s*;?\s*$/i.test(
+  /^[ \t\n\f\r]*BEGIN(?:[ \t\n\f\r]+(?:DEFERRED|IMMEDIATE|EXCLUSIVE))?(?:[ \t\n\f\r]+TRANSACTION)?[ \t\n\f\r]*;?[ \t\n\f\r]*$/i.test(
     withoutComments(sql),
   );
 const endsReadTransaction = (sql: string) =>
-  /^\s*(?:COMMIT|END|ROLLBACK)(?:\s+TRANSACTION)?\s*;?\s*$/i.test(withoutComments(sql));
+  /^[ \t\n\f\r]*(?:COMMIT|END|ROLLBACK)(?:[ \t\n\f\r]+TRANSACTION)?[ \t\n\f\r]*;?[ \t\n\f\r]*$/i.test(
+    withoutComments(sql),
+  );
 
 // WAL readers run concurrently; one worker serialized every read behind the slowest transaction.
 const DEFAULT_READER_POOL_SIZE = 4;

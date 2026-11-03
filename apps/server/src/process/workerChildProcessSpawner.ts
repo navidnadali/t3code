@@ -35,6 +35,7 @@ import * as NodeStream from "node:stream";
 
 import * as ProcessRunner from "../processRunner.ts";
 import { answerDeadlines, type SpawnerTimers } from "./spawnerDeadlines.ts";
+import { registerSpawnerProcess } from "./spawnerProcesses.ts";
 import {
   PROCESS_SPAWNER_EXECUTABLE,
   spawnerHandshake,
@@ -745,6 +746,8 @@ const openSpawnerProcess =
   (launch: ReturnType<typeof spawnerProcessLaunch>, handshake: SpawnerHandshake) =>
   (events: TransportEvents): Transport => {
     const spawner = NodeChildProcess.spawn(launch.command, launch.args, launch.options);
+    const forgetSpawner =
+      spawner.pid === undefined ? () => {} : registerSpawnerProcess(spawner.pid);
     // A spawner that failed to start reports only an error, with a negative exitCode.
     const hasExited = () => spawner.exitCode !== null || spawner.signalCode !== null;
     const exited = new Promise<void>((resolve) => {
@@ -832,6 +835,7 @@ const openSpawnerProcess =
     });
     spawner.on("exit", (code, signal) => {
       cancelHandshake();
+      forgetSpawner();
       // Launched detached, it led its own group; while members remain, no process can take its id.
       try {
         if (launch.options.detached) signalProcessGroup(spawner.pid!, "SIGKILL");

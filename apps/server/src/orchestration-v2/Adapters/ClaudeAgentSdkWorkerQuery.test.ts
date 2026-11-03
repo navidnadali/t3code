@@ -1282,6 +1282,64 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       }),
   );
 
+  // From SDK 0.3.284 an error response the SDK cannot write escapes its control-request handler as an
+  // unhandled rejection, so in-thread is no oracle here: on a worker it must fail only that request.
+  it.effect(
+    "fails a callback whose error cannot be written with a clear error, and keeps its worker",
+    () =>
+      withRunner(
+        "worker",
+        ({ runner, recorded }) =>
+          Effect.gen(function* () {
+            const unwritable = new FakeClaudeCli();
+            const neighbour = new FakeClaudeCli();
+            yield* runner.open(
+              openInput(unwritable, {
+                canUseTool: () => Promise.reject(Object.assign(new Error(), { message: 1n })),
+              }),
+            );
+            yield* runner.open(
+              openInput(neighbour, {
+                canUseTool: async () => ({ behavior: "allow", updatedInput: { allowed: true } }),
+              }),
+            );
+            // A dead worker kills its sessions' CLIs instead of answering.
+            const outcome = (cli: FakeClaudeCli, toolUseId: string) =>
+              Promise.race([
+                cli.request(permissionRequest(toolUseId)).then((response) => ({ response })),
+                new Promise<{ readonly killed: true }>((resolve) =>
+                  cli.once("exit", () => resolve({ killed: true })),
+                ),
+              ]);
+            const failed = yield* Effect.promise(() => outcome(unwritable, "toolu-unwritable"));
+            const answered = yield* Effect.promise(() => outcome(neighbour, "toolu-neighbour"));
+
+            assert.deepStrictEqual(recorded.opens, [true, true]);
+            assert.deepStrictEqual(failed, {
+              response: {
+                subtype: "error",
+                request_id: "cli-0",
+                error:
+                  "A T3 Code callback failed with an error that cannot be sent to Claude: Do not know how to serialize a BigInt",
+              },
+            });
+            assert.deepStrictEqual(answered, {
+              response: {
+                subtype: "success",
+                request_id: "cli-0",
+                response: {
+                  behavior: "allow",
+                  updatedInput: { allowed: true },
+                  toolUseID: "toolu-neighbour",
+                },
+              },
+            });
+            assert.deepStrictEqual([unwritable.kills, neighbour.kills], [[], []]);
+          }),
+        { workers: 1 },
+      ),
+  );
+
   // Answers once its request is cancelled, recording whether its signal said so.
   const answerOnAbort =
     (called: PromiseWithResolvers<void>, aborted: Array<boolean>): CanUseTool =>

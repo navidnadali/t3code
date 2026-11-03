@@ -553,9 +553,20 @@ const objectRows = (columns: ReadonlyArray<string>, rows: ReadonlyArray<Readonly
   });
 
 // Read-transaction cleanup succeeds after worker exit because it can no longer change anything.
-// COMMIT, END and a plain ROLLBACK end the transaction; ROLLBACK TO (a savepoint) keeps it open.
-const endsReadTransaction = (sql: string) =>
-  /^\s*(?:COMMIT|END)\b|^\s*ROLLBACK\b(?!\s+TO\b)/i.test(sql);
+// The statement's leading words, comments removed, upper-cased: SQLite allows comments between them.
+const leadingWords = (sql: string, count: number) =>
+  (sql.replace(/\/\*[\s\S]*?\*\/|--[^\n]*/g, " ").match(/[A-Za-z_]+/g) ?? [])
+    .slice(0, count)
+    .map((word) => word.toUpperCase());
+const beginsTransaction = (sql: string) => leadingWords(sql, 1)[0] === "BEGIN";
+// COMMIT, END [TRANSACTION] and ROLLBACK [TRANSACTION] end the transaction; ROLLBACK [TRANSACTION]
+// TO [SAVEPOINT] name rolls back to a savepoint and keeps it open.
+const endsReadTransaction = (sql: string) => {
+  const [first, second, third] = leadingWords(sql, 3);
+  if (first === "COMMIT" || first === "END") return true;
+  if (first !== "ROLLBACK") return false;
+  return (second === "TRANSACTION" ? third : second) !== "TO";
+};
 
 // WAL readers run concurrently; one worker serialized every read behind the slowest transaction.
 const DEFAULT_READER_POOL_SIZE = 4;
@@ -673,7 +684,7 @@ const makeReader = Effect.fnUntraced(function* (
 
     const request = (input: ReaderRequest) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
-        const begins = /^\s*BEGIN\b/i.test(input.sql);
+        const begins = beginsTransaction(input.sql);
         if (begins && !pendingBegin && !inTransaction) {
           pendingBegin = true;
           return Effect.succeed([]);

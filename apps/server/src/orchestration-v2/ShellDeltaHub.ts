@@ -124,15 +124,28 @@ const make = Effect.gen(function* () {
   // is committed after reaches the emptied buffer. So one read serves every subscriber a batch
   // resets, however the resets and their pulls interleave, instead of a snapshot per subscriber.
   let publishedSequence = 0;
-  // Subscribers in the reset state, each waiting to pull a base: the last base is kept while any
-  // of them may still pull it, and released once that wave is served.
-  let resetting = 0;
   let latestBase:
     | {
         readonly coversThrough: number;
         readonly result: Deferred.Deferred<ShellResyncBase, ShellDeltaHubError>;
       }
     | undefined;
+  // Per subscriber: the highest sequence its consumer has processed, and its reset.
+  interface SubscriberState {
+    seen: number;
+    resetThrough: number | undefined;
+  }
+  const subscribers = new Set<SubscriberState>();
+  // The last base is released once its wave is served: no subscriber is in the reset state, and
+  // every subscriber has processed the batch the read covers, so none can still reset from it.
+  const releaseBaseIfServed = () => {
+    const base = latestBase;
+    if (base === undefined) return;
+    for (const state of subscribers) {
+      if (state.resetThrough !== undefined || state.seen < base.coversThrough) return;
+    }
+    latestBase = undefined;
+  };
   const resyncBase = (through: number) =>
     // Publishing a read to later resets and starting it is one uninterruptible step: a
     // subscriber cancelled between the two would leave a read nobody runs, and every reset
@@ -299,6 +312,9 @@ const make = Effect.gen(function* () {
     const subscription = yield* PubSub.subscribe(instance.output).pipe(
       Scope.provide(subscriptionScope),
     );
+    // Batches published before this subscription cannot reach it: it has them "processed".
+    const state: SubscriberState = { seen: publishedSequence, resetThrough: undefined };
+    subscribers.add(state);
     // One budget for all this subscriber retains: the latest delta per aggregate, held until the
     // stream is taken (its snapshot read runs meanwhile) and buffered after. When the stream
     // starts, held deltas the snapshot covers or an unchanged check skips are released.
@@ -311,22 +327,19 @@ const make = Effect.gen(function* () {
     >(1);
     let afterSequence: number | undefined;
     let highestOffered = 0;
-    // Set by a reset: the highest sequence the dropped deltas can have, cleared by a resync whose
-    // base covers it (or by a snapshot that does, when the stream opens).
-    let resetThrough: number | undefined;
+    // `state.resetThrough` is set by a reset: the highest sequence the dropped deltas can have,
+    // cleared by a resync whose base covers it (or by a snapshot that does, when the stream opens).
     const setReset = (through: number | undefined) => {
-      if ((through === undefined) !== (resetThrough === undefined)) {
-        resetting += through === undefined ? -1 : 1;
-        if (resetting === 0) latestBase = undefined;
-      }
-      resetThrough = through;
+      state.resetThrough = through;
+      if (through === undefined) releaseBaseIfServed();
     };
     let closed = false;
     const close = (error?: LiveStreamBufferError) =>
       Effect.suspend(() => {
         if (closed) return Effect.void;
         closed = true;
-        setReset(undefined);
+        subscribers.delete(state);
+        releaseBaseIfServed();
         budget.release(pending.values());
         pending.clear();
         return (error ? Queue.fail(ready, error) : Effect.void).pipe(
@@ -345,7 +358,9 @@ const make = Effect.gen(function* () {
       if (closed) return Effect.void;
       if (afterSequence !== undefined) {
         if (delta.sequence <= afterSequence) return Effect.void;
-        if (!admission.admit(delta, now)) return Effect.void;
+        // While the buffer is reset, nothing is unchanged: the client will show the base, which
+        // may hold a state the hub never projected, and a shell equal to one sent before is news.
+        if (state.resetThrough === undefined && !admission.admit(delta, now)) return Effect.void;
       }
       const key = shellDeltaKey(delta.item);
       const previous = pending.get(key);
@@ -357,7 +372,7 @@ const make = Effect.gen(function* () {
       if (Effect.isEffect(swapped)) {
         // Entering the reset state is logged once: while the delivered chunk alone fills the
         // budget, every further delta takes this path until the client pulls.
-        if (resetThrough === undefined) {
+        if (state.resetThrough === undefined) {
           report = Effect.logWarning("orchestration shell live buffer reset for a resync", {
             pendingDeltas: pending.size,
             afterSequence,
@@ -372,19 +387,36 @@ const make = Effect.gen(function* () {
       }
       if (!Effect.isEffect(swapped)) pending.set(key, swapped);
       // A started stream needs a wakeup on the empty-to-nonempty transition and on a reset.
-      if (afterSequence !== undefined && (wasEmpty || resetThrough !== undefined)) {
+      if (afterSequence !== undefined && (wasEmpty || state.resetThrough !== undefined)) {
         Queue.offerUnsafe(ready, undefined);
       }
       return report;
     };
+    // A batch is processed whole; with it processed, this subscriber cannot reset from the base
+    // read after it any more.
+    const processed = (batch: ReadonlyArray<VersionedShellDelta>) => {
+      if (closed) return;
+      const seenBefore = state.seen;
+      for (const delta of batch) state.seen = Math.max(state.seen, delta.sequence);
+      const base = latestBase;
+      if (
+        base !== undefined &&
+        seenBefore < base.coversThrough &&
+        state.seen >= base.coversThrough
+      ) {
+        releaseBaseIfServed();
+      }
+    };
     yield* Stream.fromSubscription(subscription).pipe(
-      Stream.flatMap(Stream.fromIterable),
       Stream.merge(Stream.fromEffect(Deferred.await(instance.failed))),
       Stream.ensuring(Scope.close(subscriptionScope, Exit.void)),
-      Stream.runForEach((delta) =>
-        Effect.clockWith((clock) =>
-          Effect.suspend(() => offer(delta, clock.currentTimeMillisUnsafe())),
-        ),
+      Stream.runForEach((batch) =>
+        Effect.clockWith((clock) => {
+          const now = clock.currentTimeMillisUnsafe();
+          return Effect.forEach(batch, (delta) => offer(delta, now), { discard: true }).pipe(
+            Effect.andThen(Effect.sync(() => processed(batch))),
+          );
+        }),
       ),
       Effect.raceFirst(budget.failed),
       Effect.exit,
@@ -414,8 +446,10 @@ const make = Effect.gen(function* () {
           continueFrom(sequence, (delta) => admission.admit(delta, now));
           // A reset the snapshot covers (everything dropped is at or below its sequence) needs
           // no resync; a later one does, and the stream starts with it.
-          if (resetThrough !== undefined && resetThrough <= sequence) setReset(undefined);
-          if (resetThrough !== undefined) Queue.offerUnsafe(ready, undefined);
+          if (state.resetThrough !== undefined && state.resetThrough <= sequence) {
+            setReset(undefined);
+          }
+          if (state.resetThrough !== undefined) Queue.offerUnsafe(ready, undefined);
         }),
       );
     type Delivered = RetainedLiveItem<VersionedShellDelta | ShellResync>;
@@ -425,8 +459,8 @@ const make = Effect.gen(function* () {
     > = Queue.take(ready).pipe(
       Effect.flatMap(() =>
         Effect.suspend(() => {
-          if (resetThrough !== undefined) {
-            return resyncBase(resetThrough).pipe(
+          if (state.resetThrough !== undefined) {
+            return resyncBase(state.resetThrough).pipe(
               Effect.flatMap(({ read, base }) =>
                 Effect.suspend(() => {
                   // A started stream resets only on deltas past its position, and the base is
@@ -441,7 +475,10 @@ const make = Effect.gen(function* () {
                     );
                   }
                   // A reset the read does not cover keeps the flag: the next pull resyncs again.
-                  if (resetThrough !== undefined && resetThrough <= read.coversThrough) {
+                  if (
+                    state.resetThrough !== undefined &&
+                    state.resetThrough <= read.coversThrough
+                  ) {
                     setReset(undefined);
                   }
                   // The client shows the base now, not the shells sent before: a delta equal to

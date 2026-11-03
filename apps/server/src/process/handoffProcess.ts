@@ -4,6 +4,7 @@ import * as NodeEvents from "node:events";
 import type * as NodeNet from "node:net";
 import * as NodeStream from "node:stream";
 
+import { isPidReused } from "./processIdentity.ts";
 import type { HandoffCallbacks, HandoffChild } from "./workerChildProcessSpawner.ts";
 
 export interface ProviderSpawnOptions {
@@ -126,6 +127,18 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
   /** The server's ends of held descriptors: they close when the server exits, however it exits. */
   get held(): ReadonlyArray<NodeNet.Socket> {
     return this.#held;
+  }
+
+  /**
+   * Whether a signal to its PID's group still reaches only its own processes: false once that PID
+   * names another process, as it can by the time an exit learned by watching is reported.
+   */
+  groupIsOwn(): boolean {
+    const child = this.#child;
+    if (this.#direct !== undefined || child?.pid === undefined || child.startTime === undefined) {
+      return true;
+    }
+    return !isPidReused(child.pid, child.startTime);
   }
 
   get stdin(): NodeStream.PassThrough | null {

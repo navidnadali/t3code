@@ -40,6 +40,7 @@ import * as NodeStream from "node:stream";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ServerConfig from "../config.ts";
 import { HandoffProcess, type ProviderSpawnOptions } from "./handoffProcess.ts";
+import { isPidReused, isSameProcess } from "./processIdentity.ts";
 import { answerDeadlines, type SpawnerTimers } from "./spawnerDeadlines.ts";
 import { registerSpawnerProcess } from "./spawnerProcesses.ts";
 import {
@@ -286,21 +287,6 @@ interface HandoffEntry {
 // Unix socket paths are limited to 104 bytes on macOS and 108 on Linux, NUL included.
 const MAX_SOCKET_PATH_BYTES = 100;
 const ORPHAN_POLL_MILLIS = 1_000;
-
-/**
- * Whether the process with this PID is still the one the spawner started: same /proc start time,
- * not a zombie. A PID that names another process (reused) or none means the child exited.
- */
-export const isSameProcess = (pid: number, startTime: string): boolean => {
-  let stat: string;
-  try {
-    stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
-  } catch {
-    return false;
-  }
-  const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-  return fields[0] !== "Z" && fields[0] !== "X" && fields[19] === startTime;
-};
 
 /** Where spawn requests run: a worker thread or the spawner process. */
 interface Transport {
@@ -1377,6 +1363,8 @@ interface ChildView {
   readonly stderr: NodeStream.Readable;
   /** Killed when its transport stopped; a hand-off child never is. */
   readonly killedOnStop: boolean;
+  /** Whether its PID's group is still its own (hand-off: the PID names no other process). */
+  readonly groupIsOwn?: () => boolean;
 }
 
 /** How children start and are signalled: relayed by a worker or spawner, or handed off. */
@@ -1444,6 +1432,8 @@ const makeChildHandles = Effect.fnUntraced(function* () {
   ) =>
     Effect.try({
       try: () => {
+        // Its PID names another process: its own group is gone, so there is nothing to signal.
+        if (child.groupIsOwn?.() === false) return;
         signalProcessGroup(child.pid!, signal);
       },
       catch: (error) => toPlatformError("kill", toError(error), command),
@@ -1558,7 +1548,7 @@ const makeChildHandles = Effect.fnUntraced(function* () {
     );
 
     child.exitListeners.add((code) => {
-      if (code !== 0 && Predicate.isNotNull(code)) {
+      if (code !== 0 && Predicate.isNotNull(code) && child.groupIsOwn?.() !== false) {
         try {
           signalProcessGroup(child.pid!, command.options.killSignal ?? "SIGTERM");
         } catch {
@@ -1922,6 +1912,10 @@ const handoffView = (child: HandoffChild): HandoffView => {
     stdout: output(1),
     stderr: output(2),
     killedOnStop: false,
+    groupIsOwn: () =>
+      child.pid === undefined ||
+      child.startTime === undefined ||
+      !isPidReused(child.pid, child.startTime),
   };
 };
 

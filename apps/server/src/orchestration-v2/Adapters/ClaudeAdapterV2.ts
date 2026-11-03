@@ -161,6 +161,7 @@ import {
 } from "../../claudeModelOptions.ts";
 import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
+import { HandoffProcess } from "../../process/handoffProcess.ts";
 import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -393,7 +394,9 @@ export function spawnClaudeProcessGroup(
         });
   child.once("exit", () => {
     try {
-      signalProcessGroup(child.pid ?? 0, "SIGKILL");
+      if (!(child instanceof HandoffProcess) || child.groupIsOwn()) {
+        signalProcessGroup(child.pid ?? 0, "SIGKILL");
+      }
     } catch {}
     onExit?.();
   });

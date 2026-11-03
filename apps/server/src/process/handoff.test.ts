@@ -18,6 +18,7 @@ import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 
 import * as ServerConfig from "../config.ts";
+import { isPidReused, isSameProcess } from "./processIdentity.ts";
 import { spawnerProcessIds } from "./spawnerProcesses.ts";
 import { spawnerProcessSource } from "./spawnerSources.ts";
 import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
@@ -225,10 +226,14 @@ describe("provider process hand-off", () => {
     Effect.sync(() => {
       const stat = require("node:fs").readFileSync(`/proc/${process.pid}/stat`, "utf8") as string;
       const startTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!;
-      expect(WorkerChildProcessSpawner.isSameProcess(process.pid, startTime)).toBe(true);
+      expect(isSameProcess(process.pid, startTime)).toBe(true);
       // Same PID, another start time: a different process, so the one it named is gone.
-      expect(WorkerChildProcessSpawner.isSameProcess(process.pid, `${startTime}1`)).toBe(false);
-      expect(WorkerChildProcessSpawner.isSameProcess(2 ** 30, startTime)).toBe(false);
+      expect(isSameProcess(process.pid, `${startTime}1`)).toBe(false);
+      expect(isSameProcess(2 ** 30, startTime)).toBe(false);
+      // Reused only when the PID names another process; one that names none is not.
+      expect(isPidReused(process.pid, startTime)).toBe(false);
+      expect(isPidReused(process.pid, `${startTime}1`)).toBe(true);
+      expect(isPidReused(2 ** 30, startTime)).toBe(false);
     }),
   );
 

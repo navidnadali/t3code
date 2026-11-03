@@ -1076,20 +1076,25 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     });
     // The hub and the replay carry the project's store row; the repository identity is added
     // when the item is sent, so a delta delayed by its batch never carries an identity older than
-    // a refresh this subscriber already sent.
-    const withRepositoryIdentity = <E, R>(stream: Stream.Stream<ShellDelta, E, R>) =>
-      stream.pipe(
-        Stream.mapEffect((item): Effect.Effect<ShellDelta> =>
-          item.kind === "project.updated"
-            ? Effect.map(
-                projectEnrichment.getAvailable(item.project.workspaceRoot),
-                (enrichment) => ({
-                  ...item,
-                  project: { ...item.project, repositoryIdentity: enrichment.repositoryIdentity },
-                }),
-              )
-            : Effect.succeed(item),
-        ),
+    // a refresh this subscriber already sent. Chunks stay whole: the RPC server waits for a
+    // client acknowledgement per chunk.
+    const withRepositoryIdentityItem = (item: ShellDelta): Effect.Effect<ShellDelta> =>
+      item.kind === "project.updated"
+        ? Effect.map(
+            projectEnrichment.getAvailable(item.project.workspaceRoot),
+            (enrichment): ShellDelta => ({
+              ...item,
+              project: { ...item.project, repositoryIdentity: enrichment.repositoryIdentity },
+            }),
+          )
+        : Effect.succeed(item);
+    const withRepositoryIdentity = <E, R>(
+      stream: Stream.Stream<ShellDelta, E, R>,
+    ): Stream.Stream<ShellDelta, E, R> =>
+      Stream.mapArrayEffect(stream, (items) =>
+        items.some((item) => item.kind === "project.updated")
+          ? Effect.forEach(items, withRepositoryIdentityItem)
+          : Effect.succeed(items),
       );
 
     // Replay only; the live tail comes projected from the hub.

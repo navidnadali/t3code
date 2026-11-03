@@ -16,10 +16,14 @@ import {
   nodeOptionsWithMaxSemiSpace,
   planYoungGenerationRelaunch,
   resolveMaxSemiSpaceMb,
+  NON_SERVER_COMMANDS,
+  SERVER_COMMANDS,
   serverChildEnvironment,
   tokenizeNodeOptions,
 } from "./youngGeneration.ts";
 import { SERVICE_LAUNCHER_CONTEXT_ENV } from "./cloud/serviceProtocol.ts";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 
 const flag = `--max-semi-space-size=${DEFAULT_MAX_SEMI_SPACE_MB}`;
 
@@ -225,6 +229,25 @@ describe("isServerCommand", () => {
       expect(isServerCommand(argv(command), everythingIsADirectory), command).toBe(false);
     }
     expect(isServerCommand(argv("my-project"), everythingIsADirectory)).toBe(true);
+  });
+
+  it("lists every top-level command the CLI exports, so a new command cannot drift into a server start", () => {
+    // The CLI's top-level commands are the exported `Command.make("name")` constants under src/cli;
+    // every one that is not a server command must be a non-server command here.
+    const cliDirectory = NodePath.join(import.meta.dirname, "cli");
+    const registered = new Set<string>();
+    for (const file of NodeFS.readdirSync(cliDirectory)) {
+      if (!file.endsWith(".ts") || file.endsWith(".test.ts")) continue;
+      const source = NodeFS.readFileSync(NodePath.join(cliDirectory, file), "utf8");
+      for (const match of source.matchAll(/export const \w+ = Command\.make\(\s*"([a-z_-]+)"/g)) {
+        registered.add(match[1]!);
+      }
+    }
+    expect(registered.size).toBeGreaterThan(20);
+    const unlisted = [...registered].filter(
+      (command) => !SERVER_COMMANDS.has(command) && !NON_SERVER_COMMANDS.has(command),
+    );
+    expect(unlisted).toEqual([]);
   });
 });
 

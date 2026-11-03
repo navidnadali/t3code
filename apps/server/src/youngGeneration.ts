@@ -20,9 +20,10 @@ const FLAG = "--max-semi-space-size";
 const MAX_SEMI_SPACE_MB_LIMIT = 1024;
 const BOOTSTRAP_FD_ENV = "T3CODE_BOOTSTRAP_FD";
 const DISABLED_VALUES = new Set(["0", "off", "false", "no"]);
-const SERVER_COMMANDS = new Set(["serve", "start", "__node-flags"]);
+export const SERVER_COMMANDS: ReadonlySet<string> = new Set(["serve", "start", "__node-flags"]);
 /** Subcommands and fast paths that never run the server here: no file-system check for them. */
-const NON_SERVER_COMMANDS = new Set([
+/** Every top-level command that never starts a server; `youngGeneration.test.ts` checks it against the CLI's exported commands. */
+export const NON_SERVER_COMMANDS: ReadonlySet<string> = new Set([
   "acp-mcp-bridge",
   "acp-mcp-call",
   "__document-text",

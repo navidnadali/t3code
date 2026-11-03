@@ -342,6 +342,14 @@ describe("DesktopBackendConfiguration", () => {
             else process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = hatch;
           }),
         );
+        const wslEnv = process.env.WSLENV;
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (wslEnv === undefined) delete process.env.WSLENV;
+            else process.env.WSLENV = wslEnv;
+          }),
+        );
+        process.env.WSLENV = "NODE_OPTIONS/u:T3CODE_V8_MAX_SEMI_SPACE_MB";
         process.env.NODE_OPTIONS = "--max-semi-space-size=16";
         delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
         assert.notInclude(wslNodeFallbackCapFlags(), "--max-semi-space-size=64");
@@ -351,6 +359,11 @@ describe("DesktopBackendConfiguration", () => {
         process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "96";
         assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=96"]);
         delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
+        // Not forwarded by WSLENV: WSL never sees them, so they decide nothing.
+        delete process.env.WSLENV;
+        process.env.NODE_OPTIONS = "--max-semi-space-size=16";
+        process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "0";
         assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
       }).pipe(Effect.scoped),
   );
@@ -455,17 +468,28 @@ describe("DesktopBackendConfiguration", () => {
           const path = yield* Path.Path;
           const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
           // The Linux executable takes Node options only on its command line, and a bootstrap
-          // descriptor rules out a corrective relaunch: the desktop passes them itself.
+          // descriptor rules out a corrective relaunch: the desktop passes them itself — but only
+          // what WSL actually receives, which is what the user's WSLENV forwards.
           const nodeOptions = process.env.NODE_OPTIONS;
+          const wslEnv = process.env.WSLENV;
+          const restore = Effect.sync(() => {
+            if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
+            else process.env.NODE_OPTIONS = nodeOptions;
+            if (wslEnv === undefined) delete process.env.WSLENV;
+            else process.env.WSLENV = wslEnv;
+          });
           process.env.NODE_OPTIONS = "--max-semi-space-size=16";
-          const config = yield* configuration.resolveWsl({ port: 5000, distro: "Ubuntu" }).pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
-                if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
-                else process.env.NODE_OPTIONS = nodeOptions;
-              }),
-            ),
-          );
+          process.env.WSLENV = "NODE_OPTIONS";
+          const config = yield* configuration
+            .resolveWsl({ port: 5000, distro: "Ubuntu" })
+            .pipe(Effect.ensuring(restore));
+          // Windows-only NODE_OPTIONS that WSLENV does not forward never reach the Linux backend.
+          process.env.NODE_OPTIONS = "--require=C:\\WindowsOnly\\hook.cjs";
+          delete process.env.WSLENV;
+          const unforwarded = yield* configuration
+            .resolveWsl({ port: 5000, distro: "Ubuntu" })
+            .pipe(Effect.ensuring(restore));
+          assert.isFalse(unforwarded.args.some((arg) => arg.startsWith("--node-options=")));
 
           assert.deepEqual(observedArchives, [
             {

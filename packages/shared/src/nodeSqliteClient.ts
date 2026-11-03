@@ -748,12 +748,10 @@ const makeReader = Effect.fnUntraced(function* (
           }
           return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
             // The fiber can yield before this runs: a reply landing in that gap may have restored
-            // the flag (cleared again here, with the post), the worker may have stopped (nothing is
-            // left to end) or the outstanding replies may all have arrived (nothing to wait for).
+            // the flag (cleared again here, with the post) or the worker may have stopped (nothing
+            // is left to end). Otherwise the ending stays awaited, so SQLite's answer comes back.
             inTransaction = false;
-            if (stoppedMessage !== undefined || pending.size === 0) {
-              if (stoppedMessage === undefined && post({ id, safeIntegers: false, ...input }))
-                latestId = id;
+            if (stoppedMessage !== undefined) {
               resume(Effect.succeed([]));
               return;
             }

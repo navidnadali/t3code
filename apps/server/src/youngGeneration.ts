@@ -152,6 +152,23 @@ export const nodeOptionsWithMaxSemiSpace = (
   return current === "" ? `${FLAG}=${mb}` : `${current} ${FLAG}=${mb}`;
 };
 
+const PRELOAD_FLAGS = new Set(["--require", "-r", "--import", "--loader", "--experimental-loader"]);
+/** Whether a preload is visible on the command line or in NODE_OPTIONS as it reads now. */
+const preloadVisible = (env: Environment, execArgv: ReadonlyArray<string>): boolean =>
+  [...execArgv, ...tokenizeNodeOptions(env.NODE_OPTIONS)].some(
+    (token) =>
+      PRELOAD_FLAGS.has(token) || [...PRELOAD_FLAGS].some((flag) => token.startsWith(`${flag}=`)),
+  );
+
+/** `value` with the cap this process was given removed, when `value` starts with `prefix` + the cap. */
+const withoutAppendedCap = (value: string, prefix: string, mb: number): string | undefined => {
+  const written = nodeOptionsWithMaxSemiSpace(prefix, mb);
+  if (value === written) return prefix;
+  if (!value.startsWith(`${written} `)) return undefined;
+  const rest = value.slice(written.length + 1);
+  return prefix === "" ? rest : `${prefix} ${rest}`;
+};
+
 const withFlag = (env: Environment, mb: number): Environment => ({
   ...env,
   NODE_OPTIONS: nodeOptionsWithMaxSemiSpace(env.NODE_OPTIONS, mb),
@@ -293,6 +310,11 @@ export const planYoungGenerationRelaunch = (input: {
   if (input.inspectorActive === true || inspectorRequested(input.env, input.execArgv)) {
     return { kind: "keep", reason: "the inspector is active" };
   }
+  // A preload runs before this code and may have rewritten NODE_OPTIONS: what it reads now is not
+  // what Node started with, so neither an explicit cap nor the user's options can be trusted.
+  if (preloadVisible(input.env, input.execArgv)) {
+    return { kind: "keep", reason: "started with a preload" };
+  }
   const mb = resolveMaxSemiSpaceMb(input.env, input.execArgv);
   if (mb === null) return { kind: "keep", reason: "disabled or set explicitly" };
   if (!isServerCommand(input.argv, input.isDirectory)) {
@@ -352,10 +374,16 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   if (inherited !== undefined) {
     delete process.env[INHERITED_NODE_OPTIONS_ENV];
     const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, process.execArgv).mb;
-    // Restore only what the marker's writer appended to: children never get more than the server had.
-    if (mb !== null && nodeOptionsAtStart === nodeOptionsWithMaxSemiSpace(inherited, mb)) {
-      if (inherited === "") delete process.env.NODE_OPTIONS;
-      else process.env.NODE_OPTIONS = inherited;
+    // Children get what the server was given minus the cap added for it — a preload's own additions
+    // stay — and only when the marker matches what the relaunch or the launcher wrote; a stray or
+    // forged marker is ignored.
+    const forChildren =
+      mb === null || nodeOptionsAtStart === undefined
+        ? undefined
+        : withoutAppendedCap(nodeOptionsAtStart, inherited, mb);
+    if (forChildren !== undefined) {
+      if (forChildren === "") delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = forChildren;
       return { applied: true, nodeOptionsAtStart };
     }
   }

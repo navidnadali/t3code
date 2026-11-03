@@ -855,7 +855,7 @@ export const layerWithOptions = (
           // While the main thread is saturated a worker without a slot claims only ungated effects.
           const admission = yield* EffectAdmission.EffectAdmission;
           const slot = Option.getOrUndefined(yield* admission.reserve);
-          // A slot the claim does not use goes back unused: no worker is woken for it.
+          // A slot whose claim found nothing goes back unused: no worker was skipped for work.
           const discardSlot = slot === undefined ? Effect.void : slot.discard;
           const claimExit = yield* Effect.exit(
             outbox.claimNext({
@@ -884,7 +884,8 @@ export const layerWithOptions = (
           }
           const effect = claimed.value;
           const gated = EffectAdmission.isGated(effect.request.type);
-          if (!gated) yield* discardSlot;
+          // An ungated effect frees its slot at once; a worker refused it meanwhile is woken.
+          if (!gated && slot !== undefined) yield* slot.release;
           return yield* runClaimed(effect, gated).pipe(
             Effect.ensuring(gated && slot !== undefined ? slot.release : Effect.void),
           );

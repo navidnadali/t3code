@@ -32,7 +32,10 @@ export interface AdmissionState {
 }
 
 export interface AdmissionSlot {
-  /** Gives the slot back after its gated effect ran; the last slot freed wakes a skipped worker. */
+  /**
+   * Gives the slot back after its claim took work — a gated effect that ran, or an ungated one
+   * that needs no slot; the last slot freed wakes a worker that skipped gated effects meanwhile.
+   */
   readonly release: Effect.Effect<void>;
   /** Gives the slot back unused, because the claim found nothing: no worker is woken for it. */
   readonly discard: Effect.Effect<void>;

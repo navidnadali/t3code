@@ -794,8 +794,9 @@ saturated allowance's worth of such effects in flight until the gate is open wit
 server or a single session pays no wake-ups for it; the price is that the first close after the
 sampler starts takes its two samples from then. Effects already running are never stopped, a slot
 counts against the allowance for two minutes at most (longer than any turn start, so hung starts
-cannot hold it), a slot freed by a finished or expired effect wakes one idle worker (one given back
-unused, because the claim found nothing, wakes none) and a reopened gate wakes them all. The time an
+cannot hold it), the last slot given back wakes one idle worker — after its claim took work, gated
+or not, or when it expired; a claim that found nothing returns it without a wake-up — and a
+reopened gate wakes them all. The time an
 effect waited in the outbox is its queue wait (`effect.queue_wait_ms` on `EffectWorker.runEffect`,
 which also carries `effect.gated`; the timer `t3_orchestration_effect_queue_wait`), and each switch
 is logged ("Orchestration effect admission changed", with the delay that caused it).

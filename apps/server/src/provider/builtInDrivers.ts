@@ -33,36 +33,45 @@ export type BuiltInDriversEnv =
   | PiDriverEnv
   | MuseDriverEnv;
 
+const withSpawner =
+  (
+    spawner: Effect.Effect<
+      ChildProcessSpawner.ChildProcessSpawner["Service"],
+      never,
+      ChildProcessSpawner.ChildProcessSpawner
+    >,
+  ) =>
+  <Config, R, UsageR>(
+    driver: ProviderDriver<Config, R | ChildProcessSpawner.ChildProcessSpawner, UsageR>,
+  ): ProviderDriver<Config, R | ChildProcessSpawner.ChildProcessSpawner, UsageR> => ({
+    ...driver,
+    create: (input) =>
+      driver
+        .create(input)
+        .pipe(Effect.provideServiceEffect(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+  });
+
 /**
- * A driver whose processes (agent sessions, checks) start through Effect's spawner takes the
- * server's provider launcher's. Claude and Codex pick their spawners themselves; Cursor starts none.
+ * Sessions and checks of a provider verified on hand-off (real CLI, socket stdio, survives the
+ * spawner's death) start from the server's provider launcher. Claude and Codex pick their spawners
+ * themselves; the others stay on Node's spawner (docs/operations/observability.md says why).
  */
-const launchedByServer = <Config, R, UsageR>(
-  driver: ProviderDriver<Config, R | ChildProcessSpawner.ChildProcessSpawner, UsageR>,
-): ProviderDriver<Config, R | ChildProcessSpawner.ChildProcessSpawner, UsageR> => ({
-  ...driver,
-  create: (input) =>
-    driver
-      .create(input)
-      .pipe(
-        Effect.provideServiceEffect(
-          ChildProcessSpawner.ChildProcessSpawner,
-          WorkerChildProcessSpawner.providerSpawner,
-        ),
-      ),
-});
+const launchedByServer = withSpawner(WorkerChildProcessSpawner.providerSpawner);
+
+/** Muse's driver starts only checks (its SDK starts its sessions): the server's command spawner. */
+const checkedByServer = withSpawner(WorkerChildProcessSpawner.commandSpawner);
 
 export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> = [
   CodexDriver,
   ClaudeDriver,
   CursorDriver,
-  launchedByServer(GrokDriver),
-  launchedByServer(FxDriver),
+  GrokDriver,
+  FxDriver,
   launchedByServer(OpenCodeDriver),
-  launchedByServer(AntigravityDriver),
+  AntigravityDriver,
   launchedByServer(PiDriver),
-  launchedByServer(MuseDriver),
-  launchedByServer(AcpRegistryDriver),
+  checkedByServer(MuseDriver),
+  AcpRegistryDriver,
 ];
 
 export type BuiltInUsageReadersEnv =

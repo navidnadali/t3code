@@ -642,10 +642,7 @@ const makeReader = Effect.fnUntraced(function* (
         return true;
       } catch (cause) {
         // A BEGIN travelling with the message goes with the next statement instead.
-        if (message.begin === true) {
-          pendingBegin = true;
-          inTransaction = false;
-        }
+        if (message.begin === true) pendingBegin = true;
         const id = message.id as number;
         const resume = pending.get(id);
         if (resume === undefined) return false;
@@ -711,14 +708,21 @@ const makeReader = Effect.fnUntraced(function* (
           (pendingBegin || inTransaction)
         ) {
           // Ending a read transaction only drops a shared lock: it cannot fail or lose anything, so
-          // nothing waits for it. The worker still runs it before the next claimant's statements.
-          if (pendingBegin) pendingBegin = false;
-          else {
-            inTransaction = false;
-            const id = nextRequestId++;
+          // nothing waits for it, unless statements a fiber gave up on are still running: then the
+          // reader stays claimed until the worker has answered them and this ending, as before.
+          pendingBegin = false;
+          if (!inTransaction) return Effect.succeed([]);
+          inTransaction = false;
+          const id = nextRequestId++;
+          if (stoppedMessage !== undefined) return Effect.succeed([]);
+          if (pending.size === 0) {
             if (post({ id, safeIntegers: false, ...input })) latestId = id;
+            return Effect.succeed([]);
           }
-          return Effect.succeed([]);
+          return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
+            pending.set(id, () => resume(Effect.succeed([])));
+            if (post({ id, safeIntegers: false, ...input })) latestId = id;
+          });
         }
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
         return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
@@ -737,7 +741,6 @@ const makeReader = Effect.fnUntraced(function* (
           const begin = pendingBegin;
           pendingBegin = false;
           const id = nextRequestId++;
-          if (begin) inTransaction = true;
           pending.set(id, (reply) => {
             // A control the worker ran itself (raw, bound, duplicate, stray, a savepoint) may have
             // changed the connection's transaction state: the worker's word replaces the guess,

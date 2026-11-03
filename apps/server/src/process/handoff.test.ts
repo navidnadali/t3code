@@ -721,6 +721,71 @@ describe("provider process hand-off", () => {
       }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
   );
 
+  // As the Effect path's cancel: an aborted start still waiting its turn never runs, and frees its
+  // place in the queue; the SDK sees what a process killed at once by the abort would give.
+  it.live.skipIf(!linux)(
+    "never starts a Node-style process aborted while its start is queued",
+    () =>
+      Effect.gen(function* () {
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node, {
+          handoffLimit: 1,
+        });
+        const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        // Its events from the start: an abort reports its error at once, as Node's does.
+        const events = (child: NodeChildProcess.ChildProcess) =>
+          new Promise<ReadonlyArray<string>>((resolve) => {
+            const seen: Array<string> = [];
+            child.stdout!.resume();
+            child.stderr!.resume();
+            child.on("spawn", () => seen.push("spawn"));
+            child.on("error", (error) => seen.push(`error ${error.name}`));
+            child.on("exit", (code, signal) => seen.push(`exit ${code} ${signal}`));
+            child.once("close", (code, signal) => {
+              seen.push(`close ${code} ${signal}`, `killed ${child.killed}`);
+              resolve(seen);
+            });
+          });
+        // All in one turn: the first starts, the rest wait in the spawner; the last six are aborted.
+        const controllers = Array.from({ length: 8 }, () => new AbortController());
+        const seenAll = controllers.map((controller) =>
+          events(
+            launcher.spawn(process.execPath, ["-e", "process.stdout.write('ran')"], {
+              env: process.env,
+              stdio: ["pipe", "pipe", "pipe"],
+              signal: controller.signal,
+            }) as unknown as NodeChildProcess.ChildProcess,
+          ),
+        );
+        for (const controller of controllers.slice(2)) controller.abort();
+        // One whose signal was aborted before it was asked for gives the same.
+        seenAll.push(
+          events(
+            launcher.spawn(process.execPath, ["-e", "process.stdout.write('ran')"], {
+              env: process.env,
+              stdio: ["pipe", "pipe", "pipe"],
+              signal: AbortSignal.abort(),
+            }) as unknown as NodeChildProcess.ChildProcess,
+          ),
+        );
+        const seen = yield* Effect.promise(() => Promise.all(seenAll));
+        expect(seen).toEqual([
+          ...Array.from({ length: 2 }, () => [
+            "spawn",
+            "exit 0 null",
+            "close 0 null",
+            "killed false",
+          ]),
+          ...Array.from({ length: 7 }, () => [
+            "error AbortError",
+            "exit null SIGTERM",
+            "close null SIGTERM",
+            "killed true",
+          ]),
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live.skipIf(!linux)("gives an SDK a Node-style process with its stdio, exit and close", () =>
     Effect.gen(function* () {
       const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;

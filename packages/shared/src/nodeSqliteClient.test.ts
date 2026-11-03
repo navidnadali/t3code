@@ -1492,9 +1492,23 @@ it.effect(
 it.effect("forwards statements that merely start with a transaction keyword to SQLite", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {
-      for (const form of ["BEGIN2", "COMMIT2", "BEGIN 1", "ROLLBACK x", "END 2"]) {
+      // SQLite's whitespace is narrower than JavaScript's: a no-break space or a vertical tab is
+      // part of the token, not a separator.
+      for (const form of [
+        "BEGIN2",
+        "COMMIT2",
+        "BEGIN 1",
+        "ROLLBACK x",
+        "END 2",
+        "BEGIN\u00a0",
+        "BEGIN\v",
+      ]) {
         const error = yield* sql.unsafe(form).pipe(SqliteClient.readOnly, Effect.flip);
-        assert.include(String(error.reason.cause), "syntax error", form);
+        assert.match(
+          String(error.reason.cause),
+          /syntax error|unrecognized token/,
+          JSON.stringify(form),
+        );
       }
       // Inside a transaction too, and the reader stays usable afterwards.
       const inside = yield* sql

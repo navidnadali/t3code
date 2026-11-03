@@ -757,7 +757,25 @@ const makeReader = Effect.fnUntraced(function* (
               resume(Effect.succeed([]));
               return;
             }
-            pending.set(id, () => resume(Effect.succeed([])));
+            // SQLite's answer counts (a control it waited behind may have ended the transaction
+            // first); a worker that stopped meanwhile has nothing left to end, as before.
+            pending.set(id, (reply) =>
+              resume(
+                "error" in reply && stoppedMessage === undefined
+                  ? Effect.fail(
+                      failed(
+                        Object.assign(new Error(reply.error.message), {
+                          code: reply.error.code,
+                          errcode: reply.error.errcode,
+                          errstr: reply.error.errstr,
+                        }),
+                        readerFailureMessages[reply.error.operation],
+                        reply.error.operation,
+                      ),
+                    )
+                  : Effect.succeed([]),
+              ),
+            );
             if (pending.size === 1) worker.ref();
             if (post({ id, safeIntegers: false, ...input })) latestId = id;
             else {

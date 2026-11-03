@@ -111,10 +111,12 @@ recorded in `t3_perf_fork_migrations` (see
 [Leaving the performance fork's schema](../operations/perf-fork-schema-exit.md)), so an upstream
 build starts with the table and triggers in place, which go on counting; the fork's first release
 candidate refuses a database that an upstream migration past 76 ran on. An upstream migration that
-rebuilds the turn-item table (create, copy, drop, rename) drops the triggers with it. After
-upstream's migrations, every start runs a recorded fork migration whose objects are missing again,
-so migration 1 must stay safe to re-run (it recounts). A partial index covers nonterminal background
-items, including idle items. Latest user-message reads use an index ordered by update time.
+rebuilds the turn-item table (create, copy, drop, rename) drops the triggers with it, or leaves them
+on an old table it keeps aside. After upstream's migrations, every start runs a recorded fork
+migration whose objects are not on their table again, checking again under the write lock so that
+concurrent starts run it once; migration 1 must stay safe to re-run (it recounts). A partial index
+covers nonterminal background items, including idle items. Latest user-message reads use an index
+ordered by update time.
 
 A projection read that orders messages by their first user or assistant turn item groups those
 items by `$.messageId` through a partial index on that expression (the fork's migration 2), so it

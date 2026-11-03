@@ -12,6 +12,11 @@ import Migration0002 from "./PerfForkMigrations/002_TurnItemMessageOrdinalIndex.
  */
 export const PERF_FORK_MIGRATIONS_TABLE = "t3_perf_fork_migrations";
 
+const TURN_ITEMS = "orchestration_v2_projection_turn_items";
+const TURN_ITEM_COUNTS = "orchestration_v2_projection_turn_item_counts";
+
+type PerfForkObject = readonly [type: "table" | "trigger" | "index", name: string, table: string];
+
 // [id, name, migration, the objects it leaves in place]
 const perfForkMigrationEntries = [
   [
@@ -19,17 +24,17 @@ const perfForkMigrationEntries = [
     "ProjectionTurnItemCounts",
     Migration0001,
     [
-      "orchestration_v2_projection_turn_item_counts",
-      "orchestration_v2_turn_item_counts_insert",
-      "orchestration_v2_turn_item_counts_update",
-      "orchestration_v2_turn_item_counts_delete",
+      ["table", TURN_ITEM_COUNTS, TURN_ITEM_COUNTS],
+      ["trigger", "orchestration_v2_turn_item_counts_insert", TURN_ITEMS],
+      ["trigger", "orchestration_v2_turn_item_counts_update", TURN_ITEMS],
+      ["trigger", "orchestration_v2_turn_item_counts_delete", TURN_ITEMS],
     ],
   ],
   [
     2,
     "TurnItemMessageOrdinalIndex",
     Migration0002,
-    ["orchestration_v2_projection_turn_items_message_ordinal_idx"],
+    [["index", "orchestration_v2_projection_turn_items_message_ordinal_idx", TURN_ITEMS]],
   ],
 ] as const;
 
@@ -100,6 +105,30 @@ export const moveRc1PerfForkMigrations = Effect.fn("moveRc1PerfForkMigrations")(
   );
 });
 
+// Objects not in place on their table, and those of them that sit on another table: a rebuild
+// that keeps the old table aside takes the triggers and indexes with it, under the same names.
+const inspectObjects = Effect.fn("inspectPerfForkObjects")(function* (
+  objects: ReadonlyArray<PerfForkObject>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{
+    readonly type: string;
+    readonly name: string;
+    readonly tbl_name: string;
+  }>`
+    SELECT type, name, tbl_name FROM sqlite_master WHERE name IN ${sql.in(objects.map(([, name]) => name))}
+  `;
+  const missing = objects.filter(
+    ([type, name, table]) =>
+      !rows.some((row) => row.type === type && row.name === name && row.tbl_name === table),
+  );
+  const misplaced = missing.filter(
+    ([type, name]) =>
+      type !== "table" && rows.some((row) => row.type === type && row.name === name),
+  );
+  return { missing, misplaced };
+});
+
 const run = Migrator.make({});
 
 export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function* (
@@ -125,22 +154,40 @@ export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function
   const recorded = yield* sql<{ readonly migration_id: number; readonly name: string }>`
     SELECT migration_id, name FROM ${sql(PERF_FORK_MIGRATIONS_TABLE)}
   `;
-  // An upstream migration that rebuilds a table drops the fork's triggers and indexes on it, and
-  // the migrator never runs a recorded migration again: run one whose objects are gone again.
-  const present = new Set(
-    (yield* sql<{ readonly name: string }>`
-      SELECT name FROM sqlite_master
-      WHERE name IN ${sql.in(entries.flatMap(([, , , objects]) => objects))}
-    `).map((row) => row.name),
-  );
+  // An upstream migration that rebuilds a table drops the fork's triggers and indexes on it (or
+  // moves them to the old table it keeps), and the migrator never runs a recorded migration
+  // again: run one whose objects are not in place again.
   for (const [id, name, migration, objects] of entries) {
-    const missing = objects.filter((object) => !present.has(object));
-    if (missing.length === 0) continue;
     if (!recorded.some((row) => row.migration_id === id && row.name === name)) continue;
+    const found = yield* inspectObjects(objects);
+    if (found.missing.length === 0) continue;
+    const label = perfForkMigrationLabel([id, name]);
+    const missing = found.missing.map(([, object]) => object);
     yield* Effect.logWarning(
-      "A performance fork migration's objects are missing; running the migration again.",
-    ).pipe(Effect.annotateLogs({ migration: perfForkMigrationLabel([id, name]), missing }));
-    yield* sql.withTransaction(migration);
+      "A performance fork migration's objects are missing; restoring them.",
+    ).pipe(Effect.annotateLogs({ migration: label, missing }));
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          // Under the write lock: another start may have restored them since the check above.
+          const { missing, misplaced } = yield* inspectObjects(objects);
+          if (missing.length === 0) return;
+          for (const [type, object] of misplaced) {
+            yield* sql.unsafe(`DROP ${type === "trigger" ? "TRIGGER" : "INDEX"} "${object}"`);
+          }
+          yield* migration;
+        }),
+      )
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new Migrator.MigrationError({
+              kind: "Failed",
+              message: `Running ${label} again failed; missing: ${missing.join(", ")}`,
+              cause,
+            }),
+        ),
+      );
   }
 
   const names = new Map<number, string>(perfForkMigrationEntries.map(([id, name]) => [id, name]));

@@ -18,9 +18,10 @@ migrations it does not know, and only warns when started directly.
 Once they are moved, an upstream build starts on the database and runs its own migrations. It
 ignores `t3_perf_fork_migrations` and leaves the fork's objects in place, where writes keep them
 current. An upstream migration that rebuilds `orchestration_v2_projection_turn_items` drops the
-triggers and the index with that table. On its next start the fork runs the migrations whose objects
-are missing again, which recounts the turn items, and logs a warning that names them. Remove the
-fork's schema when you go back to an upstream build for good:
+triggers and the index with that table, or leaves them on the old table if it keeps that aside. On its
+next start the fork runs the migrations whose objects are not in place again (dropping any left on
+the old table), which recounts the turn items, and logs a warning that names them. Remove the fork's
+schema when you go back to an upstream build for good:
 
 1. Stop the server and anything else that opens the database, such as `t3` CLI commands.
 2. Copy `<T3 home>/userdata/statev2.sqlite` with its `-wal` and `-shm` files.

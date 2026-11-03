@@ -3,6 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
@@ -75,10 +76,18 @@ describe("DocumentText", () => {
             yield* TestClock.adjust("15 seconds");
             yield* probe.exited;
             return yield* Fiber.join(extraction);
-          }).pipe(Effect.provide(DocumentText.layer)),
-        ).pipe(
-          Effect.provideService(HostProcess.ExecutablePath, extractor),
-          Effect.provideService(HostProcess.IsExecutable, true),
+          }).pipe(
+            Effect.provide(
+              DocumentText.layer.pipe(
+                Layer.provide(
+                  Layer.mergeAll(
+                    Layer.succeed(HostProcess.ExecutablePath, extractor),
+                    Layer.succeed(HostProcess.IsExecutable, true),
+                  ),
+                ),
+              ),
+            ),
+          ),
         );
         expect(result).toBeUndefined();
       }).pipe(Effect.provide(NodeServices.layer)),

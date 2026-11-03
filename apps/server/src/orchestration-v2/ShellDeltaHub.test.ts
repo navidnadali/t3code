@@ -582,6 +582,66 @@ it.effect(
     }).pipe(Effect.scoped),
 );
 
+it.effect(
+  "subscribers cancelled while subscribing leave nothing behind: the next wave is served as before",
+  () =>
+    Effect.gen(function* () {
+      const base = yield* Scheduler.Scheduler;
+      const reads: Array<number> = [];
+      let baseReads = 0;
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const scope = yield* Scope.make();
+        const active = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+        const pull = yield* Stream.toPull(active.stream(0)).pipe(Scope.provide(scope));
+        const first = yield* Effect.forkScoped(pull);
+        yield* publish(threadId, 1);
+        assert.deepEqual(sequences(yield* Fiber.join(first)), [1]);
+        // A subscription parked at its n-th op and cancelled there, then its scope closed, for
+        // every n across the setup.
+        for (let at = 1; at <= 60; at++) {
+          const cancelled = yield* Scope.make();
+          const starting = yield* hub.subscribe().pipe(
+            Scope.provide(cancelled),
+            Effect.provideService(
+              Scheduler.Scheduler,
+              yieldOnceAt(base, at, () => true),
+            ),
+            Effect.forkScoped,
+          );
+          yield* Effect.yieldNow;
+          yield* Fiber.interrupt(starting);
+          yield* Scope.close(cancelled, Exit.void);
+        }
+        // The active subscriber resets on the next batch and resyncs from one read; a late
+        // subscriber is served as before.
+        yield* publish(ThreadId.make("thread:b"), 2);
+        assert.deepEqual(
+          (yield* pull).map((item) => item.kind),
+          ["resync"],
+        );
+        assert.equal(baseReads, 1);
+        const late = yield* hub.subscribe().pipe(Scope.provide(scope));
+        const pullLate = yield* Stream.toPull(late.stream(2)).pipe(Scope.provide(scope));
+        const next = yield* Effect.forkScoped(pullLate);
+        yield* TestClock.adjust(0);
+        yield* publish(ThreadId.make("thread:c"), 3);
+        assert.deepEqual(sequences(yield* Fiber.join(next)), [3]);
+        yield* Scope.close(scope, Exit.void);
+      }).pipe(
+        Effect.provide(
+          layerHub({
+            reads,
+            baseThreads: () => {
+              baseReads += 1;
+              return [];
+            },
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped),
+);
+
 it.effect("a reset the opening snapshot covers needs no resync", () =>
   Effect.gen(function* () {
     const reads: Array<number> = [];

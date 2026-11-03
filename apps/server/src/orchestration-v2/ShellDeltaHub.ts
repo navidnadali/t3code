@@ -312,9 +312,20 @@ const make = Effect.gen(function* () {
     const subscription = yield* PubSub.subscribe(instance.output).pipe(
       Scope.provide(subscriptionScope),
     );
-    // Batches published before this subscription cannot reach it: it has them "processed".
-    const state: SubscriberState = { seen: publishedSequence, resetThrough: undefined };
-    subscribers.add(state);
+    // Batches published before this subscription cannot reach it: it has them "processed". The
+    // entry and its removal are one step, so a setup cancelled after it leaves nothing behind.
+    const state = yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        const state: SubscriberState = { seen: publishedSequence, resetThrough: undefined };
+        subscribers.add(state);
+        return state;
+      }),
+      (state) =>
+        Effect.sync(() => {
+          subscribers.delete(state);
+          releaseBaseIfServed();
+        }),
+    ).pipe(Scope.provide(subscriptionScope));
     // One budget for all this subscriber retains: the latest delta per aggregate, held until the
     // stream is taken (its snapshot read runs meanwhile) and buffered after. When the stream
     // starts, held deltas the snapshot covers or an unchanged check skips are released.

@@ -1204,6 +1204,13 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerPlatformServices),
     );
   }),
-).pipe(Layer.provide(WorkerChildProcessSpawner.layerProcessRunner));
+).pipe(
+  Layer.provide(
+    Layer.merge(
+      WorkerChildProcessSpawner.layerProcessRunner,
+      WorkerChildProcessSpawner.layerCommandSpawner,
+    ),
+  ),
+);
 
 export const runServer = Layer.launch(layerMakeServer);

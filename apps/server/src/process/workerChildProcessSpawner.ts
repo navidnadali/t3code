@@ -1388,6 +1388,12 @@ export class CommandSpawner extends Context.Service<
   ChildProcessSpawner["Service"]
 >()("t3/process/workerChildProcessSpawner/CommandSpawner") {}
 
+/** The spawner for a command that runs to completion: the server's, else the ambient one. */
+export const commandSpawner = Effect.gen(function* () {
+  const server = yield* Effect.serviceOption(CommandSpawner);
+  return Option.isSome(server) ? server.value : yield* ChildProcessSpawner;
+});
+
 /** The server's CommandSpawner: the same spawner as `layerProcessRunner`'s (memoized). */
 export const layerCommandSpawner = Layer.effect(
   CommandSpawner,

@@ -22,10 +22,10 @@ export const withServerCommandSpawner = Effect.fn("testUtils.withServerCommandSp
   const ambientCommands: Array<string> = [];
   const recording = ChildProcessSpawner.ChildProcessSpawner.of({
     ...ambient,
-    spawn: (command) => {
+    spawn: Effect.fn("testUtils.ambientSpawn")(function* (command) {
       ambientCommands.push(command._tag === "StandardCommand" ? command.command : command._tag);
-      return ambient.spawn(command);
-    },
+      return yield* ambient.spawn(command);
+    }),
   });
   const result = yield* effect.pipe(
     Effect.provide(

@@ -245,7 +245,8 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
     kind: "root_run",
     ordinalWithinParent,
     advancesAppRunCount: true,
-    cwd: input.cwd,
+    // A reused scope keeps the spelling it was created with; the run's own is the same directory.
+    cwd: rootScopes.find((scope) => scope.id === scopeId)?.cwd ?? input.cwd,
     createdAt: input.createdAt,
   } satisfies OrchestrationV2CheckpointScope;
 });

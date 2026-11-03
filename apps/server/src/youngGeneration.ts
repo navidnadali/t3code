@@ -258,6 +258,7 @@ export const planYoungGenerationRelaunch = (input: {
     // supplies no flag, and a server started over IPC cannot relaunch itself. Say so, visibly.
     if (
       input.env[SERVICE_LAUNCHER_CONTEXT_ENV] !== undefined &&
+      resolveMaxSemiSpaceMb(input.env, input.execArgv) !== null &&
       !explicitMaxSemiSpace(input.env, input.execArgv).present
     ) {
       return {

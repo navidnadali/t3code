@@ -10,7 +10,6 @@ import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -437,8 +436,11 @@ describe("provider process hand-off", () => {
         expect(socket.closed).toBe(false);
         process.kill(pid, "SIGKILL");
         yield* watch.closed(socket);
-        const exit = yield* Effect.exit(handle.exitCode);
-        expect(Exit.isFailure(exit)).toBe(true);
+        // Its status is unknown, not a signal: it was not this server's child when it ended.
+        const failure = yield* Effect.flip(handle.exitCode);
+        const reason = (failure.cause as Error | undefined)?.message;
+        expect(reason).toContain("exited; its exit status is unknown");
+        expect(reason).not.toContain("signal");
         expect(yield* handle.isRunning).toBe(false);
         yield* waitFor((text) => text.includes("outlived the process spawner exited"));
       }).pipe(Effect.scoped, Effect.provide(launcherLayer().pipe(Layer.provideMerge(logLayer))));

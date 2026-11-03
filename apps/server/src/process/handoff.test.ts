@@ -732,6 +732,31 @@ describe("provider process hand-off", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // The Linux desktop runs the server with Electron's executable, Node only with
+  // ELECTRON_RUN_AS_NODE=1: the shim must start as Node too, or no provider runs.
+  it.live.skipIf(!linux)("hands off from a server running on Electron's executable", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-handoff-electron-" });
+      const electron = NodePath.join(directory, "electron");
+      yield* fs.writeFileString(
+        electron,
+        `#!/bin/sh\n[ "$ELECTRON_RUN_AS_NODE" = 1 ] || { echo "the Electron app would start" >&2; exit 9; }\nexec ${process.execPath} "$@"\n`,
+      );
+      yield* fs.chmod(electron, 0o755);
+      const handedOff = yield* Effect.gen(function* () {
+        const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node);
+        const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        const parent = yield* launcher.spawner.string(
+          ChildProcess.make(process.execPath, ["-e", "process.stdout.write(String(process.ppid))"]),
+        );
+        return spawnerProcessIds.has(Number(parent));
+      }).pipe(Effect.provideService(HostProcess.ExecutablePath, electron));
+      expect(handedOff).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   // The spawner passes each stdio end over its channel and keeps none; the command runs only once
   // the server says it holds them all, and a start cancelled before that never runs.
   it.live.skipIf(!linux)(

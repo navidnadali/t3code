@@ -18,8 +18,10 @@ import {
   planYoungGenerationRelaunch,
   resolveMaxSemiSpaceMb,
   NON_SERVER_COMMANDS,
+  nodeOptionsFromEnviron,
   nodeOptionsFromProcessListing,
   SERVER_COMMANDS,
+  startupNodeOptionsTrusted,
   serverChildEnvironment,
   tokenizeNodeOptions,
 } from "./youngGeneration.ts";
@@ -288,6 +290,38 @@ describe("isServerCommand", () => {
       (command) => !SERVER_COMMANDS.has(command) && !NON_SERVER_COMMANDS.has(command),
     );
     expect(unlisted).toEqual([]);
+  });
+});
+
+describe("nodeOptionsFromEnviron", () => {
+  it("decodes a /proc environ block as UTF-8 and finds NODE_OPTIONS among NUL-separated entries", () => {
+    const block = Buffer.from(
+      "HOME=/home/t3\0NODE_OPTIONS=--title=\u00e9t\u00e9 --no-warnings\0PATH=/usr/bin\0",
+      "utf8",
+    );
+    expect(nodeOptionsFromEnviron(block)).toBe("--title=\u00e9t\u00e9 --no-warnings");
+    expect(nodeOptionsFromEnviron(Buffer.from("HOME=/home/t3\0", "utf8"))).toBeUndefined();
+  });
+});
+
+describe("startupNodeOptionsTrusted", () => {
+  it("trusts the operating system's value only when it agrees with the value in effect now", () => {
+    // Agreement means no preload touched NODE_OPTIONS; the value in effect is then the startup value.
+    expect(
+      startupNodeOptionsTrusted({ known: true, value: "--no-warnings" }, "--no-warnings"),
+    ).toBe(true);
+    expect(startupNodeOptionsTrusted({ known: true, value: undefined }, undefined)).toBe(true);
+    // A preload deleted or rewrote it, or the listing could not be parsed exactly: never relaunch on a guess.
+    expect(startupNodeOptionsTrusted({ known: true, value: "--import x.mjs" }, undefined)).toBe(
+      false,
+    );
+    expect(
+      startupNodeOptionsTrusted(
+        { known: true, value: '--title="hello' },
+        '--title="hello FOO=bar" --max-semi-space-size=16',
+      ),
+    ).toBe(false);
+    expect(startupNodeOptionsTrusted({ known: false }, undefined)).toBe(false);
   });
 });
 
@@ -600,6 +634,26 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
         expect(report.maxSemiSpaceMb).toBe(DEFAULT_MAX_SEMI_SPACE_MB);
         expect(report.nodeOptionsForChildren).toBe(`${marker} --trace-warnings`);
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "hands children the launcher's quoted preload exactly as written, and a child starts with it",
+    () =>
+      Effect.gen(function* () {
+        // The cap is removed from NODE_OPTIONS as text; the rest is never re-tokenised, so quoting survives.
+        const marker = '--import "data:text/javascript,void 0"';
+        const report = yield* run({
+          NODE_OPTIONS: `${marker} ${flag}`,
+          [INHERITED_NODE_OPTIONS_ENV]: marker,
+        });
+        expect(report.applied).toBe(true);
+        expect(report.nodeOptionsForChildren).toBe(marker);
+        const child = NodeChildProcess.spawnSync(process.execPath, ["-e", "0"], {
+          env: { ...process.env, NODE_OPTIONS: report.nodeOptionsForChildren ?? "" },
+          encoding: "utf8",
+        });
+        expect(child.status, child.stderr).toBe(0);
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.live("keeps Node's default and says so when started with a preload", () =>

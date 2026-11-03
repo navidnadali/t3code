@@ -286,9 +286,24 @@ interface HandoffEntry {
   readonly killCallbacks: Map<number, (outcome: KillOutcome) => void>;
 }
 
-// Unix socket paths are limited to 104 bytes on macOS and 108 on Linux, NUL included.
-const MAX_SOCKET_PATH_BYTES = 100;
 const ORPHAN_POLL_MILLIS = 1_000;
+
+/**
+ * A Unix socket path holds 107 bytes on Linux, which a state directory can exceed. Reached through
+ * a descriptor of its directory, only the socket's own name counts; the kernel resolves the path
+ * while the call is made, so the descriptor closes right after.
+ */
+const throughDirectory = <A>(socketPath: string, use: (path: string) => A): A => {
+  const directory = NodeFS.openSync(
+    NodePath.dirname(socketPath),
+    NodeFS.constants.O_RDONLY | NodeFS.constants.O_DIRECTORY,
+  );
+  try {
+    return use(`/proc/self/fd/${directory}/${NodePath.basename(socketPath)}`);
+  } finally {
+    NodeFS.closeSync(directory);
+  }
+};
 
 /** Where spawn requests run: a worker thread or the spawner process. */
 interface Transport {
@@ -597,8 +612,16 @@ const makeRemoteHost = (options: {
 
   const connectHandoff = (entry: HandoffEntry) => {
     const { child } = entry;
-    for (const fd of entry.fds) {
-      const socket = NodeNet.connect({ path: entry.socketPath });
+    let sockets: ReadonlyArray<NodeNet.Socket>;
+    try {
+      sockets = throughDirectory(entry.socketPath, (path) =>
+        entry.fds.map(() => NodeNet.connect({ path })),
+      );
+    } catch (error) {
+      return handoffUnavailable(entry, toError(error));
+    }
+    for (const [index, fd] of entry.fds.entries()) {
+      const socket = sockets[index]!;
       child.sockets.set(fd, socket);
       // Output waits for its reader; stdin and held descriptors are never read.
       socket.pause();
@@ -914,10 +937,6 @@ const makeRemoteHost = (options: {
     const socketPath = NodePath.join(request.dir, NodeCrypto.randomBytes(12).toString("base64url"));
     if (transport === undefined) {
       callbacks.onUnavailable(new Error(options.stoppedMessage, { cause: failure }));
-      return child;
-    }
-    if (Buffer.byteLength(socketPath) > MAX_SOCKET_PATH_BYTES) {
-      callbacks.onUnavailable(new Error(`The hand-off socket path is too long: ${socketPath}`));
       return child;
     }
     const entry: HandoffEntry = {

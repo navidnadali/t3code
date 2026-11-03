@@ -130,6 +130,17 @@ const processStartTime = (pid) => {
     return undefined;
   }
 };
+// A socket path holds 107 bytes; through a descriptor of its directory only its name counts.
+const throughDirectory = (socketPath, use) => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const directory = fs.openSync(path.dirname(socketPath), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+  try {
+    return use("/proc/self/fd/" + directory + "/" + path.basename(socketPath));
+  } finally {
+    fs.closeSync(directory);
+  }
+};
 const startHandoff = (message) => {
   const id = message.id;
   const { path: socketPath, nonce, fds } = message.handoff;
@@ -197,9 +208,16 @@ const startHandoff = (message) => {
       for (const socket of accepted.values()) socket.destroy();
     },
   });
-  server.listen(socketPath, () => {
-    if (!closed) post({ t: "handoff", id });
-  });
+  try {
+    throughDirectory(socketPath, (path) =>
+      server.listen(path, () => {
+        if (!closed) post({ t: "handoff", id });
+      }),
+    );
+  } catch (error) {
+    close();
+    post({ t: "handoff-failed", id, error: errorFields(error) });
+  }
   const launch = () => {
     const stdio = [...message.options.stdio];
     for (const [fd, socket] of accepted) stdio[fd] = socket;

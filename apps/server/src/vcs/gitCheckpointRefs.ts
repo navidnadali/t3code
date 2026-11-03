@@ -195,14 +195,20 @@ const fingerprintOf = (stats: NodeFS.BigIntStats) =>
 export type BoundedRead =
   | { readonly kind: "bytes"; readonly fingerprint: string; readonly bytes: Buffer }
   | { readonly kind: "oversize"; readonly fingerprint: string }
+  | { readonly kind: "unchanged"; readonly fingerprint: string }
   | { readonly kind: "unreadable" };
 
 /**
- * The file's bytes, or "oversize" past `maxBytes`: the size is taken from the descriptor that is
- * then read, at most `maxBytes + 1` bytes, so a file swapped after the check is not the one read
- * and one that grows is not read whole.
+ * The file's bytes, or "oversize" past `maxBytes`, or "unchanged" when the descriptor's stat is
+ * `knownFingerprint` (nothing is read then). The size is taken from the descriptor that is then
+ * read, at most `maxBytes + 1` bytes into a buffer sized by that stat, so a file swapped after the
+ * check is not the one read and one that grows is not read whole.
  */
-export const readBoundedFile = (file: string, maxBytes: number): Effect.Effect<BoundedRead> =>
+export const readBoundedFile = (
+  file: string,
+  maxBytes: number,
+  knownFingerprint?: string,
+): Effect.Effect<BoundedRead> =>
   Effect.promise(
     () =>
       new Promise<BoundedRead>((resolve) => {
@@ -219,11 +225,16 @@ export const readBoundedFile = (file: string, maxBytes: number): Effect.Effect<B
                 return;
               }
               const fingerprint = fingerprintOf(stats);
+              if (fingerprint === knownFingerprint) {
+                finish({ kind: "unchanged", fingerprint });
+                return;
+              }
               if (stats.size > BigInt(maxBytes)) {
                 finish({ kind: "oversize", fingerprint });
                 return;
               }
-              const buffer = Buffer.allocUnsafe(maxBytes + 1);
+              // One byte past the size, so a file that grew (or a pipe) shows without reading on.
+              let buffer = Buffer.allocUnsafe(Number(stats.size) + 1);
               let offset = 0;
               const step = () =>
                 NodeFS.read(fd, buffer, offset, buffer.length - offset, null, (readError, read) => {
@@ -239,6 +250,11 @@ export const readBoundedFile = (file: string, maxBytes: number): Effect.Effect<B
                   if (offset > maxBytes) {
                     finish({ kind: "oversize", fingerprint });
                     return;
+                  }
+                  if (offset === buffer.length) {
+                    const grown = Buffer.allocUnsafe(maxBytes + 1);
+                    buffer.copy(grown, 0, 0, offset);
+                    buffer = grown;
                   }
                   step();
                 });
@@ -312,12 +328,12 @@ const readPackedRefs = Effect.fnUntraced(function* (
   cached: PackedRefs | undefined,
 ) {
   const file = NodePath.join(commonDir, "packed-refs");
-  const read = yield* readBoundedFile(file, PACKED_REFS_MAX_BYTES);
+  const read = yield* readBoundedFile(file, PACKED_REFS_MAX_BYTES, cached?.fingerprint);
   if (read.kind === "unreadable") {
     const { fingerprint } = yield* Effect.promise(() => statInfo(file));
     return fingerprint === "!ENOENT" ? { fingerprint, refs: new Map(), replaceRefs: false } : null;
   }
-  if (cached !== undefined && cached.fingerprint === read.fingerprint) return cached;
+  if (read.kind === "unchanged") return cached!;
   if (read.kind === "oversize")
     return { fingerprint: read.fingerprint, refs: null, replaceRefs: null };
   return {
@@ -422,9 +438,9 @@ const readLooseCommit = Effect.fnUntraced(function* (
 ) {
   const file = NodePath.join(objectsDir, oid.slice(0, 2), oid.slice(2));
   const key = `${objectsDir}\0${oid}`;
-  const read = yield* readBoundedFile(file, COMMIT_OBJECT_MAX_BYTES);
-  if (read.kind === "unreadable") return null;
-  if (failures.get(key) === read.fingerprint) return null;
+  // A file known to fail, still as it was, is not read again.
+  const read = yield* readBoundedFile(file, COMMIT_OBJECT_MAX_BYTES, failures.get(key));
+  if (read.kind === "unreadable" || read.kind === "unchanged") return null;
   const fail = () => {
     failures.set(key, read.fingerprint);
     return null;

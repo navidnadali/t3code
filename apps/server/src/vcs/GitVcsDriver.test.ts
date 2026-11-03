@@ -3102,5 +3102,12 @@ it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
         concurrency: "unbounded",
       });
       assert.strictEqual(fed.kind, "oversize");
+      // A known stat is answered from the descriptor without reading.
+      const again = yield* readBoundedFile(
+        exact,
+        bound,
+        read.kind === "bytes" ? read.fingerprint : "",
+      );
+      assert.strictEqual(again.kind, "unchanged");
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

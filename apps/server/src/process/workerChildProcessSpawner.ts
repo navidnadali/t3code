@@ -38,7 +38,7 @@ import * as ProcessRunner from "../processRunner.ts";
 import { HandoffProcess, type ProviderSpawnOptions } from "./handoffProcess.ts";
 import { isPidReused, isSameProcess } from "./processIdentity.ts";
 import { answerDeadlines, type SpawnerTimers } from "./spawnerDeadlines.ts";
-import { registerSpawnerProcess } from "./spawnerProcesses.ts";
+import { registerAdoptedProcess, registerSpawnerProcess } from "./spawnerProcesses.ts";
 import {
   EXEC_AFTER_GO,
   execAfterGoSource,
@@ -258,6 +258,8 @@ export interface HandoffChild {
   referenced: boolean;
   /** Its owner is done with it: its sockets close once it has exited. */
   released: boolean;
+  /** Set while it outlives its spawner: ends its adoption as the server's own child. */
+  forgetAdoption?: () => void;
 }
 
 export interface HandoffCallbacks {
@@ -576,6 +578,7 @@ const makeRemoteHost = (options: {
         isSameProcess(child.pid, child.startTime);
       if (alive) continue;
       orphans.delete(child);
+      child.forgetAdoption?.();
       completeHandoffExit(child, null, null);
       options.onHandoffOrphanExit?.();
     }
@@ -590,6 +593,8 @@ const makeRemoteHost = (options: {
     for (const child of children) {
       child.orphaned = true;
       orphans.add(child);
+      // Re-parented away from the server, still its own for the port tools and telemetry.
+      if (child.pid !== undefined) child.forgetAdoption = registerAdoptedProcess(child.pid);
     }
     options.onHandoffOrphans?.(children.length);
     if (orphanTimer === undefined) {

@@ -14,6 +14,14 @@ const adopted = new Set<number>();
  */
 export const adoptedProcessIds: ReadonlySet<number> = adopted;
 
+/** Records a provider that outlived its spawner; the returned function forgets it. */
+export const registerAdoptedProcess = (pid: number) => {
+  adopted.add(pid);
+  return () => {
+    adopted.delete(pid);
+  };
+};
+
 /** Records a spawner process the server started; the returned function forgets it. */
 export const registerSpawnerProcess = (pid: number) => {
   live.add(pid);

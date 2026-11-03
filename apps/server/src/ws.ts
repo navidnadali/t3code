@@ -1059,9 +1059,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     const enrichmentChanges = yield* projectEnrichment.subscribeChanges;
     // Subscribe before the snapshot or high-water read: the hub projects every later event once for all subscribers.
     const shellDeltas = yield* (yield* ShellDeltaHub.ShellDeltaHub).subscribe();
+    // Given `rows` (a resync base's), the projects are not listed again; only their enrichment is.
     const loadProjectMetadataSnapshot = Effect.fn("ws.orchestrationV2.loadProjectMetadataSnapshot")(
-      function* (snapshotSequence: number) {
-        const enriched = yield* enrichProjectShells(yield* projects.listShells());
+      function* (snapshotSequence: number, rows?: ReadonlyArray<OrchestrationProjectShell>) {
+        const enriched = yield* enrichProjectShells(rows ?? (yield* projects.listShells()));
         return {
           snapshot: {
             schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
@@ -1152,7 +1153,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           return Stream.concat(
             initialSnapshotItems(loaded),
             Stream.unwrap(
-              loadProjectMetadataSnapshot(base.snapshotSequence).pipe(
+              loadProjectMetadataSnapshot(base.snapshotSequence, base.projects).pipe(
                 Effect.provideService(
                   ProjectEnrichmentService.ProjectEnrichmentService,
                   projectEnrichment,

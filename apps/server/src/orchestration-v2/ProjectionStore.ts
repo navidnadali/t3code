@@ -3148,8 +3148,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             fields.some(
               (field) => field === "plans" || field === "runs" || field === "providerThreads",
             ));
-        // A window's reads that need only the thread go to the reader with the thread row; their
-        // results are checked where they were read before, so the first failure is unchanged.
+        // On a reader worker a window's reads that need only the thread go with the thread row (in
+        // turn on the writer); results are checked where they were read before, so errors keep order.
         const [threadRead, retainedRead, todoListRead] = yield* Effect.all(
           [
             sql<PayloadRow>`
@@ -3163,7 +3163,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               : Effect.void,
             readsTodoList ? latestTodoListRows(threadId) : Effect.succeed([]),
           ],
-          { concurrency: "unbounded", mode: "result" },
+          { concurrency: yield* NodeSqliteClient.readConcurrency, mode: "result" },
         );
         const threadRow = (yield* Effect.fromResult(threadRead))[0];
         if (!threadRow) {
@@ -3285,8 +3285,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         // A newer completion must keep an older active list from resurfacing after paging.
         const [latestTodoList] = yield* Effect.fromResult(todoListRead);
 
-        // One snapshot, so the table reads go to the reader together rather than one round trip
-        // after another, each of which holds the reader until the main thread sends the next.
+        // One snapshot: on a reader worker the table reads go together rather than one round trip
+        // after another, each holding the reader until the main thread sends the next.
         const [
           runRows,
           attemptRows,
@@ -3643,7 +3643,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ORDER BY rowid ASC
           `,
           ],
-          { concurrency: "unbounded" },
+          { concurrency: yield* NodeSqliteClient.readConcurrency },
         );
         // Migration 78 indexes exactly this expression, type list and json_valid term: changing
         // any, even the IN order, silently drops the index. ProjectionStore.test.ts asserts the plan.
@@ -6125,7 +6125,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       `).map((row) => ThreadId.make(row.thread_id))[0] ??
                       threadId,
                   };
-            // The sequence goes to the reader with the projection's first reads, in the same snapshot.
+            // On a reader worker the sequence goes with the projection's first reads (same snapshot).
             const [projectionRead, sequenceRead] = yield* Effect.all(
               [
                 readProjection(threadId, new Set(), {
@@ -6145,7 +6145,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     AND stream_id = ${threadId}
                 `,
               ],
-              { concurrency: "unbounded", mode: "result" },
+              { concurrency: yield* NodeSqliteClient.readConcurrency, mode: "result" },
             );
             const projection = yield* Effect.fromResult(projectionRead);
             const rows = yield* Effect.fromResult(sequenceRead);

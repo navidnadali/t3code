@@ -95,6 +95,20 @@ export const ReaderPermits = Context.Reference<Semaphore.Semaphore | undefined>(
 
 const readerPermitCount = (readers: number) => Math.max(1, readers - 1);
 
+const OnReaderWorker = Context.Reference<boolean>(
+  "@t3tools/shared/nodeSqliteClient/OnReaderWorker",
+  { defaultValue: () => false },
+);
+
+/**
+ * Concurrency for the statements of one read transaction: together on a reader worker, where they
+ * share a round trip; in turn on the writer, where forking them gains nothing and lets the reading
+ * client take the writer again before reads waiting for it.
+ */
+export const readConcurrency: Effect.Effect<"unbounded" | undefined> = Effect.gen(function* () {
+  return (yield* OnReaderWorker) ? "unbounded" : undefined;
+});
+
 /**
  * An idle reader always takes a queued read. When classes compete, a class passed over once per
  * reader goes first (most passed over first), then `small` (default) or `page` reads holding no
@@ -1598,7 +1612,14 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const body = Effect.withFiber<A, E, R>((fiber) => {
           annotateAcquired(fiber, pending.acquired, pending.ownerAtWaitStart);
           pending.restore = undefined;
-          return effect;
+          // Savepoints acquire nothing and keep their transaction's connection.
+          return pending.acquired === undefined
+            ? effect
+            : Effect.provideService(
+                effect,
+                OnReaderWorker,
+                pending.acquired.connection === "reader",
+              );
         });
         return restore(
           withTransaction(body).pipe(Effect.provideService(TransactionAcquire, pending)),

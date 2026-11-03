@@ -215,11 +215,16 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
     (scope) => scope.kind === "root_run" && scope.parentScopeId === null,
   );
   const rootScope = rootScopes.find((scope) => scope.id === rootScopeId);
-  const workspace = yield* input.resolve(input.cwd);
+  // The same spelling needs no file system lookup; another spelling may still be the same directory.
+  const sameAsRoot =
+    rootScope !== undefined &&
+    (rootScope.cwd === input.cwd ||
+      (yield* input.resolve(rootScope.cwd)) === (yield* input.resolve(input.cwd)));
   const [scopeId, ordinalWithinParent] =
-    rootScope === undefined || (yield* input.resolve(rootScope.cwd)) === workspace
+    rootScope === undefined || sameAsRoot
       ? ([rootScopeId, 0] as const)
       : yield* Effect.gen(function* () {
+          const workspace = yield* input.resolve(input.cwd);
           const crypto = yield* Crypto.Crypto;
           const digest = yield* crypto
             .digest("SHA-256", new TextEncoder().encode(workspace))

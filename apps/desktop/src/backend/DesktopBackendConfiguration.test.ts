@@ -14,6 +14,7 @@ import { ChildProcessSpawner } from "effect/process";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopManagedPolicy from "../app/DesktopManagedPolicy.ts";
 import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
+import { wslNodeFallbackCapFlags } from "./DesktopBackendConfiguration.ts";
 import * as DesktopShellEnvironment from "../shell/DesktopShellEnvironment.ts";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopServerExposure from "./DesktopServerExposure.ts";
@@ -326,6 +327,31 @@ describe("DesktopBackendConfiguration", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("resolveWsl gives the node fallback no cap when the desktop's environment sets one or disables it", () =>
+    Effect.gen(function* () {
+      // The desktop's NODE_OPTIONS and the escape hatch are what WSL sees; a forced 64 would override them.
+      const nodeOptions = process.env.NODE_OPTIONS;
+      const hatch = process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
+          else process.env.NODE_OPTIONS = nodeOptions;
+          if (hatch === undefined) delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+          else process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = hatch;
+        }),
+      );
+      process.env.NODE_OPTIONS = "--max-semi-space-size=16";
+      delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+      assert.notInclude(wslNodeFallbackCapFlags(), "--max-semi-space-size=64");
+      delete process.env.NODE_OPTIONS;
+      process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "0";
+      assert.deepEqual(wslNodeFallbackCapFlags(), []);
+      process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "96";
+      assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=96"]);
+      delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+      assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
+    }).pipe(Effect.scoped),
+  );
   it.effect("resolveWsl pins a default-tracking run to the concrete default distro", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

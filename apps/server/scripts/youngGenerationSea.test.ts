@@ -26,8 +26,9 @@ interface NodeFlagsReport {
 const nodeFlags = (
   executable: string,
   env: Record<string, string | undefined>,
+  before: ReadonlyArray<string> = [],
 ): NodeFlagsReport => {
-  const result = NodeChildProcess.spawnSync(executable, ["__node-flags"], {
+  const result = NodeChildProcess.spawnSync(executable, [...before, "__node-flags"], {
     env: {
       ...process.env,
       NODE_OPTIONS: undefined,
@@ -95,6 +96,15 @@ describe("young-generation default in the single executable", () => {
       const direct = nodeFlags(executable, { NODE_OPTIONS: userOptions });
       expect(direct.execArgv).toContain(userOptions);
       expect(direct.heapSizeLimitMiB!).toBeGreaterThan(12000);
+      // Command-line options survive the relaunch and win over NODE_OPTIONS, as Node orders them.
+      const mixed = nodeFlags(executable, { NODE_OPTIONS: "--no-warnings" }, [
+        "--node-options=--max-semi-space-size=16",
+      ]);
+      expect(mixed.maxSemiSpaceMb).toBe(16);
+      expect(mixed.execArgv.slice(1)).toEqual(["--no-warnings", "--max-semi-space-size=16"]);
+      // A helper's heap bound, given on the command line as the server now does, reaches V8.
+      const bounded = nodeFlags(executable, {}, ["--node-options=--max-old-space-size=192"]);
+      expect(bounded.heapSizeLimitMiB!).toBeLessThan(512);
       expect(direct.sea).toBe(true);
       expect(direct, direct.keptReason).toMatchObject({
         applied: true,

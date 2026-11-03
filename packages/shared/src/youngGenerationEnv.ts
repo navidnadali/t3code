@@ -195,5 +195,25 @@ export const nodeCapFlag = (env: Environment): string | undefined => {
 };
 
 /** One argument as NODE_OPTIONS text: double quotes around spaces and quotes, which Node unquotes. */
-export const quoteNodeOption = (token: string): string =>
+const quoteNodeOption = (token: string): string =>
   /[\s"]/.test(token) ? `"${token.replaceAll(/(["\\])/g, "\\$1")}"` : token;
+
+/**
+ * What a single executable, which takes Node options only on its command line, is to be given there:
+ * the user's NODE_OPTIONS, and the wanted cap when it is not the executable's own default; undefined
+ * when there is nothing to pass.
+ */
+export const nodeOptionsArgument = (
+  env: Environment,
+  commandLine: ReadonlyArray<string> = [],
+): string | undefined => {
+  const options = env.NODE_OPTIONS?.trim() ?? "";
+  // The command line follows NODE_OPTIONS, as Node orders them, so it keeps winning.
+  const given = [options, ...commandLine.map(quoteNodeOption)].filter((part) => part !== "");
+  const explicit = (flagIn(commandLine) ?? flagIn(tokenizeNodeOptions(options))) !== undefined;
+  const wanted = capSetting(env);
+  const cap =
+    explicit || wanted === DEFAULT_MAX_SEMI_SPACE_MB ? "" : `${MAX_SEMI_SPACE_FLAG}=${wanted}`;
+  const value = [...given, cap].filter((part) => part !== "").join(" ");
+  return value === "" ? undefined : `--node-options=${value}`;
+};

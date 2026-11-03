@@ -18,6 +18,7 @@ import serverPackageJson from "../../../server/package.json" with { type: "json"
 import {
   INHERITED_NODE_OPTIONS_ENV,
   nodeCapFlag,
+  nodeOptionsArgument,
   serverChildEnvironment,
 } from "@t3tools/shared/youngGenerationEnv";
 
@@ -130,11 +131,23 @@ const nodeBinDirOf = (nodePath: string): string => {
  * desktop's): none when NODE_OPTIONS sets one or the hatch disables it, so nothing is overridden.
  */
 export const wslNodeFallbackCapFlags = (): ReadonlyArray<string> => {
-  const flag = nodeCapFlag({
-    NODE_OPTIONS: process.env.NODE_OPTIONS,
-    T3CODE_V8_MAX_SEMI_SPACE_MB: process.env.T3CODE_V8_MAX_SEMI_SPACE_MB,
-  });
+  const flag = nodeCapFlag(wslYoungGenerationEnv());
   return flag === undefined ? [] : [flag];
+};
+
+/** What WSL sees of the desktop's young-generation settings: its NODE_OPTIONS and the escape hatch. */
+const wslYoungGenerationEnv = () => ({
+  NODE_OPTIONS: process.env.NODE_OPTIONS,
+  T3CODE_V8_MAX_SEMI_SPACE_MB: process.env.T3CODE_V8_MAX_SEMI_SPACE_MB,
+});
+
+/**
+ * The packaged WSL executable takes Node options only on its command line (it ignores NODE_OPTIONS),
+ * and its bootstrap descriptor rules out a corrective relaunch: the desktop passes them itself.
+ */
+const wslExecutableNodeOptions = (): ReadonlyArray<string> => {
+  const argument = nodeOptionsArgument(wslYoungGenerationEnv());
+  return argument === undefined ? [] : [argument];
 };
 
 /** The backend's young-generation cap, with the marker that gives its children the desktop's own NODE_OPTIONS. */
@@ -728,7 +741,7 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
   // The executable has its young-generation cap built in; node takes it as a flag, never relaunching.
   const command =
     runtime.kind === "executable"
-      ? [runtime.entryPath]
+      ? [runtime.entryPath, ...wslExecutableNodeOptions()]
       : [runtime.nodePath, ...wslNodeFallbackCapFlags(), runtime.linuxEntryPath];
 
   return {

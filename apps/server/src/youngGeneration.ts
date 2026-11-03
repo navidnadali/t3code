@@ -6,14 +6,13 @@ import * as NodeV8 from "node:v8";
 
 import {
   capSetting,
-  DEFAULT_MAX_SEMI_SPACE_MB,
   explicitMaxSemiSpace,
   flagIn,
   INHERITED_NODE_OPTIONS_ENV,
   MAX_SEMI_SPACE_ENV,
   MAX_SEMI_SPACE_FLAG as FLAG,
   nodeOptionSpans,
-  quoteNodeOption,
+  nodeOptionsArgument,
   nodeOptionsWithMaxSemiSpace,
   optionName,
   resolveMaxSemiSpaceMb,
@@ -27,6 +26,7 @@ export {
   DEFAULT_MAX_SEMI_SPACE_MB,
   INHERITED_NODE_OPTIONS_ENV,
   MAX_SEMI_SPACE_ENV,
+  nodeOptionsArgument,
   nodeOptionsWithMaxSemiSpace,
   resolveMaxSemiSpaceMb,
   serverChildEnvironment,
@@ -90,25 +90,6 @@ const sizeOf = (value: string | undefined): number | undefined => {
   if (value === undefined) return undefined;
   const parsed = Number(value);
   return value !== "" && Number.isFinite(parsed) ? parsed : 0;
-};
-
-/**
- * What a single executable, which takes Node options only on its command line, is to be given there:
- * the user's NODE_OPTIONS, and the wanted cap when it is not the executable's own default; undefined
- * when there is nothing to pass.
- */
-export const nodeOptionsArgument = (
-  env: Environment,
-  commandLine: ReadonlyArray<string> = [],
-): string | undefined => {
-  const options = env.NODE_OPTIONS?.trim() ?? "";
-  // The command line follows NODE_OPTIONS, as Node orders them, so it keeps winning.
-  const given = [options, ...commandLine.map(quoteNodeOption)].filter((part) => part !== "");
-  const explicit = (flagIn(commandLine) ?? flagIn(tokenizeNodeOptions(options))) !== undefined;
-  const wanted = capSetting(env);
-  const cap = explicit || wanted === DEFAULT_MAX_SEMI_SPACE_MB ? "" : `${FLAG}=${wanted}`;
-  const value = [...given, cap].filter((part) => part !== "").join(" ");
-  return value === "" ? undefined : `--node-options=${value}`;
 };
 
 /**
@@ -411,10 +392,11 @@ export const planYoungGenerationRelaunch = (input: {
     return { kind: "keep", reason: "the inspector is active", structural: true, ...pending };
   }
   // A preload runs before this code and may have rewritten NODE_OPTIONS: what it reads now is not
-  // what Node started with, so neither an explicit cap nor the user's options can be trusted. A
-  // single executable has not run its NODE_OPTIONS preloads at all yet; they run once, next image.
-  if (!cliOptions && (input.preloadRan === true || preloadVisible(input.env, input.execArgv))) {
-    return { kind: "keep", reason: "started with a preload" };
+  // what Node started with, so neither an explicit cap nor the user's options can be trusted, and
+  // carrying it into a relaunch would run it twice. A single executable has not run the preloads
+  // in its NODE_OPTIONS yet (they run once, next image); one on its command line has run.
+  if (input.preloadRan === true || preloadVisible(cliOptions ? {} : input.env, input.execArgv)) {
+    return { kind: "keep", reason: "started with a preload", ...pending };
   }
   if (!isServerCommand(input.argv, input.isDirectory)) {
     return { kind: "keep", reason: "not a server command", ...pending };

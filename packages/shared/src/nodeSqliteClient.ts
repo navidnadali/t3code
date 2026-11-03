@@ -84,14 +84,197 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
   );
 
 /**
- * One permit fewer than the reader workers, at least one. A read of large row sets holds one from
- * before its transaction until decoded, so such reads never hold every reader; with one reader or
- * none, other reads can wait behind one.
+ * Permits for reads of a thread's whole history, one fewer than the reader workers (at least one).
+ * Such a read holds one from before its transaction until decoded, so this bounds the history row
+ * sets held at once.
  */
 export const ReaderPermits = Context.Reference<Semaphore.Semaphore | undefined>(
   "@t3tools/shared/nodeSqliteClient/ReaderPermits",
   { defaultValue: () => undefined },
 );
+
+const readerPermitCount = (readers: number) => Math.max(1, readers - 1);
+
+const OnReaderWorker = Context.Reference<boolean>(
+  "@t3tools/shared/nodeSqliteClient/OnReaderWorker",
+  { defaultValue: () => false },
+);
+
+/**
+ * Concurrency for the statements of one read transaction: together on a reader worker, where they
+ * share a round trip; in turn on the writer, where forking them gains nothing and lets the reading
+ * client take the writer again before reads waiting for it.
+ */
+export const readConcurrency: Effect.Effect<"unbounded" | undefined> = Effect.gen(function* () {
+  return (yield* OnReaderWorker) ? "unbounded" : undefined;
+});
+
+/**
+ * An idle reader always takes a queued read. When classes compete, a class passed over once per
+ * reader goes first (most passed over first), then `small` (default) or `page` reads holding no
+ * reader, then small, page, history; history reads holding all readers but two (min 1) go last.
+ */
+export type ReadClass = "small" | "page" | "history";
+
+const ReadClassRef = Context.Reference<ReadClass>("@t3tools/shared/nodeSqliteClient/ReadClass", {
+  defaultValue: () => "small",
+});
+
+/** Marks a read of one page of a thread's history, bounded by the page. */
+export const pageRead = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, ReadClassRef, "page");
+
+/** Marks a read of a thread's whole history. */
+export const historyRead = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, ReadClassRef, "history");
+
+/** historyRead for a stream. */
+export const historyReadStream = <A, E, R>(
+  stream: Stream.Stream<A, E, R>,
+): Stream.Stream<A, E, R> => Stream.provideService(stream, ReadClassRef, "history");
+
+const historyReaderCount = (readers: number) => Math.max(1, readers - 2);
+
+const READ_CLASSES: ReadonlyArray<ReadClass> = ["small", "page", "history"];
+
+interface SlotWaiter {
+  readonly readClass: ReadClass;
+  woken: boolean;
+  readonly wake: () => void;
+}
+
+// Reader slots handed out by class. A woken waiter takes the slot handed to it when it runs, so one
+// interrupted in between takes nothing and passes the slot on; reads never pass queued ones.
+class ReaderSlots {
+  free: number;
+  woken = 0;
+  readonly held: Record<ReadClass, number> = { small: 0, page: 0, history: 0 };
+  readonly wokenFor: Record<ReadClass, number> = { small: 0, page: 0, history: 0 };
+  readonly passedOver: Record<ReadClass, number> = { small: 0, page: 0, history: 0 };
+  readonly historyCap: number;
+  readonly agingLimit: number;
+  readonly waiters: Record<ReadClass, Set<SlotWaiter>> = {
+    small: new Set(),
+    page: new Set(),
+    history: new Set(),
+  };
+
+  constructor(readers: number) {
+    this.free = readers;
+    this.historyCap = historyReaderCount(readers);
+    this.agingLimit = Math.max(1, readers);
+  }
+
+  private queued(readClass: ReadClass): number {
+    return this.waiters[readClass].size - this.wokenFor[readClass];
+  }
+
+  // Compared in turn, lowest first: history reads at their limit go last; a class passed over once
+  // per reader goes before the rest, the most passed over first; a small or page class holding no
+  // reader next; then class order.
+  private rank(readClass: ReadClass, order: number): ReadonlyArray<number> {
+    const holding = this.held[readClass] + this.wokenFor[readClass];
+    const overLimit = readClass === "history" && holding >= this.historyCap;
+    const passedOver = this.passedOver[readClass];
+    const aged = passedOver >= this.agingLimit;
+    const served = readClass === "history" || holding > 0;
+    return [overLimit ? 1 : 0, aged ? -passedOver : 0, served ? 1 : 0, order];
+  }
+
+  private firstQueued(readClass: ReadClass): SlotWaiter | undefined {
+    for (const waiter of this.waiters[readClass]) if (!waiter.woken) return waiter;
+    return undefined;
+  }
+
+  private next(): ReadClass | undefined {
+    let next: ReadClass | undefined;
+    let nextRank: ReadonlyArray<number> = [];
+    for (const [order, readClass] of READ_CLASSES.entries()) {
+      if (this.queued(readClass) === 0) continue;
+      const rank = this.rank(readClass, order);
+      const first = rank.findIndex((value, index) => value !== nextRank[index]);
+      if (next === undefined || rank[first]! < nextRank[first]!)
+        [next, nextRank] = [readClass, rank];
+    }
+    return next;
+  }
+
+  take(readClass: ReadClass): Effect.Effect<void> {
+    return Effect.suspend(() => {
+      if (this.free - this.woken <= 0 || READ_CLASSES.some((other) => this.queued(other) > 0))
+        return this.wait(readClass);
+      this.free--;
+      this.held[readClass]++;
+      return Effect.void;
+    });
+  }
+
+  private wait(readClass: ReadClass): Effect.Effect<void> {
+    return Effect.callback<void>((resume) => {
+      const waiter: SlotWaiter = {
+        readClass,
+        woken: false,
+        wake: () => {
+          waiter.woken = true;
+          resume(Effect.suspend(() => (this.claim(waiter) ? Effect.void : this.take(readClass))));
+        },
+      };
+      this.waiters[readClass].add(waiter);
+      return Effect.withFiber((fiber) => {
+        // Interrupted after being woken, it gives the slot handed to it to the next waiter.
+        const wokenSlot = waiter.woken;
+        this.forget(waiter);
+        if (wokenSlot) this.wakeWaiters(fiber);
+        return Effect.void;
+      });
+    });
+  }
+
+  // A woken waiter takes the slot handed to it, whatever has queued since.
+  private claim(waiter: SlotWaiter): boolean {
+    if (!this.forget(waiter)) return false;
+    this.free--;
+    this.held[waiter.readClass]++;
+    return true;
+  }
+
+  private forget(waiter: SlotWaiter): boolean {
+    const queue = this.waiters[waiter.readClass];
+    if (!queue.delete(waiter)) return false;
+    if (queue.size === 0) this.passedOver[waiter.readClass] = 0;
+    if (waiter.woken) {
+      this.woken--;
+      this.wokenFor[waiter.readClass]--;
+    }
+    return true;
+  }
+
+  release(readClass: ReadClass): Effect.Effect<void> {
+    return Effect.withFiber((fiber) => {
+      this.free++;
+      this.held[readClass]--;
+      this.wakeWaiters(fiber);
+      return Effect.void;
+    });
+  }
+
+  private wakeWaiters(fiber: Fiber.Fiber<unknown, unknown>) {
+    if (READ_CLASSES.every((readClass) => this.queued(readClass) === 0)) return;
+    fiber.currentDispatcher.scheduleTask(() => {
+      while (this.free - this.woken > 0) {
+        const readClass = this.next();
+        if (readClass === undefined) return;
+        const waiter = this.firstQueued(readClass)!;
+        for (const other of READ_CLASSES)
+          if (other !== readClass && this.queued(other) > 0) this.passedOver[other]++;
+        this.passedOver[readClass] = 0;
+        this.woken++;
+        this.wokenFor[readClass]++;
+        waiter.wake();
+      }
+    }, 0);
+  }
+}
 
 interface Acquired {
   readonly connection: "writer" | "reader";
@@ -1238,8 +1421,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           })),
         )
       : [];
-  // Counts idle reader slots, so a read waits for whichever slot frees first.
-  const idleReaders = yield* Semaphore.make(readers.length);
+  const slots = new ReaderSlots(readers.length);
   if (readers.length > 0) yield* Metric.update(readerPoolAvailable, 1);
 
   const writer = { name: "writer" as const, lock: semaphore, connection };
@@ -1255,7 +1437,9 @@ const make = Effect.fn("makeWithDatabase")(function* (
       if (readers.length === 0 || readerPool.unavailable || !Context.get(fiber.context, ReadOnly)) {
         return Effect.succeed(writer);
       }
-      const claim = Effect.flatMap(wait(idleReaders.take(1)), () => {
+      const readClass = Context.get(fiber.context, ReadClassRef);
+      const takeSlot = wait(slots.take(readClass));
+      const claim = Effect.flatMap(takeSlot, () => {
         // The lowest idle slot wins, so later slots start a worker only while earlier ones are busy.
         const slot = readers.find((candidate) => !candidate.busy)!;
         slot.busy = true;
@@ -1265,7 +1449,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           if (!held) return Effect.void;
           held = false;
           slot.busy = false;
-          return Effect.asVoid(idleReaders.release(1));
+          return slots.release(readClass);
         });
         return Effect.as(claimed(release), { slot, release });
       });
@@ -1412,7 +1596,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
     ],
   });
   const withTransaction = client.withTransaction;
-  const readerPermits = yield* Semaphore.make(Math.max(1, readers.length - 1));
+  const readerPermits = yield* Semaphore.make(readerPermitCount(readers.length));
   const transactional = Object.assign(client, {
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.uninterruptibleMask((restore) => {
@@ -1428,7 +1612,14 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const body = Effect.withFiber<A, E, R>((fiber) => {
           annotateAcquired(fiber, pending.acquired, pending.ownerAtWaitStart);
           pending.restore = undefined;
-          return effect;
+          // Savepoints acquire nothing and keep their transaction's connection.
+          return pending.acquired === undefined
+            ? effect
+            : Effect.provideService(
+                effect,
+                OnReaderWorker,
+                pending.acquired.connection === "reader",
+              );
         });
         return restore(
           withTransaction(body).pipe(Effect.provideService(TransactionAcquire, pending)),

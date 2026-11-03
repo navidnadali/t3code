@@ -4,14 +4,14 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
-import ProjectionTurnItemCounts from "./077_ProjectionTurnItemCounts.ts";
+import ProjectionTurnItemCounts from "./001_ProjectionTurnItemCounts.ts";
 
 it.effect(
   "backfills turn-item counts per thread and run, re-runs cleanly, then follows writes",
   () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 76 });
+      yield* runMigrations({ toPerfForkMigrationInclusive: 0 });
       // The projection's own upsert: every update rewrites thread_id and run_id.
       const upsert = (id: string, threadId: string, runId: string | null) => sql`
       INSERT INTO orchestration_v2_projection_turn_items (

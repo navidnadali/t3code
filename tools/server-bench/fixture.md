@@ -106,7 +106,7 @@ Kept as written (`fixture/content.ts`):
 | Model and provider names      | key ends in `model`/`provider`/`driver` (also `…Name`, `…Slug`); value without spaces, ≤ 128                                                                                                                   |
 | Git hashes                    | key ends in `sha`/`hash`/`oid`/`commit`/`revision`; value 7–64 hex digits                                                                                                                                      |
 | Object keys                   | identifiers `[A-Za-z_$@][A-Za-z0-9_$@.:-]{0,63}` the pattern layer does not flag; any other key becomes key filler: a seed and the letters it fixes, a `.` every eighth character, one per byte (at least ten) |
-| Structural tables             | `effect_sql_migrations`, `orchestration_v2_projection_metadata` and `orchestration_v2_projection_turn_item_counts`, whole                                                                                      |
+| Structural tables             | `effect_sql_migrations`, `t3_perf_fork_migrations`, `orchestration_v2_projection_metadata` and `orchestration_v2_projection_turn_item_counts`, whole                                                           |
 
 A value under a credential-named key (`password`, `token`, `secret`, `api_key`, `auth`, …) keeps only a known
 literal. Under a credential-holding ancestor (`credentials`, `auth`, `token`, `secret`, `cookie`, `pass`, `pin`, …; not
@@ -188,9 +188,9 @@ paths they find no repository. For bench runs (P1-007) set, in `<base-dir>/userd
 `T3CODE_TELEMETRY_ENABLED=false`. The identity probes cannot be switched off.
 
 A fixture carries the migrations of the build that sanitised it. Booted by a newer build, its first boot runs
-the newer migrations: one made at migration 76 gains P1-014's turn item count table (migration 77 creates it,
-its triggers, and fills it from the turn items; no events). Sanitise with the build you bench, or snapshot the
-fixture after that first boot.
+the newer migrations: one made without the fork's own migrations gains P1-014's turn item count table (fork
+migration 1 creates it, its triggers, and fills it from the turn items; no events). Sanitise with the build you
+bench, or snapshot the fixture after that first boot.
 
 ## synth
 
@@ -215,9 +215,10 @@ not filler). "A boot writes nothing" holds for synth output as written and for s
 - Events: one per entity, plus the shape's extra updates per event type (compactable types stay at first + latest,
   so the store's compaction finds nothing to delete).
 - Not written: tables the generator has no model for (pull request links, v1 sessions, …) show as `0 / target`.
-- The same shape, `--scale`, `--seed` and flags give the same bytes: the two columns the server stamps with the
-  wall clock (`effect_sql_migrations.created_at`, `orchestration_v2_projection_metadata.updated_at`) are set to
-  the synth's newest activity time (`--now`, else the shape's `capturedAt`).
+- The same shape, `--scale`, `--seed` and flags give the same bytes: the columns the server stamps with the
+  wall clock (`created_at` in `effect_sql_migrations` and `t3_perf_fork_migrations`,
+  `orchestration_v2_projection_metadata.updated_at`) are set to the synth's newest activity time (`--now`, else
+  the shape's `capturedAt`).
 - `--provider`, `--driver`, `--model` set the instance threads use (default `claudeAgent`, `claude-sonnet-4-6`);
   project folders sit under `--workspace-root` (default `/t3-bench-synthetic`, never created).
 

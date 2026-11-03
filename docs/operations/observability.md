@@ -745,15 +745,25 @@ SIGBUS and terminates the process. CLI commands that open the database, such as 
 `t3 auth`, `t3 environment`, and `t3 thread`, use the same settings, and an invalid value stops them
 as well as the server.
 
-Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers. Reads of a thread's
-history (full snapshots and projections, snapshot windows, history and timeline pages, turn starts,
-thread search, and records of turn items, nodes, messages, subagents, plans, handoffs or transfers)
-each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from before their read
-transaction until their rows are decoded. That bounds the history rows held at once and leaves a
-reader for every other read (thread shells, settlement, the thread row, runs and other bookkeeping),
-which take no permit. With a pool of 1 the one permit's holder can make those reads wait for the
-reader, and while reads fall back to the main connection they all share it. A wait for a permit is
-not part of `db.lock_wait_ms`.
+Reads run on up to `T3CODE_SQLITE_READER_POOL` (default 4) reader workers, and an idle reader always
+takes a queued read. Reads come in three classes: small reads (thread shells, settlement, the thread
+row, runs and other bookkeeping), page reads (snapshot windows, history and timeline pages), and
+reads of a thread's whole history (full snapshots and projections, turn starts, thread search, and
+records of turn items, nodes, messages, subagents, plans, handoffs or transfers). When reads of
+several classes queue, a freed reader goes first to a class that has been passed over once for each
+reader in the pool, the most passed over first, so none starves; then to small or page reads whose class holds no reader; then
+to small, page and history reads in that order. History reads that already hold all readers but two
+(at least one) go after every other queued read. Within a class, reads go in the order they queued.
+The order counts turns, not reader time, and no reader is kept for small reads: when history reads
+hold every reader, a small read waits for one of them to finish. In a review probe (two looping full
+snapshots of an 86,755-item thread beside history, window and small reads) small reads waited up to
+1.7 s at p95 with one reader, 0.5 s with two, 0.2-0.33 s with four and 95-209 ms with eight; before
+this order they waited 36-79 ms with four, but snapshot windows starved (6 in 8 s against 149). A
+read's statements go to a reader worker together; while reads fall back to the main connection they
+all share it and run their statements in turn.
+History reads each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at least one, from
+before their read transaction until their rows are decoded, which bounds the history rows held at
+once. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a reader is.
 
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for

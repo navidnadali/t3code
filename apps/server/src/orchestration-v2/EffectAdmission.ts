@@ -68,7 +68,7 @@ export const EffectAdmission = Context.Reference<EffectAdmissionShape>(
 export interface EffectAdmissionOptions {
   /** Gated effects in flight at most while the main thread has headroom. */
   readonly workers: number;
-  /** Pressure at or above which the main thread counts as saturated; it reopens below half of it. */
+  /** Pressure at or above which the main thread counts as saturated; it reopens below three quarters of it. */
   readonly closeAbove: number;
   /** Consecutive samples on one side of a mark before the state switches. */
   readonly samplesToSwitch: number;
@@ -84,8 +84,15 @@ export interface EffectAdmissionOptions {
 /** Gated effects allowed while saturated: half the workers, at least one. */
 export const saturatedAllowance = (workers: number): number => Math.max(1, Math.ceil(workers / 2));
 
-/** Headroom counts as back at half the closing pressure, so every mark can reopen. */
-export const openMarkFor = (closeAbove: number): number => closeAbove / 2;
+/**
+ * Headroom counts as back below three quarters of the closing pressure. Replayed on the recorded
+ * 1 Hz loop-delay series: at light load a spike decays below that within a few seconds, while a
+ * saturated loop hovers around the mark and stays above it — half the mark held a spike-closed gate
+ * for a minute at 250 sessions, and higher fractions, a bounded spell or the p50 flap at 80.
+ */
+export const REOPEN_FRACTION = 0.75;
+
+export const openMarkFor = (closeAbove: number): number => closeAbove * REOPEN_FRACTION;
 
 /**
  * A second at 10 ms resolution records about a hundred histogram samples; fewer than this many
@@ -135,7 +142,7 @@ interface Sampler {
 
 /**
  * Gated effects run `workers` at a time; after `samplesToSwitch` samples at or above `closeAbove`
- * only `saturatedAllowance` do, until as many fall below half of it. The pressure source runs only
+ * only `saturatedAllowance` do, until as many fall below three quarters of it. The pressure source runs only
  * while the gate can act, so an idle server pays nothing; a slot counts for `SLOT_MAX_HOLD` at most.
  */
 export const make = Effect.fn("EffectAdmission.make")(function* (options: EffectAdmissionOptions) {

@@ -144,7 +144,7 @@ it.effect(
     }),
 );
 
-it.effect("reopens only below half the closing mark, not at or above it", () =>
+it.effect("reopens only below three quarters of the closing mark, not at or above it", () =>
   Effect.gen(function* () {
     const { admission, pressure } = yield* makeHarness(2);
     yield* Ref.set(pressure, 60);
@@ -153,13 +153,13 @@ it.effect("reopens only below half the closing mark, not at or above it", () =>
     assert.equal((yield* admission.state).saturated, true);
 
     // Exactly the reopen mark and anything between the marks keep the gate closed.
-    for (const held of [20, 22, 24, 39]) {
+    for (const held of [30, 32, 35, 39]) {
       yield* Ref.set(pressure, held);
       yield* TestClock.adjust("2 seconds");
       assert.equal((yield* admission.state).saturated, true, `pressure ${held}`);
     }
-    // Just under half reopens, even though it is well above a third of the mark.
-    yield* Ref.set(pressure, 19);
+    // Just under three quarters reopens, even though it is well above half the mark.
+    yield* Ref.set(pressure, 29);
     yield* TestClock.adjust("2 seconds");
     assert.equal((yield* admission.state).saturated, false);
     yield* first!.release;
@@ -482,8 +482,9 @@ it.effect("sizes the saturated allowance, the reopen mark and the pressure readi
     assert.equal(EffectAdmission.saturatedAllowance(2), 1);
     assert.equal(EffectAdmission.saturatedAllowance(4), 2);
     assert.equal(EffectAdmission.saturatedAllowance(5), 3);
-    assert.equal(EffectAdmission.openMarkFor(40), 20);
-    assert.equal(EffectAdmission.openMarkFor(5), 2.5);
+    assert.equal(EffectAdmission.REOPEN_FRACTION, 0.75);
+    assert.equal(EffectAdmission.openMarkFor(40), 30);
+    assert.equal(EffectAdmission.openMarkFor(5), 3.75);
     assert.isTrue(EffectAdmission.isGated("provider-turn.start"));
     assert.isTrue(EffectAdmission.isGated("checkpoint.capture"));
     assert.isFalse(EffectAdmission.isGated("provider-turn.interrupt"));

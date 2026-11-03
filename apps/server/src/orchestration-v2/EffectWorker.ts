@@ -954,10 +954,10 @@ export interface OrchestrationEffectDaemonOptions {
 const DEFAULT_EFFECT_WORKER_CONCURRENCY = 4;
 export const EFFECT_WORKER_MAX_CONCURRENCY = EffectOutbox.EFFECT_WORKER_MAX_CONCURRENCY;
 const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
-// From this event loop delay p99 over a second, turn starts stay in the outbox; below half of it
+// From this event loop delay p99 over a second, turn starts stay in the outbox; below three quarters of it
 // they resume. Two samples either way, so a single burst switches nothing.
 const DEFAULT_EFFECT_ADMISSION_DELAY_MS = 40;
-// The reopen mark at half must clear the histogram's resolution and an idle loop's ~11 ms p99.
+// The reopen mark at three quarters must clear the histogram's resolution and an idle loop's ~11 ms p99.
 export const EFFECT_ADMISSION_MIN_DELAY_MS = 30;
 export const EFFECT_ADMISSION_MAX_DELAY_MS = 60_000;
 const EFFECT_ADMISSION_DELAY_RESOLUTION_MS = 10;

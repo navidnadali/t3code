@@ -234,7 +234,7 @@ const EnvServerConfig = Config.all({
     Schema.Int.check(
       Schema.isBetween({ minimum: 0, maximum: EFFECT_ADMISSION_MAX_DELAY_MS }),
       Schema.makeFilter((ms: number) => ms === 0 || ms >= EFFECT_ADMISSION_MIN_DELAY_MS, {
-        message: `T3CODE_EFFECT_ADMISSION_DELAY_MS must be 0 (off) or at least ${EFFECT_ADMISSION_MIN_DELAY_MS} ms: the gate reopens at half the mark, which must stay above the 10 ms histogram resolution and an idle loop's delay`,
+        message: `T3CODE_EFFECT_ADMISSION_DELAY_MS must be 0 (off) or at least ${EFFECT_ADMISSION_MIN_DELAY_MS} ms: the gate reopens at three quarters the mark, which must stay above the 10 ms histogram resolution and an idle loop's delay`,
       }),
     ),
     "T3CODE_EFFECT_ADMISSION_DELAY_MS",

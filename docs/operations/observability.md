@@ -788,8 +788,9 @@ a block spanned its ticks — not CPU time or
 event loop utilization: a loop can be busy for most of a second yet schedule interactive work
 promptly, and utilization counts every moment it is not idle. After two seconds at or above
 `T3CODE_EFFECT_ADMISSION_DELAY_MS` (default `40`; `0` turns the gate off; otherwise at least `30`, so
-that the reopen mark at half stays above the histogram's resolution and an idle loop's delay) only
-half the workers, at least one, may run such effects, and after two seconds below half that delay
+that the reopen mark at three quarters stays above the histogram's resolution and an idle loop's
+delay) only half the workers, at least one, may run such effects, and after two seconds below three
+quarters of that delay
 all of them may again. With one worker no gate is built: the saturated allowance equals the worker
 count, so it could change nothing. The histogram and its 1 Hz sampler run only while the gate can act — from the
 saturated allowance's worth of such effects in flight until the gate is open with fewer — so an idle

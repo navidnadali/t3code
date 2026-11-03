@@ -9,6 +9,7 @@ import * as NodeStream from "node:stream";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Deferred from "effect/Deferred";
@@ -24,7 +25,10 @@ import { AgentScope } from "@t3tools/shared/AgentScope";
 import { ProviderEventLoggers } from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
+import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
+import { spawnerProcessIds } from "../../process/spawnerProcesses.ts";
+import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import {
   ClaudeAgentSdkQueryRunner,
   type ClaudeAgentSdkQueryOpenInput,
@@ -489,6 +493,48 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
       for (const pipe of child.stdio) pipe?.destroy();
       yield* Effect.promise(() => turnStopped);
     }),
+  );
+
+  // Linux: a provider handed off by the spawner process identifies by /proc start time.
+  it.live.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
+    "starts the CLI from the server's provider launcher, not from the server",
+    () => {
+      const runner = layerQueryRunner.pipe(
+        Layer.provide(PortScanner.layerTest),
+        Layer.provide(
+          Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
+        ),
+        Layer.provide(
+          WorkerChildProcessSpawner.layerProviderLauncher.pipe(
+            Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-handoff-" })),
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))),
+          ),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      return Effect.gen(function* () {
+        const cli = fakeClaudeCli(
+          ['dir=$(dirname "$0")', 'printf "%s" "$PPID" > "$dir/parent"', "cat > /dev/null"].join(
+            "\n",
+          ),
+        );
+        const dir = NodePath.dirname(cli);
+        NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "parent")]);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
+        );
+        const parentRead = new Promise<string>((resolve) => {
+          let parent = "";
+          NodeFS.createReadStream(NodePath.join(dir, "parent"), "utf8")
+            .on("data", (chunk) => (parent += chunk))
+            .once("end", () => resolve(parent));
+        });
+        const session = yield* openFakeCli(cli);
+        const parent = Number(yield* Effect.promise(() => parentRead));
+        assert.isTrue(spawnerProcessIds.has(parent), `parent ${parent} is not a spawner`);
+        yield* session.close;
+      }).pipe(Effect.scoped, Effect.provide(runner));
+    },
   );
 
   it.effect("marks the CLI's jobs with its thread and counts it as an agent until it exits", () => {

@@ -49,6 +49,7 @@ import {
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2RemoteTaskChild,
   type OrchestrationV2ModelSwitch,
+  type OrchestrationV2CheckpointScope,
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2ThreadShell,
@@ -1023,7 +1024,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
   // The thread's scopes decide which root scope the run's workspace uses; a thread created in the
-  // same command has none yet.
+  // same command has none yet. A reused scope keeps its first spelling; the run records its own cwd.
+  const runWorkspaces = new WeakMap<OrchestrationV2CheckpointScope, string>();
   const prepareRootRunScope = (
     input: Omit<Parameters<typeof checkpointService.prepareRootRunScope>[0], "threadScopes">,
   ) =>
@@ -1033,7 +1035,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       Effect.flatMap((threadScopes) =>
         checkpointService.prepareRootRunScope({ ...input, threadScopes }),
       ),
+      Effect.tap((scope) => Effect.sync(() => runWorkspaces.set(scope, input.cwd))),
     );
+  // The cwd a run was scoped with: what it works in, whatever spelling its scope keeps.
+  const runWorkspaceOf = (scope: OrchestrationV2CheckpointScope) =>
+    runWorkspaces.get(scope) ?? scope.cwd;
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
       Partial<Pick<OrchestrationV2ThreadProjection, "turnItems">>,
@@ -1987,7 +1993,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : undefined;
       const checkpointScope =
         storedCheckpointScope !== undefined &&
-        (workspaceNow === undefined || workspaceNow === storedCheckpointScope.cwd)
+        (workspaceNow === undefined ||
+          workspaceNow === storedCheckpointScope.cwd ||
+          workspaceNow === queuedRun.workspaceCwd)
           ? storedCheckpointScope
           : yield* Effect.gen(function* () {
               if (resolvedForStart._tag === "Failure") return yield* resolvedForStart.failure;
@@ -2051,7 +2059,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerThreadId: queuedProviderThread.id,
         ordinal,
         status: "starting",
-        workspaceCwd: checkpointScope.cwd,
+        // Where it starts now; a policy that did not resolve keeps where it was queued.
+        workspaceCwd: workspaceNow ?? queuedRun.workspaceCwd ?? runWorkspaceOf(checkpointScope),
         queuePosition: null,
         startedAt: null,
         contextHandoffId: activeHandoff?.id ?? null,
@@ -5230,7 +5239,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       userMessageId: input.messageId,
       status: "starting",
       contextHandoffId: restartHandoff?.id ?? targetRun.contextHandoffId,
-      workspaceCwd: checkpointScope.cwd,
+      workspaceCwd: runWorkspaceOf(checkpointScope),
     };
     const nextAttempt: OrchestrationV2RunAttempt = {
       id: nextAttemptId,
@@ -6059,7 +6068,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
-        ...(checkpointScope === null ? {} : { workspaceCwd: checkpointScope.cwd }),
+        ...(checkpointScope === null ? {} : { workspaceCwd: runWorkspaceOf(checkpointScope) }),
       };
       const attempt: OrchestrationV2RunAttempt = {
         id: attemptId,
@@ -6407,7 +6416,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : {}),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
         ...wakeWorkStartedAt(projection.runs, command),
-        ...(checkpointScope === null ? {} : { workspaceCwd: checkpointScope.cwd }),
+        ...(checkpointScope === null ? {} : { workspaceCwd: runWorkspaceOf(checkpointScope) }),
       };
       const attempt: OrchestrationV2RunAttempt = {
         id: attemptId,
@@ -7158,7 +7167,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
       ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
       ...wakeWorkStartedAt(projection.runs, command),
-      workspaceCwd: checkpointScope.cwd,
+      workspaceCwd: runWorkspaceOf(checkpointScope),
     };
     const attempt: OrchestrationV2RunAttempt = {
       id: attemptId,
@@ -10067,7 +10076,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         nodeId: state.rootNode.id,
         providerInstanceId: state.run.providerInstanceId,
         occurredAt: now,
-        payload: { ...state.run, status: "starting", workspaceCwd: checkpointScope.cwd },
+        payload: {
+          ...state.run,
+          status: "starting",
+          workspaceCwd: runWorkspaceOf(checkpointScope),
+        },
       });
       yield* Ref.update(effects, (existing) => [
         ...existing,

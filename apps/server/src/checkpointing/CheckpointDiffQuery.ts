@@ -200,8 +200,10 @@ export const make = Effect.gen(function* () {
         });
       }
 
+      // Diffed where the run worked; its scope keeps the spelling its workspace was first reached by.
       const comparison = {
-        cwd: toScope.cwd,
+        cwd:
+          projection.runs.find((run) => run.id === toCheckpoint.runId)?.workspaceCwd ?? toScope.cwd,
         fromCheckpointRef,
         toCheckpointRef: toCheckpoint.ref,
         fallbackFromToHead: false,

@@ -813,6 +813,7 @@ export const layer: Layer.Layer<
         checkpointScope.parentScopeId !== null ||
         workspaceNow == null ||
         workspaceNow === checkpointScope.cwd ||
+        workspaceNow === run.workspaceCwd ||
         keepsOpenedCwd
           ? checkpointScope
           : yield* Effect.gen(function* () {
@@ -1470,8 +1471,12 @@ export const layer: Layer.Layer<
         ...run,
         status: "running",
         startedAt: now,
-        // The thread's scope follows its latest root run; this run's checkpoints stay here.
-        workspaceCwd: runScope.cwd,
+        // Where the run works: the turn's cwd, unless a live session serving one thread keeps the
+        // one it opened in; its scope may keep another spelling of it.
+        workspaceCwd:
+          workspaceNow != null && !keepsOpenedCwd
+            ? workspaceNow
+            : (run.workspaceCwd ?? runScope.cwd),
       };
       const runningAttempt: OrchestrationV2RunAttempt = {
         ...attempt,

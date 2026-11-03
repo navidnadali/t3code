@@ -117,6 +117,10 @@ export const isCheckpointRestoreIsolated = Effect.fn("orchestrationV2.isCheckpoi
           const paths = [
             otherThread.worktreePath,
             ...other.checkpointScopes.map((candidate) => candidate.cwd),
+            // Where its runs worked, which a scope's first spelling (a removed symlink) may not name.
+            ...other.runs.flatMap((run) =>
+              run.workspaceCwd === undefined ? [] : [run.workspaceCwd],
+            ),
             // Errored sessions can still stream. Shared sessions retain another thread's opening cwd;
             // turn worktrees and project roots are already covered here.
             ...providerContext.providerSessions

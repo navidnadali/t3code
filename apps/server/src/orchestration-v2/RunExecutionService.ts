@@ -939,7 +939,11 @@ export const layer: Layer.Layer<
             input.appThread.lineage.sideChat === true
               ? Effect.void
               : checkpointService.captureBaseline({
-                  scope: input.checkpointScope,
+                  // Where the run works; its scope keeps the spelling it was first reached by.
+                  scope: {
+                    ...input.checkpointScope,
+                    cwd: input.run.workspaceCwd ?? input.checkpointScope.cwd,
+                  },
                   ordinalWithinScope: Math.max(0, input.run.ordinal - 1),
                 })
           ).pipe(

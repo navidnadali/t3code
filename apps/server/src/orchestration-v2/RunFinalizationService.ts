@@ -70,7 +70,10 @@ const make = Effect.gen(function* () {
           (cause) => new RunFinalizationError({ ...input, operation: "refresh-workspace", cause }),
         ),
       );
-    const cwd = projection.checkpointScopes.find((scope) => scope.id === input.scopeId)?.cwd;
+    // Where the run worked; its scope keeps the spelling its workspace was first reached by.
+    const cwd =
+      projection.runs.find((run) => run.id === input.runId)?.workspaceCwd ??
+      projection.checkpointScopes.find((scope) => scope.id === input.scopeId)?.cwd;
     if (cwd !== undefined) {
       // Retrying a display refresh after the checkpoint is durable blocks the next turn.
       yield* observer.refresh({ cwd, threadId: input.threadId, runId: input.runId }).pipe(

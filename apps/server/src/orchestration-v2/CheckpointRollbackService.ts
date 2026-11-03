@@ -321,26 +321,38 @@ export const layer: Layer.Layer<
       if (input.restoreFiles !== false) {
         yield* checkpoints.restore({ scope: restoreScope, checkpoint });
       }
-      // Each workspace's refs live in its repository. A removed worktree's repository may be another
-      // workspace's (worktrees share refs), and a recreated one would reuse them as baselines: drop
-      // them through every workspace that remains; deleting a ref a repository lacks is a no-op.
+      // A scope's refs live in its workspace's repository, written where its runs worked (its own cwd
+      // may be another spelling: a removed or retargeted symlink). With neither left, the repository may
+      // be another workspace's (worktrees share refs): drop them through every workspace that remains;
+      // deleting a ref a repository lacks is a no-op.
       const rootScopes = [scope, ...context.otherRootScopes];
-      const remaining = yield* Effect.filter(
-        [
-          ...new Set([
-            ...(context.thread.worktreePath == null ? [] : [context.thread.worktreePath]),
-            ...rootScopes.map((candidate) => candidate.cwd),
-          ]),
-        ],
-        (cwd) => fileSystem.exists(cwd),
-      );
+      const existing = (cwds: ReadonlyArray<string | null | undefined>) =>
+        Effect.filter(
+          [...new Set(cwds.filter((cwd): cwd is string => typeof cwd === "string"))],
+          (cwd) => fileSystem.exists(cwd),
+        );
+      const ranIn = (scopeId: string) =>
+        runsToRollback
+          .filter(
+            (run) =>
+              context.rootNodes.find((node) => node.id === run.rootNodeId)?.checkpointScopeId ===
+              scopeId,
+          )
+          .map((run) => run.workspaceCwd);
+      const remaining = yield* existing([
+        context.thread.worktreePath,
+        ...rootScopes.map((candidate) => candidate.cwd),
+        ...runsToRollback.map((run) => run.workspaceCwd),
+      ]);
       for (const staleScope of rootScopes) {
         const stale = staleCheckpoints.filter((candidate) => candidate.scopeId === staleScope.id);
         if (stale.length === 0) continue;
-        if (remaining.includes(staleScope.cwd)) {
-          yield* checkpoints.deleteStaleRefs({ scope: staleScope, checkpoints: stale });
-          continue;
+        const ranThere = yield* existing(ranIn(staleScope.id));
+        const targets = ranThere.length > 0 ? ranThere : yield* existing([staleScope.cwd]);
+        for (const cwd of targets) {
+          yield* checkpoints.deleteStaleRefs({ scope: { ...staleScope, cwd }, checkpoints: stale });
         }
+        if (targets.length > 0) continue;
         for (const cwd of remaining) {
           yield* checkpoints
             .deleteStaleRefs({ scope: { ...staleScope, cwd }, checkpoints: stale })

@@ -276,7 +276,7 @@ it.effect.each([
               Effect.succeed({
                 turnItems: Array.from({ length: toolItems }, () => ({ type: "command_execution" })),
               }),
-            getCheckpointContext: () => Effect.succeed({ checkpointScopes: [] }),
+            getCheckpointContext: () => Effect.succeed({ runs: [], checkpointScopes: [] }),
             getThreadProviderContext: () => Effect.succeed({ providerSessions: [] }),
           } as never,
           projects: {} as never,

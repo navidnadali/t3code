@@ -228,7 +228,12 @@ export type ProjectionSettlementCandidate = Pick<
 
 const ProjectionCheckpointContext = Schema.Struct({
   runs: Schema.Array(
-    OrchestrationV2RunJsonSchema.mapFields(({ id, ordinal, status }) => ({ id, ordinal, status })),
+    OrchestrationV2RunJsonSchema.mapFields(({ id, ordinal, status, workspaceCwd }) => ({
+      id,
+      ordinal,
+      status,
+      workspaceCwd,
+    })),
   ),
   checkpointScopes: Schema.Array(
     OrchestrationV2CheckpointScopeJsonSchema.mapFields(({ id, runId, kind, cwd }) => ({
@@ -5384,8 +5389,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             }
             // Select checkpoint metadata only; diffs need neither transcripts nor large run/checkpoint JSON.
             const [runs, checkpointScopes, checkpoints] = yield* Effect.all([
-              sql`
-              SELECT run_id AS id, ordinal, status
+              sql<{ readonly workspaceCwd: string | null }>`
+              SELECT run_id AS id, ordinal, status,
+                json_extract(payload_json, '$.workspaceCwd') AS "workspaceCwd"
               FROM orchestration_v2_projection_runs
               WHERE thread_id = ${threadId}
               ORDER BY ordinal ASC
@@ -5407,7 +5413,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ORDER BY scope_id ASC, ordinal_within_scope ASC
             `,
             ]);
-            return yield* decodeCheckpointContext({ runs, checkpointScopes, checkpoints });
+            return yield* decodeCheckpointContext({
+              // Runs recorded before they kept their workspace have none.
+              runs: runs.map(({ workspaceCwd, ...run }) =>
+                workspaceCwd === null ? run : { ...run, workspaceCwd },
+              ),
+              checkpointScopes,
+              checkpoints,
+            });
           }),
         )
         .pipe(

@@ -1414,6 +1414,38 @@ it.effect("finishes a read transaction without waiting for COMMIT and ignores it
   ),
 );
 
+it.effect(
+  "answers a duplicate BEGIN and a COMMIT with no transaction with SQLite's error, bookkeeping intact",
+  () =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        const before = startedWorkers.length;
+        const duplicate = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              assert.equal(yield* countEntries(sql), 1);
+              return yield* sql.unsafe("BEGIN").pipe(Effect.flip);
+            }),
+          )
+          .pipe(SqliteClient.readOnly);
+        assert.include(String(duplicate.reason.cause), "within a transaction");
+        // The reader is still usable: the next read transaction starts and ends as always.
+        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+        yield* eventLoopTurn;
+        assert.deepEqual(messageShapes(startedWorkers[before]!), [
+          "begin+SELECT",
+          "BEGIN",
+          "COMMIT",
+          "begin+SELECT",
+          "COMMIT",
+        ]);
+        // A COMMIT with no transaction to end is answered, not dropped.
+        const stray = yield* sql.unsafe("COMMIT").pipe(SqliteClient.readOnly, Effect.flip);
+        assert.include(String(stray.reason.cause), "no transaction is active");
+      }),
+    ),
+);
+
 it.effect("sends statements issued together as one batch and answers each on its own", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {

@@ -5,6 +5,7 @@ import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -1380,3 +1381,15 @@ export const layerFromConfig = Layer.effect(
  * every `ProcessRunner.layer` inside a layer this is provided to is this same runner.
  */
 export const layerProcessRunner = ProcessRunner.layer.pipe(Layer.provide(layerFromConfig));
+
+/** The server's spawner for commands that run to completion (checks, text generation). */
+export class CommandSpawner extends Context.Service<
+  CommandSpawner,
+  ChildProcessSpawner["Service"]
+>()("t3/process/workerChildProcessSpawner/CommandSpawner") {}
+
+/** The server's CommandSpawner: the same spawner as `layerProcessRunner`'s (memoized). */
+export const layerCommandSpawner = Layer.effect(
+  CommandSpawner,
+  Effect.service(ChildProcessSpawner),
+).pipe(Layer.provide(layerFromConfig));

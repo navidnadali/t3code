@@ -1,3 +1,5 @@
+import * as NodeChildProcess from "node:child_process";
+import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -1899,6 +1901,63 @@ it.effect("ignores a reply older than the ending that freed the reader", () =>
       }),
     { readerPoolSize: 1 },
   ),
+);
+
+it.effect("refuses a write on a reader, temporary tables included", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const error = yield* sql
+        .unsafe("CREATE TEMP TABLE scratch(x)")
+        .pipe(SqliteClient.readOnly, Effect.flip);
+      assert.match(String(error.reason.cause), /readonly|query_only|read-only/i);
+      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+    }),
+  ),
+);
+
+it.effect("lets a process exit cleanly after a one-shot read transaction", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-exit-" });
+    const filename = path.join(directory, "state.sqlite");
+    const seed = new NodeSqlite.DatabaseSync(filename);
+    seed.exec("PRAGMA journal_mode = WAL; CREATE TABLE entries(name TEXT NOT NULL)");
+    seed.close();
+    // The reply that answers the read resumes the fiber, whose scope then terminates the worker;
+    // a worker let go of after that leaves nothing to keep the process alive (exit code 13). The
+    // script lives beside the client so that its bare imports resolve.
+    const script = NodePath.join(import.meta.dirname, `.exit-probe-${process.pid}.mjs`);
+    yield* Effect.acquireRelease(
+      fs.writeFileString(
+        script,
+        `import * as Effect from "effect/Effect";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as SqliteClient from "./nodeSqliteClient.ts";
+await Effect.runPromise(
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql.withTransaction(sql\`SELECT COUNT(*) AS count FROM entries\`).pipe(SqliteClient.readOnly);
+  }).pipe(
+    Effect.provide(SqliteClient.layer({ filename: process.argv[2], readerWorker: true })),
+    Effect.scoped,
+  ),
+);
+console.log("done");
+`,
+      ),
+      () => fs.remove(script).pipe(Effect.ignore),
+    );
+    const child = yield* Effect.sync(() =>
+      NodeChildProcess.spawnSync(process.execPath, ["--no-warnings", script, filename], {
+        cwd: import.meta.dirname,
+        encoding: "utf8",
+        timeout: 60_000,
+      }),
+    );
+    assert.equal(child.status, 0, `exit ${child.status}: ${child.stderr}`);
+    assert.include(child.stdout, "done");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.effect("posts statements issued together at once, in order, and answers each on its own", () =>

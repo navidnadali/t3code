@@ -553,7 +553,9 @@ const objectRows = (columns: ReadonlyArray<string>, rows: ReadonlyArray<Readonly
   });
 
 // Read-transaction cleanup succeeds after worker exit because it can no longer change anything.
-const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test(sql);
+// COMMIT, END and a plain ROLLBACK end the transaction; ROLLBACK TO (a savepoint) keeps it open.
+const endsReadTransaction = (sql: string) =>
+  /^\s*(?:COMMIT|END)\b|^\s*ROLLBACK\b(?!\s+TO\b)/i.test(sql);
 
 // WAL readers run concurrently; one worker serialized every read behind the slowest transaction.
 const DEFAULT_READER_POOL_SIZE = 4;

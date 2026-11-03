@@ -345,13 +345,17 @@ it.live.each(["thread", "shell"] as const)(
         } as unknown as ThreadManagement.ThreadManagementService["Service"]),
         Effect.provideService(ProjectStore.ProjectStoreV2, {
           listShells: () => Effect.succeed([]),
-        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
-        Effect.provideService(ProjectService.ProjectService, {
           getShell: () => Effect.succeedSome(project),
-        } as unknown as ProjectService.ProjectService["Service"]),
+        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
         Effect.provideService(ProjectEnrichment.ProjectEnrichmentService, {
           subscribeChanges: PubSub.subscribe(updates),
-        } as ProjectEnrichment.ProjectEnrichmentService["Service"]),
+          getAvailable: () =>
+            Effect.succeed({
+              repositoryIdentity: null,
+              faviconPath: null,
+              repositoryIdentityResolved: true,
+            }),
+        } as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"]),
       );
       assert.deepEqual(
         items.map((item) => item.kind),
@@ -597,10 +601,8 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
         } as unknown as ThreadManagement.ThreadManagementService["Service"]),
         Effect.provideService(ProjectStore.ProjectStoreV2, {
           listShells: () => Effect.succeed([]),
-        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
-        Effect.provideService(ProjectService.ProjectService, {
           getShell: () => Effect.succeedNone,
-        } as unknown as ProjectService.ProjectService["Service"]),
+        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
         Effect.provideServiceEffect(
           ProjectEnrichment.ProjectEnrichmentService,
           PubSub.unbounded().pipe(
@@ -688,10 +690,8 @@ it.effect("shell subscribers share one thread shell read per event", () =>
       ),
       Effect.provideService(ProjectStore.ProjectStoreV2, {
         listShells: () => Effect.succeed([]),
-      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
-      Effect.provideService(ProjectService.ProjectService, {
         getShell: () => Effect.succeedNone,
-      } as unknown as ProjectService.ProjectService["Service"]),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
       Effect.provideServiceEffect(
         ProjectEnrichment.ProjectEnrichmentService,
         PubSub.unbounded().pipe(
@@ -720,7 +720,6 @@ it.effect("shell subscribers share one thread shell read per event", () =>
 // The shell delta hub over mocked shell reads; `onStart` runs when the hub subscribes to committed events.
 const layerShellSubscribers = (input: {
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
-  readonly getProjectShell?: ProjectService.ProjectService["Service"]["getShell"];
   readonly getProjectRow?: ProjectStore.ProjectStoreV2["Service"]["getShell"];
   readonly getAvailable?: ProjectEnrichment.ProjectEnrichmentService["Service"]["getAvailable"];
   readonly onStart?: () => void;
@@ -758,11 +757,6 @@ const layerShellSubscribers = (input: {
         listShells: () => Effect.succeed([]),
         getShell: input.getProjectRow ?? (() => Effect.succeedNone),
       } as unknown as ProjectStore.ProjectStoreV2["Service"]),
-    ),
-    Layer.provideMerge(
-      Layer.succeed(ProjectService.ProjectService, {
-        getShell: input.getProjectShell ?? (() => Effect.succeedNone),
-      } as unknown as ProjectService.ProjectService["Service"]),
     ),
     Layer.provideMerge(
       Layer.effect(
@@ -1825,7 +1819,7 @@ it.effect(
                   title: "t",
                 } as unknown as OrchestrationV2ThreadShell;
               }),
-            getProjectShell: () =>
+            getProjectRow: () =>
               Effect.gen(function* () {
                 if (projectReads++ === 0) yield* Deferred.await(replayGate);
                 return Option.some({
@@ -1934,10 +1928,6 @@ it.effect(
         Effect.provide(
           layerShellSubscribers({
             getThreadShell: () => Effect.die("no thread is read"),
-            getProjectShell: () =>
-              Effect.sync(() =>
-                Option.some({ ...row, repositoryIdentity: enrichment().repositoryIdentity }),
-              ),
             getProjectRow: () => Effect.succeedSome(row),
             getAvailable: () => Effect.sync(enrichment),
           }),

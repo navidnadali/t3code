@@ -21,6 +21,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import {
   makeLiveStreamBudget,
@@ -39,6 +40,7 @@ import {
   type ShellDelta,
   type VersionedShellDelta,
 } from "./ShellStream.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
 export class ShellDeltaHubError extends Schema.TaggedError<ShellDeltaHubError>()(
@@ -71,6 +73,8 @@ export interface ShellDeltaHubShape {
   /**
    * A project's shell as of event `sequence` or later, like `getThreadShellForEvent`: shared with
    * callers the project's latest read covers, one read per project at a time, with its ordinal.
+   * The store row is what is shared; the repository identity is added per caller from the
+   * enrichment cache, because it changes without a project event.
    */
   readonly readProjectShellForEvent: (input: {
     readonly projectId: ProjectId;
@@ -134,7 +138,8 @@ const isTranscriptEvent = (stored: ApplicationStoredEvent) =>
 const make = Effect.gen(function* () {
   const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
-  const projectService = yield* ProjectService.ProjectService;
+  const projects = yield* ProjectStore.ProjectStoreV2;
+  const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
   const layerScope = yield* Effect.scope;
   const lifecycle = yield* Semaphore.make(1);
   let current: HubInstance | undefined;
@@ -143,11 +148,19 @@ const make = Effect.gen(function* () {
   // latest read covers shares it, a newer sequence starts a read after it. One entry per project.
   const projectReads = new Map<ProjectId, SharedProjectRead>();
   let nextProjectReadOrdinal = 0;
+  const enrich = (
+    row: Option.Option<OrchestrationProjectShell>,
+  ): Effect.Effect<Option.Option<OrchestrationProjectShell>> =>
+    Option.isNone(row)
+      ? Effect.succeedNone
+      : Effect.map(projectEnrichment.getAvailable(row.value.workspaceRoot), (enrichment) =>
+          Option.some({ ...row.value, repositoryIdentity: enrichment.repositoryIdentity }),
+        );
   const withOrdinal = (read: SharedProjectRead) =>
-    Effect.map(Deferred.await(read.result), (project) => ({
-      project,
-      readOrdinal: read.readOrdinal,
-    }));
+    Deferred.await(read.result).pipe(
+      Effect.flatMap(enrich),
+      Effect.map((project) => ({ project, readOrdinal: read.readOrdinal })),
+    );
   // Settled reads move to the end when they settle, so they expire in map order; a pending read
   // stays, so the project's next read still waits for it. Same limits as the thread memo.
   const trimProjectReads = (now: number) => {
@@ -195,7 +208,18 @@ const make = Effect.gen(function* () {
               read.started = true;
             }),
           ),
-          Effect.andThen(projectService.getShell(input.projectId)),
+          Effect.andThen(
+            projects.getShell(input.projectId).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectService.ProjectOperationError({
+                    operation: "read-project",
+                    projectId: input.projectId,
+                    cause,
+                  }),
+              ),
+            ),
+          ),
           Effect.forkIn(layerScope),
           Effect.flatMap((fiber) => {
             // A failed read is forgotten, so a retry at the same sequence reads again.
@@ -482,6 +506,7 @@ export const layer: Layer.Layer<
   ShellDeltaHub,
   never,
   | OrchestrationEventStore.OrchestrationEventStore
-  | ProjectService.ProjectService
+  | ProjectEnrichmentService.ProjectEnrichmentService
+  | ProjectStore.ProjectStoreV2
   | ThreadManagementService.ThreadManagementService
 > = Layer.effect(ShellDeltaHub, make);

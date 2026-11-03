@@ -361,7 +361,9 @@ export const layer = Layer.mergeAll(
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
   ShellDeltaHub.layer.pipe(
-    Layer.provide(Layer.mergeAll(layerThreadManagementProvided, layerEventInfrastructure)),
+    Layer.provide(
+      Layer.mergeAll(layerThreadManagementProvided, layerEventInfrastructure, ProjectStore.layer),
+    ),
   ),
   layerEffectWorkerProvided,
   layerProviderSessionManagerProvided,

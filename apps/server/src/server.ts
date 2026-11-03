@@ -848,9 +848,9 @@ const layerMakeServer = Layer.unwrap(
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
         yield* startup.markHttpListening;
         const runtimeFlags = nodeRuntimeFlags();
-        // A launcher that predates the young-generation default leaves the server without it until
-        // the service restarts; that deserves a warning, not an info line.
-        yield* runtimeFlags.launcherPredatesDefault === true
+        // A server that wanted the young-generation cap and runs without it says so where it is
+        // seen: an Info line hid a dead default from the fleet's logs.
+        yield* runtimeFlags.youngGenerationLost === true
           ? Effect.logWarning("server.v8", runtimeFlags)
           : Effect.logInfo("server.v8", runtimeFlags);
       }),

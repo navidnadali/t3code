@@ -2,6 +2,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeURL from "node:url";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -43,11 +44,10 @@ import {
   runtimeFlagsOf,
   SERVER_COMMANDS,
   decideYoungGeneration,
-  startupNodeOptionsFromListing,
-  startupNodeOptionsTrusted,
   serverChildEnvironment,
   tokenizeNodeOptions,
 } from "./youngGeneration.ts";
+import type { StartupNodeOptions } from "./youngGeneration.ts";
 import { SERVICE_LAUNCHER_CONTEXT_ENV } from "./cloud/serviceProtocol.ts";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -468,176 +468,10 @@ describe("runtimeFlagsOf", () => {
       { NODE_OPTIONS: "--max-semi-space-size=16" },
     );
     expect(flags.maxSemiSpaceMiB).toBe("node default");
-    expect(flags.startupUncertain).toBeUndefined();
     // Without an outcome (no startup pass ran) the current environment is all there is.
     expect(
       runtimeFlagsOf(undefined, { NODE_OPTIONS: "--max-semi-space-size=16" }).maxSemiSpaceMiB,
     ).toBe(16);
-  });
-});
-
-describe("startupNodeOptionsTrusted", () => {
-  it("trusts the operating system's value only when it agrees with the value in effect now", () => {
-    // Agreement means no preload touched NODE_OPTIONS; the value in effect is then the startup value.
-    expect(
-      startupNodeOptionsTrusted({ known: true, value: "--no-warnings" }, "--no-warnings"),
-    ).toBe(true);
-    expect(startupNodeOptionsTrusted({ known: true, value: undefined }, undefined)).toBe(true);
-    // A preload deleted or rewrote it, or the listing could not be parsed exactly: never relaunch on a guess.
-    expect(startupNodeOptionsTrusted({ known: true, value: "--import x.mjs" }, undefined)).toBe(
-      false,
-    );
-    expect(
-      startupNodeOptionsTrusted(
-        { known: true, value: '--title="hello' },
-        '--title="hello FOO=bar" --max-semi-space-size=16',
-      ),
-    ).toBe(false);
-    expect(startupNodeOptionsTrusted({ known: false }, undefined)).toBe(false);
-  });
-});
-
-describe("startupNodeOptionsFromListing", () => {
-  // `ps -E -o command=` prints the command line, then every environment entry, all separated by single
-  // spaces, so no boundary is certain on its own: the startup value is the one text that, inserted
-  // among the entries the process has now, reproduces the listing exactly.
-  const env = { PATH: "/usr/bin", NODE_OPTIONS: "--no-warnings", HOME: "/Users/t3" };
-  const listing = "node bin.js serve PATH=/usr/bin NODE_OPTIONS=--no-warnings HOME=/Users/t3\n";
-
-  it("reads the value when nothing changed, and when a preload deleted or rewrote it", () => {
-    expect(startupNodeOptionsFromListing(listing, env, ["serve"])).toEqual({
-      known: true,
-      value: "--no-warnings",
-    });
-    const { NODE_OPTIONS: _deleted, ...deleted } = env;
-    expect(startupNodeOptionsFromListing(listing, deleted, ["serve"])).toEqual({
-      known: true,
-      value: "--no-warnings",
-    });
-    expect(
-      startupNodeOptionsFromListing(listing, { ...env, NODE_OPTIONS: "--trace-warnings" }, [
-        "serve",
-      ]),
-    ).toEqual({ known: true, value: "--no-warnings" });
-  });
-
-  it("keeps NAME= text and quotes inside the value, where a token parser would cut", () => {
-    const value = '--title FOO=bar --require "/tmp/a b.cjs" --max-semi-space-size=16';
-    const line = `node bin.js serve PATH=/usr/bin NODE_OPTIONS=${value} HOME=/Users/t3\n`;
-    expect(
-      startupNodeOptionsFromListing(line, { PATH: "/usr/bin", HOME: "/Users/t3" }, ["serve"]),
-    ).toEqual({
-      known: true,
-      value,
-    });
-  });
-
-  it("is not fooled by NODE_OPTIONS-like text inside another entry, before or instead of the real one", () => {
-    // Sol's case: a forged token that equals what a self-hiding preload left behind, listed before the
-    // real entry, must not pass as the startup value.
-    const hidden = "--max-semi-space-size=16 --import /tmp/hide.mjs";
-    const forged = `node bin.js serve FOO=x NODE_OPTIONS=--no-warnings NODE_OPTIONS=${hidden} PATH=/usr/bin\n`;
-    expect(
-      startupNodeOptionsFromListing(
-        forged,
-        { FOO: "x NODE_OPTIONS=--no-warnings", NODE_OPTIONS: "--no-warnings", PATH: "/usr/bin" },
-        ["serve"],
-      ),
-    ).toEqual({ known: true, value: hidden });
-    // The text alone, with no real entry: NODE_OPTIONS was absent.
-    expect(
-      startupNodeOptionsFromListing(
-        "node bin.js serve FOO='x NODE_OPTIONS=--bar' PATH=/usr/bin\n",
-        { FOO: "'x NODE_OPTIONS=--bar'", PATH: "/usr/bin" },
-        ["serve"],
-      ),
-    ).toEqual({ known: true, value: undefined });
-    // An argument that looks like the entry is part of the command line, not the environment.
-    expect(
-      startupNodeOptionsFromListing(
-        "node bin.js NODE_OPTIONS=x PATH=/usr/bin\n",
-        { PATH: "/usr/bin" },
-        ["NODE_OPTIONS=x"],
-      ),
-    ).toEqual({ known: true, value: undefined });
-  });
-
-  it("reports absent and empty values, and the entry in first or last place", () => {
-    expect(
-      startupNodeOptionsFromListing(
-        "node bin.js serve PATH=/usr/bin HOME=/Users/t3\n",
-        { PATH: "/usr/bin", HOME: "/Users/t3" },
-        ["serve"],
-      ),
-    ).toEqual({ known: true, value: undefined });
-    expect(
-      startupNodeOptionsFromListing(
-        "node bin.js serve NODE_OPTIONS= PATH=/usr/bin\n",
-        { NODE_OPTIONS: "", PATH: "/usr/bin" },
-        ["serve"],
-      ),
-    ).toEqual({ known: true, value: "" });
-    expect(
-      startupNodeOptionsFromListing(
-        "node bin.js serve NODE_OPTIONS=--a PATH=/usr/bin\n",
-        { PATH: "/usr/bin" },
-        ["serve"],
-      ),
-    ).toEqual({ known: true, value: "--a" });
-    expect(
-      startupNodeOptionsFromListing(
-        "node bin.js serve PATH=/usr/bin NODE_OPTIONS=--a\n",
-        { PATH: "/usr/bin" },
-        ["serve"],
-      ),
-    ).toEqual({ known: true, value: "--a" });
-  });
-
-  it("matches what ps prints: control characters escaped, a trailing space kept, and an entry CoreFoundation adds after exec", () => {
-    const line = "node bin.js serve A=x\\011y\\012z^Mw^[q^? é NODE_OPTIONS=--no-warnings C=end \n";
-    const escaped = { A: "x\ty\nz\rw\u001bq\u007f é", NODE_OPTIONS: "--no-warnings", C: "end " };
-    expect(startupNodeOptionsFromListing(line, escaped, ["serve"])).toEqual({
-      known: true,
-      value: "--no-warnings",
-    });
-    expect(
-      startupNodeOptionsFromListing(
-        line,
-        { ...escaped, __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0" },
-        ["serve"],
-      ),
-    ).toEqual({ known: true, value: "--no-warnings" });
-  });
-
-  it("accounts for the IPC entries Node appends when it spawns a child and removes from process.env", () => {
-    const line =
-      "node bin.js serve PATH=/usr/bin NODE_OPTIONS=--no-warnings NODE_CHANNEL_FD=3 NODE_CHANNEL_SERIALIZATION_MODE=json\n";
-    const child = { PATH: "/usr/bin", NODE_OPTIONS: "--no-warnings" };
-    expect(startupNodeOptionsFromListing(line, child, ["serve"], { ipc: true })).toEqual({
-      known: true,
-      value: "--no-warnings",
-    });
-    // Without the hint, the trailing entries read as part of the value; the trust check rejects that.
-    expect(startupNodeOptionsFromListing(line, child, ["serve"])).toEqual({
-      known: true,
-      value: "--no-warnings NODE_CHANNEL_FD=3 NODE_CHANNEL_SERIALIZATION_MODE=json",
-    });
-  });
-
-  it("declares the record unknown when the listing cannot be reproduced or has two readings", () => {
-    // Another entry changed since startup: the listing is not the environment plus one NODE_OPTIONS.
-    expect(startupNodeOptionsFromListing(listing, { ...env, EXTRA: "1" }, ["serve"])).toEqual({
-      known: false,
-    });
-    expect(startupNodeOptionsFromListing("", env, ["serve"])).toEqual({ known: false });
-    // No arguments and the entry in first place: the command line cannot be told from the value.
-    expect(
-      startupNodeOptionsFromListing(
-        "t3 NODE_OPTIONS=--a PATH=/usr/bin\n",
-        { PATH: "/usr/bin" },
-        [],
-      ),
-    ).toEqual({ known: false });
   });
 });
 
@@ -900,7 +734,10 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
           [],
         );
         expect(hiddenEsm.preloadRuns).toBe(1);
-        expect(hiddenEsm.report?.applied).toBe(false);
+        // Linux reads the startup record and keeps. Elsewhere nothing can see an ES-module preload
+        // that removed itself: one relaunch without it, and the explicit cap becomes the default —
+        // the documented residual for `node` starts; a single executable runs no such preload.
+        expect(hiddenEsm.report?.applied).toBe(HostProcess.Platform.defaultValue() !== "linux");
         // An explicit cap beside a preload that clears NODE_OPTIONS must not be relaunched over with 64.
         const clearing = preload("delete process.env.NODE_OPTIONS;");
         const cleared = images(clearing, { NODE_OPTIONS: "--max-semi-space-size=16" }, [
@@ -985,7 +822,7 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live(
+  it.live.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
     "reports the cap Node started with even when a preload deleted NODE_OPTIONS, from the startup record",
     () =>
       Effect.gen(function* () {

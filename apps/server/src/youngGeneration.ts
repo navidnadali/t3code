@@ -1,6 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Runs first thing in bin.ts, before the CLI's Effect runtime loads.
 import * as NodeFS from "node:fs";
-import * as NodeChildProcess from "node:child_process";
 import * as NodeModule from "node:module";
 import * as NodeSea from "node:sea";
 import * as NodeV8 from "node:v8";
@@ -166,92 +165,9 @@ export const nodeOptionsWithMaxSemiSpace = (
   return current === "" ? `${FLAG}=${mb}` : `${current} ${FLAG}=${mb}`;
 };
 
-/** How `ps` prints an argument or environment value: tab and newline in octal, other controls caret-style. */
-const asListed = (text: string): string =>
-  text.replace(/[\u0000-\u001f\u007f]/g, (char) =>
-    char === "\t"
-      ? "\\011"
-      : char === "\n"
-        ? "\\012"
-        : char === "\u007f"
-          ? "^?"
-          : `^${String.fromCharCode(char.charCodeAt(0) + 0x40)}`,
-  );
-
-const CHANNEL_ENTRIES = / NODE_CHANNEL_FD=\d+ NODE_CHANNEL_SERIALIZATION_MODE=\w+$/;
-
-/** Entries a library adds to the environment after exec; the kernel's record of the process never has them. */
-const RUNTIME_ADDED_ENV: ReadonlySet<string> = new Set(["__CF_USER_TEXT_ENCODING"]);
-
-/**
- * Every NODE_OPTIONS value (undefined for none) that, inserted among `entries` at one boundary and
- * preceded by `args`, makes the listing end with the result. The command line before `args` is
- * free text; `entries` are the process's other environment entries as `ps` prints them.
- */
-const listingReadings = (
-  listing: string,
-  entries: ReadonlyArray<string>,
-  args: string,
-): ReadonlySet<string | undefined> => {
-  const readings = new Set<string | undefined>();
-  for (let index = 0; index <= entries.length; index++) {
-    const tail = entries
-      .slice(index)
-      .map((entry) => ` ${entry}`)
-      .join("");
-    if (!listing.endsWith(tail)) continue;
-    const head = listing.slice(0, listing.length - tail.length);
-    const anchor = `${args}${entries
-      .slice(0, index)
-      .map((entry) => ` ${entry}`)
-      .join("")}`;
-    if (index === 0 && head.endsWith(anchor)) readings.add(undefined);
-    for (
-      let at = head.indexOf(" NODE_OPTIONS=");
-      at !== -1;
-      at = head.indexOf(" NODE_OPTIONS=", at + 1)
-    ) {
-      if (head.slice(0, at).endsWith(anchor))
-        readings.add(head.slice(at + " NODE_OPTIONS=".length));
-    }
-  }
-  return readings;
-};
-
 export type StartupNodeOptions =
   | { readonly known: true; readonly value: string | undefined }
   | { readonly known: false };
-
-/**
- * NODE_OPTIONS at startup from a `ps -E -ww -o command=` line (command line, then every environment
- * entry, single spaces throughout): the one text that, inserted among the entries the process has
- * now, reproduces the listing. None or several readings leave the record unknown, never guessed.
- */
-export const startupNodeOptionsFromListing = (
-  line: string,
-  env: Environment,
-  args: ReadonlyArray<string>,
-  options?: { readonly ipc?: boolean },
-): StartupNodeOptions => {
-  const printed = line.endsWith("\n") ? line.slice(0, -1) : line;
-  // Node appends its IPC entries last when it spawns a child, and removes them from the child's env.
-  const listing = options?.ipc === true ? printed.replace(CHANNEL_ENTRIES, "") : printed;
-  const entries = Object.entries(env).flatMap(([name, value]) =>
-    name === "NODE_OPTIONS" || value === undefined ? [] : [asListed(`${name}=${value}`)],
-  );
-  const argsText = args.length === 0 ? "" : ` ${asListed(args.join(" "))}`;
-  const direct = listingReadings(listing, entries, argsText);
-  const exec = entries.filter(
-    (entry) => !RUNTIME_ADDED_ENV.has(entry.slice(0, entry.indexOf("="))),
-  );
-  const readings =
-    direct.size > 0 || exec.length === entries.length
-      ? direct
-      : listingReadings(listing, exec, argsText);
-  if (readings.size !== 1) return { known: false };
-  const [value] = readings;
-  return { known: true, value };
-};
 
 /** NODE_OPTIONS out of a /proc environ block: UTF-8 like `process.env`, entries separated by NUL. */
 export const nodeOptionsFromEnviron = (block: Uint8Array): string | undefined =>
@@ -262,48 +178,20 @@ export const nodeOptionsFromEnviron = (block: Uint8Array): string | undefined =>
     ?.slice("NODE_OPTIONS=".length);
 
 /**
- * The operating system's value is trusted only when it agrees with the value in effect: then no
- * preload touched NODE_OPTIONS and the value in effect is the startup value. Anything else — a
- * preload that deleted or rewrote it, a listing this code could not parse exactly, no record at all —
- * means never relaunching on a guess.
- */
-export const startupNodeOptionsTrusted = (
-  startup: StartupNodeOptions,
-  current: string | undefined,
-): boolean => startup.known && startup.value === current;
-
-/**
  * NODE_OPTIONS as Node started with, from the operating system's record of this process — a preload
- * may have changed `process.env` since. Linux keeps it in /proc; macOS answers through `ps -E`.
+ * may have changed `process.env` since. Only Linux keeps an exact record (/proc, 13 µs to read);
+ * elsewhere the relaunch rules decide without one.
  */
-const startupNodeOptions = (input: {
-  readonly platform: string;
-  readonly pid: number;
-  readonly env: Environment;
-  readonly args: ReadonlyArray<string>;
-  readonly ipc: boolean;
-}): StartupNodeOptions => {
-  const { platform, pid, env, args, ipc } = input;
+const startupNodeOptions = (platform: string): StartupNodeOptions => {
+  if (platform !== "linux") return { known: false };
   try {
-    if (platform === "linux") {
-      return {
-        known: true,
-        value: nodeOptionsFromEnviron(NodeFS.readFileSync("/proc/self/environ")),
-      };
-    }
-    if (platform === "darwin") {
-      const listing = NodeChildProcess.spawnSync(
-        "/bin/ps",
-        ["-E", "-ww", "-o", "command=", "-p", String(pid)],
-        { encoding: "utf8", timeout: 2000 },
-      );
-      if (listing.status !== 0) return { known: false };
-      return startupNodeOptionsFromListing(listing.stdout, env, args, { ipc });
-    }
+    return {
+      known: true,
+      value: nodeOptionsFromEnviron(NodeFS.readFileSync("/proc/self/environ")),
+    };
   } catch {
     return { known: false };
   }
-  return { known: false };
 };
 
 const PRELOAD_FLAGS = new Set(["--require", "-r", "--import", "--loader", "--experimental-loader"]);
@@ -520,11 +408,6 @@ export interface YoungGenerationOutcome {
   readonly keptReason?: string;
   /** Started over IPC by a service launcher that supplied no flag; the cap waits for a service restart. */
   readonly launcherPredatesDefault?: true;
-  /**
-   * The operating system's record of NODE_OPTIONS at startup was unavailable or ambiguous, so
-   * `nodeOptionsAtStart` is the value in effect when this code ran, which a preload may have changed.
-   */
-  readonly startupUncertain?: true;
 }
 
 let lastOutcome: YoungGenerationOutcome | undefined;
@@ -550,32 +433,55 @@ const inspectorActive = (): boolean => {
   }
 };
 
-const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
-  // oxlint-disable-next-line t3code/no-global-process-runtime -- Runs before the Effect runtime exists.
-  const platform = process.platform;
-  const current = process.env.NODE_OPTIONS;
-  // The operating system remembers what Node started with; a preload may have changed process.env.
-  // Only a server command asks (a `ps` on macOS): helpers run per tool call never relaunch.
-  const server = isServerCommand(process.argv);
-  const startup: StartupNodeOptions = server
-    ? startupNodeOptions({
-        platform,
-        pid: process.pid,
-        env: process.env,
-        // The listing shows the command line as typed; only the arguments after the script are certain.
-        args: NodeSea.isSea() ? process.argv.slice(1) : process.argv.slice(2),
-        ipc: process.channel !== undefined,
-      })
-    : { known: false };
-  // What V8 started with, for the outcome: the record when known, else the value in effect, flagged.
+/** A process as the decision sees it: `process` read once, plus the operating system's startup record. */
+export interface YoungGenerationProcess {
+  readonly argv: ReadonlyArray<string>;
+  readonly execArgv: ReadonlyArray<string>;
+  /** The environment as it reads now, marker and pid guard included. */
+  readonly env: Environment;
+  readonly execPath: string;
+  readonly platform: string;
+  readonly pid: number;
+  readonly hasIpcChannel: boolean;
+  readonly isSea: boolean;
+  readonly canExecve: boolean;
+  readonly inspectorActive: boolean;
+  readonly preloadRan: boolean;
+  readonly startup: StartupNodeOptions;
+  readonly isDirectory?: (path: string) => boolean;
+}
+
+export type YoungGenerationDecision =
+  | {
+      readonly kind: "applied";
+      readonly outcome: YoungGenerationOutcome;
+      /** NODE_OPTIONS for the server's children: the value in effect minus the cap added for the server. */
+      readonly nodeOptionsForChildren: string | undefined;
+    }
+  | { readonly kind: "keep"; readonly outcome: YoungGenerationOutcome }
+  | {
+      readonly kind: "relaunch";
+      readonly plan: Extract<RelaunchPlan, { readonly kind: "relaunch" }>;
+      /** The outcome should the relaunch return instead of replacing the image. */
+      readonly outcome: YoungGenerationOutcome;
+    };
+
+/**
+ * The whole decision, free of side effects: honour a marker, keep when a known startup record
+ * differs from the value in effect (a preload rewrote it), else the relaunch rules.
+ */
+export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenerationDecision => {
+  const {
+    [INHERITED_NODE_OPTIONS_ENV]: inherited,
+    [RELAUNCHED_PID_ENV]: relaunchedPid,
+    ...env
+  } = view.env;
+  const current = env.NODE_OPTIONS;
+  const { startup } = view;
+  // What V8 started with, for the outcome: the record when known, else the value in effect.
   const nodeOptionsAtStart = startup.known ? startup.value : current;
-  const uncertain = startup.known || !server ? {} : { startupUncertain: true as const };
-  const inherited = process.env[INHERITED_NODE_OPTIONS_ENV];
-  const relaunchedPid = process.env[RELAUNCHED_PID_ENV];
-  delete process.env[RELAUNCHED_PID_ENV];
   if (inherited !== undefined) {
-    delete process.env[INHERITED_NODE_OPTIONS_ENV];
-    const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, process.execArgv).mb;
+    const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, view.execArgv).mb;
     const written = mb === null ? undefined : nodeOptionsWithMaxSemiSpace(inherited, mb);
     // Honour the marker only for a process that started with exactly the marker plus the cap — what
     // the relaunch or the launcher wrote, seen in the startup record or still leading the value in
@@ -587,72 +493,100 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
         current === written ||
         current?.startsWith(`${written} `) === true);
     if (mb !== null && wrote) {
-      const forChildren = withoutCapArg(current, mb);
-      if (forChildren === undefined) delete process.env.NODE_OPTIONS;
-      else process.env.NODE_OPTIONS = forChildren;
-      return { applied: true, nodeOptionsAtStart, ...uncertain };
+      return {
+        kind: "applied",
+        outcome: { applied: true, nodeOptionsAtStart },
+        nodeOptionsForChildren: withoutCapArg(current, mb),
+      };
     }
   }
-  if (server && !startupNodeOptionsTrusted(startup, current)) {
-    return {
-      applied: false,
-      nodeOptionsAtStart,
-      keptReason: startup.known
-        ? "NODE_OPTIONS changed since startup"
-        : "startup options unavailable",
-      ...uncertain,
-    };
-  }
+  const keep = (
+    keptReason: string,
+    extra: { readonly launcherPredatesDefault?: true } = {},
+  ): YoungGenerationDecision => ({
+    kind: "keep",
+    outcome: { applied: false, nodeOptionsAtStart, keptReason, ...extra },
+  });
+  // A record that differs from the value in effect means a preload rewrote NODE_OPTIONS: what it
+  // left cannot be carried into a relaunch. Without a record, the rules below decide.
+  if (startup.known && startup.value !== current) return keep("NODE_OPTIONS changed since startup");
   const plan = planYoungGenerationRelaunch({
+    argv: view.argv,
+    execArgv: view.execArgv,
+    env,
+    execPath: view.execPath,
+    platform: view.platform,
+    hasIpcChannel: view.hasIpcChannel,
+    isSea: view.isSea,
+    canExecve: view.canExecve,
+    inspectorActive: view.inspectorActive,
+    pid: view.pid,
+    ...(relaunchedPid === undefined ? {} : { relaunchedPid }),
+    preloadRan: view.preloadRan,
+    ...(view.isDirectory === undefined ? {} : { isDirectory: view.isDirectory }),
+  });
+  if (plan.kind === "keep") {
+    return keep(
+      plan.reason,
+      plan.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true },
+    );
+  }
+  return {
+    kind: "relaunch",
+    plan,
+    outcome: { applied: false, nodeOptionsAtStart, keptReason: "relaunch returned" },
+  };
+};
+
+const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Runs before the Effect runtime exists.
+  const platform = process.platform;
+  const view: YoungGenerationProcess = {
     argv: process.argv,
     execArgv: process.execArgv,
-    env: process.env,
+    env: { ...process.env },
     execPath: process.execPath,
     platform,
+    pid: process.pid,
     hasIpcChannel: process.channel !== undefined,
     isSea: NodeSea.isSea(),
     canExecve: typeof process.execve === "function",
     inspectorActive: inspectorActive(),
-    pid: process.pid,
-    ...(relaunchedPid === undefined ? {} : { relaunchedPid }),
     preloadRan: preloadRan(),
-  });
-  if (plan.kind === "keep") {
-    return plan.launcherPredatesDefault === true
-      ? {
-          applied: false,
-          nodeOptionsAtStart,
-          keptReason: plan.reason,
-          launcherPredatesDefault: true,
-          ...uncertain,
-        }
-      : { applied: false, nodeOptionsAtStart, keptReason: plan.reason, ...uncertain };
+    // Only a server command asks: helpers run per tool call never relaunch.
+    startup: isServerCommand(process.argv) ? startupNodeOptions(platform) : { known: false },
+  };
+  // Neither travels to children or into a second image on its own.
+  delete process.env[INHERITED_NODE_OPTIONS_ENV];
+  delete process.env[RELAUNCHED_PID_ENV];
+  const decision = decideYoungGeneration(view);
+  if (decision.kind === "applied") {
+    if (decision.nodeOptionsForChildren === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = decision.nodeOptionsForChildren;
+    return decision.outcome;
   }
+  if (decision.kind === "keep") return decision.outcome;
   const execve = process.execve;
   if (execve === undefined) {
-    return {
-      applied: false,
-      nodeOptionsAtStart,
-      keptReason: "process.execve is unavailable",
-      ...uncertain,
-    };
+    return { ...decision.outcome, keptReason: "process.execve is unavailable" };
   }
   try {
-    execve(plan.file, [...plan.args], { ...plan.env });
+    execve(decision.plan.file, [...decision.plan.args], { ...decision.plan.env });
   } catch (error) {
     process.stderr.write(
       `t3: running without ${FLAG}: ${error instanceof Error ? error.message : String(error)}\n`,
     );
-    return { applied: false, nodeOptionsAtStart, keptReason: "relaunch failed", ...uncertain };
+    return { ...decision.outcome, keptReason: "relaunch failed" };
   }
-  return { applied: false, nodeOptionsAtStart, keptReason: "relaunch returned", ...uncertain };
+  return decision.outcome;
 };
 
 export interface NodeRuntimeFlags {
   /** Started over IPC by a service launcher that supplied no flag; the cap waits for a service restart. */
   readonly launcherPredatesDefault?: true;
-  /** The startup record was unavailable or ambiguous: the sizes come from NODE_OPTIONS as it read after any preload. */
-  readonly startupUncertain?: true;
+  /** The process wanted the cap (neither disabled nor set explicitly) and runs without it; `keptReason` says why. */
+  readonly youngGenerationLost?: true;
+  readonly keptReason?: string;
   readonly execArgv: ReadonlyArray<string>;
   /** NODE_OPTIONS as V8 saw it at startup (the server's children see `nodeOptionsForChildren`). */
   readonly nodeOptions: string | null;
@@ -669,16 +603,28 @@ export const describeNodeRuntime = (input: {
   readonly nodeOptionsForChildren: string | undefined;
   readonly heapSizeLimitBytes: number;
   readonly applied: boolean;
-}): NodeRuntimeFlags => ({
-  execArgv: input.execArgv,
-  nodeOptions: input.nodeOptionsAtStart ?? null,
-  nodeOptionsForChildren: input.nodeOptionsForChildren ?? null,
-  heapSizeLimitMiB: Math.round(input.heapSizeLimitBytes / 1_048_576),
-  maxSemiSpaceMiB:
-    explicitMaxSemiSpace({ NODE_OPTIONS: input.nodeOptionsAtStart }, input.execArgv).mb ??
-    "node default",
-  youngGenerationDefault: input.applied,
-});
+  /** The escape hatch's value, to tell a cap nobody wanted from one that was lost. */
+  readonly maxSemiSpaceSetting?: string | undefined;
+  readonly keptReason?: string | undefined;
+}): NodeRuntimeFlags => {
+  const wanted =
+    resolveMaxSemiSpaceMb(
+      { NODE_OPTIONS: input.nodeOptionsAtStart, [MAX_SEMI_SPACE_ENV]: input.maxSemiSpaceSetting },
+      input.execArgv,
+    ) !== null;
+  return {
+    execArgv: input.execArgv,
+    nodeOptions: input.nodeOptionsAtStart ?? null,
+    nodeOptionsForChildren: input.nodeOptionsForChildren ?? null,
+    heapSizeLimitMiB: Math.round(input.heapSizeLimitBytes / 1_048_576),
+    maxSemiSpaceMiB:
+      explicitMaxSemiSpace({ NODE_OPTIONS: input.nodeOptionsAtStart }, input.execArgv).mb ??
+      "node default",
+    youngGenerationDefault: input.applied,
+    ...(input.applied || !wanted ? {} : { youngGenerationLost: true }),
+    ...(input.keptReason === undefined ? {} : { keptReason: input.keptReason }),
+  };
+};
 
 /** The startup log's sizes for an outcome and environment: parsed sizes only, never NODE_OPTIONS verbatim. */
 export const runtimeFlagsOf = (
@@ -696,11 +642,12 @@ export const runtimeFlagsOf = (
     nodeOptionsForChildren: env.NODE_OPTIONS,
     heapSizeLimitBytes: NodeV8.getHeapStatistics().heap_size_limit,
     applied: outcome?.applied ?? false,
+    maxSemiSpaceSetting: env[MAX_SEMI_SPACE_ENV],
+    keptReason: outcome?.keptReason,
   });
   return {
     ...sizes,
     ...(outcome?.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
-    ...(outcome?.startupUncertain === undefined ? {} : { startupUncertain: true }),
   };
 };
 
@@ -738,7 +685,6 @@ export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {
     pid: process.pid,
     ...(outcome.keptReason === undefined ? {} : { keptReason: outcome.keptReason }),
     ...(outcome.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
-    ...(outcome.startupUncertain === undefined ? {} : { startupUncertain: true }),
     ...(bootstrapFd === undefined ? {} : { bootstrapFdOpen: isOpenDescriptor(bootstrapFd) }),
   };
   process.stdout.write(`${JSON.stringify(report)}\n`);

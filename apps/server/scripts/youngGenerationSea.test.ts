@@ -21,7 +21,10 @@ interface NodeFlagsReport {
 }
 
 // `t3 __node-flags` as a shell would start it: the executable's own argv shape, the user's NODE_OPTIONS.
-const nodeFlags = (executable: string, env: Record<string, string | undefined>): NodeFlagsReport => {
+const nodeFlags = (
+  executable: string,
+  env: Record<string, string | undefined>,
+): NodeFlagsReport => {
   const result = NodeChildProcess.spawnSync(executable, ["__node-flags"], {
     env: {
       ...process.env,
@@ -44,12 +47,16 @@ describe("young-generation default in the single executable", () => {
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         // The release binary's argv is [exe, exe, ...arguments]; nothing else runs that shape.
-        const build = NodeChildProcess.spawnSync(process.execPath, ["scripts/cli.ts", "build-exe"], {
-          cwd: serverDir,
-          env: { ...process.env, NODE_OPTIONS: undefined },
-          encoding: "utf8",
-          timeout: 600_000,
-        });
+        const build = NodeChildProcess.spawnSync(
+          process.execPath,
+          ["scripts/cli.ts", "build-exe"],
+          {
+            cwd: serverDir,
+            env: { ...process.env, NODE_OPTIONS: undefined },
+            encoding: "utf8",
+            timeout: 600_000,
+          },
+        );
         expect(build.status, build.stderr).toBe(0);
         const executable = NodePath.join(serverDir, "dist-exe/t3");
         const userOptions = "--max-old-space-size=12288";
@@ -73,6 +80,5 @@ describe("young-generation default in the single executable", () => {
           maxSemiSpaceMb: 16,
         });
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-    900_000,
   );
 });

@@ -1376,7 +1376,7 @@ export const layerFromConfig = Layer.effect(
 );
 
 /**
- * The server's ProcessRunner. Layers are memoized by reference, so every `ProcessRunner.layer`
- * inside a layer this is provided to is this same runner.
+ * The server's ProcessRunner, on the spawner the knobs choose. Layers are memoized by reference, so
+ * every `ProcessRunner.layer` inside a layer this is provided to is this same runner.
  */
-export const layerProcessRunner = ProcessRunner.layer;
+export const layerProcessRunner = ProcessRunner.layer.pipe(Layer.provide(layerFromConfig));

@@ -167,14 +167,15 @@ waiting. Read CPU together with page faults:
 Every Git command is a child process, and Node creates each one synchronously on the thread that
 spawns it (`posix_spawn` on macOS, `fork` on Linux). On Linux each `fork` copies the page tables of
 the whole server, so its cost grows with the server's memory. On Linux and macOS the commands of
-`VcsProcess` and `GitVcsDriver` (checkpoints, status, refs, source control CLIs) therefore start from a
-small spawner process, started once while the server is small, so the server does not fork for them:
-each fork copies only the spawner's page tables. Output, exit codes and errors are the same. These are
-the only commands the spawner starts. Every other process the server starts still forks the server on
-Linux: among them the repository identity lookup's Git commands (cached per repository), provider
-checks and provider sessions, text generation, terminals, HTML render, host probes such as
-`hostnamectl`, the login-shell `PATH` probe at start-up, and the spawner itself. macOS spawns with
-`posix_spawn`, which copies no page tables, so the gain there is only the event-loop time.
+`VcsProcess` and `GitVcsDriver` (checkpoints, status, refs, source control CLIs) and of the server's
+`ProcessRunner` (the repository identity lookup's Git commands, host probes such as `hostnamectl`,
+agent scope `systemctl` calls, port scans, device tools, update checks) therefore start from a small
+spawner process, started once while the server is small, so the server does not fork for them: each
+fork copies only the spawner's page tables. Output, exit codes and errors are the same. These are the
+only commands the spawner starts. Every other process the server starts still forks the server on
+Linux: among them provider checks and provider sessions, text generation, terminals, HTML render, the
+login-shell `PATH` probe at start-up, and the spawner itself. macOS spawns with `posix_spawn`, which
+copies no page tables, so the gain there is only the event-loop time.
 
 `T3CODE_PROCESS_SPAWNER` (any case) chooses where those commands start:
 
@@ -188,7 +189,7 @@ Any other value is logged as an error and keeps Node's spawner. A spawner proces
 restarted, which forks the server once. If it stops again before starting a command, or more than 3
 times in 10 minutes, an error is logged and commands fail with "The process spawner stopped" for a
 cool-down of 15 seconds, then a spawner is started again; while starts keep failing, the cool-down
-doubles up to 5 minutes. Git never falls back to Node's spawner meanwhile. Each command's unread
+doubles up to 5 minutes. These commands never fall back to Node's spawner meanwhile. Each command's unread
 output waits in the server, up to 1 MiB per stream, where it would otherwise wait in a 64 KiB pipe.
 Release archives ship the spawner as its own small executable, `t3-process-spawner`, beside `t3`;
 without it, `t3` runs the spawner from its own bundle, which takes about four times the memory, and
@@ -196,7 +197,7 @@ logs a warning at start.
 
 The spawner kills its children and its own process group, then exits, when the server exits however
 it exits, and when it fails or receives SIGTERM, SIGINT or SIGHUP. Once the server has begun to shut
-down, a Git command still running or started later fails with "The process spawner stopped" instead of
+down, a command still running or started later fails with "The process spawner stopped" instead of
 running on the server. Stop the server with systemd's `KillMode=mixed`: with `control-group`, the
 spawner gets SIGTERM while the server is still shutting down, and the server logs a warning and forks
 once more if another command arrives.

@@ -17,6 +17,7 @@ import {
   nodeOptionsWithMaxSemiSpace,
   planYoungGenerationRelaunch,
   resolveMaxSemiSpaceMb,
+  AMBIGUOUS_LISTING,
   NON_SERVER_COMMANDS,
   nodeOptionsFromEnviron,
   nodeOptionsFromProcessListing,
@@ -339,6 +340,19 @@ describe("nodeOptionsFromProcessListing", () => {
       "",
     );
   });
+
+  it("declares a listing with quoted values ambiguous instead of guessing where a variable ends", () => {
+    // `NAME=` text inside a quoted option value, or NODE_OPTIONS-like text inside another variable's
+    // quoted value, cannot be told apart from a variable boundary: the record is then unavailable.
+    expect(
+      nodeOptionsFromProcessListing(
+        '/usr/bin/node x.mjs NODE_OPTIONS=--title="hello FOO=bar" --max-semi-space-size=16 PATH=/usr/bin',
+      ),
+    ).toBe(AMBIGUOUS_LISTING);
+    expect(
+      nodeOptionsFromProcessListing("/usr/bin/node x.mjs FOO='x NODE_OPTIONS=--bar' PATH=/usr/bin"),
+    ).toBe(AMBIGUOUS_LISTING);
+  });
 });
 
 describe("planYoungGenerationRelaunch", () => {
@@ -654,6 +668,53 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
         });
         expect(child.status, child.stderr).toBe(0);
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "removes only the cap it inserted, never flag-like text inside a quoted payload a preload appended",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "young-generation-payload-" });
+        const append = NodePath.join(dir, "append.cjs");
+        // The payload a preload appends contains the flag's text inside quotes: it is data, not a flag.
+        const payload =
+          "--import \"data:text/javascript,globalThis.note=' --max-semi-space-size=64 '\"";
+        NodeFS.writeFileSync(
+          append,
+          `process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS ?? "") + ${JSON.stringify(` ${payload}`)};\n`,
+        );
+        const marker = `--no-warnings --require ${append}`;
+        const report = yield* run({
+          NODE_OPTIONS: `${marker} ${flag}`,
+          [INHERITED_NODE_OPTIONS_ENV]: marker,
+        });
+        expect(report.applied).toBe(true);
+        expect(report.nodeOptionsForChildren).toBe(`${marker} ${payload}`);
+        const child = NodeChildProcess.spawnSync(process.execPath, ["-e", "0"], {
+          env: { ...process.env, NODE_OPTIONS: report.nodeOptionsForChildren ?? "" },
+          encoding: "utf8",
+        });
+        expect(child.status, child.stderr).toBe(0);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "reports the cap Node started with even when a preload deleted NODE_OPTIONS, from the startup record",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "young-generation-record-" });
+        const clearing = NodePath.join(dir, "clearing.mjs");
+        NodeFS.writeFileSync(clearing, "delete process.env.NODE_OPTIONS;\n");
+        const report = yield* run({
+          NODE_OPTIONS: `--max-semi-space-size=16 --import ${clearing}`,
+        });
+        expect(report.applied).toBe(false);
+        expect(report.maxSemiSpaceMb).toBe(16);
+        expect(report.nodeOptionsAtStart).toBe(`--max-semi-space-size=16 --import ${clearing}`);
+        expect(report.nodeOptionsForChildren).toBeNull();
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.live("keeps Node's default and says so when started with a preload", () =>

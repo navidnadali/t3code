@@ -194,8 +194,9 @@ const startHandoff = (message) => {
   stdio[3] = "pipe";
   let child;
   try {
-    // Its own environment is empty: nothing of the command's (NODE_OPTIONS included) applies to it.
-    child = spawn(shim.command, shim.args, { cwd: options.cwd, detached: options.detached, env: {}, stdio, windowsHide: true });
+    // Nothing of the command's environment (NODE_OPTIONS included) applies to it; Electron's
+    // executable, which runs the desktop's server, acts as Node only with ELECTRON_RUN_AS_NODE.
+    child = spawn(shim.command, shim.args, { cwd: options.cwd, detached: options.detached, env: { ELECTRON_RUN_AS_NODE: "1" }, stdio, windowsHide: true });
   } catch (error) {
     post({ t: "throw", id, error: errorFields(commandError(error, message.command, message.args)) });
     return;

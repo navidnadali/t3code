@@ -1811,10 +1811,11 @@ export const makeProcessSpawnerWithHost = Effect.fnUntraced(function* (
     },
     // The spawner executable, or the server's own Node with the shim's script: never the whole
     // server bundle per command, so a single executable without the spawner executable hands off nothing.
+    // Outside single executables the shim runs on the server's own runtime, which needs execve.
     handoffShim: () =>
       launch.command !== executable
         ? { command: launch.command, args: [EXEC_AFTER_GO] }
-        : isExecutable
+        : isExecutable || typeof process.execve !== "function"
           ? undefined
           : { command: executable, args: ["-e", execAfterGoSource] },
     onHandoffOrphans: (count) => {

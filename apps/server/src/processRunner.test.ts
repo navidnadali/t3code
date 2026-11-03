@@ -25,7 +25,7 @@ function asChildProcessCommand(command: unknown): ChildProcessCommand {
 }
 
 function makeHandle(input: {
-  readonly stdout?: string | Stream.Stream<Uint8Array>;
+  readonly stdout?: string | Stream.Stream<Uint8Array, PlatformError.PlatformError>;
   readonly stderr?: string | Stream.Stream<Uint8Array>;
   readonly code?: number;
   readonly stdin?: ChildProcessSpawner.ChildProcessHandle["stdin"];
@@ -259,6 +259,33 @@ describe("runProcess", () => {
 
       expect(result.stdout).toBe("stdin payload");
       expect(result.code).toBe(0);
+    }),
+  );
+});
+
+describe("ProcessReadError", () => {
+  it.effect("names why a stream could not be read, through the platform error", () =>
+    Effect.gen(function* () {
+      const spawner = makeSpawner(() =>
+        Effect.succeed(
+          makeHandle({
+            stdout: Stream.fail(
+              PlatformError.systemError({
+                _tag: "Unknown",
+                module: "ChildProcess",
+                method: "fromReadable(stdout)",
+                cause: new Error("The process spawner stopped", {
+                  cause: new Error("The process spawner exited with SIGKILL"),
+                }),
+              }),
+            ),
+          }),
+        ),
+      );
+      const error = yield* Effect.flip(runWith(spawner)({ command: "git", args: ["status"] }));
+      expect(error.message).toBe(
+        "Failed to read stdout for process 'git': The process spawner stopped: The process spawner exited with SIGKILL",
+      );
     }),
   );
 });

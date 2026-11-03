@@ -13,8 +13,13 @@ import { MuseDriver, type MuseDriverEnv } from "@t3tools/provider-muse/server";
 import { PiDriver, type PiDriverEnv } from "@t3tools/provider-pi/server";
 import type {
   AnyProviderDriver,
+  ProviderDriver,
   ProviderUsageReaderEnv,
 } from "@t3tools/provider-core/server/driver";
+import * as Effect from "effect/Effect";
+import { ChildProcessSpawner } from "effect/process";
+
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
 
 export type BuiltInDriversEnv =
   | AcpRegistryDriverEnv
@@ -28,16 +33,44 @@ export type BuiltInDriversEnv =
   | PiDriverEnv
   | MuseDriverEnv;
 
+const withSpawner =
+  (
+    spawner: Effect.Effect<
+      ChildProcessSpawner.ChildProcessSpawner["Service"],
+      never,
+      ChildProcessSpawner.ChildProcessSpawner
+    >,
+  ) =>
+  <Config, R, UsageR>(
+    driver: ProviderDriver<Config, R | ChildProcessSpawner.ChildProcessSpawner, UsageR>,
+  ): ProviderDriver<Config, R | ChildProcessSpawner.ChildProcessSpawner, UsageR> => ({
+    ...driver,
+    create: (input) =>
+      driver
+        .create(input)
+        .pipe(Effect.provideServiceEffect(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+  });
+
+/**
+ * Sessions and checks of a provider verified on hand-off (real CLI, socket stdio, survives the
+ * spawner's death) start from the server's provider launcher. Claude and Codex pick their spawners
+ * themselves; the others stay on Node's spawner (docs/operations/observability.md says why).
+ */
+const launchedByServer = withSpawner(WorkerChildProcessSpawner.providerSpawner);
+
+/** Muse's driver starts only checks (its SDK starts its sessions): the server's command spawner. */
+const checkedByServer = withSpawner(WorkerChildProcessSpawner.commandSpawner);
+
 export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> = [
   CodexDriver,
   ClaudeDriver,
   CursorDriver,
   GrokDriver,
   FxDriver,
-  OpenCodeDriver,
+  launchedByServer(OpenCodeDriver),
   AntigravityDriver,
-  PiDriver,
-  MuseDriver,
+  launchedByServer(PiDriver),
+  checkedByServer(MuseDriver),
   AcpRegistryDriver,
 ];
 

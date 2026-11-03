@@ -26,6 +26,10 @@ import { CodexSettings, ProviderInstanceId } from "@t3tools/contracts";
 
 import * as ServerConfig from "../config.ts";
 import { makeProcessProbe, processProbeSource } from "../testUtils/processProbe.ts";
+import {
+  commandsLeaveTheServer,
+  withServerCommandSpawner,
+} from "../testUtils/serverCommandSpawner.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import { makeCodexTextGeneration } from "./CodexTextGeneration.ts";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
@@ -196,31 +200,61 @@ function withFakeCodexEnv<A, E, R>(
 }
 
 it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
-  it.effect.each(["exec", "mcp list"] as const)(
-    "kills a stalled %s CLI when its request is interrupted",
-    (command) =>
+  it.effect.each([
+    { command: "exec", spawner: "ambient" },
+    { command: "mcp list", spawner: "ambient" },
+    { command: "exec", spawner: "server command" },
+    { command: "mcp list", spawner: "server command" },
+  ] as const)(
+    "kills a stalled $command CLI when its request is interrupted ($spawner spawner)",
+    ({ command, spawner }) =>
       Effect.gen(function* () {
         const probe = yield* makeProcessProbe;
-        yield* withFakeCodexEnv(
-          { output: "", lifecycle: { port: probe.port, command } },
-          (textGeneration) =>
-            Effect.gen(function* () {
-              const fiber = yield* textGeneration
-                .generateThreadTitle({
-                  cwd: process.cwd(),
-                  message: "Name this thread",
-                  modelSelection: DEFAULT_TEST_MODEL_SELECTION,
-                })
-                .pipe(Effect.forkScoped);
-              yield* probe.started;
+        const run = spawner === "ambient" ? Effect.asVoid : withServerCommandSpawner;
+        yield* run(
+          withFakeCodexEnv(
+            { output: "", lifecycle: { port: probe.port, command } },
+            (textGeneration) =>
+              Effect.gen(function* () {
+                const fiber = yield* textGeneration
+                  .generateThreadTitle({
+                    cwd: process.cwd(),
+                    message: "Name this thread",
+                    modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+                  })
+                  .pipe(Effect.forkScoped);
+                yield* probe.started;
 
-              const interrupted = yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped);
-              yield* probe.exited;
-              yield* Fiber.join(interrupted);
-              const exit = yield* Fiber.await(fiber);
-              expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
-            }),
+                const interrupted = yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped);
+                yield* probe.exited;
+                yield* Fiber.join(interrupted);
+                const exit = yield* Fiber.await(fiber);
+                expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+              }),
+          ),
         );
+      }),
+  );
+
+  it.effect.skipIf(!commandsLeaveTheServer)(
+    "starts the Codex CLI from the server's command spawner",
+    () =>
+      Effect.gen(function* () {
+        const { result, ambientCommands } = yield* withServerCommandSpawner(
+          withFakeCodexEnv(
+            { output: JSON.stringify({ title: "Off the server" }) },
+            (textGeneration) =>
+              textGeneration.generateThreadTitle({
+                cwd: process.cwd(),
+                message: "Name this thread",
+                modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+              }),
+          ),
+        );
+        expect({ title: result.title, ambientCommands }).toEqual({
+          title: "Off the server",
+          ambientCommands: [],
+        });
       }),
   );
 

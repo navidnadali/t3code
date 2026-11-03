@@ -53,12 +53,11 @@ import * as ResetCreditCoordinator from "./provider/resetCreditCoordinator.ts";
 import * as EventNdjsonLogger from "./provider/EventNdjsonLogger.ts";
 import * as ProviderIoOffloads from "./provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "./provider/io/ProviderIoWorkerPool.ts";
+import { layerOpenCodeRuntime } from "./provider/openCodeRuntimeLayer.ts";
 import { layerClaudeAgentSdkWorkerPool } from "./orchestration-v2/Adapters/ClaudeAgentSdkWorkerQuery.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderIoStageTiming from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
-import * as OpenCodeRuntime from "@t3tools/provider-opencode/server/OpenCodeRuntime";
-import * as OpenCodeServerLedger from "@t3tools/provider-opencode/server/OpenCodeServerLedger";
 import * as ProviderHostLive from "./provider/ProviderHostLive.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
@@ -91,6 +90,7 @@ import * as DesktopBrowserChannel from "./preview/DesktopBrowserChannel.ts";
 import * as ServerBrowserStream from "./preview/ServerBrowserStream.ts";
 import * as PreviewBrowser from "./preview/PreviewBrowser.ts";
 import * as ProcessRunner from "./processRunner.ts";
+import * as WorkerChildProcessSpawner from "./process/workerChildProcessSpawner.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -711,18 +711,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
       McpProviderSessions.layer,
     ),
   ),
-  Layer.provideMerge(
-    OpenCodeRuntime.layer.pipe(
-      Layer.provide(
-        Layer.unwrap(
-          Effect.gen(function* () {
-            const config = yield* ServerConfig.ServerConfig;
-            return OpenCodeServerLedger.layer({ stateDir: config.stateDir });
-          }),
-        ),
-      ),
-    ),
-  ),
+  Layer.provideMerge(layerOpenCodeRuntime),
   Layer.provideMerge(layerWorkspace),
   Layer.provideMerge(ProjectEnrichmentService.layer),
   Layer.provideMerge(Layer.mergeAll(NativeAppIconResolver.layer, layerProjectFaviconResolver)),
@@ -1215,6 +1204,14 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerPlatformServices),
     );
   }),
-).pipe(Layer.provide(ProcessRunner.layer));
+).pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      WorkerChildProcessSpawner.layerProcessRunner,
+      WorkerChildProcessSpawner.layerCommandSpawner,
+      WorkerChildProcessSpawner.layerProviderLauncher,
+    ),
+  ),
+);
 
 export const runServer = Layer.launch(layerMakeServer);

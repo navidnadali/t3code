@@ -70,6 +70,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ModelManifest from "../../provider/ModelManifest.ts";
 import { resolveProviderCompatibility } from "../../provider/providerCompatibility.ts";
+import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
 import { withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
 import * as CodexAdapterV2Testkit from "./CodexAdapterV2.testkit.ts";
@@ -250,6 +251,66 @@ describe("CodexAdapterV2 runtime policy", () => {
         value: "Filtered to overdue",
       });
       assert.isDefined(withT3.additionalContext?.["t3_code_runtime"]);
+    }),
+  );
+});
+
+describe("CodexAdapterV2 app-server client factory", () => {
+  it.effect("starts the app-server from the server's provider launcher when there is one", () =>
+    Effect.gen(function* () {
+      const started: Array<string> = [];
+      const recording = (label: string) =>
+        ChildProcessSpawner.make((command) =>
+          Effect.sync(() => started.push(`${label} ${command._tag}`)).pipe(
+            Effect.andThen(
+              Effect.fail(
+                PlatformError.badArgument({
+                  module: "ChildProcess",
+                  method: "spawn",
+                  description: "The fixture starts nothing",
+                }),
+              ),
+            ),
+          ),
+        );
+      const factory = yield* CodexAdapterV2.CodexAppServerClientFactory.pipe(
+        Effect.provide(
+          CodexAdapterV2.layerAppServerClientFactory.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, recording("server")),
+                Layer.succeed(
+                  WorkerChildProcessSpawner.ProviderProcessLauncher,
+                  WorkerChildProcessSpawner.ProviderProcessLauncher.of({
+                    spawn: () => {
+                      throw new Error("The app-server is driven through Effect");
+                    },
+                    spawner: recording("launcher"),
+                  }),
+                ),
+                Layer.succeed(
+                  ProviderEventLoggers.ProviderEventLoggers,
+                  ProviderEventLoggers.NoOpProviderEventLoggers,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      const opened = yield* Effect.exit(
+        Effect.scoped(
+          factory.open({
+            instanceId: ProviderInstanceId.make("codex"),
+            threadId: ThreadId.make("thread-launcher"),
+            providerSessionId: ProviderSessionId.make("session-launcher"),
+            runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+            settings: DEFAULT_CODEX_SETTINGS,
+            environment: {},
+          }),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(opened));
+      assert.deepEqual(started, ["launcher StandardCommand"]);
     }),
   );
 });

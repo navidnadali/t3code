@@ -48,6 +48,7 @@ import { ProviderDriverError } from "./Errors.ts";
 import * as ProviderOrchestrationAdapterInfrastructure from "./ProviderOrchestrationAdapterInfrastructure.ts";
 import * as PortScanner from "../preview/PortScanner.ts";
 import * as ProviderHostLive from "./ProviderHostLive.ts";
+import { withServerCommandSpawner } from "../testUtils/serverCommandSpawner.ts";
 import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretResolver";
 import type { AnyProviderDriver, ProviderInstance } from "@t3tools/provider-core/server/driver";
 
@@ -378,58 +379,65 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
-  it.live("runs Codex and Claude readiness probes from configured tilde paths", () =>
-    Effect.gen(function* () {
-      if (yield* HostProcess.isWindows) return;
+  it.live.each(["the ambient spawner", "the server's command spawner"] as const)(
+    "runs Codex and Claude readiness probes from configured tilde paths on %s",
+    (spawner) => {
+      const probes = Effect.gen(function* () {
+        const fixtures = yield* makeTildeProviderFixtures();
 
-      const fixtures = yield* makeTildeProviderFixtures();
-
-      const codexId = ProviderInstanceId.make("codex_tilde");
-      const claudeId = ProviderInstanceId.make("claude_tilde");
-      const configMap: ProviderInstanceConfigMap = {
-        [codexId]: {
-          driver: ProviderDriverKind.make("codex"),
-          enabled: true,
-          environment: [
-            {
-              name: "T3_CODEX_COLLAB_SCRIPT",
-              value: fixtures.codexScriptPath,
-              sensitive: false,
-            },
-          ],
-          config: makeCodexConfig({ enabled: true, binaryPath: fixtures.codexBinaryPath }),
-        },
-        [claudeId]: {
-          driver: ProviderDriverKind.make("claudeAgent"),
-          enabled: true,
-          config: makeClaudeConfig({
+        const codexId = ProviderInstanceId.make("codex_tilde");
+        const claudeId = ProviderInstanceId.make("claude_tilde");
+        const configMap: ProviderInstanceConfigMap = {
+          [codexId]: {
+            driver: ProviderDriverKind.make("codex"),
             enabled: true,
-            binaryPath: fixtures.claudeBinaryPath,
-            homePath: fixtures.claudeHomePath,
-          }),
-        },
-      };
+            environment: [
+              {
+                name: "T3_CODEX_COLLAB_SCRIPT",
+                value: fixtures.codexScriptPath,
+                sensitive: false,
+              },
+            ],
+            config: makeCodexConfig({ enabled: true, binaryPath: fixtures.codexBinaryPath }),
+          },
+          [claudeId]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            enabled: true,
+            config: makeClaudeConfig({
+              enabled: true,
+              binaryPath: fixtures.claudeBinaryPath,
+              homePath: fixtures.claudeHomePath,
+            }),
+          },
+        };
 
-      const { registry } = yield* makeProviderInstanceRegistry<CodexDriverEnv | ClaudeDriverEnv>({
-        drivers: [CodexDriver, ClaudeDriver],
-        configMap,
-      });
-      const codex = yield* registry.getInstance(codexId);
-      const claude = yield* registry.getInstance(claudeId);
-      expect(codex).toBeDefined();
-      expect(claude).toBeDefined();
+        const { registry } = yield* makeProviderInstanceRegistry<CodexDriverEnv | ClaudeDriverEnv>({
+          drivers: [CodexDriver, ClaudeDriver],
+          configMap,
+        });
+        const codex = yield* registry.getInstance(codexId);
+        const claude = yield* registry.getInstance(claudeId);
+        expect(codex).toBeDefined();
+        expect(claude).toBeDefined();
 
-      const [codexSnapshot, claudeSnapshot] = yield* Effect.all(
-        [codex!.snapshot.refresh, claude!.snapshot.refresh],
-        { concurrency: "unbounded" },
-      );
-      expect(codexSnapshot).toMatchObject({ status: "ready", installed: true, version: "0.0.0" });
-      expect(claudeSnapshot).toMatchObject({
-        status: "ready",
-        installed: true,
-        version: "2.1.219",
+        const [codexSnapshot, claudeSnapshot] = yield* Effect.all(
+          [codex!.snapshot.refresh, claude!.snapshot.refresh],
+          { concurrency: "unbounded" },
+        );
+        expect(codexSnapshot).toMatchObject({ status: "ready", installed: true, version: "0.0.0" });
+        expect(claudeSnapshot).toMatchObject({
+          status: "ready",
+          installed: true,
+          version: "2.1.219",
+        });
       });
-    }).pipe(Effect.provide(layerTest)),
+      return Effect.gen(function* () {
+        if (yield* HostProcess.isWindows) return;
+        if (spawner === "the ambient spawner") return yield* probes;
+        const { ambientCommands } = yield* withServerCommandSpawner(probes);
+        expect(ambientCommands).toEqual([]);
+      }).pipe(Effect.provide(layerTest));
+    },
   );
 
   it.live("runs Claude instance probes in the server state dir, not the server cwd", () =>

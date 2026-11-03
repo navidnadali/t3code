@@ -24,6 +24,7 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import { FetchHttpClient, HttpClient } from "effect/http";
 
+import { adoptedProcessIds, spawnerProcessIds } from "../process/spawnerProcesses.ts";
 import * as ProcessRunner from "../processRunner.ts";
 
 export class PortDiscovery extends Context.Service<
@@ -447,12 +448,15 @@ const parseProcessTable = (raw: string): ReadonlyMap<number, ProcessTableRow> =>
 /**
  * The process group stopping `pid` signals. Shells with job control and agent tool shells give
  * every job its own group, so the group is the job. Null when the group also holds this server,
- * a direct child of it (agent CLIs and terminal shells), or one of its ancestors.
+ * a direct child of it (agent CLIs and terminal shells, also when one of `spawners` started them
+ * for the server, or one in `adopted` outlived its spawner), or one of its ancestors.
  */
 export const stoppableProcessGroup = (
   table: ReadonlyMap<number, ProcessTableRow>,
   pid: number,
   serverPid: number,
+  spawners: ReadonlySet<number> = new Set(),
+  adopted: ReadonlySet<number> = new Set(),
 ): number | null => {
   const group = table.get(pid)?.pgid;
   if (group === undefined || group <= 1) return null;
@@ -465,7 +469,8 @@ export const stoppableProcessGroup = (
     guarded.add(parent);
   }
   for (const row of table.values()) {
-    if (row.pgid === group && (guarded.has(row.pid) || row.ppid === serverPid)) return null;
+    const serverChild = row.ppid === serverPid || spawners.has(row.ppid) || adopted.has(row.pid);
+    if (row.pgid === group && (guarded.has(row.pid) || serverChild)) return null;
   }
   return group;
 };
@@ -1100,7 +1105,13 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
     const table = yield* readProcessTable;
     // It exited after the scan, so there is nothing left to stop.
     if (!table.has(input.pid)) return;
-    const group = stoppableProcessGroup(table, input.pid, process.pid);
+    const group = stoppableProcessGroup(
+      table,
+      input.pid,
+      process.pid,
+      spawnerProcessIds,
+      adoptedProcessIds,
+    );
     if (group === null) return yield* new PreviewStopLocalServerError({ reason: "shared-group" });
     // False when the whole group already exited.
     const signalGroup = (signal: "SIGTERM" | "SIGKILL") =>

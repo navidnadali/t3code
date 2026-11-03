@@ -30,7 +30,6 @@ import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
-import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 import { isWindowsCommandNotFound } from "@t3tools/provider-core/server/snapshotProbe";
 import * as OpenCodeServerLedger from "./OpenCodeServerLedger.ts";
 import { collectStreamAsString } from "@t3tools/provider-core/server/snapshotProbe";
@@ -435,15 +434,9 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
           ...(input.environment ? { env: input.environment } : { extendEnv: true }),
         }),
       );
-      const terminateCommandGroup =
-        hostPlatform === "win32"
-          ? child.kill({ killSignal: "SIGKILL" }).pipe(Effect.asVoid)
-          : Effect.sync(() => {
-              try {
-                signalProcessGroup(Number(child.pid), "SIGKILL");
-              } catch {}
-            });
-      yield* Effect.addFinalizer(() => terminateCommandGroup.pipe(Effect.ignore));
+      // Through the handle: once the command is gone its PID can name another process, and a
+      // handed-off command's handle signals its group only while that PID is still its own.
+      yield* Effect.addFinalizer(() => child.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore));
       const [stdout, stderr, code] = yield* Effect.all(
         [collectStreamAsString(child.stdout), collectStreamAsString(child.stderr), child.exitCode],
         { concurrency: "unbounded" },
@@ -552,14 +545,9 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
         ),
       );
 
+    // Through the handle, as for commands: it signals the group only while the PID is OpenCode's.
     const killOpenCodeProcessGroup = (signal: NodeJS.Signals) =>
-      hostPlatform === "win32"
-        ? child.kill({ killSignal: signal, forceKillAfter: "1 second" }).pipe(Effect.asVoid)
-        : Effect.sync(() => {
-            try {
-              signalProcessGroup(Number(child.pid), signal);
-            } catch {}
-          });
+      child.kill({ killSignal: signal, forceKillAfter: "1 second" }).pipe(Effect.asVoid);
     const terminateChild = killOpenCodeProcessGroup("SIGTERM").pipe(
       Effect.andThen(Effect.sleep("1 second")),
       Effect.andThen(killOpenCodeProcessGroup("SIGKILL")),

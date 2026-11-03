@@ -27,6 +27,7 @@ import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import { spawnerProcessIds } from "./spawnerProcesses.ts";
 import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
 
 // Windows keeps the main-thread spawner, so the worker cases run elsewhere.
@@ -1371,6 +1372,22 @@ describe("WorkerChildProcessSpawner", () => {
     );
   }
 
+  it.live.skipIf(!workerPlatform)("the server knows its spawner process's PID while it runs", () =>
+    Effect.gen(function* () {
+      const spawnerPid = yield* Effect.gen(function* () {
+        const spawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(
+          yield* ChildProcessSpawner,
+        );
+        const parent = Number(
+          yield* spawner.string(node("process.stdout.write(String(process.ppid))")),
+        );
+        expect(spawnerProcessIds.has(parent)).toBe(true);
+        return parent;
+      }).pipe(Effect.scoped);
+      expect(spawnerProcessIds.has(spawnerPid)).toBe(false);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.live.skipIf(!workerPlatform)(
     "VCS layers provided per WebSocket connection reuse the server's spawner process",
     () =>
@@ -1424,16 +1441,21 @@ describe("WorkerChildProcessSpawner", () => {
   );
 
   it.live(
-    `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} and ${WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV} move VCS commands off the main spawner, results and errors unchanged`,
+    `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} and ${WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV} move VCS and the server's ProcessRunner commands off the main spawner, results and errors unchanged`,
     () =>
       Effect.gen(function* () {
         const outcome = (knobs: Record<string, string>) =>
           Effect.gen(function* () {
             const { calls, spawner } = yield* recordingSpawner;
             const { logs, layer: logLayer } = capturedLogs();
-            // As in server.ts, a shared ProcessRunner is provided outside VcsProcess too.
-            const layer = Layer.mergeAll(VcsProcess.layer, GitVcsDriver.layer).pipe(
-              Layer.provide(ProcessRunner.layer),
+            // As in server.ts: the server's ProcessRunner is provided outside, and services
+            // inside its unwrapped layer provide ProcessRunner.layer themselves.
+            const layer = Layer.unwrap(
+              Effect.succeed(
+                Layer.mergeAll(VcsProcess.layer, GitVcsDriver.layer, ProcessRunner.layer),
+              ),
+            ).pipe(
+              Layer.provide(WorkerChildProcessSpawner.layerProcessRunner),
               Layer.provide(
                 ServerConfig.layerTest(process.cwd(), { prefix: "t3-worker-spawner-test-" }),
               ),
@@ -1476,6 +1498,11 @@ describe("WorkerChildProcessSpawner", () => {
                 args: ["-e", "process.stdout.write(String(process.ppid))"],
                 cwd: process.cwd(),
               });
+              const runner = yield* ProcessRunner.ProcessRunner;
+              const runnerParent = yield* runner.run({
+                command: process.execPath,
+                args: ["-e", "process.stdout.write(String(process.ppid))"],
+              });
               return {
                 version: {
                   exitCode: version.exitCode,
@@ -1494,6 +1521,8 @@ describe("WorkerChildProcessSpawner", () => {
                   cause: summarizeError(missingCwd.cause as PlatformError.PlatformError),
                 },
                 spawnedBy: Number(parent.stdout) === process.pid ? "server" : "spawner process",
+                runnerSpawnedBy:
+                  Number(runnerParent.stdout) === process.pid ? "server" : "spawner process",
                 mainSpawns: calls.length,
                 errors: logs
                   .filter(({ level }) => level === "Error")
@@ -1505,15 +1534,20 @@ describe("WorkerChildProcessSpawner", () => {
         const { VCS_SPAWN_WORKER_ENV: worker, PROCESS_SPAWNER_ENV: spawner } =
           WorkerChildProcessSpawner;
         const onNode = yield* outcome({ [spawner]: "default" });
-        expect(onNode).toMatchObject({ mainSpawns: 5, spawnedBy: "server", errors: [] });
+        expect(onNode).toMatchObject({
+          mainSpawns: 6,
+          spawnedBy: "server",
+          runnerSpawnedBy: "server",
+          errors: [],
+        });
         expect(onNode.missing.tag).toBe("VcsProcessSpawnError");
         expect(onNode.missingCwd).toMatchObject({
           tag: "GitCommandError",
           cause: { reason: "NotFound" },
         });
-        const onWorker = { ...onNode, mainSpawns: workerPlatform ? 0 : 5 };
+        const onWorker = { ...onNode, mainSpawns: workerPlatform ? 0 : 6 };
         const onSpawnerProcess = workerPlatform
-          ? { ...onWorker, spawnedBy: "spawner process" }
+          ? { ...onWorker, spawnedBy: "spawner process", runnerSpawnedBy: "spawner process" }
           : onWorker;
         // Unset is the spawner process on Linux and macOS.
         expect(yield* outcome({})).toEqual(onSpawnerProcess);

@@ -36,6 +36,7 @@ import {
   resolveLatestProviderVersion,
 } from "@t3tools/provider-core/server/maintenanceResolver";
 import { CodexDriver } from "./CodexDriver.ts";
+import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import * as CodexAdapterV2 from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -103,7 +104,10 @@ const noSpawn = ChildProcessSpawner.make(() =>
 const encodeCredentials = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 it.layer(layerTest)("CodexDriver", (it) => {
-  const checkManagedAccount = (replacementTiming: "unchanged" | "during-probe") =>
+  const checkManagedAccount = (
+    replacementTiming: "unchanged" | "during-probe",
+    probeSpawner: "ambient" | "server command" = "ambient",
+  ) =>
     Effect.gen(function* () {
       const instanceId = ProviderInstanceId.make("restored-managed-account");
       const credentials = new Map<string, Uint8Array>();
@@ -163,6 +167,21 @@ it.layer(layerTest)("CodexDriver", (it) => {
         let interruptedChecks = 0;
         let failAcquire = false;
         const startupChecksInterrupted = yield* Deferred.make<void>();
+        // The managed instance's checks run on the server's command spawner when it provides one.
+        const provideProbes =
+          (probes: ChildProcessSpawner.ChildProcessSpawner["Service"]) =>
+          <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            probeSpawner === "ambient"
+              ? effect.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, probes))
+              : effect.pipe(
+                  Effect.provideService(WorkerChildProcessSpawner.CommandSpawner, probes),
+                  Effect.provideService(
+                    ChildProcessSpawner.ChildProcessSpawner,
+                    ChildProcessSpawner.make(() =>
+                      Effect.die("The server must not start Codex checks itself"),
+                    ),
+                  ),
+                );
         const acquire = () =>
           Effect.suspend(() => {
             if (failAcquire)
@@ -205,8 +224,7 @@ it.layer(layerTest)("CodexDriver", (it) => {
               acquire,
             }),
           ),
-          Effect.provideService(
-            ChildProcessSpawner.ChildProcessSpawner,
+          provideProbes(
             ChildProcessSpawner.make(() =>
               Effect.gen(function* () {
                 if (replacementTiming === "during-probe") {
@@ -333,7 +351,11 @@ it.layer(layerTest)("CodexDriver", (it) => {
   // account's catalog with the new identity.
   it.effect.each(["unchanged", "during-probe"] as const)(
     "managed catalog keeps its account label and token together: %s",
-    checkManagedAccount,
+    (replacementTiming) => checkManagedAccount(replacementTiming),
+  );
+
+  it.effect("managed Codex starts its checks from the server's command spawner", () =>
+    checkManagedAccount("unchanged", "server command"),
   );
 
   it.effect.skipIf(windowsHost)(

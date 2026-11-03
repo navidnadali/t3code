@@ -1559,6 +1559,43 @@ it.effect("leaves a transaction control with bindings or a raw result to SQLite"
   ),
 );
 
+it.effect("keeps its transaction bookkeeping in step with controls the worker ran itself", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      // A transaction opened raw survives a managed one that cannot start inside it.
+      const manual = yield* Effect.gen(function* () {
+        yield* sql.unsafe("BEGIN").raw;
+        assert.equal(yield* countEntries(sql), 1);
+        const managed = yield* sql.withTransaction(countEntries(sql)).pipe(Effect.flip);
+        assert.include(String(managed.reason.cause), "within a transaction");
+        assert.equal(yield* countEntries(sql), 1);
+        return yield* sql.unsafe("COMMIT").raw;
+      }).pipe(SqliteClient.readOnly);
+      assert.deepEqual(manual, { changes: 0, lastInsertRowid: 0 });
+      // A raw COMMIT inside a managed transaction leaves its COMMIT with nothing to end.
+      const mixed = yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            assert.equal(yield* countEntries(sql), 1);
+            return yield* sql.unsafe("COMMIT").raw;
+          }),
+        )
+        .pipe(SqliteClient.readOnly, Effect.flip);
+      assert.include(String(mixed.reason.cause), "no transaction is active");
+      // A top-level savepoint is a transaction too: the managed one fails, the savepoint survives.
+      const savepoint = yield* Effect.gen(function* () {
+        yield* sql.unsafe("SAVEPOINT outer");
+        const managed = yield* sql.withTransaction(countEntries(sql)).pipe(Effect.flip);
+        assert.include(String(managed.reason.cause), "within a transaction");
+        return yield* sql.unsafe("RELEASE SAVEPOINT outer");
+      }).pipe(SqliteClient.readOnly);
+      assert.deepEqual(savepoint, []);
+      // And the reader is as usable as ever.
+      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+    }),
+  ),
+);
+
 it.effect("sends statements issued together as one batch and answers each on its own", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {

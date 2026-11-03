@@ -189,6 +189,68 @@ interface StatInfo {
   readonly size: number;
 }
 
+const fingerprintOf = (stats: NodeFS.BigIntStats) =>
+  `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+
+export type BoundedRead =
+  | { readonly kind: "bytes"; readonly fingerprint: string; readonly bytes: Buffer }
+  | { readonly kind: "oversize"; readonly fingerprint: string }
+  | { readonly kind: "unreadable" };
+
+/**
+ * The file's bytes, or "oversize" past `maxBytes`: the size is taken from the descriptor that is
+ * then read, at most `maxBytes + 1` bytes, so a file swapped after the check is not the one read
+ * and one that grows is not read whole.
+ */
+export const readBoundedFile = (file: string, maxBytes: number): Effect.Effect<BoundedRead> =>
+  Effect.promise(
+    () =>
+      new Promise<BoundedRead>((resolve) => {
+        try {
+          NodeFS.open(file, "r", (openError, fd) => {
+            if (openError) {
+              resolve({ kind: "unreadable" });
+              return;
+            }
+            const finish = (result: BoundedRead) => NodeFS.close(fd, () => resolve(result));
+            NodeFS.fstat(fd, { bigint: true }, (statError, stats) => {
+              if (statError) {
+                finish({ kind: "unreadable" });
+                return;
+              }
+              const fingerprint = fingerprintOf(stats);
+              if (stats.size > BigInt(maxBytes)) {
+                finish({ kind: "oversize", fingerprint });
+                return;
+              }
+              const buffer = Buffer.allocUnsafe(maxBytes + 1);
+              let offset = 0;
+              const step = () =>
+                NodeFS.read(fd, buffer, offset, buffer.length - offset, null, (readError, read) => {
+                  if (readError) {
+                    finish({ kind: "unreadable" });
+                    return;
+                  }
+                  offset += read;
+                  if (read === 0) {
+                    finish({ kind: "bytes", fingerprint, bytes: buffer.subarray(0, offset) });
+                    return;
+                  }
+                  if (offset > maxBytes) {
+                    finish({ kind: "oversize", fingerprint });
+                    return;
+                  }
+                  step();
+                });
+              step();
+            });
+          });
+        } catch {
+          resolve({ kind: "unreadable" });
+        }
+      }),
+  );
+
 const statInfo = (file: string) =>
   new Promise<StatInfo>((resolve) => {
     try {
@@ -196,10 +258,7 @@ const statInfo = (file: string) =>
         resolve(
           error
             ? { fingerprint: `!${error.code ?? "error"}`, size: 0 }
-            : {
-                fingerprint: `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`,
-                size: Number(stats.size),
-              },
+            : { fingerprint: fingerprintOf(stats), size: Number(stats.size) },
         ),
       );
     } catch {
@@ -246,34 +305,31 @@ interface PackedRefs extends ParsedPackedRefs {
   readonly fingerprint: string;
 }
 
-// Stat before reading, so a rewrite between the two is seen by the next stat; null when unreadable.
-const readPackedRefs = (commonDir: string, cached: PackedRefs | undefined) =>
-  Effect.promise(async (): Promise<PackedRefs | null> => {
-    const file = NodePath.join(commonDir, "packed-refs");
-    const { fingerprint, size } = await statInfo(file);
-    if (cached !== undefined && cached.fingerprint === fingerprint) return cached;
-    if (fingerprint === "!ENOENT") return { fingerprint, refs: new Map(), replaceRefs: false };
-    if (fingerprint.startsWith("!")) return null;
-    if (size > PACKED_REFS_MAX_BYTES) return { fingerprint, refs: null, replaceRefs: null };
-    const content = await new Promise<string | null>((resolve) => {
-      try {
-        NodeFS.readFile(file, "latin1", (error, text) => resolve(error ? null : text));
-      } catch {
-        resolve(null);
-      }
-    });
-    if (content === null) return null;
-    // The file may have grown between the stat and the read; the bytes read decide.
-    return {
-      fingerprint,
-      ...parsePackedRefs(
-        content,
-        PACKED_REFS_PREFIX,
-        PACKED_REFS_ENTRY_BUDGET,
-        PACKED_REFS_MAX_BYTES,
-      ),
-    };
-  });
+// Read from one descriptor: the fingerprint and size are those of the bytes read, and a file
+// above the cap is not read whole; null when unreadable.
+const readPackedRefs = Effect.fnUntraced(function* (
+  commonDir: string,
+  cached: PackedRefs | undefined,
+) {
+  const file = NodePath.join(commonDir, "packed-refs");
+  const read = yield* readBoundedFile(file, PACKED_REFS_MAX_BYTES);
+  if (read.kind === "unreadable") {
+    const { fingerprint } = yield* Effect.promise(() => statInfo(file));
+    return fingerprint === "!ENOENT" ? { fingerprint, refs: new Map(), replaceRefs: false } : null;
+  }
+  if (cached !== undefined && cached.fingerprint === read.fingerprint) return cached;
+  if (read.kind === "oversize")
+    return { fingerprint: read.fingerprint, refs: null, replaceRefs: null };
+  return {
+    fingerprint: read.fingerprint,
+    ...parsePackedRefs(
+      read.bytes.toString("latin1"),
+      PACKED_REFS_PREFIX,
+      PACKED_REFS_ENTRY_BUDGET,
+      PACKED_REFS_MAX_BYTES,
+    ),
+  };
+});
 
 const environmentPlain = () => HISTORY_ENVIRONMENT.every((name) => process.env[name] === undefined);
 
@@ -335,45 +391,53 @@ export const parseCommitObject = (object: Buffer): CommitFacts | null => {
   return { tree, parents, committerTime: committer[1]! };
 };
 
-// Read as Git would: bounded, and accepted only when the object's hash is the id asked for (SHA-1
-// for 40-hex ids, SHA-256 for 64-hex ones). Null hands the question to Git.
-const readLooseCommit = (
+// The inflated object when the bytes are one zlib stream inflating within the bound, else null
+// (Git refuses bytes after the stream as a corrupt object).
+const inflateObject = (bytes: Buffer): Buffer | null => {
+  try {
+    // `info` makes the convenience method return the engine too; the types omit that form.
+    const inflated = NodeZlib.inflateSync(bytes, {
+      maxOutputLength: COMMIT_OBJECT_MAX_BYTES,
+      info: true,
+    } as NodeZlib.ZlibOptions) as unknown as {
+      readonly buffer: Buffer | ArrayBuffer;
+      readonly engine: { readonly bytesWritten: number };
+    };
+    if (inflated.engine.bytesWritten !== bytes.length) return null;
+    const buffer: unknown = inflated.buffer;
+    return Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer as ArrayBuffer);
+  } catch {
+    return null;
+  }
+};
+
+// Read as Git would: from one descriptor, bounded, every byte part of the zlib stream, and
+// accepted only when the object's hash is the id asked for (SHA-1 for 40-hex ids, SHA-256 for
+// 64-hex ones). Null hands the question to Git. Untraced: it runs per commit per turn.
+const readLooseCommit = Effect.fnUntraced(function* (
   objectsDir: string,
   oid: string,
   failures: BoundedMap<string, string>,
   counter: { reads: number },
-) =>
-  Effect.promise(async (): Promise<CommitFacts | null> => {
-    const file = NodePath.join(objectsDir, oid.slice(0, 2), oid.slice(2));
-    const { fingerprint, size } = await statInfo(file);
-    if (fingerprint.startsWith("!")) return null;
-    const key = `${objectsDir}\0${oid}`;
-    if (failures.get(key) === fingerprint) return null;
-    const fail = () => {
-      failures.set(key, fingerprint);
-      return null;
-    };
-    if (size > COMMIT_OBJECT_MAX_BYTES) return fail();
-    counter.reads++;
-    const data = await new Promise<Buffer | null>((resolve) => {
-      try {
-        NodeFS.readFile(file, (error, bytes) => resolve(error ? null : bytes));
-      } catch {
-        resolve(null);
-      }
-    });
-    if (data === null) return null;
-    let object: Buffer;
-    try {
-      object = NodeZlib.inflateSync(data, { maxOutputLength: COMMIT_OBJECT_MAX_BYTES });
-    } catch {
-      return fail();
-    }
-    const algorithm = oid.length === 64 ? "sha256" : "sha1";
-    if (NodeCrypto.createHash(algorithm).update(object).digest("hex") !== oid) return fail();
-    const facts = parseCommitObject(object);
-    return facts === null ? fail() : facts;
-  });
+) {
+  const file = NodePath.join(objectsDir, oid.slice(0, 2), oid.slice(2));
+  const key = `${objectsDir}\0${oid}`;
+  const read = yield* readBoundedFile(file, COMMIT_OBJECT_MAX_BYTES);
+  if (read.kind === "unreadable") return null;
+  if (failures.get(key) === read.fingerprint) return null;
+  const fail = () => {
+    failures.set(key, read.fingerprint);
+    return null;
+  };
+  if (read.kind === "oversize") return fail();
+  counter.reads++;
+  const object = inflateObject(read.bytes);
+  if (object === null) return fail();
+  const algorithm = oid.length === 64 ? "sha256" : "sha1";
+  if (NodeCrypto.createHash(algorithm).update(object).digest("hex") !== oid) return fail();
+  const facts = parseCommitObject(object);
+  return facts === null ? fail() : facts;
+});
 
 export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const refs = new BoundedMap<string, string>(REFS_CAPACITY);

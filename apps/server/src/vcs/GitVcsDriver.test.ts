@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - the fallback-log race hooks must change files synchronously inside a command.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeZlib from "node:zlib";
@@ -32,6 +33,7 @@ import {
   makeCheckpointRefMemory,
   parseCommitObject,
   parsePackedRefs,
+  readBoundedFile,
 } from "./gitCheckpointRefs.ts";
 import { gitConfigBool, parseGitConfigList } from "./gitConfigSnapshot.ts";
 import type * as VcsDriver from "./VcsDriver.ts";
@@ -3073,4 +3075,32 @@ it.effect("a file swapped between the size check and the read is not what gets r
     });
     assert.strictEqual(swaps, 0);
   }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "a bounded read stops at one byte past the bound, whatever the descriptor's size says",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-bounded-read-" });
+      const bound = 1024;
+      const exact = path.join(directory, "exact");
+      yield* fileSystem.writeFile(exact, new Uint8Array(bound).fill(1));
+      const read = yield* readBoundedFile(exact, bound);
+      assert.strictEqual(read.kind === "bytes" ? read.bytes.length : -1, bound);
+      const over = path.join(directory, "over");
+      yield* fileSystem.writeFile(over, new Uint8Array(bound + 1).fill(1));
+      assert.strictEqual((yield* readBoundedFile(over, bound)).kind, "oversize");
+      // A pipe reports no size, so only the read itself can bound what a writer feeds.
+      const fifo = path.join(directory, "fifo");
+      NodeChildProcess.execFileSync("mkfifo", [fifo]);
+      const writer = fileSystem
+        .writeFile(fifo, new Uint8Array(64 * 1024).fill(2))
+        .pipe(Effect.ignore);
+      const [, fed] = yield* Effect.all([writer, readBoundedFile(fifo, bound)], {
+        concurrency: "unbounded",
+      });
+      assert.strictEqual(fed.kind, "oversize");
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

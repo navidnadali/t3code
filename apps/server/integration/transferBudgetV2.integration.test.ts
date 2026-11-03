@@ -390,6 +390,21 @@ it.live("reports V2 thread HTTP and WebSocket transfer budgets", () =>
           const reconnectSqlStatements = counter.count() - reconnectSqlStart;
           assert.equal(threadMode, "snapshot");
 
+          // A shell client that resumes with a replay of this thread still gets its next live update.
+          const lateShell = yield* openMeasuredWsClient({ url, cookie: "" });
+          const lsq = yield* subscribe(lateShell, "shell", last.sequence - 1);
+          assert.equal(yield* synchronized(lsq), "replay");
+          yield* sink.write({
+            events: turnEvents(provider, TRANSFER_HISTORY_TURN_COUNT + 1, false),
+          });
+          const nextShell = yield* projection.getThreadShell(THREAD_ID);
+          yield* collectUntil(
+            lsq,
+            (item) =>
+              item.kind === "thread.updated" && NodeUtil.isDeepStrictEqual(item.thread, nextShell),
+          );
+          yield* lateShell.close;
+
           for (const events of longTurnThreadBatches(provider)) yield* sink.write({ events });
           const get = (path: string) =>
             measureHttpGet({

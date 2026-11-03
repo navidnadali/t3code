@@ -2660,3 +2660,52 @@ it.effect("a remembered checkpoint ref is not trusted after the object store mov
     assert.isFalse(warm);
   }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
+
+it.effect("a relative alternates directory is read per worktree, so git answers", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const h = yield* makeTurnHarness("t3-checkpoint-relative-alternates-");
+    yield* h.writeBoth("file.txt", "initial\n");
+    yield* h.gitBoth(["add", "."]);
+    yield* h.commitBoth("initial");
+    yield* h.turn(1);
+    yield* h.turn(2);
+    const worktrees = { warm: path.join(h.root, "wt-warm"), cold: path.join(h.root, "wt-cold") };
+    for (const [name, cwd] of Object.entries(h.repos)) {
+      yield* h.gitIn(cwd, [
+        "worktree",
+        "add",
+        "-q",
+        worktrees[name as "warm" | "cold"],
+        "-b",
+        "wt",
+      ]);
+    }
+    // With the store moved away, a relative alternate resolves from each worktree's own directory:
+    // the main worktree's .git/objects holds the commits, a linked worktree's .git is a file.
+    const objects = path.join(h.root, "objects-elsewhere");
+    yield* fileSystem.makeDirectory(objects);
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.GIT_OBJECT_DIRECTORY = objects;
+        process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = path.join(".git", "objects");
+      }),
+      () =>
+        Effect.sync(() => {
+          delete process.env.GIT_OBJECT_DIRECTORY;
+          delete process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+        }),
+    );
+    const probe = (driver: VcsDriver.VcsDriver["Service"], cwd: string) =>
+      driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef: turnRef(2) });
+    assert.isTrue(yield* probe(h.warm, h.repos.warm));
+    assert.isTrue(yield* probe(h.warm, h.repos.warm));
+    const cold = yield* GitVcsDriver.makeVcsDriverShape();
+    // A directory's first read runs git; the second has the snapshot and the remembered ref.
+    yield* probe(h.warm, worktrees.warm);
+    const warm = yield* probe(h.warm, worktrees.warm);
+    assert.strictEqual(warm, yield* probe(cold, worktrees.cold));
+    assert.isFalse(warm);
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);

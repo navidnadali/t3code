@@ -365,11 +365,12 @@ const CLAUDE_GROUP_WATCH_SCRIPT = [
   "{ trap '' TERM; read -r _ <&3; kill -TERM 0; sleep 5; kill -KILL 0; } </dev/null >/dev/null 2>&1 &",
   'exec "$@" 3<&-',
 ].join("\n");
-// The same watch on descriptor 2, the CLI's stderr discarded: a provider launcher hands a process
-// only stdin, stdout and stderr, in blocking mode as Node's own pipes.
+// The same watch on descriptor 2, which also carries the CLI's stderr: a provider launcher hands a
+// process only stdin, stdout and stderr, in blocking mode as Node's own pipes. A socket both ways:
+// the CLI writes its stderr to the server, and the watch reads the server's side, which only reads.
 const CLAUDE_GROUP_WATCH_SCRIPT_FD2 = [
   "{ trap '' TERM; read -r _ <&3; kill -TERM 0; sleep 5; kill -KILL 0; } 3<&2 </dev/null >/dev/null 2>&1 &",
-  'exec "$@" 2>/dev/null',
+  'exec "$@"',
 ].join("\n");
 
 /**
@@ -400,15 +401,9 @@ export function spawnClaudeProcessGroup(
           env: options.env,
           signal: options.signal,
           stdio: ["pipe", "pipe", "pipe"],
-          held: [2],
         });
-  if (launcher === undefined) {
-    // Always drained, so a chatty CLI never blocks on a full stderr pipe.
-    child.stderr?.setEncoding("utf8").on("data", onStderr).once("close", onStderrClose);
-  } else {
-    // A handed-off CLI's descriptor 2 is the group watch, and its stderr goes to /dev/null.
-    onStderrClose();
-  }
+  // Always drained, so a chatty CLI never blocks on a full stderr pipe.
+  child.stderr?.setEncoding("utf8").on("data", onStderr).once("close", onStderrClose);
   child.once("exit", () => {
     try {
       if (!(child instanceof HandoffProcess) || child.groupIsOwn()) {

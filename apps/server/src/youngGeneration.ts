@@ -68,33 +68,46 @@ const NON_SERVER_ROOT_FLAGS = new Set([
 
 export type Environment = Readonly<Record<string, string | undefined>>;
 
+/** One argument of NODE_OPTIONS: its text as Node reads it, and where it sits in the string, quotes included. */
+interface NodeOptionSpan {
+  readonly start: number;
+  readonly end: number;
+  readonly text: string;
+}
+
 /** Splits NODE_OPTIONS as Node does: spaces separate, double quotes group, a backslash inside quotes escapes. */
-export const tokenizeNodeOptions = (nodeOptions: string | undefined): ReadonlyArray<string> => {
-  if (nodeOptions === undefined) return [];
-  const tokens: Array<string> = [];
-  let token = "";
+const nodeOptionSpans = (nodeOptions: string): ReadonlyArray<NodeOptionSpan> => {
+  const spans: Array<NodeOptionSpan> = [];
+  let text = "";
+  let start = -1;
   let quoted = false;
-  let hasToken = false;
+  const close = (end: number): void => {
+    if (start !== -1) spans.push({ start, end, text });
+    text = "";
+    start = -1;
+  };
   for (let index = 0; index < nodeOptions.length; index++) {
     let char = nodeOptions[index]!;
     if (char === "\\" && quoted && index + 1 < nodeOptions.length) {
+      if (start === -1) start = index;
       char = nodeOptions[++index]!;
     } else if (char === " " && !quoted) {
-      if (hasToken) tokens.push(token);
-      token = "";
-      hasToken = false;
+      close(index);
       continue;
     } else if (char === '"') {
+      if (start === -1) start = index;
       quoted = !quoted;
-      hasToken = true;
       continue;
     }
-    token += char;
-    hasToken = true;
+    if (start === -1) start = index;
+    text += char;
   }
-  if (hasToken) tokens.push(token);
-  return tokens;
+  close(nodeOptions.length);
+  return spans;
 };
+
+export const tokenizeNodeOptions = (nodeOptions: string | undefined): ReadonlyArray<string> =>
+  nodeOptions === undefined ? [] : nodeOptionSpans(nodeOptions).map((span) => span.text);
 
 /** Node accepts `_` for `-` in option names and a single leading dash; compare on the `--dashed` form. */
 const optionName = (arg: string): string => {
@@ -153,19 +166,34 @@ export const nodeOptionsWithMaxSemiSpace = (
   return current === "" ? `${FLAG}=${mb}` : `${current} ${FLAG}=${mb}`;
 };
 
+/** A process listing that cannot be read exactly: see `nodeOptionsFromProcessListing`. */
+export const AMBIGUOUS_LISTING: unique symbol = Symbol("ambiguous process listing");
+
+const ENV_ENTRY_START = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const hasQuote = (token: string): boolean => token.includes('"') || token.includes("'");
+
 /**
- * NODE_OPTIONS as a `ps -E -o command=` line reports it: the command line, then `NAME=value`
- * entries separated by spaces; a value runs until the next `NAME=` token. Undefined when absent.
+ * NODE_OPTIONS as a `ps -E -o command=` line reports it: `NAME=value` entries separated by spaces, a
+ * value running until the next `NAME=` token; undefined when absent. Ambiguous, never guessed, when
+ * `NODE_OPTIONS=` starts more than one token or a quote precedes or sits in the value: quoted text
+ * can hold a `NAME=` that is no boundary or a `NODE_OPTIONS=` that is no entry.
  */
-export const nodeOptionsFromProcessListing = (line: string): string | undefined => {
+export const nodeOptionsFromProcessListing = (
+  line: string,
+): string | undefined | typeof AMBIGUOUS_LISTING => {
   const tokens = line.trim().split(" ");
-  const start = tokens.findIndex((token) => token.startsWith("NODE_OPTIONS="));
-  if (start === -1) return undefined;
+  const starts = tokens.flatMap((token, index) =>
+    token.startsWith("NODE_OPTIONS=") ? [index] : [],
+  );
+  if (starts.length === 0) return undefined;
+  if (starts.length > 1) return AMBIGUOUS_LISTING;
+  const start = starts[0]!;
   const value = [tokens[start]!.slice("NODE_OPTIONS=".length)];
   for (const token of tokens.slice(start + 1)) {
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) break;
+    if (ENV_ENTRY_START.test(token)) break;
     value.push(token);
   }
+  if (tokens.slice(0, start).some(hasQuote) || value.some(hasQuote)) return AMBIGUOUS_LISTING;
   return value.join(" ").trim();
 };
 
@@ -211,7 +239,8 @@ const startupNodeOptions = (platform: string, pid: number): StartupNodeOptions =
         { encoding: "utf8", timeout: 2000 },
       );
       if (listing.status !== 0) return { known: false };
-      return { known: true, value: nodeOptionsFromProcessListing(listing.stdout) };
+      const value = nodeOptionsFromProcessListing(listing.stdout);
+      return value === AMBIGUOUS_LISTING ? { known: false } : { known: true, value };
     }
   } catch {
     return { known: false };
@@ -240,17 +269,21 @@ const preloadRan = (): boolean => {
 };
 
 /**
- * `value` without its last `--max-semi-space-size=<mb>` token, removed as text so the rest keeps its
- * quoting exactly (a preload's own additions included); undefined when nothing remains.
+ * `value` without its last `--max-semi-space-size=<mb>` argument — an argument as Node reads it, so
+ * the flag's text inside a quoted value is never touched — cut out of the string so the rest keeps
+ * its quoting exactly (a preload's own additions included); undefined when nothing remains.
  */
-const withoutCapText = (value: string | undefined, mb: number): string | undefined => {
+const withoutCapArg = (value: string | undefined, mb: number): string | undefined => {
   if (value === undefined) return undefined;
-  const matches = [...value.matchAll(new RegExp(`(^|\\s)${FLAG}=${mb}(?=\\s|$)`, "g"))];
-  const last = matches.at(-1);
+  const spans = nodeOptionSpans(value);
+  let cap: NodeOptionSpan | undefined;
+  for (const span of spans) if (span.text === `${FLAG}=${mb}`) cap = span;
   const rest =
-    last === undefined
+    cap === undefined
       ? value
-      : `${value.slice(0, last.index)}${value.slice(last.index + last[0].length)}`;
+      : [value.slice(0, cap.start).trimEnd(), value.slice(cap.end).trimStart()]
+          .filter((part) => part !== "")
+          .join(" ");
   const trimmed = rest.trim();
   return trimmed === "" ? undefined : trimmed;
 };
@@ -429,6 +462,11 @@ export interface YoungGenerationOutcome {
   readonly keptReason?: string;
   /** Started over IPC by a service launcher that supplied no flag; the cap waits for a service restart. */
   readonly launcherPredatesDefault?: true;
+  /**
+   * The operating system's record of NODE_OPTIONS at startup was unavailable or ambiguous, so
+   * `nodeOptionsAtStart` is the value in effect when this code ran, which a preload may have changed.
+   */
+  readonly startupUncertain?: true;
 }
 
 let lastOutcome: YoungGenerationOutcome | undefined;
@@ -457,9 +495,12 @@ const inspectorActive = (): boolean => {
 const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   // oxlint-disable-next-line t3code/no-global-process-runtime -- Runs before the Effect runtime exists.
   const platform = process.platform;
-  const nodeOptionsAtStart = process.env.NODE_OPTIONS;
+  const current = process.env.NODE_OPTIONS;
   // The operating system remembers what Node started with; a preload may have changed process.env.
   const startup = startupNodeOptions(platform, process.pid);
+  // What V8 started with, for the outcome: the record when known, else the value in effect, flagged.
+  const nodeOptionsAtStart = startup.known ? startup.value : current;
+  const uncertain = startup.known ? {} : { startupUncertain: true as const };
   const inherited = process.env[INHERITED_NODE_OPTIONS_ENV];
   const relaunchedPid = process.env[RELAUNCHED_PID_ENV];
   delete process.env[RELAUNCHED_PID_ENV];
@@ -470,26 +511,27 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
     // Honour the marker only for a process that started with exactly the marker plus the cap — what
     // the relaunch or the launcher wrote, seen in the startup record or still leading the value in
     // effect; a stray or forged marker is ignored. Children then get the value in effect minus that
-    // cap, as text, so a preload's additions and the user's quoting survive.
+    // one argument, cut out of the string, so a preload's additions and the user's quoting survive.
     const wrote =
       written !== undefined &&
       ((startup.known && startup.value === written) ||
-        nodeOptionsAtStart === written ||
-        nodeOptionsAtStart?.startsWith(`${written} `) === true);
+        current === written ||
+        current?.startsWith(`${written} `) === true);
     if (mb !== null && wrote) {
-      const forChildren = withoutCapText(nodeOptionsAtStart, mb);
+      const forChildren = withoutCapArg(current, mb);
       if (forChildren === undefined) delete process.env.NODE_OPTIONS;
       else process.env.NODE_OPTIONS = forChildren;
-      return { applied: true, nodeOptionsAtStart };
+      return { applied: true, nodeOptionsAtStart, ...uncertain };
     }
   }
-  if (!startupNodeOptionsTrusted(startup, nodeOptionsAtStart)) {
+  if (!startupNodeOptionsTrusted(startup, current)) {
     return {
       applied: false,
       nodeOptionsAtStart,
       keptReason: startup.known
         ? "NODE_OPTIONS changed since startup"
         : "startup options unavailable",
+      ...uncertain,
     };
   }
   const plan = planYoungGenerationRelaunch({
@@ -513,12 +555,18 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
           nodeOptionsAtStart,
           keptReason: plan.reason,
           launcherPredatesDefault: true,
+          ...uncertain,
         }
-      : { applied: false, nodeOptionsAtStart, keptReason: plan.reason };
+      : { applied: false, nodeOptionsAtStart, keptReason: plan.reason, ...uncertain };
   }
   const execve = process.execve;
   if (execve === undefined) {
-    return { applied: false, nodeOptionsAtStart, keptReason: "process.execve is unavailable" };
+    return {
+      applied: false,
+      nodeOptionsAtStart,
+      keptReason: "process.execve is unavailable",
+      ...uncertain,
+    };
   }
   try {
     execve(plan.file, [...plan.args], { ...plan.env });
@@ -526,14 +574,16 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
     process.stderr.write(
       `t3: running without ${FLAG}: ${error instanceof Error ? error.message : String(error)}\n`,
     );
-    return { applied: false, nodeOptionsAtStart, keptReason: "relaunch failed" };
+    return { applied: false, nodeOptionsAtStart, keptReason: "relaunch failed", ...uncertain };
   }
-  return { applied: false, nodeOptionsAtStart, keptReason: "relaunch returned" };
+  return { applied: false, nodeOptionsAtStart, keptReason: "relaunch returned", ...uncertain };
 };
 
 export interface NodeRuntimeFlags {
   /** Started over IPC by a service launcher that supplied no flag; the cap waits for a service restart. */
   readonly launcherPredatesDefault?: true;
+  /** The startup record was unavailable or ambiguous: the sizes come from NODE_OPTIONS as it read after any preload. */
+  readonly startupUncertain?: true;
   readonly execArgv: ReadonlyArray<string>;
   /** NODE_OPTIONS as V8 saw it at startup (the server's children see `nodeOptionsForChildren`). */
   readonly nodeOptions: string | null;
@@ -582,6 +632,7 @@ export const nodeRuntimeFlags = (): Omit<
     ...(lastOutcome?.launcherPredatesDefault === undefined
       ? {}
       : { launcherPredatesDefault: true }),
+    ...(lastOutcome?.startupUncertain === undefined ? {} : { startupUncertain: true }),
   };
 };
 
@@ -613,6 +664,7 @@ export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {
     pid: process.pid,
     ...(outcome.keptReason === undefined ? {} : { keptReason: outcome.keptReason }),
     ...(outcome.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
+    ...(outcome.startupUncertain === undefined ? {} : { startupUncertain: true }),
     ...(bootstrapFd === undefined ? {} : { bootstrapFdOpen: isOpenDescriptor(bootstrapFd) }),
   };
   process.stdout.write(`${JSON.stringify(report)}\n`);

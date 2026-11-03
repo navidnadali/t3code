@@ -220,10 +220,15 @@ a direct `t3 serve` on Windows (no `execve`), while a Windows server the service
 flag through its environment. A direct start with a preload (`--require`, `--import`, `--loader` on the
 command line or in `NODE_OPTIONS`) keeps Node's default too, with the reason "started with a preload": what
 `NODE_OPTIONS` says after a preload ran is not what Node started with, so neither an explicit cap nor the
-user's options could be carried into a relaunch; a server the launcher starts gets the flag regardless. A
-process relaunches at most once (the relaunch marks its own pid), whatever a preload does to `NODE_OPTIONS`.
-`t3 __node-flags` prints what the current process runs with; `server.v8` logs the parsed sizes once the
-server listens.
+user's options could be carried into a relaunch; a server the launcher starts gets the flag regardless. The
+decision rests on `NODE_OPTIONS` as Node started with, read from the operating system's record of the process
+(`/proc/self/environ` on Linux, `ps -E` on macOS): the process relaunches only when that record agrees with
+`NODE_OPTIONS` as it reads, and keeps Node's default otherwise ("NODE_OPTIONS changed since startup"; "startup
+options unavailable" when there is no record, as on Windows, or the macOS listing is ambiguous — `NODE_OPTIONS`
+set beside quoted environment values). A process relaunches at most once (the relaunch marks its own pid),
+whatever a preload does to `NODE_OPTIONS`. `t3 __node-flags` prints what the current process runs with;
+`server.v8` logs the parsed sizes once the server listens. Both report `nodeOptionsAtStart` from the startup
+record and flag `startupUncertain` when it had to fall back to `NODE_OPTIONS` as it read after any preload.
 
 ### Related Artifacts
 

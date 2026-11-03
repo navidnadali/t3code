@@ -59,6 +59,7 @@ import {
   OrchestrationV2DispatchCommandError,
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2GetThreadProjectionError,
+  OrchestrationV2RpcSchemas,
   OrchestrationV2ThreadLaunchError,
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
@@ -107,7 +108,7 @@ import {
   HttpServerRespondable,
   HttpServerResponse,
 } from "effect/http";
-import { RpcGroup, RpcSerialization, RpcServer } from "effect/rpc";
+import { RpcGroup, RpcSchema, RpcSerialization, RpcServer } from "effect/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as NativeChildWorkQuery from "./orchestration-v2/NativeChildWorkQuery.ts";
@@ -618,8 +619,54 @@ function projectFileFailureContext(
 
 const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
+// Shell and thread stream items are shared across clients (the shell delta hub, projected
+// events); each object is encoded once with the JSON codec RpcServer would apply, and the
+// server-side definitions of those two streams pass the encoded items through unchanged.
+// Each encoder has its own cache: an object that reached both streams is encoded per schema.
+const encodeStreamItemOnce = <A extends object>(encode: (item: A) => unknown) => {
+  const encoded = new WeakMap<A, unknown>();
+  return (item: A): unknown => {
+    const cached = encoded.get(item);
+    if (cached !== undefined) return cached;
+    const value = encode(item);
+    encoded.set(item, value);
+    return value;
+  };
+};
+export const encodeShellStreamItem = encodeStreamItemOnce(
+  Schema.encodeSync(Schema.toCodecJson(OrchestrationV2RpcSchemas.subscribeShell.output)),
+);
+export const encodeThreadStreamItem = encodeStreamItemOnce(
+  Schema.encodeSync(Schema.toCodecJson(OrchestrationV2RpcSchemas.subscribeThread.output)),
+);
+// `toCodecJson` would turn `Schema.Unknown` into a walk over every field of every item per
+// client; the items are already the contract codec's output, so they pass through untouched.
+const EncodedStreamItem = Schema.declare((_: unknown): _ is unknown => true, {
+  toCodecJson: () => undefined,
+});
+type WsRpc = RpcGroup.Rpcs<typeof WsRpcGroup>;
+const wsRpc = <Tag extends WsRpc["_tag"]>(tag: Tag) =>
+  WsRpcGroup.requests.get(tag) as Extract<WsRpc, { readonly _tag: Tag }>;
+const subscribeShellRpc = wsRpc(ORCHESTRATION_V2_WS_METHODS.subscribeShell);
+const subscribeThreadRpc = wsRpc(ORCHESTRATION_V2_WS_METHODS.subscribeThread);
+type EncodedStreamWsRpc = typeof subscribeShellRpc | typeof subscribeThreadRpc;
+/** The two stream RPCs as the server defines them: encoded items pass through. Exported for RpcServer-level tests. */
+export const ServerWsStreamRpcGroup = RpcGroup.make(
+  subscribeShellRpc.setSuccess(
+    RpcSchema.Stream(EncodedStreamItem, subscribeShellRpc.successSchema.error),
+  ),
+  subscribeThreadRpc.setSuccess(
+    RpcSchema.Stream(EncodedStreamItem, subscribeThreadRpc.successSchema.error),
+  ),
+);
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
-const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
+const ServerWsRpcGroup = RpcGroup.make(
+  ...Array.from(WsRpcGroup.requests.values()).filter(
+    (rpc): rpc is Exclude<WsRpc, EncodedStreamWsRpc> =>
+      rpc !== subscribeShellRpc && rpc !== subscribeThreadRpc,
+  ),
+  ...Array.from(ServerWsStreamRpcGroup.requests.values()),
+).middleware(RpcInstrumentation);
 
 // RpcGroup.toLayer derives each handler's requirements by scanning every RPC in
 // the group, so its type cost grows with handlers × RPCs. Near 200 methods that
@@ -1371,6 +1418,19 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     );
   },
 );
+
+/** The stream handlers as `layerWsRpc` registers them: each item encoded once, shared across clients. */
+export const subscribeShellRpcHandler = (
+  input: Parameters<typeof subscribeOrchestrationV2Shell>[0],
+) => Stream.unwrap(subscribeOrchestrationV2Shell(input)).pipe(Stream.map(encodeShellStreamItem));
+export const subscribeThreadRpcHandler = (
+  input: Parameters<typeof subscribeOrchestrationV2Thread>[0],
+) =>
+  Stream.unwrap(
+    Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
+      Effect.andThen(subscribeOrchestrationV2Thread(input)),
+    ),
+  ).pipe(Stream.map(encodeThreadStreamItem));
 
 export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
@@ -2288,14 +2348,8 @@ export const layerWsRpc = (
                 ),
             ),
           ),
-        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input) =>
-          Stream.unwrap(subscribeOrchestrationV2Shell(input)),
-        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
-          Stream.unwrap(
-            Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-              Effect.andThen(subscribeOrchestrationV2Thread(input)),
-            ),
-          ),
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: subscribeShellRpcHandler,
+        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: subscribeThreadRpcHandler,
         [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: (input) =>
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(

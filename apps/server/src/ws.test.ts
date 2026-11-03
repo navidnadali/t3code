@@ -11,15 +11,19 @@ import {
   TurnItemId,
   ProviderDriverKind,
   ProviderInstanceId,
+  WsRpcGroup,
   WS_METHODS,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
+  AuthOrchestrationReadScope,
+  ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationProjectShell,
+  OrchestrationV2RpcSchemas,
   type OrchestrationV2ShellStreamItem,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadProjection,
-  type OrchestrationV2ThreadShell,
+  OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadStreamItem,
-  type OrchestrationProjectShell,
   type RepositoryIdentity,
   type ServerConfig,
   type ServerConfigStreamEvent,
@@ -36,11 +40,12 @@ import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
-import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
+import { RpcGroup, RpcMessage, RpcServer, type Rpc } from "effect/rpc";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import { vi } from "vite-plus/test";
@@ -142,8 +147,14 @@ import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
 import {
+  encodeShellStreamItem,
+  encodeThreadStreamItem,
   layerWsRpc,
+  ServerWsStreamRpcGroup,
+  subscribeShellRpcHandler,
+  subscribeThreadRpcHandler,
   resolveOpenDiscoveryForConfig,
   subscribeOrchestrationV2Shell,
   subscribeOrchestrationV2Thread,
@@ -2080,6 +2091,329 @@ it.live(
       assert.equal(snapshotLoads, 1 + rounds);
       assert.equal(overflows.count, rounds);
       assert.equal(title, `Events through ${marker[0]!.sequence - 1}`);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+const decodeThreadShellJson = Schema.decodeSync(Schema.toCodecJson(OrchestrationV2ThreadShell));
+const encodeShellChunk = Schema.encodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeShell.output)),
+);
+const encodeThreadChunk = Schema.encodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeThread.output)),
+);
+
+const sampleThreadShell = decodeThreadShellJson({
+  createdBy: "user",
+  creationSource: "web",
+  id: "4fce7cfc-16ef-42bb-bca2-000000000046",
+  projectId: "d2e0512a-ce5d-42b9-b72d-000000000001",
+  title: "Synthetic thread 63",
+  providerInstanceId: "claudeAgent",
+  modelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-4-6" },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+  linkedPullRequest: null,
+  pullRequests: [],
+  branchPullRequest: null,
+  lineage: {
+    parentThreadId: null,
+    relationshipToParent: null,
+    rootThreadId: "4fce7cfc-16ef-42bb-bca2-000000000046",
+  },
+  forkedFrom: null,
+  activeProviderThreadId: null,
+  latestRunId: "run:thread:4fce7cfc-16ef-42bb-bca2-000000000046:ordinal:4",
+  latestRunRequestedAt: "2025-11-09T01:43:58.436Z",
+  latestRunStartedAt: "2025-11-09T01:43:59.436Z",
+  latestRunCompletedAt: "2025-11-09T01:44:33.436Z",
+  latestRunStopRequested: false,
+  activeRunId: null,
+  activityRunStartedAt: null,
+  activityRunStatus: null,
+  blockedOnThreadWait: false,
+  status: "completed",
+  lastError: null,
+  usageLimitResetAt: null,
+  pendingRuntimeRequest: null,
+  pendingGuestMessageCount: 0,
+  latestVisibleMessage: null,
+  latestUserMessageAt: "2025-11-09T01:43:58.436Z",
+  hasActionableProposedPlan: false,
+  pendingBackgroundTasks: [],
+  providerInstanceHistory: ["claudeAgent"],
+  itemCount: 25,
+  visibleItemCount: 25,
+  createdAt: "2025-11-09T01:09:02.473Z",
+  updatedAt: "2025-11-09T01:45:33.436Z",
+  archivedAt: null,
+  settledOverride: "settled",
+  settledAt: "2025-11-09T01:45:33.436Z",
+  lastVisitedAt: "2025-11-09T01:45:33.436Z",
+  deletedAt: null,
+});
+
+it("encodes a shared stream item once, as the RPC JSON codec encodes a chunk", () => {
+  const shell = sampleThreadShell;
+  const shellItems: Array<OrchestrationV2ShellStreamItem> = [
+    { kind: "thread.updated", sequence: 7, location: "active", thread: shell },
+    { kind: "thread.removed", sequence: 8, location: "archive", threadId: shell.id },
+    { kind: "synchronized" },
+  ];
+  assert.deepStrictEqual<unknown>(
+    shellItems.map(encodeShellStreamItem),
+    encodeShellChunk(shellItems),
+  );
+  assert.strictEqual(encodeShellStreamItem(shellItems[0]!), encodeShellStreamItem(shellItems[0]!));
+  const synchronized = { kind: "synchronized" as const };
+  assert.deepStrictEqual<unknown>(
+    [encodeThreadStreamItem(synchronized)],
+    encodeThreadChunk([synchronized]),
+  );
+});
+
+// Review E1: each encoder keeps its own cache, so an object that reaches both streams is never
+// served with the other stream's encoding.
+it("an item encoded for the shell stream is not served to the thread stream from the cache", () => {
+  const item: OrchestrationV2ShellStreamItem = {
+    kind: "thread.removed",
+    sequence: 9,
+    location: "archive",
+    threadId: ThreadId.make("4fce7cfc-16ef-42bb-bca2-000000000047"),
+  };
+  assert.deepStrictEqual<unknown>([encodeShellStreamItem(item)], encodeShellChunk([item]));
+  // Not a thread stream item: the thread encoder must reject it, not return the shell encoding.
+  assert.throws(() => encodeThreadStreamItem(item as never));
+});
+
+// Review E2: the two stream RPCs served through the server's real definitions by RpcServer with
+// the JSON codec (pass-through items), decoded with the client contract's chunk codec, and
+// byte-identical to the same handlers served through the contract definitions.
+const decodeProjectShellJson = Schema.decodeSync(Schema.toCodecJson(OrchestrationProjectShell));
+type WsRpc = RpcGroup.Rpcs<typeof WsRpcGroup>;
+const contractRpc = <Tag extends WsRpc["_tag"]>(tag: Tag) =>
+  WsRpcGroup.requests.get(tag) as Extract<WsRpc, { readonly _tag: Tag }>;
+const ContractStreamRpcGroup = RpcGroup.make(
+  contractRpc(ORCHESTRATION_V2_WS_METHODS.subscribeShell),
+  contractRpc(ORCHESTRATION_V2_WS_METHODS.subscribeThread),
+);
+const decodeShellChunk = Schema.decodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeShell.output)),
+);
+const decodeThreadChunk = Schema.decodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeThread.output)),
+);
+
+// RpcServer over an in-memory protocol with the JSON codec: the frames it sends are collected,
+// each chunk acknowledged as the websocket client would.
+const serveStreamRequest = <Rpcs extends Rpc.Any, R>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  handlers: Layer.Layer<Rpc.ToHandler<Rpcs>, never, R>,
+  request: { readonly tag: string; readonly payload: unknown },
+) =>
+  Effect.gen(function* () {
+    const frames = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
+    const disconnects = yield* Queue.unbounded<number>();
+    let write:
+      | ((clientId: number, data: RpcMessage.FromClientEncoded) => Effect.Effect<void>)
+      | undefined;
+    const protocol = yield* RpcServer.Protocol.make((toServer) =>
+      Effect.sync(() => {
+        write = toServer;
+        return {
+          disconnects,
+          send: (_clientId: number, response: RpcMessage.FromServerEncoded) =>
+            Effect.asVoid(Queue.offer(frames, response)),
+          end: () => Effect.void,
+          clientIds: Effect.succeed(new Set([0])),
+          initialMessage: Effect.succeedNone,
+          supportsAck: true,
+          supportsTransferables: false,
+          supportsSpanPropagation: false,
+          supportsNotifications: false,
+          codecFor: Schema.toCodecJson,
+        };
+      }),
+    );
+    yield* RpcServer.make(group, WS_RPC_SERVER_OPTIONS).pipe(
+      Effect.provideService(RpcServer.Protocol, protocol),
+      Effect.provide(Layer.merge(handlers, RpcAuthorization.layer([AuthOrchestrationReadScope]))),
+      Effect.forkScoped,
+    );
+    const toServer = (data: RpcMessage.FromClientEncoded) =>
+      write === undefined ? Effect.die("the protocol has not started") : write(0, data);
+    yield* toServer({
+      _tag: "Request",
+      id: "1",
+      tag: request.tag,
+      payload: request.payload,
+      headers: [],
+    });
+    // Chunk frames as JSON strings, until the completion marker (the live tail never ends).
+    const chunks: Array<string> = [];
+    while (true) {
+      const frame = yield* Queue.take(frames);
+      if (frame._tag === "Exit" || frame._tag === "Defect") {
+        return yield* Effect.die(
+          `stream ended before the completion marker: ${JSON.stringify(frame)}`,
+        );
+      }
+      if (frame._tag !== "Chunk") continue;
+      chunks.push(JSON.stringify(frame.values));
+      yield* toServer({ _tag: "Ack", requestId: frame.requestId });
+      if (frame.values.some((value) => (value as { kind?: string }).kind === "synchronized")) {
+        return chunks;
+      }
+    }
+  });
+
+it.live(
+  "the server's stream RPC definitions send what the contract definitions send, and the contract client decodes them",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const now = "2026-10-31T00:00:00.000Z";
+      const threadId = ThreadId.make("thread:stream-rpc");
+      const projectId = ProjectId.make("project:stream-rpc");
+      const identity = {
+        canonicalKey: "github.com/x/y",
+        locator: {
+          source: "git-remote",
+          remoteName: "origin",
+          remoteUrl: "https://github.com/x/y.git",
+        },
+      } as const;
+      const projectRow = decodeProjectShellJson({
+        id: projectId,
+        title: "Stream RPC",
+        workspaceRoot: "/tmp/stream-rpc",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      });
+      // Events the resumes replay: a project update and a thread update.
+      yield* sql`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          'stream-rpc:project:1', 'project', ${projectId}, 1, 'project.meta-updated',
+          ${now}, 'server', ${JSON.stringify({ projectId, title: "Stream RPC", updatedAt: now })}, '{}', 2
+        )
+      `;
+      yield* insertShellEvent(sql, threadId, 0);
+      const layerStreamServices = ShellDeltaHub.layer.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(
+            Layer.succeed(ThreadManagement.ThreadManagementService, {
+              ensureLegacyTranscript: () => Effect.void,
+              getShellSnapshot: () => Effect.die("a resume must not load a full snapshot"),
+              listActiveSubagentThreadIds: () => Effect.succeed([]),
+              getThreadShellReadForEvent: (input: {
+                readonly threadId: ThreadId;
+                readonly sequence: number;
+              }) =>
+                Effect.succeed({
+                  shell: { ...sampleThreadShell, id: input.threadId },
+                  readOrdinal: input.sequence,
+                }),
+              streamStoredEventsFrom: (input?: { readonly afterSequence?: number }) =>
+                store
+                  .streamApplicationEvents({ afterSequence: input?.afterSequence ?? 0 })
+                  .pipe(
+                    Stream.filter((event): event is OrchestrationV2StoredEvent => "event" in event),
+                  ),
+            } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+            Layer.succeed(ProjectStore.ProjectStoreV2, {
+              listShells: () => Effect.succeed([projectRow]),
+              getShell: () => Effect.succeedSome(projectRow),
+            } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+            Layer.effect(
+              ProjectEnrichment.ProjectEnrichmentService,
+              PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>().pipe(
+                Effect.map(
+                  (changes) =>
+                    ({
+                      subscribeChanges: PubSub.subscribe(changes),
+                      // The identity is attached as each subscriber sends the project item.
+                      getAvailable: () =>
+                        Effect.succeed({
+                          repositoryIdentity: identity,
+                          faviconPath: null,
+                          repositoryIdentityResolved: true,
+                        }),
+                    }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+                ),
+              ),
+            ),
+            Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, store),
+          ),
+        ),
+      );
+      const serverHandlers = ServerWsStreamRpcGroup.toLayer({
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: subscribeShellRpcHandler,
+        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: subscribeThreadRpcHandler,
+      }).pipe(Layer.provide(layerStreamServices));
+      const contractHandlers = ContractStreamRpcGroup.toLayer({
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input) =>
+          Stream.unwrap(subscribeOrchestrationV2Shell(input)),
+        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
+          Stream.unwrap(subscribeOrchestrationV2Thread(input)),
+      }).pipe(Layer.provide(layerStreamServices));
+      const shellRequest = {
+        tag: ORCHESTRATION_V2_WS_METHODS.subscribeShell,
+        payload: { afterSequence: 0, requestCompletionMarker: true },
+      };
+      const threadRequest = {
+        tag: ORCHESTRATION_V2_WS_METHODS.subscribeThread,
+        payload: { threadId, afterSequence: 0, requestCompletionMarker: true },
+      };
+
+      const shellChunks = yield* serveStreamRequest(
+        ServerWsStreamRpcGroup,
+        serverHandlers,
+        shellRequest,
+      );
+      const shellItems = shellChunks.flatMap((chunk) => decodeShellChunk(JSON.parse(chunk)));
+      assert.deepEqual(
+        shellItems.map((item) => item.kind),
+        ["snapshot", "project.updated", "thread.updated", "synchronized"],
+      );
+      const projectItem = shellItems.find((item) => item.kind === "project.updated");
+      assert.equal(
+        projectItem?.kind === "project.updated"
+          ? projectItem.project.repositoryIdentity?.canonicalKey
+          : undefined,
+        identity.canonicalKey,
+      );
+      const threadItem = shellItems.find((item) => item.kind === "thread.updated");
+      assert.deepEqual(threadItem?.kind === "thread.updated" ? threadItem.thread : undefined, {
+        ...sampleThreadShell,
+        id: threadId,
+      });
+      assert.deepEqual(
+        shellChunks,
+        yield* serveStreamRequest(ContractStreamRpcGroup, contractHandlers, shellRequest),
+      );
+
+      const threadChunks = yield* serveStreamRequest(
+        ServerWsStreamRpcGroup,
+        serverHandlers,
+        threadRequest,
+      );
+      const threadItems = threadChunks.flatMap((chunk) => decodeThreadChunk(JSON.parse(chunk)));
+      assert.deepEqual(
+        threadItems.map((item) => item.kind),
+        ["event", "synchronized"],
+      );
+      // The event's timestamps travel as the contract encodes them.
+      assert.include(threadChunks.join("\n"), `"occurredAt":"${now}"`);
+      assert.deepEqual(
+        threadChunks,
+        yield* serveStreamRequest(ContractStreamRpcGroup, contractHandlers, threadRequest),
+      );
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 

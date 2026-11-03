@@ -670,6 +670,52 @@ it.effect(
     }).pipe(Effect.scoped),
 );
 
+it.effect(
+  "a base pinned by a reset subscriber that never pulls is released after the read TTL",
+  () =>
+    Effect.gen(function* () {
+      const reads: Array<number> = [];
+      let baseReads = 0;
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const scope = yield* Scope.make();
+        const pulling = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+        const stalled = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+        const pull = yield* Stream.toPull(pulling.stream(0)).pipe(Scope.provide(scope));
+        const pullStalled = yield* Stream.toPull(stalled.stream(0)).pipe(Scope.provide(scope));
+        yield* publish(threadId, 1);
+        assert.deepEqual(sequences(yield* pull), [1]);
+        assert.deepEqual(sequences(yield* pullStalled), [1]);
+        // One batch resets both; only one pulls. The base waits for the other, but not for ever.
+        yield* publish(ThreadId.make("thread:b"), 2);
+        assert.deepEqual(
+          (yield* pull).map((item) => item.kind),
+          ["resync"],
+        );
+        assert.deepEqual(hub.inspect(), { subscribers: 2, baseRetained: true });
+        yield* TestClock.adjust(ThreadManagementService.SHARED_SHELL_READ_TTL_MS);
+        assert.deepEqual(hub.inspect(), { subscribers: 2, baseRetained: false });
+        // Its late pull reads again.
+        assert.deepEqual(
+          (yield* pullStalled).map((item) => item.kind),
+          ["resync"],
+        );
+        assert.equal(baseReads, 2);
+        yield* Scope.close(scope, Exit.void);
+      }).pipe(
+        Effect.provide(
+          layerHub({
+            reads,
+            baseThreads: () => {
+              baseReads += 1;
+              return [];
+            },
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped),
+);
+
 it.effect("a reset the opening snapshot covers needs no resync", () =>
   Effect.gen(function* () {
     const reads: Array<number> = [];

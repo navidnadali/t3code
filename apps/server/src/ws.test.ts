@@ -1545,7 +1545,7 @@ it.live(
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
-it.live.each([20, 100])(
+it.live.each([20, 100, 250])(
   "one large batch resets %d shell subscribers at once (half of them stalled), who share one base read",
   (subscribers) =>
     Effect.gen(function* () {

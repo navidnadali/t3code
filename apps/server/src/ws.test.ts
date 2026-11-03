@@ -1086,6 +1086,7 @@ const buildShellHub = (input: {
   readonly store: OrchestrationEventStore.OrchestrationEventStore["Service"];
   readonly threadManagement: ThreadManagement.ThreadManagementService["Service"];
   readonly projectService: ProjectService.ProjectService["Service"];
+  readonly projectStore?: ProjectStore.ProjectStoreV2["Service"];
 }) =>
   Layer.build(
     ShellDeltaHub.layer.pipe(
@@ -1094,6 +1095,15 @@ const buildShellHub = (input: {
         Layer.succeed(ThreadManagement.ThreadManagementService, input.threadManagement),
       ),
       Layer.provide(Layer.succeed(ProjectService.ProjectService, input.projectService)),
+      Layer.provide(
+        Layer.succeed(
+          ProjectStore.ProjectStoreV2,
+          input.projectStore ??
+            ({
+              listShells: () => Effect.succeed([]),
+            } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+        ),
+      ),
     ),
   );
 
@@ -1435,13 +1445,14 @@ it.live(
       const projectService = {
         getShell: () => Effect.succeedNone,
       } as unknown as ProjectService.ProjectService["Service"];
-      const hub = yield* buildShellHub({ store, threadManagement, projectService });
+      const projectStore = {
+        listShells: () => Effect.sync(() => projects),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"];
+      const hub = yield* buildShellHub({ store, threadManagement, projectService, projectStore });
       const stream = yield* subscribeOrchestrationV2Shell({ requestCompletionMarker: true }).pipe(
         Effect.provide(hub),
         Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
-        Effect.provideService(ProjectStore.ProjectStoreV2, {
-          listShells: () => Effect.sync(() => projects),
-        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+        Effect.provideService(ProjectStore.ProjectStoreV2, projectStore),
         Effect.provideService(ProjectService.ProjectService, projectService),
         Effect.provideService(ProjectEnrichment.ProjectEnrichmentService, enrichment),
         Effect.provide(Logger.layer([overflows.logger], { mergeWithExisting: true })),
@@ -1668,6 +1679,186 @@ it.live.each([20, 100])(
       assert.equal(readsForPulling, 1);
       assert.equal(baseReads, 1);
       assert.equal(overflows.count, subscribers);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live(
+  "a subscriber cancelled mid-read leaves the wave's read to the others; a restarted hub reads anew",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-01T00:00:00.000Z";
+      const threads = new Map<string, string>();
+      const versions = new Map<string, number>();
+      let eventCounter = 0;
+      const commit = (threadIds: ReadonlyArray<string>) =>
+        Effect.gen(function* () {
+          let first: number | undefined;
+          let last = 0;
+          for (const threadId of threadIds) {
+            const version = (versions.get(threadId) ?? -1) + 1;
+            versions.set(threadId, version);
+            const [inserted] = yield* sql<{ sequence: number }>`
+              INSERT INTO orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type,
+                occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+              ) VALUES (
+                ${`cancel:${eventCounter++}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+                ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:cancel", detachedAt: now })},
+                '{}', 2
+              ) RETURNING sequence
+            `;
+            first ??= inserted!.sequence;
+            last = inserted!.sequence;
+            threads.set(threadId, `${threadId}@${inserted!.sequence}`);
+          }
+          const stored = yield* store
+            .readApplicationEvents({ afterSequence: first! - 1, throughSequence: last })
+            .pipe(Stream.runCollect);
+          yield* store.publishCommitted(Array.from(stored));
+          return last;
+        });
+      yield* commit(["thread:sentinel"]);
+      const shell = (threadId: string) =>
+        ({
+          id: threadId,
+          projectId: "project",
+          archivedAt: null,
+          title: threads.get(threadId),
+          status: "completed",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          pendingBackgroundTasks: [],
+          settledOverride: null,
+          settledAt: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        }) as unknown as OrchestrationV2ThreadShell;
+      let snapshotReads = 0;
+      let hubStarts = 0;
+      // A gated base read signals when it starts and completes when the gate opens.
+      let gate:
+        | { readonly started: Deferred.Deferred<void>; readonly open: Deferred.Deferred<void> }
+        | undefined;
+      const threadManagement = {
+        listActiveShellIndex: () => Effect.succeed([]),
+        readShellSnapshot: () =>
+          Effect.suspend(() => {
+            snapshotReads += 1;
+            const rows = Array.from(threads.keys(), shell);
+            const held = gate;
+            return (
+              held === undefined
+                ? Effect.void
+                : Deferred.succeed(held.started, undefined).pipe(
+                    Effect.andThen(Deferred.await(held.open)),
+                  )
+            ).pipe(
+              Effect.map(() =>
+                Effect.succeed({
+                  schemaVersion: 1,
+                  snapshotSequence: 0,
+                  threads: rows,
+                  archivedThreads: [],
+                }),
+              ),
+            );
+          }),
+        listActiveSubagentThreadIds: () =>
+          Effect.sync(() => {
+            hubStarts += 1;
+            return [];
+          }),
+        getThreadShellForEvent: (input: { readonly threadId: string }) =>
+          Effect.sync(() => shell(input.threadId)),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"];
+      const projectService = {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"];
+      const hub = yield* buildShellHub({ store, threadManagement, projectService });
+      const subscriber = (scope: Scope.Scope) =>
+        Effect.gen(function* () {
+          const fold = makeShellFold();
+          const stream = yield* subscribeOrchestrationV2Shell({
+            requestCompletionMarker: true,
+          }).pipe(
+            Effect.provide(hub),
+            Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
+            Effect.provideService(ProjectStore.ProjectStoreV2, {
+              listShells: () => Effect.succeed([]),
+            } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+            Effect.provideService(ProjectService.ProjectService, projectService),
+            Effect.provideServiceEffect(
+              ProjectEnrichment.ProjectEnrichmentService,
+              PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>().pipe(
+                Effect.map(
+                  (changes) =>
+                    ({
+                      subscribeChanges: PubSub.subscribe(changes),
+                    }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+                ),
+              ),
+            ),
+            Scope.provide(scope),
+          );
+          const pull = (yield* Stream.toPull(stream).pipe(Scope.provide(scope))).pipe(
+            Effect.map((items) => {
+              for (const item of items) fold.apply(item);
+            }),
+          );
+          const consume = pull.pipe(Effect.forever, Effect.forkIn(scope));
+          return { fold, consume, consumer: yield* consume };
+        });
+      const truth = () => Array.from(threads.entries()).sort(([a], [b]) => a.localeCompare(b));
+      const folded = (fold: ReturnType<typeof makeShellFold>) =>
+        Array.from(fold.state.threads.entries()).sort(([a], [b]) => a.localeCompare(b));
+      const scopeA = yield* Scope.make();
+      const scopeB = yield* Scope.make();
+      const a = yield* subscriber(scopeA);
+      const b = yield* subscriber(scopeB);
+      const ready = yield* commit(["thread:sentinel"]);
+      yield* a.fold.reach(ready);
+      yield* b.fold.reach(ready);
+      yield* Fiber.interrupt(a.consumer);
+      yield* Fiber.interrupt(b.consumer);
+      // One batch resets both. A pulls first and starts the wave's read, held by the gate; A is
+      // cancelled while it waits. B's resync waits on that same read, which the hub keeps running.
+      yield* commit(
+        Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:x${index}`),
+      );
+      const held = { started: yield* Deferred.make<void>(), open: yield* Deferred.make<void>() };
+      gate = held;
+      const readsBefore = snapshotReads;
+      yield* a.consume;
+      yield* Deferred.await(held.started);
+      yield* Scope.close(scopeA, Exit.void);
+      yield* b.consume;
+      gate = undefined;
+      yield* Deferred.succeed(held.open, undefined);
+      const afterB = yield* commit(["thread:sentinel"]);
+      yield* b.fold.reach(afterB);
+      assert.equal(snapshotReads - readsBefore, 1);
+      assert.equal(b.fold.state.snapshots, 2);
+      assert.deepEqual(folded(b.fold), truth());
+      // The last subscriber leaves and the hub stops. A new one restarts it; its own wave reads.
+      yield* Scope.close(scopeB, Exit.void);
+      const startsBefore = hubStarts;
+      const scopeC = yield* Scope.make();
+      const c = yield* subscriber(scopeC);
+      yield* c.fold.reach(yield* commit(["thread:sentinel"]));
+      assert.isAbove(hubStarts, startsBefore);
+      yield* Fiber.interrupt(c.consumer);
+      const readsC = snapshotReads;
+      yield* commit(
+        Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:y${index}`),
+      );
+      yield* c.consume;
+      yield* c.fold.reach(yield* commit(["thread:sentinel"]));
+      assert.equal(snapshotReads - readsC, 1);
+      assert.equal(c.fold.state.snapshots, 2);
+      assert.equal(c.fold.state.dropped, 0);
+      assert.deepEqual(folded(c.fold), truth());
+      yield* Scope.close(scopeC, Exit.void);
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 

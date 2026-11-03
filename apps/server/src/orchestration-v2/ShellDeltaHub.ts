@@ -1,4 +1,8 @@
-import type { ApplicationStoredEvent, OrchestrationV2ThreadShell } from "@t3tools/contracts";
+import type {
+  ApplicationStoredEvent,
+  OrchestrationProjectShell,
+  OrchestrationV2ThreadShell,
+} from "@t3tools/contracts";
 import type * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -12,16 +16,19 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 import {
   makeLiveStreamBudget,
   type LiveStreamBufferError,
   type RetainedLiveItem,
 } from "./LiveStreamBudget.ts";
 import {
+  loadShellSnapshotParts,
   makeShellDeltaAdmission,
   makeThreadShellVersions,
   projectShellDeltas,
@@ -47,6 +54,7 @@ export interface ShellResyncBase {
   readonly schemaVersion: number;
   readonly snapshotSequence: number;
   readonly threads: ReadonlyArray<OrchestrationV2ThreadShell>;
+  readonly projects: ReadonlyArray<OrchestrationProjectShell>;
 }
 
 /**
@@ -105,6 +113,8 @@ const make = Effect.gen(function* () {
   const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const projectService = yield* ProjectService.ProjectService;
+  const projectStore = yield* ProjectStore.ProjectStoreV2;
+  const sql = yield* SqlClient.SqlClient;
   const layerScope = yield* Effect.scope;
   const lifecycle = yield* Semaphore.make(1);
   let current: HubInstance | undefined;
@@ -114,6 +124,9 @@ const make = Effect.gen(function* () {
   // is committed after reaches the emptied buffer. So one read serves every subscriber a batch
   // resets, however the resets and their pulls interleave, instead of a snapshot per subscriber.
   let publishedSequence = 0;
+  // Subscribers in the reset state, each waiting to pull a base: the last base is kept while any
+  // of them may still pull it, and released once that wave is served.
+  let resetting = 0;
   let latestBase:
     | {
         readonly coversThrough: number;
@@ -135,25 +148,32 @@ const make = Effect.gen(function* () {
           result: Deferred.makeUnsafe<ShellResyncBase, ShellDeltaHubError>(),
         };
         latestBase = read;
-        // The sequence is read first: the shells are at least as new, and a change between the
-        // two reads is in the snapshot and delivered live again, as the same full state.
-        return Effect.gen(function* () {
-          const snapshotSequence = yield* applicationEvents.latestApplicationSequence;
-          const snapshot = yield* yield* threadManagement.readShellSnapshot({
-            location: "active",
-          });
-          return {
-            schemaVersion: snapshot.schemaVersion,
-            snapshotSequence,
-            threads: snapshot.threads,
-          } satisfies ShellResyncBase;
+        // One read transaction, as the initial snapshot: the sequence, the thread shells and the
+        // project rows agree, so every delta above the sequence is newer than the base's rows.
+        return loadShellSnapshotParts({
+          sql,
+          readThreads: threadManagement.readShellSnapshot({ location: "active" }),
+          listProjects: projectStore.listShells(),
+          latestSequence: applicationEvents.latestApplicationSequence,
         }).pipe(
+          Effect.map(({ projects, threads, snapshotSequence }): ShellResyncBase => ({
+            schemaVersion: threads.schemaVersion,
+            snapshotSequence,
+            threads: threads.threads,
+            projects,
+          })),
           Effect.mapError(
             (cause) =>
               new ShellDeltaHubError({ message: "The shell snapshot for a resync failed", cause }),
           ),
           Effect.exit,
-          Effect.flatMap((exit) => Deferred.done(read.result, exit)),
+          Effect.flatMap((exit) =>
+            Effect.suspend(() => {
+              // A failed read is not kept for its wave: the next pull reads again.
+              if (Exit.isFailure(exit) && latestBase === read) latestBase = undefined;
+              return Deferred.done(read.result, exit);
+            }),
+          ),
           // In the hub's scope: a subscriber interrupted mid-read must not fail the others' wait.
           Effect.forkIn(layerScope),
           Effect.andThen(restore(Deferred.await(read.result))),
@@ -246,6 +266,7 @@ const make = Effect.gen(function* () {
   const stop = (instance: HubInstance) =>
     Effect.suspend(() => {
       if (current === instance) current = undefined;
+      latestBase = undefined;
       return Scope.close(instance.scope, Exit.void);
     });
 
@@ -291,13 +312,21 @@ const make = Effect.gen(function* () {
     let afterSequence: number | undefined;
     let highestOffered = 0;
     // Set by a reset: the highest sequence the dropped deltas can have, cleared by a resync whose
-    // base covers it.
+    // base covers it (or by a snapshot that does, when the stream opens).
     let resetThrough: number | undefined;
+    const setReset = (through: number | undefined) => {
+      if ((through === undefined) !== (resetThrough === undefined)) {
+        resetting += through === undefined ? -1 : 1;
+        if (resetting === 0) latestBase = undefined;
+      }
+      resetThrough = through;
+    };
     let closed = false;
     const close = (error?: LiveStreamBufferError) =>
       Effect.suspend(() => {
         if (closed) return Effect.void;
         closed = true;
+        setReset(undefined);
         budget.release(pending.values());
         pending.clear();
         return (error ? Queue.fail(ready, error) : Effect.void).pipe(
@@ -326,13 +355,17 @@ const make = Effect.gen(function* () {
       let swapped = budget.swapUnsafe(previous, delta);
       let report: Effect.Effect<void> = Effect.void;
       if (Effect.isEffect(swapped)) {
-        report = Effect.logWarning("orchestration shell live buffer reset for a resync", {
-          pendingDeltas: pending.size,
-          afterSequence,
-        });
+        // Entering the reset state is logged once: while the delivered chunk alone fills the
+        // budget, every further delta takes this path until the client pulls.
+        if (resetThrough === undefined) {
+          report = Effect.logWarning("orchestration shell live buffer reset for a resync", {
+            pendingDeltas: pending.size,
+            afterSequence,
+          });
+        }
         budget.release(pending.values());
         pending.clear();
-        resetThrough = highestOffered;
+        setReset(highestOffered);
         // What the client already holds stays charged until it acknowledges; this delta waits
         // for the resync if even that leaves no room.
         swapped = budget.swapUnsafe(undefined, delta);
@@ -381,7 +414,7 @@ const make = Effect.gen(function* () {
           continueFrom(sequence, (delta) => admission.admit(delta, now));
           // A reset the snapshot covers (everything dropped is at or below its sequence) needs
           // no resync; a later one does, and the stream starts with it.
-          if (resetThrough !== undefined && resetThrough <= sequence) resetThrough = undefined;
+          if (resetThrough !== undefined && resetThrough <= sequence) setReset(undefined);
           if (resetThrough !== undefined) Queue.offerUnsafe(ready, undefined);
         }),
       );
@@ -409,8 +442,11 @@ const make = Effect.gen(function* () {
                   }
                   // A reset the read does not cover keeps the flag: the next pull resyncs again.
                   if (resetThrough !== undefined && resetThrough <= read.coversThrough) {
-                    resetThrough = undefined;
+                    setReset(undefined);
                   }
+                  // The client shows the base now, not the shells sent before: a delta equal to
+                  // one of those is still news to it (the base may hold a state never projected).
+                  admission.reset();
                   continueFrom(base.snapshotSequence, () => true);
                   const resync: ShellResync = { kind: "resync", base };
                   return Effect.succeed([
@@ -447,5 +483,7 @@ export const layer: Layer.Layer<
   never,
   | OrchestrationEventStore.OrchestrationEventStore
   | ProjectService.ProjectService
+  | ProjectStore.ProjectStoreV2
+  | SqlClient.SqlClient
   | ThreadManagementService.ThreadManagementService
 > = Layer.effect(ShellDeltaHub, make);

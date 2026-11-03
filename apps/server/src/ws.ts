@@ -1125,7 +1125,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     const resyncItems = (base: ShellDeltaHub.ShellResyncBase) =>
       Stream.unwrap(
         Effect.gen(function* () {
-          const enriched = yield* enrichProjectShells(yield* projects.listShells());
+          const enriched = yield* enrichProjectShells(base.projects);
           const trimmed = trimSubscriberShellSnapshot(
             {
               schemaVersion: base.schemaVersion,

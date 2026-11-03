@@ -699,6 +699,10 @@ export function makeThreadShellVersions() {
 export function makeShellDeltaAdmission() {
   const lastSent = new Map<ThreadId, { readonly version: number; readonly sentAt: number }>();
   return {
+    /** The subscriber shows a fresh base now: what was sent before it means nothing. */
+    reset(): void {
+      lastSent.clear();
+    },
     admit({ item, version }: VersionedShellDelta, now: number): boolean {
       if (item.kind === "thread.removed") {
         lastSent.delete(item.threadId);

@@ -47,6 +47,8 @@ const replyHold = vi.hoisted(() => ({
   held: [] as Array<() => void>,
   waiters: [] as Array<() => void>,
 }));
+// Resolves a waiter when a request whose SQL mentions its needle is posted to a worker.
+const postWaiters = vi.hoisted(() => [] as Array<{ needle: string; resolve: () => void }>);
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
 
@@ -80,6 +82,10 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         }
         if ("sql" in request && String(request.sql).includes("hold-reply"))
           replyHold.ids.add(request.id as number);
+        for (const waiter of postWaiters.splice(0)) {
+          if ("sql" in request && String(request.sql).includes(waiter.needle)) waiter.resolve();
+          else postWaiters.push(waiter);
+        }
         if ("sql" in request && /^\s*COMMIT\b/i.test(String(request.sql)) && commitHold.on) {
           if (commitHold.failNext) {
             commitHold.failNext = false;
@@ -425,6 +431,24 @@ it.effect("serves another read while a read-only transaction is open", () =>
 
 // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary that lets the worker's queued messages land, not a wait for time
 const eventLoopTurn = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
+// Registers now, waits later: the posting of the next request whose SQL mentions the needle.
+const posting = (needle: string) => {
+  const promise = new Promise<void>((resolve) => postWaiters.push({ needle, resolve }));
+  return Effect.promise(() => promise);
+};
+// Replies a worker has given to the requests whose SQL mentions the needle.
+const repliesTo = (worker: NodeWorkerThreads.Worker, needle: string) => {
+  const ids = new Set(
+    workerMessages
+      .get(worker)!
+      .filter((message) => String(message.sql ?? "").includes(needle))
+      .map((message) => message.id),
+  );
+  return workerReplies.get(worker)!.filter((reply) => ids.has(reply.id)).length;
+};
+// A read that keeps a worker busy for a while (a recursive count), tagged in its rows.
+const longRead = (tag: string, rows: number) =>
+  `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ${rows}) SELECT count(*) AS n, '${tag}' AS tag FROM c`;
 // The failure an effect ends with (a success fails the test), typed as its error.
 const failureOf = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.map(Effect.exit(effect), (exit) => {
@@ -1683,6 +1707,61 @@ it.effect(
         assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
       }),
     ),
+);
+
+it.effect(
+  "keeps an interrupted read transaction's reader until the worker has answered what it abandoned",
+  () =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const before = startedWorkers.length;
+          yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
+          const worker = startedWorkers[before]!;
+          const arrived = posting("long-1");
+          const long = yield* sql
+            .withTransaction(sql.unsafe(longRead("long-1", 1_500_000)))
+            .pipe(SqliteClient.readOnly, (effect) =>
+              Effect.forkChild(effect, { startImmediately: true }),
+            );
+          yield* arrived;
+          yield* Fiber.interrupt(long);
+          // The interruption completed only once the worker had answered the abandoned read, so
+          // the reader it frees is idle, as it was before the ending stopped being awaited.
+          assert.equal(repliesTo(worker, "long-1"), 1);
+          assert.deepEqual(yield* sql`SELECT ${"short-1"} AS tag`.pipe(SqliteClient.readOnly), [
+            { tag: "short-1" },
+          ]);
+        }),
+      { readerPoolSize: 1 },
+    ),
+);
+
+it.effect("leaves no abandoned statement unanswered behind a run of interrupted transactions", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const before = startedWorkers.length;
+        yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
+        const worker = startedWorkers[before]!;
+        for (let i = 0; i < 5; i++) {
+          const arrived = posting(`pile-${i}`);
+          const fiber = yield* sql
+            .withTransaction(sql.unsafe(longRead(`pile-${i}`, 500_000)))
+            .pipe(SqliteClient.readOnly, (effect) =>
+              Effect.forkChild(effect, { startImmediately: true }),
+            );
+          yield* arrived;
+          yield* Fiber.interrupt(fiber);
+        }
+        const unanswered = [0, 1, 2, 3, 4].filter((i) => repliesTo(worker, `pile-${i}`) === 0);
+        assert.deepEqual(unanswered, [], "abandoned reads still queued on the worker");
+        assert.deepEqual(yield* sql`SELECT ${"after"} AS tag`.pipe(SqliteClient.readOnly), [
+          { tag: "after" },
+        ]);
+      }),
+    { readerPoolSize: 1 },
+  ),
 );
 
 it.effect("sends statements issued together as one batch and answers each on its own", () =>

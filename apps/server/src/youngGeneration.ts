@@ -166,40 +166,92 @@ export const nodeOptionsWithMaxSemiSpace = (
   return current === "" ? `${FLAG}=${mb}` : `${current} ${FLAG}=${mb}`;
 };
 
-/** A process listing that cannot be read exactly: see `nodeOptionsFromProcessListing`. */
-export const AMBIGUOUS_LISTING: unique symbol = Symbol("ambiguous process listing");
+/** How `ps` prints an argument or environment value: tab and newline in octal, other controls caret-style. */
+const asListed = (text: string): string =>
+  text.replace(/[\u0000-\u001f\u007f]/g, (char) =>
+    char === "\t"
+      ? "\\011"
+      : char === "\n"
+        ? "\\012"
+        : char === "\u007f"
+          ? "^?"
+          : `^${String.fromCharCode(char.charCodeAt(0) + 0x40)}`,
+  );
 
-const ENV_ENTRY_START = /^[A-Za-z_][A-Za-z0-9_]*=/;
-const hasQuote = (token: string): boolean => token.includes('"') || token.includes("'");
+const CHANNEL_ENTRIES = / NODE_CHANNEL_FD=\d+ NODE_CHANNEL_SERIALIZATION_MODE=\w+$/;
+
+/** Entries a library adds to the environment after exec; the kernel's record of the process never has them. */
+const RUNTIME_ADDED_ENV: ReadonlySet<string> = new Set(["__CF_USER_TEXT_ENCODING"]);
 
 /**
- * NODE_OPTIONS as a `ps -E -o command=` line reports it: `NAME=value` entries separated by spaces, a
- * value running until the next `NAME=` token; undefined when absent. Ambiguous, never guessed, when
- * `NODE_OPTIONS=` starts more than one token or a quote precedes or sits in the value: quoted text
- * can hold a `NAME=` that is no boundary or a `NODE_OPTIONS=` that is no entry.
+ * Every NODE_OPTIONS value (undefined for none) that, inserted among `entries` at one boundary and
+ * preceded by `args`, makes the listing end with the result. The command line before `args` is
+ * free text; `entries` are the process's other environment entries as `ps` prints them.
  */
-export const nodeOptionsFromProcessListing = (
-  line: string,
-): string | undefined | typeof AMBIGUOUS_LISTING => {
-  const tokens = line.trim().split(" ");
-  const starts = tokens.flatMap((token, index) =>
-    token.startsWith("NODE_OPTIONS=") ? [index] : [],
-  );
-  if (starts.length === 0) return undefined;
-  if (starts.length > 1) return AMBIGUOUS_LISTING;
-  const start = starts[0]!;
-  const value = [tokens[start]!.slice("NODE_OPTIONS=".length)];
-  for (const token of tokens.slice(start + 1)) {
-    if (ENV_ENTRY_START.test(token)) break;
-    value.push(token);
+const listingReadings = (
+  listing: string,
+  entries: ReadonlyArray<string>,
+  args: string,
+): ReadonlySet<string | undefined> => {
+  const readings = new Set<string | undefined>();
+  for (let index = 0; index <= entries.length; index++) {
+    const tail = entries
+      .slice(index)
+      .map((entry) => ` ${entry}`)
+      .join("");
+    if (!listing.endsWith(tail)) continue;
+    const head = listing.slice(0, listing.length - tail.length);
+    const anchor = `${args}${entries
+      .slice(0, index)
+      .map((entry) => ` ${entry}`)
+      .join("")}`;
+    if (index === 0 && head.endsWith(anchor)) readings.add(undefined);
+    for (
+      let at = head.indexOf(" NODE_OPTIONS=");
+      at !== -1;
+      at = head.indexOf(" NODE_OPTIONS=", at + 1)
+    ) {
+      if (head.slice(0, at).endsWith(anchor))
+        readings.add(head.slice(at + " NODE_OPTIONS=".length));
+    }
   }
-  if (tokens.slice(0, start).some(hasQuote) || value.some(hasQuote)) return AMBIGUOUS_LISTING;
-  return value.join(" ").trim();
+  return readings;
 };
 
 export type StartupNodeOptions =
   | { readonly known: true; readonly value: string | undefined }
   | { readonly known: false };
+
+/**
+ * NODE_OPTIONS at startup from a `ps -E -ww -o command=` line (command line, then every environment
+ * entry, single spaces throughout): the one text that, inserted among the entries the process has
+ * now, reproduces the listing. None or several readings leave the record unknown, never guessed.
+ */
+export const startupNodeOptionsFromListing = (
+  line: string,
+  env: Environment,
+  args: ReadonlyArray<string>,
+  options?: { readonly ipc?: boolean },
+): StartupNodeOptions => {
+  const printed = line.endsWith("\n") ? line.slice(0, -1) : line;
+  // Node appends its IPC entries last when it spawns a child, and removes them from the child's env.
+  const listing = options?.ipc === true ? printed.replace(CHANNEL_ENTRIES, "") : printed;
+  const entries = Object.entries(env).flatMap(([name, value]) =>
+    name === "NODE_OPTIONS" || value === undefined ? [] : [asListed(`${name}=${value}`)],
+  );
+  const argsText = args.length === 0 ? "" : ` ${asListed(args.join(" "))}`;
+  const direct = listingReadings(listing, entries, argsText);
+  const exec = entries.filter(
+    (entry) => !RUNTIME_ADDED_ENV.has(entry.slice(0, entry.indexOf("="))),
+  );
+  const readings =
+    direct.size > 0 || exec.length === entries.length
+      ? direct
+      : listingReadings(listing, exec, argsText);
+  if (readings.size !== 1) return { known: false };
+  const [value] = readings;
+  return { known: true, value };
+};
 
 /** NODE_OPTIONS out of a /proc environ block: UTF-8 like `process.env`, entries separated by NUL. */
 export const nodeOptionsFromEnviron = (block: Uint8Array): string | undefined =>
@@ -224,7 +276,14 @@ export const startupNodeOptionsTrusted = (
  * NODE_OPTIONS as Node started with, from the operating system's record of this process — a preload
  * may have changed `process.env` since. Linux keeps it in /proc; macOS answers through `ps -E`.
  */
-const startupNodeOptions = (platform: string, pid: number): StartupNodeOptions => {
+const startupNodeOptions = (input: {
+  readonly platform: string;
+  readonly pid: number;
+  readonly env: Environment;
+  readonly args: ReadonlyArray<string>;
+  readonly ipc: boolean;
+}): StartupNodeOptions => {
+  const { platform, pid, env, args, ipc } = input;
   try {
     if (platform === "linux") {
       return {
@@ -239,8 +298,7 @@ const startupNodeOptions = (platform: string, pid: number): StartupNodeOptions =
         { encoding: "utf8", timeout: 2000 },
       );
       if (listing.status !== 0) return { known: false };
-      const value = nodeOptionsFromProcessListing(listing.stdout);
-      return value === AMBIGUOUS_LISTING ? { known: false } : { known: true, value };
+      return startupNodeOptionsFromListing(listing.stdout, env, args, { ipc });
     }
   } catch {
     return { known: false };
@@ -497,7 +555,14 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   const platform = process.platform;
   const current = process.env.NODE_OPTIONS;
   // The operating system remembers what Node started with; a preload may have changed process.env.
-  const startup = startupNodeOptions(platform, process.pid);
+  const startup = startupNodeOptions({
+    platform,
+    pid: process.pid,
+    env: process.env,
+    // The listing shows the command line as typed; only the arguments after the script are certain.
+    args: NodeSea.isSea() ? process.argv.slice(1) : process.argv.slice(2),
+    ipc: process.channel !== undefined,
+  });
   // What V8 started with, for the outcome: the record when known, else the value in effect, flagged.
   const nodeOptionsAtStart = startup.known ? startup.value : current;
   const uncertain = startup.known ? {} : { startupUncertain: true as const };
@@ -612,27 +677,26 @@ export const describeNodeRuntime = (input: {
 });
 
 /** What this process runs with, for the startup log: parsed sizes only, never NODE_OPTIONS verbatim. */
-export const nodeRuntimeFlags = (): Omit<
-  NodeRuntimeFlags,
-  "nodeOptions" | "nodeOptionsForChildren"
-> => {
+export const nodeRuntimeFlags = (
+  outcome: YoungGenerationOutcome | undefined = lastOutcome,
+  env: Environment = process.env,
+): Omit<NodeRuntimeFlags, "nodeOptions" | "nodeOptionsForChildren"> => {
   const {
     nodeOptions: _nodeOptions,
     nodeOptionsForChildren: _forChildren,
     ...sizes
   } = describeNodeRuntime({
     execArgv: process.execArgv,
-    nodeOptionsAtStart: lastOutcome?.nodeOptionsAtStart ?? process.env.NODE_OPTIONS,
-    nodeOptionsForChildren: process.env.NODE_OPTIONS,
+    // A known-absent startup value stays absent: the environment now may hold what a preload added.
+    nodeOptionsAtStart: outcome === undefined ? env.NODE_OPTIONS : outcome.nodeOptionsAtStart,
+    nodeOptionsForChildren: env.NODE_OPTIONS,
     heapSizeLimitBytes: NodeV8.getHeapStatistics().heap_size_limit,
-    applied: lastOutcome?.applied ?? false,
+    applied: outcome?.applied ?? false,
   });
   return {
     ...sizes,
-    ...(lastOutcome?.launcherPredatesDefault === undefined
-      ? {}
-      : { launcherPredatesDefault: true }),
-    ...(lastOutcome?.startupUncertain === undefined ? {} : { startupUncertain: true }),
+    ...(outcome?.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
+    ...(outcome?.startupUncertain === undefined ? {} : { startupUncertain: true }),
   };
 };
 

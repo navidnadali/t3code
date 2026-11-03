@@ -224,8 +224,9 @@ user's options could be carried into a relaunch; a server the launcher starts ge
 decision rests on `NODE_OPTIONS` as Node started with, read from the operating system's record of the process
 (`/proc/self/environ` on Linux, `ps -E` on macOS): the process relaunches only when that record agrees with
 `NODE_OPTIONS` as it reads, and keeps Node's default otherwise ("NODE_OPTIONS changed since startup"; "startup
-options unavailable" when there is no record, as on Windows, or the macOS listing is ambiguous — `NODE_OPTIONS`
-set beside quoted environment values). A process relaunches at most once (the relaunch marks its own pid),
+options unavailable" when there is no record, as on Windows, or the macOS listing has no single reading — it
+is reproduced from the process's own environment rather than parsed, so `NAME=` text and quotes inside a value
+are no problem, but an environment changed in more than `NODE_OPTIONS` is). A process relaunches at most once (the relaunch marks its own pid),
 whatever a preload does to `NODE_OPTIONS`. `t3 __node-flags` prints what the current process runs with;
 `server.v8` logs the parsed sizes once the server listens. Both report `nodeOptionsAtStart` from the startup
 record and flag `startupUncertain` when it had to fall back to `NODE_OPTIONS` as it read after any preload.

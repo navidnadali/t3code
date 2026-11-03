@@ -316,7 +316,9 @@ describe("nodeRuntimeFlags", () => {
     expect(flags.maxSemiSpaceMiB).toBe("node default");
     expect(flags.startupUncertain).toBeUndefined();
     // Without an outcome (no startup pass ran) the current environment is all there is.
-    expect(nodeRuntimeFlags(undefined, { NODE_OPTIONS: "--max-semi-space-size=16" }).maxSemiSpaceMiB).toBe(16);
+    expect(
+      nodeRuntimeFlags(undefined, { NODE_OPTIONS: "--max-semi-space-size=16" }).maxSemiSpaceMiB,
+    ).toBe(16);
   });
 });
 
@@ -359,14 +361,18 @@ describe("startupNodeOptionsFromListing", () => {
       value: "--no-warnings",
     });
     expect(
-      startupNodeOptionsFromListing(listing, { ...env, NODE_OPTIONS: "--trace-warnings" }, ["serve"]),
+      startupNodeOptionsFromListing(listing, { ...env, NODE_OPTIONS: "--trace-warnings" }, [
+        "serve",
+      ]),
     ).toEqual({ known: true, value: "--no-warnings" });
   });
 
   it("keeps NAME= text and quotes inside the value, where a token parser would cut", () => {
     const value = '--title FOO=bar --require "/tmp/a b.cjs" --max-semi-space-size=16';
     const line = `node bin.js serve PATH=/usr/bin NODE_OPTIONS=${value} HOME=/Users/t3\n`;
-    expect(startupNodeOptionsFromListing(line, { PATH: "/usr/bin", HOME: "/Users/t3" }, ["serve"])).toEqual({
+    expect(
+      startupNodeOptionsFromListing(line, { PATH: "/usr/bin", HOME: "/Users/t3" }, ["serve"]),
+    ).toEqual({
       known: true,
       value,
     });
@@ -394,24 +400,42 @@ describe("startupNodeOptionsFromListing", () => {
     ).toEqual({ known: true, value: undefined });
     // An argument that looks like the entry is part of the command line, not the environment.
     expect(
-      startupNodeOptionsFromListing("node bin.js NODE_OPTIONS=x PATH=/usr/bin\n", { PATH: "/usr/bin" }, [
-        "NODE_OPTIONS=x",
-      ]),
+      startupNodeOptionsFromListing(
+        "node bin.js NODE_OPTIONS=x PATH=/usr/bin\n",
+        { PATH: "/usr/bin" },
+        ["NODE_OPTIONS=x"],
+      ),
     ).toEqual({ known: true, value: undefined });
   });
 
   it("reports absent and empty values, and the entry in first or last place", () => {
     expect(
-      startupNodeOptionsFromListing("node bin.js serve PATH=/usr/bin HOME=/Users/t3\n", { PATH: "/usr/bin", HOME: "/Users/t3" }, ["serve"]),
+      startupNodeOptionsFromListing(
+        "node bin.js serve PATH=/usr/bin HOME=/Users/t3\n",
+        { PATH: "/usr/bin", HOME: "/Users/t3" },
+        ["serve"],
+      ),
     ).toEqual({ known: true, value: undefined });
     expect(
-      startupNodeOptionsFromListing("node bin.js serve NODE_OPTIONS= PATH=/usr/bin\n", { NODE_OPTIONS: "", PATH: "/usr/bin" }, ["serve"]),
+      startupNodeOptionsFromListing(
+        "node bin.js serve NODE_OPTIONS= PATH=/usr/bin\n",
+        { NODE_OPTIONS: "", PATH: "/usr/bin" },
+        ["serve"],
+      ),
     ).toEqual({ known: true, value: "" });
     expect(
-      startupNodeOptionsFromListing("node bin.js serve NODE_OPTIONS=--a PATH=/usr/bin\n", { PATH: "/usr/bin" }, ["serve"]),
+      startupNodeOptionsFromListing(
+        "node bin.js serve NODE_OPTIONS=--a PATH=/usr/bin\n",
+        { PATH: "/usr/bin" },
+        ["serve"],
+      ),
     ).toEqual({ known: true, value: "--a" });
     expect(
-      startupNodeOptionsFromListing("node bin.js serve PATH=/usr/bin NODE_OPTIONS=--a\n", { PATH: "/usr/bin" }, ["serve"]),
+      startupNodeOptionsFromListing(
+        "node bin.js serve PATH=/usr/bin NODE_OPTIONS=--a\n",
+        { PATH: "/usr/bin" },
+        ["serve"],
+      ),
     ).toEqual({ known: true, value: "--a" });
   });
 
@@ -423,27 +447,42 @@ describe("startupNodeOptionsFromListing", () => {
       value: "--no-warnings",
     });
     expect(
-      startupNodeOptionsFromListing(line, { ...escaped, __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0" }, ["serve"]),
+      startupNodeOptionsFromListing(
+        line,
+        { ...escaped, __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0" },
+        ["serve"],
+      ),
     ).toEqual({ known: true, value: "--no-warnings" });
   });
 
   it("accounts for the IPC entries Node appends when it spawns a child and removes from process.env", () => {
-    const line = "node bin.js serve PATH=/usr/bin NODE_OPTIONS=--no-warnings NODE_CHANNEL_FD=3 NODE_CHANNEL_SERIALIZATION_MODE=json\n";
+    const line =
+      "node bin.js serve PATH=/usr/bin NODE_OPTIONS=--no-warnings NODE_CHANNEL_FD=3 NODE_CHANNEL_SERIALIZATION_MODE=json\n";
     const child = { PATH: "/usr/bin", NODE_OPTIONS: "--no-warnings" };
     expect(startupNodeOptionsFromListing(line, child, ["serve"], { ipc: true })).toEqual({
       known: true,
       value: "--no-warnings",
     });
-    expect(startupNodeOptionsFromListing(line, child, ["serve"])).toEqual({ known: false });
+    // Without the hint, the trailing entries read as part of the value; the trust check rejects that.
+    expect(startupNodeOptionsFromListing(line, child, ["serve"])).toEqual({
+      known: true,
+      value: "--no-warnings NODE_CHANNEL_FD=3 NODE_CHANNEL_SERIALIZATION_MODE=json",
+    });
   });
 
   it("declares the record unknown when the listing cannot be reproduced or has two readings", () => {
     // Another entry changed since startup: the listing is not the environment plus one NODE_OPTIONS.
-    expect(startupNodeOptionsFromListing(listing, { ...env, EXTRA: "1" }, ["serve"])).toEqual({ known: false });
+    expect(startupNodeOptionsFromListing(listing, { ...env, EXTRA: "1" }, ["serve"])).toEqual({
+      known: false,
+    });
     expect(startupNodeOptionsFromListing("", env, ["serve"])).toEqual({ known: false });
     // No arguments and the entry in first place: the command line cannot be told from the value.
     expect(
-      startupNodeOptionsFromListing("t3 NODE_OPTIONS=--a PATH=/usr/bin\n", { PATH: "/usr/bin" }, []),
+      startupNodeOptionsFromListing(
+        "t3 NODE_OPTIONS=--a PATH=/usr/bin\n",
+        { PATH: "/usr/bin" },
+        [],
+      ),
     ).toEqual({ known: false });
   });
 });

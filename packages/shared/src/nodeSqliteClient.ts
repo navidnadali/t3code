@@ -553,20 +553,16 @@ const objectRows = (columns: ReadonlyArray<string>, rows: ReadonlyArray<Readonly
   });
 
 // Read-transaction cleanup succeeds after worker exit because it can no longer change anything.
-// The statement's leading words, comments removed, upper-cased: SQLite allows comments between them.
-const leadingWords = (sql: string, count: number) =>
-  (sql.replace(/\/\*[\s\S]*?\*\/|--[^\n]*/g, " ").match(/[A-Za-z_]+/g) ?? [])
-    .slice(0, count)
-    .map((word) => word.toUpperCase());
-const beginsTransaction = (sql: string) => leadingWords(sql, 1)[0] === "BEGIN";
-// COMMIT, END [TRANSACTION] and ROLLBACK [TRANSACTION] end the transaction; ROLLBACK [TRANSACTION]
-// TO [SAVEPOINT] name rolls back to a savepoint and keeps it open.
-const endsReadTransaction = (sql: string) => {
-  const [first, second, third] = leadingWords(sql, 3);
-  if (first === "COMMIT" || first === "END") return true;
-  if (first !== "ROLLBACK") return false;
-  return (second === "TRANSACTION" ? third : second) !== "TO";
-};
+const withoutComments = (sql: string) => sql.replace(/\/\*[\s\S]*?\*\/|--[^\n]*/g, " ");
+// Exactly SQLite's transaction statements, comments removed. Anything else that starts like one
+// (BEGIN2, BEGIN 1, ROLLBACK TO a savepoint, trailing text) is an ordinary statement for the
+// worker, which answers as SQLite does, and leaves this bookkeeping alone.
+const beginsTransaction = (sql: string) =>
+  /^\s*BEGIN(?:\s+(?:DEFERRED|IMMEDIATE|EXCLUSIVE))?(?:\s+TRANSACTION)?\s*;?\s*$/i.test(
+    withoutComments(sql),
+  );
+const endsReadTransaction = (sql: string) =>
+  /^\s*(?:COMMIT|END|ROLLBACK)(?:\s+TRANSACTION)?\s*;?\s*$/i.test(withoutComments(sql));
 
 // WAL readers run concurrently; one worker serialized every read behind the slowest transaction.
 const DEFAULT_READER_POOL_SIZE = 4;

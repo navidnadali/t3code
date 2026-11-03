@@ -40,6 +40,7 @@ it.effect.each([
   "shared-provider",
   "conversation",
   "unplaced",
+  "recorded-run",
 ] as const)("preserves overlapping workspace files, owner=%s", (owner) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -123,12 +124,27 @@ it.effect.each([
                 threads: [otherThread] as never,
                 archivedThreads: [],
               }),
+            // "recorded-run": the other thread's scope keeps a spelling that is gone (a removed
+            // symlink); its run recorded the path it worked in, this worktree.
             getCheckpointContext: () =>
-              Effect.succeed({
-                runs: [],
-                checkpoints: [],
-                checkpointScopes: [],
-              }),
+              Effect.succeed(
+                owner === "recorded-run"
+                  ? ({
+                      runs: [
+                        { id: "other-run", ordinal: 1, status: "completed", workspaceCwd: cwd },
+                      ],
+                      checkpoints: [],
+                      checkpointScopes: [
+                        {
+                          id: "other-scope",
+                          runId: "other-run",
+                          kind: "root_run",
+                          cwd: "/gone-link",
+                        },
+                      ],
+                    } as never)
+                  : { runs: [], checkpoints: [], checkpointScopes: [] },
+              ),
             getThreadProviderContext: () =>
               Effect.succeed({
                 thread: otherThread as never,

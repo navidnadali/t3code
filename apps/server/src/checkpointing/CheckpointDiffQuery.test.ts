@@ -268,6 +268,41 @@ it.effect("does not diff a range across two workspace scopes", () => {
   }).pipe(Effect.provide(layer));
 });
 
+// A scope keeps the spelling its workspace was first reached by (a symlink, maybe gone since); a run
+// records the path it ran in, which is where its checkpoints are diffed.
+it.effect("diffs a turn in the workspace its run ran in, not its scope's spelling", () => {
+  const diffCheckpoints = vi.fn((_input: CheckpointStore.DiffCheckpointsInput) =>
+    Effect.succeed("diff --git a/file b/file"),
+  );
+  const layer = layerFor({
+    projection: Effect.succeed({
+      runs: [{ id: firstRunId, ordinal: 1, status: "completed", workspaceCwd: "/repo-real" }],
+      checkpointScopes: [
+        { id: firstScopeId, runId: firstRunId, kind: "root_run", cwd: "/gone-link" },
+      ],
+      checkpoints: [
+        {
+          scopeId: firstScopeId,
+          runId: firstRunId,
+          ordinalWithinScope: 1,
+          appRunOrdinal: 1,
+          status: "ready",
+          ref: CheckpointRef.make("refs/t3/test/real/1"),
+        },
+      ],
+    } as never),
+    diffCheckpoints,
+  });
+  return Effect.gen(function* () {
+    const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
+    yield* query.getTurnDiff({ threadId, fromTurnCount: 0, toTurnCount: 1 });
+    assert.deepEqual(
+      [...new Set(diffCheckpoints.mock.calls.map(([input]) => input.cwd))],
+      ["/repo-real"],
+    );
+  }).pipe(Effect.provide(layer));
+});
+
 const layerVcsProcess = VcsProcess.layer.pipe(Layer.provide(NodeServices.layer));
 const layerStore = CheckpointStore.layer.pipe(
   Layer.provide(VcsDriverRegistry.layer.pipe(Layer.provide(layerVcsProcess))),

@@ -2269,6 +2269,61 @@ it.effect("the same worktree under another path spelling keeps its scope", () =>
   ),
 );
 
+// B is first reached through a symlink, so its scope keeps that spelling; the thread returns to B by
+// its real path after the symlink is gone, or points elsewhere. Run 4 works in B's real path, so its
+// baseline, checkpoint and a file revert to it must use that path, not the scope's spelling.
+it.effect.each(["removed", "retargeted"] as const)(
+  "a run back in a workspace whose first spelling was a symlink, now %s, is checkpointed and restored where it runs",
+  (symlink) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* nextTurnSelectionHarness(`symlink-${symlink}`);
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const thread = yield* worktreeThread(harness);
+          const link = path.join(
+            yield* fs.makeTempDirectoryScoped({ prefix: `t3-symlink-${symlink}-` }),
+            "link",
+          );
+          yield* fs.symlink(thread.other, link);
+          yield* thread.switchTo(link);
+          yield* thread.nextRun(link, "edited-by-second.txt");
+          yield* thread.switchTo(harness.cwd);
+          yield* thread.nextRun(harness.cwd, "edited-by-third.txt");
+          yield* fs.remove(link);
+          const elsewhere = yield* checkpointWorkspace(`symlink-${symlink}-elsewhere`);
+          if (symlink === "retargeted") yield* fs.symlink(elsewhere, link);
+          yield* thread.switchTo(thread.other);
+          const fourth = yield* thread.nextRun(thread.other, "edited-by-fourth.txt");
+          const checkpoint = yield* thread.checkpointOf(fourth.runId);
+          assert.deepEqual(
+            [checkpoint.status, checkpoint.files.map((file) => file.path)],
+            ["ready", ["edited-by-fourth.txt"]],
+          );
+          yield* fs.writeFileString(path.join(thread.other, "after.txt"), "later\n");
+          yield* orchestrator.dispatch({
+            type: "checkpoint.rollback",
+            commandId: CommandId.make("run-4-files"),
+            threadId: thread.threadId,
+            scopeId: checkpoint.scopeId,
+            checkpointId: checkpoint.id,
+            restoreFiles: true,
+          });
+          yield* worker.drain();
+          assert.isNull(
+            (yield* orchestrator.getThreadProjection(thread.threadId)).thread.rollbackFailure,
+          );
+          assert.isTrue(yield* fs.exists(path.join(thread.other, "edited-by-fourth.txt")));
+          assert.isFalse(yield* fs.exists(path.join(thread.other, "after.txt")));
+          assert.isFalse(yield* fs.exists(path.join(elsewhere, "edited-by-fourth.txt")));
+        }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+      }),
+    ),
+);
+
 it.effect("queues a plain send behind the stopped queue and releases its hold", () =>
   Effect.scoped(
     Effect.gen(function* () {

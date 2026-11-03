@@ -321,10 +321,10 @@ export const layer: Layer.Layer<
       if (input.restoreFiles !== false) {
         yield* checkpoints.restore({ scope: restoreScope, checkpoint });
       }
-      // A scope's refs live in its workspace's repository, written where its runs worked (its own cwd
-      // may be another spelling: a removed or retargeted symlink). With neither left, the repository may
-      // be another workspace's (worktrees share refs): drop them through every workspace that remains;
-      // deleting a ref a repository lacks is a no-op.
+      // A scope's refs live in its workspace's repository: where its runs worked, or the workspace's
+      // real path (a spelling may be a removed or retargeted symlink, so only scopes recorded without
+      // one use it). With none left, the repository may be another workspace's (worktrees share
+      // refs): drop them through every workspace that remains; deleting a ref it lacks is a no-op.
       const rootScopes = [scope, ...context.otherRootScopes];
       const existing = (cwds: ReadonlyArray<string | null | undefined>) =>
         Effect.filter(
@@ -341,14 +341,15 @@ export const layer: Layer.Layer<
           .map((run) => run.workspaceCwd);
       const remaining = yield* existing([
         context.thread.worktreePath,
-        ...rootScopes.map((candidate) => candidate.cwd),
+        ...rootScopes.map((candidate) => candidate.realCwd ?? candidate.cwd),
         ...runsToRollback.map((run) => run.workspaceCwd),
       ]);
       for (const staleScope of rootScopes) {
         const stale = staleCheckpoints.filter((candidate) => candidate.scopeId === staleScope.id);
         if (stale.length === 0) continue;
         const ranThere = yield* existing(ranIn(staleScope.id));
-        const targets = ranThere.length > 0 ? ranThere : yield* existing([staleScope.cwd]);
+        const targets =
+          ranThere.length > 0 ? ranThere : yield* existing([staleScope.realCwd ?? staleScope.cwd]);
         for (const cwd of targets) {
           yield* checkpoints.deleteStaleRefs({ scope: { ...staleScope, cwd }, checkpoints: stale });
         }

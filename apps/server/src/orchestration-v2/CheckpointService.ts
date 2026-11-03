@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - the scope choice resolves a path without yielding (resolveWorkspaceNow).
 import {
   CheckpointId,
   CheckpointRef,
@@ -9,6 +10,7 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as NodeFS from "node:fs";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -19,7 +21,6 @@ import * as Hex from "effect/encoding/Hex";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
-import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import { isGitImport, parseTurnDiffFilesFromNumstat } from "../checkpointing/Diffs.ts";
@@ -193,6 +194,20 @@ export const resolveWorkspacePath = (
     ),
   );
 
+// The scope choice runs on the command path, where an asynchronous lookup yields the fiber and lets
+// provider output commit first (an order the product leaves open, which an equivalence test pins);
+// a synchronous realpath does not. A missing path resolves lexically.
+const resolveWorkspaceNow = (path: Path.Path, target: string) =>
+  Effect.sync(() => {
+    try {
+      return NodeFS.realpathSync(target);
+    } catch (cause) {
+      const code = (cause as { readonly code?: unknown }).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return path.resolve(target);
+      throw cause;
+    }
+  });
+
 // A thread's first workspace keeps the root scope; each later, different workspace (by real path)
 // gets a scope of its own, so a run's diff and a restore never span two worktrees. A workspace the
 // thread returns to reuses its scope. ordinalWithinParent orders the root scopes; 0 starts the thread.
@@ -205,7 +220,7 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
   readonly cwd: string;
   readonly createdAt: DateTime.Utc;
   readonly threadScopes: ReadonlyArray<OrchestrationV2CheckpointScope>;
-  readonly resolve: (cwd: string) => Effect.Effect<string, PlatformError.PlatformError>;
+  readonly resolve: (cwd: string) => Effect.Effect<string>;
 }) {
   const rootScopeId = yield* input.idAllocator.allocate.checkpointScope({
     threadId: input.threadId,
@@ -290,16 +305,11 @@ function makeCheckpoint(input: {
 export const layer: Layer.Layer<
   CheckpointServiceV2,
   never,
-  | CheckpointStore.CheckpointStore
-  | Crypto.Crypto
-  | FileSystem.FileSystem
-  | IdAllocator.IdAllocatorV2
-  | Path.Path
+  CheckpointStore.CheckpointStore | Crypto.Crypto | IdAllocator.IdAllocatorV2 | Path.Path
 > = Layer.effect(
   CheckpointServiceV2,
   Effect.gen(function* () {
     const checkpointStore = yield* CheckpointStore.CheckpointStore;
-    const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const crypto = yield* Crypto.Crypto;
     const checkpointRefFor = (input: Parameters<typeof checkpointRefForScopeOrdinal>[0]) =>
@@ -626,7 +636,7 @@ export const layer: Layer.Layer<
         makeRootRunScope({
           ...input,
           idAllocator,
-          resolve: (cwd) => resolveWorkspacePath(fileSystem, path, cwd),
+          resolve: (cwd) => resolveWorkspaceNow(path, cwd),
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
           Effect.mapError(

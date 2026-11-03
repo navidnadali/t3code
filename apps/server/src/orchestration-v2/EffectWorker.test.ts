@@ -752,7 +752,7 @@ it.effect("claims only ungated effects once the admission slots are taken", () =
   }),
 );
 
-it.effect("a saturated daemon runs an interrupt while turn starts beyond the allowance wait", () =>
+const saturatedDaemon = (options: { readonly wakeUpsDelivered: boolean }) =>
   Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
     const workerId = "worker-admission-daemon";
@@ -781,10 +781,12 @@ it.effect("a saturated daemon runs an interrupt while turn starts beyond the all
         ),
       awaitAvailable: Queue.take(available),
       notifyAvailable: (count = 1) =>
-        Queue.offerAll(
-          available,
-          Array.from({ length: count }, () => undefined),
-        ).pipe(Effect.asVoid),
+        options.wakeUpsDelivered
+          ? Queue.offerAll(
+              available,
+              Array.from({ length: count }, () => undefined),
+            ).pipe(Effect.asVoid)
+          : Effect.void,
       get: () => Effect.succeedNone,
       awaitCancellation: () => Effect.never,
       clearCancellation: () => Effect.void,
@@ -850,14 +852,23 @@ it.effect("a saturated daemon runs an interrupt while turn starts beyond the all
       ["effect:admission-3", "effect:admission-4"],
     );
 
-    // Headroom returns: the idle workers are woken and take the remaining turn starts.
+    // Headroom returns: the idle workers are woken, or look again within a sample, and take the rest.
     yield* Ref.set(utilization, 0.2);
     yield* TestClock.adjust("2 seconds");
+    if (!options.wakeUpsDelivered) yield* TestClock.adjust("1 second");
     const secondWave = yield* Effect.all([Queue.take(started), Queue.take(started)]);
     assert.deepEqual([...secondWave].toSorted(), ["effect:admission-3", "effect:admission-4"]);
     assert.equal(pending.length, 0);
 
     yield* Deferred.succeed(finishTurnStarts, undefined);
     yield* Fiber.interrupt(daemon);
-  }),
+  });
+
+it.effect("a saturated daemon runs an interrupt while turn starts beyond the allowance wait", () =>
+  saturatedDaemon({ wakeUpsDelivered: true }),
+);
+
+it.effect(
+  "a worker idle behind the closed gate looks again within a sample when no wake-up comes",
+  () => saturatedDaemon({ wakeUpsDelivered: false }),
 );

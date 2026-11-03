@@ -1026,11 +1026,13 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             continue;
           }
 
-          // Skipped turn starts are not due work; the allowance's return wakes the workers for them.
+          // Skipped turn starts are not due work; the allowance's return wakes the workers for them,
+          // and a worker idle behind a closed gate looks again every sample in case a wake-up was lost.
+          const excludedTypes = admission === undefined ? [] : yield* admission.excludedTypes;
           const nextClaimable =
             admission === undefined
               ? worker.nextClaimableAt
-              : worker.nextClaimableAtExcluding(yield* admission.excludedTypes);
+              : worker.nextClaimableAtExcluding(excludedTypes);
           const nextClaimableAt = yield* nextClaimable.pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning(
@@ -1040,11 +1042,18 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             ),
           );
           const now = DateTime.toEpochMillis(yield* DateTime.now);
+          const longestIdleMs =
+            excludedTypes.length === 0
+              ? livenessPollIntervalMs
+              : Math.min(
+                  livenessPollIntervalMs,
+                  Duration.toMillis(EFFECT_ADMISSION_SAMPLE_INTERVAL),
+                );
           const sleepMs = Option.match(nextClaimableAt, {
-            onNone: () => livenessPollIntervalMs,
+            onNone: () => longestIdleMs,
             onSome: (availableAt) => {
               const untilAvailable = DateTime.toEpochMillis(availableAt) - now;
-              return Math.min(livenessPollIntervalMs, untilAvailable > 0 ? untilAvailable : 25);
+              return Math.min(longestIdleMs, untilAvailable > 0 ? untilAvailable : 25);
             },
           });
           yield* Effect.raceFirst(

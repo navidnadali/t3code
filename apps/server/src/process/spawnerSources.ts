@@ -202,10 +202,12 @@ const startHandoff = (message) => {
     for (const socket of accepted.values()) socket.destroy();
     post({ t: "handoff-failed", id, error: errorFields(error) });
   });
+  // Cancelled before its command ran: nothing else will come for this start, so say it is over.
   handoffs.set(id, {
     cancel: () => {
       close();
       for (const socket of accepted.values()) socket.destroy();
+      post({ t: "close", id });
     },
   });
   try {

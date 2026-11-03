@@ -1,4 +1,5 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointId,
@@ -275,6 +276,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
                       Layer.mergeAll(
                         IdAllocator.layer,
                         NodeCrypto.layer,
+                        NodeServices.layer,
                         Layer.mock(CheckpointStore.CheckpointStore)({
                           listAuthoredPaths: () => Effect.succeed(null),
                           isGitRepository: () => Effect.succeed(true),
@@ -643,6 +645,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
                   Layer.mergeAll(
                     IdAllocator.layer,
                     NodeCrypto.layer,
+                    NodeServices.layer,
                     Layer.mock(CheckpointStore.CheckpointStore)({
                       isGitRepository: (cwd) => inWorkspace(cwd).pipe(Effect.as(true)),
                       hasCheckpointRef: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as(true)),
@@ -1073,6 +1076,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
                 Layer.mergeAll(
                   IdAllocator.layer,
                   NodeCrypto.layer,
+                  NodeServices.layer,
                   Layer.mock(CheckpointStore.CheckpointStore)({
                     isGitRepository: gitUnavailable,
                     captureCheckpoint: gitUnavailable,

@@ -19,9 +19,10 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import {
   anotherWorktreeRestoreMessage,
+  checkpointRestoreRefusal,
   isCheckpointRestoreIsolated,
+  UNPLACED_RESTORE_MESSAGE,
 } from "./CheckpointRestoreSafety.ts";
-import * as CheckpointRestoreSafety from "./CheckpointRestoreSafety.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
 import { EventSinkV2 } from "./EventSink.ts";
@@ -111,10 +112,8 @@ it.effect.each([
           }),
           Layer.mock(ProjectionStoreV2)({
             // "unplaced": recorded before the upgrade, by a thread that ran in two worktrees.
-            ...({
-              getCheckpointWorkspaces: () =>
-                Effect.succeed(owner === "unplaced" ? [sibling, cwd] : [cwd]),
-            } as {}),
+            getCheckpointWorkspaces: () =>
+              Effect.succeed(owner === "unplaced" ? [sibling, cwd] : [cwd]),
             getThread: () => Effect.succeed(projection.thread),
             getCheckpointRollbackContext: () => Effect.succeed(projection),
             getShellSnapshot: () =>
@@ -287,8 +286,8 @@ it("names the other worktree in the refusal, a long path shortened in the middle
 // One check for admission and the rollback: where the checkpoint's files are, against this worktree.
 it.effect.each([
   ["taken here", ["here"], null],
-  ["taken in another worktree", ["other"], "another worktree (OTHER)"],
-  ["recorded before the upgrade by a thread in two worktrees", ["other", "here"], "can't tell"],
+  ["taken in another worktree", ["other"], "another"],
+  ["recorded before the upgrade by a thread in two worktrees", ["other", "here"], "unplaced"],
   ["for a thread without a worktree", ["other"], null],
 ] as const)("refuses a file restore of a checkpoint %s", ([name, workspaces, refusal]) =>
   Effect.gen(function* () {
@@ -298,12 +297,7 @@ it.effect.each([
     const places = { here: path.join(parent, "here"), other: path.join(parent, "other") };
     yield* fileSystem.makeDirectory(places.here);
     yield* fileSystem.makeDirectory(places.other);
-    const check = Reflect.get(CheckpointRestoreSafety, "checkpointRestoreRefusal") as (
-      thread: { readonly id: ThreadId; readonly worktreePath: string | null },
-      checkpointId: CheckpointId,
-      dependencies: unknown,
-    ) => Effect.Effect<string | null>;
-    const result = yield* check(
+    const result = yield* checkpointRestoreRefusal(
       {
         id: ThreadId.make("restore-refusal"),
         worktreePath: name === "for a thread without a worktree" ? null : places.here,
@@ -317,7 +311,13 @@ it.effect.each([
         },
       },
     );
-    if (refusal === null) assert.isNull(result);
-    else assert.include(result, refusal.replace("OTHER", places.other));
+    assert.equal(
+      result,
+      refusal === null
+        ? null
+        : refusal === "another"
+          ? anotherWorktreeRestoreMessage(places.other)
+          : UNPLACED_RESTORE_MESSAGE,
+    );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

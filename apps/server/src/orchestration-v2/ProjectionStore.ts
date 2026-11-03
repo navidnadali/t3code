@@ -642,6 +642,14 @@ export interface ProjectionStoreV2Shape {
       readonly scopeId: CheckpointScopeId;
     },
   ) => Effect.Effect<ProjectionCheckpointRollbackContext, ProjectionStoreV2Error>;
+  /**
+   * Where a checkpoint's files may be: the workspace its run recorded, or, for a run recorded before
+   * runs kept their workspace, every cwd its scope was created with (more than one: unknown).
+   */
+  readonly getCheckpointWorkspaces: (
+    threadId: ThreadId,
+    checkpointId: CheckpointId,
+  ) => Effect.Effect<ReadonlyArray<string>, ProjectionStoreV2Error>;
   readonly getRunMessage: (
     threadId: ThreadId,
     runId: RunId,
@@ -5606,6 +5614,66 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         )
         .pipe(Effect.mapError(controlReadError(threadId)));
 
+    // A run checkpoint's run is its own; a baseline's is the run it precedes, which materialized it
+    // (the thread's first run for the thread start). The event log keeps every scope creation.
+    const getCheckpointWorkspaces: ProjectionStoreV2Shape["getCheckpointWorkspaces"] = (
+      threadId,
+      checkpointId,
+    ) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const checkpoints = yield* sql<{
+              readonly scopeId: string;
+              readonly nodeId: string;
+              readonly ordinalWithinScope: number;
+              readonly appRunOrdinal: number | null;
+              readonly scopeCwd: string | null;
+            }>`SELECT checkpoint.scope_id AS "scopeId", checkpoint.node_id AS "nodeId",
+              checkpoint.ordinal_within_scope AS "ordinalWithinScope",
+              checkpoint.app_run_ordinal AS "appRunOrdinal",
+              json_extract(scope.payload_json, '$.cwd') AS "scopeCwd"
+            FROM orchestration_v2_projection_checkpoints AS checkpoint
+            LEFT JOIN orchestration_v2_projection_checkpoint_scopes AS scope
+              ON scope.scope_id = checkpoint.scope_id
+            WHERE checkpoint.thread_id = ${threadId} AND checkpoint.checkpoint_id = ${checkpointId}`;
+            const checkpoint = checkpoints[0];
+            if (checkpoint === undefined) return [];
+            const runs =
+              checkpoint.appRunOrdinal !== null
+                ? yield* sql<{ readonly workspace: string | null }>`
+                  SELECT json_extract(payload_json, '$.workspaceCwd') AS workspace
+                  FROM orchestration_v2_projection_runs
+                  WHERE thread_id = ${threadId} AND ordinal = ${checkpoint.appRunOrdinal}`
+                : checkpoint.ordinalWithinScope === 0
+                  ? yield* sql<{ readonly workspace: string | null }>`
+                    SELECT json_extract(payload_json, '$.workspaceCwd') AS workspace
+                    FROM orchestration_v2_projection_runs
+                    WHERE thread_id = ${threadId} ORDER BY ordinal ASC LIMIT 1`
+                  : yield* sql<{ readonly workspace: string | null }>`
+                    SELECT json_extract(payload_json, '$.workspaceCwd') AS workspace
+                    FROM orchestration_v2_projection_runs
+                    WHERE thread_id = ${threadId}
+                      AND json_extract(payload_json, '$.rootNodeId') = ${checkpoint.nodeId}`;
+            const recorded = runs[0]?.workspace;
+            if (typeof recorded === "string") return [recorded];
+            const created = yield* sql<{ readonly cwd: string | null }>`
+              SELECT DISTINCT json_extract(payload_json, '$.cwd') AS cwd
+              FROM orchestration_events
+              WHERE application_event_version = 2 AND aggregate_kind = 'thread'
+                AND stream_id = ${threadId} AND event_type = 'checkpoint-scope.created'
+                AND json_extract(payload_json, '$.id') = ${checkpoint.scopeId}`;
+            return [
+              ...new Set(
+                [...created.map(({ cwd }) => cwd), checkpoint.scopeCwd].filter(
+                  (cwd): cwd is string => typeof cwd === "string",
+                ),
+              ),
+            ];
+          }),
+        )
+        .pipe(Effect.mapError(controlReadError(threadId)));
+
     const getRunMessage: ProjectionStoreV2Shape["getRunMessage"] = (threadId, runId) =>
       sql
         .withTransaction(
@@ -7520,6 +7588,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getCheckpointContext: readOnReader(getCheckpointContext),
       getCheckpointCaptureContext: readOnReader(getCheckpointCaptureContext),
       getCheckpointRollbackContext: readOnReader(getCheckpointRollbackContext),
+      getCheckpointWorkspaces: readOnReader(getCheckpointWorkspaces),
       getRunMessage: readOnReader(getRunMessage),
       canStartQueuedRun: readOnReader(canStartQueuedRun),
       getHeldQueuedRuns: readOnReader(getHeldQueuedRuns),

@@ -98,8 +98,7 @@ import * as Stream from "effect/Stream";
 
 import * as ProjectStore from "./ProjectStore.ts";
 import {
-  anotherWorktreeRestoreMessage,
-  isCheckpointFromAnotherWorktree,
+  checkpointRestoreRefusal,
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
 } from "./CheckpointRestoreSafety.ts";
@@ -1992,7 +1991,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? storedCheckpointScope
           : yield* Effect.gen(function* () {
               if (resolvedForStart._tag === "Failure") return yield* resolvedForStart.failure;
-              return yield* prepareRootRunScope({
+              const prepared = yield* prepareRootRunScope({
                 threadId,
                 runId: queuedRun.id,
                 rootNodeId: rootNode.id,
@@ -2000,6 +1999,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 cwd: workspaceNow!,
                 createdAt: now,
               });
+              // Another spelling of the same workspace keeps the scope as stored.
+              return prepared.id === storedCheckpointScope?.id ? storedCheckpointScope : prepared;
             }).pipe(
               Effect.mapError(
                 (cause) =>
@@ -11985,15 +11986,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
       if (command.restoreFiles !== false) {
-        // A run's checkpoint was taken where the run worked; a baseline where its scope's runs work.
-        const workspace =
-          (targetCheckpoint.appRunOrdinal === null
-            ? undefined
-            : projection.runs.find((run) => run.ordinal === targetCheckpoint.appRunOrdinal)
-          )?.workspaceCwd ?? targetScope.cwd;
-        const elsewhere = yield* isCheckpointFromAnotherWorktree(projection.thread, workspace, {
+        const refusal = yield* checkpointRestoreRefusal(projection.thread, targetCheckpoint.id, {
           fileSystem,
           path,
+          projections: projectionStore,
         }).pipe(
           Effect.mapError(
             (cause) =>
@@ -12004,11 +12000,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               }),
           ),
         );
-        if (elsewhere)
+        if (refusal !== null)
           return yield* new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
-            cause: anotherWorktreeRestoreMessage(workspace),
+            cause: refusal,
           });
         const isolated = yield* isCheckpointRestoreIsolated(projection.thread, targetScope, {
           projects,

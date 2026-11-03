@@ -22,10 +22,10 @@ import type * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
-  anotherWorktreeRestoreMessage,
-  isCheckpointFromAnotherWorktree,
+  checkpointRestoreRefusal,
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
+  UNPLACED_RESTORE_MESSAGE,
 } from "./CheckpointRestoreSafety.ts";
 import { CheckpointRestoreError, CheckpointServiceV2 } from "./CheckpointService.ts";
 import { EventSinkV2 } from "./EventSink.ts";
@@ -55,8 +55,8 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,
     checkpointId: CheckpointId,
-    /** The worktree the checkpoint was taken in, for another-worktree. */
-    workspace: Schema.optional(Schema.String),
+    /** Why another-worktree refused the file restore, as the user reads it. */
+    refusal: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -71,7 +71,7 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
       case "shared-workspace":
         return SHARED_WORKSPACE_RESTORE_MESSAGE;
       case "another-worktree":
-        return anotherWorktreeRestoreMessage(this.workspace ?? "unknown");
+        return this.refusal ?? UNPLACED_RESTORE_MESSAGE;
       case "unexpected-failure":
         return ROLLBACK_FAILED_MESSAGE;
     }
@@ -243,16 +243,21 @@ export const layer: Layer.Layer<
       }
 
       // Admission checked this too; the thread may have moved to another worktree since.
-      if (
-        input.restoreFiles !== false &&
-        (yield* isCheckpointFromAnotherWorktree(context.thread, scope.cwd, { fileSystem, path }))
-      ) {
+      const refusal =
+        input.restoreFiles === false
+          ? null
+          : yield* checkpointRestoreRefusal(context.thread, input.checkpointId, {
+              fileSystem,
+              path,
+              projections,
+            });
+      if (refusal !== null) {
         return yield* new CheckpointRollbackExecutionError({
           reason: "another-worktree",
           threadId: input.threadId,
           providerThreadId: input.providerThreadId,
           checkpointId: input.checkpointId,
-          workspace: scope.cwd,
+          refusal,
         });
       }
       if (

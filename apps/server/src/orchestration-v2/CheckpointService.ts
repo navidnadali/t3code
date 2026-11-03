@@ -13,10 +13,13 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Base64Url from "effect/encoding/Base64Url";
 import * as Hex from "effect/encoding/Hex";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import { isGitImport, parseTurnDiffFilesFromNumstat } from "../checkpointing/Diffs.ts";
@@ -176,9 +179,23 @@ function checkpointIdForScopeOrdinal(
   });
 }
 
-// A thread's first workspace keeps the root scope; each later, different workspace gets a scope of
-// its own, so a run's diff and a restore never span two worktrees. A workspace the thread returns
-// to reuses its scope. ordinalWithinParent orders the root scopes; 0 holds the thread start.
+// A workspace by its real path, so two spellings of one directory (a symlink, /var and /private/var
+// on macOS) are one workspace. A removed worktree keeps its resolved spelling.
+export const resolveWorkspacePath = (
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+  target: string,
+) =>
+  fileSystem.realPath(target).pipe(
+    Effect.catchIf(
+      (error) => error.reason._tag === "NotFound",
+      (_error) => Effect.succeed(path.resolve(target)),
+    ),
+  );
+
+// A thread's first workspace keeps the root scope; each later, different workspace (by real path)
+// gets a scope of its own, so a run's diff and a restore never span two worktrees. A workspace the
+// thread returns to reuses its scope. ordinalWithinParent orders the root scopes; 0 starts the thread.
 const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(function* (input: {
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly threadId: ThreadId;
@@ -188,6 +205,7 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
   readonly cwd: string;
   readonly createdAt: DateTime.Utc;
   readonly threadScopes: ReadonlyArray<OrchestrationV2CheckpointScope>;
+  readonly resolve: (cwd: string) => Effect.Effect<string, PlatformError.PlatformError>;
 }) {
   const rootScopeId = yield* input.idAllocator.allocate.checkpointScope({
     threadId: input.threadId,
@@ -197,13 +215,14 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
     (scope) => scope.kind === "root_run" && scope.parentScopeId === null,
   );
   const rootScope = rootScopes.find((scope) => scope.id === rootScopeId);
+  const workspace = yield* input.resolve(input.cwd);
   const [scopeId, ordinalWithinParent] =
-    rootScope === undefined || rootScope.cwd === input.cwd
+    rootScope === undefined || (yield* input.resolve(rootScope.cwd)) === workspace
       ? ([rootScopeId, 0] as const)
       : yield* Effect.gen(function* () {
           const crypto = yield* Crypto.Crypto;
           const digest = yield* crypto
-            .digest("SHA-256", new TextEncoder().encode(input.cwd))
+            .digest("SHA-256", new TextEncoder().encode(workspace))
             .pipe(Effect.orDie);
           const workspaceScopeId = yield* input.idAllocator.allocate.checkpointScope({
             threadId: input.threadId,
@@ -263,11 +282,17 @@ function makeCheckpoint(input: {
 export const layer: Layer.Layer<
   CheckpointServiceV2,
   never,
-  CheckpointStore.CheckpointStore | Crypto.Crypto | IdAllocator.IdAllocatorV2
+  | CheckpointStore.CheckpointStore
+  | Crypto.Crypto
+  | FileSystem.FileSystem
+  | IdAllocator.IdAllocatorV2
+  | Path.Path
 > = Layer.effect(
   CheckpointServiceV2,
   Effect.gen(function* () {
     const checkpointStore = yield* CheckpointStore.CheckpointStore;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
     const crypto = yield* Crypto.Crypto;
     const checkpointRefFor = (input: Parameters<typeof checkpointRefForScopeOrdinal>[0]) =>
       checkpointRefForScopeOrdinal(input).pipe(Effect.provideService(Crypto.Crypto, crypto));
@@ -590,7 +615,11 @@ export const layer: Layer.Layer<
 
     return CheckpointServiceV2.of({
       prepareRootRunScope: (input) =>
-        makeRootRunScope({ ...input, idAllocator }).pipe(
+        makeRootRunScope({
+          ...input,
+          idAllocator,
+          resolve: (cwd) => resolveWorkspacePath(fileSystem, path, cwd),
+        }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
           Effect.mapError(
             (cause) =>

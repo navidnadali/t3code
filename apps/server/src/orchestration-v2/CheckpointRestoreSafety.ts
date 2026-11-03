@@ -1,8 +1,13 @@
-import type { OrchestrationV2AppThread, OrchestrationV2CheckpointScope } from "@t3tools/contracts";
+import type {
+  CheckpointId,
+  OrchestrationV2AppThread,
+  OrchestrationV2CheckpointScope,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import type * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import type * as Path from "effect/Path";
+import { resolveWorkspacePath } from "./CheckpointService.ts";
 import type { ProjectionStoreV2 } from "./ProjectionStore.ts";
 import type * as ProjectStore from "./ProjectStore.ts";
 
@@ -17,34 +22,42 @@ const shortenedPath = (value: string) => {
   return `${characters.slice(0, prefixLength).join("")}…${characters.slice(-suffixLength).join("")}`;
 };
 
+// In the revert dialog's terms: "this message" is where the user reverts to.
 export const anotherWorktreeRestoreMessage = (workspace: string) =>
-  `This checkpoint was taken in another worktree (${shortenedPath(workspace)}). Restoring its files would overwrite this worktree's branch. Use “Revert and keep changes” to rewind the conversation only.`;
+  `The files from before this message are in another worktree (${shortenedPath(workspace)}). Restoring them here would overwrite this worktree's files. Use “Revert and keep changes” to rewind the conversation only.`;
 
-// Storage cleanup may have removed a worktree; rollback recreates the thread's.
-const resolveWorkspace = (fileSystem: FileSystem.FileSystem, path: Path.Path, target: string) =>
-  fileSystem.realPath(target).pipe(
-    Effect.catchIf(
-      (error) => error.reason._tag === "NotFound",
-      (_error) => Effect.succeed(path.resolve(target)),
-    ),
-  );
+export const UNPLACED_RESTORE_MESSAGE =
+  "T3 can't tell which worktree the files from before this message are in: this conversation ran in more than one before T3 recorded where each turn ran. Restoring them here could overwrite this worktree's files. Use “Revert and keep changes” to rewind the conversation only.";
 
-// A file restore writes the checkpoint's tree into the thread's worktree; one taken in another
-// worktree would replace this worktree's branch with that one's. Shared workspaces are refused apart.
-export const isCheckpointFromAnotherWorktree = Effect.fn(
-  "orchestrationV2.isCheckpointFromAnotherWorktree",
-)(function* (
-  thread: Pick<OrchestrationV2AppThread, "worktreePath">,
-  workspace: string,
-  dependencies: { readonly fileSystem: FileSystem.FileSystem; readonly path: Path.Path },
-) {
-  if (thread.worktreePath == null) return false;
-  const { fileSystem, path } = dependencies;
-  return (
-    (yield* resolveWorkspace(fileSystem, path, workspace)) !==
-    (yield* resolveWorkspace(fileSystem, path, thread.worktreePath))
-  );
-});
+// The one check admission and the rollback make before a file restore, which writes the checkpoint's
+// tree into the thread's worktree: refused when it was taken in another worktree, or when that is
+// unknown (recorded before runs kept their workspace, by a thread that ran in more than one). A
+// thread without a worktree is a shared workspace, which the isolation check refuses.
+export const checkpointRestoreRefusal = Effect.fn("orchestrationV2.checkpointRestoreRefusal")(
+  function* (
+    thread: Pick<OrchestrationV2AppThread, "id" | "worktreePath">,
+    checkpointId: CheckpointId,
+    dependencies: {
+      readonly fileSystem: FileSystem.FileSystem;
+      readonly path: Path.Path;
+      readonly projections: Pick<ProjectionStoreV2["Service"], "getCheckpointWorkspaces">;
+    },
+  ) {
+    if (thread.worktreePath == null) return null;
+    const { fileSystem, path, projections } = dependencies;
+    const workspaces = yield* projections.getCheckpointWorkspaces(thread.id, checkpointId);
+    const places = new Map<string, string>();
+    for (const workspace of workspaces) {
+      places.set(yield* resolveWorkspacePath(fileSystem, path, workspace), workspace);
+    }
+    if (places.size > 1) return UNPLACED_RESTORE_MESSAGE;
+    const here = yield* resolveWorkspacePath(fileSystem, path, thread.worktreePath);
+    for (const [place, workspace] of places) {
+      if (place !== here) return anotherWorktreeRestoreMessage(workspace);
+    }
+    return null;
+  },
+);
 
 export const SHARED_WORKSPACE_RESTORE_MESSAGE =
   "File restore requires an isolated worktree. This workspace may contain changes from another thread or a side chat. Rewind the conversation without restoring files instead, or delete side chats you no longer need.";
@@ -72,7 +85,7 @@ export const isCheckpointRestoreIsolated = Effect.fn("orchestrationV2.isCheckpoi
     const worktreePath = thread.worktreePath;
     let shared = worktreePath == null;
     if (!shared && worktreePath !== null) {
-      const resolve = (target: string) => resolveWorkspace(fileSystem, path, target);
+      const resolve = (target: string) => resolveWorkspacePath(fileSystem, path, target);
       const cwd = yield* resolve(scope.cwd);
       const worktreeCwd = yield* resolve(worktreePath);
       shared = cwd !== worktreeCwd;

@@ -261,6 +261,7 @@ it.effect(
             ),
           getCheckpointContext: () => Effect.die("not used"),
           getCheckpointRollbackContext: () => Effect.die("unused rollback context"),
+          getCheckpointWorkspaces: () => Effect.die("unused checkpoint workspaces"),
           getCheckpointCaptureContext: () => Effect.die("not used"),
           getRunMessage: () => Effect.die("not used"),
           isNodeStored: () => Effect.die("not used"),

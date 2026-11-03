@@ -1,4 +1,5 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointScopeId,
@@ -52,6 +53,7 @@ it.effect(
           Layer.provide(
             Layer.mergeAll(
               IdAllocator.layer,
+              NodeServices.layer,
               Layer.mock(CheckpointStore.CheckpointStore)({
                 isGitRepository: () => Effect.succeed(true),
                 hasCheckpointRef: () => Effect.succeed(false),

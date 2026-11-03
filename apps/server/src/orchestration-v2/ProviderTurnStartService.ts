@@ -56,6 +56,7 @@ import {
   makeProviderFailure,
 } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
+import * as CheckpointService from "./CheckpointService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import {
   isRestartNoteContinuation,
@@ -145,6 +146,7 @@ export const layer: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | RunExecutionService.RunExecutionServiceV2
   | RuntimePolicy.RuntimePolicyV2
+  | CheckpointService.CheckpointServiceV2
 > = Layer.effect(
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
@@ -161,6 +163,7 @@ export const layer: Layer.Layer<
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    const checkpointService = yield* CheckpointService.CheckpointServiceV2;
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
 
     const resolveRecreateBase = Effect.fn("ProviderTurnStartService.resolveRecreateBase")(
@@ -793,6 +796,33 @@ export const layer: Layer.Layer<
         });
         if (!repaired.committed) return;
       }
+      // A run is checkpointed where it works. A live session keeps its cwd; a new one opens in the
+      // thread's workspace now, which may not be the one the run was scoped in: it takes that scope.
+      const workspaceNow = resolvedRuntimePolicy.cwd;
+      const runScope =
+        checkpointScope.kind !== "root_run" ||
+        checkpointScope.parentScopeId !== null ||
+        workspaceNow == null ||
+        workspaceNow === checkpointScope.cwd ||
+        Option.isSome(yield* providerSessions.get(providerSessionId))
+          ? checkpointScope
+          : yield* Effect.gen(function* () {
+              const { checkpointScopes } = yield* projectionStore.getThreadRecords(
+                projection.thread.id,
+                ["checkpointScopes"],
+              );
+              const prepared = yield* checkpointService.prepareRootRunScope({
+                threadId: projection.thread.id,
+                runId: run.id,
+                rootNodeId: rootNode.id,
+                providerThreadId: providerThread.id,
+                cwd: workspaceNow,
+                createdAt: yield* DateTime.now,
+                threadScopes: checkpointScopes,
+              });
+              // Another spelling of the same workspace keeps the scope as stored.
+              return prepared.id === checkpointScope.id ? checkpointScope : prepared;
+            });
       const sessionResult = yield* Effect.result(
         providerSessions.open({
           threadId: projection.thread.id,
@@ -1432,7 +1462,7 @@ export const layer: Layer.Layer<
         status: "running",
         startedAt: now,
         // The thread's scope follows its latest root run; this run's checkpoints stay here.
-        workspaceCwd: checkpointScope.cwd,
+        workspaceCwd: runScope.cwd,
       };
       const runningAttempt: OrchestrationV2RunAttempt = {
         ...attempt,
@@ -1446,8 +1476,23 @@ export const layer: Layer.Layer<
         ...rootNode,
         status: "running",
         startedAt: now,
+        checkpointScopeId: runScope.id,
       };
       const events: Array<OrchestrationV2DomainEvent> = [
+        ...(runScope === checkpointScope
+          ? []
+          : [
+              {
+                id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                type: "checkpoint-scope.created" as const,
+                threadId: projection.thread.id,
+                runId: run.id,
+                nodeId: rootNode.id,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: now,
+                payload: runScope,
+              },
+            ]),
         {
           id: yield* idAllocator.allocate.event({
             threadId: projection.thread.id,
@@ -1665,7 +1710,7 @@ export const layer: Layer.Layer<
         session: deliverySession,
         run: runningRun,
         rootNode: runningRootNode,
-        checkpointScope,
+        checkpointScope: runScope,
         providerThread: runningProviderThread,
         attempt: runningAttempt,
         attemptId: attempt.id,

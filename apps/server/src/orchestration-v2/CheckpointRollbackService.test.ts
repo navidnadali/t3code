@@ -104,6 +104,7 @@ it.effect.each(["initial", "waiting"])(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
             getThread,
             getCheckpointRollbackContext,
+            getCheckpointWorkspaces: () => Effect.succeed([projection.scope!.cwd]),
             getShellSnapshot: () =>
               Effect.succeed({
                 schemaVersion: 1,
@@ -269,6 +270,7 @@ it.effect.each([
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
             getThread: () => Effect.succeed(projection.thread),
             getCheckpointRollbackContext: () => Effect.succeed(projection),
+            getCheckpointWorkspaces: () => Effect.succeed([worktreePath]),
             getShellSnapshot: () =>
               Effect.succeed({
                 schemaVersion: 1,

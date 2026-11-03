@@ -231,8 +231,8 @@ const STDOUT_BUFFER_BYTES = 1024 * 1024;
 // The SDK's close: end the CLI's input, SIGTERM after this grace, SIGKILL after the second wait.
 const CLOSE_GRACE = Duration.seconds(2);
 const CLOSE_KILL_AFTER = Duration.seconds(5);
-// The SDK's own error for a call once its transport has closed.
-const QUERY_ENDED = "ProcessTransport is not ready for writing";
+// The SDK's own error for a control call once its query has been cleaned up (SDK 0.3.284).
+const QUERY_ENDED = "Query closed before response received";
 // The signals the SDK sends its CLI; `kill` throws on an unknown name.
 const CLI_SIGNALS: ReadonlySet<string> = new Set(["SIGTERM", "SIGKILL", "SIGINT"]);
 

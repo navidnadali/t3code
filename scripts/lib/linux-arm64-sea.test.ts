@@ -1,6 +1,6 @@
 // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
 import { describe, expect, it } from "@effect/vitest";
-import { assertLinuxArm64PageCompatibility } from "./linux-arm64-sea.ts";
+import { assertLinuxArm64PageCompatibility, linuxArm64SeaConfig } from "./linux-arm64-sea.ts";
 
 function elf(loads: Array<{ offset: bigint; address: bigint; size: bigint }>) {
   const bytes = new Uint8Array(64 + loads.length * 56);
@@ -62,3 +62,30 @@ describe("Linux ARM64 SEA page compatibility", () => {
     ).toThrow();
   });
 });
+
+describe("linuxArm64SeaConfig", () => {
+  it("bakes only what the caller asks for: the server's cap and cli mode, nothing for the spawner", () => {
+    const server = linuxArm64SeaConfig({
+      bundlePath: "/b/bin.mjs",
+      blobPath: "/t/sea.blob",
+      sea: { execArgv: ["--max-semi-space-size=64"], execArgvExtension: "env" },
+    });
+    expect(server).toMatchObject({
+      main: "/b/bin.mjs",
+      output: "/t/sea.blob",
+      mainFormat: "module",
+      useCodeCache: false,
+      execArgv: ["--max-semi-space-size=64"],
+      execArgvExtension: "env",
+    });
+    const spawner = linuxArm64SeaConfig({
+      bundlePath: "/t/process-spawner.cjs",
+      blobPath: "/t/sea.blob",
+      mainFormat: "commonjs",
+      sea: { execArgvExtension: "none" },
+    });
+    expect(spawner).toMatchObject({ mainFormat: "commonjs", execArgvExtension: "none" });
+    expect(spawner).not.toHaveProperty("execArgv");
+  });
+});
+

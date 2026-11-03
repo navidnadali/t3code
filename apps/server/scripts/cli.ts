@@ -27,6 +27,7 @@ import {
   ServerCliDevelopmentIconTargetMissingError,
   ServerCliExecutableImportError,
 } from "./cliErrors.ts";
+import { seaBuildOptions } from "@t3tools/shared/youngGenerationEnv";
 
 const RepoRoot = Effect.service(Path.Path).pipe(
   Effect.flatMap((path) => path.fromFileUrl(new URL("../../..", import.meta.url))),
@@ -116,6 +117,12 @@ const buildExeCmd = Command.make(
       ),
       Flag.optional,
     ),
+    outDir: Flag.String("out-dir").pipe(
+      Flag.withDescription(
+        "Directory for the executable and its bundle; defaults to apps/server/dist-exe.",
+      ),
+      Flag.optional,
+    ),
   },
   (config) =>
     Effect.gen(function* () {
@@ -123,6 +130,9 @@ const buildExeCmd = Command.make(
       const fs = yield* FileSystem.FileSystem;
       const repoRoot = yield* RepoRoot;
       const serverDir = path.join(repoRoot, "apps/server");
+      const outDir = path.resolve(
+        Option.getOrElse(config.outDir, () => path.join(serverDir, "dist-exe")),
+      );
 
       yield* Effect.log("[cli] Building single-executable...");
       const target = Option.getOrUndefined(config.target);
@@ -139,6 +149,7 @@ const buildExeCmd = Command.make(
             ...process.env,
             T3CODE_PACK_EXE: linuxArm64 ? "bundle" : "1",
             T3CODE_PACK_EXE_TARGET: target ?? "",
+            T3CODE_PACK_EXE_OUT_DIR: outDir,
           },
           stdout: config.verbose ? "inherit" : "ignore",
           stderr: "inherit",
@@ -147,7 +158,7 @@ const buildExeCmd = Command.make(
       );
 
       // Executables reject non-builtin imports even when bundling succeeds; inspect the emitted graph.
-      const bundlePath = path.join(serverDir, "dist-exe/bin.mjs");
+      const bundlePath = path.join(outDir, "bin.mjs");
       const specifiers = findEsmImportsOfExternalPackages(yield* fs.readFileString(bundlePath));
       if (specifiers.length > 0) {
         return yield* new ServerCliExecutableImportError({ bundlePath, specifiers });
@@ -156,27 +167,28 @@ const buildExeCmd = Command.make(
       if (linuxArm64) {
         yield* injectLinuxArm64Sea({
           bundlePath,
-          outputPath: path.join(serverDir, "dist-exe/t3"),
+          outputPath: path.join(outDir, "t3"),
           nodeVersion: rootPackageJson.engines.node,
           verbose: config.verbose,
+          sea: seaBuildOptions(),
         });
       }
       // Without it the server runs its spawner as t3 __process-spawner, which parses the whole bundle.
       if (target === undefined && (yield* HostProcess.Platform) !== "win32") {
         yield* buildProcessSpawnerSea({
           source: spawnerProcessSource,
-          outputPath: path.join(serverDir, "dist-exe", PROCESS_SPAWNER_EXECUTABLE),
+          outputPath: path.join(outDir, PROCESS_SPAWNER_EXECUTABLE),
           nodeVersion: rootPackageJson.engines.node,
           verbose: config.verbose,
         });
-        yield* Effect.log(`[cli] Built dist-exe/${PROCESS_SPAWNER_EXECUTABLE}`);
+        yield* Effect.log(`[cli] Built ${path.join(outDir, PROCESS_SPAWNER_EXECUTABLE)}`);
       } else {
         yield* Effect.log(
-          `[cli] No dist-exe/${PROCESS_SPAWNER_EXECUTABLE} for a cross-target or Windows build; t3 starts its spawner itself`,
+          `[cli] No ${PROCESS_SPAWNER_EXECUTABLE} beside the executable for a cross-target or Windows build; t3 starts its spawner itself`,
         );
       }
       yield* Effect.log(
-        "[cli] Built dist-exe/t3 (expects client/, resource-monitor/, and the runtime-external node_modules beside it; scripts/build-cli-archive.ts assembles that tree)",
+        `[cli] Built ${path.join(outDir, "t3")} (expects client/, resource-monitor/, and the runtime-external node_modules beside it; scripts/build-cli-archive.ts assembles that tree)`,
       );
     }),
 ).pipe(

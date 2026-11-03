@@ -202,6 +202,49 @@ once more if another command arrives.
 The spawner process and the worker run real processes even when a test injects a fake
 `ChildProcessSpawner` below these services; such a test sets `T3CODE_PROCESS_SPAWNER=default`.
 
+The server runs with a 64 MiB V8 young generation (`--max-semi-space-size=64`; Node 26's default
+behaves like 32 MiB). At 250 sessions that halves the scavenges, cuts GC time by 42 % and the
+event-loop delay maximum by 59 %, for about 128 MiB more RSS; at 50 sessions nothing measurable
+changes. The flag is process-wide, so worker isolates share the cap and may each grow by up to 64 MiB
+under load. V8
+reads the flag only at startup. The single executable has it built in (the SEA's `execArgv`, with
+`execArgvExtension: "env"`), so no start of the packaged binary ever relaunches: Node reads `NODE_OPTIONS` itself,
+with its own guards (the allowlist refuses what it would refuse anywhere; nothing is read under AT_SECURE), and
+the built-in 64 MiB stays whatever `NODE_OPTIONS`, the knob or the hatch say — by decision, the packaged binary's
+cap cannot be changed or turned off, and the server logs `server.v8` at Warn (`capSettingIneffective`) when the
+environment tried. A `node bin.mjs` start (an npm install) and the desktop's backend (Electron's Node, given the
+cap in `NODE_OPTIONS` with the marker) keep the knob, the hatch and the relaunch fallback: such a start without
+the cap relaunches itself once (`execve`, same pid, before any other work) with the cap in `NODE_OPTIONS`, the
+background service launcher passes it the same way, and in every case the server's children (agents, helpers)
+get exactly the `NODE_OPTIONS` the server itself was given. `T3CODE_V8_MAX_SEMI_SPACE_MB=0` keeps
+Node's default, a positive integer sets another cap, and an explicit `--max-semi-space-size` in `NODE_OPTIONS` or
+on the command line is never overridden (values above 1024 MiB are ignored) — on node-run installs; the packaged
+binary's built-in cap takes none of them. The packaged binary keeps its built-in cap on every one
+of these paths. On a node-run or unbaked install, a server started with an IPC channel or a bootstrap
+descriptor (`--bootstrap-fd`, `T3CODE_BOOTSTRAP_FD`) by a launcher that did not set the flag, or with the
+inspector (`--inspect*`), runs with Node's default; so does a direct `node bin.mjs serve` on Windows (no
+`execve`), while a server the service launcher starts gets the flag through its environment. A direct start with a preload (`--require`, `--import`, `--loader` on the
+command line or in `NODE_OPTIONS`) keeps Node's default too, with the reason "started with a preload": what
+`NODE_OPTIONS` says after a preload ran is not what Node started with, so neither an explicit cap nor the
+user's options could be carried into a relaunch; a server the launcher starts gets the flag regardless. On Linux the
+decision also checks `NODE_OPTIONS` as Node started with, read from `/proc/self/environ`: when that record differs
+from `NODE_OPTIONS` as it reads, a preload rewrote it and the process keeps Node's default ("NODE_OPTIONS changed
+since startup"); a `node --env-file` that supplies `NODE_OPTIONS` reads the same way (Node applies the file after
+exec, so the record lacks it), so such a server keeps Node's default — safe but lossy; put the cap in the file or the
+environment instead. macOS and Windows keep no exact record, so the rules above decide on their own; the one case they
+cannot see is an ES-module preload (`--import`, `--loader`) in `NODE_OPTIONS` that deletes its own entry: a `node`
+start (an npm install) is then relaunched once without that preload, and an explicit cap the preload also deleted
+becomes the default — the single executable runs no `--import` preload from `NODE_OPTIONS`, so the release binary
+cannot hit it. A process relaunches at most once (the relaunch marks its own pid), whatever a preload does to
+`NODE_OPTIONS`. `t3 __node-flags` prints what the current process runs with; `server.v8` logs the parsed sizes once
+the server listens — at Warn, with the reason, whenever the server wanted the cap and lost it to something changeable
+(`youngGenerationLost`: a preload, a failed relaunch, a changed `NODE_OPTIONS`) or to a service launcher that
+predates the default (`launcherPredatesDefault`: a remote update under a launcher that supplied no cap, until the
+service restarts), or when a packaged binary's built-in cap could not take what the environment asked
+(`capSettingIneffective`),
+and at Info when the start itself rules a relaunch out (`structuralKeep`: an IPC channel without a launcher, a bootstrap
+descriptor as the desktop app's backend uses, the inspector, no `execve`).
+
 ### Related Artifacts
 
 Provider event NDJSON files still exist for provider runtime streams. Those are separate from the main server trace file.

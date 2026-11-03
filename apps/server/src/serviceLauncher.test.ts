@@ -306,6 +306,59 @@ if (context.update?.status === "pending") {
     }),
   );
 
+  it.effect("starts every runtime with its Node options in the environment, never on the command line", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-launcher-env-options-" });
+      const statePath = path.join(root, "runtime", "service-state.json");
+      const observationsPath = path.join(root, "observations.jsonl");
+      vi.stubEnv("NODE_OPTIONS", "--max-old-space-size=4096");
+      vi.stubEnv("T3CODE_V8_MAX_SEMI_SPACE_MB", "");
+      const marker = process.env.T3CODE_INHERITED_NODE_OPTIONS;
+      delete process.env.T3CODE_INHERITED_NODE_OPTIONS;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          vi.unstubAllEnvs();
+          if (marker !== undefined) process.env.T3CODE_INHERITED_NODE_OPTIONS = marker;
+        }),
+      );
+      // Node validates NODE_OPTIONS itself (its allowlist, AT_SECURE); a command-line
+      // `--node-options=` would bypass that, so the launcher never emits one — not even for a
+      // runtime shipping a stale exec-argv.json that asks for it.
+      const childSource = `
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(observationsPath)}, JSON.stringify({
+  args: process.argv.slice(2),
+  nodeOptions: process.env.NODE_OPTIONS ?? null,
+  inheritedNodeOptions: process.env.T3CODE_INHERITED_NODE_OPTIONS ?? null,
+}) + "\\n");
+process.exit(1);
+`;
+      const versionDir = path.join(root, "runtime", "versions", "1.0.0");
+      yield* writeFakeRuntime(fs, path, versionDir, childSource);
+      yield* fs.writeFileString(
+        path.join(versionDir, "exec-argv.json"),
+        JSON.stringify({ execArgvExtension: "cli" }),
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, { protocol: SERVICE_LAUNCHER_PROTOCOL, activeVersion: "1.0.0" }),
+      );
+      const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      yield* Effect.promise(() =>
+        launcher.run().then(
+          () => Promise.reject(new Error("launcher unexpectedly completed")),
+          () => Promise.resolve(),
+        ),
+      );
+      const [first] = (yield* fs.readFileString(observationsPath)).trim().split("\n");
+      assert.deepEqual(JSON.parse(first!), {
+        args: ["serve"],
+        nodeOptions: "--max-old-space-size=4096 --max-semi-space-size=64",
+        inheritedNodeOptions: "--max-old-space-size=4096",
+      });
+    }),
+  );
   it.effect("rolls back invalid trials with the startup environment", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -318,7 +371,17 @@ if (context.update?.status === "pending") {
       yield* fs.writeFileString(envPath, "T3CODE_TEST_SERVICE_TOKEN=initial\n");
       vi.stubEnv("T3CODE_HOME", root);
       vi.stubEnv("T3CODE_TEST_SERVICE_TOKEN", "inherited");
-      yield* Effect.addFinalizer(() => Effect.sync(() => vi.unstubAllEnvs()));
+      // The launcher gives the server its young-generation cap on top of the inherited NODE_OPTIONS.
+      vi.stubEnv("NODE_OPTIONS", "--max-old-space-size=4096");
+      vi.stubEnv("T3CODE_V8_MAX_SEMI_SPACE_MB", "");
+      const marker = process.env.T3CODE_INHERITED_NODE_OPTIONS;
+      delete process.env.T3CODE_INHERITED_NODE_OPTIONS;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          vi.unstubAllEnvs();
+          if (marker !== undefined) process.env.T3CODE_INHERITED_NODE_OPTIONS = marker;
+        }),
+      );
       yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
       yield* fs.writeFileString(databasePath, "before trial");
       const encodedDatabasePath = JSON.stringify(databasePath);
@@ -328,6 +391,8 @@ const context = JSON.parse(process.env.T3_SERVICE_LAUNCHER_CONTEXT);
 appendFileSync(${JSON.stringify(observationsPath)}, JSON.stringify({
   token: process.env.T3CODE_TEST_SERVICE_TOKEN,
   update: context.update?.status ?? "active",
+  nodeOptions: process.env.NODE_OPTIONS ?? null,
+  inheritedNodeOptions: process.env.T3CODE_INHERITED_NODE_OPTIONS ?? null,
 }) + "\\n");
 if (context.update?.status === "pending") {
   process.send({ type: "prepared", updateId: "wrong-update" });
@@ -372,10 +437,14 @@ if (context.update?.status === "pending") {
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));
+      const serverEnv = {
+        nodeOptions: "--max-old-space-size=4096 --max-semi-space-size=64",
+        inheritedNodeOptions: "--max-old-space-size=4096",
+      };
       assert.deepEqual(observations, [
-        { token: "initial", update: "active" },
-        { token: "initial", update: "pending" },
-        { token: "initial", update: "rolled-back" },
+        { token: "initial", update: "active", ...serverEnv },
+        { token: "initial", update: "pending", ...serverEnv },
+        { token: "initial", update: "rolled-back", ...serverEnv },
       ]);
       assert.equal(process.env.T3CODE_TEST_SERVICE_TOKEN, "inherited");
       assert.equal(yield* fs.readFileString(envPath), "T3CODE_TEST_SERVICE_TOKEN=changed\n");

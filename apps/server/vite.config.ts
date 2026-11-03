@@ -3,6 +3,7 @@ import "vite-plus/test/config";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { defineConfig, mergeConfig } from "vite-plus";
+import { seaBuildOptions } from "@t3tools/shared/youngGenerationEnv";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
@@ -37,6 +38,8 @@ if (!TELEMETRY_CHANNELS.includes(telemetryChannel)) {
 // "1" builds dist-exe/t3 here; "bundle" stops at bin.mjs for scripts/cli.ts to inject (linux-arm64).
 const packMode = process.env.T3CODE_PACK_EXE;
 const packExecutable = packMode === "1" || packMode === "bundle";
+// Where the executable and its bundle go; a release check builds beside itself, not over dist-exe.
+const packExecutableOutDir = process.env.T3CODE_PACK_EXE_OUT_DIR?.trim() || "dist-exe";
 // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
 // No linux-arm64: --build-sea output cannot load on 16/64 KiB page kernels, so it builds natively.
 const SEA_TARGETS = {
@@ -58,6 +61,7 @@ if (packExecutableTarget && !Object.hasOwn(SEA_TARGETS, packExecutableTarget)) {
     `T3CODE_PACK_EXE_TARGET must be one of ${Object.keys(SEA_TARGETS).join(", ")}, got "${packExecutableTarget}".`,
   );
 }
+const packSeaOptions = seaBuildOptions();
 const packExecutableTargets = packExecutableTarget
   ? [
       {
@@ -90,7 +94,7 @@ export default mergeConfig(
     pack: {
       // SEA embeds one entry; expose the history worker as a hidden subcommand.
       entry: packExecutable ? ["src/bin.ts"] : ["src/bin.ts", "src/claude-history-worker.ts"],
-      outDir: packExecutable ? "dist-exe" : "dist",
+      outDir: packExecutable ? packExecutableOutDir : "dist",
       sourcemap: !packExecutable,
       clean: true,
       plugins: [
@@ -106,10 +110,15 @@ export default mergeConfig(
         ? {
             exe: {
               fileName: "t3",
-              outDir: "dist-exe",
+              outDir: packExecutableOutDir,
               ...(packExecutableTargets ? { targets: packExecutableTargets } : {}),
               // Node SEA useCodeCache breaks import(), which the server needs.
-              seaConfig: { useCodeCache: false },
+              seaConfig: {
+                useCodeCache: false,
+                // The young-generation default, baked in: no start of the executable relaunches.
+                execArgv: [...packSeaOptions.execArgv],
+                execArgvExtension: packSeaOptions.execArgvExtension,
+              },
             },
           }
         : {}),

@@ -133,6 +133,7 @@ import * as SourceControlRepositoryService from "./sourceControl/SourceControlRe
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as Observability from "./observability/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
+import { nodeRuntimeFlags } from "./youngGeneration.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
@@ -846,6 +847,17 @@ const layerMakeServer = Layer.unwrap(
         yield* HttpServer.HttpServer;
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
         yield* startup.markHttpListening;
+        const runtimeFlags = nodeRuntimeFlags();
+        // A server that wanted the young-generation cap and lost it to something changeable (a
+        // preload, an old launcher, a failed relaunch) says so where it is seen, as does a packaged
+        // executable whose built-in cap the environment tried to change; a start that rules a
+        // relaunch out by its shape (IPC, bootstrap descriptor, inspector) is not for the user to fix.
+        yield* (runtimeFlags.youngGenerationLost === true &&
+          runtimeFlags.structuralKeep !== true) ||
+        runtimeFlags.launcherPredatesDefault === true ||
+        runtimeFlags.capSettingIneffective === true
+          ? Effect.logWarning("server.v8", runtimeFlags)
+          : Effect.logInfo("server.v8", runtimeFlags);
       }),
     );
     const layerRuntimeState = Layer.effectDiscard(

@@ -238,6 +238,13 @@ describe("DesktopBackendConfiguration", () => {
           environment.backendEntryPath,
         ]);
         assert.equal(first.entryPath, environment.backendEntryPath);
+        // The backend never relaunches: the desktop hands it the young-generation cap, with the marker
+        // that gives the backend's children the NODE_OPTIONS the desktop itself had.
+        assert.equal(
+          first.env.NODE_OPTIONS,
+          `${process.env.NODE_OPTIONS === undefined ? "" : `${process.env.NODE_OPTIONS} `}--max-semi-space-size=64`,
+        );
+        assert.equal(first.env.T3CODE_INHERITED_NODE_OPTIONS, process.env.NODE_OPTIONS ?? "");
         assert.equal(first.cwd, environment.backendCwd);
         assert.equal(first.captureOutput, true);
         assert.equal(first.env.ELECTRON_RUN_AS_NODE, "1");
@@ -419,7 +426,26 @@ describe("DesktopBackendConfiguration", () => {
         Effect.gen(function* () {
           const path = yield* Path.Path;
           const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
-          const config = yield* configuration.resolveWsl({ port: 5000, distro: "Ubuntu" });
+          // The WSL backend gets nothing new from the young-generation default: whatever the
+          // desktop's NODE_OPTIONS, hatch or WSLENV say, its arguments are what they were (the Linux
+          // executable has the cap built in; its bootstrap descriptor rules a relaunch out).
+          const nodeOptions = process.env.NODE_OPTIONS;
+          const hatch = process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+          const wslEnv = process.env.WSLENV;
+          const restore = Effect.sync(() => {
+            if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
+            else process.env.NODE_OPTIONS = nodeOptions;
+            if (hatch === undefined) delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+            else process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = hatch;
+            if (wslEnv === undefined) delete process.env.WSLENV;
+            else process.env.WSLENV = wslEnv;
+          });
+          process.env.NODE_OPTIONS = "--max-semi-space-size=16";
+          process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "96";
+          process.env.WSLENV = "NODE_OPTIONS/u:T3CODE_V8_MAX_SEMI_SPACE_MB/u";
+          const config = yield* configuration
+            .resolveWsl({ port: 5000, distro: "Ubuntu" })
+            .pipe(Effect.ensuring(restore));
 
           assert.deepEqual(observedArchives, [
             {

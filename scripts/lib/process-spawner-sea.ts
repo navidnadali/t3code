@@ -65,6 +65,8 @@ export const buildProcessSpawnerSea = Effect.fn("ProcessSpawnerSea.build")(funct
       nodeVersion: input.nodeVersion,
       verbose: input.verbose,
       mainFormat: "commonjs",
+      // The server's NODE_OPTIONS, such as its heap ceiling, are not the spawner's; nothing is baked.
+      sea: { execArgvExtension: "none" },
     }).pipe(Effect.mapError((error) => new ProcessSpawnerSeaError({ message: error.message })));
   }
   const configPath = path.join(temp, "sea.json");

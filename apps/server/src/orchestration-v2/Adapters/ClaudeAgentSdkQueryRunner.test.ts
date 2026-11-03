@@ -27,6 +27,7 @@ import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
+import { HandoffProcess, type HandoffHost } from "../../process/handoffProcess.ts";
 import { spawnerProcessIds } from "../../process/spawnerProcesses.ts";
 import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import {
@@ -514,6 +515,75 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
           ),
         ),
       ),
+  );
+
+  // Linux: a handed-off CLI is known by its PID and /proc start time. Its exit can be learned late
+  // (its spawner died), when its PID may name another process: that one's group is not signalled.
+  it.live.each(
+    HostProcess.Platform.defaultValue() === "linux"
+      ? ([
+          { pid: "still names the CLI", reused: false },
+          { pid: "names another process", reused: true },
+        ] as const)
+      : [],
+  )("kills the group of an exited, handed-off CLI only while its PID $pid", ({ reused }) =>
+    Effect.gen(function* () {
+      // Leads its own group, as the CLI's group would, or as a process that took its PID might.
+      const leader = NodeChildProcess.spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+      yield* Effect.promise(() => new Promise((resolve) => leader.once("spawn", resolve)));
+      yield* Effect.addFinalizer(() => Effect.sync(() => leader.kill("SIGKILL")));
+      const pid = leader.pid!;
+      const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const startTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!;
+      const exitListeners = new Set<(code: number | null, signal: NodeJS.Signals | null) => void>();
+      // A spawner host that hands off nothing: it names the leader as the CLI it started.
+      const host: HandoffHost = {
+        spawnHandoff: (_command, _args, _options, _request, callbacks) => {
+          queueMicrotask(() => callbacks.onSpawn());
+          return {
+            id: 1,
+            pid,
+            startTime: reused ? `${startTime}0` : startTime,
+            sockets: new Map(),
+            exitSignal: Deferred.makeUnsafe(),
+            exitListeners,
+            orphaned: true,
+            referenced: true,
+          };
+        },
+        abandonHandoff: () => {},
+        killHandoff: (_child, _signal, callback) => callback({ _tag: "Sent", killed: false }),
+        setHandoffReferenced: () => {},
+      };
+      const child = spawnClaudeProcessGroup(
+        {
+          command: "claude",
+          args: [],
+          cwd: process.cwd(),
+          env: process.env,
+          // @effect-diagnostics-next-line abortControllerInEffect:off - The SDK's spawn options carry one; nothing aborts here.
+          signal: new AbortController().signal,
+        },
+        undefined,
+        WorkerChildProcessSpawner.ProviderProcessLauncher.of({
+          spawn: (command, args, options) =>
+            new HandoffProcess(host, NodeOS.tmpdir(), command, args, options, () => {}),
+          spawner: undefined as never,
+        }),
+      );
+      yield* Effect.promise(
+        () => new Promise((resolve) => (child as unknown as HandoffProcess).once("spawn", resolve)),
+      );
+      // Its exit as the server reports one it learned by watching: no status.
+      for (const listener of exitListeners) listener(null, null);
+      const killed = yield* Effect.callback<boolean>((resume) => {
+        if (leader.exitCode !== null || leader.signalCode !== null) {
+          return resume(Effect.succeed(true));
+        }
+        leader.once("exit", () => resume(Effect.succeed(true)));
+      }).pipe(Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.succeed(false) }));
+      assert.strictEqual(killed, !reused);
+    }).pipe(Effect.scoped),
   );
 
   // Linux: a provider handed off by the spawner process identifies by /proc start time.

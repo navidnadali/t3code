@@ -629,9 +629,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     repository: CheckpointRepository,
     revision: string,
   ) {
-    const oid = isObjectId(revision)
-      ? revision
-      : yield* refMemory.resolveRef(repository.commonDir, revision);
+    const oid = isObjectId(revision) ? revision : yield* refMemory.resolveRef(repository, revision);
     return typeof oid === "string" ? yield* refMemory.commitFacts(repository, oid) : null;
   });
 
@@ -849,7 +847,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
   const resolveCheckpointCommit = Effect.fnUntraced(function* (cwd: string, checkpointRef: string) {
     const repository = yield* checkpointRepository(cwd);
     if (repository !== null) {
-      const remembered = yield* refMemory.resolveRef(repository.commonDir, checkpointRef);
+      const remembered = yield* refMemory.resolveRef(repository, checkpointRef);
       if (remembered !== undefined) return remembered;
     }
     const result = yield* execute({
@@ -860,8 +858,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     });
     const commit = result.exitCode === 0 ? result.stdout.trim() : "";
     if (repository !== null) {
-      if (commit.length > 0) refMemory.rememberRef(repository.commonDir, checkpointRef, commit);
-      else refMemory.forgetRef(repository.commonDir, checkpointRef);
+      if (commit.length > 0) yield* refMemory.rememberRef(repository, checkpointRef, commit);
+      else yield* refMemory.forgetRef(repository, checkpointRef);
     }
     return commit.length > 0 ? commit : null;
   });
@@ -1416,7 +1414,11 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           args: [...durableWrite, "update-ref", input.checkpointRef, commitOid],
         });
         if (snapshot !== null && snapshot.commonDir !== null) {
-          refMemory.rememberRef(snapshot.commonDir, input.checkpointRef, commitOid);
+          yield* refMemory.rememberRef(
+            { commonDir: snapshot.commonDir, objectsDir: snapshot.objectsDir },
+            input.checkpointRef,
+            commitOid,
+          );
         }
       }).pipe(Effect.ensuring(cleanupTempIndex));
     }),
@@ -1660,9 +1662,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
               allowNonZeroExit: true,
             }).pipe(
               Effect.tap(() =>
-                Effect.sync(() => {
-                  if (repository !== null) refMemory.forgetRef(repository.commonDir, checkpointRef);
-                }),
+                repository === null ? Effect.void : refMemory.forgetRef(repository, checkpointRef),
               ),
             ),
           { discard: true },

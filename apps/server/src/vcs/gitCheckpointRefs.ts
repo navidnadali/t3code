@@ -22,15 +22,25 @@ export interface CheckpointRepository {
 }
 
 export interface CheckpointRefMemory {
-  /** A ref this process wrote or resolved, so a loose file still holding `oid` answers without Git. */
-  readonly rememberRef: (commonDir: string, ref: string, oid: string) => void;
-  readonly forgetRef: (commonDir: string, ref: string) => void;
+  /**
+   * A ref this process wrote or resolved, so a loose file still holding `oid` answers without Git.
+   * Remembered per object store (directory and alternates): the commit must stay findable.
+   */
+  readonly rememberRef: (
+    repository: CheckpointRepository,
+    ref: string,
+    oid: string,
+  ) => Effect.Effect<void>;
+  readonly forgetRef: (repository: CheckpointRepository, ref: string) => Effect.Effect<void>;
   /**
    * The commit a remembered ref names, or undefined when Git must answer: an unknown ref, another
    * value, a symbolic ref, an unreadable or oversized store, a reftable store, a ref found neither
    * loose nor packed (rev-parse then tries other names), or an environment that moves refs.
    */
-  readonly resolveRef: (commonDir: string, ref: string) => Effect.Effect<string | undefined>;
+  readonly resolveRef: (
+    repository: CheckpointRepository,
+    ref: string,
+  ) => Effect.Effect<string | undefined>;
   /**
    * Everything that decides whether Git reads commits as their objects say (shallow boundary,
    * grafts, replacements, the environment), as one string; null when it does not.
@@ -348,7 +358,16 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   // Parsed packed-refs per common directory (insertion order = age), bounded in files and entries.
   const packed = new Map<string, PackedRefs>();
   let packedEntries = 0;
-  const refKey = (commonDir: string, ref: string) => `${commonDir}\0${ref}`;
+  // The store a ref was resolved against: its objects directory, alternates file and the
+  // alternates named by the environment; a different store may lack the commit.
+  const refKey = (repository: CheckpointRepository, ref: string) =>
+    Effect.promise(async () => {
+      const alternates = await statFingerprint(
+        NodePath.join(repository.objectsDir, "info", "alternates"),
+      );
+      const environment = process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? "";
+      return `${repository.commonDir}\0${repository.objectsDir}\0${alternates}\0${environment}\0${ref}`;
+    });
 
   const packedRefs = Effect.fnUntraced(function* (commonDir: string) {
     const current = yield* readPackedRefs(commonDir, packed.get(commonDir));
@@ -375,11 +394,11 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   // Git's files backend: the loose file wins, then packed-refs. A reftable store (which only the
   // repository's own config declares, so the snapshot may still say files) keeps neither, and a
   // name absent from both is one rev-parse would try under refs/heads and the like, so Git answers.
-  const resolveRef = Effect.fnUntraced(function* (commonDir: string, ref: string) {
-    const known = refs.get(refKey(commonDir, ref));
-    if (known === undefined || !CHECKPOINT_REF_NAME.test(ref) || !environmentPlain()) {
-      return undefined;
-    }
+  const resolveRef = Effect.fnUntraced(function* (repository: CheckpointRepository, ref: string) {
+    const { commonDir } = repository;
+    if (!CHECKPOINT_REF_NAME.test(ref) || !environmentPlain()) return undefined;
+    const known = refs.get(yield* refKey(repository, ref));
+    if (known === undefined) return undefined;
     const reftable = yield* Effect.promise(() =>
       statFingerprint(NodePath.join(commonDir, "reftable")),
     );
@@ -424,8 +443,9 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   });
 
   return {
-    rememberRef: (commonDir, ref, oid) => refs.set(refKey(commonDir, ref), oid),
-    forgetRef: (commonDir, ref) => refs.delete(refKey(commonDir, ref)),
+    rememberRef: (repository, ref, oid) =>
+      Effect.map(refKey(repository, ref), (key) => refs.set(key, oid)),
+    forgetRef: (repository, ref) => Effect.map(refKey(repository, ref), (key) => refs.delete(key)),
     resolveRef,
     historyState,
     rememberCommits,

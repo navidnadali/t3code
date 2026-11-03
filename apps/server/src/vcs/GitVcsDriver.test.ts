@@ -2131,13 +2131,14 @@ it.effect("packed-refs memory stays accounted under concurrent reloads", () =>
     yield* git(["commit", "-q", "--allow-empty", "-m", "root"]);
     const head = yield* git(["rev-parse", "HEAD"]);
     const commonDir = path.join(cwd, ".git");
+    const repository = { commonDir, objectsDir: path.join(commonDir, "objects") };
     const memory = makeCheckpointRefMemory();
     const refs = Array.from({ length: 24 }, (_, index) => `refs/t3/memory/${index}`);
     for (const ref of refs) {
       yield* git(["update-ref", ref, head]);
-      memory.rememberRef(commonDir, ref, head);
+      yield* memory.rememberRef(repository, ref, head);
     }
-    const resolveAll = Effect.forEach(refs, (ref) => memory.resolveRef(commonDir, ref), {
+    const resolveAll = Effect.forEach(refs, (ref) => memory.resolveRef(repository, ref), {
       concurrency: "unbounded",
     });
     const packedCount = Effect.map(
@@ -2409,10 +2410,11 @@ it.effect("an oversized packed-refs is left to git", () =>
     yield* git(["commit", "-q", "--allow-empty", "-m", "root"]);
     const head = yield* git(["rev-parse", "HEAD"]);
     const commonDir = path.join(cwd, ".git");
+    const repository = { commonDir, objectsDir: path.join(commonDir, "objects") };
     const memory = makeCheckpointRefMemory();
     const ref = "refs/t3/oversized/checkpoint";
     yield* git(["update-ref", ref, head]);
-    memory.rememberRef(commonDir, ref, head);
+    yield* memory.rememberRef(repository, ref, head);
     // Enough refs (long names, few processes) that parsing the file would cost more than asking git.
     const segment = Array.from({ length: 4 }, () => "x".repeat(200)).join("/");
     const filler = Array.from(
@@ -2425,10 +2427,8 @@ it.effect("an oversized packed-refs is left to git", () =>
     const size = (yield* fileSystem.stat(path.join(commonDir, "packed-refs"))).size;
     assert.isAbove(Number(size), 8 * 1024 * 1024);
 
-    assert.isUndefined(yield* memory.resolveRef(commonDir, ref));
-    assert.isNull(
-      yield* memory.commitFacts({ commonDir, objectsDir: path.join(commonDir, "objects") }, head),
-    );
+    assert.isUndefined(yield* memory.resolveRef(repository, ref));
+    assert.isNull(yield* memory.commitFacts(repository, head));
     assert.strictEqual(memory.packedRefsEntries(), 0);
   }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

@@ -91,6 +91,7 @@ import * as DesktopBrowserChannel from "./preview/DesktopBrowserChannel.ts";
 import * as ServerBrowserStream from "./preview/ServerBrowserStream.ts";
 import * as PreviewBrowser from "./preview/PreviewBrowser.ts";
 import * as ProcessRunner from "./processRunner.ts";
+import * as WorkerChildProcessSpawner from "./process/workerChildProcessSpawner.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -1203,6 +1204,6 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerPlatformServices),
     );
   }),
-).pipe(Layer.provide(ProcessRunner.layer));
+).pipe(Layer.provide(WorkerChildProcessSpawner.layerProcessRunner));
 
 export const runServer = Layer.launch(layerMakeServer);

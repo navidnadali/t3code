@@ -32,6 +32,7 @@ import type * as NodeNet from "node:net";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 
+import * as ProcessRunner from "../processRunner.ts";
 import { answerDeadlines, type SpawnerTimers } from "./spawnerDeadlines.ts";
 import {
   PROCESS_SPAWNER_EXECUTABLE,
@@ -1373,3 +1374,9 @@ export const layerFromConfig = Layer.effect(
     return yield* make(fallback);
   }),
 );
+
+/**
+ * The server's ProcessRunner. Layers are memoized by reference, so every `ProcessRunner.layer`
+ * inside a layer this is provided to is this same runner.
+ */
+export const layerProcessRunner = ProcessRunner.layer;

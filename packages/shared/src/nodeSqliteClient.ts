@@ -747,8 +747,10 @@ const makeReader = Effect.fnUntraced(function* (
             return Effect.succeed([]);
           }
           return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
-            // The fiber can yield before this runs: the worker may have stopped (nothing is
+            // The fiber can yield before this runs: a reply landing in that gap may have restored
+            // the flag (cleared again here, with the post), the worker may have stopped (nothing is
             // left to end) or the outstanding replies may all have arrived (nothing to wait for).
+            inTransaction = false;
             if (stoppedMessage !== undefined || pending.size === 0) {
               if (stoppedMessage === undefined && post({ id, safeIntegers: false, ...input }))
                 latestId = id;
@@ -757,8 +759,6 @@ const makeReader = Effect.fnUntraced(function* (
             }
             pending.set(id, () => resume(Effect.succeed([])));
             if (pending.size === 1) worker.ref();
-            // A reply landing in the gap may have restored the flag: cleared again with the post.
-            inTransaction = false;
             if (post({ id, safeIntegers: false, ...input })) latestId = id;
             else {
               pending.delete(id);

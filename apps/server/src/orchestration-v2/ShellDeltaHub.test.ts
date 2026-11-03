@@ -516,15 +516,16 @@ it.effect(
  * A scheduler like `base` whose fibers, after `park()`, stop at their next op and stay stopped,
  * with everything they schedule, until `release()`.
  */
-const parkingScheduler = (base: Scheduler.Scheduler) => {
+const parkingScheduler = (base: Scheduler.Scheduler, at = 1) => {
   const dispatcher = base.makeDispatcher();
   let parking = false;
   let parked = false;
+  let ops = 0;
   const held: Array<() => void> = [];
   const scheduler: Scheduler.Scheduler = {
     executionMode: base.executionMode,
     shouldYield: () => {
-      if (!parking) return false;
+      if (!parking || ++ops !== at) return false;
       parking = false;
       parked = true;
       return true;
@@ -714,6 +715,68 @@ it.effect(
         ),
       );
     }).pipe(Effect.scoped),
+);
+
+it.effect("a subscriber taken while a batch is published shares that batch's base", () =>
+  Effect.gen(function* () {
+    const base = yield* Scheduler.Scheduler;
+    // The subscription is parked at its n-th op, for every n across the setup, while two batches
+    // are published and the active subscriber resyncs from them; the new one must share that base
+    // if it received the batches, and read nothing otherwise.
+    for (let at = 1; at <= 60; at++) {
+      const reads: Array<number> = [];
+      let baseReads = 0;
+      const parking = parkingScheduler(base, at);
+      yield* Effect.gen(function* () {
+        const hub = yield* ShellDeltaHub.ShellDeltaHub;
+        const scope = yield* Scope.make();
+        const active = yield* hub.subscribe({ maxItems: 1 }).pipe(Scope.provide(scope));
+        const pull = yield* Stream.toPull(active.stream(0)).pipe(Scope.provide(scope));
+        const first = yield* Effect.forkScoped(pull);
+        yield* publish(threadId, 1);
+        assert.deepEqual(sequences(yield* Fiber.join(first)), [1]);
+        parking.park();
+        const taking = yield* hub
+          .subscribe({ maxItems: 1 })
+          .pipe(
+            Effect.provideService(Scheduler.Scheduler, parking.scheduler),
+            Scope.provide(scope),
+            Effect.forkScoped,
+          );
+        yield* Effect.yieldNow;
+        yield* publish(ThreadId.make("thread:b"), 2);
+        yield* publish(ThreadId.make("thread:c"), 3);
+        assert.deepEqual(
+          (yield* pull).map((item) => item.kind),
+          ["resync"],
+        );
+        parking.release();
+        const late = yield* Fiber.join(taking);
+        const pullLate = yield* Stream.toPull(late.stream(0)).pipe(Scope.provide(scope));
+        const next = yield* Effect.forkScoped(pullLate);
+        yield* TestClock.adjust(0);
+        yield* publish(ThreadId.make("thread:d"), 4);
+        const kinds = (yield* Fiber.join(next)).map((item) => item.kind);
+        assert.isTrue(
+          kinds[0] === "resync" || kinds[0] === "thread.updated",
+          `taken at op ${at}: ${kinds.join(",")}`,
+        );
+        assert.equal(baseReads, 1, `taken at op ${at}`);
+        yield* Scope.close(scope, Exit.void);
+      }).pipe(
+        Effect.provide(
+          layerHub({
+            reads,
+            baseThreads: () => {
+              baseReads += 1;
+              return [];
+            },
+          }),
+        ),
+        Effect.scoped,
+      );
+    }
+  }).pipe(Effect.scoped),
 );
 
 it.effect("a reset the opening snapshot covers needs no resync", () =>

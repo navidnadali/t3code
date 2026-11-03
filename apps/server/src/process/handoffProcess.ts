@@ -213,8 +213,11 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
   #fail(error: Error) {
     this.emit("error", error);
     if (this.pid === undefined && !this.#exited) {
-      // As Node's: a process that never started closes with no exit.
+      // As Node's: a process that never started closes with no exit, its exit code the negative
+      // errno of why it could not start (-2 for ENOENT, -13 for EACCES).
       this.#exited = true;
+      const errno = (error as NodeJS.ErrnoException).errno;
+      if (typeof errno === "number" && errno < 0) this.exitCode = errno;
       for (const stream of this.stdio) stream?.destroy();
       this.#openOutputs = 0;
       this.#maybeClose();

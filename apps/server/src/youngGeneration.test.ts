@@ -422,12 +422,13 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
   const run = Effect.fn("youngGeneration.test.run")(function* (
     env: Record<string, string | undefined>,
     args: ReadonlyArray<string> = [],
+    nodeArgs: ReadonlyArray<string> = [],
   ) {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const child = yield* spawner.spawn(
       ChildProcess.make(
         process.execPath,
-        ["--experimental-strip-types", binPath, "__node-flags", ...args],
+        ["--experimental-strip-types", ...nodeArgs, binPath, "__node-flags", ...args],
         { env: { ...cleanEnv, ...env } },
       ),
     );
@@ -505,11 +506,58 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
           );
           return NodeFS.readFileSync(countFile, "utf8").split("\n").filter(Boolean).length;
         };
+        // A preload on the command line or in NODE_OPTIONS is visible: NODE_OPTIONS as seen now may
+        // not be what Node started with, so the process keeps Node's default — one image, no relaunch.
         const strip = preload("delete process.env.NODE_OPTIONS;");
-        expect(images(strip, {}, ["--require", strip])).toBe(2);
+        expect(images(strip, {}, ["--require", strip])).toBe(1);
         const rewrite = preload('process.env.NODE_OPTIONS = "--require " + __filename;');
-        expect(images(rewrite, { NODE_OPTIONS: `--require ${rewrite}` }, [])).toBe(2);
+        expect(images(rewrite, { NODE_OPTIONS: `--require ${rewrite}` }, [])).toBe(1);
+        // A NODE_OPTIONS preload that deletes NODE_OPTIONS hides itself: the first image relaunches
+        // and the pid-bound guard stops the second — two images at most, never a loop.
+        const hidden = preload("delete process.env.NODE_OPTIONS;");
+        expect(images(hidden, { NODE_OPTIONS: `--require ${hidden}` }, [])).toBe(2);
+        // An explicit cap beside a preload that clears NODE_OPTIONS must not be relaunched over with 64.
+        const clearing = preload("delete process.env.NODE_OPTIONS;");
+        expect(
+          images(clearing, { NODE_OPTIONS: "--max-semi-space-size=16" }, ["--require", clearing]),
+        ).toBe(1);
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "gives children the launcher's NODE_OPTIONS without the cap even when a preload appended to it",
+    () =>
+      Effect.gen(function* () {
+        // A launcher-started server: the marker is the user's NODE_OPTIONS (preload included) and
+        // NODE_OPTIONS is that plus the cap; the preload appends an option at runtime.
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "young-generation-append-" });
+        const append = NodePath.join(dir, "append.cjs");
+        NodeFS.writeFileSync(
+          append,
+          'process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS ?? "") + " --trace-warnings";\n',
+        );
+        const marker = `--no-warnings --require ${append}`;
+        const report = yield* run({
+          NODE_OPTIONS: `${marker} ${flag}`,
+          [INHERITED_NODE_OPTIONS_ENV]: marker,
+        });
+        expect(report.applied).toBe(true);
+        expect(report.maxSemiSpaceMb).toBe(DEFAULT_MAX_SEMI_SPACE_MB);
+        expect(report.nodeOptionsForChildren).toBe(`${marker} --trace-warnings`);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("keeps Node's default and says so when started with a preload", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "young-generation-preload-" });
+      const quiet = NodePath.join(dir, "quiet.mjs");
+      NodeFS.writeFileSync(quiet, "export {};\n");
+      const report = yield* run({}, [], ["--import", quiet]);
+      expect(report.applied).toBe(false);
+      expect(report.keptReason).toContain("preload");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.live("keeps the user's NODE_OPTIONS beside the flag and gives children the original", () =>

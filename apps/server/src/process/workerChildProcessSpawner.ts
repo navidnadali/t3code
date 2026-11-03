@@ -570,8 +570,16 @@ const makeRemoteHost = (options: {
     forgetHandoff(entry);
   };
 
+  // A start the server stopped waiting for: its group, unless its PID names another process now.
+  // Without its identity nothing is signalled.
   const killHandoffGroup = (child: HandoffChild) => {
-    if (child.pid === undefined) return;
+    if (
+      child.pid === undefined ||
+      child.startTime === undefined ||
+      isPidReused(child.pid, child.startTime)
+    ) {
+      return;
+    }
     try {
       signalProcessGroup(child.pid, "SIGKILL");
     } catch {
@@ -652,6 +660,7 @@ const makeRemoteHost = (options: {
         return;
       case "started":
         child.pid ??= message.pid;
+        child.startTime ??= message.startTime;
         if (entry.abandoned) killHandoffGroup(child);
         return;
       case "spawn":
@@ -1233,8 +1242,13 @@ const openSpawnerProcess =
         exitReason = line.slice("exit ".length);
         return;
       }
-      const [id, pid] = line.split(" ").map(Number);
-      events.onMessage({ t: "started", id, pid });
+      const [id, pid, startTime] = line.split(" ");
+      events.onMessage({
+        t: "started",
+        id: Number(id),
+        pid: Number(pid),
+        ...(startTime === undefined ? {} : { startTime }),
+      });
     };
     starts.on("data", (chunk: string) => {
       const lines = (partial + chunk).split("\n");

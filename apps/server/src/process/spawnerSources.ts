@@ -233,7 +233,7 @@ const startHandoff = (message) => {
     children.set(id, { child, detached: message.options.detached === true, handoff: true });
     // Read before this process can reap the child, so the PID still names it.
     const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);
-    if (child.pid !== undefined) started(id, child.pid);
+    if (child.pid !== undefined) started(id, child.pid, startTime);
     child.on("spawn", () => post({ t: "spawn", id, pid: child.pid, startTime }));
     child.on("error", (error) => post({ t: "error", id, error: errorFields(error) }));
     child.on("exit", (code, signal) => post({ t: "exit", id, code, signal }));
@@ -252,10 +252,11 @@ const windowBytes = Number(process.argv[process.argv.length - 1]);
 const post = (message) => {
   if (process.connected) process.send(message, () => {});
 };
-// Written at once, before any reply, so the server can kill this child even if the spawner dies.
-const started = (id, pid) => {
+// Written at once, before any reply, so the server can kill this child even if the spawner dies;
+// a handed-off child's start time comes with it, its identity once its PID can name another.
+const started = (id, pid, startTime) => {
   try {
-    require("node:fs").writeSync(1, id + " " + pid + "\\n");
+    require("node:fs").writeSync(1, id + " " + pid + (startTime === undefined ? "" : " " + startTime) + "\\n");
   } catch {}
 };
 ${spawnProtocolSource}

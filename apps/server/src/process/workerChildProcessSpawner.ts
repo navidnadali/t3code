@@ -303,7 +303,11 @@ interface Transport {
   readonly post: (message: unknown, transfer?: ReadonlyArray<ArrayBuffer>) => void;
   readonly ref: () => void;
   readonly unref: () => void;
-  readonly terminate: () => Promise<void>;
+  /**
+   * Ends it. `keepHandedOff`: a stop for a fault, not the server's shutdown, so the commands it
+   * handed off (whose stdio the server holds, and which it adopts) keep running.
+   */
+  readonly terminate: (keepHandedOff?: boolean) => Promise<void>;
 }
 
 interface TransportEvents {
@@ -515,7 +519,7 @@ export const makeRemoteHost = (options: {
     }
     adoptOrphans(running);
     if (stopped !== undefined) {
-      void stopped.terminate();
+      void stopped.terminate(!closing);
       stopped.unref();
     }
   };
@@ -1384,7 +1388,7 @@ const openSpawnerProcess =
         spawner.channel?.unref();
         starts.unref();
       },
-      terminate: () =>
+      terminate: (keepHandedOff = false) =>
         (terminated ??= new Promise<void>((resolve) => {
           if (hasExited()) return resolve();
           const timer = setTimeout(() => spawner.kill("SIGKILL"), spawnerCloseGraceMillis);
@@ -1393,7 +1397,11 @@ const openSpawnerProcess =
             resolve();
           });
           closing = true;
-          if (spawner.connected) spawner.disconnect();
+          // Its channel closing means the server's exit, on which it kills everything it started;
+          // SIGTERM spares what it handed off. A spawner too wedged to act on it is SIGKILLed after
+          // the grace, which kills nothing in other groups (handed-off commands lead their own).
+          if (keepHandedOff) spawner.kill("SIGTERM");
+          else if (spawner.connected) spawner.disconnect();
           else spawner.kill("SIGKILL");
         })),
     };

@@ -271,8 +271,9 @@ one began), the server stops it and they start on Node's spawner, with a warning
 without `t3-process-spawner` beside it hands off nothing, since its shim would load the whole server
 bundle.
 
-If the spawner process dies, the providers it handed off keep running in their own process groups,
-their stdio still held by the server. The server then checks each one's process identity (PID and
+If the spawner process dies, or the server stops it for a fault (a start it did not answer, a queue that
+did not move: the server sends it SIGTERM, not the channel's close that means the server's exit), the
+providers it handed off keep running in their own process groups, their stdio still held by the server. The server then checks each one's process identity (PID and
 start time) every second and reports its exit once it ends, as "exit status unknown"; a kill checks
 that identity first, so a reused PID is never signalled. Until it ends, the port tools still treat
 such a provider as the server's own child and do not stop its group. Resource telemetry, which

@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Runs first thing in bin.ts, before the CLI's Effect runtime loads.
 import * as NodeFS from "node:fs";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeModule from "node:module";
 import * as NodeSea from "node:sea";
 import * as NodeV8 from "node:v8";
@@ -152,6 +153,53 @@ export const nodeOptionsWithMaxSemiSpace = (
   return current === "" ? `${FLAG}=${mb}` : `${current} ${FLAG}=${mb}`;
 };
 
+/**
+ * NODE_OPTIONS as a `ps -E -o command=` line reports it: the command line, then `NAME=value`
+ * entries separated by spaces; a value runs until the next `NAME=` token. Undefined when absent.
+ */
+export const nodeOptionsFromProcessListing = (line: string): string | undefined => {
+  const tokens = line.trim().split(" ");
+  const start = tokens.findIndex((token) => token.startsWith("NODE_OPTIONS="));
+  if (start === -1) return undefined;
+  const value = [tokens[start]!.slice("NODE_OPTIONS=".length)];
+  for (const token of tokens.slice(start + 1)) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) break;
+    value.push(token);
+  }
+  return value.join(" ").trim();
+};
+
+type StartupNodeOptions =
+  | { readonly known: true; readonly value: string | undefined }
+  | { readonly known: false };
+
+/**
+ * NODE_OPTIONS as Node started with, from the operating system's record of this process — a preload
+ * may have changed `process.env` since. Linux keeps it in /proc; macOS answers through `ps -E`.
+ */
+const startupNodeOptions = (platform: string, pid: number): StartupNodeOptions => {
+  try {
+    if (platform === "linux") {
+      const entry = NodeFS.readFileSync("/proc/self/environ", "latin1")
+        .split("\0")
+        .find((candidate) => candidate.startsWith("NODE_OPTIONS="));
+      return { known: true, value: entry?.slice("NODE_OPTIONS=".length) };
+    }
+    if (platform === "darwin") {
+      const listing = NodeChildProcess.spawnSync(
+        "/bin/ps",
+        ["-E", "-ww", "-o", "command=", "-p", String(pid)],
+        { encoding: "utf8", timeout: 2000 },
+      );
+      if (listing.status !== 0) return { known: false };
+      return { known: true, value: nodeOptionsFromProcessListing(listing.stdout) };
+    }
+  } catch {
+    return { known: false };
+  }
+  return { known: false };
+};
+
 const PRELOAD_FLAGS = new Set(["--require", "-r", "--import", "--loader", "--experimental-loader"]);
 /** Whether a preload is visible on the command line or in NODE_OPTIONS as it reads now. */
 const preloadVisible = (env: Environment, execArgv: ReadonlyArray<string>): boolean =>
@@ -172,13 +220,14 @@ const preloadRan = (): boolean => {
   }
 };
 
-/** `value` with the cap this process was given removed, when `value` starts with `prefix` + the cap. */
-const withoutAppendedCap = (value: string, prefix: string, mb: number): string | undefined => {
-  const written = nodeOptionsWithMaxSemiSpace(prefix, mb);
-  if (value === written) return prefix;
-  if (!value.startsWith(`${written} `)) return undefined;
-  const rest = value.slice(written.length + 1);
-  return prefix === "" ? rest : `${prefix} ${rest}`;
+/** `value` without the `--max-semi-space-size=<mb>` token (the last one), a preload's own additions kept. */
+const withoutCapToken = (value: string | undefined, mb: number): string | undefined => {
+  if (value === undefined) return undefined;
+  const tokens = [...tokenizeNodeOptions(value)];
+  const index = tokens.lastIndexOf(`${FLAG}=${mb}`);
+  if (index !== -1) tokens.splice(index, 1);
+  const rest = tokens.join(" ");
+  return rest === "" ? undefined : rest;
 };
 
 const withFlag = (env: Environment, mb: number): Environment => ({
@@ -381,33 +430,40 @@ const inspectorActive = (): boolean => {
 };
 
 const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
-  const nodeOptionsAtStart = process.env.NODE_OPTIONS;
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Runs before the Effect runtime exists.
+  const platform = process.platform;
+  // What Node started with, not what a preload left behind: an explicit cap or a preload in the
+  // startup NODE_OPTIONS decides, a marker is checked against it, and a relaunch carries it on.
+  const startup = startupNodeOptions(platform, process.pid);
+  const nodeOptionsAtStart = startup.known ? startup.value : process.env.NODE_OPTIONS;
   const inherited = process.env[INHERITED_NODE_OPTIONS_ENV];
   const relaunchedPid = process.env[RELAUNCHED_PID_ENV];
   delete process.env[RELAUNCHED_PID_ENV];
   if (inherited !== undefined) {
     delete process.env[INHERITED_NODE_OPTIONS_ENV];
     const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, process.execArgv).mb;
-    // Children get what the server was given minus the cap added for it — a preload's own additions
-    // stay — and only when the marker matches what the relaunch or the launcher wrote; a stray or
-    // forged marker is ignored.
-    const forChildren =
-      mb === null || nodeOptionsAtStart === undefined
-        ? undefined
-        : withoutAppendedCap(nodeOptionsAtStart, inherited, mb);
-    if (forChildren !== undefined) {
-      if (forChildren === "") delete process.env.NODE_OPTIONS;
+    // Honour the marker only when the process started with exactly the marker plus the cap — what
+    // the relaunch or the launcher wrote; a stray or forged marker is ignored. Children then get
+    // NODE_OPTIONS as it reads now minus that cap, so a preload's own additions stay.
+    if (mb !== null && nodeOptionsAtStart === nodeOptionsWithMaxSemiSpace(inherited, mb)) {
+      const forChildren = withoutCapToken(process.env.NODE_OPTIONS, mb);
+      if (forChildren === undefined) delete process.env.NODE_OPTIONS;
       else process.env.NODE_OPTIONS = forChildren;
       return { applied: true, nodeOptionsAtStart };
     }
   }
+  if (!startup.known) {
+    return { applied: false, nodeOptionsAtStart, keptReason: "startup options unavailable" };
+  }
+  const { NODE_OPTIONS: _current, ...rest } = process.env;
+  const startupEnv: Environment =
+    startup.value === undefined ? rest : { ...rest, NODE_OPTIONS: startup.value };
   const plan = planYoungGenerationRelaunch({
     argv: process.argv,
     execArgv: process.execArgv,
-    env: process.env,
+    env: startupEnv,
     execPath: process.execPath,
-    // oxlint-disable-next-line t3code/no-global-process-runtime -- Runs before the Effect runtime exists.
-    platform: process.platform,
+    platform,
     hasIpcChannel: process.channel !== undefined,
     isSea: NodeSea.isSea(),
     canExecve: typeof process.execve === "function",

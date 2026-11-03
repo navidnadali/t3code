@@ -10,6 +10,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
+import { readBoundedFileAsync } from "./gitCheckpointRefs.ts";
 import type * as GitVcsDriver from "./GitVcsDriver.ts";
 
 export interface GitConfigEntry {
@@ -267,6 +268,24 @@ export interface GitConfigSnapshot {
   readonly commonDir: string | null;
   // Results of commands that read only config and refs, see runWithRefs.
   readonly refResults: Map<string, CachedGitRefResult>;
+  // Results that depend only on config and on named files, see runWithFiles.
+  readonly fileResults: Map<string, CachedFileResult>;
+  // What `git rev-parse --show-toplevel` prints, and the directory's path below it.
+  readonly toplevel: string;
+  readonly prefixSegments: ReadonlyArray<string>;
+  // Absolute: the git directory, the common directory, the index, the object store, HEAD and info/exclude.
+  readonly gitDir: string;
+  readonly gitCommonDir: string;
+  readonly absoluteIndexPath: string;
+  readonly objectsDir: string;
+  readonly headPath: string;
+  readonly infoExcludePath: string;
+}
+
+interface CachedFileResult {
+  readonly dependencies: ReadonlyArray<GitConfigDependency>;
+  readonly fingerprint: string;
+  readonly value: unknown;
 }
 
 interface CachedGitRefResult {
@@ -295,7 +314,8 @@ const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
 const CONFIG_SNAPSHOT_LOAD_ATTEMPTS = 3;
 const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
 const REF_RESULTS_CAPACITY = 256;
-const REPOSITORY_PATH_COUNT = 10;
+const REPOSITORY_PATH_COUNT = 12;
+const FILE_RESULTS_CAPACITY = 64;
 const REUSED_RESULTS_CAPACITY = 64;
 // Ref names whose loose file Git's files backend keeps at <common dir>/<name>: refs shared by every
 // worktree, under refs/ or (like `<remote>/<branch>` when Git resolves a short name) outside it.
@@ -321,8 +341,10 @@ const readsSymbolicRef = (file: string) =>
       NodeFS.lstat(file, (statError, stats) => {
         if (statError) return resolve(false);
         if (stats.isSymbolicLink()) return resolve(true);
-        NodeFS.readFile(file, (error, data) =>
-          resolve(error === null && data.subarray(0, 4).toString("latin1") === "ref:"),
+        // A file the bounded read cannot classify (too large, not regular) counts as symbolic:
+        // Git may still follow it, so its result is not reused.
+        void readBoundedFileAsync(file, 4096).then((read) =>
+          resolve(read.kind !== "bytes" || read.bytes.subarray(0, 4).toString("latin1") === "ref:"),
         );
       });
     } catch {
@@ -354,6 +376,11 @@ const REPOSITORY_PATH_ARGS = [
   "objects",
   "--git-path",
   "refs",
+  // The real common directory: a --git-path answer resolves symbolic links, so a symlinked
+  // refs directory would otherwise name its target's parent.
+  "--git-common-dir",
+  "--git-path",
+  "index",
   "--show-prefix",
 ] as const;
 
@@ -438,8 +465,33 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     ) {
       return null;
     }
-    const [toplevel, , config, configWorktree, commondir, remotes, branches, head, objects, refs] =
-      paths as [string, string, string, string, string, string, string, string, string, string];
+    const [
+      toplevel,
+      gitDir,
+      config,
+      configWorktree,
+      commondir,
+      remotes,
+      branches,
+      head,
+      objects,
+      refs,
+      gitCommonDir,
+      absoluteIndexPath,
+    ] = paths as [
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+    ];
     const segments = prefix.split("/").filter((segment) => segment.length > 0);
     const [locations, listResult, remoteFiles, branchFiles, insideTopLevel] = yield* Effect.all(
       [
@@ -478,7 +530,11 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     dependencies.push(
       { path: path.join(toplevel, ".git"), kind: "identity" },
       { path: head, kind: "content" },
+      // With core.preferSymlinkRefs HEAD is a link whose target names the branch.
+      { path: path.join(gitDir, "HEAD"), kind: "entry" },
       { path: objects, kind: "presence" },
+      // Git prints the objects path with a link resolved; the link itself can be retargeted.
+      { path: path.join(gitCommonDir, "objects"), kind: "physical" },
       { path: path.join(objects, "info", "alternates"), kind: "content" },
       { path: refs, kind: "presence" },
     );
@@ -523,8 +579,18 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       values: snapshotSupported ? values : null,
       valueLists,
       indexPath,
-      // Refs live in the common directory, the one `--git-path refs` names.
-      commonDir: refStorage === undefined || refStorage === "files" ? path.dirname(refs) : null,
+      // Refs live in the common directory.
+      commonDir: refStorage === undefined || refStorage === "files" ? gitCommonDir : null,
+      toplevel,
+      prefixSegments: segments,
+      gitDir,
+      gitCommonDir,
+      absoluteIndexPath,
+      objectsDir: objects,
+      headPath: head,
+      // Not --git-path info/exclude, which git prints with a symbolic link resolved: the link itself
+      // must be the dependency, so retargeting it is seen.
+      infoExcludePath: path.join(gitCommonDir, "info", "exclude"),
     };
   });
 
@@ -571,6 +637,15 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
                     indexPath: state.indexPath,
                     commonDir: state.commonDir,
                     refResults: new Map(),
+                    fileResults: new Map(),
+                    toplevel: state.toplevel,
+                    prefixSegments: state.prefixSegments,
+                    gitDir: state.gitDir,
+                    gitCommonDir: state.gitCommonDir,
+                    absoluteIndexPath: state.absoluteIndexPath,
+                    objectsDir: state.objectsDir,
+                    headPath: state.headPath,
+                    infoExcludePath: state.infoExcludePath,
                   },
           } satisfies CachedGitConfigSnapshot;
         }
@@ -646,11 +721,11 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
    * result) or from its result; null means the result cannot be reused. Untraced like read: it runs
    * for every ref probe, and the Git command it may run keeps its own span.
    */
-  const runWithRefs = Effect.fnUntraced(function* (
+  const runWithRefs = Effect.fnUntraced(function* <E>(
     snapshot: GitConfigSnapshot | null,
     args: ReadonlyArray<string>,
     refs: (result?: GitVcsDriver.ExecuteGitResult) => ReadonlyArray<string> | null,
-    run: Effect.Effect<GitVcsDriver.ExecuteGitResult, GitCommandError>,
+    run: Effect.Effect<GitVcsDriver.ExecuteGitResult, E>,
   ) {
     const commonDir = snapshot?.commonDir ?? null;
     if (snapshot === null || commonDir === null) return yield* run;
@@ -695,7 +770,40 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     return result;
   });
 
-  return { read, peek, runWithRefs };
+  /**
+   * Runs an effect whose result depends only on the snapshot and on the content of `files`, once
+   * per state of those files. Every file is stat'ed before the run, so a write during the run
+   * leaves the result stale for one read rather than wrong. Failures are not kept.
+   */
+  const runWithFiles = Effect.fnUntraced(function* <A, E, R>(
+    snapshot: GitConfigSnapshot,
+    key: string,
+    files: ReadonlyArray<string>,
+    run: Effect.Effect<A, E, R>,
+  ) {
+    const dependencies = files.map((file): GitConfigDependency => ({
+      path: file,
+      kind: "content",
+    }));
+    const fingerprint = (yield* fingerprintDependencies(dependencies)).join("\n");
+    const cached = snapshot.fileResults.get(key);
+    if (
+      cached !== undefined &&
+      cached.fingerprint === fingerprint &&
+      cached.dependencies.length === dependencies.length &&
+      cached.dependencies.every((dependency, index) => dependency.path === files[index])
+    ) {
+      return cached.value as A;
+    }
+    const value = yield* run;
+    if (!snapshot.fileResults.has(key) && snapshot.fileResults.size >= FILE_RESULTS_CAPACITY) {
+      snapshot.fileResults.delete(snapshot.fileResults.keys().next().value!);
+    }
+    snapshot.fileResults.set(key, { dependencies, fingerprint, value });
+    return value;
+  });
+
+  return { read, peek, runWithRefs, runWithFiles };
 });
 
 /**

@@ -50,6 +50,10 @@ const encodeGitCommandError = Schema.encodeEffect(Schema.fromJsonString(GitComma
 const decodeVcsRef = Schema.decodeUnknownSync(VcsRef);
 const decodeVcsListRefsResult = Schema.decodeUnknownSync(VcsListRefsResult);
 
+// The per-call common-directory probe; the config snapshot's own rev-parse also names the common directory.
+const isCommonDirProbe = (args: ReadonlyArray<string>) =>
+  args.length === 2 && args[0] === "rev-parse" && args[1] === "--git-common-dir";
+
 const layerServerConfig = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-git-vcs-driver-test-",
 });
@@ -1370,7 +1374,7 @@ it.effect.each([
               return yield* Effect.die("expected a standard Git command");
             }
             spawnedArgs.push(command.args);
-            if (invalidationFailure !== "none" && command.args.includes("--git-common-dir")) {
+            if (invalidationFailure !== "none" && isCommonDirProbe(command.args)) {
               if (invalidationFailure === "non-repository") return makeNonRepositoryHandle();
               return ChildProcessSpawner.makeHandle({
                 ...makeNonRepositoryHandle(),
@@ -1426,7 +1430,7 @@ it.effect.each([
           assert.equal(created.failure.detail, "git worktree add failed");
           assert.equal(created.failure.exitCode, hookExitCode);
         }
-        const metadataQueries = spawnedArgs.filter((args) => args.includes("--git-common-dir"));
+        const metadataQueries = spawnedArgs.filter((args) => isCommonDirProbe(args));
         assert.deepStrictEqual(metadataQueries, [["rev-parse", "--git-common-dir"]]);
         assert.isFalse(spawnedArgs.some((args) => args.includes("symbolic-ref")));
         invalidationFailure = "none";
@@ -1434,7 +1438,7 @@ it.effect.each([
         spawnedArgs.length = 0;
         const creatorStatus = yield* driver.statusDetailsLocal(cwd);
         assert.equal(creatorStatus.branch, "creator-current");
-        assert.isTrue(spawnedArgs.some((args) => args.includes("--git-common-dir")));
+        assert.isTrue(spawnedArgs.some((args) => isCommonDirProbe(args)));
         const siblingRefs = yield* driver.listRefs({ cwd: siblingPath });
         const createdRef = siblingRefs.refs.find((ref) => ref.name === "feature/cache-created");
         assert.isDefined(createdRef?.worktreePath);
@@ -1490,7 +1494,7 @@ it.effect.each(["branch", "detached", "nested", "aliased-root", "aliased-nested"
           newRefName: "feature/cold",
         });
 
-        assert.equal(spawnedArgs.filter((args) => args.includes("--git-common-dir")).length, 1);
+        assert.equal(spawnedArgs.filter((args) => isCommonDirProbe(args)).length, 1);
         assert.isFalse(spawnedArgs.some((args) => args.includes("--show-toplevel")));
         assert.isFalse(spawnedArgs.some((args) => args.includes("symbolic-ref")));
         spawnedArgs.length = 0;
@@ -1502,7 +1506,7 @@ it.effect.each(["branch", "detached", "nested", "aliased-root", "aliased-nested"
           originalRefs.refs.filter((ref) => ref.current).map((ref) => ref.name),
           location === "detached" ? [] : [initialBranch],
         );
-        assert.equal(spawnedArgs.filter((args) => args.includes("--git-common-dir")).length, 1);
+        assert.equal(spawnedArgs.filter((args) => isCommonDirProbe(args)).length, 1);
         const refs = yield* driver.listRefs({ cwd: worktreePath });
         assert.isTrue(refs.refs.find((ref) => ref.name === "feature/cold")?.current);
         assert.equal(
@@ -1552,7 +1556,7 @@ it.effect.each(["bare", "unborn"] as const)(
           assert.equal(result.failure.operation, "GitVcsDriver.createWorktree.createBranch");
           assert.equal(result.failure.detail, "git worktree add failed");
         }
-        assert.equal(spawnedArgs.filter((args) => args.includes("--git-common-dir")).length, 1);
+        assert.equal(spawnedArgs.filter((args) => isCommonDirProbe(args)).length, 1);
         assert.isFalse(spawnedArgs.some((args) => args[0] === "symbolic-ref"));
         spawnedArgs.length = 0;
         const refs = yield* driver.listRefs({ cwd });
@@ -1562,7 +1566,7 @@ it.effect.each(["bare", "unborn"] as const)(
         } else {
           assert.isEmpty(refs.refs);
         }
-        assert.equal(spawnedArgs.filter((args) => args.includes("--git-common-dir")).length, 1);
+        assert.equal(spawnedArgs.filter((args) => isCommonDirProbe(args)).length, 1);
       }),
     ).pipe(Effect.provide(layerTest)),
 );
@@ -1642,7 +1646,7 @@ it.effect(
             if (
               !holdDiscovery ||
               !ChildProcess.isStandardCommand(command) ||
-              !command.args.includes("--git-common-dir")
+              !isCommonDirProbe(command.args)
             )
               return handle;
             holdDiscovery = false;
@@ -1700,7 +1704,7 @@ it.effect("invalidates cached metadata after interrupted worktree creation", () 
           if (
             !holdDiscovery ||
             !ChildProcess.isStandardCommand(command) ||
-            !command.args.includes("--git-common-dir")
+            !isCommonDirProbe(command.args)
           )
             return handle;
           holdDiscovery = false;

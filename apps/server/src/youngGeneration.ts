@@ -555,17 +555,21 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   const platform = process.platform;
   const current = process.env.NODE_OPTIONS;
   // The operating system remembers what Node started with; a preload may have changed process.env.
-  const startup = startupNodeOptions({
-    platform,
-    pid: process.pid,
-    env: process.env,
-    // The listing shows the command line as typed; only the arguments after the script are certain.
-    args: NodeSea.isSea() ? process.argv.slice(1) : process.argv.slice(2),
-    ipc: process.channel !== undefined,
-  });
+  // Only a server command asks (a `ps` on macOS): helpers run per tool call never relaunch.
+  const server = isServerCommand(process.argv);
+  const startup: StartupNodeOptions = server
+    ? startupNodeOptions({
+        platform,
+        pid: process.pid,
+        env: process.env,
+        // The listing shows the command line as typed; only the arguments after the script are certain.
+        args: NodeSea.isSea() ? process.argv.slice(1) : process.argv.slice(2),
+        ipc: process.channel !== undefined,
+      })
+    : { known: false };
   // What V8 started with, for the outcome: the record when known, else the value in effect, flagged.
   const nodeOptionsAtStart = startup.known ? startup.value : current;
-  const uncertain = startup.known ? {} : { startupUncertain: true as const };
+  const uncertain = startup.known || !server ? {} : { startupUncertain: true as const };
   const inherited = process.env[INHERITED_NODE_OPTIONS_ENV];
   const relaunchedPid = process.env[RELAUNCHED_PID_ENV];
   delete process.env[RELAUNCHED_PID_ENV];
@@ -589,7 +593,7 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
       return { applied: true, nodeOptionsAtStart, ...uncertain };
     }
   }
-  if (!startupNodeOptionsTrusted(startup, current)) {
+  if (server && !startupNodeOptionsTrusted(startup, current)) {
     return {
       applied: false,
       nodeOptionsAtStart,
@@ -676,10 +680,10 @@ export const describeNodeRuntime = (input: {
   youngGenerationDefault: input.applied,
 });
 
-/** What this process runs with, for the startup log: parsed sizes only, never NODE_OPTIONS verbatim. */
-export const nodeRuntimeFlags = (
-  outcome: YoungGenerationOutcome | undefined = lastOutcome,
-  env: Environment = process.env,
+/** The startup log's sizes for an outcome and environment: parsed sizes only, never NODE_OPTIONS verbatim. */
+export const runtimeFlagsOf = (
+  outcome: YoungGenerationOutcome | undefined,
+  env: Environment,
 ): Omit<NodeRuntimeFlags, "nodeOptions" | "nodeOptionsForChildren"> => {
   const {
     nodeOptions: _nodeOptions,
@@ -699,6 +703,12 @@ export const nodeRuntimeFlags = (
     ...(outcome?.startupUncertain === undefined ? {} : { startupUncertain: true }),
   };
 };
+
+/** What this process runs with, for the startup log: parsed sizes only, never NODE_OPTIONS verbatim. */
+export const nodeRuntimeFlags = (): Omit<
+  NodeRuntimeFlags,
+  "nodeOptions" | "nodeOptionsForChildren"
+> => runtimeFlagsOf(lastOutcome, process.env);
 
 const isOpenDescriptor = (fd: string): boolean => {
   const parsed = Number(fd);

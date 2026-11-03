@@ -7,7 +7,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
-import { vi } from "vitest";
+import { vi } from "vite-plus/test";
 
 // Records every synchronous spawn the module under test makes; the calls go through to the real one.
 const spawned = vi.hoisted(() => ({ files: [] as Array<string> }));
@@ -34,7 +34,7 @@ import {
   resolveMaxSemiSpaceMb,
   NON_SERVER_COMMANDS,
   nodeOptionsFromEnviron,
-  nodeRuntimeFlags,
+  runtimeFlagsOf,
   SERVER_COMMANDS,
   startupNodeOptionsFromListing,
   startupNodeOptionsTrusted,
@@ -339,11 +339,11 @@ describe("applyYoungGenerationDefault", () => {
   });
 });
 
-describe("nodeRuntimeFlags", () => {
+describe("runtimeFlagsOf", () => {
   it("reports the startup value it knows, never the current environment in its place", () => {
     // NODE_OPTIONS was absent at startup; a command-line preload set a cap afterwards. V8 runs with
     // Node's default, and the log must say so without claiming uncertainty.
-    const flags = nodeRuntimeFlags(
+    const flags = runtimeFlagsOf(
       { applied: false, nodeOptionsAtStart: undefined, keptReason: "started with a preload" },
       { NODE_OPTIONS: "--max-semi-space-size=16" },
     );
@@ -351,7 +351,7 @@ describe("nodeRuntimeFlags", () => {
     expect(flags.startupUncertain).toBeUndefined();
     // Without an outcome (no startup pass ran) the current environment is all there is.
     expect(
-      nodeRuntimeFlags(undefined, { NODE_OPTIONS: "--max-semi-space-size=16" }).maxSemiSpaceMiB,
+      runtimeFlagsOf(undefined, { NODE_OPTIONS: "--max-semi-space-size=16" }).maxSemiSpaceMiB,
     ).toBe(16);
   });
 });

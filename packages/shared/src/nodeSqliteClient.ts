@@ -440,8 +440,13 @@ try {
   if (typeof next.setAuthorizer === "function") {
     const c = sqlite.constants;
     next.setAuthorizer((actionCode, action, _argument, database) =>
-      (actionCode === c.SQLITE_PRAGMA && action === "query_only") ||
-      (database === "temp" && actionCode !== c.SQLITE_READ && actionCode !== c.SQLITE_SELECT)
+      actionCode === c.SQLITE_ATTACH ||
+      actionCode === c.SQLITE_DETACH ||
+      (actionCode === c.SQLITE_PRAGMA && String(action).toLowerCase() === "query_only") ||
+      (database != null &&
+        database !== "main" &&
+        actionCode !== c.SQLITE_READ &&
+        actionCode !== c.SQLITE_SELECT)
         ? c.SQLITE_DENY
         : c.SQLITE_OK,
     );
@@ -452,7 +457,8 @@ try {
   permanent = mode !== "wal";
   if (permanent) throw new Error("database uses journal_mode " + mode + ", not wal");
   db = next;
-  parentPort.postMessage({ type: "ready" });
+  // Guarded: nothing on this reader can write, so an ending cannot fail and need not be awaited.
+  parentPort.postMessage({ type: "ready", guarded: typeof next.setAuthorizer === "function" });
 } catch (error) {
   parentPort.postMessage({ type: "unavailable", message: String(error && error.message ? error.message : error), permanent });
 }
@@ -523,7 +529,7 @@ interface ReaderRequest {
 }
 
 type ReaderStartup =
-  | { readonly type: "ready" }
+  | { readonly type: "ready"; readonly guarded?: boolean }
   | { readonly type: "unavailable"; readonly message: string; readonly permanent?: boolean };
 
 type ReaderReply =
@@ -632,6 +638,8 @@ const makeReader = Effect.fnUntraced(function* (
       announce = resolve;
     });
     let ready = false;
+    // Whether the worker's authorizer rules out every write, so that an ending cannot fail.
+    let guarded = false;
     let stoppedMessage: string | undefined;
     const pending = new Map<number, (reply: ReaderReply) => void>();
     // A read transaction's BEGIN waits for its first statement and travels with it; once it has
@@ -685,6 +693,7 @@ const makeReader = Effect.fnUntraced(function* (
     worker.on("message", (reply: ReaderReply | ReaderStartup) => {
       if ("type" in reply) {
         ready = reply.type === "ready";
+        guarded = ready && reply.guarded === true;
         announce(reply);
         if (pending.size === 0) worker.unref();
         return;
@@ -720,11 +729,12 @@ const makeReader = Effect.fnUntraced(function* (
           control &&
           !begins &&
           endsReadTransaction(input.sql) &&
-          (pendingBegin || inTransaction)
+          (pendingBegin || (inTransaction && guarded))
         ) {
           // Ending a read transaction only drops a shared lock: it cannot fail or lose anything, so
           // nothing waits for it, unless statements a fiber gave up on are still running: then the
           // reader stays claimed until the worker has answered them and this ending, as before.
+          // (An unguarded reader's ending is an ordinary awaited statement below.)
           pendingBegin = false;
           if (!inTransaction) return Effect.succeed([]);
           inTransaction = false;

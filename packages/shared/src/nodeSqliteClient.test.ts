@@ -1974,6 +1974,7 @@ it.effect("awaits a read transaction's ending on a reader without an authorizer"
           yield* eventLoopTurn;
           // Without an authorizer a write could have happened, so the ending's answer is waited for.
           assert.isUndefined(fiber.pollUnsafe(), "ended before the COMMIT was answered");
+          commitHold.on = false;
           for (const release of commitHold.held.splice(0)) release();
           assert.equal(yield* Fiber.join(fiber), 1);
           assert.equal(

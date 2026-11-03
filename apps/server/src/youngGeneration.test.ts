@@ -523,13 +523,19 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
         const rewritten = images(rewrite, { NODE_OPTIONS: `--require ${rewrite}` }, []);
         expect(rewritten.preloadRuns).toBe(1);
         expect(rewritten.report?.applied).toBe(false);
-        // A NODE_OPTIONS preload that deletes NODE_OPTIONS hides itself: the first image relaunches
-        // without it (the preload ran once and is gone from the relaunched image), and the pid-bound
-        // guard would stop any further image — never a loop.
+        // A NODE_OPTIONS preload that deletes NODE_OPTIONS hides its flag, but not the module it loaded:
+        // the first image sees it in the module cache and keeps, so an explicit cap beside it survives.
         const hidden = preload("delete process.env.NODE_OPTIONS;");
         const hiddenRun = images(hidden, { NODE_OPTIONS: `--require ${hidden}` }, []);
         expect(hiddenRun.preloadRuns).toBe(1);
-        expect(hiddenRun.report?.applied).toBe(true);
+        expect(hiddenRun.report?.applied).toBe(false);
+        const hiddenCap = images(
+          hidden,
+          { NODE_OPTIONS: `--max-semi-space-size=16 --require ${hidden}` },
+          [],
+        );
+        expect(hiddenCap.preloadRuns).toBe(1);
+        expect(hiddenCap.report?.applied).toBe(false);
         // An explicit cap beside a preload that clears NODE_OPTIONS must not be relaunched over with 64.
         const clearing = preload("delete process.env.NODE_OPTIONS;");
         const cleared = images(clearing, { NODE_OPTIONS: "--max-semi-space-size=16" }, [

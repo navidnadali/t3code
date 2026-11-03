@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - node:perf_hooks is the only source of the event loop utilization.
+// @effect-diagnostics nodeBuiltinImport:off - node:perf_hooks is the only source of the event loop delay.
 import * as NodePerfHooks from "node:perf_hooks";
 
 import { CommandId } from "@t3tools/contracts";
@@ -938,10 +938,10 @@ export const layer = layerWithOptions();
 
 export interface OrchestrationEffectDaemonOptions {
   readonly concurrency?: number;
-  /** Leave turn starts in the outbox while the main thread is this busy; `false` claims everything. */
-  readonly admission?: { readonly utilizationHighMark: number } | false;
-  /** Event loop utilization of the last sample interval; tests inject one. */
-  readonly utilization?: Effect.Effect<number>;
+  /** Leave turn starts in the outbox while the loop delays work this much; `false` claims everything. */
+  readonly admission?: { readonly delayAboveMs: number } | false;
+  /** The loop's delay p99 of the last sample interval in ms; tests inject one. */
+  readonly pressure?: Effect.Effect<number>;
   readonly livenessPollIntervalMs?: number;
 }
 
@@ -951,22 +951,32 @@ export interface OrchestrationEffectDaemonOptions {
 const DEFAULT_EFFECT_WORKER_CONCURRENCY = 4;
 export const EFFECT_WORKER_MAX_CONCURRENCY = 256;
 const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
-// Past this share of the last second busy, turn starts stay in the outbox; a tenth below it they
-// resume. Two samples either way, so a single burst switches nothing.
-const DEFAULT_EFFECT_ADMISSION_UTILIZATION = 0.95;
+// From this event loop delay p99 over a second, turn starts stay in the outbox; below half of it
+// they resume. Two samples either way, so a single burst switches nothing.
+const DEFAULT_EFFECT_ADMISSION_DELAY_MS = 40;
+const EFFECT_ADMISSION_DELAY_RESOLUTION_MS = 10;
 const EFFECT_ADMISSION_SAMPLES_TO_SWITCH = 2;
 const EFFECT_ADMISSION_SAMPLE_INTERVAL = Duration.seconds(1);
 
-/** Event loop utilization since the previous call, from the process's own counters. */
-const eventLoopUtilizationSource = Effect.sync(() => {
-  let previous = NodePerfHooks.performance.eventLoopUtilization();
-  return Effect.sync(() => {
-    const next = NodePerfHooks.performance.eventLoopUtilization();
-    const { utilization } = NodePerfHooks.performance.eventLoopUtilization(next, previous);
-    previous = next;
-    return Number.isFinite(utilization) ? utilization : 0;
-  });
-});
+/** The event loop delay p99 in ms since the previous call, from a histogram reset at each call. */
+const eventLoopDelaySource = Effect.acquireRelease(
+  Effect.sync(() => {
+    const histogram = NodePerfHooks.monitorEventLoopDelay({
+      resolution: EFFECT_ADMISSION_DELAY_RESOLUTION_MS,
+    });
+    histogram.enable();
+    return histogram;
+  }),
+  (histogram) => Effect.sync(() => histogram.disable()),
+).pipe(
+  Effect.map((histogram) =>
+    Effect.sync(() => {
+      const p99Ms = histogram.percentile(99) / 1e6;
+      histogram.reset();
+      return Number.isFinite(p99Ms) ? p99Ms : 0;
+    }),
+  ),
+);
 
 export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions = {}) =>
   Effect.scoped(
@@ -976,24 +986,24 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       const concurrency = Number.isFinite(requestedConcurrency)
         ? Math.max(1, Math.floor(requestedConcurrency))
         : DEFAULT_EFFECT_WORKER_CONCURRENCY;
-      const utilizationHighMark =
+      const delayAboveMs =
         options.admission === false
           ? undefined
-          : (options.admission?.utilizationHighMark ?? DEFAULT_EFFECT_ADMISSION_UTILIZATION);
+          : (options.admission?.delayAboveMs ?? DEFAULT_EFFECT_ADMISSION_DELAY_MS);
       yield* Effect.logInfo("Orchestration effect worker pool", {
         concurrency,
         configured: options.concurrency !== undefined,
-        admissionUtilization: utilizationHighMark ?? null,
+        admissionDelayMs: delayAboveMs ?? null,
       });
       const admission =
-        utilizationHighMark === undefined
+        delayAboveMs === undefined
           ? undefined
           : yield* EffectAdmission.make({
               workers: concurrency,
-              utilizationHighMark,
+              closeAbove: delayAboveMs,
               samplesToSwitch: EFFECT_ADMISSION_SAMPLES_TO_SWITCH,
               sampleInterval: EFFECT_ADMISSION_SAMPLE_INTERVAL,
-              utilization: options.utilization ?? (yield* eventLoopUtilizationSource),
+              pressure: options.pressure ?? (yield* eventLoopDelaySource),
               onAllowanceRestored: worker.notifyWork(concurrency),
             });
       const runOnce =

@@ -553,12 +553,12 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
             ...(serverConfig.effectWorkers === undefined
               ? {}
               : { concurrency: serverConfig.effectWorkers }),
-            ...(serverConfig.effectAdmissionUtilization === undefined
+            ...(serverConfig.effectAdmissionDelayMs === undefined
               ? {}
               : {
                   admission:
-                    serverConfig.effectAdmissionUtilization > 0
-                      ? { utilizationHighMark: serverConfig.effectAdmissionUtilization }
+                    serverConfig.effectAdmissionDelayMs > 0
+                      ? { delayAboveMs: serverConfig.effectAdmissionDelayMs }
                       : false,
                 }),
           }),

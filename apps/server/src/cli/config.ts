@@ -226,9 +226,9 @@ const EnvServerConfig = Config.all({
     Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: EFFECT_WORKER_MAX_CONCURRENCY })),
     "T3CODE_EFFECT_WORKERS",
   ).pipe(Config.option, Config.map(Option.getOrUndefined)),
-  effectAdmissionUtilization: Config.schema(
-    Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
-    "T3CODE_EFFECT_ADMISSION_ELU",
+  effectAdmissionDelayMs: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 60_000 })),
+    "T3CODE_EFFECT_ADMISSION_DELAY_MS",
   ).pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
@@ -592,9 +592,9 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
       ? {}
       : { providerIoAcpOffloadMinChars: env.providerIoAcpOffloadMinChars }),
     ...(env.effectWorkers === undefined ? {} : { effectWorkers: env.effectWorkers }),
-    ...(env.effectAdmissionUtilization === undefined
+    ...(env.effectAdmissionDelayMs === undefined
       ? {}
-      : { effectAdmissionUtilization: env.effectAdmissionUtilization }),
+      : { effectAdmissionDelayMs: env.effectAdmissionDelayMs }),
     ...(env.providerIoClaudeSdk === undefined
       ? {}
       : { providerIoClaudeSdk: env.providerIoClaudeSdk }),

@@ -42,13 +42,13 @@ export const EffectAdmission = Context.Reference<EffectAdmissionShape>(
 export interface EffectAdmissionOptions {
   /** Gated effects in flight at most while the main thread has headroom. */
   readonly workers: number;
-  /** Event loop utilization at or above which the main thread counts as saturated. */
-  readonly utilizationHighMark: number;
+  /** Pressure at or above which the main thread counts as saturated; it reopens below half of it. */
+  readonly closeAbove: number;
   /** Consecutive samples on one side of a mark before the state switches. */
   readonly samplesToSwitch: number;
   readonly sampleInterval: Duration.Duration;
-  /** Event loop utilization of the last interval, 0 to 1. */
-  readonly utilization: Effect.Effect<number>;
+  /** The main thread's latency pressure over the last interval: its event loop delay p99 in ms. */
+  readonly pressure: Effect.Effect<number>;
   /** Runs when the full allowance returns, so idle workers claim the effects they skipped. */
   readonly onAllowanceRestored: Effect.Effect<void>;
 }
@@ -56,19 +56,18 @@ export interface EffectAdmissionOptions {
 /** Gated effects allowed while saturated: half the workers, at least one. */
 export const saturatedAllowance = (workers: number): number => Math.max(1, Math.ceil(workers / 2));
 
-/** Headroom returns a tenth below the high mark, or halfway to zero for marks under 0.2. */
-export const utilizationLowMark = (highMark: number): number =>
-  highMark - Math.min(0.1, highMark / 2);
+/** Headroom counts as back at half the closing pressure, so every mark can reopen. */
+export const openMarkFor = (closeAbove: number): number => closeAbove / 2;
 
 /**
- * Admission keyed to the main thread's headroom. Gated effects run `workers` at a time; after
- * `samplesToSwitch` samples at or above the high mark only `saturatedAllowance` of them do, until as
- * many samples fall below the low mark. Effects already running are never stopped.
+ * Admission keyed to the main thread's latency. Gated effects run `workers` at a time; after
+ * `samplesToSwitch` samples of pressure at or above `closeAbove` only `saturatedAllowance` of them
+ * do, until as many samples fall below half of it. Effects already running are never stopped.
  */
 export const make = Effect.fn("EffectAdmission.make")(function* (options: EffectAdmissionOptions) {
   const workers = Math.max(1, Math.floor(options.workers));
   const whenSaturated = saturatedAllowance(workers);
-  const lowMark = utilizationLowMark(options.utilizationHighMark);
+  const openBelow = openMarkFor(options.closeAbove);
   let allowed = workers;
   let inFlight = 0;
   let saturated = false;
@@ -80,11 +79,11 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
   });
 
   const sample = Effect.gen(function* () {
-    const utilization = yield* options.utilization;
-    if (utilization >= options.utilizationHighMark) {
+    const pressure = yield* options.pressure;
+    if (pressure >= options.closeAbove) {
       highRun += 1;
       lowRun = 0;
-    } else if (utilization < lowMark) {
+    } else if (pressure < openBelow) {
       lowRun += 1;
       highRun = 0;
     } else {
@@ -103,7 +102,7 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
     yield* Effect.logInfo("Orchestration effect admission changed", {
       saturated,
       allowed,
-      utilization,
+      pressure,
     });
     if (!saturated) yield* options.onAllowanceRestored;
   });

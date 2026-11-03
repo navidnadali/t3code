@@ -721,10 +721,10 @@ it.effect("claims only ungated effects once the admission slots are taken", () =
     );
     const admission = yield* EffectAdmission.make({
       workers: 1,
-      utilizationHighMark: 0.95,
+      closeAbove: 40,
       samplesToSwitch: 2,
       sampleInterval: Duration.seconds(1),
-      utilization: Effect.succeed(0.2),
+      pressure: Effect.succeed(5),
       onAllowanceRestored: Effect.void,
     });
     const runOnce = worker.runOnce.pipe(
@@ -805,11 +805,11 @@ const saturatedDaemon = (options: { readonly wakeUpsDelivered: boolean }) =>
           ),
       }),
     );
-    const utilization = yield* Ref.make(0.99);
+    const pressure = yield* Ref.make(60);
     const daemon = yield* EffectWorker.runDaemonWithOptions({
       concurrency: 4,
-      admission: { utilizationHighMark: 0.95 },
-      utilization: Ref.get(utilization),
+      admission: { delayAboveMs: 40 },
+      pressure: Ref.get(pressure),
       livenessPollIntervalMs: 60_000,
     }).pipe(
       Effect.provide(
@@ -853,7 +853,7 @@ const saturatedDaemon = (options: { readonly wakeUpsDelivered: boolean }) =>
     );
 
     // Headroom returns: the idle workers are woken, or look again within a sample, and take the rest.
-    yield* Ref.set(utilization, 0.2);
+    yield* Ref.set(pressure, 5);
     yield* TestClock.adjust("2 seconds");
     if (!options.wakeUpsDelivered) yield* TestClock.adjust("1 second");
     const secondWave = yield* Effect.all([Queue.take(started), Queue.take(started)]);

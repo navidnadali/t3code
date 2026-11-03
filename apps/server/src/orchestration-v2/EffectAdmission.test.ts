@@ -9,16 +9,16 @@ import * as EffectAdmission from "./EffectAdmission.ts";
 
 const makeAdmission = (
   workers: number,
-  utilization: Ref.Ref<number>,
+  pressure: Ref.Ref<number>,
   restored: Ref.Ref<number>,
-  utilizationHighMark = 0.95,
+  closeAbove = 40,
 ) =>
   EffectAdmission.make({
     workers,
-    utilizationHighMark,
+    closeAbove,
     samplesToSwitch: 2,
     sampleInterval: Duration.seconds(1),
-    utilization: Ref.get(utilization),
+    pressure: Ref.get(pressure),
     onAllowanceRestored: Ref.update(restored, (count) => count + 1),
   });
 
@@ -28,9 +28,9 @@ const reserve = (admission: EffectAdmission.EffectAdmissionShape) =>
 
 it.effect("hands out one slot per worker and excludes nothing while a slot is free", () =>
   Effect.gen(function* () {
-    const utilization = yield* Ref.make(0.2);
+    const pressure = yield* Ref.make(5);
     const restored = yield* Ref.make(0);
-    const admission = yield* makeAdmission(2, utilization, restored);
+    const admission = yield* makeAdmission(2, pressure, restored);
 
     assert.deepEqual(yield* admission.excludedTypes, []);
     const first = yield* reserve(admission);
@@ -54,9 +54,9 @@ it.effect(
   "halves the allowance after two saturated samples and restores it after two calm ones",
   () =>
     Effect.gen(function* () {
-      const utilization = yield* Ref.make(0.99);
+      const pressure = yield* Ref.make(60);
       const restored = yield* Ref.make(0);
-      const admission = yield* makeAdmission(4, utilization, restored);
+      const admission = yield* makeAdmission(4, pressure, restored);
 
       // One high sample switches nothing.
       yield* TestClock.adjust("1 second");
@@ -72,10 +72,10 @@ it.effect(
       assert.deepEqual(yield* admission.excludedTypes, EffectAdmission.GATED_EFFECT_TYPES);
 
       // Between the marks nothing changes; one calm sample is not enough either.
-      yield* Ref.set(utilization, 0.9);
+      yield* Ref.set(pressure, 30);
       yield* TestClock.adjust("2 seconds");
       assert.equal((yield* admission.state).saturated, true);
-      yield* Ref.set(utilization, 0.5);
+      yield* Ref.set(pressure, 10);
       yield* TestClock.adjust("1 second");
       assert.equal((yield* admission.state).saturated, true);
       assert.equal(yield* Ref.get(restored), 0);
@@ -95,15 +95,15 @@ it.effect(
   "keeps running effects when the allowance shrinks and excludes new ones until they end",
   () =>
     Effect.gen(function* () {
-      const utilization = yield* Ref.make(0.2);
+      const pressure = yield* Ref.make(5);
       const restored = yield* Ref.make(0);
-      const admission = yield* makeAdmission(2, utilization, restored);
+      const admission = yield* makeAdmission(2, pressure, restored);
       const first = yield* reserve(admission);
       const second = yield* reserve(admission);
       assert.isDefined(first);
       assert.isDefined(second);
 
-      yield* Ref.set(utilization, 0.99);
+      yield* Ref.set(pressure, 60);
       yield* TestClock.adjust("2 seconds");
       assert.deepEqual(yield* admission.state, { allowed: 1, inFlight: 2, saturated: true });
       assert.deepEqual(yield* admission.excludedTypes, EffectAdmission.GATED_EFFECT_TYPES);
@@ -118,30 +118,30 @@ it.effect(
     }),
 );
 
-it.effect("recovers from saturation at a low mark too", () =>
+it.effect("recovers from saturation at a small mark too", () =>
   Effect.gen(function* () {
-    const utilization = yield* Ref.make(0.2);
+    const pressure = yield* Ref.make(5);
     const restored = yield* Ref.make(0);
-    const admission = yield* makeAdmission(4, utilization, restored, 0.1);
+    const admission = yield* makeAdmission(4, pressure, restored, 5);
 
+    // Pressure 5 is at the mark; the gate closes and reopens once the loop is idle.
     yield* TestClock.adjust("2 seconds");
     assert.equal((yield* admission.state).saturated, true);
-    yield* Ref.set(utilization, 0);
+    yield* Ref.set(pressure, 0);
     yield* TestClock.adjust("2 seconds");
     assert.deepEqual(yield* admission.state, { allowed: 4, inFlight: 0, saturated: false });
     assert.equal(yield* Ref.get(restored), 1);
   }),
 );
 
-it.effect("sizes the saturated allowance and the low mark", () =>
+it.effect("sizes the saturated allowance and the reopen mark", () =>
   Effect.sync(() => {
     assert.equal(EffectAdmission.saturatedAllowance(1), 1);
     assert.equal(EffectAdmission.saturatedAllowance(2), 1);
     assert.equal(EffectAdmission.saturatedAllowance(4), 2);
     assert.equal(EffectAdmission.saturatedAllowance(5), 3);
-    assert.closeTo(EffectAdmission.utilizationLowMark(0.95), 0.85, 1e-9);
-    assert.closeTo(EffectAdmission.utilizationLowMark(0.2), 0.1, 1e-9);
-    assert.closeTo(EffectAdmission.utilizationLowMark(0.1), 0.05, 1e-9);
+    assert.equal(EffectAdmission.openMarkFor(40), 20);
+    assert.equal(EffectAdmission.openMarkFor(5), 2.5);
     assert.isTrue(EffectAdmission.isGated("provider-turn.start"));
     assert.isTrue(EffectAdmission.isGated("checkpoint.capture"));
     assert.isFalse(EffectAdmission.isGated("provider-turn.interrupt"));

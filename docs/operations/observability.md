@@ -778,17 +778,20 @@ read capacity and watch `db.lock_wait_ms`. The trace shows each effect's wait in
 process slots in `VcsProcess.run` (`vcs.permit_wait_ms`); the server also exports the timer
 `t3_orchestration_effect_queue_wait` by `effect_type`.
 
-Effect admission. While the main thread is saturated, the workers leave the effects that start turn
-work — turn starts, restarted-run continuations, checkpoint captures and title generation — in the
+Effect admission. While the main thread's latency suffers, the workers leave the effects that start
+turn work — turn starts, restarted-run continuations, checkpoint captures and title generation — in the
 outbox beyond an allowance, so that user-facing work keeps its latency: interrupts, steers, runtime
 request answers, detaches, stops and cleanups are always claimed (behind an older effect of their own
-thread, as ever). The daemon samples the event loop utilization every second; after two samples at or
-above `T3CODE_EFFECT_ADMISSION_ELU` (default `0.95`) only half the workers, at least one, may run such
-effects, and after two samples a tenth below that mark (half the mark for marks under `0.2`) all of
-them may again. Effects already running are never stopped. `0` turns the gate off. The time an effect
-waited in the outbox is its queue wait (`effect.queue_wait_ms` on `EffectWorker.runEffect`, which also
-carries `effect.gated`; the timer `t3_orchestration_effect_queue_wait`), and each switch is logged
-("Orchestration effect admission changed").
+thread, as ever). The daemon measures the event loop's delay every second (the p99 of a 10 ms-resolution
+histogram, reset each second); after two seconds at or above `T3CODE_EFFECT_ADMISSION_DELAY_MS`
+(default `40`) only half the workers, at least one, may run such effects, and after two seconds below
+half that delay all of them may again. Effects already running are never stopped. `0` turns the gate
+off. The delay, not CPU time or event loop utilization, is the signal: a loop can be busy for most of a
+second yet schedule interactive work promptly, and utilization counts every moment it is not idle. The
+time an effect waited in the outbox is its queue wait (`effect.queue_wait_ms` on
+`EffectWorker.runEffect`, which also carries `effect.gated`; the timer
+`t3_orchestration_effect_queue_wait`), and each switch is logged ("Orchestration effect admission
+changed", with the delay that caused it).
 
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for

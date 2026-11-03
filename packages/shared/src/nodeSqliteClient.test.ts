@@ -41,6 +41,12 @@ const commitHold = vi.hoisted(() => ({
   held: [] as Array<() => void>,
   failNext: false,
 }));
+// Holds the reply to any request whose SQL mentions "hold-reply" until released, and tells a waiter.
+const replyHold = vi.hoisted(() => ({
+  ids: new Set<number>(),
+  held: [] as Array<() => void>,
+  waiters: [] as Array<() => void>,
+}));
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
 
@@ -72,6 +78,8 @@ vi.mock("node:worker_threads", async (importOriginal) => {
           if ("params" in part)
             workerParams.get(this)!.push(...(part.params as ReadonlyArray<unknown>));
         }
+        if ("sql" in request && String(request.sql).includes("hold-reply"))
+          replyHold.ids.add(request.id as number);
         if ("sql" in request && /^\s*COMMIT\b/i.test(String(request.sql)) && commitHold.on) {
           if (commitHold.failNext) {
             commitHold.failNext = false;
@@ -85,6 +93,21 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         }
       }
       super.postMessage(...args);
+    }
+    override emit(event: string | symbol, ...args: Array<any>): boolean {
+      const reply = args[0];
+      if (
+        event === "message" &&
+        typeof reply === "object" &&
+        reply !== null &&
+        replyHold.ids.has(reply.id)
+      ) {
+        replyHold.ids.delete(reply.id);
+        replyHold.held.push(() => super.emit(event, ...args));
+        for (const waiter of replyHold.waiters.splice(0)) waiter();
+        return true;
+      }
+      return super.emit(event, ...args);
     }
     override terminate() {
       // A "ready" already queued when termination starts reaches the parent before "exit".
@@ -1591,6 +1614,35 @@ it.effect("keeps its transaction bookkeeping in step with controls the worker ra
       }).pipe(SqliteClient.readOnly);
       assert.deepEqual(savepoint, []);
       // And the reader is as usable as ever.
+      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+    }),
+  ),
+);
+
+it.effect("ignores a reply that arrives after a newer transaction transition", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+      // A standalone read whose fiber gives up on it while the worker's reply is held back.
+      const abandoned = yield* Effect.forkChild(
+        sql`SELECT COUNT(*) AS count /* hold-reply */ FROM entries`.pipe(SqliteClient.readOnly),
+        { startImmediately: true },
+      );
+      yield* Effect.promise(() => new Promise<void>((resolve) => replyHold.waiters.push(resolve)));
+      yield* Fiber.interrupt(abandoned);
+      const count = yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            // This read carries the folded BEGIN; the stale reply lands after it.
+            assert.equal(yield* countEntries(sql), 1);
+            for (const release of replyHold.held.splice(0)) release();
+            const duplicate = yield* sql.unsafe("BEGIN").pipe(Effect.flip);
+            assert.include(String(duplicate.reason.cause), "within a transaction");
+            return yield* countEntries(sql);
+          }),
+        )
+        .pipe(SqliteClient.readOnly);
+      assert.equal(count, 1);
       assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
     }),
   ),

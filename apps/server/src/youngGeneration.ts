@@ -473,8 +473,22 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
   const { startup } = view;
   // What V8 started with, for the outcome: the record when known, else the value in effect.
   const nodeOptionsAtStart = startup.known ? startup.value : current;
+  // The cap as it stands is read from what Node started with, never from what a preload left.
+  const cap = capState({
+    execArgv: view.execArgv,
+    env: { ...env, NODE_OPTIONS: nodeOptionsAtStart },
+    isSea: view.isSea,
+  });
+  const base = {
+    nodeOptionsAtStart,
+    ...(cap.effective === undefined ? {} : { maxSemiSpaceMb: cap.effective }),
+    ...(cap.ineffective ? { capSettingIneffective: true as const } : {}),
+  };
   if (inherited !== undefined) {
-    const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, view.execArgv).mb;
+    // The marker names what a launcher or the relaunch added to NODE_OPTIONS, whatever cap is in
+    // effect (a packaged executable's baked value wins over it), so it is checked against the cap
+    // NODE_OPTIONS itself carries.
+    const mb = sizeOf(flagIn(tokenizeNodeOptions(nodeOptionsAtStart))) ?? null;
     const written = mb === null ? undefined : nodeOptionsWithMaxSemiSpace(inherited, mb);
     // Honour the marker only for a process that started with exactly the marker plus the cap — what
     // the relaunch or the launcher wrote, seen in the startup record or still leading the value in
@@ -488,16 +502,11 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
     if (mb !== null && wrote) {
       return {
         kind: "applied",
-        outcome: { applied: true, nodeOptionsAtStart, maxSemiSpaceMb: mb },
+        outcome: { applied: true, ...base },
         nodeOptionsForChildren: withoutCapArg(current, mb),
       };
     }
   }
-  const cap = capState({ execArgv: view.execArgv, env, isSea: view.isSea });
-  const base = {
-    nodeOptionsAtStart,
-    ...(cap.effective === undefined ? {} : { maxSemiSpaceMb: cap.effective }),
-  };
   // The cap this process wanted is what V8 runs with, whoever put it there; pending NODE_OPTIONS
   // (the user's other flags) are reported separately.
   const capInEffect = !cap.explicit && cap.wanted !== 0 && (cap.effective ?? 0) === cap.wanted;
@@ -512,7 +521,6 @@ export const decideYoungGeneration = (view: YoungGenerationProcess): YoungGenera
       keptReason,
       ...(extra.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
       ...(extra.structural === undefined ? {} : { structural: true }),
-      ...(extra.capSettingIneffective === undefined ? {} : { capSettingIneffective: true }),
     },
   });
   // A record that differs from the value in effect means a preload rewrote NODE_OPTIONS: what it

@@ -219,11 +219,11 @@ background service launcher passes it the same way, and in every case the server
 get exactly the `NODE_OPTIONS` the server itself was given. `T3CODE_V8_MAX_SEMI_SPACE_MB=0` keeps
 Node's default, a positive integer sets another cap, and an explicit `--max-semi-space-size` in `NODE_OPTIONS` or
 on the command line is never overridden (values above 1024 MiB are ignored) — on node-run installs; the packaged
-binary's built-in cap takes none of them. A server
-started with an IPC channel or a bootstrap descriptor (`--bootstrap-fd`, `T3CODE_BOOTSTRAP_FD`) by a
-launcher that did not set the flag, or with the inspector (`--inspect*`), runs with Node's default; so does
-a direct `t3 serve` on Windows (no `execve`), while a Windows server the service launcher starts gets the
-flag through its environment. A direct start with a preload (`--require`, `--import`, `--loader` on the
+binary's built-in cap takes none of them. The packaged binary keeps its built-in cap on every one
+of these paths. On a node-run or unbaked install, a server started with an IPC channel or a bootstrap
+descriptor (`--bootstrap-fd`, `T3CODE_BOOTSTRAP_FD`) by a launcher that did not set the flag, or with the
+inspector (`--inspect*`), runs with Node's default; so does a direct `node bin.mjs serve` on Windows (no
+`execve`), while a server the service launcher starts gets the flag through its environment. A direct start with a preload (`--require`, `--import`, `--loader` on the
 command line or in `NODE_OPTIONS`) keeps Node's default too, with the reason "started with a preload": what
 `NODE_OPTIONS` says after a preload ran is not what Node started with, so neither an explicit cap nor the
 user's options could be carried into a relaunch; a server the launcher starts gets the flag regardless. On Linux the

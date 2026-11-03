@@ -2709,3 +2709,62 @@ it.effect("a relative alternates directory is read per worktree, so git answers"
     assert.isFalse(warm);
   }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
+
+it.effect(
+  "an alternate store's own alternates decide whether a remembered ref still resolves",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const h = yield* makeTurnHarness("t3-checkpoint-nested-alternates-");
+      yield* h.writeBoth("file.txt", "initial\n");
+      yield* h.gitBoth(["add", "."]);
+      yield* h.commitBoth("initial");
+      yield* h.turn(1);
+      yield* h.turn(2);
+      // The primary store borrows from a middle store, which borrows the commits from the real one.
+      const stores = {
+        warm: path.join(h.root, "stores-warm"),
+        cold: path.join(h.root, "stores-cold"),
+      };
+      for (const [name, cwd] of Object.entries(h.repos)) {
+        const root = stores[name as "warm" | "cold"];
+        for (const store of ["primary", "middle"]) {
+          yield* fileSystem.makeDirectory(path.join(root, store, "info"), { recursive: true });
+        }
+        yield* fileSystem.writeFileString(
+          path.join(root, "middle", "info", "alternates"),
+          `${path.join(cwd, ".git", "objects")}\n`,
+        );
+        yield* fileSystem.writeFileString(
+          path.join(root, "primary", "info", "alternates"),
+          `${path.join(root, "middle")}\n`,
+        );
+      }
+      const probe = Effect.fn("test.probe")(function* (
+        driver: VcsDriver.VcsDriver["Service"],
+        name: "warm" | "cold",
+      ) {
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            process.env.GIT_OBJECT_DIRECTORY = path.join(stores[name], "primary");
+          }),
+          () => Effect.sync(() => delete process.env.GIT_OBJECT_DIRECTORY),
+        );
+        return yield* driver.checkpoints.hasCheckpointRef({
+          cwd: h.repos[name],
+          checkpointRef: turnRef(2),
+        });
+      });
+      assert.isTrue(yield* Effect.scoped(probe(h.warm, "warm")));
+      assert.isTrue(yield* Effect.scoped(probe(h.warm, "warm")));
+      // Cutting the middle store's link leaves the primary store without the commit.
+      for (const root of Object.values(stores)) {
+        yield* fileSystem.remove(path.join(root, "middle", "info", "alternates"));
+      }
+      const cold = yield* GitVcsDriver.makeVcsDriverShape();
+      const warm = yield* Effect.scoped(probe(h.warm, "warm"));
+      assert.strictEqual(warm, yield* Effect.scoped(probe(cold, "cold")));
+      assert.isFalse(warm);
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);

@@ -238,6 +238,13 @@ describe("DesktopBackendConfiguration", () => {
           environment.backendEntryPath,
         ]);
         assert.equal(first.entryPath, environment.backendEntryPath);
+        // The backend never relaunches: the desktop hands it the young-generation cap, with the marker
+        // that gives the backend's children the NODE_OPTIONS the desktop itself had.
+        assert.equal(
+          first.env.NODE_OPTIONS,
+          `${process.env.NODE_OPTIONS === undefined ? "" : `${process.env.NODE_OPTIONS} `}--max-semi-space-size=64`,
+        );
+        assert.equal(first.env.T3CODE_INHERITED_NODE_OPTIONS, process.env.NODE_OPTIONS ?? "");
         assert.equal(first.cwd, environment.backendCwd);
         assert.equal(first.captureOutput, true);
         assert.equal(first.env.ELECTRON_RUN_AS_NODE, "1");

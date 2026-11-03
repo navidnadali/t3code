@@ -16,8 +16,10 @@ interface NodeFlagsReport {
   readonly applied: boolean;
   readonly maxSemiSpaceMb: number | null;
   readonly nodeOptionsForChildren: string | null;
+  readonly execArgv: ReadonlyArray<string>;
   readonly sea: boolean;
   readonly keptReason?: string;
+  readonly heapSizeLimitMiB?: number;
 }
 
 // `t3 __node-flags` as a shell would start it: the executable's own argv shape, the user's NODE_OPTIONS.
@@ -75,8 +77,24 @@ describe("young-generation default in the single executable", () => {
       expect(build.status, build.stderr).toBe(0);
       expect(modifiedAt(shipped)).toBe(shippedBefore);
       const executable = NodePath.join(dir, "t3");
+      // The default is baked in: a bare start runs with it and never relaunches.
+      const bare = nodeFlags(executable, {});
+      expect(bare.execArgv).toEqual(["--max-semi-space-size=64"]);
+      expect(bare, bare.keptReason).toMatchObject({
+        applied: true,
+        maxSemiSpaceMb: 64,
+        keptReason: "the young-generation cap is already in effect",
+      });
+      // The cap reached V8: the escape hatch, applied over the baked value, lowers the heap limit.
+      const off = nodeFlags(executable, { T3CODE_V8_MAX_SEMI_SPACE_MB: "0" });
+      expect(off.applied).toBe(false);
+      expect(bare.heapSizeLimitMiB! - off.heapSizeLimitMiB!).toBeGreaterThanOrEqual(64);
+      // NODE_OPTIONS, which the executable takes only on its command line, reach V8 through one
+      // relaunch and stay exactly as they were for the children.
       const userOptions = "--max-old-space-size=12288";
       const direct = nodeFlags(executable, { NODE_OPTIONS: userOptions });
+      expect(direct.execArgv).toContain(userOptions);
+      expect(direct.heapSizeLimitMiB!).toBeGreaterThan(12000);
       expect(direct.sea).toBe(true);
       expect(direct, direct.keptReason).toMatchObject({
         applied: true,

@@ -1303,6 +1303,19 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
         }),
       "A T3 Code callback failed with an error that cannot be sent to Claude",
     ],
+    // JSON-escaped, this reason would pass V8's longest string; only its first KiB is named.
+    [
+      "a message whose JSON fails with a huge error",
+      () =>
+        Object.assign(new Error(), {
+          message: {
+            toJSON: () => {
+              throw new Error("\u0000".repeat(1e8));
+            },
+          },
+        }),
+      `A T3 Code callback failed with an error that cannot be sent to Claude: ${"\u0000".repeat(1024)} [truncated]`,
+    ],
   ];
 
   it.effect.each(unwritableErrors)(
@@ -1334,25 +1347,40 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
                 ),
                 unhandled.promise,
               ]);
-            const failed = yield* Effect.promise(() => outcome(unwritable, "toolu-unwritable"));
-            const answered = yield* Effect.promise(() => outcome(neighbour, "toolu-neighbour"));
+            // A second round on both shows the worker outlived the failure.
+            const rounds = [];
+            for (const round of [0, 1]) {
+              rounds.push({
+                failed: yield* Effect.promise(() =>
+                  outcome(unwritable, `toolu-unwritable-${round}`),
+                ),
+                answered: yield* Effect.promise(() =>
+                  outcome(neighbour, `toolu-neighbour-${round}`),
+                ),
+              });
+            }
             process.off("unhandledRejection", onUnhandled);
 
             assert.deepStrictEqual(recorded.opens, [true, true]);
-            assert.deepStrictEqual(failed, {
-              response: { subtype: "error", request_id: "cli-0", error: expected },
-            });
-            assert.deepStrictEqual(answered, {
-              response: {
-                subtype: "success",
-                request_id: "cli-0",
-                response: {
-                  behavior: "allow",
-                  updatedInput: { allowed: true },
-                  toolUseID: "toolu-neighbour",
+            assert.deepStrictEqual(
+              rounds,
+              [0, 1].map((round) => ({
+                failed: {
+                  response: { subtype: "error", request_id: `cli-${round}`, error: expected },
                 },
-              },
-            });
+                answered: {
+                  response: {
+                    subtype: "success",
+                    request_id: `cli-${round}`,
+                    response: {
+                      behavior: "allow",
+                      updatedInput: { allowed: true },
+                      toolUseID: `toolu-neighbour-${round}`,
+                    },
+                  },
+                },
+              })),
+            );
             assert.deepStrictEqual([unwritable.kills, neighbour.kills], [[], []]);
           }),
         { workers: 1 },

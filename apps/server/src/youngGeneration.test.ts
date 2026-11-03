@@ -656,6 +656,24 @@ describe("the single executable with the default baked in", () => {
     expect(after.outcome.applied).toBe(true);
   });
 
+  it("keeps when a command-line preload already ran, even with NODE_OPTIONS still pending", () => {
+    // `--node-options=--require=/x.cjs` ran in this image; carrying it into a relaunch would run it twice.
+    const decision = decideYoungGeneration(
+      sea({
+        execArgv: [...baked, "--require", "/x.cjs"],
+        env: { NODE_OPTIONS: "--no-warnings" },
+        preloadRan: true,
+      }),
+    );
+    expect(decision.kind).toBe("keep");
+    expect(decision.outcome.keptReason).toBe("started with a preload");
+    // Visible on the command line is enough, with or without a trace in the module cache.
+    const visible = decideYoungGeneration(
+      sea({ execArgv: [...baked, "--require=/x.cjs"], env: { NODE_OPTIONS: "--no-warnings" } }),
+    );
+    expect(visible.kind).toBe("keep");
+  });
+
   it("over IPC, reports a launcher that passes NODE_OPTIONS in the environment and accepts one that passes it on the command line", () => {
     const old = decideYoungGeneration(
       sea({

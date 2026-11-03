@@ -327,30 +327,32 @@ describe("DesktopBackendConfiguration", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("resolveWsl gives the node fallback no cap when the desktop's environment sets one or disables it", () =>
-    Effect.gen(function* () {
-      // The desktop's NODE_OPTIONS and the escape hatch are what WSL sees; a forced 64 would override them.
-      const nodeOptions = process.env.NODE_OPTIONS;
-      const hatch = process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
-          else process.env.NODE_OPTIONS = nodeOptions;
-          if (hatch === undefined) delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
-          else process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = hatch;
-        }),
-      );
-      process.env.NODE_OPTIONS = "--max-semi-space-size=16";
-      delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
-      assert.notInclude(wslNodeFallbackCapFlags(), "--max-semi-space-size=64");
-      delete process.env.NODE_OPTIONS;
-      process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "0";
-      assert.deepEqual(wslNodeFallbackCapFlags(), []);
-      process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "96";
-      assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=96"]);
-      delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
-      assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
-    }).pipe(Effect.scoped),
+  it.effect(
+    "resolveWsl gives the node fallback no cap when the desktop's environment sets one or disables it",
+    () =>
+      Effect.gen(function* () {
+        // The desktop's NODE_OPTIONS and the escape hatch are what WSL sees; a forced 64 would override them.
+        const nodeOptions = process.env.NODE_OPTIONS;
+        const hatch = process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
+            else process.env.NODE_OPTIONS = nodeOptions;
+            if (hatch === undefined) delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+            else process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = hatch;
+          }),
+        );
+        process.env.NODE_OPTIONS = "--max-semi-space-size=16";
+        delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+        assert.notInclude(wslNodeFallbackCapFlags(), "--max-semi-space-size=64");
+        delete process.env.NODE_OPTIONS;
+        process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "0";
+        assert.deepEqual(wslNodeFallbackCapFlags(), []);
+        process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "96";
+        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=96"]);
+        delete process.env.T3CODE_V8_MAX_SEMI_SPACE_MB;
+        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
+      }).pipe(Effect.scoped),
   );
   it.effect("resolveWsl pins a default-tracking run to the concrete default distro", () =>
     Effect.gen(function* () {
@@ -452,7 +454,18 @@ describe("DesktopBackendConfiguration", () => {
         Effect.gen(function* () {
           const path = yield* Path.Path;
           const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
-          const config = yield* configuration.resolveWsl({ port: 5000, distro: "Ubuntu" });
+          // The Linux executable takes Node options only on its command line, and a bootstrap
+          // descriptor rules out a corrective relaunch: the desktop passes them itself.
+          const nodeOptions = process.env.NODE_OPTIONS;
+          process.env.NODE_OPTIONS = "--max-semi-space-size=16";
+          const config = yield* configuration.resolveWsl({ port: 5000, distro: "Ubuntu" }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
+                else process.env.NODE_OPTIONS = nodeOptions;
+              }),
+            ),
+          );
 
           assert.deepEqual(observedArchives, [
             {
@@ -473,6 +486,7 @@ describe("DesktopBackendConfiguration", () => {
             "env",
             `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${resolvedPath}`,
             `${linuxAppRoot}/t3`,
+            "--node-options=--max-semi-space-size=16",
             "--bootstrap-fd",
             "0",
           ]);

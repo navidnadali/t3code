@@ -169,9 +169,28 @@ export const nodeOptionsFromProcessListing = (line: string): string | undefined 
   return value.join(" ").trim();
 };
 
-type StartupNodeOptions =
+export type StartupNodeOptions =
   | { readonly known: true; readonly value: string | undefined }
   | { readonly known: false };
+
+/** NODE_OPTIONS out of a /proc environ block: UTF-8 like `process.env`, entries separated by NUL. */
+export const nodeOptionsFromEnviron = (block: Uint8Array): string | undefined =>
+  new TextDecoder("utf-8")
+    .decode(block)
+    .split("\0")
+    .find((entry) => entry.startsWith("NODE_OPTIONS="))
+    ?.slice("NODE_OPTIONS=".length);
+
+/**
+ * The operating system's value is trusted only when it agrees with the value in effect: then no
+ * preload touched NODE_OPTIONS and the value in effect is the startup value. Anything else — a
+ * preload that deleted or rewrote it, a listing this code could not parse exactly, no record at all —
+ * means never relaunching on a guess.
+ */
+export const startupNodeOptionsTrusted = (
+  startup: StartupNodeOptions,
+  current: string | undefined,
+): boolean => startup.known && startup.value === current;
 
 /**
  * NODE_OPTIONS as Node started with, from the operating system's record of this process — a preload
@@ -180,10 +199,10 @@ type StartupNodeOptions =
 const startupNodeOptions = (platform: string, pid: number): StartupNodeOptions => {
   try {
     if (platform === "linux") {
-      const entry = NodeFS.readFileSync("/proc/self/environ", "latin1")
-        .split("\0")
-        .find((candidate) => candidate.startsWith("NODE_OPTIONS="));
-      return { known: true, value: entry?.slice("NODE_OPTIONS=".length) };
+      return {
+        known: true,
+        value: nodeOptionsFromEnviron(NodeFS.readFileSync("/proc/self/environ")),
+      };
     }
     if (platform === "darwin") {
       const listing = NodeChildProcess.spawnSync(
@@ -220,14 +239,20 @@ const preloadRan = (): boolean => {
   }
 };
 
-/** `value` without the `--max-semi-space-size=<mb>` token (the last one), a preload's own additions kept. */
-const withoutCapToken = (value: string | undefined, mb: number): string | undefined => {
+/**
+ * `value` without its last `--max-semi-space-size=<mb>` token, removed as text so the rest keeps its
+ * quoting exactly (a preload's own additions included); undefined when nothing remains.
+ */
+const withoutCapText = (value: string | undefined, mb: number): string | undefined => {
   if (value === undefined) return undefined;
-  const tokens = [...tokenizeNodeOptions(value)];
-  const index = tokens.lastIndexOf(`${FLAG}=${mb}`);
-  if (index !== -1) tokens.splice(index, 1);
-  const rest = tokens.join(" ");
-  return rest === "" ? undefined : rest;
+  const matches = [...value.matchAll(new RegExp(`(^|\\s)${FLAG}=${mb}(?=\\s|$)`, "g"))];
+  const last = matches.at(-1);
+  const rest =
+    last === undefined
+      ? value
+      : `${value.slice(0, last.index)}${value.slice(last.index + last[0].length)}`;
+  const trimmed = rest.trim();
+  return trimmed === "" ? undefined : trimmed;
 };
 
 const withFlag = (env: Environment, mb: number): Environment => ({
@@ -432,36 +457,45 @@ const inspectorActive = (): boolean => {
 const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
   // oxlint-disable-next-line t3code/no-global-process-runtime -- Runs before the Effect runtime exists.
   const platform = process.platform;
-  // What Node started with, not what a preload left behind: an explicit cap or a preload in the
-  // startup NODE_OPTIONS decides, a marker is checked against it, and a relaunch carries it on.
+  const nodeOptionsAtStart = process.env.NODE_OPTIONS;
+  // The operating system remembers what Node started with; a preload may have changed process.env.
   const startup = startupNodeOptions(platform, process.pid);
-  const nodeOptionsAtStart = startup.known ? startup.value : process.env.NODE_OPTIONS;
   const inherited = process.env[INHERITED_NODE_OPTIONS_ENV];
   const relaunchedPid = process.env[RELAUNCHED_PID_ENV];
   delete process.env[RELAUNCHED_PID_ENV];
   if (inherited !== undefined) {
     delete process.env[INHERITED_NODE_OPTIONS_ENV];
     const mb = explicitMaxSemiSpace({ NODE_OPTIONS: nodeOptionsAtStart }, process.execArgv).mb;
-    // Honour the marker only when the process started with exactly the marker plus the cap — what
-    // the relaunch or the launcher wrote; a stray or forged marker is ignored. Children then get
-    // NODE_OPTIONS as it reads now minus that cap, so a preload's own additions stay.
-    if (mb !== null && nodeOptionsAtStart === nodeOptionsWithMaxSemiSpace(inherited, mb)) {
-      const forChildren = withoutCapToken(process.env.NODE_OPTIONS, mb);
+    const written = mb === null ? undefined : nodeOptionsWithMaxSemiSpace(inherited, mb);
+    // Honour the marker only for a process that started with exactly the marker plus the cap — what
+    // the relaunch or the launcher wrote, seen in the startup record or still leading the value in
+    // effect; a stray or forged marker is ignored. Children then get the value in effect minus that
+    // cap, as text, so a preload's additions and the user's quoting survive.
+    const wrote =
+      written !== undefined &&
+      ((startup.known && startup.value === written) ||
+        nodeOptionsAtStart === written ||
+        nodeOptionsAtStart?.startsWith(`${written} `) === true);
+    if (mb !== null && wrote) {
+      const forChildren = withoutCapText(nodeOptionsAtStart, mb);
       if (forChildren === undefined) delete process.env.NODE_OPTIONS;
       else process.env.NODE_OPTIONS = forChildren;
       return { applied: true, nodeOptionsAtStart };
     }
   }
-  if (!startup.known) {
-    return { applied: false, nodeOptionsAtStart, keptReason: "startup options unavailable" };
+  if (!startupNodeOptionsTrusted(startup, nodeOptionsAtStart)) {
+    return {
+      applied: false,
+      nodeOptionsAtStart,
+      keptReason: startup.known
+        ? "NODE_OPTIONS changed since startup"
+        : "startup options unavailable",
+    };
   }
-  const { NODE_OPTIONS: _current, ...rest } = process.env;
-  const startupEnv: Environment =
-    startup.value === undefined ? rest : { ...rest, NODE_OPTIONS: startup.value };
   const plan = planYoungGenerationRelaunch({
     argv: process.argv,
     execArgv: process.execArgv,
-    env: startupEnv,
+    env: process.env,
     execPath: process.execPath,
     platform,
     hasIpcChannel: process.channel !== undefined,

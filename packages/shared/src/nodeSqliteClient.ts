@@ -629,6 +629,9 @@ const makeReader = Effect.fnUntraced(function* (
     // back SQLite's error, as it always did, without touching this bookkeeping.
     let pendingBegin = false;
     let inTransaction = false;
+    // The id of the last message that changed the transaction state (a folded BEGIN or an ending
+    // control); a reply to an older message, late to a fiber that gave up on it, is stale.
+    let transitionId = 0;
     // A message the worker cannot receive, such as one with an uncloneable binding, fails its
     // own statement; an ending statement with nothing waiting on it is dropped.
     const send = (message: Record<string, unknown>) => {
@@ -711,8 +714,9 @@ const makeReader = Effect.fnUntraced(function* (
           if (pendingBegin) pendingBegin = false;
           else {
             inTransaction = false;
+            transitionId = nextRequestId++;
             if (stoppedMessage === undefined)
-              post({ id: nextRequestId++, safeIntegers: false, ...input });
+              post({ id: transitionId, safeIntegers: false, ...input });
           }
           return Effect.succeed([]);
         }
@@ -732,12 +736,17 @@ const makeReader = Effect.fnUntraced(function* (
           }
           const begin = pendingBegin;
           pendingBegin = false;
-          if (begin) inTransaction = true;
           const id = nextRequestId++;
+          if (begin) {
+            inTransaction = true;
+            transitionId = id;
+          }
           pending.set(id, (reply) => {
             // A control the worker ran itself (raw, bound, duplicate, stray, a savepoint) may have
-            // changed the connection's transaction state: the worker's word replaces the guess.
-            if (reply.inTransaction !== undefined) inTransaction = reply.inTransaction;
+            // changed the connection's transaction state: the worker's word replaces the guess,
+            // unless the reply is older than the last transition.
+            if (reply.inTransaction !== undefined && id >= transitionId)
+              inTransaction = reply.inTransaction;
             if ("rows" in reply) {
               resume(
                 Effect.succeed(

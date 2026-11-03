@@ -3111,3 +3111,86 @@ it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
       assert.strictEqual(again.kind, "unchanged");
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
+
+// Writers that let a blocking FIFO open through (3 s, then EOF), so a reader that does block
+// returns; killed at the end whether or not anything opened them.
+const fifoWriters = (fifos: ReadonlyArray<string>) =>
+  Effect.acquireRelease(
+    Effect.sync(() =>
+      fifos.map((fifo) =>
+        NodeChildProcess.spawn("sh", ["-c", `sleep 3 > "$0"`, fifo], { stdio: "ignore" }),
+      ),
+    ),
+    (children) =>
+      Effect.sync(() => {
+        for (const child of children) child.kill("SIGKILL");
+      }),
+  );
+
+it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "a FIFO at a file this memory reads is handed to git without tying up the thread pool",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-fifo-read-" });
+      // As many FIFOs as libuv has threads: a blocking open on each would stall every async fs call.
+      const fifos = [0, 1, 2, 3].map((index) => path.join(directory, `fifo-${index}`));
+      for (const fifo of fifos) NodeChildProcess.execFileSync("mkfifo", [fifo]);
+      yield* fifoWriters(fifos);
+      const [reads, probe] = yield* Effect.all(
+        [
+          Effect.forEach(fifos, (fifo) => readBoundedFile(fifo, 4096), {
+            concurrency: "unbounded",
+          }),
+          fileSystem.stat(directory),
+        ],
+        { concurrency: "unbounded" },
+      );
+      assert.deepStrictEqual(
+        reads.map((read) => read.kind),
+        fifos.map(() => "unreadable"),
+      );
+      assert.strictEqual(probe.type, "Directory");
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "a FIFO at a loose object's or a loose ref's path is handed to git",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeObjectStoreFixture("t3-fifo-object-");
+      assert.isNotNull(fixture);
+      const memory = makeCheckpointRefMemory();
+      // Four planted objects at the paths of ids the memory will be asked for.
+      const oids = ["a", "b", "c", "d"].map((letter) => letter.repeat(40));
+      const fifos = oids.map((oid) => {
+        const file = NodePath_join(fixture!.objectsDir, oid.slice(0, 2), oid.slice(2));
+        NodeFS.mkdirSync(NodePath_join(fixture!.objectsDir, oid.slice(0, 2)), { recursive: true });
+        NodeChildProcess.execFileSync("mkfifo", [file]);
+        return file;
+      });
+      yield* fifoWriters(fifos);
+      const reads = memory.looseObjectReads();
+      const facts = yield* Effect.forEach(
+        oids,
+        (oid) => memory.commitFacts(fixture!.repository, oid),
+        {
+          concurrency: "unbounded",
+        },
+      );
+      assert.deepStrictEqual(facts, [null, null, null, null]);
+      // Not a regular file: nothing was read.
+      assert.strictEqual(memory.looseObjectReads(), reads);
+
+      // A remembered ref whose loose file became a FIFO is git's to answer (git sees an empty ref).
+      const ref = "refs/t3/fifo/checkpoint";
+      yield* fixture!.git(["update-ref", ref, fixture!.head]);
+      yield* memory.rememberRef(fixture!.repository, ref, fixture!.head);
+      const refFile = NodePath_join(fixture!.commonDir, ref);
+      NodeFS.rmSync(refFile);
+      NodeChildProcess.execFileSync("mkfifo", [refFile]);
+      yield* fifoWriters([refFile]);
+      assert.isUndefined(yield* memory.resolveRef(fixture!.repository, ref));
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);

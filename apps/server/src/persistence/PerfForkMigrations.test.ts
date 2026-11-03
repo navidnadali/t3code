@@ -10,6 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as References from "effect/References";
+import * as Tracer from "effect/Tracer";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -397,7 +398,42 @@ describe("performance fork migrations", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("does not run a fork migration again once another start restored its objects", () =>
+  it.effect("restores missing objects once, and warns once, when starts run concurrently", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* insertTurnItems;
+      // Each run of migration 1's recount deletes this count row once.
+      yield* sql`CREATE TABLE recounts (n INTEGER)`;
+      yield* sql`
+        CREATE TRIGGER count_recounts BEFORE DELETE ON orchestration_v2_projection_turn_item_counts
+        WHEN old.thread_id = 'thread-a' AND old.run_id = 'run-1'
+        BEGIN INSERT INTO recounts VALUES (1); END
+      `;
+      for (const name of FORK_OBJECTS_ON_TURN_ITEMS) {
+        yield* sql.unsafe(`DROP ${name.endsWith("_idx") ? "INDEX" : "TRIGGER"} ${name}`);
+      }
+      yield* insertMoreTurnItems("while-missing");
+      const warnings: Array<unknown> = [];
+
+      yield* Effect.all([runMigrations(), runMigrations(), runMigrations()], {
+        concurrency: "unbounded",
+      }).pipe(Effect.provide(captureWarnings(warnings)));
+      const [recounts] = yield* sql<{ readonly n: number }>`SELECT COUNT(*) AS n FROM recounts`;
+      assert.strictEqual(recounts?.n, 1);
+      const restoring = (migration: string) =>
+        warnings.filter((warning) => {
+          const text = JSON.stringify(warning);
+          return text.includes("restoring them") && text.includes(migration);
+        });
+      assert.lengthOf(restoring("t3_perf_fork_migrations:1_ProjectionTurnItemCounts"), 1);
+      assert.lengthOf(restoring("t3_perf_fork_migrations:2_TurnItemMessageOrdinalIndex"), 1);
+      assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
+      assert.deepStrictEqual(yield* counts, yield* countedFromItems);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("warns only when this start restores the objects, not when another just did", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -419,44 +455,49 @@ describe("performance fork migrations", () => {
         return created.map((row) => row.sql);
       }).pipe(Effect.provide(atFile));
 
-      // Another server restores the objects between this start's check and its repair, and
-      // leaves a stray count row that running migration 1 again would recount away.
+      // Another start restores the objects right after this start's first check finds them
+      // missing, and leaves a stray count row that this start's recount would remove.
       let restoredElsewhere = false;
-      const anotherStart = Logger.layer([
-        Logger.make(({ logLevel }) => {
-          if (logLevel !== "Warn" || restoredElsewhere) return;
-          restoredElsewhere = true;
-          const db = new NodeSqlite.DatabaseSync(filename);
-          try {
-            db.exec("BEGIN IMMEDIATE");
-            for (const statement of restore) db.exec(statement);
-            db.exec(`
-              DELETE FROM orchestration_v2_projection_turn_item_counts;
-              INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
-              SELECT thread_id, COALESCE(run_id, ''), COUNT(*)
-              FROM orchestration_v2_projection_turn_items GROUP BY thread_id, COALESCE(run_id, '');
-              INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
-              VALUES ('thread-stray', '', 7);
-            `);
-            db.exec("COMMIT");
-          } finally {
-            db.close();
-          }
-        }),
-      ]);
+      const anotherStart = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options);
+          if (options.name !== "inspectPerfForkObjects") return span;
+          const end = span.end.bind(span);
+          span.end = (endTime, exit) => {
+            end(endTime, exit);
+            if (restoredElsewhere) return;
+            restoredElsewhere = true;
+            const db = new NodeSqlite.DatabaseSync(filename);
+            try {
+              db.exec("BEGIN IMMEDIATE");
+              for (const statement of restore) db.exec(statement);
+              db.exec(`
+                DELETE FROM orchestration_v2_projection_turn_item_counts;
+                INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
+                SELECT thread_id, COALESCE(run_id, ''), COUNT(*)
+                FROM orchestration_v2_projection_turn_items GROUP BY thread_id, COALESCE(run_id, '');
+                INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
+                VALUES ('thread-stray', '', 7);
+              `);
+              db.exec("COMMIT");
+            } finally {
+              db.close();
+            }
+          };
+          return span;
+        },
+      });
+      const warnings: Array<unknown> = [];
 
       yield* Effect.gen(function* () {
-        const restoredCounts = yield* Effect.gen(function* () {
-          yield* runMigrations().pipe(Effect.provide(anotherStart));
-          return yield* counts;
-        });
+        yield* runMigrations().pipe(
+          Effect.withTracer(anotherStart),
+          Effect.provide(captureWarnings(warnings)),
+        );
         assert.isTrue(restoredElsewhere);
+        assert.notInclude(JSON.stringify(warnings), "restoring them");
         assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
-        assert.deepInclude(restoredCounts, {
-          thread_id: "thread-stray",
-          run_id: "",
-          item_count: 7,
-        });
+        assert.deepInclude(yield* counts, { thread_id: "thread-stray", run_id: "", item_count: 7 });
       }).pipe(Effect.provide(atFile));
     }).pipe(Effect.provide(NodeServices.layer)),
   );

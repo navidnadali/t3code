@@ -19,6 +19,7 @@ import {
   serverChildEnvironment,
   tokenizeNodeOptions,
 } from "./youngGeneration.ts";
+import { SERVICE_LAUNCHER_CONTEXT_ENV } from "./cloud/serviceProtocol.ts";
 
 const flag = `--max-semi-space-size=${DEFAULT_MAX_SEMI_SPACE_MB}`;
 
@@ -199,9 +200,48 @@ describe("isServerCommand", () => {
     expect(isServerCommand(argv("acp-mcp-bridge"), isDirectory)).toBe(false);
     expect(isServerCommand(argv("__process-spawner"), isDirectory)).toBe(false);
   });
+
+  it("never takes a registered subcommand for a project directory of the same name", () => {
+    // A directory called `app` or `status` beside the user must not turn `t3 app` into a server start.
+    const everythingIsADirectory = () => true;
+    for (const command of [
+      "app",
+      "browser",
+      "environment",
+      "pair",
+      "policy",
+      "status",
+      "theme",
+      "trace",
+      "triage",
+    ]) {
+      expect(isServerCommand(argv(command), everythingIsADirectory), command).toBe(false);
+    }
+    expect(isServerCommand(argv("my-project"), everythingIsADirectory)).toBe(true);
+  });
 });
 
 describe("planYoungGenerationRelaunch", () => {
+  it("names a service launcher that predates the default when it starts the server over IPC without the flag", () => {
+    // A remote update replaces the binary but not the running launcher: the RC2 launcher supplies no
+    // flag, and a server started with an IPC channel cannot relaunch itself. Say so, visibly.
+    const result = plan({
+      hasIpcChannel: true,
+      env: { [SERVICE_LAUNCHER_CONTEXT_ENV]: '{"serviceName":"t3code"}' },
+    });
+    expect(result).toEqual({
+      kind: "keep",
+      reason: expect.stringContaining(
+        "service launcher that predates the young-generation default",
+      ),
+      launcherPredatesDefault: true,
+    });
+    expect(plan({ hasIpcChannel: true })).toEqual({
+      kind: "keep",
+      reason: "started with an IPC channel",
+    });
+  });
+
   it("relaunches a Node entry with the flag in NODE_OPTIONS and the original kept for children", () => {
     const result = plan({
       argv: ["/usr/bin/node", "/opt/t3/dist/bin.mjs", "start", "--no-browser"],

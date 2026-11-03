@@ -2633,6 +2633,7 @@ it.effect("a run recorded before the upgrade, captured after it, keeps its works
         false,
         true,
         Effect.void,
+        true,
         database,
       );
       yield* Effect.gen(function* () {

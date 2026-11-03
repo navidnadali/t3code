@@ -593,6 +593,39 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     }).pipe(Effect.provide(realQueryRunner)),
   );
 
+  // The provider launcher (hand-off on Linux, or Node's spawner when it is off) carries the
+  // CLI's stderr as Node's own spawn does, so the refusal reads the same however it started.
+  it.live("reports the CLI's root refusal the same whichever launcher starts the CLI", () => {
+    const launcherRunner = (knobs: Record<string, string>) =>
+      layerQueryRunner.pipe(
+        Layer.provide(PortScanner.layerTest),
+        Layer.provide(
+          Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
+        ),
+        Layer.provide(
+          WorkerChildProcessSpawner.layerProviderLauncher.pipe(
+            Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-refusal-" })),
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(knobs))),
+          ),
+        ),
+        Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+      );
+    const message = <E>(runner: Layer.Layer<ClaudeAgentSdkQueryRunner, E>) =>
+      startupFailureMessage(rootRefusal).pipe(Effect.scoped, Effect.provide(runner));
+    return Effect.gen(function* () {
+      const nodeSpawner = yield* message(realQueryRunner);
+      assert.include(nodeSpawner, rootRefusal);
+      const handedOff = yield* message(launcherRunner({}));
+      const launcherDirect = yield* message(
+        launcherRunner({ [WorkerChildProcessSpawner.PROVIDER_SPAWNER_ENV]: "direct" }),
+      );
+      assert.deepStrictEqual(
+        { handedOff, launcherDirect },
+        { handedOff: nodeSpawner, launcherDirect: nodeSpawner },
+      );
+    });
+  });
+
   // The CLI keeps running its turn after its pipes close, so a server that
   // crashed would leave it working next to the session it resumes.
   it.effect.each([

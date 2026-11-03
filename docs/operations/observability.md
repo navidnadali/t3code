@@ -202,8 +202,8 @@ standard error and exit; and it keeps working when the spawner process dies.
 Everything else the server starts still forks it on Linux:
 
 - the sessions and checks of Grok, which exits about 2 s after its parent process dies (so a spawner
-  that died would end its sessions); of Fx and Antigravity, whose CLIs could not be run to verify
-  them; and of ACP registry agents, which can be any agent the registry or a local command names
+  that died would end its sessions); of Fx, Antigravity and Kiro, whose CLIs could not be run to
+  verify them; and of ACP registry agents, which can be any agent the registry or a local command names
   (Gemini, verified, behaves);
 - the Claude capability probe the Agent SDK starts itself (2 at start-up, then on stale health
   checks);

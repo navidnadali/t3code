@@ -952,7 +952,7 @@ export interface OrchestrationEffectDaemonOptions {
 // and are decoded on the main thread; more workers than that plus one moved the queue from the
 // outbox to the readers on the bench and slowed every small read, so the count stays at 4.
 const DEFAULT_EFFECT_WORKER_CONCURRENCY = 4;
-export const EFFECT_WORKER_MAX_CONCURRENCY = 256;
+export const EFFECT_WORKER_MAX_CONCURRENCY = EffectOutbox.EFFECT_WORKER_MAX_CONCURRENCY;
 const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
 // From this event loop delay p99 over a second, turn starts stay in the outbox; below half of it
 // they resume. Two samples either way, so a single burst switches nothing.

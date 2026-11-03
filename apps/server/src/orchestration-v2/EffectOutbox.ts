@@ -29,6 +29,9 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import { forkParked } from "../serverActivation.ts";
 
+/** The largest effect worker pool the knob allows; the wake-up queue holds a token per worker. */
+export const EFFECT_WORKER_MAX_CONCURRENCY = 256;
+
 export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
@@ -296,7 +299,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
   EffectOutboxV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    const available = yield* Queue.dropping<void>(64);
+    // One token per worker is the most that is ever useful: a reopened gate wakes the whole pool
+    // with one call, so the queue holds as many as the largest pool the knob allows.
+    const available = yield* Queue.dropping<void>(EFFECT_WORKER_MAX_CONCURRENCY);
     const cancellationSignals = new Map<string, Deferred.Deferred<void>>();
     const settledSignals = new Map<string, Deferred.Deferred<void>>();
     const signalSettled = (effectIds: ReadonlyArray<string>) =>
@@ -313,7 +318,10 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
     const notifyAvailable = (count = 1) =>
       Queue.offerAll(
         available,
-        Array.from({ length: Math.min(64, Math.max(0, Math.floor(count))) }, () => undefined),
+        Array.from(
+          { length: Math.min(EFFECT_WORKER_MAX_CONCURRENCY, Math.max(0, Math.floor(count))) },
+          () => undefined,
+        ),
       ).pipe(Effect.asVoid);
     // Retry backoff must block later effects so turns cannot race a pending rollback.
     const claimableCandidatePredicate = (

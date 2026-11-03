@@ -320,7 +320,8 @@ const DESTROYED_STDIN: SerializedError = {
   code: "ERR_STREAM_DESTROYED",
 };
 
-const makeRemoteHost = (options: {
+/** The host that drives a spawner over a transport (exported for protocol tests). */
+export const makeRemoteHost = (options: {
   readonly open: (events: TransportEvents) => Transport;
   readonly windowBytes: number;
   readonly stoppedMessage: string;

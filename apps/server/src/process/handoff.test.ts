@@ -197,6 +197,48 @@ process.stdout.write("ready\\n");
 setInterval(() => {}, 1000);
 `;
 
+// The host alone over a transport the test plays: which start deadlines are armed as reports arrive.
+describe("hand-off start deadlines", () => {
+  it.each([
+    { order: ["handoff-queued", "started"] },
+    { order: ["started", "handoff-queued"] },
+  ] as const)("keeps an active start's deadline when its reports arrive as $order", ({ order }) => {
+    const armed = new Set<object>();
+    let events: { readonly onMessage: (message: unknown) => void } | undefined;
+    const host = WorkerChildProcessSpawner.makeRemoteHost({
+      open: (opened) => {
+        events = opened;
+        return { post: () => {}, ref: () => {}, unref: () => {}, terminate: async () => {} };
+      },
+      windowBytes: 65_536,
+      stoppedMessage: "stopped",
+      closedMessage: "closed",
+      restarts: 1,
+      startDeadline: () => {
+        const deadline = {};
+        armed.add(deadline);
+        return () => armed.delete(deadline);
+      },
+      handoffShim: () => ({ command: "shim", args: [] }),
+    });
+    const child = host.spawnHandoff(
+      "provider",
+      [],
+      { stdio: ["ignore", "ignore", "ignore"] },
+      { fds: [0, 1, 2] },
+      { onSpawn: () => {}, onError: () => {}, onUnavailable: () => {} },
+    );
+    // Its PID report travels on the spawner's stdout, its queue report on the channel: either may
+    // come first. Once the spawner has started it, the start must be answered in time.
+    for (const t of order) {
+      events!.onMessage(
+        t === "started" ? { t, id: child.id, pid: 4242, startTime: "1" } : { t, id: child.id },
+      );
+    }
+    expect(armed.size).toBe(1);
+  });
+});
+
 describe("provider process hand-off", () => {
   it.live.skipIf(!linux)(
     "hands off 64 concurrent processes without losing a line of their output",

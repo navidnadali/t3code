@@ -2324,6 +2324,47 @@ it.effect.each(["removed", "retargeted"] as const)(
     ),
 );
 
+// Run 3 works in B through a symlink; back in A, the symlink is pointed at A. Run 3's checkpoint
+// was taken in B, so a file revert to it from A is refused, though its recorded spelling names A now.
+it.effect(
+  "a file revert to a run that worked through a symlink, since pointed at this worktree, is refused",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* nextTurnSelectionHarness("symlink-pointed-here");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const thread = yield* switchedWorktreeThread(harness);
+          const link = path.join(
+            yield* fs.makeTempDirectoryScoped({ prefix: "t3-symlink-pointed-here-" }),
+            "link",
+          );
+          yield* fs.symlink(thread.other, link);
+          yield* thread.switchTo(link);
+          const third = yield* thread.nextRun(link, "edited-by-third.txt");
+          yield* thread.switchTo(harness.cwd);
+          yield* fs.remove(link);
+          yield* fs.symlink(harness.cwd, link);
+          const checkpoint = yield* thread.checkpointOf(third.runId);
+          const refused = yield* orchestrator
+            .dispatch({
+              type: "checkpoint.rollback",
+              commandId: CommandId.make("run-3-files"),
+              threadId: thread.threadId,
+              scopeId: checkpoint.scopeId,
+              checkpointId: checkpoint.id,
+              restoreFiles: true,
+            })
+            .pipe(Effect.flip);
+          assert.include(String(refused.cause), "another worktree");
+          assert.isFalse(yield* fs.exists(path.join(harness.cwd, "only-on-b.txt")));
+        }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+      }),
+    ),
+);
+
 it.effect("queues a plain send behind the stopped queue and releases its hold", () =>
   Effect.scoped(
     Effect.gen(function* () {

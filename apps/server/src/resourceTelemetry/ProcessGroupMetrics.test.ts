@@ -94,28 +94,6 @@ describe("groupProcesses through a spawner process", () => {
   });
 });
 
-describe("groupProcesses after the spawner process died", () => {
-  it("books a provider that outlived the server's spawner as the server's own", () => {
-    const totals = groupProcesses(
-      [
-        process(10, 1, "node", "server"),
-        // Re-parented to init when its spawner died; still the server's provider.
-        process(16, 1, "claude"),
-        process(17, 16, "bash"),
-        process(30, 1, "claude"),
-      ],
-      new Set(),
-      new Set([16]),
-    );
-
-    assert.deepStrictEqual(Object.fromEntries(totals), {
-      server: { residentBytes: 10_000, cpuPercent: 10, count: 1 },
-      claude: { residentBytes: 33_000, cpuPercent: 33, count: 2 },
-      other: { residentBytes: 30_000, cpuPercent: 30, count: 1 },
-    });
-  });
-});
-
 describe("ProcessGroupMetrics.layer", () => {
   it.effect("logs the first failed sample and the recovery, not every repeat", () => {
     const logs: Array<string> = [];

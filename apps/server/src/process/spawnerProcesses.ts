@@ -10,7 +10,7 @@ const adopted = new Set<number>();
 
 /**
  * PIDs of handed-off providers that outlived their spawner process (re-parented elsewhere) while
- * they run: they stay the server's own children for process attribution and the port tools.
+ * they run: the port tools treat them as the server's own children.
  */
 export const adoptedProcessIds: ReadonlySet<number> = adopted;
 

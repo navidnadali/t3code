@@ -6,7 +6,7 @@ import * as Metric from "effect/Metric";
 import * as Ref from "effect/Ref";
 
 import * as ServerConfig from "../config.ts";
-import { adoptedProcessIds, spawnerProcessIds } from "../process/spawnerProcesses.ts";
+import { spawnerProcessIds } from "../process/spawnerProcesses.ts";
 import { metricAttributes } from "../observability/Metrics.ts";
 import * as ResourceTelemetry from "./ResourceTelemetry.ts";
 
@@ -61,14 +61,10 @@ export interface ProcessGroupTotals {
   readonly count: number;
 }
 
-/**
- * `spawners`: the server's spawner processes, whose children are grouped as the server's; `adopted`:
- * providers that outlived their spawner, grouped as the server's children themselves.
- */
+/** `spawners`: the server's spawner processes; what they start is grouped as the server's children. */
 export function groupProcesses(
   processes: ReadonlyArray<ResourceTelemetryProcess>,
   spawners: ReadonlySet<number> = new Set(),
-  adopted: ReadonlySet<number> = new Set(),
 ): ReadonlyMap<string, ProcessGroupTotals> {
   const byPid = new Map(processes.map((process) => [process.identity.pid, process]));
   const serverPid = processes.find((process) => process.category === "server")?.identity.pid;
@@ -79,11 +75,7 @@ export function groupProcesses(
     let current = process;
     // Bounded by the table size, in case a reused PID makes the parent chain loop.
     for (let step = 0; step < processes.length; step++) {
-      if (
-        current.ppid === serverPid ||
-        spawners.has(current.ppid) ||
-        adopted.has(current.identity.pid)
-      ) {
+      if (current.ppid === serverPid || spawners.has(current.ppid)) {
         return childGroup(current.name, current.command);
       }
       const parent = byPid.get(current.ppid);
@@ -118,11 +110,7 @@ export const layer = Layer.effectDiscard(
     // A group that empties reads zero rather than holding its last value.
     const seen = new Set<string>();
     const sample = Effect.fn("ProcessGroupMetrics.sample")(function* () {
-      const totals = groupProcesses(
-        (yield* telemetry.refresh).processes,
-        spawnerProcessIds,
-        adoptedProcessIds,
-      );
+      const totals = groupProcesses((yield* telemetry.refresh).processes, spawnerProcessIds);
       for (const group of totals.keys()) seen.add(group);
       for (const group of seen) {
         const total = totals.get(group) ?? { residentBytes: 0, cpuPercent: 0, count: 0 };

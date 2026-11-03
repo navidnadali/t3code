@@ -237,6 +237,30 @@ it.effect("stops counting a slot held longer than a turn start may take", () =>
   }),
 );
 
+it.effect("stops sampling when expired slots leave the open gate nothing to act on", () =>
+  Effect.gen(function* () {
+    const { admission, acquired, released } = yield* makeHarness(4);
+    const first = yield* reserve(admission);
+    const second = yield* reserve(admission);
+    assert.isTrue(yield* sampling(admission));
+    // Calm throughout: both starts hang past the bound, so nothing is in flight and the source,
+    // which runs only while the gate can act, must stop with them.
+    yield* TestClock.adjust(EffectAdmission.SLOT_MAX_HOLD);
+    assert.deepEqual(yield* admission.state, {
+      allowed: 4,
+      inFlight: 0,
+      saturated: false,
+      sampling: false,
+    });
+    assert.equal(yield* Ref.get(released), 1);
+    // The late releases of the expired slots change nothing.
+    yield* first!;
+    yield* second!;
+    assert.equal(yield* Ref.get(acquired), 1);
+    assert.isFalse(yield* sampling(admission));
+  }),
+);
+
 it.effect("recovers from saturation at a small mark too", () =>
   Effect.gen(function* () {
     const { admission, pressure, restored } = yield* makeHarness(4, 5);

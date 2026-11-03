@@ -1095,3 +1095,53 @@ it.effect("a freed slot wakes one worker, which claims the next turn start", () 
     yield* Fiber.interrupt(daemon);
   }),
 );
+
+it.effect("an empty claim gives its slot back without waking a worker", () =>
+  Effect.gen(function* () {
+    const workerId = "worker-empty-claim";
+    const available = yield* Queue.unbounded<void>();
+    const claims = yield* Ref.make(0);
+    const wakeUps = yield* Ref.make(0);
+    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () => Ref.update(claims, (count) => count + 1).pipe(Effect.as(Option.none())),
+      nextClaimableAt: Effect.succeedNone,
+      nextClaimableAtExcluding: () => Effect.succeedNone,
+      awaitAvailable: Queue.take(available),
+      notifyAvailable: (count = 1) =>
+        Ref.update(wakeUps, (total) => total + count).pipe(
+          Effect.andThen(
+            Queue.offerAll(
+              available,
+              Array.from({ length: count }, () => undefined),
+            ),
+          ),
+          Effect.asVoid,
+        ),
+    });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({ execute: () => Effect.void }),
+    );
+    // One worker, so its own slot is the whole allowance: a wake-up with nothing to claim must end
+    // in the liveness sleep, not in the slot's return waking the worker again without end.
+    const daemon = yield* EffectWorker.runDaemonWithOptions({
+      concurrency: 1,
+      admission: { delayAboveMs: 40 },
+      pressure: Effect.succeed(Effect.succeed(5)),
+      livenessPollIntervalMs: 60_000,
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layerWithOptions({ workerId }).pipe(
+          Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+        ),
+      ),
+      Effect.forkChild,
+    );
+    yield* Queue.offer(available, undefined);
+    yield* TestClock.adjust("3 seconds");
+    // The worker's first probe and the one the wake-up caused, and no wake-up of its own making.
+    assert.equal(yield* Ref.get(claims), 2);
+    assert.equal(yield* Ref.get(wakeUps), 0);
+    yield* Fiber.interrupt(daemon);
+  }),
+);

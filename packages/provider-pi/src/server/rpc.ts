@@ -289,10 +289,15 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     });
 
   // Watch exit before reading stdout so immediate crashes populate exitDeferred for diagnosis.
+  // Exited either way: an exit without a code (a signal, or a status nobody could read) leaves no
+  // process of pi's to stop, and its PID may name another process by teardown.
   yield* child.exitCode.pipe(
     Effect.matchEffect({
       onFailure: (cause) =>
-        Deferred.fail(exitDeferred, new PiRpcError({ operation: "exit", cause })),
+        Effect.suspend(() => {
+          childExited = true;
+          return Deferred.fail(exitDeferred, new PiRpcError({ operation: "exit", cause }));
+        }),
       onSuccess: (code) =>
         Effect.suspend(() => {
           childExited = true;

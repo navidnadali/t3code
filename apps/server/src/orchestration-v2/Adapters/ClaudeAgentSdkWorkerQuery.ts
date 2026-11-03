@@ -203,10 +203,19 @@ const errorJson = (error: unknown): string => {
   try {
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   } catch (cause) {
-    const reason = cause instanceof Error ? cause.message : "unknown";
-    return JSON.stringify({
-      error: `A T3 Code callback failed with an error that cannot be sent to Claude: ${reason}`,
-    });
+    return JSON.stringify({ error: `${UNSENDABLE_ERROR}${unsendableReason(cause)}` });
+  }
+};
+
+const UNSENDABLE_ERROR = "A T3 Code callback failed with an error that cannot be sent to Claude";
+
+// Why JSON failed, when that can be read as text; reading it must not throw on main.
+const unsendableReason = (cause: unknown) => {
+  try {
+    const message: unknown = cause instanceof Error ? cause.message : undefined;
+    return typeof message === "string" ? `: ${message}` : "";
+  } catch {
+    return "";
   }
 };
 

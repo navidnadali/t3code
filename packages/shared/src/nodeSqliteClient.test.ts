@@ -425,6 +425,12 @@ it.effect("serves another read while a read-only transaction is open", () =>
 
 // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary that lets the worker's queued messages land, not a wait for time
 const eventLoopTurn = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
+// The failure an effect ends with (a success fails the test), typed as its error.
+const failureOf = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.map(Effect.exit(effect), (exit) => {
+    if (Exit.isSuccess(exit)) return assert.fail("expected a failure");
+    return Cause.squash(exit.cause) as E;
+  });
 
 const holdReader = (sql: SqlClient.SqlClient, name: string) =>
   Effect.gen(function* () {
@@ -1555,10 +1561,10 @@ it.effect("leaves a transaction control with bindings or a raw result to SQLite"
       const raw = yield* sql
         .withTransaction(
           Effect.gen(function* () {
-            const begun = yield* sql.unsafe("BEGIN").raw.pipe(Effect.flip);
+            const begun = yield* failureOf(sql.unsafe("BEGIN").raw);
             assert.include(String(begun.reason.cause), "within a transaction");
             assert.equal(yield* countEntries(sql), 1);
-            return yield* sql.unsafe("RELEASE SAVEPOINT missing").raw.pipe(Effect.flip);
+            return yield* failureOf(sql.unsafe("RELEASE SAVEPOINT missing").raw);
           }),
         )
         .pipe(SqliteClient.readOnly);
@@ -1596,14 +1602,16 @@ it.effect("keeps its transaction bookkeeping in step with controls the worker ra
       }).pipe(SqliteClient.readOnly);
       assert.deepEqual(manual, { changes: 0, lastInsertRowid: 0 });
       // A raw COMMIT inside a managed transaction leaves its COMMIT with nothing to end.
-      const mixed = yield* sql
-        .withTransaction(
-          Effect.gen(function* () {
-            assert.equal(yield* countEntries(sql), 1);
-            return yield* sql.unsafe("COMMIT").raw;
-          }),
-        )
-        .pipe(SqliteClient.readOnly, Effect.flip);
+      const mixed = yield* failureOf(
+        sql
+          .withTransaction(
+            Effect.gen(function* () {
+              assert.equal(yield* countEntries(sql), 1);
+              return yield* sql.unsafe("COMMIT").raw;
+            }),
+          )
+          .pipe(SqliteClient.readOnly),
+      );
       assert.include(String(mixed.reason.cause), "no transaction is active");
       // A top-level savepoint is a transaction too: the managed one fails, the savepoint survives.
       const savepoint = yield* Effect.gen(function* () {

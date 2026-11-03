@@ -3213,3 +3213,29 @@ it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
       assert.isUndefined(yield* memory.resolveRef(fixture!.repository, ref));
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
+
+it.effect(
+  "a symbolic ref too large to classify is not cached, so its target's deletion is seen",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const h = yield* makeTurnHarness("t3-checkpoint-padded-symref-");
+      yield* h.writeBoth("file.txt", "initial\n");
+      yield* h.gitBoth(["add", "."]);
+      yield* h.commitBoth("initial");
+      // main becomes a symbolic ref to real, padded past what the memory reads; git trims the padding.
+      yield* h.gitBoth(["branch", "real"]);
+      for (const cwd of [h.repos.warm, h.repos.cold]) {
+        yield* fileSystem.writeFileString(
+          path.join(cwd, ".git", "refs", "heads", "main"),
+          `ref: refs/heads/real${" ".repeat(5000)}\n`,
+        );
+      }
+      yield* h.turn(1);
+      yield* h.turn(2);
+      yield* h.gitBoth(["update-ref", "-d", "refs/heads/real"]);
+      const unborn = yield* h.turn(3);
+      assert.isNull(unborn.failed);
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);

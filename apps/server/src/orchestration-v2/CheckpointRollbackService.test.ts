@@ -789,9 +789,10 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
         }),
     );
 
-    // A workspace that no longer exists has no refs left to drop; its checkpoints are still stale.
+    // A workspace that no longer exists may share its repository (and refs) with one that does: its
+    // refs are dropped through the thread's other workspaces, and its checkpoints are still stale.
     it.effect.each(["exists", "was removed"] as const)(
-      "marks stale the later checkpoints of every workspace scope, dropping refs where each was taken (second workspace %s)",
+      "marks stale the later checkpoints of every workspace scope and drops their refs (second workspace %s)",
       (secondWorkspace) =>
         Effect.gen(function* () {
           const fileSystem = yield* FileSystem.FileSystem;
@@ -810,9 +811,10 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
 
           assert.sameDeepMembers(history.deletions, [
             { cwd: process.cwd(), ids: [3, 4].map(checkpointId).toSorted() },
-            ...(secondWorkspace === "exists"
-              ? [{ cwd: directory, ids: [baselineB, ...[5, 6].map(checkpointId)].toSorted() }]
-              : []),
+            {
+              cwd: secondWorkspace === "exists" ? directory : process.cwd(),
+              ids: [baselineB, ...[5, 6].map(checkpointId)].toSorted(),
+            },
           ]);
           const checkpoints = yield* sql<{ id: string; status: string }>`
             SELECT checkpoint_id AS id, status FROM orchestration_v2_projection_checkpoints

@@ -1474,9 +1474,12 @@ it.effect("a run records its workspace when it is scoped, before its turn starts
 );
 
 // A thread whose runs each edit a file in the worktree the thread is in when the run is sent:
-// run 1 in worktree A, then switchTo and nextRun. B is a worktree of the same repo (one branch
-// each, refs shared) with a file of its own committed.
-const worktreeThread = (harness: Effect.Success<ReturnType<typeof nextTurnSelectionHarness>>) =>
+// run 1 in worktree A (ended unless firstEnds is false), then switchTo and nextRun. B is a worktree
+// of the same repo (one branch each, refs shared) with a file of its own committed.
+const worktreeThread = (
+  harness: Effect.Success<ReturnType<typeof nextTurnSelectionHarness>>,
+  options: { readonly firstEnds?: boolean } = {},
+) =>
   Effect.gen(function* () {
     const { cwd, events, started, startFirstTurn } = harness;
     const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1538,11 +1541,12 @@ const worktreeThread = (harness: Effect.Success<ReturnType<typeof nextTurnSelect
     const threadId = yield* startFirstTurn;
     const first = started[0]!;
     yield* fs.writeFileString(path.join(cwd, "edited-by-first.txt"), "first\n");
-    yield* endTurn(first.runId, first.runOrdinal);
+    if (options.firstEnds !== false) yield* endTurn(first.runId, first.runOrdinal);
+    let switches = 0;
     const switchTo = (worktreePath: string) =>
       orchestrator.dispatch({
         type: "thread.metadata.update",
-        commandId: CommandId.make(`switch:${started.length}`),
+        commandId: CommandId.make(`switch:${switches++}`),
         threadId,
         worktreePath,
       });
@@ -1589,7 +1593,7 @@ const worktreeThread = (harness: Effect.Success<ReturnType<typeof nextTurnSelect
             projection.checkpoints.find((checkpoint) => checkpoint.runId === runId)!,
           ),
         );
-    return { threadId, other, first, switchTo, nextRun, checkpointOf, git };
+    return { threadId, other, first, switchTo, nextRun, endTurn, checkpointOf, git };
   });
 
 // Run 1 in A, then run 2 in B.
@@ -1780,6 +1784,130 @@ it.effect("a rollback marks stale the later checkpoints of every workspace scope
             0,
           );
         }
+      }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+    }),
+  ),
+);
+
+// Prompts queued before and after a worktree switch both start in the worktree the thread is in
+// then (B); each is checkpointed there, not in the worktree it was queued in.
+it.effect("prompts queued around a worktree switch are checkpointed where they start", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* nextTurnSelectionHarness("queued-around-switch");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { started } = harness;
+        const thread = yield* worktreeThread(harness, { firstEnds: false });
+        const queue = (text: string) =>
+          orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(text),
+            threadId: thread.threadId,
+            messageId: MessageId.make(`message:${text}`),
+            text,
+            attachments: [],
+            modelSelection: runSelection,
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+        yield* queue("queued-in-a");
+        yield* thread.switchTo(thread.other);
+        yield* queue("queued-in-b");
+        const queued: Array<(typeof started)[number]> = [];
+        let ending = thread.first;
+        for (const file of ["edited-by-queued-in-a.txt", "edited-by-queued-in-b.txt"]) {
+          const index = started.length;
+          const earlier = new Set(started.map((turn) => turn.attemptId));
+          const running = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "provider-turn.updated" &&
+                event.payload.status === "running" &&
+                event.payload.runAttemptId !== null &&
+                !earlier.has(event.payload.runAttemptId),
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* thread.endTurn(ending.runId, ending.runOrdinal);
+          yield* orchestrator.resumeQueuedRuns;
+          yield* worker.drain();
+          yield* Fiber.join(running);
+          ending = started[index]!;
+          queued.push(ending);
+          yield* fs.writeFileString(path.join(thread.other, file), `${file}\n`);
+        }
+        yield* thread.endTurn(ending.runId, ending.runOrdinal);
+        const firstScopeId = (yield* thread.checkpointOf(thread.first.runId)).scopeId;
+        const checkpoints = yield* Effect.forEach(queued, (run) => thread.checkpointOf(run.runId));
+        assert.deepEqual(
+          checkpoints.map((checkpoint) => checkpoint.files.map((file) => file.path)),
+          [["edited-by-queued-in-a.txt"], ["edited-by-queued-in-b.txt"]],
+        );
+        assert.equal(checkpoints[0]!.scopeId, checkpoints[1]!.scopeId);
+        assert.notEqual(checkpoints[0]!.scopeId, firstScopeId);
+      }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
+    }),
+  ),
+);
+
+// Run 1 in A, runs 2 and 3 in B; back in A, B is removed, then a rewind to run 1. B's stale refs
+// are dropped through A (one repository), so B recreated at the same path takes a fresh baseline.
+it.effect("a rewind drops a removed worktree's stale refs; recreated, it diffs afresh", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* nextTurnSelectionHarness("rewind-removed-worktree");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const thread = yield* switchedWorktreeThread(harness);
+        yield* thread.nextRun(thread.other, "edited-by-third.txt");
+        yield* thread.switchTo(harness.cwd);
+        assert.equal(
+          yield* thread.git(harness.cwd, "worktree", "remove", "--force", thread.other),
+          0,
+        );
+        const target = yield* thread.checkpointOf(thread.first.runId);
+        const laterInB = (yield* orchestrator.getThreadProjection(
+          thread.threadId,
+        )).checkpoints.filter(
+          (checkpoint) =>
+            checkpoint.status === "ready" &&
+            checkpoint.scopeId !== target.scopeId &&
+            checkpoint.ordinalWithinScope > 1,
+        );
+        assert.lengthOf(laterInB, 2);
+        yield* orchestrator.dispatch({
+          type: "checkpoint.rollback",
+          commandId: CommandId.make("revert-conversation"),
+          threadId: thread.threadId,
+          scopeId: target.scopeId,
+          checkpointId: target.id,
+          restoreFiles: false,
+        });
+        yield* worker.drain();
+        for (const checkpoint of laterInB) {
+          assert.notEqual(
+            yield* thread.git(harness.cwd, "rev-parse", "--verify", "--quiet", checkpoint.ref),
+            0,
+          );
+        }
+        assert.equal(
+          yield* thread.git(harness.cwd, "worktree", "add", thread.other, "switched"),
+          0,
+        );
+        yield* thread.switchTo(thread.other);
+        const fourth = yield* thread.nextRun(thread.other, "edited-by-fourth.txt");
+        assert.deepEqual(
+          (yield* thread.checkpointOf(fourth.runId)).files.map((file) => file.path),
+          ["edited-by-fourth.txt"],
+        );
       }).pipe(Effect.provide(Layer.merge(harness.layer, NodeServices.layer)));
     }),
   ),

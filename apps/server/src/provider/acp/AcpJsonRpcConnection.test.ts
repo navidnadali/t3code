@@ -1541,7 +1541,7 @@ describe("AcpSessionRuntime", () => {
           Exit.succeed({ stopReason: "cancelled", _meta: { nativeCancel: true } }),
         );
         expect(slow.offloadedLines > 0).toBe(workers > 0);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect.each(
@@ -1581,7 +1581,7 @@ describe("AcpSessionRuntime", () => {
           Exit.succeed({ stopReason: "cancelled", _meta: { nativeCancel: true } }),
         );
         expect(run.offloadedLines > 0).toBe(workers > 0);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect.each([0, 2])(
@@ -1620,7 +1620,7 @@ describe("AcpSessionRuntime", () => {
             ?.map(({ status }) => status),
         ).toEqual(["started", "failed"]);
         expect(run.offloadedLines > 0).toBe(workers > 0);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect("closes a runtime while its prompt's started record is still appending", () =>
@@ -1656,7 +1656,7 @@ describe("AcpSessionRuntime", () => {
       yield* Deferred.await(appendCut);
       yield* Fiber.join(closing);
       expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect("ends a prompt whose runtime closes before the prompt is queued", () =>
@@ -1688,7 +1688,7 @@ describe("AcpSessionRuntime", () => {
       yield* Fiber.join(yield* Deferred.await(closing));
       expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
       expect(yield* Deferred.isDone(dispatched)).toBe(true);
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect("fails a prompt whose started logger throws", () =>
@@ -1705,7 +1705,7 @@ describe("AcpSessionRuntime", () => {
       expect(
         yield* runtime.prompt({ prompt: [{ type: "text", text: "first" }] }).pipe(Effect.exit),
       ).toEqual(Exit.die(loggerFailure));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect.each(["dies", "throws"] as const)(
@@ -1730,7 +1730,7 @@ describe("AcpSessionRuntime", () => {
         expect(run.promptExit).toEqual(Exit.die(appendFailure));
         expect(records.some(({ method }) => method === "session/prompt")).toBe(false);
         expect(run.received).toEqual(["session/prompt", "session/cancel", "_test/finish-cancel"]);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect("writes a held-back backlog of request records and returns every call", () =>
@@ -1779,7 +1779,7 @@ describe("AcpSessionRuntime", () => {
       expect(written.filter((record) => record.startsWith("_test/environment"))).toHaveLength(
         2 * requests,
       );
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect(
@@ -1817,7 +1817,7 @@ describe("AcpSessionRuntime", () => {
           "_test/environment started",
           "_test/environment failed",
         ]);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect(
@@ -1869,8 +1869,9 @@ describe("AcpSessionRuntime", () => {
         expect(warnings).toEqual([]);
       }).pipe(
         Effect.provide(
-          Layer.merge(
+          Layer.mergeAll(
             NodeServices.layer,
+            NodeCrypto.layer,
             Logger.layer([
               Logger.make(({ logLevel, message, fiber }) => {
                 if (logLevel === "Warn") {
@@ -1902,7 +1903,7 @@ describe("AcpSessionRuntime", () => {
 
       yield* Scope.close(runtimeScope, Exit.void);
       expect(yield* Fiber.await(prompt)).toEqual(Exit.succeed({ stopReason: "cancelled" }));
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect(
@@ -1961,7 +1962,7 @@ describe("AcpSessionRuntime", () => {
         expect(written).toEqual(produced);
       }).pipe(
         Effect.scoped,
-        Effect.provide(NodeServices.layer),
+        Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
         Effect.ensuring(
           Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true })),
         ),

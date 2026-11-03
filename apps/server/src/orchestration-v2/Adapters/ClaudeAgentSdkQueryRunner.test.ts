@@ -646,7 +646,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
           WorkerChildProcessSpawner.layerProviderLauncher.pipe(
             Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-handoff-" })),
             Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))),
-            Layer.provide(NodeServices.layer),
+            Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
           ),
         ),
       ),
@@ -737,7 +737,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
             Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))),
           ),
         ),
-        Layer.provideMerge(NodeServices.layer),
+        Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
       );
       return Effect.gen(function* () {
         const cli = fakeClaudeCli(

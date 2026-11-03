@@ -1,4 +1,5 @@
 import type { CanUseTool, PermissionResult, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import type {
   ProviderAdapterV2,
@@ -203,7 +204,7 @@ const layerWireReplayQueryRunner = (
           }),
         ),
         Layer.provide(Layer.succeed(ClaudeAgentSdkWorkerPool, input.pool)),
-        Layer.provide(NodeServices.layer),
+        Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
       ),
     ),
   );

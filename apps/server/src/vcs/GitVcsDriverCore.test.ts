@@ -52,7 +52,7 @@ const decodeVcsRef = Schema.decodeUnknownSync(VcsRef);
 const decodeVcsListRefsResult = Schema.decodeUnknownSync(VcsListRefsResult);
 
 // The per-call common-directory probe; the config snapshot's own rev-parse also names the common directory.
-const isCommonDirProbe = (args: ReadonlyArray<string>) =>
+const isCommonDirProbe = (args: ReadonlyArray<unknown>) =>
   args.length === 2 && args[0] === "rev-parse" && args[1] === "--git-common-dir";
 
 const layerServerConfig = ServerConfig.layerTest(process.cwd(), {
@@ -364,7 +364,7 @@ const makeCountingDriver = Effect.gen(function* () {
   const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
   const spawned: Array<ReadonlyArray<string>> = [];
   const spawner = ChildProcessSpawner.make((command) => {
-    if (ChildProcess.isStandardCommand(command)) spawned.push(command.args);
+    if (ChildProcess.isStandardCommand(command)) spawned.push(command.args.map(String));
     return delegate.spawn(command);
   });
   const driver = yield* makeGitVcsDriverCore().pipe(
@@ -818,7 +818,7 @@ describe("config reads", () => {
         const spawned: Array<ReadonlyArray<string>> = [];
         const spawner = ChildProcessSpawner.make((command) => {
           if (!ChildProcess.isStandardCommand(command)) return delegate.spawn(command);
-          spawned.push(command.args);
+          spawned.push(command.args.map(String));
           if (command.args[0] !== "var") return delegate.spawn(command);
           return Effect.succeed(
             ChildProcessSpawner.makeHandle({

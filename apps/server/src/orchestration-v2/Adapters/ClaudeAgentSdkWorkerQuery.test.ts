@@ -10,6 +10,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
@@ -165,7 +166,7 @@ const withRunner = <A, E>(
         }),
       ),
       Layer.provide(Layer.succeed(ClaudeAgentSdkWorkerPool, pool)),
-      Layer.provide(NodeServices.layer),
+      Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
     );
     return yield* Effect.gen(function* () {
       return yield* use({ runner: yield* ClaudeAgentSdkQueryRunner, logs, recorded });
@@ -1756,7 +1757,7 @@ const runWired = (env: Record<string, string>) =>
       Layer.provide(
         Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
       ),
-      Layer.provide(NodeServices.layer),
+      Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
     );
     const openedBefore = workers.opened.length;
     const messages = yield* Effect.gen(function* () {
@@ -1770,7 +1771,7 @@ const runWired = (env: Record<string, string>) =>
       stages: workers.opened.slice(openedBefore).map((opened) => opened.stage),
       last: messages.at(-1)?.type,
     };
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
 
 describe("Claude Agent SDK worker wiring", () => {
   it.effect("runs Claude queries on a worker when the environment opts in", () =>

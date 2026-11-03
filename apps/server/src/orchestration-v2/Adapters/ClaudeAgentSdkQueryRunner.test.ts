@@ -489,6 +489,9 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
           undefined,
           providerLauncher,
         ) as NodeChildProcess.ChildProcess & { readonly held?: ReadonlyArray<NodeStream.Duplex> };
+        // Its descriptors are the server's once it has started (a handed-off CLI can open its
+        // fifo before the spawner's answer reaches the server).
+        const started = new Promise<void>((resolve) => child.once("spawn", () => resolve()));
         yield* Effect.addFinalizer(() =>
           Effect.sync(() => {
             try {
@@ -501,7 +504,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
         const turnStarted = new Promise<void>((resolve) => alive.once("open", () => resolve()));
         const turnStopped = new Promise<void>((resolve) => alive.once("close", () => resolve()));
         alive.resume();
-        yield* Effect.promise(() => turnStarted);
+        yield* Effect.promise(() => Promise.all([started, turnStarted]));
 
         // A dying server's descriptors close; the kernel would do this for it.
         for (const pipe of [...child.stdio, ...(child.held ?? [])]) pipe?.destroy();

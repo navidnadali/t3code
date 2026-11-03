@@ -104,13 +104,27 @@ export class ProcessOutputLimitError extends Schema.TaggedError<ProcessOutputLim
   }
 }
 
+// Why a stream failed: the messages along its cause chain, past the platform errors wrapping them.
+const causeMessages = (cause: unknown): ReadonlyArray<string> => {
+  const messages: Array<string> = [];
+  let current = cause;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth++) {
+    if (!PlatformError.isPlatformError(current)) messages.push(current.message);
+    current = current.cause;
+  }
+  return messages;
+};
+
 export class ProcessReadError extends Schema.TaggedError<ProcessReadError>()("ProcessReadError", {
   ...ProcessInvocationFields,
   stream: Schema.Literals(["stdout", "stderr", "exitCode"]),
   cause: Schema.Defect(),
 }) {
   override get message(): string {
-    return `Failed to read ${this.stream} for process ${formatProcessInvocation(this)}`;
+    return [
+      `Failed to read ${this.stream} for process ${formatProcessInvocation(this)}`,
+      ...causeMessages(this.cause),
+    ].join(": ");
   }
 }
 

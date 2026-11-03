@@ -86,6 +86,8 @@ const make = Effect.gen(function* () {
             },
             extendEnv: false,
             windowsHide: true,
+            // A stuck extractor that ignores SIGTERM is killed after its timeout too.
+            forceKillAfter: "1 second",
           },
         ),
       );

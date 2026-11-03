@@ -1,5 +1,4 @@
 // @effect-diagnostics nodeBuiltinImport:off -- the isolated parser process is an external runtime boundary.
-import * as NodeChildProcess from "node:child_process";
 import * as NodeURL from "node:url";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -8,7 +7,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
+import { ChildProcess } from "effect/process";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
 
 const extensions = new Set(["docx", "xlsx", "pptx", "odt", "ods", "odp", "rtf", "epub", "ipynb"]);
 
@@ -22,6 +25,13 @@ class DocumentTextError extends Schema.TaggedError<DocumentTextError>()("Documen
     return `Failed to ${this.operation} ${this.extension} document text.`;
   }
 }
+
+// Exit code 2 is the extractor rejecting the document: not retried.
+class DocumentTextExit extends Schema.TaggedError<DocumentTextExit>()("DocumentTextExit", {
+  exitCode: Schema.NullOr(Schema.Number),
+  outputLimit: Schema.Boolean,
+}) {}
+const isDocumentTextExit = Schema.is(DocumentTextExit);
 
 export const resolveExtractedTextPath = Effect.fn("DocumentText.resolveExtractedTextPath")(
   function* (path: string) {
@@ -42,8 +52,11 @@ export class DocumentText extends Context.Service<
   }
 >()("t3/provider/DocumentText") {}
 
+const MAX_TEXT_BYTES = 4 * 1024 * 1024 + 1024;
+
 const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
+  const spawner = yield* WorkerChildProcessSpawner.commandSpawner;
   const executable = yield* HostProcess.ExecutablePath;
   const isExecutable = yield* HostProcess.IsExecutable;
   const environment = yield* HostProcess.Environment;
@@ -60,34 +73,53 @@ const make = Effect.gen(function* () {
     if ((failed.get(path) ?? 0) > clock.currentTimeMillisUnsafe()) return;
     const info = yield* fs.stat(path);
     if (Number(info.size) > 16 * 1024 * 1024) return;
-    const content = yield* Effect.tryPromise({
-      try: (signal) =>
-        new Promise<string>((resolve, reject) => {
-          NodeChildProcess.execFile(
-            executable,
-            [...(isExecutable ? [] : [entry]), "__document-text", path, `.${extension}`],
-            {
-              signal,
-              timeout: 15_000,
-              maxBuffer: 4 * 1024 * 1024 + 1024,
-              encoding: "utf8",
-              windowsHide: true,
-              env: {
-                ...environment,
-                ELECTRON_RUN_AS_NODE: "1",
-                NODE_OPTIONS: `${environment.NODE_OPTIONS ?? ""} --max-old-space-size=192`,
-              },
+    const content = yield* Effect.gen(function* () {
+      const child = yield* spawner.spawn(
+        ChildProcess.make(
+          executable,
+          [...(isExecutable ? [] : [entry]), "__document-text", path, `.${extension}`],
+          {
+            env: {
+              ...environment,
+              ELECTRON_RUN_AS_NODE: "1",
+              NODE_OPTIONS: `${environment.NODE_OPTIONS ?? ""} --max-old-space-size=192`,
             },
-            (error, stdout) => (error ? reject(error) : resolve(stdout)),
-          );
-        }),
-      catch: (cause) => new DocumentTextError({ operation: "extract", path, extension, cause }),
+            extendEnv: false,
+            windowsHide: true,
+          },
+        ),
+      );
+      const chunks: Array<Uint8Array> = [];
+      let size = 0;
+      const [, , exitCode] = yield* Effect.all(
+        [
+          Stream.runForEach(child.stdout, (chunk) => {
+            size += chunk.byteLength;
+            chunks.push(chunk);
+            return size > MAX_TEXT_BYTES
+              ? Effect.fail(new DocumentTextExit({ exitCode: null, outputLimit: true }))
+              : Effect.void;
+          }),
+          Stream.runDrain(child.stderr),
+          child.exitCode,
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (exitCode !== 0) {
+        return yield* new DocumentTextExit({ exitCode, outputLimit: false });
+      }
+      return Buffer.concat(chunks).toString("utf8");
     }).pipe(
+      Effect.scoped,
+      Effect.timeout("15 seconds"),
+      Effect.mapError(
+        (cause) => new DocumentTextError({ operation: "extract", path, extension, cause }),
+      ),
       Effect.tapError(({ cause }) => {
         if (failed.size >= 1024) failed.delete(failed.keys().next().value!);
         failed.set(
           path,
-          cause instanceof Error && "code" in cause && cause.code === 2
+          isDocumentTextExit(cause) && cause.exitCode === 2
             ? Infinity
             : clock.currentTimeMillisUnsafe() + 1_000,
         );

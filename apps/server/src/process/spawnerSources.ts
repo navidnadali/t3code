@@ -59,7 +59,11 @@ const onMessage = (message) => {
   const entry = children.get(message.id);
   switch (message.t) {
     case "spawn":
-      start(message);
+      if (message.handoff !== undefined) startHandoff(message);
+      else start(message);
+      return;
+    case "handoff-cancel":
+      cancelHandoff(message.id);
       return;
     case "stdin":
       if (entry === undefined) return post({ t: "stdin-done", id: message.id, seq: message.seq, error: destroyedStdin });
@@ -105,8 +109,122 @@ const { spawn } = require("node:child_process");
 const windowBytes = workerData.windowBytes;
 const post = (message, transfer) => parentPort.postMessage(message, transfer);
 const started = () => {};
+const startHandoff = (message) =>
+  post({ t: "handoff-failed", id: message.id, error: { name: "Error", message: "A worker thread hands off no descriptors" } });
+const cancelHandoff = () => {};
 ${spawnProtocolSource}
 parentPort.on("message", onMessage);
+`;
+
+// Hand-off: the child's stdio are Unix sockets the server connects, so its output never passes
+// through this process. pauseOnConnect: an accepted socket reads nothing until its header is
+// checked, and the server writes nothing past the header before the start is answered.
+const handoffSource = `
+const handoffs = new Map();
+const cancelHandoff = (id) => handoffs.get(id)?.cancel();
+const processStartTime = (pid) => {
+  try {
+    const stat = require("node:fs").readFileSync("/proc/" + pid + "/stat", "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+};
+const startHandoff = (message) => {
+  const id = message.id;
+  const { path: socketPath, nonce, fds } = message.handoff;
+  const headerBytes = nonce.byteLength + 1;
+  const accepted = new Map();
+  const unchecked = new Set();
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    handoffs.delete(id);
+    server.close();
+    require("node:fs").rm(socketPath, { force: true }, () => {});
+    for (const socket of unchecked) socket.destroy();
+  };
+  const refuse = (socket) => {
+    unchecked.delete(socket);
+    socket.destroy();
+    post({ t: "handoff-refused", id });
+  };
+  const server = require("node:net").createServer({ pauseOnConnect: true }, (socket) => {
+    socket.on("error", () => {});
+    if (closed) return refuse(socket);
+    unchecked.add(socket);
+    const chunks = [];
+    let length = 0;
+    const onData = (chunk) => {
+      chunks.push(chunk);
+      length += chunk.byteLength;
+      if (length < headerBytes) return;
+      socket.off("data", onData);
+      socket.off("end", onEnd);
+      socket.pause();
+      const header = Buffer.concat(chunks);
+      const fd = header[nonce.byteLength];
+      if (
+        closed ||
+        header.byteLength !== headerBytes ||
+        !require("node:crypto").timingSafeEqual(header.subarray(0, nonce.byteLength), nonce) ||
+        !fds.includes(fd) ||
+        accepted.has(fd)
+      ) {
+        return refuse(socket);
+      }
+      unchecked.delete(socket);
+      accepted.set(fd, socket);
+      if (accepted.size === fds.length) {
+        close();
+        launch();
+      }
+    };
+    const onEnd = () => refuse(socket);
+    socket.on("data", onData);
+    socket.on("end", onEnd);
+    socket.resume();
+  });
+  server.on("error", (error) => {
+    close();
+    for (const socket of accepted.values()) socket.destroy();
+    post({ t: "handoff-failed", id, error: errorFields(error) });
+  });
+  handoffs.set(id, {
+    cancel: () => {
+      close();
+      for (const socket of accepted.values()) socket.destroy();
+    },
+  });
+  server.listen(socketPath, () => {
+    if (!closed) post({ t: "handoff", id });
+  });
+  const launch = () => {
+    const stdio = [...message.options.stdio];
+    for (const [fd, socket] of accepted) stdio[fd] = socket;
+    let child;
+    try {
+      child = spawn(message.command, message.args, { ...message.options, stdio });
+    } catch (error) {
+      post({ t: "throw", id, error: errorFields(error) });
+      return;
+    } finally {
+      for (const socket of accepted.values()) socket.destroy();
+    }
+    children.set(id, { child, detached: message.options.detached === true, handoff: true });
+    // Read before this process can reap the child, so the PID still names it.
+    const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);
+    if (child.pid !== undefined) started(id, child.pid);
+    child.on("spawn", () => post({ t: "spawn", id, pid: child.pid, startTime }));
+    child.on("error", (error) => post({ t: "error", id, error: errorFields(error) }));
+    child.on("exit", (code, signal) => post({ t: "exit", id, code, signal }));
+    child.on("close", () => {
+      children.delete(id);
+      post({ t: "close", id });
+    });
+  };
+};
 `;
 
 const spawnerProcessBody = `
@@ -123,11 +241,15 @@ const started = (id, pid) => {
   } catch {}
 };
 ${spawnProtocolSource}
+${handoffSource}
 process.title = "t3-process-spawner";
 process.on("message", onMessage);
 post({ t: "ready", protocol: handshake.protocol, build: handshake.build });
-const killChildren = () => {
-  for (const { child, detached } of children.values()) {
+// A child whose descriptors the server holds talks to the server, not to the spawner: only the
+// server's exit (the channel closing) ends it here.
+const killChildren = (handedOff) => {
+  for (const { child, detached, handoff } of children.values()) {
+    if (handoff && !handedOff) continue;
     try {
       if (detached && child.pid > 1) process.kill(-child.pid, "SIGKILL");
       else child.kill("SIGKILL");
@@ -136,17 +258,17 @@ const killChildren = () => {
 };
 // Launched detached, the spawner leads its own process group (never the server's): ending that group
 // also ends what children spawned with detached: false left behind, and the spawner with them.
-const exitWithGroup = (code, reason) => {
+const exitWithGroup = (code, reason, handedOff = false) => {
   try {
     require("node:fs").writeSync(1, "exit " + reason.replace(/\\s+/g, " ") + "\\n");
   } catch {}
-  killChildren();
+  killChildren(handedOff);
   try {
     if (process.pid > 1) process.kill(-process.pid, "SIGKILL");
   } catch {}
   process.exit(code);
 };
-process.on("disconnect", () => exitWithGroup(0, "its channel closed"));
+process.on("disconnect", () => exitWithGroup(0, "its channel closed", true));
 process.on("uncaughtException", (error) => {
   try {
     require("node:fs").writeSync(2, "t3-process-spawner: " + (error && error.stack ? error.stack : String(error)) + "\\n");

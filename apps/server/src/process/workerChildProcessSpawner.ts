@@ -6,6 +6,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
+import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -29,11 +30,16 @@ import {
   ProcessId,
 } from "effect/process/ChildProcessSpawner";
 import * as NodeChildProcess from "node:child_process";
-import type * as NodeNet from "node:net";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
+import * as NodePath from "node:path";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 
 import * as ProcessRunner from "../processRunner.ts";
+import * as ServerConfig from "../config.ts";
+import { HandoffProcess, type ProviderSpawnOptions } from "./handoffProcess.ts";
 import { answerDeadlines, type SpawnerTimers } from "./spawnerDeadlines.ts";
 import { registerSpawnerProcess } from "./spawnerProcesses.ts";
 import {
@@ -83,7 +89,14 @@ interface SerializedError {
 }
 
 type WorkerMessage =
-  | { readonly t: "spawn" | "started"; readonly id: number; readonly pid: number }
+  | {
+      readonly t: "spawn" | "started";
+      readonly id: number;
+      readonly pid: number;
+      readonly startTime?: string;
+    }
+  | { readonly t: "handoff" | "handoff-refused"; readonly id: number }
+  | { readonly t: "handoff-failed"; readonly id: number; readonly error: SerializedError }
   | {
       readonly t: "error" | "throw" | "stdin-error";
       readonly id: number;
@@ -136,7 +149,15 @@ const isWorkerMessage = (value: unknown): value is WorkerMessage => {
   switch (message.t) {
     case "spawn":
     case "started":
-      return isChildPid(message.pid);
+      return (
+        isChildPid(message.pid) &&
+        (message.startTime === undefined || typeof message.startTime === "string")
+      );
+    case "handoff":
+    case "handoff-refused":
+      return true;
+    case "handoff-failed":
+      return isSerializedError(message.error);
     case "data":
       return isStreamIndex(message.s) && message.chunk instanceof Uint8Array;
     case "end":
@@ -224,6 +245,63 @@ interface Entry {
   readonly killCallbacks: Map<number, (outcome: KillOutcome) => void>;
 }
 
+/** A child started by hand-off: the spawner forked it, the server holds its stdio sockets. */
+export interface HandoffChild {
+  readonly id: number;
+  pid: number | undefined;
+  /** /proc start time, read by the spawner before it could reap the child: with the PID, its identity. */
+  startTime: string | undefined;
+  /** The server's end of each handed-off descriptor; output sockets stay paused until read. */
+  readonly sockets: Map<number, NodeNet.Socket>;
+  readonly exitSignal: Deferred.Deferred<ExitCodeWithSignal>;
+  readonly exitListeners: Set<(code: number | null, signal: NodeJS.Signals | null) => void>;
+  /** Its spawner stopped while it ran: its exit is found by watching its PID and start time. */
+  orphaned: boolean;
+  referenced: boolean;
+}
+
+export interface HandoffCallbacks {
+  readonly onSpawn: () => void;
+  /** The command failed to start, as Node's spawner reports it (ENOENT and the like). */
+  readonly onError: (error: Error) => void;
+  /** Hand-off failed before the command started: nothing ran, start it another way. */
+  readonly onUnavailable: (error: Error) => void;
+}
+
+interface HandoffEntry {
+  readonly child: HandoffChild;
+  readonly callbacks: HandoffCallbacks;
+  readonly socketPath: string;
+  readonly nonce: Uint8Array;
+  readonly fds: ReadonlyArray<number>;
+  spawned: boolean;
+  settled: boolean;
+  abandoned: boolean;
+  closed: boolean;
+  holdsLoop: boolean;
+  cancelStartDeadline: (() => void) | undefined;
+  readonly killCallbacks: Map<number, (outcome: KillOutcome) => void>;
+}
+
+// Unix socket paths are limited to 104 bytes on macOS and 108 on Linux, NUL included.
+const MAX_SOCKET_PATH_BYTES = 100;
+const ORPHAN_POLL_MILLIS = 1_000;
+
+/**
+ * Whether the process with this PID is still the one the spawner started: same /proc start time,
+ * not a zombie. A PID that names another process (reused) or none means the child exited.
+ */
+export const isSameProcess = (pid: number, startTime: string): boolean => {
+  let stat: string;
+  try {
+    stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return false;
+  }
+  const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  return fields[0] !== "Z" && fields[0] !== "X" && fields[19] === startTime;
+};
+
 /** Where spawn requests run: a worker thread or the spawner process. */
 interface Transport {
   readonly post: (message: unknown, transfer?: ReadonlyArray<ArrayBuffer>) => void;
@@ -268,6 +346,11 @@ const makeRemoteHost = (options: {
   /** Arms the deadline for the transport to answer a start; without it, a start may wait for ever. */
   readonly startDeadline?: (expire: () => void) => () => void;
   readonly startDeadlineMessage?: string;
+  /** A connection to a hand-off socket did not present this server's header and was closed. */
+  readonly onHandoffRefused?: () => void;
+  /** Children started by hand-off kept running when the spawner stopped; then each exit. */
+  readonly onHandoffOrphans?: (count: number) => void;
+  readonly onHandoffOrphanExit?: () => void;
 }) => {
   let transport: Transport | undefined;
   let generation: object | undefined;
@@ -282,6 +365,9 @@ const makeRemoteHost = (options: {
   let nextSeq = 1;
   let holding = 0;
   const entries = new Map<number, Entry>();
+  const handoffs = new Map<number, HandoffEntry>();
+  const orphans = new Set<HandoffChild>();
+  let orphanTimer: ReturnType<typeof setInterval> | undefined;
 
   const post = (message: unknown, transfer?: ReadonlyArray<ArrayBuffer>) => {
     transport?.post(message, transfer);
@@ -390,6 +476,31 @@ const makeRemoteHost = (options: {
       for (const callback of killCallbacks) callback({ _tag: "Sent", killed: false });
       remove(entry);
     }
+    // Hand-off: a running child's stdio are the server's, so it keeps running; one not yet
+    // running never ran (the caller starts it another way), unless its start was reported.
+    const stoppedHandoffs = [...handoffs.values()];
+    handoffs.clear();
+    const running: Array<HandoffChild> = [];
+    for (const entry of stoppedHandoffs) {
+      const { child } = entry;
+      entry.cancelStartDeadline?.();
+      if (entry.holdsLoop) {
+        entry.holdsLoop = false;
+        holding -= 1;
+      }
+      const killCallbacks = [...entry.killCallbacks.values()];
+      entry.killCallbacks.clear();
+      if (!entry.settled) {
+        entry.settled = true;
+        if (child.pid !== undefined) killHandoffGroup(child);
+        destroySockets(child);
+        entry.callbacks.onUnavailable(error);
+      } else if (entry.spawned && !Deferred.isDoneUnsafe(child.exitSignal)) {
+        running.push(child);
+      }
+      for (const callback of killCallbacks) callback(killOrphan(child, "SIGTERM", false));
+    }
+    adoptOrphans(running);
     if (stopped !== undefined) {
       void stopped.terminate();
       stopped.unref();
@@ -408,7 +519,189 @@ const makeRemoteHost = (options: {
     }
   };
 
+  const updateHandoffHold = (entry: HandoffEntry) => {
+    const { child } = entry;
+    const holds =
+      entry.killCallbacks.size > 0 ||
+      !entry.settled ||
+      (entry.spawned && child.referenced && !Deferred.isDoneUnsafe(child.exitSignal));
+    if (holds === entry.holdsLoop) return;
+    entry.holdsLoop = holds;
+    holding += holds ? 1 : -1;
+    if (holding === 0) transport?.unref();
+    else if (holding === 1 && holds) transport?.ref();
+  };
+
+  const completeHandoffExit = (
+    child: HandoffChild,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ) => {
+    if (!Deferred.doneUnsafe(child.exitSignal, Exit.succeed([code, signal] as const))) return;
+    for (const listener of child.exitListeners) listener(code, signal);
+  };
+
+  const forgetHandoff = (entry: HandoffEntry) => {
+    updateHandoffHold(entry);
+    if (entry.settled && entry.closed && entry.killCallbacks.size === 0) {
+      handoffs.delete(entry.child.id);
+    }
+  };
+
+  const destroySockets = (child: HandoffChild) => {
+    for (const socket of child.sockets.values()) socket.destroy();
+  };
+
+  // Hand-off itself failed before the command ran: tell the spawner and the caller.
+  const handoffUnavailable = (entry: HandoffEntry, error: Error) => {
+    if (entry.settled) return;
+    entry.settled = true;
+    entry.closed = true;
+    entry.cancelStartDeadline?.();
+    post({ t: "handoff-cancel", id: entry.child.id });
+    destroySockets(entry.child);
+    entry.callbacks.onUnavailable(error);
+    forgetHandoff(entry);
+  };
+
+  const killHandoffGroup = (child: HandoffChild) => {
+    if (child.pid === undefined) return;
+    try {
+      signalProcessGroup(child.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  };
+
+  const checkOrphans = () => {
+    for (const child of orphans) {
+      const alive =
+        child.pid !== undefined &&
+        child.startTime !== undefined &&
+        isSameProcess(child.pid, child.startTime);
+      if (alive) continue;
+      orphans.delete(child);
+      completeHandoffExit(child, null, null);
+      options.onHandoffOrphanExit?.();
+    }
+    if (orphans.size === 0 && orphanTimer !== undefined) {
+      clearInterval(orphanTimer);
+      orphanTimer = undefined;
+    }
+  };
+
+  const adoptOrphans = (children: ReadonlyArray<HandoffChild>) => {
+    if (children.length === 0) return;
+    for (const child of children) {
+      child.orphaned = true;
+      orphans.add(child);
+    }
+    options.onHandoffOrphans?.(children.length);
+    if (orphanTimer === undefined) {
+      orphanTimer = setInterval(checkOrphans, ORPHAN_POLL_MILLIS);
+      orphanTimer.unref();
+    }
+    checkOrphans();
+  };
+
+  const connectHandoff = (entry: HandoffEntry) => {
+    const { child } = entry;
+    for (const fd of entry.fds) {
+      const socket = NodeNet.connect({ path: entry.socketPath });
+      child.sockets.set(fd, socket);
+      // Output waits for its reader; stdin and held descriptors are never read.
+      socket.pause();
+      if (!child.referenced) socket.unref();
+      socket.once("connect", () => {
+        const header = new Uint8Array(entry.nonce.byteLength + 1);
+        header.set(entry.nonce);
+        header[entry.nonce.byteLength] = fd;
+        socket.write(header);
+      });
+      socket.on("error", (error) => {
+        if (!entry.spawned) handoffUnavailable(entry, error);
+      });
+    }
+  };
+
+  const onHandoffMessage = (entry: HandoffEntry, message: WorkerMessage) => {
+    const { child } = entry;
+    switch (message.t) {
+      case "handoff":
+        if (!entry.settled) connectHandoff(entry);
+        return;
+      case "handoff-refused":
+        options.onHandoffRefused?.();
+        return;
+      case "handoff-failed":
+        handoffUnavailable(entry, reviveError(message.error));
+        return;
+      case "started":
+        child.pid ??= message.pid;
+        if (entry.abandoned) killHandoffGroup(child);
+        return;
+      case "spawn":
+        stopsInARow = 0;
+        entry.cancelStartDeadline?.();
+        child.pid = message.pid;
+        child.startTime = message.startTime;
+        if (entry.abandoned) {
+          killHandoffGroup(child);
+          destroySockets(child);
+          return;
+        }
+        entry.spawned = true;
+        entry.settled = true;
+        entry.callbacks.onSpawn();
+        updateHandoffHold(entry);
+        return;
+      case "error":
+        entry.cancelStartDeadline?.();
+        if (!entry.spawned && !entry.settled) {
+          entry.settled = true;
+          destroySockets(child);
+          entry.callbacks.onError(reviveError(message.error));
+        }
+        forgetHandoff(entry);
+        return;
+      case "throw":
+        entry.cancelStartDeadline?.();
+        if (!entry.settled) {
+          entry.settled = true;
+          destroySockets(child);
+          entry.callbacks.onError(reviveError(message.error));
+        }
+        entry.closed = true;
+        forgetHandoff(entry);
+        return;
+      case "exit":
+        completeHandoffExit(child, message.code, message.signal);
+        updateHandoffHold(entry);
+        return;
+      case "close":
+        entry.closed = true;
+        forgetHandoff(entry);
+        return;
+      case "kill-result": {
+        const callback = entry.killCallbacks.get(message.seq);
+        entry.killCallbacks.delete(message.seq);
+        forgetHandoff(entry);
+        callback?.(
+          message.error === undefined
+            ? { _tag: "Sent", killed: message.killed }
+            : { _tag: "Threw", error: reviveError(message.error) },
+        );
+        return;
+      }
+      default:
+        // Hand-off output never passes through the spawner.
+        return;
+    }
+  };
+
   const onMessage = (message: WorkerMessage) => {
+    const handoff = handoffs.get(message.id);
+    if (handoff !== undefined) return onHandoffMessage(handoff, message);
     const entry = entries.get(message.id);
     if (entry === undefined) return;
     const { child } = entry;
@@ -603,6 +896,127 @@ const makeRemoteHost = (options: {
     return child;
   };
 
+  /**
+   * Starts a command whose stdio `request.fds` are sockets the server holds: the spawner forks it
+   * and reads none of its output. `spawnOptions.stdio` gives the other descriptors.
+   */
+  const spawnHandoff = (
+    command: string,
+    args: ReadonlyArray<string>,
+    spawnOptions: Record<string, unknown>,
+    request: { readonly dir: string; readonly fds: ReadonlyArray<number> },
+    callbacks: HandoffCallbacks,
+  ): HandoffChild => {
+    ensureTransport();
+    const id = nextId++;
+    const child: HandoffChild = {
+      id,
+      pid: undefined,
+      startTime: undefined,
+      sockets: new Map(),
+      exitSignal: Deferred.makeUnsafe<ExitCodeWithSignal>(),
+      exitListeners: new Set(),
+      orphaned: false,
+      referenced: true,
+    };
+    const socketPath = NodePath.join(request.dir, NodeCrypto.randomBytes(12).toString("base64url"));
+    if (transport === undefined) {
+      callbacks.onUnavailable(new Error(options.stoppedMessage, { cause: failure }));
+      return child;
+    }
+    if (Buffer.byteLength(socketPath) > MAX_SOCKET_PATH_BYTES) {
+      callbacks.onUnavailable(new Error(`The hand-off socket path is too long: ${socketPath}`));
+      return child;
+    }
+    const entry: HandoffEntry = {
+      child,
+      callbacks,
+      socketPath,
+      nonce: NodeCrypto.randomBytes(16),
+      fds: request.fds,
+      spawned: false,
+      settled: false,
+      abandoned: false,
+      closed: false,
+      holdsLoop: false,
+      cancelStartDeadline: undefined,
+      killCallbacks: new Map(),
+    };
+    handoffs.set(id, entry);
+    updateHandoffHold(entry);
+    post({
+      t: "spawn",
+      id,
+      command,
+      args,
+      options: spawnOptions,
+      handoff: { path: socketPath, nonce: entry.nonce, fds: request.fds },
+    });
+    entry.cancelStartDeadline = options.startDeadline?.(() => {
+      entry.cancelStartDeadline = undefined;
+      if (handoffs.get(id) === entry && !entry.settled) {
+        stop(new Error(options.startDeadlineMessage ?? "The transport did not answer a start"));
+      }
+    });
+    return child;
+  };
+
+  // A hand-off child without its spawner: signal it only while it is still the same process.
+  const killOrphan = (child: HandoffChild, signal: NodeJS.Signals, send: boolean): KillOutcome => {
+    if (
+      !send ||
+      child.pid === undefined ||
+      child.startTime === undefined ||
+      Deferred.isDoneUnsafe(child.exitSignal) ||
+      !isSameProcess(child.pid, child.startTime)
+    ) {
+      return { _tag: "Sent", killed: false };
+    }
+    try {
+      process.kill(child.pid, signal);
+      return { _tag: "Sent", killed: true };
+    } catch (error) {
+      return { _tag: "Threw", error: error as Error };
+    }
+  };
+
+  const killHandoff = (
+    child: HandoffChild,
+    signal: NodeJS.Signals,
+    callback: (outcome: KillOutcome) => void,
+  ) => {
+    if (Deferred.isDoneUnsafe(child.exitSignal)) return callback({ _tag: "Sent", killed: false });
+    if (child.orphaned) return callback(killOrphan(child, signal, true));
+    const entry = handoffs.get(child.id);
+    if (entry === undefined || !entry.spawned) return callback({ _tag: "Sent", killed: false });
+    const seq = nextSeq++;
+    entry.killCallbacks.set(seq, callback);
+    updateHandoffHold(entry);
+    post({ t: "kill", id: child.id, seq, signal });
+  };
+
+  const abandonHandoff = (child: HandoffChild) => {
+    const entry = handoffs.get(child.id);
+    if (entry === undefined || entry.settled) return;
+    entry.abandoned = true;
+    entry.settled = true;
+    entry.cancelStartDeadline?.();
+    post({ t: "handoff-cancel", id: child.id });
+    killHandoffGroup(child);
+    destroySockets(child);
+    forgetHandoff(entry);
+  };
+
+  const setHandoffReferenced = (child: HandoffChild, referenced: boolean) => {
+    child.referenced = referenced;
+    for (const socket of child.sockets.values()) {
+      if (referenced) socket.ref();
+      else socket.unref();
+    }
+    const entry = handoffs.get(child.id);
+    if (entry !== undefined) updateHandoffHold(entry);
+  };
+
   // Its caller was interrupted before the start was answered.
   const abandon = (child: RemoteChild) => {
     const entry = entries.get(child.id);
@@ -653,6 +1067,10 @@ const makeRemoteHost = (options: {
     abandon,
     kill,
     setReferenced,
+    spawnHandoff,
+    abandonHandoff,
+    killHandoff,
+    setHandoffReferenced,
     terminate: () =>
       Effect.promise(async () => {
         const current = transport;
@@ -950,13 +1368,34 @@ const runsOnWorker = (command: ChildProcess.Command): command is ChildProcess.St
 };
 
 /** Handles keep `NodeChildProcessSpawner`'s semantics; other command shapes use `fallback`. */
-const makeRemoteSpawner = Effect.fnUntraced(function* (
-  fallback: ChildProcessSpawner["Service"],
-  host: RemoteHost,
-  unavailable: (
+/** What a handle needs of a started child, wherever its stdio are. */
+interface ChildView {
+  readonly pid: number | undefined;
+  readonly exitSignal: Deferred.Deferred<ExitCodeWithSignal>;
+  readonly exitListeners: Set<(code: number | null, signal: NodeJS.Signals | null) => void>;
+  readonly stdin: NodeStream.Writable;
+  readonly stdout: NodeStream.Readable;
+  readonly stderr: NodeStream.Readable;
+  /** Killed when its transport stopped; a hand-off child never is. */
+  readonly killedOnStop: boolean;
+}
+
+/** How children start and are signalled: relayed by a worker or spawner, or handed off. */
+interface ChildBackend<C extends ChildView, E> {
+  readonly start: (
     command: ChildProcess.StandardCommand,
-  ) => Effect.Effect<ChildProcessHandle, PlatformError.PlatformError, Scope.Scope>,
-) {
+    spawnOptions: Record<string, unknown>,
+  ) => Effect.Effect<C, PlatformError.PlatformError | E>;
+  readonly kill: (
+    child: C,
+    signal: NodeJS.Signals,
+    callback: (outcome: KillOutcome) => void,
+  ) => void;
+  readonly setReferenced: (child: C, referenced: boolean) => void;
+}
+
+/** Handles for started children, whichever backend started them: the same kill and exit semantics. */
+const makeChildHandles = Effect.fnUntraced(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const platform = yield* HostProcess.Platform;
@@ -988,20 +1427,7 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
     };
   };
 
-  const spawnRemote = (
-    command: ChildProcess.StandardCommand,
-    spawnOptions: Record<string, unknown>,
-  ) =>
-    Effect.callback<RemoteChild, PlatformError.PlatformError>((resume) => {
-      const child = host.spawn(command.command, command.args, spawnOptions, {
-        onSpawn: () => resume(Effect.succeed(child)),
-        onError: (error) => resume(Effect.fail(toPlatformError("spawn", error, command))),
-        onThrow: (error) => resume(Effect.die(error)),
-      });
-      return Effect.sync(() => host.abandon(child));
-    });
-
-  const isProcessAlive = (child: RemoteChild): boolean => {
+  const isProcessAlive = (child: ChildView): boolean => {
     if (child.killedOnStop) return false;
     if (!Deferred.isDoneUnsafe(child.exitSignal)) return true;
     try {
@@ -1014,7 +1440,7 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
 
   const killProcessGroup = (
     command: ChildProcess.StandardCommand,
-    child: RemoteChild,
+    child: ChildView,
     signal: NodeJS.Signals,
   ) =>
     Effect.try({
@@ -1024,13 +1450,14 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
       catch: (error) => toPlatformError("kill", toError(error), command),
     });
 
-  const killProcess = (
+  const killProcess = <C extends ChildView>(
     command: ChildProcess.StandardCommand,
-    child: RemoteChild,
+    backend: ChildBackend<C, unknown>,
+    child: C,
     signal: NodeJS.Signals,
   ) =>
     Effect.callback<void, PlatformError.PlatformError>((resume) => {
-      host.kill(child, signal, (outcome) => {
+      backend.kill(child, signal, (outcome) => {
         if (outcome._tag === "Threw") return resume(Effect.die(outcome.error));
         resume(
           outcome.killed
@@ -1046,7 +1473,7 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
       });
     });
 
-  const awaitProcessExit = (child: RemoteChild, timeoutMillis: number): Effect.Effect<void> =>
+  const awaitProcessExit = (child: ChildView, timeoutMillis: number): Effect.Effect<void> =>
     Effect.callback<void>((resume) => {
       const deadline = Date.now() + timeoutMillis;
       let timer: NodeJS.Timeout | undefined;
@@ -1068,14 +1495,15 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
       return Effect.sync(stop);
     });
 
-  const terminateProcessGroup = Effect.fnUntraced(function* (
+  const terminateProcessGroup = Effect.fnUntraced(function* <C extends ChildView>(
     command: ChildProcess.StandardCommand,
-    child: RemoteChild,
+    backend: ChildBackend<C, unknown>,
+    child: C,
     killOptions: ChildProcess.KillOptions | undefined,
   ) {
     const signalGroup = (signal: NodeJS.Signals) =>
       killProcessGroup(command, child, signal).pipe(
-        Effect.catch(() => killProcess(command, child, signal)),
+        Effect.catch(() => killProcess(command, backend, child, signal)),
       );
     yield* signalGroup(killOptions?.killSignal ?? "SIGTERM");
     if (Predicate.isUndefined(killOptions?.forceKillAfter)) {
@@ -1090,7 +1518,10 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
     yield* Deferred.await(child.exitSignal);
   });
 
-  const spawnOnWorker = Effect.fnUntraced(function* (command: ChildProcess.StandardCommand) {
+  const spawnWith = Effect.fnUntraced(function* <C extends ChildView, E>(
+    command: ChildProcess.StandardCommand,
+    backend: ChildBackend<C, E>,
+  ) {
     const stdinConfig = resolveStdinOption(command.options);
     let isReferenced = true;
     const cwd = yield* resolveWorkingDirectory(command.options);
@@ -1110,20 +1541,20 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
 
     const child = yield* Effect.acquireRelease(
       // Interruptible, so a command's own timeout ends the wait for a start that is not answered.
-      spawnRemote(command, spawnOptions).pipe(Effect.interruptible),
+      backend.start(command, spawnOptions).pipe(Effect.interruptible),
       Effect.fnUntraced(function* (child) {
         const exited = yield* Deferred.isDone(child.exitSignal);
         if (exited) {
           const [code] = yield* Deferred.await(child.exitSignal);
           if (code !== 0 && Predicate.isNotNull(code)) {
-            yield* Effect.ignore(terminateProcessGroup(command, child, command.options));
+            yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
           } else if (isReferenced && platform !== "win32" && command.options.detached !== false) {
-            yield* Effect.ignore(terminateProcessGroup(command, child, command.options));
+            yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
           }
           return;
         }
         if (!isReferenced) return;
-        yield* Effect.ignore(terminateProcessGroup(command, child, command.options));
+        yield* Effect.ignore(terminateProcessGroup(command, backend, child, command.options));
       }),
     );
 
@@ -1138,13 +1569,13 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
     });
     const reref = Effect.sync(() => {
       if (!isReferenced) {
-        host.setReferenced(child, true);
+        backend.setReferenced(child, true);
         isReferenced = true;
       }
     });
     const unref = Effect.sync(() => {
       if (isReferenced) {
-        host.setReferenced(child, false);
+        backend.setReferenced(child, false);
         isReferenced = false;
       }
       return reref;
@@ -1181,7 +1612,7 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
       pid: ProcessId(child.pid!),
       exitCode,
       isRunning: Effect.map(Deferred.isDone(child.exitSignal), (done) => !done),
-      kill: (killOptions) => terminateProcessGroup(command, child, killOptions),
+      kill: (killOptions) => terminateProcessGroup(command, backend, child, killOptions),
       stdin: stdinSink,
       stdout,
       stderr,
@@ -1192,13 +1623,38 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
     });
   });
 
+  return { platform, spawnWith };
+});
+
+const makeRemoteSpawner = Effect.fnUntraced(function* (
+  fallback: ChildProcessSpawner["Service"],
+  host: RemoteHost,
+  unavailable: (
+    command: ChildProcess.StandardCommand,
+  ) => Effect.Effect<ChildProcessHandle, PlatformError.PlatformError, Scope.Scope>,
+) {
+  const { platform, spawnWith } = yield* makeChildHandles();
+  const relayed: ChildBackend<RemoteChild, never> = {
+    start: (command, spawnOptions) =>
+      Effect.callback<RemoteChild, PlatformError.PlatformError>((resume) => {
+        const child = host.spawn(command.command, command.args, spawnOptions, {
+          onSpawn: () => resume(Effect.succeed(child)),
+          onError: (error) => resume(Effect.fail(toPlatformError("spawn", error, command))),
+          onThrow: (error) => resume(Effect.die(error)),
+        });
+        return Effect.sync(() => host.abandon(child));
+      }),
+    kill: host.kill,
+    setReferenced: host.setReferenced,
+  };
+
   return makeSpawner((command) =>
     Effect.gen(function* () {
       if (platform === "win32" || !runsOnWorker(command)) {
         return yield* fallback.spawn(command);
       }
       if (!host.start()) return yield* unavailable(command);
-      return yield* spawnOnWorker(command);
+      return yield* spawnWith(command, relayed);
     }),
   );
 });
@@ -1240,13 +1696,22 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
  * past `spawnerRestartLimit` it is down and commands fail until its cool-down has passed.
  */
 
+interface ProcessSpawnerOptions {
+  readonly source?: string;
+  readonly windowBytes?: number;
+  readonly timers?: SpawnerTimers;
+}
+
 export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
   fallback: ChildProcessSpawner["Service"],
-  options: {
-    readonly source?: string;
-    readonly windowBytes?: number;
-    readonly timers?: SpawnerTimers;
-  } = {},
+  options: ProcessSpawnerOptions = {},
+) {
+  return (yield* makeProcessSpawnerWithHost(fallback, options)).spawner;
+});
+
+const makeProcessSpawnerWithHost = Effect.fnUntraced(function* (
+  fallback: ChildProcessSpawner["Service"],
+  options: ProcessSpawnerOptions = {},
 ) {
   const windowBytes = options.windowBytes ?? STREAM_WINDOW_BYTES;
   const executable = yield* HostProcess.ExecutablePath;
@@ -1318,11 +1783,28 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
     onRetry: () => {
       runLog(Effect.logWarning("Process spawner starting again after its cool-down"));
     },
+    onHandoffRefused: () => {
+      runLog(
+        Effect.logWarning(
+          "A connection to a provider hand-off socket did not present this server's header; it was closed",
+        ),
+      );
+    },
+    onHandoffOrphans: (count) => {
+      runLog(
+        Effect.logWarning(
+          `${count} provider process(es) keep running without the process spawner; their exits are found by watching their PIDs, with no exit status`,
+        ),
+      );
+    },
+    onHandoffOrphanExit: () => {
+      runLog(Effect.logInfo("A provider process that outlived the process spawner exited"));
+    },
   });
   yield* Effect.addFinalizer(() => host.terminate());
   // Started while the server is small: starting it is the one fork it costs.
   host.start();
-  return yield* makeRemoteSpawner(fallback, host, (command) =>
+  const spawner = yield* makeRemoteSpawner(fallback, host, (command) =>
     Effect.fail(
       toPlatformError(
         "spawn",
@@ -1331,6 +1813,7 @@ export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (
       ),
     ),
   );
+  return { spawner, host };
 });
 
 const processSpawnerChoices = new Map<string, "node" | "worker" | "child">([
@@ -1354,8 +1837,13 @@ const processSpawnerChoices = new Map<string, "node" | "worker" | "child">([
  * 0, false or off keep Node's spawner on the event loop, as Windows always does, and so does an
  * unknown value, which is logged. Off-main spawners run real processes even under a fake spawner.
  */
-export const layerFromConfig = Layer.effect(
-  ChildProcessSpawner,
+/** Node's spawner and, when the knobs chose the spawner process, its host (for hand-off). */
+class SpawnerHost extends Context.Service<
+  SpawnerHost,
+  { readonly node: ChildProcessSpawner["Service"]; readonly host: RemoteHost | undefined }
+>()("t3/process/workerChildProcessSpawner/SpawnerHost") {}
+
+export const layerFromConfig = Layer.effectContext(
   Effect.gen(function* () {
     const fallback = yield* ChildProcessSpawner;
     const platform = yield* HostProcess.Platform;
@@ -1374,9 +1862,16 @@ export const layerFromConfig = Layer.effect(
       );
       spawner = "node";
     }
-    if (platform === "win32" || spawner === "node") return fallback;
-    if (spawner === "child") return yield* makeProcessSpawner(fallback);
-    return yield* make(fallback);
+    const withHost = (service: ChildProcessSpawner["Service"], host?: RemoteHost) =>
+      Context.make(ChildProcessSpawner, service).pipe(
+        Context.add(SpawnerHost, { node: fallback, host }),
+      );
+    if (platform === "win32" || spawner === "node") return withHost(fallback);
+    if (spawner === "child") {
+      const started = yield* makeProcessSpawnerWithHost(fallback);
+      return withHost(started.spawner, started.host);
+    }
+    return withHost(yield* make(fallback));
   }),
 );
 
@@ -1402,4 +1897,173 @@ export const commandSpawner = Effect.gen(function* () {
 export const layerCommandSpawner = Layer.effect(
   CommandSpawner,
   Effect.service(ChildProcessSpawner),
+).pipe(Layer.provide(layerFromConfig));
+
+export const PROVIDER_SPAWNER_ENV = "T3CODE_PROVIDER_SPAWNER";
+
+class HandoffUnavailableError extends Data.TaggedError("HandoffUnavailableError")<{
+  readonly cause: Error;
+}> {}
+
+interface HandoffView extends ChildView {
+  readonly child: HandoffChild;
+}
+
+const handoffView = (child: HandoffChild): HandoffView => {
+  const output = (fd: number) => child.sockets.get(fd) ?? NodeStream.Readable.from([]);
+  return {
+    child,
+    get pid() {
+      return child.pid;
+    },
+    exitSignal: child.exitSignal,
+    exitListeners: child.exitListeners,
+    stdin: child.sockets.get(0) ?? new NodeStream.PassThrough(),
+    stdout: output(1),
+    stderr: output(2),
+    killedOnStop: false,
+  };
+};
+
+/**
+ * Starts long-lived processes by hand-off: the spawner process forks them with Unix sockets the
+ * server holds as their stdio, so their I/O never passes through the spawner. A command it
+ * cannot hand off runs on Node's spawner, as does one whose hand-off fails, with `warn`.
+ */
+const makeHandoffSpawner = Effect.fnUntraced(function* (
+  node: ChildProcessSpawner["Service"],
+  host: RemoteHost,
+  dir: string,
+  warn: (reason: Error) => Effect.Effect<void>,
+) {
+  const { platform, spawnWith } = yield* makeChildHandles();
+  const handedOff: ChildBackend<HandoffView, HandoffUnavailableError> = {
+    start: (command, spawnOptions) =>
+      Effect.callback<HandoffView, PlatformError.PlatformError | HandoffUnavailableError>(
+        (resume) => {
+          const child = host.spawnHandoff(
+            command.command,
+            command.args,
+            { ...spawnOptions, stdio: ["ignore", "ignore", "ignore"] },
+            { dir, fds: [0, 1, 2] },
+            {
+              onSpawn: () => resume(Effect.succeed(handoffView(child))),
+              onError: (error) => resume(Effect.fail(toPlatformError("spawn", error, command))),
+              onUnavailable: (cause) => resume(Effect.fail(new HandoffUnavailableError({ cause }))),
+            },
+          );
+          return Effect.sync(() => host.abandonHandoff(child));
+        },
+      ),
+    kill: (view, signal, callback) => host.killHandoff(view.child, signal, callback),
+    setReferenced: (view, referenced) => host.setHandoffReferenced(view.child, referenced),
+  };
+  return makeSpawner((command) =>
+    Effect.gen(function* () {
+      // Its own group: a spawner that stops ends its own group, never a running provider's.
+      if (platform !== "linux" || !runsOnWorker(command) || command.options.detached === false) {
+        return yield* node.spawn(command);
+      }
+      return yield* spawnWith(command, handedOff).pipe(
+        Effect.catchTags({
+          HandoffUnavailableError: (error) =>
+            warn(error.cause).pipe(Effect.andThen(node.spawn(command))),
+        }),
+      );
+    }),
+  );
+});
+
+/** How the server starts long-lived provider processes (Claude CLI, Codex app-server, ACP agents). */
+export class ProviderProcessLauncher extends Context.Service<
+  ProviderProcessLauncher,
+  {
+    /** A Node-style child process, for an SDK that drives one (the Claude Agent SDK's spawn hook). */
+    readonly spawn: (
+      command: string,
+      args: ReadonlyArray<string>,
+      options: ProviderSpawnOptions,
+    ) => NodeChildProcess.ChildProcess | HandoffProcess;
+    /** For Effect consumers. */
+    readonly spawner: ChildProcessSpawner["Service"];
+  }
+>()("t3/process/workerChildProcessSpawner/ProviderProcessLauncher") {}
+
+const providerSpawnerChoices = new Map<string, "handoff" | "direct">([
+  ["handoff", "handoff"],
+  ["on", "handoff"],
+  ["1", "handoff"],
+  ["true", "handoff"],
+  ["direct", "direct"],
+  ["default", "direct"],
+  ["off", "direct"],
+  ["0", "direct"],
+  ["false", "direct"],
+]);
+
+const directLauncher = (node: ChildProcessSpawner["Service"]) =>
+  ProviderProcessLauncher.of({
+    spawn: (command, args, options) =>
+      NodeChildProcess.spawn(command, [...args], {
+        cwd: options.cwd,
+        env: options.env,
+        signal: options.signal,
+        stdio: [...options.stdio],
+        detached: true,
+      }),
+    spawner: node,
+  });
+
+/**
+ * Provider processes start by hand-off from the spawner process (Linux, when the process
+ * spawner is on) unless `T3CODE_PROVIDER_SPAWNER` says direct: Node's spawner on the event loop,
+ * as before. Hand-off sockets live in a directory only the server's user can enter.
+ */
+export const layerProviderLauncher = Layer.effect(
+  ProviderProcessLauncher,
+  Effect.gen(function* () {
+    const { node, host } = yield* SpawnerHost;
+    const platform = yield* HostProcess.Platform;
+    const value = yield* Config.String(PROVIDER_SPAWNER_ENV).pipe(Config.option, Effect.orDie);
+    const choice = Option.match(value, {
+      onNone: () => "handoff" as const,
+      onSome: (set) => providerSpawnerChoices.get(set.trim().toLowerCase()),
+    });
+    if (choice === undefined) {
+      yield* Effect.logError(
+        `${PROVIDER_SPAWNER_ENV}="${Option.getOrElse(value, () => "")}" is not handoff or direct; provider processes start on Node's spawner`,
+      );
+    }
+    if (choice !== "handoff" || host === undefined || platform !== "linux") {
+      return directLauncher(node);
+    }
+    const { stateDir } = yield* ServerConfig.ServerConfig;
+    const dir = NodePath.join(stateDir, "spawner");
+    const prepared = yield* Effect.try(() => {
+      NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      NodeFS.chmodSync(dir, 0o700);
+      const info = NodeFS.statSync(dir);
+      if (!info.isDirectory() || info.uid !== globalThis.process.getuid?.()) {
+        throw new Error(`${dir} is not a directory this user owns`);
+      }
+    }).pipe(Effect.option);
+    if (Option.isNone(prepared)) {
+      yield* Effect.logWarning(
+        `Provider processes start on Node's spawner: the hand-off directory ${dir} is unusable`,
+      );
+      return directLauncher(node);
+    }
+    const runLog = Effect.runSyncExitWith(yield* Effect.context<never>());
+    const warn = (reason: Error) =>
+      Effect.logWarning(
+        "Provider process hand-off failed; this one starts on Node's spawner",
+        reason,
+      );
+    const spawner = yield* makeHandoffSpawner(node, host, dir, warn);
+    return ProviderProcessLauncher.of({
+      spawn: (command, args, options) =>
+        new HandoffProcess(host, dir, command, args, options, (reason) => runLog(warn(reason))),
+      spawner,
+    });
+  }),
 ).pipe(Layer.provide(layerFromConfig));

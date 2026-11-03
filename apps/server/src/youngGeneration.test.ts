@@ -4,6 +4,7 @@ import * as NodeURL from "node:url";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
@@ -225,25 +226,63 @@ describe("isServerCommand", () => {
       "triage",
       "__service-preflight",
       "__ssh-helper",
+      "help",
     ]) {
       expect(isServerCommand(argv(command), everythingIsADirectory), command).toBe(false);
     }
     expect(isServerCommand(argv("my-project"), everythingIsADirectory)).toBe(true);
   });
 
-  it("lists every top-level command the CLI exports, so a new command cannot drift into a server start", () => {
-    // The CLI's top-level commands are the exported `Command.make("name")` constants under src/cli;
-    // every one that is not a server command must be a non-server command here.
+  it("looks past a leading global flag before classifying the command", () => {
+    const argv = (...rest: ReadonlyArray<string>) => [
+      "/usr/bin/node",
+      "/opt/t3/dist/bin.mjs",
+      ...rest,
+    ];
+    const isDirectory = (path: string) => path.endsWith("my-project");
+    expect(isServerCommand(argv("--log-level", "warn", "doctor"), isDirectory)).toBe(false);
+    expect(isServerCommand(argv("--log-level=warn", "doctor", "--help"), isDirectory)).toBe(false);
+    expect(isServerCommand(argv("--log-level", "warn"), isDirectory)).toBe(true);
+    expect(isServerCommand(argv("--log-level", "warn", "my-project"), isDirectory)).toBe(true);
+    expect(isServerCommand(argv("--log-level", "warn", "--port", "3773"), isDirectory)).toBe(true);
+    expect(isServerCommand(argv("--log-level", "warn", "--help"), isDirectory)).toBe(false);
+  });
+
+  it("lists every top-level command the CLI registers, inline ones included, so none can drift into a server start", () => {
+    // The root command's subcommands are the `withSubcommands([...])` list in binCli.ts: inline
+    // `Command.make("name")` calls and identifiers defined as `const name = Command.make("…")` in
+    // binCli.ts or exported from src/cli. Every one that is not a server command must be listed here.
+    const read = (file: string) => NodeFS.readFileSync(file, "utf8");
+    const binCli = read(NodePath.join(import.meta.dirname, "binCli.ts"));
     const cliDirectory = NodePath.join(import.meta.dirname, "cli");
-    const registered = new Set<string>();
-    for (const file of NodeFS.readdirSync(cliDirectory)) {
-      if (!file.endsWith(".ts") || file.endsWith(".test.ts")) continue;
-      const source = NodeFS.readFileSync(NodePath.join(cliDirectory, file), "utf8");
-      for (const match of source.matchAll(/export const \w+ = Command\.make\(\s*"([a-z_-]+)"/g)) {
-        registered.add(match[1]!);
+    const definitions = new Map<string, string>();
+    const collect = (source: string) => {
+      for (const match of source.matchAll(
+        /(?:export )?const (\w+) = Command\.make\(\s*"([a-z_-]+)"/g,
+      )) {
+        definitions.set(match[1]!, match[2]!);
       }
+    };
+    collect(binCli);
+    for (const file of NodeFS.readdirSync(cliDirectory)) {
+      if (file.endsWith(".ts") && !file.endsWith(".test.ts"))
+        collect(read(NodePath.join(cliDirectory, file)));
     }
+    const list = /Command\.withSubcommands\(\[([\s\S]*?)\]\)/.exec(binCli)?.[1];
+    expect(list).toBeDefined();
+    const registered = new Set<string>();
+    for (const match of list!.matchAll(/Command\.make\(\s*"([a-z_-]+)"/g))
+      registered.add(match[1]!);
+    const inlineStripped = list!.replace(/Command\.make\([\s\S]*?\)\.pipe\([\s\S]*?\),\n/g, "");
+    const unresolved: Array<string> = [];
+    for (const match of inlineStripped.matchAll(/\b([a-zA-Z]+Command)\b/g)) {
+      const name = definitions.get(match[1]!);
+      if (name === undefined) unresolved.push(match[1]!);
+      else registered.add(name);
+    }
+    expect(unresolved).toEqual([]);
     expect(registered.size).toBeGreaterThan(20);
+    expect(registered.has("help")).toBe(true);
     const unlisted = [...registered].filter(
       (command) => !SERVER_COMMANDS.has(command) && !NON_SERVER_COMMANDS.has(command),
     );
@@ -252,6 +291,21 @@ describe("isServerCommand", () => {
 });
 
 describe("planYoungGenerationRelaunch", () => {
+  it("relaunches a process at most once: the image that carries its own pid keeps, whatever a preload did", () => {
+    // A preload can rewrite or delete NODE_OPTIONS in the new image; the pid-bound guard ends the chain.
+    const first = plan({ pid: 4242 });
+    expect(first.kind).toBe("relaunch");
+    expect(
+      first.kind === "relaunch" ? first.env.T3CODE_YOUNG_GENERATION_RELAUNCHED_PID : undefined,
+    ).toBe("4242");
+    expect(plan({ pid: 4242, relaunchedPid: "4242" })).toEqual({
+      kind: "keep",
+      reason: "relaunched once already",
+    });
+    // An inherited value from an ancestor never matches this process.
+    expect(plan({ pid: 4242, relaunchedPid: "7" }).kind).toBe("relaunch");
+  });
+
   it("names a service launcher that predates the default when it starts the server over IPC without the flag", () => {
     // A remote update replaces the binary but not the running launcher: the RC2 launcher supplies no
     // flag, and a server started with an IPC channel cannot relaunch itself. Say so, visibly.
@@ -400,6 +454,61 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
         expect(report.nodeOptionsForChildren).toBeNull();
         expect(report.execArgv).toContain("--experimental-strip-types");
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("ignores a marker that does not match what the relaunch would have written", () =>
+    Effect.gen(function* () {
+      // A forged marker beside the flag must not hand children text the server never ran with.
+      const forged = yield* run({
+        NODE_OPTIONS: flag,
+        [INHERITED_NODE_OPTIONS_ENV]: "--require /nonexistent",
+      });
+      expect(forged.applied).toBe(false);
+      expect(forged.nodeOptionsForChildren).toBe(flag);
+      // A stale empty marker beside the user's explicit cap must not strip that cap from children.
+      const stale = yield* run({
+        NODE_OPTIONS: "--max-semi-space-size=16",
+        [INHERITED_NODE_OPTIONS_ENV]: "",
+      });
+      expect(stale.applied).toBe(false);
+      expect(stale.maxSemiSpaceMb).toBe(16);
+      expect(stale.nodeOptionsForChildren).toBe("--max-semi-space-size=16");
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "relaunches exactly once even when a preload rewrites or deletes NODE_OPTIONS in the new image",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "young-generation-loop-" });
+        const countFile = NodePath.join(dir, "images");
+        const preload = (body: string) => {
+          const file = NodePath.join(dir, `${body.length}.cjs`);
+          NodeFS.writeFileSync(
+            file,
+            `require("node:fs").appendFileSync(process.env.RELAUNCH_COUNT_FILE, process.pid + "\\n");\n${body}\n`,
+          );
+          return file;
+        };
+        const images = (file: string, env: Record<string, string>, args: ReadonlyArray<string>) => {
+          NodeFS.writeFileSync(countFile, "");
+          // A looping entrypoint never exits: the timeout ends it and the count says how many images ran.
+          NodeChildProcess.spawnSync(
+            process.execPath,
+            ["--experimental-strip-types", ...args, binPath, "__node-flags"],
+            {
+              env: { ...process.env, ...cleanEnv, ...env, RELAUNCH_COUNT_FILE: countFile },
+              timeout: 5000,
+            },
+          );
+          return NodeFS.readFileSync(countFile, "utf8").split("\n").filter(Boolean).length;
+        };
+        const strip = preload("delete process.env.NODE_OPTIONS;");
+        expect(images(strip, {}, ["--require", strip])).toBe(2);
+        const rewrite = preload('process.env.NODE_OPTIONS = "--require " + __filename;');
+        expect(images(rewrite, { NODE_OPTIONS: `--require ${rewrite}` }, [])).toBe(2);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.live("keeps the user's NODE_OPTIONS beside the flag and gives children the original", () =>

@@ -26,19 +26,23 @@ export interface CheckpointRefMemory {
   readonly rememberRef: (commonDir: string, ref: string, oid: string) => void;
   readonly forgetRef: (commonDir: string, ref: string) => void;
   /**
-   * The commit a remembered ref names: its oid, null when the ref exists neither loose nor packed,
-   * undefined when Git must answer (unknown ref, another value, a symbolic ref, an unreadable store).
+   * The commit a remembered ref names, or undefined when Git must answer: an unknown ref, another
+   * value, a symbolic ref, an unreadable or oversized store, a reftable store, a ref found neither
+   * loose nor packed (rev-parse then tries other names), or an environment that moves refs.
    */
-  readonly resolveRef: (commonDir: string, ref: string) => Effect.Effect<string | null | undefined>;
-  /** Keeps facts Git reported, while the repository's history is the objects' own. */
+  readonly resolveRef: (commonDir: string, ref: string) => Effect.Effect<string | undefined>;
+  /**
+   * Everything that decides whether Git reads commits as their objects say (shallow boundary,
+   * grafts, replacements, the environment), as one string; null when it does not.
+   */
+  readonly historyState: (commonDir: string) => Effect.Effect<string | null>;
+  /** Keeps facts Git reported, when the history state is the one taken before Git ran. */
   readonly rememberCommits: (
     repository: CheckpointRepository,
     facts: ReadonlyArray<readonly [oid: string, facts: CommitFacts]>,
+    stateBefore: string | null,
   ) => Effect.Effect<void>;
-  /**
-   * Facts from memory or the loose object; null when Git must answer: a packed or missing object,
-   * or a history Git reads differently from the objects (shallow, grafts, replacements).
-   */
+  /** Facts from memory or the loose object; null when Git must answer. */
   readonly commitFacts: (
     repository: CheckpointRepository,
     oid: string,
@@ -54,9 +58,22 @@ const COMMITS_CAPACITY = 16_384;
 // Parsed packed-refs files kept, and the entries they may hold in all; a file with more is left to Git.
 const PACKED_REFS_CAPACITY = 256;
 const PACKED_REFS_ENTRY_BUDGET = 16_384;
+// A cold parse runs on the main thread at about 1.8 ms and 1.2 MB per MiB of file (review bench:
+// 6.2 MB → 11 ms, 62 MB → 184 ms), against 19–25 ms for a `git rev-parse` child; 8 MiB keeps one
+// parse below one child. Larger files are left to Git.
+const PACKED_REFS_MAX_BYTES = 8 * 1024 * 1024;
 // Only refs under this prefix are kept from packed-refs; others are asked of Git.
 const PACKED_REFS_PREFIX = "refs/t3/";
 const REPLACE_REFS_PREFIX = "refs/replace/";
+// The generated names: base64url scope keys, "ordinal" and decimal ordinals.
+const CHECKPOINT_REF_NAME = /^refs\/t3\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)+$/;
+// Variables that move refs or change which commits Git sees; any of them set disables the fast paths.
+const HISTORY_ENVIRONMENT = [
+  "GIT_NAMESPACE",
+  "GIT_GRAFT_FILE",
+  "GIT_SHALLOW_FILE",
+  "GIT_REPLACE_REF_BASE",
+] as const;
 
 class BoundedMap<K, V> {
   readonly #entries = new Map<K, V>();
@@ -136,20 +153,43 @@ export const readTextFile = (file: string): Effect.Effect<string | null> =>
       }),
   );
 
-const statFingerprint = (file: string) =>
-  new Promise<string>((resolve) => {
+/** Whether the path is a symbolic link; null when it cannot be examined. */
+export const isSymbolicLink = (file: string): Effect.Effect<boolean | null> =>
+  Effect.promise(
+    () =>
+      new Promise<boolean | null>((resolve) => {
+        try {
+          NodeFS.lstat(file, (error, stats) => resolve(error ? null : stats.isSymbolicLink()));
+        } catch {
+          resolve(null);
+        }
+      }),
+  );
+
+interface StatInfo {
+  readonly fingerprint: string;
+  readonly size: number;
+}
+
+const statInfo = (file: string) =>
+  new Promise<StatInfo>((resolve) => {
     try {
       NodeFS.stat(file, { bigint: true }, (error, stats) =>
         resolve(
           error
-            ? `!${error.code ?? "error"}`
-            : `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`,
+            ? { fingerprint: `!${error.code ?? "error"}`, size: 0 }
+            : {
+                fingerprint: `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`,
+                size: Number(stats.size),
+              },
         ),
       );
     } catch {
-      resolve("!invalid");
+      resolve({ fingerprint: "!invalid", size: 0 });
     }
   });
+
+const statFingerprint = (file: string) => statInfo(file).then((info) => info.fingerprint);
 
 export interface ParsedPackedRefs {
   // Null when the file holds more refs under the prefix than `maxEntries`.
@@ -180,18 +220,22 @@ export const parsePackedRefs = (
   return { refs, replaceRefs };
 };
 
-interface PackedRefs extends ParsedPackedRefs {
+interface PackedRefs {
   readonly fingerprint: string;
+  readonly refs: ReadonlyMap<string, string> | null;
+  // Null when the file was not parsed (too large), so whether it holds replacements is unknown.
+  readonly replaceRefs: boolean | null;
 }
 
 // Stat before reading, so a rewrite between the two is seen by the next stat; null when unreadable.
 const readPackedRefs = (commonDir: string, cached: PackedRefs | undefined) =>
   Effect.promise(async (): Promise<PackedRefs | null> => {
     const file = NodePath.join(commonDir, "packed-refs");
-    const fingerprint = await statFingerprint(file);
+    const { fingerprint, size } = await statInfo(file);
     if (cached !== undefined && cached.fingerprint === fingerprint) return cached;
     if (fingerprint === "!ENOENT") return { fingerprint, refs: new Map(), replaceRefs: false };
     if (fingerprint.startsWith("!")) return null;
+    if (size > PACKED_REFS_MAX_BYTES) return { fingerprint, refs: null, replaceRefs: null };
     const content = await new Promise<string | null>((resolve) => {
       try {
         NodeFS.readFile(file, "latin1", (error, text) => resolve(error ? null : text));
@@ -206,15 +250,15 @@ const readPackedRefs = (commonDir: string, cached: PackedRefs | undefined) =>
     };
   });
 
-// Whether `git log` reports a commit as its object says: no shallow boundary, grafts or replacements
-// (replace refs are also looked for in packed-refs by the caller).
-const plainHistoryFiles = (commonDir: string) =>
+const environmentPlain = () => HISTORY_ENVIRONMENT.every((name) => process.env[name] === undefined);
+
+// The shallow file, grafts and loose replacements as one string, or null when any is present
+// (deleting the last replacement can leave its directory; only entries count).
+const historyFiles = (commonDir: string) =>
   Effect.promise(async () => {
-    if (process.env.GIT_REPLACE_REF_BASE !== undefined) return false;
     const [shallow, grafts, replaceRefs] = await Promise.all([
       statFingerprint(NodePath.join(commonDir, "shallow")),
       statFingerprint(NodePath.join(commonDir, "info", "grafts")),
-      // Deleting the last replacement can leave the directory; only entries count.
       new Promise<ReadonlyArray<string> | null>((resolve) => {
         try {
           NodeFS.readdir(NodePath.join(commonDir, "refs", "replace"), (error, names) =>
@@ -227,10 +271,16 @@ const plainHistoryFiles = (commonDir: string) =>
         }
       }),
     ]);
-    return shallow === "!ENOENT" && grafts === "!ENOENT" && replaceRefs?.length === 0;
+    return shallow === "!ENOENT" && grafts === "!ENOENT" && replaceRefs?.length === 0
+      ? `${shallow}\n${grafts}\n`
+      : null;
   });
 
-/** A commit object's header; null when it is not a well-formed commit. */
+/**
+ * A commit object's header as `git log` reads it: the tree on the first line, parents right after
+ * it, then the author and the committer with `<email> <time> <zone>`; null for anything else,
+ * which Git rejects or reads differently.
+ */
 export const parseCommitObject = (object: Buffer): CommitFacts | null => {
   const headerEnd = object.indexOf(0);
   if (headerEnd === -1) return null;
@@ -238,24 +288,21 @@ export const parseCommitObject = (object: Buffer): CommitFacts | null => {
   if (!header.startsWith("commit ") || Number(header.slice(7)) !== object.length - headerEnd - 1) {
     return null;
   }
-  let tree: string | null = null;
+  const lines = object.toString("latin1", headerEnd + 1).split("\n");
+  const tree = lines[0]?.startsWith("tree ") ? lines[0].slice(5) : null;
+  if (tree === null || !OBJECT_ID.test(tree)) return null;
   const parents: string[] = [];
-  let committerTime: string | null = null;
-  for (const line of object.toString("latin1", headerEnd + 1).split("\n")) {
-    if (line.length === 0) break;
-    if (line.startsWith("tree ")) {
-      if (tree !== null || !OBJECT_ID.test(line.slice(5))) return null;
-      tree = line.slice(5);
-    } else if (line.startsWith("parent ")) {
-      if (!OBJECT_ID.test(line.slice(7))) return null;
-      parents.push(line.slice(7));
-    } else if (line.startsWith("committer ")) {
-      const match = /^committer [^\n]* (\d+) [+-]\d{4}$/.exec(line);
-      if (match === null || committerTime !== null) return null;
-      committerTime = match[1]!;
-    }
+  let index = 1;
+  while (lines[index]?.startsWith("parent ")) {
+    const parent = lines[index]!.slice(7);
+    if (!OBJECT_ID.test(parent)) return null;
+    parents.push(parent);
+    index++;
   }
-  return tree === null || committerTime === null ? null : { tree, parents, committerTime };
+  if (!lines[index]?.startsWith("author ")) return null;
+  const committer = /^committer [^<>\n]*<[^<>\n]*> (\d+) [+-]\d{4}$/.exec(lines[index + 1] ?? "");
+  if (committer === null) return null;
+  return { tree, parents, committerTime: committer[1]! };
 };
 
 const readLooseCommit = (objectsDir: string, oid: string) =>
@@ -282,10 +329,6 @@ const readLooseCommit = (objectsDir: string, oid: string) =>
         }
       }),
   );
-
-const isCheckpointRefName = (ref: string) =>
-  ref.startsWith(PACKED_REFS_PREFIX) &&
-  ref.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
 
 export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const refs = new BoundedMap<string, string>(REFS_CAPACITY);
@@ -317,12 +360,14 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     return current;
   });
 
-  // Git's files backend: the loose file wins, then packed-refs; absent from both is absent. A
-  // reftable store (which only the repository's own config declares, so the snapshot may still
-  // say files) keeps neither, so Git answers there.
+  // Git's files backend: the loose file wins, then packed-refs. A reftable store (which only the
+  // repository's own config declares, so the snapshot may still say files) keeps neither, and a
+  // name absent from both is one rev-parse would try under refs/heads and the like, so Git answers.
   const resolveRef = Effect.fnUntraced(function* (commonDir: string, ref: string) {
     const known = refs.get(refKey(commonDir, ref));
-    if (known === undefined || !isCheckpointRefName(ref)) return undefined;
+    if (known === undefined || !CHECKPOINT_REF_NAME.test(ref) || !environmentPlain()) {
+      return undefined;
+    }
     const reftable = yield* Effect.promise(() =>
       statFingerprint(NodePath.join(commonDir, "reftable")),
     );
@@ -333,18 +378,20 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     const current = yield* packedRefs(commonDir);
     if (current === null || current.refs === null) return undefined;
     const entry = current.refs.get(ref);
-    if (entry === undefined) return null;
     return entry === known ? known : undefined;
   });
 
-  const plainHistory = Effect.fnUntraced(function* (commonDir: string) {
-    if (!(yield* plainHistoryFiles(commonDir))) return false;
+  const historyState = Effect.fnUntraced(function* (commonDir: string) {
+    if (!environmentPlain()) return null;
+    const files = yield* historyFiles(commonDir);
+    if (files === null) return null;
     const current = yield* packedRefs(commonDir);
-    return current !== null && !current.replaceRefs;
+    if (current === null || current.replaceRefs !== false) return null;
+    return `${files}${current.fingerprint}`;
   });
 
   const commitFacts = Effect.fnUntraced(function* (repository: CheckpointRepository, oid: string) {
-    if (!(yield* plainHistory(repository.commonDir))) return null;
+    if ((yield* historyState(repository.commonDir)) === null) return null;
     const remembered = commits.get(oid);
     if (remembered !== undefined) return remembered;
     const facts = yield* readLooseCommit(repository.objectsDir, oid);
@@ -352,11 +399,15 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     return facts;
   });
 
+  // Facts Git reported describe the history as it was while Git ran; keep them only when the
+  // state taken before the run is still the state after it.
   const rememberCommits = Effect.fnUntraced(function* (
     repository: CheckpointRepository,
     facts: ReadonlyArray<readonly [oid: string, facts: CommitFacts]>,
+    stateBefore: string | null,
   ) {
-    if (facts.length === 0 || !(yield* plainHistory(repository.commonDir))) return;
+    if (facts.length === 0 || stateBefore === null) return;
+    if ((yield* historyState(repository.commonDir)) !== stateBefore) return;
     for (const [oid, commit] of facts) commits.set(oid, commit);
   });
 
@@ -364,6 +415,7 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     rememberRef: (commonDir, ref, oid) => refs.set(refKey(commonDir, ref), oid),
     forgetRef: (commonDir, ref) => refs.delete(refKey(commonDir, ref)),
     resolveRef,
+    historyState,
     rememberCommits,
     commitFacts,
     packedRefsEntries: () => packedEntries,

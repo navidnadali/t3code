@@ -47,6 +47,7 @@ import {
   type CheckpointRepository,
   type CommitFacts,
   isObjectId,
+  isSymbolicLink,
   makeCheckpointRefMemory,
   readTextFile,
 } from "./gitCheckpointRefs.ts";
@@ -883,6 +884,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
   // Whether HEAD resolves: Git answers once per state of HEAD's content (a snapshot dependency)
   // and of the ref it names; null when HEAD is neither symbolic nor an object id, or Git failed.
   const headResolves = Effect.fnUntraced(function* (cwd: string, snapshot: GitConfigSnapshot) {
+    // With core.preferSymlinkRefs HEAD is a link to the branch file; Git reads its target as a name.
+    if ((yield* isSymbolicLink(path.join(snapshot.gitDir, "HEAD"))) !== false) return null;
     const content = yield* readTextFile(snapshot.headPath);
     if (content === null) return null;
     const names = content.startsWith("ref:")
@@ -1030,6 +1033,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         );
       }
     }
+    const stateBefore =
+      repository === null ? null : yield* refMemory.historyState(repository.commonDir);
     const heads = yield* execute({
       operation,
       cwd,
@@ -1054,7 +1059,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         }
         return `${parents.join(" ")} ${committerTime}`;
       });
-    if (repository !== null) yield* refMemory.rememberCommits(repository, reported);
+    if (repository !== null) yield* refMemory.rememberCommits(repository, reported, stateBefore);
     return lines;
   });
 

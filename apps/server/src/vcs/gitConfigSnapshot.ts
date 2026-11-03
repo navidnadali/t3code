@@ -272,7 +272,8 @@ export interface GitConfigSnapshot {
   // What `git rev-parse --show-toplevel` prints, and the directory's path below it.
   readonly toplevel: string;
   readonly prefixSegments: ReadonlyArray<string>;
-  // Absolute: the common directory, the index, the object store, HEAD and info/exclude.
+  // Absolute: the git directory, the common directory, the index, the object store, HEAD and info/exclude.
+  readonly gitDir: string;
   readonly gitCommonDir: string;
   readonly absoluteIndexPath: string;
   readonly objectsDir: string;
@@ -312,7 +313,7 @@ const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
 const CONFIG_SNAPSHOT_LOAD_ATTEMPTS = 3;
 const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
 const REF_RESULTS_CAPACITY = 256;
-const REPOSITORY_PATH_COUNT = 12;
+const REPOSITORY_PATH_COUNT = 13;
 const FILE_RESULTS_CAPACITY = 64;
 const REUSED_RESULTS_CAPACITY = 64;
 // Ref names whose loose file Git's files backend keeps at <common dir>/<name>: refs shared by every
@@ -372,6 +373,9 @@ const REPOSITORY_PATH_ARGS = [
   "objects",
   "--git-path",
   "refs",
+  // The real common directory: a --git-path answer resolves symbolic links, so a symlinked
+  // refs directory would otherwise name its target's parent.
+  "--git-common-dir",
   "--git-path",
   "index",
   "--git-path",
@@ -462,7 +466,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     }
     const [
       toplevel,
-      ,
+      gitDir,
       config,
       configWorktree,
       commondir,
@@ -471,9 +475,11 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       head,
       objects,
       refs,
+      gitCommonDir,
       absoluteIndexPath,
       infoExclude,
     ] = paths as [
+      string,
       string,
       string,
       string,
@@ -525,6 +531,8 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     dependencies.push(
       { path: path.join(toplevel, ".git"), kind: "identity" },
       { path: head, kind: "content" },
+      // With core.preferSymlinkRefs HEAD is a link whose target names the branch.
+      { path: path.join(gitDir, "HEAD"), kind: "entry" },
       { path: objects, kind: "presence" },
       { path: path.join(objects, "info", "alternates"), kind: "content" },
       { path: refs, kind: "presence" },
@@ -570,11 +578,12 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       values: snapshotSupported ? values : null,
       valueLists,
       indexPath,
-      // Refs live in the common directory, the one `--git-path refs` names.
-      commonDir: refStorage === undefined || refStorage === "files" ? path.dirname(refs) : null,
+      // Refs live in the common directory.
+      commonDir: refStorage === undefined || refStorage === "files" ? gitCommonDir : null,
       toplevel,
       prefixSegments: segments,
-      gitCommonDir: path.dirname(refs),
+      gitDir,
+      gitCommonDir,
       absoluteIndexPath,
       objectsDir: objects,
       headPath: head,
@@ -628,6 +637,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
                     fileResults: new Map(),
                     toplevel: state.toplevel,
                     prefixSegments: state.prefixSegments,
+                    gitDir: state.gitDir,
                     gitCommonDir: state.gitCommonDir,
                     absoluteIndexPath: state.absoluteIndexPath,
                     objectsDir: state.objectsDir,

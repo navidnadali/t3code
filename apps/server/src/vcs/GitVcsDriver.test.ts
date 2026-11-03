@@ -1773,7 +1773,8 @@ it.effect("checkpoint ref memory follows deletions, rewrites, packed refs and pa
       { baseline: recreated.baselineExists, previous: recreated.previousExists },
       { baseline: false, previous: true },
     );
-    assert.isFalse(recreated.commands.includes("rev-parse"));
+    // A name found neither loose nor packed is one rev-parse would try elsewhere: git answers once.
+    assert.strictEqual(recreated.commands.filter((command) => command === "rev-parse").length, 1);
 
     // Rewritten to another commit: git answers once, then the new value is known.
     yield* h.gitBoth(["update-ref", turnRef(4), "HEAD"]);
@@ -2406,9 +2407,9 @@ it.effect("an oversized packed-refs is left to git", () =>
     yield* git(["update-ref", ref, head]);
     memory.rememberRef(commonDir, ref, head);
     // Enough refs (long names, few processes) that parsing the file would cost more than asking git.
-    const segment = "x".repeat(200);
+    const segment = Array.from({ length: 4 }, () => "x".repeat(200)).join("/");
     const filler = Array.from(
-      { length: 40_000 },
+      { length: 11_000 },
       (_, index) =>
         `update refs/t3/oversized/${segment}/${String(index).padStart(5, "0")} ${head}\n`,
     ).join("");
@@ -2442,8 +2443,8 @@ it.effect("a deleted checkpoint ref is resolved as rev-parse would", () =>
   }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
 
-it.effect("rejects or reads commit objects exactly as git log does", () =>
-  Effect.gen(function* () {
+it("rejects or reads commit objects exactly as git log does", () => {
+  {
     const tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
     const parent = "399eaf5fa16d1e49764d639c52fbbce85b2ab3cf";
     const object = (body: string) => Buffer.from(`commit ${Buffer.byteLength(body)}\0${body}`);
@@ -2472,5 +2473,5 @@ it.effect("rejects or reads commit objects exactly as git log does", () =>
       facts(`tree ${tree}\n${author}committer T <t@t> 1700000001 +0000\nparent ${parent}\n\nm\n`),
       { tree, parents: [], committerTime: "1700000001" },
     );
-  }),
-);
+  }
+});

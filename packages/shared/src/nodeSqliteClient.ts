@@ -629,9 +629,10 @@ const makeReader = Effect.fnUntraced(function* (
     // back SQLite's error, as it always did, without touching this bookkeeping.
     let pendingBegin = false;
     let inTransaction = false;
-    // The id of the last message that changed the transaction state (a folded BEGIN or an ending
-    // control); a reply to an older message, late to a fiber that gave up on it, is stale.
-    let transitionId = 0;
+    // The id of the newest message that reached the worker: it answers in order and each reply
+    // carries the connection's state after that message, so only a reply at or after this id is
+    // current (one late to a fiber that gave up on it is not).
+    let latestId = 0;
     // A message the worker cannot receive, such as one with an uncloneable binding, fails its
     // own statement; an ending statement with nothing waiting on it is dropped.
     const send = (message: Record<string, unknown>) => {
@@ -663,10 +664,8 @@ const makeReader = Effect.fnUntraced(function* (
       }
     };
     // Bench variant V2: every message goes to the worker at once, in order (pipelined, no batch).
-    const post = (message: Record<string, unknown>) => {
-      if (stoppedMessage !== undefined) return;
-      send(message);
-    };
+    const post = (message: Record<string, unknown>) =>
+      stoppedMessage === undefined && send(message);
     const stop = (message: string) => {
       stoppedMessage = message;
       announce({ type: "unavailable", message });
@@ -699,7 +698,9 @@ const makeReader = Effect.fnUntraced(function* (
         // error to return, and a raw control has a run() result.
         const control = input.params.length === 0 && !input.raw;
         const begins = control && beginsTransaction(input.sql);
-        if (begins && !pendingBegin && !inTransaction) {
+        // Folding is a guess about the connection's state: only with nothing outstanding on it
+        // (an earlier statement could still open or end a transaction when it runs).
+        if (begins && !pendingBegin && !inTransaction && pending.size === 0) {
           pendingBegin = true;
           return Effect.succeed([]);
         }
@@ -714,9 +715,8 @@ const makeReader = Effect.fnUntraced(function* (
           if (pendingBegin) pendingBegin = false;
           else {
             inTransaction = false;
-            transitionId = nextRequestId++;
-            if (stoppedMessage === undefined)
-              post({ id: transitionId, safeIntegers: false, ...input });
+            const id = nextRequestId++;
+            if (post({ id, safeIntegers: false, ...input })) latestId = id;
           }
           return Effect.succeed([]);
         }
@@ -737,15 +737,12 @@ const makeReader = Effect.fnUntraced(function* (
           const begin = pendingBegin;
           pendingBegin = false;
           const id = nextRequestId++;
-          if (begin) {
-            inTransaction = true;
-            transitionId = id;
-          }
+          if (begin) inTransaction = true;
           pending.set(id, (reply) => {
             // A control the worker ran itself (raw, bound, duplicate, stray, a savepoint) may have
             // changed the connection's transaction state: the worker's word replaces the guess,
-            // unless the reply is older than the last transition.
-            if (reply.inTransaction !== undefined && id >= transitionId)
+            // unless a newer message has reached the worker since.
+            if (reply.inTransaction !== undefined && id >= latestId)
               inTransaction = reply.inTransaction;
             if ("rows" in reply) {
               resume(
@@ -770,7 +767,8 @@ const makeReader = Effect.fnUntraced(function* (
           });
           if (pending.size === 1) worker.ref();
           const cached = input.cached && !hasLargeBinding(input.params);
-          post({ id, safeIntegers, ...input, cached, ...(begin ? { begin } : {}) });
+          if (post({ id, safeIntegers, ...input, cached, ...(begin ? { begin } : {}) }))
+            latestId = id;
         });
       });
 

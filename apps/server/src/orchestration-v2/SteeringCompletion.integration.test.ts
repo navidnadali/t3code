@@ -2237,6 +2237,7 @@ it.effect("a thread recorded before the upgrade that never switched still restor
         false,
         true,
         Effect.void,
+        true,
         database,
       );
       yield* Effect.gen(function* () {

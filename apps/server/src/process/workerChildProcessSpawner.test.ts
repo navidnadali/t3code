@@ -18,6 +18,7 @@ import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
+import * as Redacted from "effect/Redacted";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
@@ -284,6 +285,46 @@ describe("WorkerChildProcessSpawner", () => {
           expect((yield* collect(remoteSpawner, commands[9]!)).stdout).toHaveLength(
             3 * 1024 * 1024,
           );
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: gives the child Redacted arguments and environment values, like the Node spawner`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          const command = ChildProcess.make(
+            process.execPath,
+            [
+              "-e",
+              "process.stdout.write(JSON.stringify([process.argv[1], process.env.T3_REDACTED_ENV]))",
+              Redacted.make("secret-argument"),
+            ],
+            { env: { T3_REDACTED_ENV: Redacted.make("secret-env") }, extendEnv: true },
+          );
+          const expected = yield* collect(nodeSpawner, command);
+          expect(expected.stdout.toString()).toBe(
+            JSON.stringify(["secret-argument", "secret-env"]),
+          );
+          expect(yield* collect(remoteSpawner, command)).toEqual(expected);
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: keeps Redacted values out of spawn errors, like the Node spawner`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          for (const command of [
+            ChildProcess.make("t3-missing-executable-redacted", [Redacted.make("secret-missing")]),
+            ChildProcess.make(process.execPath, ["-e", "1", Redacted.make("secret\0nul")]),
+          ]) {
+            const expected = yield* spawnError(nodeSpawner, command);
+            expect(JSON.stringify(expected)).not.toContain("secret");
+            expect(yield* spawnError(remoteSpawner, command)).toEqual(expected);
+          }
         }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
 

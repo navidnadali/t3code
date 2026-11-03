@@ -148,3 +148,30 @@ it.effect("sizes the saturated allowance and the reopen mark", () =>
     assert.isFalse(EffectAdmission.isGated("runtime-request.respond"));
   }),
 );
+
+it.effect("stops counting a slot held longer than a turn start may take", () =>
+  Effect.gen(function* () {
+    const pressure = yield* Ref.make(5);
+    const restored = yield* Ref.make(0);
+    const admission = yield* makeAdmission(2, pressure, restored);
+    const first = yield* reserve(admission);
+    const second = yield* reserve(admission);
+    assert.isDefined(first);
+    assert.isDefined(second);
+    assert.isUndefined(yield* reserve(admission));
+
+    // Two hung starts must not hold every slot for good: after the bound a new start may run.
+    yield* TestClock.adjust("120 seconds");
+    assert.deepEqual(yield* admission.excludedTypes, []);
+    const third = yield* reserve(admission);
+    assert.isDefined(third);
+    assert.equal((yield* admission.state).inFlight, 1);
+
+    // A late release of an expired slot changes nothing; the live one still counts.
+    yield* first!;
+    yield* second!;
+    assert.equal((yield* admission.state).inFlight, 1);
+    yield* third!;
+    assert.equal((yield* admission.state).inFlight, 0);
+  }),
+);

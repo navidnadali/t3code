@@ -872,3 +872,41 @@ it.effect(
   "a worker idle behind the closed gate looks again within a sample when no wake-up comes",
   () => saturatedDaemon({ wakeUpsDelivered: false }),
 );
+
+it.effect("requeues a claim whose timestamp cannot be parsed, as before", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const workerId = "worker-corrupt-timestamp";
+    const claimedEffect: EffectOutbox.OrchestrationEffectV2 = {
+      ...admissionEffect(1, now, workerId, { type: "terminal.cleanup" }),
+      availableAt: "not a timestamp",
+    };
+    const retries = yield* Ref.make<ReadonlyArray<string>>([]);
+    const executionCount = yield* Ref.make(0);
+    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () => Effect.succeedSome(claimedEffect),
+      get: () => Effect.succeedNone,
+      retry: (input) =>
+        Ref.update(retries, (existing) => [...existing, input.effectId]).pipe(Effect.as(true)),
+    });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({
+        execute: () => Ref.update(executionCount, (count) => count + 1),
+      }),
+    );
+    const layerWorker = EffectWorker.layerWithOptions({ workerId }).pipe(
+      Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+    );
+
+    const exit = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => worker.runOnce),
+      Effect.provide(layerWorker),
+      Effect.exit,
+    );
+
+    assert.isTrue(Exit.isFailure(exit));
+    assert.equal(yield* Ref.get(executionCount), 0);
+    assert.deepEqual(yield* Ref.get(retries), [claimedEffect.id]);
+  }),
+);

@@ -266,10 +266,12 @@ const make = Effect.gen(function* () {
   let lastPublished = 0;
   let latestBase:
     | {
+        readonly generation: number;
         readonly coversThrough: number;
         readonly result: Deferred.Deferred<ShellResyncBase, ShellDeltaHubError>;
       }
     | undefined;
+  let baseGeneration = 0;
   // Per subscriber: the highest sequence its consumer has processed, and its reset.
   interface SubscriberState {
     seen: number;
@@ -297,9 +299,11 @@ const make = Effect.gen(function* () {
           return restore(Deferred.await(read.result)).pipe(Effect.map((base) => ({ read, base })));
         }
         const read = {
+          generation: ++baseGeneration,
           coversThrough: publishedSequence,
           result: Deferred.makeUnsafe<ShellResyncBase, ShellDeltaHubError>(),
         };
+        const generation = read.generation;
         latestBase = read;
         // One read transaction, as the initial snapshot: the sequence, the thread shells and the
         // project rows agree, so every delta above the sequence is newer than the base's rows.
@@ -328,12 +332,13 @@ const make = Effect.gen(function* () {
             }),
           ),
           // A base pinned by a reset subscriber that never pulls goes after the shared-read TTL,
-          // like any shared read; that subscriber's late pull reads again.
+          // like any shared read; that subscriber's late pull reads again. The timer holds the
+          // read's generation only, so a base released earlier is not kept alive by it.
           Effect.andThen(
             Effect.sleep(ThreadManagementService.SHARED_SHELL_READ_TTL_MS).pipe(
               Effect.andThen(
                 Effect.sync(() => {
-                  if (latestBase === read) latestBase = undefined;
+                  if (latestBase?.generation === generation) latestBase = undefined;
                 }),
               ),
             ),
@@ -488,11 +493,10 @@ const make = Effect.gen(function* () {
           }),
         ),
     ).pipe(Scope.provide(subscriptionScope));
-    const subscription = yield* PubSub.subscribe(instance.output).pipe(
-      Scope.provide(subscriptionScope),
-    );
-    // Batches published before this subscription cannot reach it: it has them "processed". The
-    // entry and its removal are one step, so a setup cancelled after it leaves nothing behind.
+    // Counted before the hub's output can reach it: a batch published from now on finds this
+    // subscriber lagging until it has processed it, so the batch's base waits for it. Batches
+    // published before are "processed" (they cannot reach it). The entry and its removal are
+    // one step, so a setup cancelled after it leaves nothing behind.
     const state = yield* Effect.acquireRelease(
       Effect.sync(() => {
         const state: SubscriberState = { seen: lastPublished, resetThrough: undefined };
@@ -505,6 +509,9 @@ const make = Effect.gen(function* () {
           releaseBaseIfServed();
         }),
     ).pipe(Scope.provide(subscriptionScope));
+    const subscription = yield* PubSub.subscribe(instance.output).pipe(
+      Scope.provide(subscriptionScope),
+    );
     // One budget for all this subscriber retains: the latest delta per aggregate, held until the
     // stream is taken (its snapshot read runs meanwhile) and buffered after. When the stream
     // starts, held deltas the snapshot covers or an unchanged check skips are released.

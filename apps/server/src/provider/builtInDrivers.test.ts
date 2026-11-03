@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, expect, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import { ProviderInstanceId } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -16,6 +16,7 @@ import * as Path from "effect/Path";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
@@ -41,7 +42,10 @@ const layerTest = TestProviderHost.layer({ runBackgroundWork: false }).pipe(
   Layer.provideMerge(
     Layer.succeed(
       HttpClient.HttpClient,
-      HttpClient.make(() => Effect.die("The fixture makes no HTTP request")),
+      // Latest-version lookups find nothing.
+      HttpClient.make((request) =>
+        Effect.succeed(HttpClientResponse.fromWeb(request, new Response(null, { status: 404 }))),
+      ),
     ),
   ),
 );
@@ -68,52 +72,99 @@ const stubBrew = (prefix: string, spawned: Array<string>) =>
     );
   });
 
-// The stub `brew` cannot run as an executable on Windows.
-it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
-  "starts an ACP driver's processes from the server's provider launcher when there is one",
-  () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const prefix = yield* fs.realPath(
-        yield* fs.makeTempDirectoryScoped({ prefix: "t3-launcher-grok-" }),
+// Which spawners a driver's checks and maintenance lookups reach (a Homebrew-installed binary's
+// lookup runs `brew --prefix`; a status check runs the binary).
+const spawnersUsed = (driverKind: string, binaryName: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const prefix = yield* fs.realPath(
+      yield* fs.makeTempDirectoryScoped({ prefix: `t3-launcher-${driverKind}-` }),
+    );
+    const binaryPath = path.join(prefix, "Caskroom", binaryName, "1.2.3", binaryName);
+    for (const executable of [path.join(prefix, "bin", "brew"), binaryPath]) {
+      yield* fs.makeDirectory(path.dirname(executable), { recursive: true });
+      yield* fs.writeFileString(executable, "#!/bin/sh\n");
+      yield* fs.chmod(executable, 0o755);
+    }
+    const spawned = { launcher: [], commands: [], ambient: [] } satisfies Record<
+      string,
+      Array<string>
+    >;
+    // The list's entry, as the registry creates it; each of these drivers takes this environment.
+    const driver = BUILT_IN_DRIVERS.find(
+      (entry) => entry.driverKind === driverKind,
+    ) as unknown as typeof GrokDriver;
+    const instance = yield* driver
+      .create({
+        instanceId: ProviderInstanceId.make(`${driverKind}-launcher`),
+        displayName: "Launcher test",
+        enabled: true,
+        environment: [],
+        config: { ...driver.defaultConfig(), binaryPath },
+      })
+      .pipe(
+        Effect.provideService(
+          WorkerChildProcessSpawner.ProviderProcessLauncher,
+          WorkerChildProcessSpawner.ProviderProcessLauncher.of({
+            spawn: () => {
+              throw new Error("These drivers start processes through Effect");
+            },
+            spawner: stubBrew(prefix, spawned.launcher),
+          }),
+        ),
+        Effect.provideService(
+          WorkerChildProcessSpawner.CommandSpawner,
+          stubBrew(prefix, spawned.commands),
+        ),
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          stubBrew(prefix, spawned.ambient),
+        ),
       );
-      const binaryPath = path.join(prefix, "Caskroom", "grok-build", "1.2.3,456", "grok");
-      for (const executable of [path.join(prefix, "bin", "brew"), binaryPath]) {
-        yield* fs.makeDirectory(path.dirname(executable), { recursive: true });
-        yield* fs.writeFileString(executable, "#!/bin/sh\n");
-        yield* fs.chmod(executable, 0o755);
-      }
-      const launched: Array<string> = [];
-      const fromServer: Array<string> = [];
-      // The list's entry for Grok, as the registry creates it.
-      const grok = BUILT_IN_DRIVERS.find(
-        ({ driverKind }) => driverKind === GrokDriver.driverKind,
-      ) as unknown as typeof GrokDriver;
-      const instance = yield* grok
-        .create({
-          instanceId: ProviderInstanceId.make("grok-launcher"),
-          displayName: "Grok test",
-          enabled: false,
-          environment: [],
-          config: { ...grok.defaultConfig(), binaryPath },
-        })
-        .pipe(
-          Effect.provideService(
-            WorkerChildProcessSpawner.ProviderProcessLauncher,
-            WorkerChildProcessSpawner.ProviderProcessLauncher.of({
-              spawn: () => {
-                throw new Error("ACP agents are driven through Effect");
-              },
-              spawner: stubBrew(prefix, launched),
-            }),
-          ),
-          Effect.provideService(
-            ChildProcessSpawner.ChildProcessSpawner,
-            stubBrew(prefix, fromServer),
-          ),
-        );
-      yield* instance.snapshot.resolveMaintenance();
-      expect({ launched, fromServer }).toEqual({ launched: ["--prefix"], fromServer: [] });
-    }).pipe(Effect.provide(layerTest), Effect.scoped),
+    yield* instance.snapshot.resolveMaintenance();
+    yield* instance.snapshot.refresh;
+    return {
+      launcher: spawned.launcher.length > 0,
+      commands: spawned.commands.length > 0,
+      ambient: spawned.ambient.length > 0,
+    };
+  }).pipe(Effect.provide(layerTest), Effect.scoped);
+
+// The stub `brew` cannot run as an executable on Windows.
+describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "built-in drivers' processes",
+  () => {
+    it.effect("start from the server's provider launcher for a provider verified on hand-off", () =>
+      Effect.gen(function* () {
+        expect(yield* spawnersUsed("pi", "pi")).toEqual({
+          launcher: true,
+          commands: false,
+          ambient: false,
+        });
+      }),
+    );
+
+    it.effect("stay on Node's spawner for Grok, which exits when its parent process dies", () =>
+      Effect.gen(function* () {
+        expect(yield* spawnersUsed("grok", "grok")).toEqual({
+          launcher: false,
+          commands: false,
+          ambient: true,
+        });
+      }),
+    );
+
+    it.effect(
+      "run Muse's checks on the server's command spawner (its SDK starts its sessions)",
+      () =>
+        Effect.gen(function* () {
+          expect(yield* spawnersUsed("muse", "muse")).toEqual({
+            launcher: false,
+            commands: true,
+            ambient: false,
+          });
+        }),
+    );
+  },
 );

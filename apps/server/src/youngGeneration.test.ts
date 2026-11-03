@@ -18,6 +18,7 @@ import {
   planYoungGenerationRelaunch,
   resolveMaxSemiSpaceMb,
   NON_SERVER_COMMANDS,
+  nodeOptionsFromProcessListing,
   SERVER_COMMANDS,
   serverChildEnvironment,
   tokenizeNodeOptions,
@@ -290,6 +291,22 @@ describe("isServerCommand", () => {
   });
 });
 
+describe("nodeOptionsFromProcessListing", () => {
+  it("reads NODE_OPTIONS out of a ps -E line, spaces in the value included, and stops at the next variable", () => {
+    const line =
+      "/usr/bin/node /opt/t3/dist/bin.mjs serve HOME=/home/t3 NODE_OPTIONS=--max-old-space-size=4096 --import /tmp/x.mjs PATH=/usr/bin TERM=xterm";
+    expect(nodeOptionsFromProcessListing(line)).toBe(
+      "--max-old-space-size=4096 --import /tmp/x.mjs",
+    );
+    expect(
+      nodeOptionsFromProcessListing("/usr/bin/node x.mjs HOME=/home/t3 PATH=/usr/bin"),
+    ).toBeUndefined();
+    expect(nodeOptionsFromProcessListing("/usr/bin/node x.mjs NODE_OPTIONS= PATH=/usr/bin")).toBe(
+      "",
+    );
+  });
+});
+
 describe("planYoungGenerationRelaunch", () => {
   it("relaunches a process at most once: the image that carries its own pid keeps, whatever a preload did", () => {
     // A preload can rewrite or delete NODE_OPTIONS in the new image; the pid-bound guard ends the chain.
@@ -536,6 +553,20 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
         );
         expect(hiddenCap.preloadRuns).toBe(1);
         expect(hiddenCap.report?.applied).toBe(false);
+        // The same with an ES module preload, which leaves nothing in the CommonJS cache: the process's
+        // startup environment, read from the OS, still shows the preload and the explicit cap.
+        const hiddenModule = NodePath.join(dir, "hidden.mjs");
+        NodeFS.writeFileSync(
+          hiddenModule,
+          'import { appendFileSync } from "node:fs";\nappendFileSync(process.env.RELAUNCH_COUNT_FILE, process.pid + "\\n");\ndelete process.env.NODE_OPTIONS;\n',
+        );
+        const hiddenEsm = images(
+          hiddenModule,
+          { NODE_OPTIONS: `--max-semi-space-size=16 --import ${hiddenModule}` },
+          [],
+        );
+        expect(hiddenEsm.preloadRuns).toBe(1);
+        expect(hiddenEsm.report?.applied).toBe(false);
         // An explicit cap beside a preload that clears NODE_OPTIONS must not be relaunched over with 64.
         const clearing = preload("delete process.env.NODE_OPTIONS;");
         const cleared = images(clearing, { NODE_OPTIONS: "--max-semi-space-size=16" }, [

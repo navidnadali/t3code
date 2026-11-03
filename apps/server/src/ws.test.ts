@@ -2163,6 +2163,20 @@ it("encodes a shared stream item once, as the RPC JSON codec encodes a chunk", (
   );
 });
 
+// Review E1: each encoder keeps its own cache, so an object that reaches both streams is never
+// served with the other stream's encoding.
+it("an item encoded for the shell stream is not served to the thread stream from the cache", () => {
+  const item: OrchestrationV2ShellStreamItem = {
+    kind: "thread.removed",
+    sequence: 9,
+    location: "archive",
+    threadId: ThreadId.make("4fce7cfc-16ef-42bb-bca2-000000000047"),
+  };
+  assert.deepStrictEqual<unknown>([encodeShellStreamItem(item)], encodeShellChunk([item]));
+  // Not a thread stream item: the thread encoder must reject it, not return the shell encoding.
+  assert.throws(() => encodeThreadStreamItem(item as never));
+});
+
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ShellDeltaHub.ShellDeltaHub)({

@@ -1461,8 +1461,15 @@ it.effect(
               assert.isTrue(Exit.isFailure(nested));
               const duplicate = yield* sql.unsafe("BEGIN").pipe(Effect.flip);
               assert.include(String(duplicate.reason.cause), "within a transaction");
-              const missing = yield* sql.unsafe("ROLLBACK TO SAVEPOINT missing").pipe(Effect.flip);
-              assert.include(String(missing.reason.cause), "no such savepoint");
+              for (const form of [
+                "ROLLBACK TO SAVEPOINT missing",
+                "ROLLBACK TRANSACTION TO SAVEPOINT missing",
+                "ROLLBACK/*to the savepoint*/TO SAVEPOINT missing",
+                "-- a comment first\nROLLBACK TO missing",
+              ]) {
+                const missing = yield* sql.unsafe(form).pipe(Effect.flip);
+                assert.include(String(missing.reason.cause), "no such savepoint", form);
+              }
               return yield* countEntries(sql);
             }),
           )

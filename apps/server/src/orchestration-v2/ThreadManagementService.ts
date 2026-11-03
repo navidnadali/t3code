@@ -426,6 +426,17 @@ export interface ThreadManagementServiceShape {
     readonly threadId: ThreadId;
     readonly sequence: number;
   }) => ReturnType<Orchestrator.OrchestratorV2["Service"]["getThreadShell"]>;
+  /**
+   * `getThreadShellForEvent` with the shared read's ordinal: reads of one thread run in ordinal
+   * order, so a higher ordinal is newer-or-equal content.
+   */
+  readonly getThreadShellReadForEvent: (input: {
+    readonly threadId: ThreadId;
+    readonly sequence: number;
+  }) => Effect.Effect<
+    { readonly shell: OrchestrationV2ThreadShell | null; readonly readOrdinal: number },
+    Orchestrator.OrchestratorV2Error
+  >;
   /** Omit `projectId` to list every project's threads. Side chats are never listed. */
   readonly listProjectThreads: (input: {
     readonly projectId?: ProjectId | undefined;
@@ -579,6 +590,8 @@ interface SharedShellRead {
   sequence: number;
   started: boolean;
   expiresAt: number;
+  /** Creation order across threads; reads of one thread complete in this order. */
+  readonly readOrdinal: number;
   readonly result: Deferred.Deferred<
     OrchestrationV2ThreadShell | null,
     Orchestrator.OrchestratorV2Error
@@ -810,7 +823,12 @@ const make = Effect.gen(function* () {
   // Callers ask after their event commits, so a read that has not started covers every sequence asked
   // so far. A thread's reads run one after another, so a newer read never sees older state, and in the
   // layer scope, so a caller that disconnects cannot cancel a read other callers await.
-  const getThreadShellForEvent: ThreadManagementServiceShape["getThreadShellForEvent"] = (input) =>
+  let nextReadOrdinal = 0;
+  const withReadOrdinal = (read: SharedShellRead) =>
+    Effect.map(Deferred.await(read.result), (shell) => ({ shell, readOrdinal: read.readOrdinal }));
+  const getThreadShellReadForEvent: ThreadManagementServiceShape["getThreadShellReadForEvent"] = (
+    input,
+  ) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.clockWith((clock) => {
         const now = clock.currentTimeMillisUnsafe();
@@ -821,12 +839,13 @@ const make = Effect.gen(function* () {
           (current.sequence >= input.sequence || !current.started)
         ) {
           current.sequence = Math.max(current.sequence, input.sequence);
-          return restore(Deferred.await(current.result));
+          return restore(withReadOrdinal(current));
         }
         const read: SharedShellRead = {
           sequence: Math.max(input.sequence, current?.sequence ?? 0),
           started: false,
           expiresAt: Number.POSITIVE_INFINITY,
+          readOrdinal: ++nextReadOrdinal,
           result: Deferred.makeUnsafe(),
         };
         sharedShellReads.delete(input.threadId);
@@ -857,11 +876,13 @@ const make = Effect.gen(function* () {
               }
               Deferred.doneUnsafe(read.result, exit);
             });
-            return restore(Deferred.await(read.result));
+            return restore(withReadOrdinal(read));
           }),
         );
       }),
     );
+  const getThreadShellForEvent: ThreadManagementServiceShape["getThreadShellForEvent"] = (input) =>
+    Effect.map(getThreadShellReadForEvent(input), (read) => read.shell);
 
   const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = (input) =>
     orchestrator
@@ -1612,6 +1633,7 @@ const make = Effect.gen(function* () {
     readShellSnapshot: orchestrator.readShellSnapshot,
     getThreadShell: orchestrator.getThreadShell,
     getThreadShellForEvent,
+    getThreadShellReadForEvent,
     listProjectThreads,
     sendToThread,
     assertProviderInstanceEnabled,

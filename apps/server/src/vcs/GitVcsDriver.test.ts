@@ -2632,3 +2632,31 @@ it("leaves a packed-refs file that outgrew its stat to git", () => {
     replaceRefs: null,
   });
 });
+
+it.effect("a remembered checkpoint ref is not trusted after the object store moves", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const h = yield* makeTurnHarness("t3-checkpoint-object-store-");
+    yield* h.writeBoth("file.txt", "initial\n");
+    yield* h.gitBoth(["add", "."]);
+    yield* h.commitBoth("initial");
+    yield* h.turn(1);
+    yield* h.turn(2);
+    // The ref file still names the commit, but git can no longer find the object.
+    const objects = path.join(h.root, "objects-elsewhere");
+    yield* fileSystem.makeDirectory(objects);
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        process.env.GIT_OBJECT_DIRECTORY = objects;
+      }),
+      () => Effect.sync(() => delete process.env.GIT_OBJECT_DIRECTORY),
+    );
+    const cold = yield* GitVcsDriver.makeVcsDriverShape();
+    const probe = (driver: VcsDriver.VcsDriver["Service"], cwd: string) =>
+      driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef: turnRef(2) });
+    const warm = yield* probe(h.warm, h.repos.warm);
+    assert.strictEqual(warm, yield* probe(cold, h.repos.cold));
+    assert.isFalse(warm);
+  }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);

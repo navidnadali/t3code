@@ -613,21 +613,26 @@ it.effect(
           yield* Fiber.interrupt(starting);
           yield* Scope.close(cancelled, Exit.void);
         }
-        // The active subscriber resets on the next batch and resyncs from one read; a late
-        // subscriber is served as before.
+        // Only the active subscriber is registered. It resets on the next batch and resyncs from
+        // one read, and with that wave served (nobody left behind on the batch) the base goes.
+        assert.deepEqual(hub.inspect(), { subscribers: 1, baseRetained: false });
         yield* publish(ThreadId.make("thread:b"), 2);
         assert.deepEqual(
           (yield* pull).map((item) => item.kind),
           ["resync"],
         );
         assert.equal(baseReads, 1);
+        assert.deepEqual(hub.inspect(), { subscribers: 1, baseRetained: false });
+        // A late subscriber is served as before.
         const late = yield* hub.subscribe().pipe(Scope.provide(scope));
         const pullLate = yield* Stream.toPull(late.stream(2)).pipe(Scope.provide(scope));
         const next = yield* Effect.forkScoped(pullLate);
         yield* TestClock.adjust(0);
         yield* publish(ThreadId.make("thread:c"), 3);
         assert.deepEqual(sequences(yield* Fiber.join(next)), [3]);
+        assert.equal(hub.inspect().subscribers, 2);
         yield* Scope.close(scope, Exit.void);
+        assert.deepEqual(hub.inspect(), { subscribers: 0, baseRetained: false });
       }).pipe(
         Effect.provide(
           layerHub({

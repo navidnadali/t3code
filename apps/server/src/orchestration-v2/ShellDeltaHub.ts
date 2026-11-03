@@ -79,6 +79,8 @@ export interface ShellDeltaSubscription {
 }
 
 export interface ShellDeltaHubShape {
+  /** For tests and diagnostics: the subscribers registered, and whether a base is retained. */
+  readonly inspect: () => { readonly subscribers: number; readonly baseRetained: boolean };
   /**
    * Take the subscription before reading the snapshot it continues: every later committed event
    * reaches it as a projected delta, the latest per aggregate, under the live-stream budget. A
@@ -523,7 +525,12 @@ const make = Effect.gen(function* () {
     };
   });
 
-  return ShellDeltaHub.of({ subscribe });
+  const inspect: ShellDeltaHubShape["inspect"] = () => ({
+    subscribers: subscribers.size,
+    baseRetained: latestBase !== undefined,
+  });
+
+  return ShellDeltaHub.of({ inspect, subscribe });
 });
 
 export const layer: Layer.Layer<

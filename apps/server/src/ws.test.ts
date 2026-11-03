@@ -2028,7 +2028,9 @@ it.live(
 
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
-  Layer.mock(ShellDeltaHub.ShellDeltaHub)({}),
+  Layer.mock(ShellDeltaHub.ShellDeltaHub)({
+    inspect: () => ({ subscribers: 0, baseRetained: false }),
+  }),
   Layer.mock(DocumentText.DocumentText)({}),
   Layer.mock(ServerSecretStore.ServerSecretStore)({}),
   Layer.mock(WorkspacePaths.WorkspacePaths)({}),

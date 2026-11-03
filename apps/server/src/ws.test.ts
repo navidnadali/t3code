@@ -1500,7 +1500,7 @@ it.live(
 );
 
 it.live.each([20, 100])(
-  "one large batch resets %d shell subscribers at once, who share one base read",
+  "one large batch resets %d shell subscribers at once (half of them stalled), who share one base read",
   (subscribers) =>
     Effect.gen(function* () {
       const store = yield* OrchestrationEventStore.OrchestrationEventStore;
@@ -1575,6 +1575,24 @@ it.live.each([20, 100])(
       const logging = Logger.layer([overflows.logger], { mergeWithExisting: true });
       const hub = yield* buildShellHub({ store, threadManagement, projectService });
       const folds: Array<ReturnType<typeof makeShellFold>> = [];
+      // A subscriber that pulls by hand: its consumer is interrupted while it stalls.
+      const pullInto = (
+        stream: Effect.Success<ReturnType<typeof subscribeOrchestrationV2Shell>>,
+        fold: ReturnType<typeof makeShellFold>,
+      ) =>
+        Stream.toPull(stream.pipe(Stream.provide(logging))).pipe(
+          Effect.map((pull) =>
+            pull.pipe(
+              Effect.map((items) => {
+                for (const item of items) fold.apply(item);
+              }),
+            ),
+          ),
+        );
+      const stalled: Array<{
+        readonly pull: Effect.Success<ReturnType<typeof pullInto>>;
+        consumer: Fiber.Fiber<unknown, unknown>;
+      }> = [];
       for (let index = 0; index < subscribers; index++) {
         const fold = makeShellFold();
         folds.push(fold);
@@ -1598,25 +1616,43 @@ it.live.each([20, 100])(
           ),
           Effect.provide(logging),
         );
-        yield* stream.pipe(
-          Stream.provide(logging),
-          Stream.runForEach((item) => Effect.sync(() => fold.apply(item))),
-          Effect.forkScoped,
-        );
+        if (index % 2 === 0) {
+          yield* stream.pipe(
+            Stream.provide(logging),
+            Stream.runForEach((item) => Effect.sync(() => fold.apply(item))),
+            Effect.forkScoped,
+          );
+        } else {
+          const pull = yield* pullInto(stream, fold);
+          stalled.push({ pull, consumer: yield* pull.pipe(Effect.forever, Effect.forkScoped) });
+        }
       }
       const ready = yield* commit(["thread:sentinel"]);
       yield* Effect.forEach(folds, (fold) => fold.reach(ready), { discard: true });
+      // Half the subscribers stop pulling; one batch with more distinct threads than a buffer
+      // holds empties every buffer at once, and the pulling half resyncs.
+      for (const entry of stalled) yield* Fiber.interrupt(entry.consumer);
       const readsBefore = snapshotReads;
-      // Every subscriber keeps pulling; one batch with more distinct threads than a buffer holds
-      // empties all of their buffers at once.
       yield* commit(
         Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:bulk${index}`),
       );
+      const pulled = yield* commit(["thread:sentinel"]);
+      yield* Effect.forEach(
+        folds.filter((_, index) => index % 2 === 0),
+        (fold) => fold.reach(pulled),
+        { discard: true },
+      );
+      const readsForPulling = snapshotReads - readsBefore;
+      // More changes before the stalled half pulls again: their resync shares the wave's base.
+      yield* commit(Array.from({ length: 50 }, (_, index) => `thread:late${index}`));
+      for (const entry of stalled) {
+        entry.consumer = yield* entry.pull.pipe(Effect.forever, Effect.forkScoped);
+      }
       const after = yield* commit(["thread:sentinel"]);
       yield* Effect.forEach(folds, (fold) => fold.reach(after), { discard: true });
       const baseReads = snapshotReads - readsBefore;
       yield* Effect.log(
-        `shell resync herd: subscribers=${subscribers} resets=${overflows.count} baseReads=${baseReads}`,
+        `shell resync herd: subscribers=${subscribers} resets=${overflows.count} baseReads=${baseReads} (pulling half: ${readsForPulling})`,
       );
       const truth = Array.from(threads.entries()).sort(([a], [b]) => a.localeCompare(b));
       for (const fold of folds) {
@@ -1627,7 +1663,9 @@ it.live.each([20, 100])(
           truth,
         );
       }
-      // The resets of one batch share one base read, however the resets and pulls interleave.
+      // The resets of one batch share one base read, however the resets and pulls interleave,
+      // and a subscriber that pulls late finds the base its reset is covered by.
+      assert.equal(readsForPulling, 1);
       assert.equal(baseReads, 1);
       assert.equal(overflows.count, subscribers);
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),

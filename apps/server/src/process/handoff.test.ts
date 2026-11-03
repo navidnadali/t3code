@@ -19,6 +19,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
+import { HandoffProcess } from "./handoffProcess.ts";
 import { answerDeadlines } from "./spawnerDeadlines.ts";
 import { isPidReused, isSameProcess } from "./processIdentity.ts";
 import { adoptedProcessIds, spawnerProcessIds } from "./spawnerProcesses.ts";
@@ -237,6 +238,107 @@ describe("hand-off start deadlines", () => {
     }
     expect(armed.size).toBe(1);
   });
+});
+
+// A Node-style process whose streams the SDK destroys, as Node's ChildProcess: each destroyed or
+// errored stream closes its descriptor (stdin's reader sees end of input), and close follows exit
+// once its outputs have closed, however they closed.
+const destroyedStdioScript =
+  "process.stdin.on('end', () => process.exit(7)).resume(); setTimeout(() => process.exit(0), 3000);";
+
+const destroyedStdioEvents = (child: NodeChildProcess.ChildProcess) =>
+  Effect.callback<ReadonlyArray<string>>((resume) => {
+    const seen: Array<string> = [];
+    child.on("error", (error) => seen.push(`error ${error.message}`));
+    child.stderr!.on("error", (error) => seen.push(`stderr error ${error.message}`));
+    child.on("exit", (code, signal) => seen.push(`exit ${code} ${signal}`));
+    child.once("close", (code, signal) => {
+      seen.push(`close ${code} ${signal}`);
+      resume(Effect.succeed(seen));
+    });
+    child.stdin!.destroy();
+    child.stdout!.destroy();
+    child.stderr!.destroy(new Error("boom"));
+  }).pipe(
+    Effect.timeoutOrElse({ duration: "6 seconds", orElse: () => Effect.succeed(["no close"]) }),
+  );
+
+const destroyedStdioOptions = {
+  env: process.env,
+  stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"],
+};
+
+describe("Node-style process with destroyed stdio", () => {
+  it.live("closes on Node's spawner, after a hand-off that was unavailable", () =>
+    Effect.gen(function* () {
+      const viaNode = yield* destroyedStdioEvents(
+        NodeChildProcess.spawn(
+          process.execPath,
+          ["-e", destroyedStdioScript],
+          destroyedStdioOptions,
+        ),
+      );
+      expect(viaNode).toEqual(["stderr error boom", "exit 7 null", "close 7 null"]);
+      // A host with no hand-off: the process starts on Node's spawner at once.
+      const unavailable = {
+        spawnHandoff: (
+          _command: string,
+          _args: ReadonlyArray<string>,
+          _options: Record<string, unknown>,
+          _request: { readonly fds: ReadonlyArray<number> },
+          callbacks: { readonly onUnavailable: (error: Error) => void },
+        ) => {
+          callbacks.onUnavailable(new Error("no hand-off here"));
+          return { sockets: new Map() } as never;
+        },
+        abandonHandoff: () => {},
+        killHandoff: () => {},
+        setHandoffReferenced: () => {},
+      };
+      const fellBack = yield* destroyedStdioEvents(
+        new HandoffProcess(
+          unavailable,
+          process.execPath,
+          ["-e", destroyedStdioScript],
+          destroyedStdioOptions,
+          () => {},
+        ) as unknown as NodeChildProcess.ChildProcess,
+      );
+      expect(fellBack).toEqual(viaNode);
+    }),
+  );
+
+  it.live.skipIf(!linux)(
+    "closes through hand-off and its fallback, and releases the server's descriptors",
+    () => {
+      const openDescriptors = () =>
+        require("node:fs").readdirSync("/proc/self/fd").length as number;
+      return Effect.gen(function* () {
+        const launcher = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        const refusing = yield* refusingLauncher;
+        // Both spawner processes are up before counting.
+        yield* launcher.spawner.exitCode(node(""));
+        yield* refusing.spawner.exitCode(node(""));
+        const before = openDescriptors();
+        const start = (spawn: typeof launcher.spawn) =>
+          destroyedStdioEvents(
+            spawn(
+              process.execPath,
+              ["-e", destroyedStdioScript],
+              destroyedStdioOptions,
+            ) as unknown as NodeChildProcess.ChildProcess,
+          );
+        const handedOff = yield* start(launcher.spawn);
+        const fellBack = yield* start(refusing.spawn);
+        const expected = ["stderr error boom", "exit 7 null", "close 7 null"];
+        expect({ handedOff, fellBack, descriptors: openDescriptors() }).toEqual({
+          handedOff: expected,
+          fellBack: expected,
+          descriptors: before,
+        });
+      }).pipe(Effect.scoped, Effect.provide(launcherLayer()));
+    },
+  );
 });
 
 // A queued start has no deadline of its own: one covers the queue, and holds while it moves.

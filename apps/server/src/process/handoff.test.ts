@@ -126,6 +126,35 @@ const rawSpawner = Effect.gen(function* () {
   return { spawner, next };
 });
 
+// A process of the server's own user that races every socket appearing under the state directory:
+// it moves the real one aside, listens in its place, and relays whatever passes, counting each.
+const sameUserAttacker = `
+const fs = require("node:fs"), net = require("node:net"), path = require("node:path");
+const dir = process.argv[1];
+const seen = new Set();
+const watcher = fs.watch(dir, { recursive: true }, (event, name) => {
+  if (!name || path.basename(name).startsWith("x-") || seen.has(name)) return;
+  const target = path.join(dir, name);
+  let info; try { info = fs.lstatSync(target); } catch { return; }
+  if (!info.isSocket()) return;
+  seen.add(name);
+  const real = path.join(path.dirname(target), "x-" + path.basename(target));
+  try { fs.renameSync(target, real); } catch { return; }
+  const server = net.createServer((client) => {
+    client.on("error", () => {});
+    process.stdout.write("captured\\n");
+    const upstream = net.connect(real);
+    upstream.on("error", () => {});
+    client.pipe(upstream); upstream.pipe(client);
+  });
+  server.on("error", () => {});
+  server.listen(target);
+});
+watcher.on("error", () => {});
+process.stdout.write("ready\\n");
+setInterval(() => {}, 1000);
+`;
+
 describe("provider process hand-off", () => {
   it.live.skipIf(!linux)(
     "hands off 64 concurrent processes without losing a line of their output",
@@ -410,6 +439,47 @@ describe("provider process hand-off", () => {
         );
         expect({ outcome, ended }).toEqual({ outcome: "unavailable", ended: false });
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // No path a process of the same user could reach carries a hand-off: such a process could
+  // otherwise read or write another session's provider.
+  it.live.skipIf(!linux)("hands off nothing a process of the server's own user can intercept", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { stateDir } = yield* ServerConfig.ServerConfig;
+      const { spawner } = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+      // Where hand-off sockets lived; watched whether or not anything uses it now.
+      yield* fs.makeDirectory(NodePath.join(stateDir, "spawner"), { recursive: true });
+      const attacker = NodeChildProcess.spawn(
+        process.execPath,
+        ["-e", sameUserAttacker, stateDir],
+        {
+          stdio: ["ignore", "pipe", "ignore"],
+        },
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => attacker.kill("SIGKILL")));
+      let captured = 0;
+      yield* Effect.callback<void>((resume) => {
+        attacker.stdout!.setEncoding("utf8").on("data", (chunk: string) => {
+          if (chunk.includes("ready")) resume(Effect.void);
+          captured += chunk.split("captured").length - 1;
+        });
+      });
+      const echoes: Array<string> = [];
+      for (let index = 0; index < 12; index++) {
+        echoes.push(
+          yield* spawner.string(
+            node("process.stdin.pipe(process.stdout)", {
+              stdin: Stream.make(new TextEncoder().encode(`secret-${index}`)),
+            }),
+          ),
+        );
+      }
+      expect({ captured, echoes }).toEqual({
+        captured: 0,
+        echoes: Array.from({ length: 12 }, (_, index) => `secret-${index}`),
+      });
+    }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
   );
 
   it.live.skipIf(!linux)(

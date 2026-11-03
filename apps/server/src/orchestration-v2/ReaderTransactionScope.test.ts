@@ -956,6 +956,79 @@ it.effect("sends a snapshot window's first reads to the reader together", () =>
   ),
 );
 
+// The store on the writer alone: readers off, or the fallback after reader workers fail to start.
+const withWriterStore = <A, E>(
+  mode: "off" | "fallback",
+  body: Effect.Effect<
+    A,
+    E,
+    | EventSink.EventSinkV2
+    | ProjectionStore.ProjectionStoreV2
+    | EventStore.EventStoreV2
+    | SqlClient.SqlClient
+  >,
+) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: `reader-scope-writer-${mode}-` });
+    const sqlLayer =
+      mode === "off"
+        ? SqlitePersistence.layerMemory
+        : SqlitePersistence.layerFromPath(path.join(directory, "statev2.sqlite"), {
+            readerPoolSize: 4,
+          });
+    // Readers refuse a database outside WAL, so every read falls back to the writer.
+    const run =
+      mode === "off"
+        ? body
+        : Effect.andThen(
+            Effect.flatMap(SqlClient.SqlClient, (sql) =>
+              sql.unsafe("PRAGMA journal_mode = DELETE"),
+            ),
+            body,
+          );
+    return yield* run.pipe(
+      Effect.provide(
+        EventSink.layer.pipe(
+          Layer.provideMerge(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+          Layer.provideMerge(sqlLayer),
+        ),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+// On the writer (readers off, or the fallback after reader workers fail to start) a read's
+// statements run in turn on the reading fiber. Forked, they gained nothing there and let a looping
+// window client take the writer again before reads waiting for it, which then starved.
+it.effect.each(
+  (["off", "fallback"] as const).flatMap((mode) =>
+    projectionReads.map((readCase) => ({ ...readCase, mode })),
+  ),
+)("runs the $name statements in turn on the writer ($mode)", ({ read, mode }) =>
+  withWriterStore(
+    mode,
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const fixture = yield* writeFixture("writer", 2);
+      const { transactions } = yield* traced(store.getThreadShell(fixture.fork));
+      assert.strictEqual(transactions[0]?.attributes.get("db.connection"), "writer");
+      const fibers = new Set<number>();
+      const exit = yield* read(store, fixture).pipe(
+        Effect.provideService(Statement.CurrentTransformer, (statement, _sql, fiber) =>
+          Effect.sync(() => {
+            fibers.add(fiber.id);
+            return statement;
+          }),
+        ),
+        Effect.exit,
+      );
+      assert.isTrue(Exit.isSuccess(exit));
+      assert.strictEqual(fibers.size, 1);
+    }),
+  ),
+);
+
 const isReadError = Schema.is(ProjectionStore.ProjectionStoreReadError);
 
 // The run's root node is decoded early for its checkpoint scope, yet a bad run row still wins.

@@ -194,12 +194,18 @@ const startupNodeOptions = (platform: string): StartupNodeOptions => {
   }
 };
 
-const PRELOAD_FLAGS = new Set(["--require", "-r", "--import", "--loader", "--experimental-loader"]);
-/** Whether a preload is visible on the command line or in NODE_OPTIONS as it reads now. */
+/** The preload options on their `--dashed` form (`optionName`), `--r` standing for Node's `-r`. */
+const PRELOAD_OPTIONS = new Set([
+  "--require",
+  "--r",
+  "--import",
+  "--loader",
+  "--experimental-loader",
+]);
+/** Whether a preload is visible on the command line or in NODE_OPTIONS as it reads now, in any spelling. */
 const preloadVisible = (env: Environment, execArgv: ReadonlyArray<string>): boolean =>
-  [...execArgv, ...tokenizeNodeOptions(env.NODE_OPTIONS)].some(
-    (token) =>
-      PRELOAD_FLAGS.has(token) || [...PRELOAD_FLAGS].some((flag) => token.startsWith(`${flag}=`)),
+  [...execArgv, ...tokenizeNodeOptions(env.NODE_OPTIONS)].some((token) =>
+    PRELOAD_OPTIONS.has(optionName(token)),
   );
 
 /**

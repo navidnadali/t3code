@@ -164,18 +164,45 @@ waiting. Read CPU together with page faults:
   file writes.
 - Many `involuntaryContextSwitches` mean other processes were competing for the CPU.
 
-Every Git command is a child process, and Node creates each one synchronously on the thread that
-spawns it (`posix_spawn` on macOS, `fork` on Linux). On Linux each `fork` copies the page tables of
-the whole server, so its cost grows with the server's memory. On Linux and macOS the commands of
-`VcsProcess` and `GitVcsDriver` (checkpoints, status, refs, source control CLIs) and of the server's
-`ProcessRunner` (the repository identity lookup's Git commands, host probes such as `hostnamectl`,
-agent scope `systemctl` calls, port scans, device tools, update checks) therefore start from a small
-spawner process, started once while the server is small, so the server does not fork for them: each
-fork copies only the spawner's page tables. Output, exit codes and errors are the same. These are the
-only commands the spawner starts. Every other process the server starts still forks the server on
-Linux: among them provider checks and provider sessions, text generation, terminals, HTML render, the
-login-shell `PATH` probe at start-up, and the spawner itself. macOS spawns with `posix_spawn`, which
-copies no page tables, so the gain there is only the event-loop time.
+Every child process Node starts is created synchronously on the thread that spawns it
+(`posix_spawn` on macOS, `fork` on Linux). On Linux each `fork` copies the page tables of the whole
+server, so its cost grows with the server's memory: about 10–17 ms per fork at 1–2 GB, and an
+estimated 200–300 ms at 12–18 GB. On Linux and macOS the server therefore starts these commands from a
+small spawner process, started once while the server is small, so the server does not fork for them
+(each fork copies only the spawner's page tables):
+
+- the commands of `VcsProcess` and `GitVcsDriver`: checkpoints, status, refs, diffs, worktrees and the
+  source control CLIs, about 1,400–3,200 a minute at 100–250 busy sessions;
+- the server's `ProcessRunner`: the repository identity lookup's Git commands (about 8 a minute, plus
+  2 per project added), agent scope `systemctl` and `systemd-run` calls (one per session that ends),
+  host probes such as `hostnamectl`, port scans, the terminal process-table fallback, device tools and
+  update checks;
+- the Claude and Codex instances' own commands: version checks and maintenance lookups (a few per
+  health check, every 5 minutes by default) and text generation (thread titles, branch names, commit
+  messages, pull request content and review guides, one or two per request);
+- document text extraction (one per document attachment).
+
+Output, exit codes, errors, timeouts and kills are the same. Everything else the server starts still
+forks it on Linux:
+
+- provider session processes: one per Claude session start or restart (100 or 250 in a burst when as
+  many sessions start), one shared `codex app-server` per Codex instance, one per ACP agent session,
+  and the Claude capability probe the Agent SDK starts itself (2 at start-up, then on stale health
+  checks);
+- terminals: one `node-pty` process per terminal opened, which needs a pseudo-terminal in the server;
+- HTML render: one headless Chrome per `html_render` or `html_preview` call, which needs extra pipes
+  (file descriptors 3 and 4) the spawner does not pass;
+- the preview browser and the Cursor and Muse SDKs, which spawn inside their libraries;
+- the login-shell `PATH` probe (once, synchronously, before the server builds its services), the
+  resource monitor and the spawner itself (once each at start-up), and the few commands whose output
+  is not piped or that need extra file descriptors (opening an editor or a folder, `xdg-mime`, and on
+  macOS `vm_stat` and `plutil`);
+- commands other services still start on Node's spawner, each per user action, setting change or
+  health check: the other providers' checks (their drivers start sessions on the same spawner),
+  `ssh -G` for device hosts, `tailscale`, `cloudflared` and the 1Password CLI.
+
+macOS spawns with `posix_spawn`, which copies no page tables, so the gain there is only the
+event-loop time.
 
 `T3CODE_PROCESS_SPAWNER` (any case) chooses where those commands start:
 

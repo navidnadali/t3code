@@ -239,6 +239,111 @@ describe("hand-off start deadlines", () => {
   });
 });
 
+// A queued start has no deadline of its own: one covers the queue, and holds while it moves.
+describe("hand-off queue deadline", () => {
+  it("stops a spawner whose queue stops moving, so its queued starts fall back", () => {
+    const armed = new Set<{ readonly expire: () => void }>();
+    let events: { readonly onMessage: (message: unknown) => void } | undefined;
+    const host = WorkerChildProcessSpawner.makeRemoteHost({
+      open: (opened) => {
+        events = opened;
+        return { post: () => {}, ref: () => {}, unref: () => {}, terminate: async () => {} };
+      },
+      windowBytes: 65_536,
+      stoppedMessage: "stopped",
+      closedMessage: "closed",
+      restarts: 1,
+      startDeadline: (expire) => {
+        const deadline = {
+          expire: () => {
+            armed.delete(deadline);
+            expire();
+          },
+        };
+        armed.add(deadline);
+        return () => armed.delete(deadline);
+      },
+      handoffShim: () => ({ command: "shim", args: [] }),
+    });
+    const outcomes: Array<string> = [];
+    const start = (name: string) =>
+      host.spawnHandoff(
+        "provider",
+        [],
+        { stdio: ["ignore", "ignore", "ignore"] },
+        { fds: [0, 1, 2] },
+        {
+          onSpawn: () => outcomes.push(`${name} spawned`),
+          onError: (error) => outcomes.push(`${name} error: ${error.message}`),
+          onUnavailable: () => outcomes.push(`${name} falls back`),
+        },
+      );
+    const [first, second, third] = [start("first"), start("second"), start("third")];
+    for (const child of [first, second, third]) {
+      events!.onMessage({ t: "handoff-queued", id: child.id });
+    }
+    // All three wait in the spawner: one deadline, for the queue.
+    expect(armed.size).toBe(1);
+    const fire = () => {
+      for (const deadline of Array.from(armed)) deadline.expire();
+    };
+    // The queue moves: its deadline holds over, while the start that began has its own.
+    events!.onMessage({ t: "started", id: first.id, pid: 2 ** 30, startTime: "1" });
+    events!.onMessage({ t: "spawn", id: first.id, pid: 2 ** 30, startTime: "1" });
+    fire();
+    expect({ outcomes, armed: armed.size }).toEqual({ outcomes: ["first spawned"], armed: 1 });
+    // Then it stops moving: the next deadline stops the spawner and the queued starts fall back.
+    fire();
+    expect({ outcomes, armed: armed.size }).toEqual({
+      outcomes: ["first spawned", "second falls back", "third falls back"],
+      armed: 0,
+    });
+  });
+
+  it.live.skipIf(!linux)(
+    "starts a provider on Node's spawner when its start waits in a queue that never moves",
+    () => {
+      const { logs, layer: logLayer } = capturedLogs();
+      return Effect.gen(function* () {
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        // A spawner whose freed slots start nothing more: what waits in its queue waits for ever.
+        const wedged = spawnerProcessSource.replace(
+          "startingHandoffs -= 1;\n    nextHandoff();",
+          "startingHandoffs -= 1;",
+        );
+        expect(wedged).not.toBe(spawnerProcessSource);
+        const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node, {
+          source: wedged,
+          handoffLimit: 1,
+          timers: answerDeadlines(500),
+        });
+        const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        const parents = yield* Effect.forEach(
+          [1, 2, 3],
+          () =>
+            launcher.spawner.string(
+              ChildProcess.make(process.execPath, [
+                "-e",
+                "process.stdout.write(String(process.ppid))",
+              ]),
+            ),
+          { concurrency: "unbounded" },
+        ).pipe(
+          Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.succeed(["hung"]) }),
+        );
+        // One starts from the spawner; the two it queued fall back, in time.
+        expect({
+          handedOff: parents.filter(
+            (parent) => Number(parent) > 0 && Number(parent) !== process.pid,
+          ).length,
+          fromServer: parents.filter((parent) => Number(parent) === process.pid).length,
+          fellBack: logs.filter(({ text }) => text.includes("hand-off failed")).length,
+        }).toEqual({ handedOff: 1, fromServer: 2, fellBack: 2 });
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, logLayer)));
+    },
+  );
+});
+
 describe("provider process hand-off", () => {
   it.live.skipIf(!linux)(
     "hands off 64 concurrent processes without losing a line of their output",

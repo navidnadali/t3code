@@ -203,6 +203,11 @@ describe("isServerCommand", () => {
 
   it("never takes a registered subcommand for a project directory of the same name", () => {
     // A directory called `app` or `status` beside the user must not turn `t3 app` into a server start.
+    const argv = (...rest: ReadonlyArray<string>) => [
+      "/usr/bin/node",
+      "/opt/t3/dist/bin.mjs",
+      ...rest,
+    ];
     const everythingIsADirectory = () => true;
     for (const command of [
       "app",

@@ -4,6 +4,8 @@ import * as NodeInspector from "node:inspector";
 import * as NodeSea from "node:sea";
 import * as NodeV8 from "node:v8";
 
+import { SERVICE_LAUNCHER_CONTEXT_ENV } from "./cloud/serviceProtocol.ts";
+
 // V8 reads --max-semi-space-size only at startup, so the cap travels in NODE_OPTIONS: a parent that
 // starts the server puts it there, and a server started without it relaunches itself once (execve,
 // same pid). The server's children get the NODE_OPTIONS the server itself was given.
@@ -28,12 +30,21 @@ const NON_SERVER_COMMANDS = new Set([
   "__process-spawner",
   "__claude-history",
   "__service-launcher",
+  "app",
   "auth",
+  "browser",
   "connect",
   "doctor",
+  "environment",
+  "pair",
+  "policy",
   "project",
   "service",
+  "status",
+  "theme",
   "thread",
+  "trace",
+  "triage",
   "up",
   "update",
   "uninstall",
@@ -212,7 +223,12 @@ export type RelaunchPlan =
       readonly args: ReadonlyArray<string>;
       readonly env: Environment;
     }
-  | { readonly kind: "keep"; readonly reason: string };
+  | {
+      readonly kind: "keep";
+      readonly reason: string;
+      /** The server was started over IPC by a service launcher that supplied no flag (an RC2 launcher). */
+      readonly launcherPredatesDefault?: true;
+    };
 
 export const planYoungGenerationRelaunch = (input: {
   readonly argv: ReadonlyArray<string>;
@@ -237,7 +253,22 @@ export const planYoungGenerationRelaunch = (input: {
     return { kind: "keep", reason: "process.execve is unavailable on this platform" };
   }
   // execve keeps only stdio: an IPC channel or a bootstrap descriptor would be lost.
-  if (input.hasIpcChannel) return { kind: "keep", reason: "started with an IPC channel" };
+  if (input.hasIpcChannel) {
+    // A remote update replaces the binary, not the running launcher; one that predates the default
+    // supplies no flag, and a server started over IPC cannot relaunch itself. Say so, visibly.
+    if (
+      input.env[SERVICE_LAUNCHER_CONTEXT_ENV] !== undefined &&
+      !explicitMaxSemiSpace(input.env, input.execArgv).present
+    ) {
+      return {
+        kind: "keep",
+        reason:
+          "started over IPC by a service launcher that predates the young-generation default; the cap applies once the service restarts",
+        launcherPredatesDefault: true,
+      };
+    }
+    return { kind: "keep", reason: "started with an IPC channel" };
+  }
   if (bootstrapFdOf(input.argv, input.env) !== undefined) {
     return { kind: "keep", reason: "started with a bootstrap descriptor" };
   }
@@ -266,6 +297,8 @@ export interface YoungGenerationOutcome {
   readonly applied: boolean;
   readonly nodeOptionsAtStart: string | undefined;
   readonly keptReason?: string;
+  /** Started over IPC by a service launcher that supplied no flag; the cap waits for a service restart. */
+  readonly launcherPredatesDefault?: true;
 }
 
 let lastOutcome: YoungGenerationOutcome | undefined;
@@ -301,7 +334,16 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
     canExecve: typeof process.execve === "function",
     inspectorActive: NodeInspector.url() !== undefined,
   });
-  if (plan.kind === "keep") return { applied: false, nodeOptionsAtStart, keptReason: plan.reason };
+  if (plan.kind === "keep") {
+    return plan.launcherPredatesDefault === true
+      ? {
+          applied: false,
+          nodeOptionsAtStart,
+          keptReason: plan.reason,
+          launcherPredatesDefault: true,
+        }
+      : { applied: false, nodeOptionsAtStart, keptReason: plan.reason };
+  }
   const execve = process.execve;
   if (execve === undefined) {
     return { applied: false, nodeOptionsAtStart, keptReason: "process.execve is unavailable" };
@@ -318,6 +360,8 @@ const applyYoungGenerationDefaultUnsafe = (): YoungGenerationOutcome => {
 };
 
 export interface NodeRuntimeFlags {
+  /** Started over IPC by a service launcher that supplied no flag; the cap waits for a service restart. */
+  readonly launcherPredatesDefault?: true;
   readonly execArgv: ReadonlyArray<string>;
   /** NODE_OPTIONS as V8 saw it at startup (the server's children see `nodeOptionsForChildren`). */
   readonly nodeOptions: string | null;
@@ -361,7 +405,12 @@ export const nodeRuntimeFlags = (): Omit<
     heapSizeLimitBytes: NodeV8.getHeapStatistics().heap_size_limit,
     applied: lastOutcome?.applied ?? false,
   });
-  return sizes;
+  return {
+    ...sizes,
+    ...(lastOutcome?.launcherPredatesDefault === undefined
+      ? {}
+      : { launcherPredatesDefault: true }),
+  };
 };
 
 const isOpenDescriptor = (fd: string): boolean => {
@@ -391,6 +440,7 @@ export const printNodeFlags = (outcome: YoungGenerationOutcome): void => {
     sea: NodeSea.isSea(),
     pid: process.pid,
     ...(outcome.keptReason === undefined ? {} : { keptReason: outcome.keptReason }),
+    ...(outcome.launcherPredatesDefault === undefined ? {} : { launcherPredatesDefault: true }),
     ...(bootstrapFd === undefined ? {} : { bootstrapFdOpen: isOpenDescriptor(bootstrapFd) }),
   };
   process.stdout.write(`${JSON.stringify(report)}\n`);

@@ -847,7 +847,12 @@ const layerMakeServer = Layer.unwrap(
         yield* HttpServer.HttpServer;
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
         yield* startup.markHttpListening;
-        yield* Effect.logInfo("server.v8", nodeRuntimeFlags());
+        const runtimeFlags = nodeRuntimeFlags();
+        // A launcher that predates the young-generation default leaves the server without it until
+        // the service restarts; that deserves a warning, not an info line.
+        yield* runtimeFlags.launcherPredatesDefault === true
+          ? Effect.logWarning("server.v8", runtimeFlags)
+          : Effect.logInfo("server.v8", runtimeFlags);
       }),
     );
     const layerRuntimeState = Layer.effectDiscard(

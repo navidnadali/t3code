@@ -163,17 +163,22 @@ export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function
     if (found.missing.length === 0) continue;
     const label = perfForkMigrationLabel([id, name]);
     const missing = found.missing.map(([, object]) => object);
-    yield* Effect.logWarning(
-      "A performance fork migration's objects are missing; restoring them.",
-    ).pipe(Effect.annotateLogs({ migration: label, missing }));
     yield* sql
       .withTransaction(
         Effect.gen(function* () {
           // Under the write lock: another start may have restored them since the check above.
-          const { missing, misplaced } = yield* inspectObjects(objects);
-          if (missing.length === 0) return;
-          for (const [type, object] of misplaced) {
-            yield* sql.unsafe(`DROP ${type === "trigger" ? "TRIGGER" : "INDEX"} "${object}"`);
+          const now = yield* inspectObjects(objects);
+          if (now.missing.length === 0) return;
+          yield* Effect.logWarning(
+            "A performance fork migration's objects are missing; restoring them.",
+          ).pipe(
+            Effect.annotateLogs({
+              migration: label,
+              missing: now.missing.map(([, object]) => object),
+            }),
+          );
+          for (const [type, object] of now.misplaced) {
+            yield* sql.unsafe(`DROP ${type === "trigger" ? "TRIGGER" : "INDEX"} main."${object}"`);
           }
           yield* migration;
         }),

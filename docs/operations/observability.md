@@ -265,8 +265,11 @@ shim costs about 8 MiB of private memory and 10–20 ms of CPU, outside the serv
 provider. The spawner runs at most one shim per core at a time; further starts in a burst (sessions
 resuming after a restart) wait in the spawner before their shim exists, so 1,000 simultaneous starts
 hold about 150 MiB of shims rather than 8.6 GiB, and are all handed off in 12–14 s on 16 cores (the
-channel passes one descriptor at a time, about 75 starts a second). A single executable without
-`t3-process-spawner` beside it hands off nothing, since its shim would load the whole server bundle.
+channel passes one descriptor at a time, about 75 starts a second). The queue must keep moving: if the
+spawner begins none of the starts waiting there for 10 s (checked every 10 s, so 10–20 s after the last
+one began), the server stops it and they start on Node's spawner, with a warning. A single executable
+without `t3-process-spawner` beside it hands off nothing, since its shim would load the whole server
+bundle.
 
 If the spawner process dies, the providers it handed off keep running in their own process groups,
 their stdio still held by the server. The server then checks each one's process identity (PID and

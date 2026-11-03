@@ -284,7 +284,7 @@ interface HandoffEntry {
   closed: boolean;
   holdsLoop: boolean;
   cancelStartDeadline: (() => void) | undefined;
-  /** It waited for a slot in the spawner, without a start deadline. */
+  /** It waited for a slot in the spawner, without a start deadline of its own. */
   queued: boolean;
   readonly killCallbacks: Map<number, (outcome: KillOutcome) => void>;
 }
@@ -344,6 +344,8 @@ export const makeRemoteHost = (options: {
   /** Arms the deadline for the transport to answer a start; without it, a start may wait for ever. */
   readonly startDeadline?: (expire: () => void) => () => void;
   readonly startDeadlineMessage?: string;
+  /** Why the host stopped a transport whose queue of hand-offs did not move for a deadline. */
+  readonly queueDeadlineMessage?: string;
   /** Hand-offs the spawner starts at once; the rest wait their turn in the spawner. */
   readonly handoffLimit?: number;
   /** How the spawner starts a handed-off command's shim; none means no hand-off. */
@@ -370,6 +372,12 @@ export const makeRemoteHost = (options: {
   const handoffs = new Map<number, HandoffEntry>();
   const orphans = new Set<HandoffChild>();
   let orphanTimer: ReturnType<typeof setInterval> | undefined;
+  // Hand-offs waiting in the spawner's queue: none has a deadline of its own, one covers them all.
+  // It expires only when a whole deadline passed with none of them begun or ended by the spawner,
+  // and then stops the transport, so they fall back even on an otherwise idle server.
+  const queuedHandoffs = new Set<HandoffEntry>();
+  let queueMoved = false;
+  let cancelQueueDeadline: (() => void) | undefined;
 
   const post = (message: unknown, transfer?: ReadonlyArray<ArrayBuffer>) => {
     transport?.post(message, transfer);
@@ -482,6 +490,9 @@ export const makeRemoteHost = (options: {
     // running never ran (the caller starts it another way), unless its start was reported.
     const stoppedHandoffs = [...handoffs.values()];
     handoffs.clear();
+    queuedHandoffs.clear();
+    cancelQueueDeadline?.();
+    cancelQueueDeadline = undefined;
     const running: Array<HandoffChild> = [];
     for (const entry of stoppedHandoffs) {
       const { child } = entry;
@@ -563,6 +574,7 @@ export const makeRemoteHost = (options: {
     entry.settled = true;
     entry.closed = true;
     entry.cancelStartDeadline?.();
+    leaveQueue(entry, true);
     post({ t: "handoff-cancel", id: entry.child.id });
     destroySockets(entry.child);
     entry.callbacks.onUnavailable(error);
@@ -652,6 +664,7 @@ export const makeRemoteHost = (options: {
         entry.cancelStartDeadline?.();
         entry.cancelStartDeadline = undefined;
         entry.queued = true;
+        joinQueue(entry);
         return;
       case "handoff-failed":
         handoffUnavailable(entry, reviveError(message.error));
@@ -659,6 +672,7 @@ export const makeRemoteHost = (options: {
       case "started":
         child.pid ??= message.pid;
         child.startTime ??= message.startTime;
+        leaveQueue(entry, true);
         if (entry.abandoned) killHandoffGroup(child);
         // Its turn came: from now on it must be answered in time again.
         else if (entry.queued && !entry.settled && entry.cancelStartDeadline === undefined) {
@@ -668,6 +682,7 @@ export const makeRemoteHost = (options: {
       case "spawn":
         stopsInARow = 0;
         entry.cancelStartDeadline?.();
+        leaveQueue(entry, true);
         child.pid = message.pid;
         child.startTime = message.startTime;
         if (entry.abandoned) {
@@ -682,6 +697,7 @@ export const makeRemoteHost = (options: {
         return;
       case "error":
         entry.cancelStartDeadline?.();
+        leaveQueue(entry, true);
         if (!entry.spawned && !entry.settled) {
           entry.settled = true;
           destroySockets(child);
@@ -691,6 +707,7 @@ export const makeRemoteHost = (options: {
         return;
       case "throw":
         entry.cancelStartDeadline?.();
+        leaveQueue(entry, true);
         if (!entry.settled) {
           entry.settled = true;
           destroySockets(child);
@@ -997,6 +1014,30 @@ export const makeRemoteHost = (options: {
     });
   };
 
+  const armQueueDeadline = () => {
+    queueMoved = false;
+    cancelQueueDeadline = options.startDeadline?.(() => {
+      cancelQueueDeadline = undefined;
+      if (queuedHandoffs.size === 0) return;
+      if (queueMoved) return armQueueDeadline();
+      stop(new Error(options.queueDeadlineMessage ?? "The transport's queue did not move"));
+    });
+  };
+
+  const joinQueue = (entry: HandoffEntry) => {
+    queuedHandoffs.add(entry);
+    if (cancelQueueDeadline === undefined) armQueueDeadline();
+  };
+
+  // `moved`: the spawner began or ended it; one the server gave up on moves nothing.
+  const leaveQueue = (entry: HandoffEntry, moved: boolean) => {
+    if (!queuedHandoffs.delete(entry)) return;
+    if (moved) queueMoved = true;
+    if (queuedHandoffs.size > 0) return;
+    cancelQueueDeadline?.();
+    cancelQueueDeadline = undefined;
+  };
+
   // A hand-off child without its spawner: signal it only while it is still the same process.
   const killOrphan = (child: HandoffChild, signal: NodeJS.Signals, send: boolean): KillOutcome => {
     if (
@@ -1037,6 +1078,7 @@ export const makeRemoteHost = (options: {
     entry.abandoned = true;
     entry.settled = true;
     entry.cancelStartDeadline?.();
+    leaveQueue(entry, false);
     post({ t: "handoff-cancel", id: child.id });
     killHandoffGroup(child);
     destroySockets(child);
@@ -1814,6 +1856,7 @@ export const makeProcessSpawnerWithHost = Effect.fnUntraced(function* (
     },
     startDeadline: (expire) => schedule("start", expire),
     startDeadlineMessage: `The process spawner did not answer a start within ${spawnerAnswerMillis / 1_000} s`,
+    queueDeadlineMessage: `The process spawner began none of its queued hand-offs for ${spawnerAnswerMillis / 1_000} s`,
     windowBytes,
     stoppedMessage: SPAWNER_STOPPED_MESSAGE,
     closedMessage: "process spawner closed",

@@ -365,6 +365,11 @@ describe("DesktopBackendConfiguration", () => {
         process.env.NODE_OPTIONS = "--max-semi-space-size=16";
         process.env.T3CODE_V8_MAX_SEMI_SPACE_MB = "0";
         assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
+        // `/w` forwards only into Windows; `/u` and a bare name forward into WSL.
+        process.env.WSLENV = "NODE_OPTIONS/w:T3CODE_V8_MAX_SEMI_SPACE_MB/w";
+        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
+        process.env.WSLENV = "NODE_OPTIONS/u:T3CODE_V8_MAX_SEMI_SPACE_MB/p";
+        assert.deepEqual(wslNodeFallbackCapFlags(), []);
       }).pipe(Effect.scoped),
   );
   it.effect("resolveWsl pins a default-tracking run to the concrete default distro", () =>
@@ -518,6 +523,13 @@ describe("DesktopBackendConfiguration", () => {
             .resolveWsl({ port: 5000, distro: "Ubuntu" })
             .pipe(Effect.ensuring(restore));
           assert.isFalse(unforwarded.args.some((arg) => arg.startsWith("--node-options=")));
+          // A `/w` entry forwards only into Windows: the Linux backend does not receive it either.
+          process.env.NODE_OPTIONS = "--require=C:\\WindowsOnly\\hook.cjs";
+          process.env.WSLENV = "NODE_OPTIONS/w";
+          const windowsOnly = yield* configuration
+            .resolveWsl({ port: 5000, distro: "Ubuntu" })
+            .pipe(Effect.ensuring(restore));
+          assert.isFalse(windowsOnly.args.some((arg) => arg.startsWith("--node-options=")));
         }),
     );
   });

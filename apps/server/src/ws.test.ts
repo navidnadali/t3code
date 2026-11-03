@@ -2070,3 +2070,66 @@ it.effect(
       assert.deepEqual(stale, [], `identity went back after the refresh: ${seen.join(" ")}`);
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
+
+// Sol SOL-6: the live tail keeps the hub's batch boundaries; the RPC server waits for a client
+// acknowledgement per chunk, so one chunk per delta would make a burst one round trip per delta.
+it.effect("live thread deltas of one hub batch reach the subscriber in one chunk", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const threads = ["thread:chunk-a", "thread:chunk-b", "thread:chunk-c"].map((id) =>
+      ThreadId.make(id),
+    );
+    const highWater = yield* insertShellEvent(sql, threads[0]!, 0);
+    const chunks: Array<Array<string>> = [];
+    yield* Effect.gen(function* () {
+      const stream = yield* subscribeOrchestrationV2Shell({
+        afterSequence: highWater,
+        requestCompletionMarker: true,
+      });
+      yield* stream.pipe(
+        Stream.runForEachArray((items) =>
+          Effect.sync(() => {
+            chunks.push(
+              items.map((item) =>
+                item.kind === "thread.updated" ? `${item.thread.id}@${item.sequence}` : item.kind,
+              ),
+            );
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* settleHub;
+      // Three threads change inside one batch window.
+      for (const [index, threadId] of threads.entries()) {
+        yield* insertShellEvent(sql, threadId, index === 0 ? 1 : 0);
+      }
+      const events = yield* store
+        .readApplicationEvents({ afterSequence: highWater, throughSequence: highWater + 3 })
+        .pipe(Stream.runCollect);
+      yield* store.publishCommitted(events);
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settleHub;
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settleHub;
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: (id) =>
+            Effect.succeed({
+              id,
+              archivedAt: null,
+              title: "t",
+            } as unknown as OrchestrationV2ThreadShell),
+        }),
+      ),
+    );
+    const live = chunks.filter((chunk) => chunk.some((item) => item.includes("@")));
+    assert.deepEqual(
+      live,
+      [threads.map((threadId, index) => `${threadId}@${highWater + 1 + index}`)],
+      JSON.stringify(chunks),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);

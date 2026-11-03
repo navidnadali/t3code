@@ -1455,10 +1455,7 @@ it.effect("a run records its workspace when it is scoped, before its turn starts
         // Its turn has not started (the effect worker has not run), so Stop could still end it.
         const projection = yield* orchestrator.getThreadProjection(threadId);
         assert.equal(projection.runs[0]?.status, "starting");
-        assert.equal(
-          (projection.runs[0] as { readonly workspaceCwd?: string } | undefined)?.workspaceCwd,
-          cwd,
-        );
+        assert.equal(projection.runs[0]?.workspaceCwd, cwd);
       }).pipe(Effect.provide(layer));
     }),
   ),

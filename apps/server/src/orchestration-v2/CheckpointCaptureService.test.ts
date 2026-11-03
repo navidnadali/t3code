@@ -552,7 +552,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
             checkpointId: null,
             contextHandoffId: null,
             // The workspace it ran in; the next run's scope names another.
-            ...({ workspaceCwd: "/repo" } as {}),
+            workspaceCwd: "/repo",
           },
         });
         yield* projectionStore.apply({

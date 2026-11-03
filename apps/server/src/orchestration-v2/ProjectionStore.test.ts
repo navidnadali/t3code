@@ -4546,10 +4546,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         ProjectionStore.emptyProjection(threadCreated),
       );
       for (const kept of [projection.runs[0], inMemory.runs[0]]) {
-        assert.equal(
-          (kept as { readonly workspaceCwd?: string } | undefined)?.workspaceCwd,
-          run.workspaceCwd,
-        );
+        assert.equal(kept?.workspaceCwd, run.workspaceCwd);
       }
       assert.deepEqual(projection.subagents[0]?.completionDelivery, task.completionDelivery);
       assert.deepEqual(

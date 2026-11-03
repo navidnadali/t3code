@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - reads loose refs, packed-refs and loose objects as the files Git writes; Effect's FileSystem has no inflate and its stat lacks the inode.
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeZlib from "node:zlib";
@@ -59,6 +60,8 @@ export interface CheckpointRefMemory {
   ) => Effect.Effect<CommitFacts | null>;
   /** Entries currently kept from packed-refs files, for tests and diagnostics. */
   readonly packedRefsEntries: () => number;
+  /** Loose objects read and inflated so far, for tests and diagnostics. */
+  readonly looseObjectReads: () => number;
 }
 
 // Caches, not state: an evicted entry costs the Git command it would have replaced. A turn keeps
@@ -72,6 +75,11 @@ const PACKED_REFS_ENTRY_BUDGET = 16_384;
 // 6.2 MB → 11 ms, 62 MB → 184 ms), against 19–25 ms for a `git rev-parse` child; 8 MiB keeps one
 // parse below one child. Larger files are left to Git.
 const PACKED_REFS_MAX_BYTES = 8 * 1024 * 1024;
+// A commit object is a few hundred bytes, a signed or long-messaged one a few KiB; anything that
+// is larger on disk or inflates past this is left to Git, which bounds the work a planted
+// object can cause. Objects that failed are remembered by file, so one costs one read.
+const COMMIT_OBJECT_MAX_BYTES = 1024 * 1024;
+const OBJECT_FAILURES_CAPACITY = 4_096;
 // Only refs under this prefix are kept from packed-refs; others are asked of Git.
 const PACKED_REFS_PREFIX = "refs/t3/";
 const REPLACE_REFS_PREFIX = "refs/replace/";
@@ -327,34 +335,52 @@ export const parseCommitObject = (object: Buffer): CommitFacts | null => {
   return { tree, parents, committerTime: committer[1]! };
 };
 
-const readLooseCommit = (objectsDir: string, oid: string) =>
-  Effect.promise(
-    () =>
-      new Promise<CommitFacts | null>((resolve) => {
-        try {
-          NodeFS.readFile(
-            NodePath.join(objectsDir, oid.slice(0, 2), oid.slice(2)),
-            (error, data) => {
-              if (error) {
-                resolve(null);
-                return;
-              }
-              try {
-                resolve(parseCommitObject(NodeZlib.inflateSync(data)));
-              } catch {
-                resolve(null);
-              }
-            },
-          );
-        } catch {
-          resolve(null);
-        }
-      }),
-  );
+// Read as Git would: bounded, and accepted only when the object's hash is the id asked for (SHA-1
+// for 40-hex ids, SHA-256 for 64-hex ones). Null hands the question to Git.
+const readLooseCommit = (
+  objectsDir: string,
+  oid: string,
+  failures: BoundedMap<string, string>,
+  counter: { reads: number },
+) =>
+  Effect.promise(async (): Promise<CommitFacts | null> => {
+    const file = NodePath.join(objectsDir, oid.slice(0, 2), oid.slice(2));
+    const { fingerprint, size } = await statInfo(file);
+    if (fingerprint.startsWith("!")) return null;
+    const key = `${objectsDir}\0${oid}`;
+    if (failures.get(key) === fingerprint) return null;
+    const fail = () => {
+      failures.set(key, fingerprint);
+      return null;
+    };
+    if (size > COMMIT_OBJECT_MAX_BYTES) return fail();
+    counter.reads++;
+    const data = await new Promise<Buffer | null>((resolve) => {
+      try {
+        NodeFS.readFile(file, (error, bytes) => resolve(error ? null : bytes));
+      } catch {
+        resolve(null);
+      }
+    });
+    if (data === null) return null;
+    let object: Buffer;
+    try {
+      object = NodeZlib.inflateSync(data, { maxOutputLength: COMMIT_OBJECT_MAX_BYTES });
+    } catch {
+      return fail();
+    }
+    const algorithm = oid.length === 64 ? "sha256" : "sha1";
+    if (NodeCrypto.createHash(algorithm).update(object).digest("hex") !== oid) return fail();
+    const facts = parseCommitObject(object);
+    return facts === null ? fail() : facts;
+  });
 
 export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   const refs = new BoundedMap<string, string>(REFS_CAPACITY);
   const commits = new BoundedMap<string, CommitFacts>(COMMITS_CAPACITY);
+  // Objects that could not be read as the commit they claim to be, by the file's stat.
+  const objectFailures = new BoundedMap<string, string>(OBJECT_FAILURES_CAPACITY);
+  const objectReads = { reads: 0 };
   // Parsed packed-refs per common directory (insertion order = age), bounded in files and entries.
   const packed = new Map<string, PackedRefs>();
   let packedEntries = 0;
@@ -440,7 +466,7 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     if ((yield* historyState(repository.commonDir)) === null) return null;
     const remembered = commits.get(oid);
     if (remembered !== undefined) return remembered;
-    const facts = yield* readLooseCommit(repository.objectsDir, oid);
+    const facts = yield* readLooseCommit(repository.objectsDir, oid, objectFailures, objectReads);
     if (facts !== null) commits.set(oid, facts);
     return facts;
   });
@@ -471,5 +497,6 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
     rememberCommits,
     commitFacts,
     packedRefsEntries: () => packedEntries,
+    looseObjectReads: () => objectReads.reads,
   };
 };

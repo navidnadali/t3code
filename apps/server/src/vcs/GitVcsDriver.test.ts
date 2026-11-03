@@ -2865,10 +2865,10 @@ it.effect.skipIf(!symlinksSupported)(
 const plantLooseObject = (objectsDir: string, oid: string, body: Buffer) => {
   const object = Buffer.concat([Buffer.from(`commit ${body.length}\0`), body]);
   NodeFS.mkdirSync(NodePath_join(objectsDir, oid.slice(0, 2)), { recursive: true });
-  NodeFS.writeFileSync(
-    NodePath_join(objectsDir, oid.slice(0, 2), oid.slice(2)),
-    NodeZlib.deflateSync(object, { level: 9 }),
-  );
+  // Git writes objects read-only; an attacker (or this test) replaces the file.
+  const file = NodePath_join(objectsDir, oid.slice(0, 2), oid.slice(2));
+  NodeFS.rmSync(file, { force: true });
+  NodeFS.writeFileSync(file, NodeZlib.deflateSync(object, { level: 9 }));
 };
 const NodePath_join = (...parts: ReadonlyArray<string>) => parts.join("/");
 
@@ -2922,7 +2922,10 @@ it.effect("an oversized loose object is left to git", () =>
       ]),
     );
     assert.isNull(yield* memory.commitFacts(fixture!.repository, bomb));
+    // Known bad by its file: the next turn does not inflate it again.
+    const reads = memory.looseObjectReads();
     assert.isNull(yield* memory.commitFacts(fixture!.repository, bomb));
+    assert.strictEqual(memory.looseObjectReads(), reads);
   }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
 
@@ -2984,6 +2987,7 @@ it.effect(
       );
       assert.isNull(yield* memory.commitFacts(fixture!.repository, fixture!.head));
       assert.isNull(yield* memory.commitFacts(fixture!.repository, fixture!.head));
+      NodeFS.rmSync(file, { force: true });
       NodeFS.writeFileSync(file, real);
       const [tree, time] = [fixture!.facts.split(" ")[0]!, fixture!.facts.split(" ").at(-1)!];
       assert.deepStrictEqual(yield* memory.commitFacts(fixture!.repository, fixture!.head), {

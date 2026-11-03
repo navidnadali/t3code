@@ -30,6 +30,8 @@ const NON_SERVER_COMMANDS = new Set([
   "__process-spawner",
   "__claude-history",
   "__service-launcher",
+  "__service-preflight",
+  "__ssh-helper",
   "app",
   "auth",
   "browser",

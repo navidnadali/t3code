@@ -721,7 +721,9 @@ it.effect("shell subscribers share one thread shell read per event", () =>
 const layerShellSubscribers = (input: {
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
   readonly getProjectRow?: ProjectStore.ProjectStoreV2["Service"]["getShell"];
+  readonly listShells?: ProjectStore.ProjectStoreV2["Service"]["listShells"];
   readonly getAvailable?: ProjectEnrichment.ProjectEnrichmentService["Service"]["getAvailable"];
+  readonly enrichmentChanges?: PubSub.PubSub<ProjectEnrichment.ProjectEnrichmentChange>;
   readonly onStart?: () => void;
 }) =>
   ShellDeltaHub.layer.pipe(
@@ -754,14 +756,17 @@ const layerShellSubscribers = (input: {
     ),
     Layer.provideMerge(
       Layer.succeed(ProjectStore.ProjectStoreV2, {
-        listShells: () => Effect.succeed([]),
+        listShells: input.listShells ?? (() => Effect.succeed([])),
         getShell: input.getProjectRow ?? (() => Effect.succeedNone),
       } as unknown as ProjectStore.ProjectStoreV2["Service"]),
     ),
     Layer.provideMerge(
       Layer.effect(
         ProjectEnrichment.ProjectEnrichmentService,
-        PubSub.unbounded().pipe(
+        (input.enrichmentChanges === undefined
+          ? PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>()
+          : Effect.succeed(input.enrichmentChanges)
+        ).pipe(
           Effect.map(
             (changes) =>
               ({
@@ -1938,5 +1943,130 @@ it.effect(
         [`project.updated@${sequence}:resolved`],
         seen.join(" "),
       );
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// Sol SOL-5: a hub batch that waits on another aggregate must not deliver a project row with a
+// repository identity older than the refresh this subscriber already sent (no project event in
+// the replay, so no read ordinal guards the delta).
+it.effect(
+  "a delayed hub batch never sends a repository identity older than a refresh the subscriber already sent",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const threadId = ThreadId.make("thread:identity-order");
+      const projectId = ProjectId.make("project:identity-order");
+      const now = "2026-10-31T00:00:00.000Z";
+      const identityA = { canonicalKey: "repo:a" } as unknown as RepositoryIdentity;
+      const identityB = { canonicalKey: "repo:b" } as unknown as RepositoryIdentity;
+      let identity = identityA;
+      const row = {
+        id: projectId,
+        title: "p",
+        workspaceRoot: "/tmp/identity-order",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as OrchestrationProjectShell;
+      const changes = yield* PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>();
+      const threadGate = yield* Deferred.make<void>();
+      let threadReads = 0;
+      const keyOf = (project: OrchestrationProjectShell) =>
+        project.repositoryIdentity?.canonicalKey ?? "none";
+      const seen: Array<string> = [];
+      const highWater = yield* insertShellEvent(sql, threadId, 0);
+      yield* Effect.gen(function* () {
+        // Resume at the high water: an empty replay, so no project read orders the live tail.
+        const stream = yield* subscribeOrchestrationV2Shell({
+          afterSequence: highWater,
+          requestCompletionMarker: true,
+        });
+        yield* stream.pipe(
+          Stream.runForEach((item) =>
+            Effect.sync(() => {
+              seen.push(
+                item.kind === "project.updated"
+                  ? `project.updated@${item.sequence}:${keyOf(item.project)}`
+                  : item.kind === "snapshot"
+                    ? `snapshot:${item.snapshot.projects.map(keyOf).join(",")}`
+                    : item.kind,
+              );
+            }),
+          ),
+          Effect.forkScoped,
+        );
+        yield* settleHub;
+        // A project event and a thread event share one hub batch; the thread's read waits.
+        const [projectRow] = yield* sql<{ sequence: number }>`
+          INSERT INTO orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type,
+            occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+          ) VALUES (
+            'identity-order:1', 'project', ${projectId}, 1, 'project.meta-updated',
+            ${now}, 'server', ${JSON.stringify({ projectId, title: "p", updatedAt: now })}, '{}', 2
+          ) RETURNING sequence
+        `;
+        const projectSequence = projectRow!.sequence;
+        yield* insertShellEvent(sql, threadId, 1);
+        const events = yield* store
+          .readApplicationEvents({ afterSequence: highWater, throughSequence: highWater + 2 })
+          .pipe(Stream.runCollect);
+        yield* store.publishCommitted(events);
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        // The identity changes while the batch waits; the subscriber gets the refresh first.
+        identity = identityB;
+        yield* PubSub.publish(changes, {
+          workspaceRoot: row.workspaceRoot,
+          enrichment: {
+            repositoryIdentity: identityB,
+            faviconPath: null,
+            repositoryIdentityResolved: true,
+          },
+          repositoryIdentityResolved: true,
+        });
+        yield* TestClock.adjust(25);
+        yield* settleHub;
+        yield* Deferred.succeed(threadGate, undefined);
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        assert.isTrue(
+          seen.some((item) => item.startsWith(`project.updated@${projectSequence}:`)),
+          `the delayed delta was not delivered: ${seen.join(" ")}`,
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          layerShellSubscribers({
+            getThreadShell: (id) =>
+              Effect.gen(function* () {
+                if (threadReads++ === 0) yield* Deferred.await(threadGate);
+                return {
+                  id,
+                  archivedAt: null,
+                  title: "t",
+                } as unknown as OrchestrationV2ThreadShell;
+              }),
+            getProjectRow: () => Effect.succeedSome(row),
+            listShells: () => Effect.succeed([row]),
+            getAvailable: () =>
+              Effect.sync(() => ({
+                repositoryIdentity: identity,
+                faviconPath: null,
+                repositoryIdentityResolved: true,
+              })),
+            enrichmentChanges: changes,
+          }),
+        ),
+      );
+      const firstB = seen.findIndex((item) => item.includes("repo:b"));
+      assert.isAtLeast(firstB, 0, seen.join(" "));
+      const stale = seen.slice(firstB + 1).filter((item) => item.includes("repo:a"));
+      assert.deepEqual(stale, [], `identity went back after the refresh: ${seen.join(" ")}`);
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );

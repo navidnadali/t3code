@@ -410,6 +410,15 @@ describe("decideYoungGeneration", () => {
     expect(same.kind).toBe("relaunch");
   });
 
+  it("carries a structural keep into the outcome", () => {
+    const ipc = decideYoungGeneration(view({ hasIpcChannel: true }));
+    expect(ipc.kind).toBe("keep");
+    expect(ipc.outcome.structural).toBe(true);
+    const preload = decideYoungGeneration(view({ preloadRan: true }));
+    expect(preload.kind).toBe("keep");
+    expect(preload.outcome.structural).toBeUndefined();
+  });
+
   it("honours the marker as an exact prefix, bounds the relaunch by pid, and ignores a forged marker", () => {
     const marker = "--max-old-space-size=12288";
     const applied = decideYoungGeneration(
@@ -446,6 +455,18 @@ describe("runtimeFlagsOf", () => {
     expect(kept("started with a preload").youngGenerationLost).toBe(true);
     expect(kept("started with a preload").keptReason).toBe("started with a preload");
     expect(kept("started with a bootstrap descriptor").youngGenerationLost).toBe(true);
+    expect(kept("started with a preload").structuralKeep).toBeUndefined();
+    const structural = runtimeFlagsOf(
+      {
+        applied: false,
+        nodeOptionsAtStart: undefined,
+        keptReason: "started with a bootstrap descriptor",
+        structural: true,
+      },
+      {},
+    );
+    expect(structural.youngGenerationLost).toBe(true);
+    expect(structural.structuralKeep).toBe(true);
     expect(kept("NODE_OPTIONS changed since startup").youngGenerationLost).toBe(true);
     expect(
       kept("disabled or set explicitly", { NODE_OPTIONS: "--max-semi-space-size=16" })
@@ -569,6 +590,27 @@ describe("planYoungGenerationRelaunch", () => {
       const result = plan({ env: { NODE_OPTIONS } });
       expect(result.kind, NODE_OPTIONS).toBe("keep");
       if (result.kind === "keep") expect(result.reason).toBe("started with a preload");
+    }
+  });
+
+  it("tells a keep the start itself rules out from one the environment caused", () => {
+    // The server logs a lost cap at Warn only when something changeable lost it; a bootstrap
+    // descriptor, an IPC channel without a launcher, the inspector or no execve is how it was started.
+    for (const structural of [
+      plan({ hasIpcChannel: true }),
+      plan({ argv: ["node", "bin.mjs", "serve", "--bootstrap-fd", "3"] }),
+      plan({ inspectorActive: true }),
+      plan({ canExecve: false }),
+    ]) {
+      expect(structural.kind).toBe("keep");
+      if (structural.kind === "keep") expect(structural.structural, structural.reason).toBe(true);
+    }
+    for (const lossy of [
+      plan({ execArgv: ["-r", "x.cjs"] }),
+      plan({ hasIpcChannel: true, env: { [SERVICE_LAUNCHER_CONTEXT_ENV]: "1" } }),
+    ]) {
+      expect(lossy.kind).toBe("keep");
+      if (lossy.kind === "keep") expect(lossy.structural, lossy.reason).toBeUndefined();
     }
   });
 

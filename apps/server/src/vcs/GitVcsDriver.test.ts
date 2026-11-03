@@ -2768,3 +2768,49 @@ it.effect(
       assert.isFalse(warm);
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
+
+it.effect.skipIf(!symlinksSupported)(
+  "retargeting a symbolic link at the objects directory is seen by the ref memory",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const h = yield* makeTurnHarness("t3-checkpoint-objects-link-");
+      // Each repository's object store lives behind a symbolic link.
+      const stores: Record<"warm" | "cold", string> = {
+        warm: path.join(h.root, "stores-warm"),
+        cold: path.join(h.root, "stores-cold"),
+      };
+      for (const [name, cwd] of Object.entries(h.repos)) {
+        const root = stores[name as "warm" | "cold"];
+        yield* fileSystem.makeDirectory(path.join(root, "b", "info"), { recursive: true });
+        yield* fileSystem.makeDirectory(path.join(root, "a"), { recursive: true });
+        yield* fileSystem.rename(
+          path.join(cwd, ".git", "objects"),
+          path.join(root, "a", "objects"),
+        );
+        yield* fileSystem.symlink(
+          path.join(root, "a", "objects"),
+          path.join(cwd, ".git", "objects"),
+        );
+      }
+      yield* h.writeBoth("file.txt", "initial\n");
+      yield* h.gitBoth(["add", "."]);
+      yield* h.commitBoth("initial");
+      yield* h.turn(1);
+      yield* h.turn(2);
+      // Git prints --git-path objects with the link resolved; the link itself must count.
+      for (const [name, cwd] of Object.entries(h.repos)) {
+        const root = stores[name as "warm" | "cold"];
+        const link = path.join(cwd, ".git", "objects");
+        yield* fileSystem.remove(link);
+        yield* fileSystem.symlink(path.join(root, "b"), link);
+      }
+      const probe = (driver: VcsDriver.VcsDriver["Service"], cwd: string) =>
+        driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef: turnRef(2) });
+      const cold = yield* GitVcsDriver.makeVcsDriverShape();
+      const warm = yield* probe(h.warm, h.repos.warm);
+      assert.strictEqual(warm, yield* probe(cold, h.repos.cold));
+      assert.isFalse(warm);
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);

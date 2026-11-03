@@ -368,6 +368,8 @@ describe("DesktopBackendConfiguration", () => {
         // `/w` forwards only into Windows; `/u` and a bare name forward into WSL.
         process.env.WSLENV = "NODE_OPTIONS/w:T3CODE_V8_MAX_SEMI_SPACE_MB/w";
         assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
+        process.env.WSLENV = "NODE_OPTIONS/uw:T3CODE_V8_MAX_SEMI_SPACE_MB/wu";
+        assert.deepEqual(wslNodeFallbackCapFlags(), ["--max-semi-space-size=64"]);
         process.env.WSLENV = "NODE_OPTIONS/u:T3CODE_V8_MAX_SEMI_SPACE_MB/p";
         assert.deepEqual(wslNodeFallbackCapFlags(), []);
       }).pipe(Effect.scoped),
@@ -530,6 +532,13 @@ describe("DesktopBackendConfiguration", () => {
             .resolveWsl({ port: 5000, distro: "Ubuntu" })
             .pipe(Effect.ensuring(restore));
           assert.isFalse(windowsOnly.args.some((arg) => arg.startsWith("--node-options=")));
+          // WSL drops any entry carrying `w` in this direction, `/uw` included.
+          process.env.NODE_OPTIONS = "--require=C:\\WindowsOnly\\hook.cjs";
+          process.env.WSLENV = "NODE_OPTIONS/uw";
+          const bothWays = yield* configuration
+            .resolveWsl({ port: 5000, distro: "Ubuntu" })
+            .pipe(Effect.ensuring(restore));
+          assert.isFalse(bothWays.args.some((arg) => arg.startsWith("--node-options=")));
         }),
     );
   });

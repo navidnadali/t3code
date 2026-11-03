@@ -313,7 +313,7 @@ const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
 const CONFIG_SNAPSHOT_LOAD_ATTEMPTS = 3;
 const CONFIG_FILE_LOCATIONS_CAPACITY = 16;
 const REF_RESULTS_CAPACITY = 256;
-const REPOSITORY_PATH_COUNT = 13;
+const REPOSITORY_PATH_COUNT = 12;
 const FILE_RESULTS_CAPACITY = 64;
 const REUSED_RESULTS_CAPACITY = 64;
 // Ref names whose loose file Git's files backend keeps at <common dir>/<name>: refs shared by every
@@ -378,8 +378,6 @@ const REPOSITORY_PATH_ARGS = [
   "--git-common-dir",
   "--git-path",
   "index",
-  "--git-path",
-  "info/exclude",
   "--show-prefix",
 ] as const;
 
@@ -477,9 +475,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       refs,
       gitCommonDir,
       absoluteIndexPath,
-      infoExclude,
     ] = paths as [
-      string,
       string,
       string,
       string,
@@ -587,7 +583,9 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       absoluteIndexPath,
       objectsDir: objects,
       headPath: head,
-      infoExcludePath: infoExclude,
+      // Not --git-path info/exclude, which git prints with a symbolic link resolved: the link itself
+      // must be the dependency, so retargeting it is seen.
+      infoExcludePath: path.join(gitCommonDir, "info", "exclude"),
     };
   });
 

@@ -2505,7 +2505,11 @@ it.effect.skipIf(!symlinksSupported)(
       }
       yield* h.writeBoth("new.txt", "new\n");
       const retargeted = yield* h.turn(3);
-      assert.deepStrictEqual(retargeted.commands, withProbe(STEADY_TURN_COMMANDS));
+      assert.deepStrictEqual(retargeted.commands, [
+        ...withProbe(STEADY_TURN_COMMANDS),
+        "diff",
+        "diff",
+      ]);
       assert.strictEqual(retargeted.numstat, "1\t0\tnew.txt\0");
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );

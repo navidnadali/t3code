@@ -757,6 +757,8 @@ const makeReader = Effect.fnUntraced(function* (
             }
             pending.set(id, () => resume(Effect.succeed([])));
             if (pending.size === 1) worker.ref();
+            // A reply landing in the gap may have restored the flag: cleared again with the post.
+            inTransaction = false;
             if (post({ id, safeIntegers: false, ...input })) latestId = id;
             else {
               pending.delete(id);

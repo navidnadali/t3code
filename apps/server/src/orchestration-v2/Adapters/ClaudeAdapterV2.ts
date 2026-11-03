@@ -70,7 +70,6 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- the SDK takes a Node ChildProcess for the CLI.
 import * as NodeChildProcess from "node:child_process";
-import * as NodeNet from "node:net";
 import * as NodeUtil from "node:util";
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
@@ -162,6 +161,7 @@ import {
 } from "../../claudeModelOptions.ts";
 import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
+import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
@@ -356,6 +356,12 @@ const CLAUDE_GROUP_WATCH_SCRIPT = [
   "{ trap '' TERM; read -r _ <&3; kill -TERM 0; sleep 5; kill -KILL 0; } </dev/null >/dev/null 2>&1 &",
   'exec "$@" 3<&-',
 ].join("\n");
+// The same watch on descriptor 2, the CLI's stderr being ignored either way: a provider launcher
+// hands a process only stdin, stdout and stderr, in blocking mode as Node's own pipes.
+const CLAUDE_GROUP_WATCH_SCRIPT_FD2 = [
+  "{ trap '' TERM; read -r _ <&3; kill -TERM 0; sleep 5; kill -KILL 0; } 3<&2 </dev/null >/dev/null 2>&1 &",
+  'exec "$@" 2>/dev/null',
+].join("\n");
 
 /**
  * Kill the CLI's group on exit to stop MCP grandchildren; `onExit` stops its agent scope for
@@ -365,18 +371,26 @@ const CLAUDE_GROUP_WATCH_SCRIPT = [
 export function spawnClaudeProcessGroup(
   options: ClaudeSpawnOptions,
   onExit?: () => void,
+  launcher?: WorkerChildProcessSpawner.ProviderProcessLauncher["Service"],
 ): ClaudeSpawnedProcess {
-  const child = NodeChildProcess.spawn(
-    "/bin/sh",
-    ["-c", CLAUDE_GROUP_WATCH_SCRIPT, "t3-claude", options.command, ...options.args],
-    {
-      cwd: options.cwd,
-      env: options.env,
-      signal: options.signal,
-      stdio: ["pipe", "pipe", "ignore", "pipe"],
-      detached: true,
-    },
-  );
+  const watch = (script: string) => ["-c", script, "t3-claude", options.command, ...options.args];
+  // The provider launcher starts it without forking the server where it can.
+  const child =
+    launcher === undefined
+      ? NodeChildProcess.spawn("/bin/sh", watch(CLAUDE_GROUP_WATCH_SCRIPT), {
+          cwd: options.cwd,
+          env: options.env,
+          signal: options.signal,
+          stdio: ["pipe", "pipe", "ignore", "pipe"],
+          detached: true,
+        })
+      : launcher.spawn("/bin/sh", watch(CLAUDE_GROUP_WATCH_SCRIPT_FD2), {
+          cwd: options.cwd,
+          env: options.env,
+          signal: options.signal,
+          stdio: ["pipe", "pipe", "pipe"],
+          held: [2],
+        });
   child.once("exit", () => {
     try {
       signalProcessGroup(child.pid ?? 0, "SIGKILL");
@@ -970,6 +984,9 @@ export const layerQueryRunner: Layer.Layer<
     const portDiscovery = yield* PortScanner.PortDiscovery;
     const stageTiming = (yield* ProviderIoStageTiming)?.forProvider(CLAUDE_PROVIDER);
     const workerPool = yield* ClaudeAgentSdkWorkerPool;
+    const launcher = Option.getOrUndefined(
+      yield* Effect.serviceOption(WorkerChildProcessSpawner.ProviderProcessLauncher),
+    );
 
     return ClaudeAgentSdkQueryRunner.of({
       allocateSessionId: crypto
@@ -1031,7 +1048,9 @@ export const layerQueryRunner: Layer.Layer<
           const spawnProcess =
             options.spawnClaudeCodeProcess ??
             ((spawnOptions: ClaudeSpawnOptions) => {
-              if (platform !== "win32") return spawnClaudeProcessGroup(spawnOptions, stopScope);
+              if (platform !== "win32") {
+                return spawnClaudeProcessGroup(spawnOptions, stopScope, launcher);
+              }
               const child = NodeChildProcess.spawn(spawnOptions.command, spawnOptions.args, {
                 cwd: spawnOptions.cwd,
                 env: spawnOptions.env,
@@ -1047,11 +1066,12 @@ export const layerQueryRunner: Layer.Layer<
           let spawnedProcess: ClaudeSpawnedProcess | undefined;
           const countSdkMessage =
             stageTiming &&
-            makeProviderIoReadCounter(stageTiming, "sdkMessage", () =>
-              spawnedProcess?.stdout instanceof NodeNet.Socket
-                ? spawnedProcess.stdout.bytesRead
-                : 0,
-            );
+            makeProviderIoReadCounter(stageTiming, "sdkMessage", () => {
+              // A socket's, or a handed-off process's output stream's.
+              const read = (spawnedProcess?.stdout as { readonly bytesRead?: unknown } | undefined)
+                ?.bytesRead;
+              return typeof read === "number" ? read : 0;
+            });
           let processExited = false;
           let processExit: Promise<void> | undefined;
           const spawnClaudeCodeProcess = (spawnOptions: ClaudeSpawnOptions) => {

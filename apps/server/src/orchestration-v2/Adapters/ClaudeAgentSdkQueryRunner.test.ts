@@ -462,37 +462,58 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
 
   // The CLI keeps running its turn after its pipes close, so a server that
   // crashed would leave it working next to the session it resumes.
-  it.effect("stops the CLI when the server that started it goes away", () =>
-    Effect.gen(function* () {
-      const cli = fakeClaudeCli(['dir=$(dirname "$0")', 'sleep 600 > "$dir/alive"'].join("\n"));
-      const dir = NodePath.dirname(cli);
-      NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "alive")]);
-      const child = spawnClaudeProcessGroup({
-        command: cli,
-        args: [],
-        cwd: dir,
-        env: process.env,
-        // @effect-diagnostics-next-line abortControllerInEffect:off - This crash fixture closes pipes itself; aborting on test teardown raises an unrelated process error.
-        signal: new AbortController().signal,
-      }) as NodeChildProcess.ChildProcess;
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          try {
-            signalProcessGroup(child.pid ?? 0, "SIGKILL");
-          } catch {}
-          NodeFS.rmSync(dir, { recursive: true, force: true });
-        }),
-      );
-      const alive = NodeFS.createReadStream(NodePath.join(dir, "alive"));
-      const turnStarted = new Promise<void>((resolve) => alive.once("open", () => resolve()));
-      const turnStopped = new Promise<void>((resolve) => alive.once("close", () => resolve()));
-      alive.resume();
-      yield* Effect.promise(() => turnStarted);
+  it.effect.each([
+    { launcher: "none" },
+    ...(HostProcess.Platform.defaultValue() === "linux" ? [{ launcher: "provider" }] : []),
+  ] as const)(
+    "stops the CLI when the server that started it goes away ($launcher launcher)",
+    ({ launcher }) =>
+      Effect.gen(function* () {
+        const cli = fakeClaudeCli(['dir=$(dirname "$0")', 'sleep 600 > "$dir/alive"'].join("\n"));
+        const dir = NodePath.dirname(cli);
+        NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "alive")]);
+        const providerLauncher =
+          launcher === "none"
+            ? undefined
+            : yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        const child = spawnClaudeProcessGroup(
+          {
+            command: cli,
+            args: [],
+            cwd: dir,
+            env: process.env,
+            // @effect-diagnostics-next-line abortControllerInEffect:off - This crash fixture closes pipes itself; aborting on test teardown raises an unrelated process error.
+            signal: new AbortController().signal,
+          },
+          undefined,
+          providerLauncher,
+        ) as NodeChildProcess.ChildProcess & { readonly held?: ReadonlyArray<NodeStream.Duplex> };
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            try {
+              signalProcessGroup(child.pid ?? 0, "SIGKILL");
+            } catch {}
+            NodeFS.rmSync(dir, { recursive: true, force: true });
+          }),
+        );
+        const alive = NodeFS.createReadStream(NodePath.join(dir, "alive"));
+        const turnStarted = new Promise<void>((resolve) => alive.once("open", () => resolve()));
+        const turnStopped = new Promise<void>((resolve) => alive.once("close", () => resolve()));
+        alive.resume();
+        yield* Effect.promise(() => turnStarted);
 
-      // A dying server's descriptors close; the kernel would do this for it.
-      for (const pipe of child.stdio) pipe?.destroy();
-      yield* Effect.promise(() => turnStopped);
-    }),
+        // A dying server's descriptors close; the kernel would do this for it.
+        for (const pipe of [...child.stdio, ...(child.held ?? [])]) pipe?.destroy();
+        yield* Effect.promise(() => turnStopped);
+      }).pipe(
+        Effect.provide(
+          WorkerChildProcessSpawner.layerProviderLauncher.pipe(
+            Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-handoff-" })),
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
   );
 
   // Linux: a provider handed off by the spawner process identifies by /proc start time.

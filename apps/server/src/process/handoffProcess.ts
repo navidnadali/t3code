@@ -10,8 +10,13 @@ export interface ProviderSpawnOptions {
   readonly cwd?: string | undefined;
   readonly env: NodeJS.ProcessEnv;
   readonly signal?: AbortSignal | undefined;
-  /** Piped descriptors become the server's sockets; the others are ignored. */
-  readonly stdio: ReadonlyArray<"pipe" | "ignore">;
+  /**
+   * stdin, stdout and stderr; piped ones become the server's sockets. Only these three: the child
+   * gets them in blocking mode, as Node's own pipes, which a descriptor past 2 would not be.
+   */
+  readonly stdio: readonly ["pipe" | "ignore", "pipe" | "ignore", "pipe" | "ignore"];
+  /** Piped descriptors the server only holds open (a watch pipe): never read, not in `stdio`. */
+  readonly held?: ReadonlyArray<0 | 1 | 2>;
 }
 
 /** What a hand-off process needs of the spawner host. */
@@ -30,6 +35,19 @@ export interface HandoffHost {
     callback: (outcome: unknown) => void,
   ) => void;
   readonly setHandoffReferenced: (child: HandoffChild, referenced: boolean) => void;
+}
+
+// Counts what the provider wrote, as a socket's bytesRead does (provider I/O stage timing reads it).
+class OutputStream extends NodeStream.PassThrough {
+  bytesRead = 0;
+  override _transform(
+    chunk: Buffer,
+    encoding: BufferEncoding,
+    callback: NodeStream.TransformCallback,
+  ): void {
+    this.bytesRead += chunk.byteLength;
+    super._transform(chunk, encoding, callback);
+  }
 }
 
 const abortError = () =>
@@ -64,8 +82,13 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     fallback: (reason: Error) => void,
   ) {
     super();
+    const held = new Set<number>(options.held ?? []);
     this.stdio = options.stdio.map((mode, fd) =>
-      mode === "pipe" && fd <= 2 ? new NodeStream.PassThrough() : null,
+      mode !== "pipe" || held.has(fd)
+        ? null
+        : fd === 0
+          ? new NodeStream.PassThrough()
+          : new OutputStream(),
     );
     for (const [fd, stream] of this.stdio.entries()) {
       if (stream === null || fd === 0) continue;
@@ -98,6 +121,11 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
         onUnavailable: (error) => startDirect(error),
       },
     );
+  }
+
+  /** The server's ends of held descriptors: they close when the server exits, however it exits. */
+  get held(): ReadonlyArray<NodeNet.Socket> {
+    return this.#held;
   }
 
   get stdin(): NodeStream.PassThrough | null {

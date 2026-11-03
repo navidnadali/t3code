@@ -232,7 +232,7 @@ describe("provider process hand-off", () => {
       const child = launcher.spawn(
         "/bin/sh",
         ["-c", 'echo ready; read -r line; echo "got $line"; exit 3'],
-        { env: process.env, stdio: ["pipe", "pipe", "ignore", "pipe"] },
+        { env: process.env, stdio: ["pipe", "pipe", "pipe"], held: [2] },
       );
       const output = yield* Effect.callback<{ stdout: string; code: number | null }>((resume) => {
         let stdout = "";
@@ -243,7 +243,11 @@ describe("provider process hand-off", () => {
         child.once("close", (code: number | null) => resume(Effect.succeed({ stdout, code })));
       });
       expect(output).toEqual({ stdout: "ready\ngot hello\n", code: 3 });
-      expect(child.exitCode).toBe(3);
+      // A held descriptor stays the server's: open, unread, not offered as a stream.
+      expect({ exitCode: child.exitCode, stderr: child.stderr }).toEqual({
+        exitCode: 3,
+        stderr: null,
+      });
       expect(spawnerProcessIds.size).toBeGreaterThan(0);
     }).pipe(Effect.provide(launcherLayer())),
   );

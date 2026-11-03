@@ -1618,8 +1618,11 @@ const makeChildHandles = Effect.fnUntraced(function* () {
     });
     const exitCode = Effect.flatMap(Deferred.await(child.exitSignal), ([code, signal]) => {
       if (Predicate.isNotNull(code)) return Effect.succeed(ExitCode(code));
+      // Neither code nor signal: a handed-off process that ended after its spawner died.
       const error = new globalThis.Error(
-        `Process interrupted due to receipt of signal: '${signal}'`,
+        signal === null
+          ? "Process exited; its exit status is unknown (its process spawner had stopped)"
+          : `Process interrupted due to receipt of signal: '${signal}'`,
       );
       return Effect.fail(toPlatformError("exitCode", error, command));
     });

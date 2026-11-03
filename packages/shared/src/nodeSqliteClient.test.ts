@@ -1446,6 +1446,42 @@ it.effect(
     ),
 );
 
+it.effect(
+  "keeps a read transaction through a nested rollback and answers a missing savepoint with SQLite's error",
+  () =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        const before = startedWorkers.length;
+        const outer = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              assert.equal(yield* countEntries(sql), 1);
+              // A failed nested transaction rolls back to its savepoint; the outer one goes on.
+              const nested = yield* sql.withTransaction(Effect.fail("nested")).pipe(Effect.exit);
+              assert.isTrue(Exit.isFailure(nested));
+              const duplicate = yield* sql.unsafe("BEGIN").pipe(Effect.flip);
+              assert.include(String(duplicate.reason.cause), "within a transaction");
+              const missing = yield* sql.unsafe("ROLLBACK TO SAVEPOINT missing").pipe(Effect.flip);
+              assert.include(String(missing.reason.cause), "no such savepoint");
+              return yield* countEntries(sql);
+            }),
+          )
+          .pipe(SqliteClient.readOnly);
+        assert.equal(outer, 1);
+        // The reader is still usable, and only the two transactions carried a BEGIN.
+        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+        yield* eventLoopTurn;
+        const shapes = messageShapes(startedWorkers[before]!);
+        assert.deepEqual(
+          shapes.filter((shape) => shape.startsWith("begin+")),
+          ["begin+SELECT", "begin+SELECT"],
+          shapes.join(" "),
+        );
+        assert.include(shapes, "ROLLBACK", shapes.join(" "));
+      }),
+    ),
+);
+
 it.effect("sends statements issued together as one batch and answers each on its own", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {

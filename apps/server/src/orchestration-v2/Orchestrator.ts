@@ -1977,30 +1977,39 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               )
           : null;
       const activeHandoff = handoff ?? legacyImportRecoveryHandoff;
+      // A queued run starts in the thread's workspace now; if the thread moved since the run was
+      // queued, it takes that workspace's scope. A policy the turn start refuses keeps the stored one.
+      const resolvedForStart = yield* runtimePolicy
+        .resolve({ thread: projection.thread, modelSelection: queuedRun.modelSelection })
+        .pipe(Effect.result);
+      const workspaceNow =
+        resolvedForStart._tag === "Success"
+          ? (resolvedForStart.success.cwd ?? projection.thread.worktreePath ?? process.cwd())
+          : undefined;
       const checkpointScope =
-        storedCheckpointScope ??
-        (yield* runtimePolicy
-          .resolve({ thread: projection.thread, modelSelection: queuedRun.modelSelection })
-          .pipe(
-            Effect.flatMap((resolvedRuntimePolicy) =>
-              prepareRootRunScope({
+        storedCheckpointScope !== undefined &&
+        (workspaceNow === undefined || workspaceNow === storedCheckpointScope.cwd)
+          ? storedCheckpointScope
+          : yield* Effect.gen(function* () {
+              if (resolvedForStart._tag === "Failure") return yield* resolvedForStart.failure;
+              return yield* prepareRootRunScope({
                 threadId,
                 runId: queuedRun.id,
                 rootNodeId: rootNode.id,
                 providerThreadId: queuedProviderThread.id,
-                cwd: resolvedRuntimePolicy.cwd ?? projection.thread.worktreePath ?? process.cwd(),
+                cwd: workspaceNow!,
                 createdAt: now,
-              }),
-            ),
-            Effect.mapError(
-              (cause) =>
-                new OrchestratorDispatchError({
-                  commandId,
-                  commandType: "message.dispatch",
-                  cause,
-                }),
-            ),
-          ));
+              });
+            }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestratorDispatchError({
+                    commandId,
+                    commandType: "message.dispatch",
+                    cause,
+                  }),
+              ),
+            );
       const providerSessionId =
         (!canResumeAcrossInstances &&
         queuedProviderThread.providerSessionId !== null &&
@@ -2132,6 +2141,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             };
       const executionIdentityEvents: ReadonlyArray<Omit<OrchestrationV2DomainEvent, "id">> =
         storedCheckpointScope === undefined ||
+        checkpointScope.id !== storedCheckpointScope.id ||
         storedProviderThread.id !== queuedProviderThread.id ||
         attempt.providerInstanceId !== queuedRun.providerInstanceId
           ? [

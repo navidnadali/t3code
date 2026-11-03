@@ -311,21 +311,39 @@ export const layer: Layer.Layer<
               providerThreadTurns,
             });
       if (input.restoreFiles !== false) yield* checkpoints.restore({ scope, checkpoint });
-      // Each workspace's refs live in its own repository; one that was removed has none to drop.
-      for (const staleScope of [scope, ...context.otherRootScopes]) {
+      // Each workspace's refs live in its repository. A removed worktree's repository may be another
+      // workspace's (worktrees share refs), and a recreated one would reuse them as baselines: drop
+      // them through every workspace that remains; deleting a ref a repository lacks is a no-op.
+      const rootScopes = [scope, ...context.otherRootScopes];
+      const remaining = yield* Effect.filter(
+        [
+          ...new Set([
+            ...(context.thread.worktreePath == null ? [] : [context.thread.worktreePath]),
+            ...rootScopes.map((candidate) => candidate.cwd),
+          ]),
+        ],
+        (cwd) => fileSystem.exists(cwd),
+      );
+      for (const staleScope of rootScopes) {
         const stale = staleCheckpoints.filter((candidate) => candidate.scopeId === staleScope.id);
         if (stale.length === 0) continue;
-        if (!(yield* fileSystem.exists(staleScope.cwd))) {
-          yield* Effect.logInfo(
-            "orchestration V2 stale checkpoint refs left in a removed workspace",
-            {
-              scopeId: staleScope.id,
-              cwd: staleScope.cwd,
-            },
-          );
+        if (remaining.includes(staleScope.cwd)) {
+          yield* checkpoints.deleteStaleRefs({ scope: staleScope, checkpoints: stale });
           continue;
         }
-        yield* checkpoints.deleteStaleRefs({ scope: staleScope, checkpoints: stale });
+        for (const cwd of remaining) {
+          yield* checkpoints
+            .deleteStaleRefs({ scope: { ...staleScope, cwd }, checkpoints: stale })
+            .pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("orchestration V2 stale checkpoint refs not dropped", {
+                  scopeId: staleScope.id,
+                  cwd,
+                  cause: String(cause),
+                }),
+              ),
+            );
+        }
       }
 
       // Lock against full-row thread writes that could restore the old native session after rollback.

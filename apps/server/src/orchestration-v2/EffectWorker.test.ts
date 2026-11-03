@@ -868,16 +868,19 @@ const saturatedDaemon = (options: {
       providerTurnId,
     });
     if (options.admission === false) {
-      // No gate: every worker claims whatever is due, saturated or not.
-      pending.push(startEffect(1), startEffect(2), startEffect(3), startEffect(4), interruptEffect);
-      yield* Queue.offerAll(available, [undefined, undefined, undefined, undefined, undefined]);
-      const all = yield* startsWithin(started, 4, "the four turn starts");
-      assert.deepEqual([...all].toSorted(), [
-        "effect:admission-1",
-        "effect:admission-2",
-        "effect:admission-3",
-        "effect:admission-4",
-      ]);
+      // No gate: the pressure never matters. After the saturated samples that would close a gate
+      // to two, the third and fourth starts are claimed while the first two still run.
+      pending.push(startEffect(1), startEffect(2));
+      yield* Queue.offerAll(available, [undefined, undefined]);
+      const firstTwo = yield* startsWithin(started, 2, "the first two turn starts");
+      assert.deepEqual([...firstTwo].toSorted(), ["effect:admission-1", "effect:admission-2"]);
+      yield* TestClock.adjust("2 seconds");
+      pending.push(startEffect(3), startEffect(4), interruptEffect);
+      yield* Queue.offerAll(available, [undefined, undefined, undefined]);
+      const rest = yield* startsWithin(started, 2, "the third and fourth turn starts");
+      assert.deepEqual([...rest].toSorted(), ["effect:admission-3", "effect:admission-4"]);
+      // Every worker runs a start, so the interrupt waits for one of them, not for a gate.
+      assert.equal(pending.length, 1);
       yield* Deferred.succeed(finishTurnStarts, undefined);
       assert.deepEqual(yield* startsWithin(started, 1, "the interrupt"), ["effect:admission-5"]);
       yield* Fiber.interrupt(daemon);

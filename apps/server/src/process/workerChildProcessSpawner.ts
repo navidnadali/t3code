@@ -646,7 +646,9 @@ export const makeRemoteHost = (options: {
         takeHandoffEnd(entry, message.fd, handle);
         return;
       case "handoff-queued":
-        // It answered: the start waits its turn, which is no failure to answer.
+        // It answered: the start waits its turn, which is no failure to answer. A report that
+        // comes after the spawner began it (the PID report travels apart) changes nothing.
+        if (entry.settled || child.pid !== undefined) return;
         entry.cancelStartDeadline?.();
         entry.cancelStartDeadline = undefined;
         entry.queued = true;

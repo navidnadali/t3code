@@ -4,8 +4,12 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as ServerConfig from "../config.ts";
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
 
-/** The server's OpenCode runtime: its `opencode serve` servers and commands, and their ledger. */
+/**
+ * The server's OpenCode runtime: its `opencode serve` servers and commands, and their ledger,
+ * started from the server's provider launcher when there is one.
+ */
 export const layerOpenCodeRuntime = OpenCodeRuntime.layer.pipe(
   Layer.provide(
     Layer.unwrap(
@@ -15,4 +19,5 @@ export const layerOpenCodeRuntime = OpenCodeRuntime.layer.pipe(
       }),
     ),
   ),
+  Layer.provide(WorkerChildProcessSpawner.layerProviderSpawner),
 );

@@ -1995,6 +1995,9 @@ export const providerSpawner = Effect.gen(function* () {
   return Option.isSome(launcher) ? launcher.value.spawner : yield* ChildProcessSpawner;
 });
 
+/** `providerSpawner` as the ChildProcessSpawner, for a layer that starts provider processes. */
+export const layerProviderSpawner = Layer.effect(ChildProcessSpawner, providerSpawner);
+
 const providerSpawnerChoices = new Map<string, "handoff" | "direct">([
   ["handoff", "handoff"],
   ["on", "handoff"],

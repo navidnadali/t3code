@@ -771,6 +771,13 @@ describe("provider process hand-off", () => {
           held.get(0)!.end("only the server holds this provider's stdio");
         });
         expect(echoed).toBe("only the server holds this provider's stdio");
+        // Once it has exited, its start is over in the spawner too: it says so, and forgets it.
+        yield* next("exit", 1);
+        const closed = yield* next("close", 1).pipe(
+          Effect.as(true),
+          Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.succeed(false) }),
+        );
+        expect(closed).toBe(true);
         // Cancelled once its ends were passed, before the go: it ends without running.
         const cancelledMarker = NodePath.join(directory, "cancelled");
         start(2, cancelledMarker);

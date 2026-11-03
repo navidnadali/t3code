@@ -1915,6 +1915,24 @@ it.effect("refuses a write on a reader, temporary tables included", () =>
   ),
 );
 
+it.effect("keeps a reader from turning its writes back on", () =>
+  withReaderClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const pragma = yield* sql
+          .unsafe("PRAGMA query_only = OFF")
+          .pipe(SqliteClient.readOnly, Effect.exit);
+        const write = yield* sql
+          .unsafe("CREATE TEMP TABLE scratch(x)")
+          .pipe(SqliteClient.readOnly, Effect.flip);
+        assert.match(String(write.reason.cause), /readonly|query_only|read-only|not authorized/i);
+        assert.isTrue(Exit.isFailure(pragma), "query_only stays on");
+        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+      }),
+    { readerPoolSize: 1 },
+  ),
+);
+
 it.effect("lets a process exit cleanly after a one-shot read transaction", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;

@@ -493,34 +493,51 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
           );
           return file;
         };
+        // The preload counts the images it ran in; a looping entrypoint never exits, so the timeout
+        // ends it. The report comes from the image that finished, if one did.
         const images = (file: string, env: Record<string, string>, args: ReadonlyArray<string>) => {
           NodeFS.writeFileSync(countFile, "");
-          // A looping entrypoint never exits: the timeout ends it and the count says how many images ran.
-          NodeChildProcess.spawnSync(
+          const result = NodeChildProcess.spawnSync(
             process.execPath,
             ["--experimental-strip-types", ...args, binPath, "__node-flags"],
             {
               env: { ...process.env, ...cleanEnv, ...env, RELAUNCH_COUNT_FILE: countFile },
               timeout: 5000,
+              encoding: "utf8",
             },
           );
-          return NodeFS.readFileSync(countFile, "utf8").split("\n").filter(Boolean).length;
+          const preloadRuns = NodeFS.readFileSync(countFile, "utf8")
+            .split("\n")
+            .filter(Boolean).length;
+          const report =
+            result.status === 0 ? (JSON.parse(result.stdout) as NodeFlagsReport) : undefined;
+          return { preloadRuns, report };
         };
         // A preload on the command line or in NODE_OPTIONS is visible: NODE_OPTIONS as seen now may
         // not be what Node started with, so the process keeps Node's default — one image, no relaunch.
         const strip = preload("delete process.env.NODE_OPTIONS;");
-        expect(images(strip, {}, ["--require", strip])).toBe(1);
+        const stripped = images(strip, {}, ["--require", strip]);
+        expect(stripped.preloadRuns).toBe(1);
+        expect(stripped.report?.applied).toBe(false);
         const rewrite = preload('process.env.NODE_OPTIONS = "--require " + __filename;');
-        expect(images(rewrite, { NODE_OPTIONS: `--require ${rewrite}` }, [])).toBe(1);
+        const rewritten = images(rewrite, { NODE_OPTIONS: `--require ${rewrite}` }, []);
+        expect(rewritten.preloadRuns).toBe(1);
+        expect(rewritten.report?.applied).toBe(false);
         // A NODE_OPTIONS preload that deletes NODE_OPTIONS hides itself: the first image relaunches
-        // and the pid-bound guard stops the second — two images at most, never a loop.
+        // without it (the preload ran once and is gone from the relaunched image), and the pid-bound
+        // guard would stop any further image — never a loop.
         const hidden = preload("delete process.env.NODE_OPTIONS;");
-        expect(images(hidden, { NODE_OPTIONS: `--require ${hidden}` }, [])).toBe(2);
+        const hiddenRun = images(hidden, { NODE_OPTIONS: `--require ${hidden}` }, []);
+        expect(hiddenRun.preloadRuns).toBe(1);
+        expect(hiddenRun.report?.applied).toBe(true);
         // An explicit cap beside a preload that clears NODE_OPTIONS must not be relaunched over with 64.
         const clearing = preload("delete process.env.NODE_OPTIONS;");
-        expect(
-          images(clearing, { NODE_OPTIONS: "--max-semi-space-size=16" }, ["--require", clearing]),
-        ).toBe(1);
+        const cleared = images(clearing, { NODE_OPTIONS: "--max-semi-space-size=16" }, [
+          "--require",
+          clearing,
+        ]);
+        expect(cleared.preloadRuns).toBe(1);
+        expect(cleared.report?.applied).toBe(false);
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

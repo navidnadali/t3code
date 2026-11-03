@@ -216,6 +216,7 @@ it.effect.each([
       targetAttempt: undefined,
       rolledBackAttemptIds: [],
       staleCheckpoints: [],
+      otherRootScopes: [],
       rootNodes: [],
       providerTurns: [],
     } as unknown as ProjectionStore.ProjectionCheckpointRollbackContext;

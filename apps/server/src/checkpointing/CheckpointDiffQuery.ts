@@ -175,22 +175,20 @@ export const make = Effect.gen(function* () {
             )
           : undefined;
 
-      const firstScope =
-        input.fromTurnCount === 0
-          ? projection.checkpointScopes.find((scope) => scope.kind === "root_run")
-          : undefined;
+      // A range stays in the turn's scope: a thread has one per workspace it ran in, and a diff
+      // between two worktrees would show their branches' differences as the turn's changes.
       const fromCheckpointRef =
         input.fromTurnCount === 0
-          ? firstScope === undefined
-            ? undefined
-            : yield* checkpointRefForScopeOrdinal({
-                scopeId: firstScope.id,
-                ordinalWithinScope: 0,
-              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+          ? yield* checkpointRefForScopeOrdinal({
+              scopeId: toScope.id,
+              ordinalWithinScope: 0,
+            }).pipe(Effect.provideService(Crypto.Crypto, crypto))
           : (
               parentCheckpoint ??
               readyCheckpoints.find(
-                (checkpoint) => checkpoint.appRunOrdinal === input.fromTurnCount,
+                (checkpoint) =>
+                  checkpoint.appRunOrdinal === input.fromTurnCount &&
+                  checkpoint.scopeId === toCheckpoint.scopeId,
               )
             )?.ref;
       if (fromCheckpointRef === undefined) {

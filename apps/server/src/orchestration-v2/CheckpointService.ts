@@ -110,6 +110,8 @@ export interface CheckpointServiceV2Shape {
     readonly providerThreadId: ProviderThreadId;
     readonly cwd: string;
     readonly createdAt: DateTime.Utc;
+    /** The thread's checkpoint scopes so far: they decide which root scope this workspace uses. */
+    readonly threadScopes: ReadonlyArray<OrchestrationV2CheckpointScope>;
   }) => Effect.Effect<OrchestrationV2CheckpointScope, CheckpointServiceV2Error>;
   readonly captureBaseline: (input: {
     readonly scope: OrchestrationV2CheckpointScope;
@@ -174,6 +176,9 @@ function checkpointIdForScopeOrdinal(
   });
 }
 
+// A thread's first workspace keeps the root scope; each later, different workspace gets a scope of
+// its own, so a run's diff and a restore never span two worktrees. A workspace the thread returns
+// to reuses its scope. ordinalWithinParent orders the root scopes; 0 holds the thread start.
 const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(function* (input: {
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly threadId: ThreadId;
@@ -182,11 +187,35 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
   readonly providerThreadId: ProviderThreadId;
   readonly cwd: string;
   readonly createdAt: DateTime.Utc;
+  readonly threadScopes: ReadonlyArray<OrchestrationV2CheckpointScope>;
 }) {
-  const scopeId = yield* input.idAllocator.allocate.checkpointScope({
+  const rootScopeId = yield* input.idAllocator.allocate.checkpointScope({
     threadId: input.threadId,
     name: ROOT_CHECKPOINT_SCOPE_NAME,
   });
+  const rootScopes = input.threadScopes.filter(
+    (scope) => scope.kind === "root_run" && scope.parentScopeId === null,
+  );
+  const rootScope = rootScopes.find((scope) => scope.id === rootScopeId);
+  const [scopeId, ordinalWithinParent] =
+    rootScope === undefined || rootScope.cwd === input.cwd
+      ? ([rootScopeId, 0] as const)
+      : yield* Effect.gen(function* () {
+          const crypto = yield* Crypto.Crypto;
+          const digest = yield* crypto
+            .digest("SHA-256", new TextEncoder().encode(input.cwd))
+            .pipe(Effect.orDie);
+          const workspaceScopeId = yield* input.idAllocator.allocate.checkpointScope({
+            threadId: input.threadId,
+            name: `${ROOT_CHECKPOINT_SCOPE_NAME}@${Hex.encode(digest).slice(0, 16)}`,
+          });
+          const existing = rootScopes.find((scope) => scope.id === workspaceScopeId);
+          return [
+            workspaceScopeId,
+            existing?.ordinalWithinParent ??
+              Math.max(...rootScopes.map((scope) => scope.ordinalWithinParent)) + 1,
+          ] as const;
+        });
   return {
     id: scopeId,
     threadId: input.threadId,
@@ -195,7 +224,7 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
     parentScopeId: null,
     providerThreadId: input.providerThreadId,
     kind: "root_run",
-    ordinalWithinParent: 0,
+    ordinalWithinParent,
     advancesAppRunCount: true,
     cwd: input.cwd,
     createdAt: input.createdAt,
@@ -562,6 +591,7 @@ export const layer: Layer.Layer<
     return CheckpointServiceV2.of({
       prepareRootRunScope: (input) =>
         makeRootRunScope({ ...input, idAllocator }).pipe(
+          Effect.provideService(Crypto.Crypto, crypto),
           Effect.mapError(
             (cause) =>
               new CheckpointRootScopePrepareError({

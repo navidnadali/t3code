@@ -98,6 +98,8 @@ import * as Stream from "effect/Stream";
 
 import * as ProjectStore from "./ProjectStore.ts";
 import {
+  anotherWorktreeRestoreMessage,
+  isCheckpointFromAnotherWorktree,
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
 } from "./CheckpointRestoreSafety.ts";
@@ -1021,6 +1023,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
+  // The thread's scopes decide which root scope the run's workspace uses; a thread created in the
+  // same command has none yet.
+  const prepareRootRunScope = (
+    input: Omit<Parameters<typeof checkpointService.prepareRootRunScope>[0], "threadScopes">,
+  ) =>
+    projectionStore.getThreadRecords(input.threadId, ["checkpointScopes"]).pipe(
+      Effect.map(({ checkpointScopes }) => checkpointScopes),
+      Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed([]) }),
+      Effect.flatMap((threadScopes) =>
+        checkpointService.prepareRootRunScope({ ...input, threadScopes }),
+      ),
+    );
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
       Partial<Pick<OrchestrationV2ThreadProjection, "turnItems">>,
@@ -1969,7 +1983,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           .resolve({ thread: projection.thread, modelSelection: queuedRun.modelSelection })
           .pipe(
             Effect.flatMap((resolvedRuntimePolicy) =>
-              checkpointService.prepareRootRunScope({
+              prepareRootRunScope({
                 threadId,
                 runId: queuedRun.id,
                 rootNodeId: rootNode.id,
@@ -5175,28 +5189,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
-    const checkpointScope = yield* checkpointService
-      .prepareRootRunScope({
-        threadId: input.command.threadId,
-        runId: targetRun.id,
-        rootNodeId: nextRootNodeId,
-        providerThreadId: restartProviderThread.id,
-        cwd:
-          resolvedRuntimePolicy.cwd ??
-          input.projection.thread.worktreePath ??
-          session.providerSession.cwd,
-        createdAt: now,
-      })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId: input.command.commandId,
-              commandType: input.command.type,
-              cause,
-            }),
-        ),
-      );
+    const checkpointScope = yield* prepareRootRunScope({
+      threadId: input.command.threadId,
+      runId: targetRun.id,
+      rootNodeId: nextRootNodeId,
+      providerThreadId: restartProviderThread.id,
+      cwd:
+        resolvedRuntimePolicy.cwd ??
+        input.projection.thread.worktreePath ??
+        session.providerSession.cwd,
+      createdAt: now,
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new OrchestratorDispatchError({
+            commandId: input.command.commandId,
+            commandType: input.command.type,
+            cause,
+          }),
+      ),
+    );
     const restartedRun: OrchestrationV2Run = {
       ...targetRun,
       providerInstanceId: input.modelSelection.instanceId,
@@ -5968,7 +5980,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? null
           : yield* runtimePolicy.resolve({ thread: projection.thread, modelSelection }).pipe(
               Effect.flatMap((resolvedRuntimePolicy) =>
-                checkpointService.prepareRootRunScope({
+                prepareRootRunScope({
                   threadId: command.threadId,
                   runId,
                   rootNodeId,
@@ -6346,7 +6358,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .pipe(
                 mapDispatchError(command),
                 Effect.flatMap((resolvedRuntimePolicy) =>
-                  checkpointService.prepareRootRunScope({
+                  prepareRootRunScope({
                     threadId: command.threadId,
                     runId,
                     rootNodeId,
@@ -7086,29 +7098,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   }),
               ),
             );
-    const checkpointScope = yield* checkpointService
-      .prepareRootRunScope({
-        threadId: command.threadId,
-        runId,
-        rootNodeId,
-        providerThreadId: providerThread.id,
-        cwd:
-          resolvedRuntimePolicy.cwd ??
-          existingProviderSession?.cwd ??
-          projection.thread.worktreePath ??
-          process.cwd(),
-        createdAt: now,
-      })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId: command.commandId,
-              commandType: command.type,
-              cause,
-            }),
-        ),
-      );
+    const checkpointScope = yield* prepareRootRunScope({
+      threadId: command.threadId,
+      runId,
+      rootNodeId,
+      providerThreadId: providerThread.id,
+      cwd:
+        resolvedRuntimePolicy.cwd ??
+        existingProviderSession?.cwd ??
+        projection.thread.worktreePath ??
+        process.cwd(),
+      createdAt: now,
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause,
+          }),
+      ),
+    );
     const run: OrchestrationV2Run = {
       id: runId,
       threadId: command.threadId,
@@ -9995,16 +10005,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const resolvedRuntimePolicy = yield* runtimePolicy
         .resolve({ thread: projection.thread, modelSelection: state.run.modelSelection })
         .pipe(mapDispatchError(command));
-      const checkpointScope = yield* checkpointService
-        .prepareRootRunScope({
-          threadId: command.threadId,
-          runId: state.run.id,
-          rootNodeId: state.rootNode.id,
-          providerThreadId: state.providerThread.id,
-          cwd: resolvedRuntimePolicy.cwd ?? projection.thread.worktreePath ?? process.cwd(),
-          createdAt: now,
-        })
-        .pipe(mapDispatchError(command));
+      const checkpointScope = yield* prepareRootRunScope({
+        threadId: command.threadId,
+        runId: state.run.id,
+        rootNodeId: state.rootNode.id,
+        providerThreadId: state.providerThread.id,
+        cwd: resolvedRuntimePolicy.cwd ?? projection.thread.worktreePath ?? process.cwd(),
+        createdAt: now,
+      }).pipe(mapDispatchError(command));
       const emitEvent = emit(events, command);
       yield* emitEvent({
         type: "checkpoint-scope.created",
@@ -11967,6 +11975,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
       if (command.restoreFiles !== false) {
+        // A run's checkpoint was taken where the run worked; a baseline where its scope's runs work.
+        const workspace =
+          (targetCheckpoint.appRunOrdinal === null
+            ? undefined
+            : projection.runs.find((run) => run.ordinal === targetCheckpoint.appRunOrdinal)
+          )?.workspaceCwd ?? targetScope.cwd;
+        const elsewhere = yield* isCheckpointFromAnotherWorktree(projection.thread, workspace, {
+          fileSystem,
+          path,
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause,
+              }),
+          ),
+        );
+        if (elsewhere)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: anotherWorktreeRestoreMessage(workspace),
+          });
         const isolated = yield* isCheckpointRestoreIsolated(projection.thread, targetScope, {
           projects,
           path,

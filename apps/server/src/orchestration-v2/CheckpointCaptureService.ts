@@ -116,8 +116,10 @@ export const layer: Layer.Layer<
           capturedAt: run.requestedAt,
           forceMissing: sideChat,
         });
+      // The thread starts in its first workspace's scope; a later workspace's scope starts at the
+      // baseline of its first run there.
       const threadStartCheckpoint =
-        baselineOrdinalWithinScope === 0 || hasReadyCheckpoint(0)
+        baselineOrdinalWithinScope === 0 || hasReadyCheckpoint(0) || scope.ordinalWithinParent !== 0
           ? null
           : yield* materializeBaseline(0);
       const baselineCheckpoint = hasReadyCheckpoint(baselineOrdinalWithinScope)

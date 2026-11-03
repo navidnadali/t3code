@@ -1308,10 +1308,10 @@ const repoWorktree = (cwd: string, branch: string) =>
     return worktree;
   });
 
-// The next root run re-creates the thread's scope in the switched-to worktree before the stopped
-// run's capture: sent after Stop, or queued while the run ends (branch selector). Without the run's
-// own workspace, another repo loses its thread-start baseline; a worktree of the same repo gives it
-// the other worktree's tree.
+// The next root run is scoped in the switched-to worktree before the stopped run's capture: sent
+// after Stop, or queued while the run ends (branch selector). That worktree gets a scope of its own;
+// the stopped run's checkpoint and the thread start stay where they were taken (once, the next run
+// re-created the thread's only scope there, and the capture used it).
 it.effect.each(
   (["sent after Stop", "queued while it ends"] as const).flatMap((flow) =>
     (["another repo", "a worktree of the same repo"] as const).map((switchedTo) => ({
@@ -1407,7 +1407,12 @@ it.effect.each(
           }
 
           const projection = yield* orchestrator.getThreadProjection(threadId);
-          assert.equal(projection.checkpointScopes[0]?.cwd, other);
+          assert.deepEqual(
+            projection.checkpointScopes
+              .toSorted((left, right) => left.ordinalWithinParent - right.ordinalWithinParent)
+              .map((scope) => scope.cwd),
+            [cwd, other],
+          );
           const threadStart = projection.checkpoints.find(
             (checkpoint) => checkpoint.ordinalWithinScope === 0,
           );

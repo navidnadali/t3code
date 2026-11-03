@@ -17,8 +17,10 @@ import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
-import * as CheckpointRestoreSafety from "./CheckpointRestoreSafety.ts";
-import { isCheckpointRestoreIsolated } from "./CheckpointRestoreSafety.ts";
+import {
+  anotherWorktreeRestoreMessage,
+  isCheckpointRestoreIsolated,
+} from "./CheckpointRestoreSafety.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
 import { EventSinkV2 } from "./EventSink.ts";
@@ -88,6 +90,7 @@ it.effect.each([
       targetAttempt: undefined,
       rolledBackAttemptIds: [],
       staleCheckpoints: [],
+      otherRootScopes: [],
       checkpoint: { id: checkpointId, scopeId, status: "ready", appRunOrdinal: null },
       scope: { id: scopeId, cwd },
       runsToRollback: [{ id: "later-run", ordinal: 1, status: "completed", rootNodeId: null }],
@@ -255,15 +258,12 @@ it.effect.each([
 );
 
 it("names the other worktree in the refusal, a long path shortened in the middle", () => {
-  const message = Reflect.get(CheckpointRestoreSafety, "anotherWorktreeRestoreMessage") as (
-    workspace: string,
-  ) => string;
   assert.equal(
-    message("/repo/worktrees/feature"),
+    anotherWorktreeRestoreMessage("/repo/worktrees/feature"),
     "This checkpoint was taken in another worktree (/repo/worktrees/feature). Restoring its files would overwrite this worktree's branch. Use \u201cRevert and keep changes\u201d to rewind the conversation only.",
   );
   const long = `/Users/someone/${"nested/".repeat(12)}worktrees/feature-with-a-long-name`;
-  const shown = /\(([^)]*)\)/.exec(message(long))![1]!;
+  const shown = /\(([^)]*)\)/.exec(anotherWorktreeRestoreMessage(long))![1]!;
   assert.lengthOf(Array.from(shown), 64);
   assert.isTrue(shown.startsWith("/Users/someone/"));
   assert.isTrue(shown.endsWith("/worktrees/feature-with-a-long-name"));

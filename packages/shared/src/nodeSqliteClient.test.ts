@@ -1,5 +1,3 @@
-import * as NodeChildProcess from "node:child_process";
-import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -2107,7 +2105,7 @@ it.effect("lets a process exit cleanly after a one-shot read transaction", () =>
     // The reply that answers the read resumes the fiber, whose scope then terminates the worker;
     // a worker let go of after that leaves nothing to keep the process alive (exit code 13). The
     // script lives beside the client so that its bare imports resolve.
-    const script = NodePath.join(import.meta.dirname, `.exit-probe-${process.pid}.mjs`);
+    const script = path.join(import.meta.dirname, `.exit-probe-${process.pid}.mjs`);
     yield* Effect.acquireRelease(
       fs.writeFileString(
         script,
@@ -2128,15 +2126,24 @@ console.log("done");
       ),
       () => fs.remove(script).pipe(Effect.ignore),
     );
-    const child = yield* Effect.sync(() =>
-      NodeChildProcess.spawnSync(process.execPath, ["--no-warnings", script, filename], {
-        cwd: import.meta.dirname,
-        encoding: "utf8",
-        timeout: 60_000,
-      }),
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const child = yield* spawner.spawn(
+      ChildProcess.make(process.execPath, ["--no-warnings", script, filename]),
     );
-    assert.equal(child.status, 0, `exit ${child.status}: ${child.stderr}`);
-    assert.include(child.stdout, "done");
+    const decoder = new TextDecoder();
+    const output = yield* Stream.runFold(
+      child.stdout,
+      () => "",
+      (text, chunk) => text + decoder.decode(chunk),
+    );
+    const errors = yield* Stream.runFold(
+      child.stderr,
+      () => "",
+      (text, chunk) => text + decoder.decode(chunk),
+    );
+    const exitCode = yield* child.exitCode;
+    assert.equal(exitCode, 0, `exit ${exitCode}: ${errors}`);
+    assert.include(output, "done");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 

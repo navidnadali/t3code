@@ -695,7 +695,7 @@ const makeReader = Effect.fnUntraced(function* (
     worker.on("message", (reply: ReaderReply | ReaderStartup) => {
       if ("type" in reply) {
         ready = reply.type === "ready";
-        guarded = ready && reply.guarded === true;
+        guarded = reply.type === "ready" && reply.guarded === true;
         announce(reply);
         if (pending.size === 0) worker.unref();
         return;

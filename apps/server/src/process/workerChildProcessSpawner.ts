@@ -1229,10 +1229,9 @@ export const make = Effect.fn("WorkerChildProcessSpawner.make")(function* (
 });
 
 /**
- * Starts child processes from a small spawner process, so the server itself never forks: on
- * Linux, Node forks and copies the page tables of the whole server for every command. A spawner
- * that stops is restarted; one that stops again before starting a command, or more than
- * `spawnerRestartLimit` times in its window, is down: commands fail until its cool-down has passed.
+ * Starts the commands given to it from a small spawner process, so the server does not fork for
+ * them (on Linux each fork copies the whole server's page tables). A stopped spawner is restarted;
+ * past `spawnerRestartLimit` it is down and commands fail until its cool-down has passed.
  */
 
 export const makeProcessSpawner = Effect.fn("ProcessSpawner.make")(function* (

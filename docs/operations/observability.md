@@ -168,11 +168,13 @@ Every Git command is a child process, and Node creates each one synchronously on
 spawns it (`posix_spawn` on macOS, `fork` on Linux). On Linux each `fork` copies the page tables of
 the whole server, so its cost grows with the server's memory. On Linux and macOS the commands of
 `VcsProcess` and `GitVcsDriver` (checkpoints, status, refs, source control CLIs) therefore start from a
-small spawner process, started once while the server is small, so the server never forks for them:
-each fork copies only the spawner's page tables. Output, exit codes and errors are the same. Git run
-through other services, such as the cached repository identity lookup, still spawns on the event
-loop. macOS spawns with `posix_spawn`, which copies no page tables, so the gain there is only the
-event-loop time.
+small spawner process, started once while the server is small, so the server does not fork for them:
+each fork copies only the spawner's page tables. Output, exit codes and errors are the same. These are
+the only commands the spawner starts. Every other process the server starts still forks the server on
+Linux: among them the repository identity lookup's Git commands (cached per repository), provider
+checks and provider sessions, text generation, terminals, HTML render, host probes such as
+`hostnamectl`, the login-shell `PATH` probe at start-up, and the spawner itself. macOS spawns with
+`posix_spawn`, which copies no page tables, so the gain there is only the event-loop time.
 
 `T3CODE_PROCESS_SPAWNER` (any case) chooses where those commands start:
 

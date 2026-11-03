@@ -90,19 +90,19 @@ const make = Effect.gen(function* () {
         ),
       );
       const chunks: Array<Uint8Array> = [];
-      let size = 0;
+      // Each stream is capped, as execFile's maxBuffer did; stderr is read and dropped.
+      const capped = (stream: typeof child.stdout, keep: boolean) => {
+        let size = 0;
+        return Stream.runForEach(stream, (chunk) => {
+          size += chunk.byteLength;
+          if (keep) chunks.push(chunk);
+          return size > MAX_TEXT_BYTES
+            ? Effect.fail(new DocumentTextExit({ exitCode: null, outputLimit: true }))
+            : Effect.void;
+        });
+      };
       const [, , exitCode] = yield* Effect.all(
-        [
-          Stream.runForEach(child.stdout, (chunk) => {
-            size += chunk.byteLength;
-            chunks.push(chunk);
-            return size > MAX_TEXT_BYTES
-              ? Effect.fail(new DocumentTextExit({ exitCode: null, outputLimit: true }))
-              : Effect.void;
-          }),
-          Stream.runDrain(child.stderr),
-          child.exitCode,
-        ],
+        [capped(child.stdout, true), capped(child.stderr, false), child.exitCode],
         { concurrency: "unbounded" },
       );
       if (exitCode !== 0) {

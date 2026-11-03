@@ -1194,9 +1194,10 @@ const layerMakeServer = Layer.unwrap(
   }),
 ).pipe(
   Layer.provide(
-    Layer.merge(
+    Layer.mergeAll(
       WorkerChildProcessSpawner.layerProcessRunner,
       WorkerChildProcessSpawner.layerCommandSpawner,
+      WorkerChildProcessSpawner.layerProviderLauncher,
     ),
   ),
 );

@@ -796,15 +796,24 @@ export const layer: Layer.Layer<
         });
         if (!repaired.committed) return;
       }
-      // A run is checkpointed where it works. A live session keeps its cwd; a new one opens in the
-      // thread's workspace now, which may not be the one the run was scoped in: it takes that scope.
+      // A run is checkpointed where it works: the turn's cwd, the thread's workspace now, which may not
+      // be the one the run was scoped in (then it takes that scope). A live session that serves one
+      // thread keeps the cwd it was opened in; a shared one (Codex) resumes each turn in its cwd.
       const workspaceNow = resolvedRuntimePolicy.cwd;
+      const keepsOpenedCwd = (yield* providerSessions.get(providerSessionId)).pipe(
+        Option.match({
+          onNone: () => false,
+          onSome: (live) =>
+            live.providerSession?.capabilities.sessions
+              .supportsMultipleProviderThreadsPerSession !== true,
+        }),
+      );
       const runScope =
         checkpointScope.kind !== "root_run" ||
         checkpointScope.parentScopeId !== null ||
         workspaceNow == null ||
         workspaceNow === checkpointScope.cwd ||
-        Option.isSome(yield* providerSessions.get(providerSessionId))
+        keepsOpenedCwd
           ? checkpointScope
           : yield* Effect.gen(function* () {
               const { checkpointScopes } = yield* projectionStore.getThreadRecords(

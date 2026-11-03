@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off - the fallback-log race hooks must change files synchronously inside a command.
+import * as NodeFS from "node:fs";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -2513,3 +2515,107 @@ it.effect.skipIf(!symlinksSupported)(
       assert.strictEqual(retargeted.numstat, "1\t0\tnew.txt\0");
     }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
 );
+
+// A driver whose fallback `git log` is wrapped: `before` runs once git is about to run, `after` once
+// it has returned, both inside the command, so the history state taken before and after sees them.
+const makeHookedDriver = Effect.fn("test.makeHookedDriver")(function* () {
+  const liveRunner = yield* ProcessRunner.ProcessRunner;
+  const hooks: { before: (() => void) | null; after: (() => void) | null } = {
+    before: null,
+    after: null,
+  };
+  const spawned: Array<ReadonlyArray<string>> = [];
+  const process = yield* VcsProcess.make.pipe(
+    Effect.provideService(ProcessRunner.ProcessRunner, {
+      run: (input) => {
+        spawned.push(input.args);
+        const isLog = input.args.includes("--no-walk=unsorted");
+        return Effect.sync(() => {
+          if (isLog && hooks.before !== null) hooks.before();
+        }).pipe(
+          Effect.andThen(liveRunner.run(input)),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              if (isLog && hooks.after !== null) hooks.after();
+            }),
+          ),
+        );
+      },
+    }),
+  );
+  const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+    Effect.provideService(VcsProcess.VcsProcess, process),
+  );
+  return { driver, hooks, spawned };
+});
+
+it.effect.each(["graft", "shallow", "loose replace"] as const)(
+  "a %s that exists only while the fallback git log runs is not remembered",
+  (kind) =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const h = yield* makeTurnHarness(`t3-checkpoint-aba-${kind.replace(" ", "-")}-`);
+      yield* h.writeBoth("file.txt", "initial\n");
+      yield* h.gitBoth(["add", "."]);
+      yield* h.commitBoth("initial");
+      yield* h.turn(1);
+      yield* h.writeBoth("file.txt", "edit\n");
+      yield* h.gitBoth(["add", "file.txt"]);
+      yield* h.commitBoth("edit");
+      yield* h.turn(2);
+      // Packed objects force the git log fallback for a driver that has not read these commits.
+      yield* h.gitBoth(["gc", "-q", "--prune=now"]);
+      const cwd = h.repos.warm;
+      const [first, second] = yield* Effect.all(
+        [1, 2].map((ordinal) =>
+          h
+            .gitIn(cwd, ["rev-parse", `${turnRef(ordinal)}^{commit}`])
+            .pipe(Effect.map((result) => result.stdout.trim())),
+        ),
+      );
+      const later = yield* makeHookedDriver();
+      for (const ref of [turnRef(1), turnRef(2), turnRef(1), turnRef(2)]) {
+        yield* later.driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef: ref });
+      }
+      const grafts = path.join(cwd, ".git", "info", "grafts");
+      const shallow = path.join(cwd, ".git", "shallow");
+      switch (kind) {
+        case "graft":
+          later.hooks.before = () => NodeFS.writeFileSync(grafts, `${second}\n`);
+          later.hooks.after = () => NodeFS.rmSync(grafts);
+          break;
+        case "shallow":
+          later.hooks.before = () => NodeFS.writeFileSync(shallow, `${second}\n`);
+          later.hooks.after = () => NodeFS.rmSync(shallow);
+          break;
+        case "loose replace": {
+          const replace = path.join(cwd, ".git", "refs", "replace", second);
+          later.hooks.before = () => {
+            NodeFS.mkdirSync(path.dirname(replace), { recursive: true });
+            NodeFS.writeFileSync(replace, `${first}\n`);
+          };
+          later.hooks.after = () => NodeFS.rmSync(replace);
+          break;
+        }
+      }
+      const refs = { cwd, fromCheckpointRef: turnRef(1), toCheckpointRef: turnRef(2) };
+      const sorted = (paths: ReadonlySet<string> | null) =>
+        paths === null ? null : [...paths].sort();
+      assert.isNull(sorted(yield* later.driver.checkpoints.listAuthoredPaths(refs)));
+      const cold = yield* GitVcsDriver.makeVcsDriverShape();
+      assert.deepStrictEqual(
+        sorted(yield* later.driver.checkpoints.listAuthoredPaths(refs)),
+        sorted(yield* cold.checkpoints.listAuthoredPaths(refs)),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerGitCaptureContract)),
+);
+
+it("leaves a packed-refs file that outgrew its stat to git", () => {
+  const head = "399eaf5fa16d1e49764d639c52fbbce85b2ab3cf";
+  const content = `# pack-refs with: peeled fully-peeled sorted \n${head} refs/t3/x/one\n${head} refs/t3/x/two\n`;
+  assert.deepStrictEqual(parsePackedRefs(content, "refs/t3/", 10, content.length).refs?.size, 2);
+  assert.deepStrictEqual(parsePackedRefs(content, "refs/t3/", 10, content.length - 1), {
+    refs: null,
+    replaceRefs: null,
+  });
+});

@@ -2,6 +2,22 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.6-perf.3 (2026-11-04)
+
+Admission gate, encode-once fan-out and fewer git commands per turn
+
+Upstream base: 12ec17ce4c64.
+
+- Server: an admission gate on event-loop delay, on by default.
+- Events: each live update is encoded once for all subscribers; the live stream's hub owns resynchronisation.
+- Memory: a scratch store for compaction; a larger V8 young generation by default, also for the packaged executable.
+- Database: a new reader protocol between the server and its reader workers.
+- Git: fewer git commands per turn; every command, not only git, goes through the spawner process.
+- Checkpoints: a run records its workspace directory, and checkpoint scopes are per workspace.
+- Background task interrupts settle cleanly.
+- Fixes that came with the upstream merge: the Claude Agent SDK update and the spawner's refusal of a root working directory.
+- Bench parameters in tools/server-bench set to chosen defaults.
+
 ## v0.1.6-perf.2 (2026-11-03)
 
 Reader scheduling, a git spawner process and a shell delta hub

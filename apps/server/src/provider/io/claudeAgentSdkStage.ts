@@ -194,17 +194,10 @@ const makeCallbackRelay = (signal: Signal, read: () => number) => {
     if (callback === undefined) return;
     pending.delete(request.id);
     if (request.type === "callbackError") {
-      // The SDK writes an Error's message as its error field, so this one writes main's, or fails to.
-      const { json } = request;
+      // The SDK writes an Error's message as its error field, so this one writes main's.
+      const field = (JSON.parse(request.json) as { readonly error?: unknown }).error;
       const error = new Error();
-      Object.defineProperty(error, "message", {
-        value: {
-          toJSON: () => {
-            if (json === undefined) throw new TypeError("The callback's error cannot be written.");
-            return (JSON.parse(json) as { readonly error?: unknown }).error;
-          },
-        },
-      });
+      Object.defineProperty(error, "message", { value: { toJSON: () => field } });
       callback.reject(error);
       return;
     }

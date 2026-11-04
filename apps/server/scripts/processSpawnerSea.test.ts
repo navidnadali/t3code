@@ -80,6 +80,24 @@ describe("process spawner single executable", () => {
         expect(node.stdout).toBe("ran");
         // The server's own entry, t3 __process-spawner, measured about 4x the node -e spawner.
         expect(built.rssKiB).toBeLessThan(node.rssKiB * 1.5);
+        // As a handed-off command's shim: told on descriptor 3 what to become, it becomes that.
+        const became = yield* Effect.callback<string>((resume) => {
+          const shim = NodeChildProcess.spawn(executable, [SpawnerSources.EXEC_AFTER_GO], {
+            stdio: ["ignore", "pipe", "inherit", "pipe"],
+            env: {},
+          });
+          let output = "";
+          shim.stdout!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+          shim.once("close", () => resume(Effect.succeed(output)));
+          (shim.stdio[3] as NodeJS.WritableStream).end(
+            JSON.stringify({
+              file: process.execPath,
+              argv: [process.execPath, "-e", "process.stdout.write(process.env.T3_EXACT)"],
+              env: { T3_EXACT: "its own environment" },
+            }),
+          );
+        });
+        expect(became).toBe("its own environment");
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

@@ -6,6 +6,9 @@ import serverPackage from "../../package.json" with { type: "json" };
 /** The spawner executable a single-executable build ships beside `t3`. */
 export const PROCESS_SPAWNER_EXECUTABLE = "t3-process-spawner";
 
+/** The spawner executable's argument that makes it a handed-off command's shim. */
+export const EXEC_AFTER_GO = "__exec-after-go";
+
 // Inline sources also run in bundles and single-executable builds without module files.
 const spawnProtocolSource = `
 const streamNames = ["stdout", "stderr"];
@@ -59,7 +62,14 @@ const onMessage = (message) => {
   const entry = children.get(message.id);
   switch (message.t) {
     case "spawn":
-      start(message);
+      if (message.handoff !== undefined) startHandoff(message);
+      else start(message);
+      return;
+    case "handoff-cancel":
+      cancelHandoff(message.id);
+      return;
+    case "handoff-go":
+      releaseHandoff(message.id);
       return;
     case "stdin":
       if (entry === undefined) return post({ t: "stdin-done", id: message.id, seq: message.seq, error: destroyedStdin });
@@ -105,9 +115,227 @@ const { spawn } = require("node:child_process");
 const windowBytes = workerData.windowBytes;
 const post = (message, transfer) => parentPort.postMessage(message, transfer);
 const started = () => {};
+const startHandoff = (message) =>
+  post({ t: "handoff-failed", id: message.id, error: { name: "Error", message: "A worker thread hands off no descriptors" } });
+const cancelHandoff = () => {};
+const releaseHandoff = () => {};
 ${spawnProtocolSource}
 parentPort.on("message", onMessage);
 `;
+
+// Hand-off: the child's stdio are the ends of ordinary pipes that this process passes to the server
+// over its channel, keeping no copy, so its output never passes through here and no path or name
+// leads to them. The child starts as a waiting shim (`execAfterGoBody`) that has written nothing
+// when the server holds them all; it is then told, on descriptor 3, what to become.
+const handoffSource = `
+const handoffs = new Map();
+// Starts beyond the server's bound wait here, before their shim exists: a burst costs that many
+// shims at once, whatever its size. A slot frees when its shim becomes the command or its start ends.
+const waitingHandoffs = [];
+let startingHandoffs = 0;
+const nextHandoff = () => {
+  while (waitingHandoffs.length > 0 && startingHandoffs < waitingHandoffs[0].handoff.limit) {
+    launchHandoff(waitingHandoffs.shift());
+  }
+};
+const processStartTime = (pid) => {
+  try {
+    const stat = require("node:fs").readFileSync("/proc/" + pid + "/stat", "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+};
+// The file execvp would run for Node's spawn, or the code it would fail with.
+const resolveExecutable = (command, env, cwd) => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const check = (file) => {
+    try {
+      if (!fs.statSync(file).isFile()) return { problem: "EACCES" };
+      fs.accessSync(file, fs.constants.X_OK);
+      return { file };
+    } catch (error) {
+      return { problem: error && error.code === "EACCES" ? "EACCES" : "ENOENT" };
+    }
+  };
+  const base = cwd ?? process.cwd();
+  if (command.includes("/")) return check(path.resolve(base, command));
+  let problem = "ENOENT";
+  for (const directory of (env.PATH ?? "/usr/bin:/bin").split(":")) {
+    const found = check(path.resolve(base, directory || ".", command));
+    if (found.file !== undefined) return found;
+    if (found.problem === "EACCES") problem = "EACCES";
+  }
+  return { problem };
+};
+// An error about the command, not the shim that starts it: as Node's spawn reports it.
+const commandError = (error, command, args) => {
+  const code = error && error.code;
+  const failure = new Error("spawn " + command + (code ? " " + code : ""));
+  if (code !== undefined) failure.code = code;
+  if (error && error.errno !== undefined) failure.errno = error.errno;
+  failure.syscall = "spawn " + command;
+  failure.path = command;
+  failure.spawnargs = [...args];
+  return failure;
+};
+const cancelHandoff = (id) => {
+  const waiting = waitingHandoffs.findIndex((message) => message.id === id);
+  if (waiting !== -1) {
+    waitingHandoffs.splice(waiting, 1);
+    post({ t: "close", id });
+    return;
+  }
+  const handoff = handoffs.get(id);
+  if (handoff === undefined) return;
+  handoffs.delete(id);
+  handoff.cancel();
+};
+const startHandoff = (message) => {
+  if (startingHandoffs >= message.handoff.limit) {
+    waitingHandoffs.push(message);
+    post({ t: "handoff-queued", id: message.id });
+    return;
+  }
+  launchHandoff(message);
+};
+const launchHandoff = (message) => {
+  const id = message.id;
+  const { fds, shim } = message.handoff;
+  const options = message.options;
+  const env = options.env ?? process.env;
+  const resolved = resolveExecutable(message.command, env, options.cwd);
+  if (resolved.file === undefined) {
+    const errno = resolved.problem === "EACCES" ? -13 : -2;
+    post({ t: "error", id, error: errorFields(commandError({ code: resolved.problem, errno }, message.command, message.args)) });
+    post({ t: "close", id });
+    return;
+  }
+  const stdio = [...options.stdio];
+  for (const fd of fds) stdio[fd] = "pipe";
+  stdio[3] = "pipe";
+  startingHandoffs += 1;
+  let holdsSlot = true;
+  const freeSlot = () => {
+    if (!holdsSlot) return;
+    holdsSlot = false;
+    startingHandoffs -= 1;
+    nextHandoff();
+  };
+  let child;
+  try {
+    // Nothing of the command's environment (NODE_OPTIONS included) applies to it; Electron's
+    // executable, which runs the desktop's server, acts as Node only with ELECTRON_RUN_AS_NODE.
+    child = spawn(shim.command, shim.args, { cwd: options.cwd, detached: options.detached, env: { ELECTRON_RUN_AS_NODE: "1" }, stdio, windowsHide: true });
+  } catch (error) {
+    post({ t: "throw", id, error: errorFields(commandError(error, message.command, message.args)) });
+    freeSlot();
+    return;
+  }
+  const go = child.stdio[3];
+  go.on("error", () => {});
+  // The shim closes it just before it becomes the command: its slot is free from then.
+  go.on("close", () => freeSlot());
+  let cancelled = false;
+  const cancel = () => {
+    cancelled = true;
+    // Never released: the shim reads end of input and exits without running the command.
+    go.destroy();
+    for (const fd of fds) child.stdio[fd].destroy();
+    freeSlot();
+  };
+  children.set(id, { child, detached: options.detached === true, handoff: true });
+  // Read before this process can reap the child, so the PID still names it.
+  const startTime = child.pid === undefined ? undefined : processStartTime(child.pid);
+  if (child.pid !== undefined) started(id, child.pid, startTime);
+  handoffs.set(id, {
+    cancel,
+    // The server holds every end: the command may run, and nothing it writes comes here.
+    release: () => {
+      handoffs.delete(id);
+      const argv = [options.argv0 ?? message.command, ...message.args];
+      go.end(JSON.stringify({ file: resolved.file, argv, env }));
+      post({ t: "spawn", id, pid: child.pid, startTime });
+    },
+  });
+  child.on("spawn", () => {
+    if (cancelled) return;
+    for (const fd of fds) {
+      const stream = child.stdio[fd];
+      process.send({ t: "handoff-fd", id, fd }, stream, { keepOpen: false }, (error) => {
+        // Its descriptor now travels on its own; the wrapper closes, so the child can close too.
+        stream.destroy();
+        if (error === null || error === undefined || cancelled) return;
+        handoffs.delete(id);
+        cancel();
+        post({ t: "handoff-failed", id, error: errorFields(error) });
+      });
+    }
+  });
+  child.on("error", (error) => {
+    handoffs.delete(id);
+    post({ t: "error", id, error: errorFields(commandError(error, message.command, message.args)) });
+    freeSlot();
+  });
+  child.on("exit", (code, signal) => {
+    freeSlot();
+    post({ t: "exit", id, code, signal });
+  });
+  child.on("close", () => {
+    children.delete(id);
+    post({ t: "close", id });
+  });
+};
+const releaseHandoff = (id) => handoffs.get(id)?.release();
+`;
+
+// A handed-off command's shim: once the server holds its stdio it becomes the command (execve: same
+// PID and group). File, argv and environment arrive on descriptor 3, never on any argv; its own
+// environment is empty. SIGPIPE and SIGXFSZ, which Node ignores and an exec would keep ignored, are
+// caught instead, so the command starts with them at their defaults, as after Node's spawn.
+const execAfterGoBody = `
+const fs = require("node:fs");
+const request = [];
+const buffer = Buffer.alloc(65536);
+for (;;) {
+  let count;
+  try {
+    count = fs.readSync(3, buffer, 0, buffer.length, null);
+  } catch (error) {
+    if (error && error.code === "EAGAIN") {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      continue;
+    }
+    process.exit(125);
+  }
+  if (count === 0) break;
+  request.push(Buffer.from(buffer.subarray(0, count)));
+}
+fs.closeSync(3);
+// Never released: the start was cancelled or the spawner went away, and the command never runs.
+if (request.length === 0) process.exit(125);
+const { file, argv, env } = JSON.parse(Buffer.concat(request).toString("utf8"));
+for (const signal of ["SIGPIPE", "SIGXFSZ"]) process.on(signal, () => {});
+try {
+  try {
+    process.execve(file, argv, env);
+  } catch (error) {
+    // As execvp does for a script without a #! line.
+    if (!error || error.code !== "ENOEXEC") throw error;
+    process.execve("/bin/sh", ["/bin/sh", file, ...argv.slice(1)], env);
+  }
+} catch (error) {
+  try {
+    fs.writeSync(2, "t3: cannot run " + file + ": " + (error && error.message) + "\\n");
+  } catch {}
+  process.exit(error && error.code === "ENOENT" ? 127 : 126);
+}
+`;
+
+/** The shim as a script for `node -e` (the spawner's own Node runs it outside single executables). */
+export const execAfterGoSource = `"use strict";
+${execAfterGoBody}`;
 
 const spawnerProcessBody = `
 const { spawn } = require("node:child_process");
@@ -116,18 +344,23 @@ const windowBytes = Number(process.argv[process.argv.length - 1]);
 const post = (message) => {
   if (process.connected) process.send(message, () => {});
 };
-// Written at once, before any reply, so the server can kill this child even if the spawner dies.
-const started = (id, pid) => {
+// Written at once, before any reply, so the server can kill this child even if the spawner dies;
+// a handed-off child's start time comes with it, its identity once its PID can name another.
+const started = (id, pid, startTime) => {
   try {
-    require("node:fs").writeSync(1, id + " " + pid + "\\n");
+    require("node:fs").writeSync(1, id + " " + pid + (startTime === undefined ? "" : " " + startTime) + "\\n");
   } catch {}
 };
 ${spawnProtocolSource}
+${handoffSource}
 process.title = "t3-process-spawner";
 process.on("message", onMessage);
 post({ t: "ready", protocol: handshake.protocol, build: handshake.build });
-const killChildren = () => {
-  for (const { child, detached } of children.values()) {
+// A child whose descriptors the server holds talks to the server, not to the spawner: only the
+// server's exit (the channel closing) ends it here.
+const killChildren = (handedOff) => {
+  for (const { child, detached, handoff } of children.values()) {
+    if (handoff && !handedOff) continue;
     try {
       if (detached && child.pid > 1) process.kill(-child.pid, "SIGKILL");
       else child.kill("SIGKILL");
@@ -136,17 +369,17 @@ const killChildren = () => {
 };
 // Launched detached, the spawner leads its own process group (never the server's): ending that group
 // also ends what children spawned with detached: false left behind, and the spawner with them.
-const exitWithGroup = (code, reason) => {
+const exitWithGroup = (code, reason, handedOff = false) => {
   try {
     require("node:fs").writeSync(1, "exit " + reason.replace(/\\s+/g, " ") + "\\n");
   } catch {}
-  killChildren();
+  killChildren(handedOff);
   try {
     if (process.pid > 1) process.kill(-process.pid, "SIGKILL");
   } catch {}
   process.exit(code);
 };
-process.on("disconnect", () => exitWithGroup(0, "its channel closed"));
+process.on("disconnect", () => exitWithGroup(0, "its channel closed", true));
 process.on("uncaughtException", (error) => {
   try {
     require("node:fs").writeSync(2, "t3-process-spawner: " + (error && error.stack ? error.stack : String(error)) + "\\n");
@@ -160,7 +393,11 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
 
 /** What a spawner process says first: the server kills one that says anything else. */
 export const spawnerHandshake = {
-  protocol: NodeCrypto.createHash("sha256").update(spawnerProcessBody).digest("hex").slice(0, 16),
+  protocol: NodeCrypto.createHash("sha256")
+    .update(spawnerProcessBody)
+    .update(execAfterGoBody)
+    .digest("hex")
+    .slice(0, 16),
   build: serverPackage.version,
 };
 
@@ -172,7 +409,11 @@ export const spawnerHandshake = {
  */
 export const spawnerProcessSource = `"use strict";
 const handshake = { protocol: "${spawnerHandshake.protocol}", build: "${spawnerHandshake.build}" };
-${spawnerProcessBody}`;
+if (process.argv.includes("${EXEC_AFTER_GO}")) {
+${execAfterGoBody}
+} else {
+${spawnerProcessBody}
+}`;
 
 /** Entry of `t3 __process-spawner <windowBytes>`: single executables cannot evaluate `-e`. */
 export const runProcessSpawner = () => {

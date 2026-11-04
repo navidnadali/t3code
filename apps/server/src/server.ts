@@ -11,6 +11,7 @@ import * as DelegatedTaskQuestionReactor from "./orchestration-v2/DelegatedTaskQ
 import * as NodeHttp from "node:http";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentHttpApi, type RepositoryIdentity } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -53,12 +54,11 @@ import * as ResetCreditCoordinator from "./provider/resetCreditCoordinator.ts";
 import * as EventNdjsonLogger from "./provider/EventNdjsonLogger.ts";
 import * as ProviderIoOffloads from "./provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "./provider/io/ProviderIoWorkerPool.ts";
+import { layerOpenCodeRuntime } from "./provider/openCodeRuntimeLayer.ts";
 import { layerClaudeAgentSdkWorkerPool } from "./orchestration-v2/Adapters/ClaudeAgentSdkWorkerQuery.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderIoStageTiming from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
-import * as OpenCodeRuntime from "@t3tools/provider-opencode/server/OpenCodeRuntime";
-import * as OpenCodeServerLedger from "@t3tools/provider-opencode/server/OpenCodeServerLedger";
 import * as ProviderHostLive from "./provider/ProviderHostLive.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
@@ -91,6 +91,7 @@ import * as DesktopBrowserChannel from "./preview/DesktopBrowserChannel.ts";
 import * as ServerBrowserStream from "./preview/ServerBrowserStream.ts";
 import * as PreviewBrowser from "./preview/PreviewBrowser.ts";
 import * as ProcessRunner from "./processRunner.ts";
+import * as WorkerChildProcessSpawner from "./process/workerChildProcessSpawner.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -133,6 +134,7 @@ import * as SourceControlRepositoryService from "./sourceControl/SourceControlRe
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as Observability from "./observability/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
+import { nodeRuntimeFlags } from "./youngGeneration.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
@@ -376,7 +378,9 @@ const layerHttpServer = Layer.unwrap(
   }),
 ).pipe(Layer.provide(ManagedPolicy.layer));
 
-const layerPlatformServices = DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer));
+const layerPlatformServices = DocumentText.layer.pipe(
+  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+);
 
 const layerPersistence = Layer.empty.pipe(Layer.provideMerge(SqlitePersistence.layerConfig));
 
@@ -710,18 +714,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
       McpProviderSessions.layer,
     ),
   ),
-  Layer.provideMerge(
-    OpenCodeRuntime.layer.pipe(
-      Layer.provide(
-        Layer.unwrap(
-          Effect.gen(function* () {
-            const config = yield* ServerConfig.ServerConfig;
-            return OpenCodeServerLedger.layer({ stateDir: config.stateDir });
-          }),
-        ),
-      ),
-    ),
-  ),
+  Layer.provideMerge(layerOpenCodeRuntime),
   Layer.provideMerge(layerWorkspace),
   Layer.provideMerge(ProjectEnrichmentService.layer),
   Layer.provideMerge(Layer.mergeAll(NativeAppIconResolver.layer, layerProjectFaviconResolver)),
@@ -846,6 +839,17 @@ const layerMakeServer = Layer.unwrap(
         yield* HttpServer.HttpServer;
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
         yield* startup.markHttpListening;
+        const runtimeFlags = nodeRuntimeFlags();
+        // A server that wanted the young-generation cap and lost it to something changeable (a
+        // preload, an old launcher, a failed relaunch) says so where it is seen, as does a packaged
+        // executable whose built-in cap the environment tried to change; a start that rules a
+        // relaunch out by its shape (IPC, bootstrap descriptor, inspector) is not for the user to fix.
+        yield* (runtimeFlags.youngGenerationLost === true &&
+          runtimeFlags.structuralKeep !== true) ||
+        runtimeFlags.launcherPredatesDefault === true ||
+        runtimeFlags.capSettingIneffective === true
+          ? Effect.logWarning("server.v8", runtimeFlags)
+          : Effect.logInfo("server.v8", runtimeFlags);
       }),
     );
     const layerRuntimeState = Layer.effectDiscard(
@@ -1203,6 +1207,14 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerPlatformServices),
     );
   }),
-).pipe(Layer.provide(ProcessRunner.layer));
+).pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      WorkerChildProcessSpawner.layerProcessRunner,
+      WorkerChildProcessSpawner.layerCommandSpawner,
+      WorkerChildProcessSpawner.layerProviderLauncher,
+    ),
+  ),
+);
 
 export const runServer = Layer.launch(layerMakeServer);

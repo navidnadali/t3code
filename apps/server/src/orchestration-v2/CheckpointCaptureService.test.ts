@@ -1,4 +1,5 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointId,
@@ -268,6 +269,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
         const layerCapture = CheckpointCaptureService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              NodeServices.layer,
               IdAllocator.layer,
               refLookupFails
                 ? CheckpointService.layer.pipe(
@@ -275,6 +277,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
                       Layer.mergeAll(
                         IdAllocator.layer,
                         NodeCrypto.layer,
+                        NodeServices.layer,
                         Layer.mock(CheckpointStore.CheckpointStore)({
                           listAuthoredPaths: () => Effect.succeed(null),
                           isGitRepository: () => Effect.succeed(true),
@@ -447,6 +450,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               materializeBaselineCheckpoint: () => Effect.die("a discarded run has no baseline"),
@@ -551,6 +555,8 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
             completedAt: stoppedAt,
             checkpointId: null,
             contextHandoffId: null,
+            // The workspace it ran in; the next run's scope names another.
+            workspaceCwd: "/repo",
           },
         });
         yield* projectionStore.apply({
@@ -624,27 +630,31 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
             kind: "root_run",
             ordinalWithinParent: 0,
             advancesAppRunCount: true,
-            cwd: "/repo",
+            cwd: "/repo-next",
             createdAt: rescopedAt,
           },
         });
 
         const committed = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
+        const workspaces = new Set<string>();
+        const inWorkspace = (cwd: string) => Effect.sync(() => workspaces.add(cwd));
         const layerCapture = CheckpointCaptureService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              NodeServices.layer,
               IdAllocator.layer,
               CheckpointService.layer.pipe(
                 Layer.provide(
                   Layer.mergeAll(
                     IdAllocator.layer,
                     NodeCrypto.layer,
+                    NodeServices.layer,
                     Layer.mock(CheckpointStore.CheckpointStore)({
-                      isGitRepository: () => Effect.succeed(true),
-                      hasCheckpointRef: () => Effect.succeed(true),
-                      captureCheckpoint: () => Effect.void,
-                      diffCheckpoints: () => Effect.succeed(""),
-                      listAuthoredPaths: () => Effect.succeed(null),
+                      isGitRepository: (cwd) => inWorkspace(cwd).pipe(Effect.as(true)),
+                      hasCheckpointRef: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as(true)),
+                      captureCheckpoint: ({ cwd }) => inWorkspace(cwd).pipe(Effect.asVoid),
+                      diffCheckpoints: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as("")),
+                      listAuthoredPaths: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as(null)),
                     }),
                   ),
                 ),
@@ -672,6 +682,8 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
           assert.equal(baseline.payload.nodeId, lateRootNodeId);
           assert.deepEqual(baseline.payload.capturedAt, requestedAt);
         }
+        // Its checkpoint and baselines are taken in its own workspace, not the thread's latest.
+        assert.deepEqual([...workspaces], ["/repo"]);
       }),
   );
 
@@ -869,6 +881,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               materializeBaselineCheckpoint: () =>
@@ -1061,12 +1074,14 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             CheckpointService.layer.pipe(
               Layer.provide(
                 Layer.mergeAll(
                   IdAllocator.layer,
                   NodeCrypto.layer,
+                  NodeServices.layer,
                   Layer.mock(CheckpointStore.CheckpointStore)({
                     isGitRepository: gitUnavailable,
                     captureCheckpoint: gitUnavailable,

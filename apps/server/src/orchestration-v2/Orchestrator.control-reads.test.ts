@@ -26,6 +26,7 @@ import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import {
   orchestrationCommandDuration,
   orchestrationCommandsTotal,
@@ -1040,6 +1041,81 @@ it.effect("keeps delegated child pull-request links independent of the parent", 
     const parentAfterChildLink = yield* projections.getThreadProjection(parentThreadId);
     assert.deepEqual(parentAfterChildLink.thread.linkedPullRequest, parentPullRequest);
     assert.deepEqual(parentAfterChildLink.thread.pullRequests, parent.thread.pullRequests);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+// A thread created in a command has no stored records: its first scope comes from the command's
+// pending events, which the scope choice reads, not from a store read the thread is missing from.
+it.effect("chooses a delegated child's first scope from its own command's pending events", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const parentThreadId = ThreadId.make("thread:parent-scope");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-parent-scope"),
+      threadId: parentThreadId,
+      projectId: ProjectId.make("project:parent-scope"),
+      title: "Parent delegating in its worktree",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: "feature/parent-scope",
+      worktreePath: "/repo-worktree-scope",
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("start-parent-scope"),
+      threadId: parentThreadId,
+      messageId: MessageId.make("message:parent-scope"),
+      text: "Delegate a review",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const parentRun = (yield* projections.getThreadProjection(parentThreadId)).runs[0]!;
+    const scopeReads: Array<ReadonlyArray<unknown>> = [];
+    const observe: Statement.Transformer = (statement) => {
+      const [query, params] = statement.compile();
+      if (/FROM orchestration_v2_projection_checkpoint_scopes/.test(query)) scopeReads.push(params);
+      return Effect.succeed(statement);
+    };
+    yield* orchestrator
+      .dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make("delegate-parent-scope"),
+        parentThreadId,
+        parentRunId: parentRun.id,
+        parentNodeId: parentRun.rootNodeId!,
+        task: "Review the changes",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+      })
+      .pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+
+    const childThreadId = (yield* projections.getThreadProjection(parentThreadId)).subagents[0]!
+      .childThreadId!;
+    const child = yield* projections.getThreadProjection(childThreadId);
+    assert.deepEqual(
+      child.checkpointScopes.map((scope) => [
+        scope.id.endsWith(":name:root"),
+        scope.ordinalWithinParent,
+        scope.cwd,
+      ]),
+      [[true, 0, "/repo-worktree-scope"]],
+    );
+    assert.equal(child.runs[0]?.workspaceCwd, "/repo-worktree-scope");
+    // Its scope list was never read from the store, where the child did not exist yet.
+    assert.deepEqual(
+      scopeReads.filter((params) => params.includes(childThreadId)),
+      [],
+    );
   }).pipe(Effect.provide(layerTest)),
 );
 

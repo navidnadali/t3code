@@ -101,9 +101,8 @@ export type ClaudeAgentSdkWorkerRequest =
   | { readonly type: "error"; readonly error: ClaudeAgentSdkProcessError }
   // The SDK's response field for the answer as JSON (`{"response":…}`), undefined for a null answer.
   | { readonly type: "callbackResult"; readonly id: number; readonly json: string | undefined }
-  // The SDK's error field for a callback that threw as JSON (`{"error":…}`), undefined when the SDK
-  // could not write it.
-  | { readonly type: "callbackError"; readonly id: number; readonly json: string | undefined };
+  // The SDK's error field for a callback that threw as JSON (`{"error":…}`).
+  | { readonly type: "callbackError"; readonly id: number; readonly json: string };
 
 export type ClaudeAgentSdkWorkerEvent =
   | {

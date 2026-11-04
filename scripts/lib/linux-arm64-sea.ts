@@ -9,6 +9,8 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
+import type { SeaBuildOptions } from "@t3tools/shared/youngGenerationEnv";
+
 class LinuxArm64SeaError extends Schema.TaggedError<LinuxArm64SeaError>()("LinuxArm64SeaError", {
   message: Schema.String,
 }) {}
@@ -30,7 +32,28 @@ const run = Effect.fn("LinuxArm64Sea.run")(function* (args: Array<string>, verbo
 });
 
 // Builds the SEA blob with this Node and injects it into a copy of this Node with postject.
+/** The SEA config for a blob built with `--experimental-sea-config`; the caller decides what is baked. */
+export const linuxArm64SeaConfig = (input: {
+  readonly bundlePath: string;
+  readonly blobPath: string;
+  readonly mainFormat?: "module" | "commonjs";
+  readonly sea: Partial<SeaBuildOptions> & Pick<SeaBuildOptions, "execArgvExtension">;
+}) => ({
+  main: input.bundlePath,
+  output: input.blobPath,
+  mainFormat: input.mainFormat ?? "module",
+  disableExperimentalSEAWarning: true,
+  // Node SEA useCodeCache breaks import(), which the server needs.
+  useCodeCache: false,
+  ...(input.sea.execArgv === undefined || input.sea.execArgv.length === 0
+    ? {}
+    : { execArgv: [...input.sea.execArgv] }),
+  execArgvExtension: input.sea.execArgvExtension,
+});
+
 export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (input: {
+  /** What to bake and how options may extend it: the server's cap and cli mode, or nothing for the spawner. */
+  readonly sea: Partial<SeaBuildOptions> & Pick<SeaBuildOptions, "execArgvExtension">;
   bundlePath: string;
   outputPath: string;
   nodeVersion: string;
@@ -50,14 +73,14 @@ export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (
   const configPath = path.join(temp, "sea.json");
   yield* fs.writeFileString(
     configPath,
-    yield* encodeJson({
-      main: input.bundlePath,
-      output: blobPath,
-      mainFormat: input.mainFormat ?? "module",
-      disableExperimentalSEAWarning: true,
-      // Node SEA useCodeCache breaks import(), which the server needs.
-      useCodeCache: false,
-    }),
+    yield* encodeJson(
+      linuxArm64SeaConfig({
+        bundlePath: input.bundlePath,
+        blobPath,
+        ...(input.mainFormat === undefined ? {} : { mainFormat: input.mainFormat }),
+        sea: input.sea,
+      }),
+    ),
   );
   yield* run(["--experimental-sea-config", configPath], input.verbose);
   yield* fs.copyFile(process.execPath, input.outputPath);

@@ -302,6 +302,24 @@ function shellSubscriberThreadIds(
 }
 
 /**
+ * The snapshot a subscriber gets from a base holding every active shell (a resync's shared read),
+ * trimmed as `loadSubscriberShellSnapshot` trims, and the subagent ids its stream drops.
+ */
+export function trimSubscriberShellSnapshot(
+  base: OrchestrationV2ShellSnapshot,
+  options: ShellSubscriberOptions & { readonly now: DateTime.Utc },
+): {
+  readonly snapshot: OrchestrationV2ShellSnapshot;
+  readonly subagentThreadIds: Set<string>;
+} {
+  const facts = shellTrimFacts(base.threads);
+  return {
+    snapshot: trimShellSnapshot(base, facts, options),
+    subagentThreadIds: facts.subagentThreadIds,
+  };
+}
+
+/**
  * A subscriber's active shell snapshot, read like `loadShellSnapshotParts`. With an opt-in, the
  * store's index decides which shells to read, so threads the trims drop are never built.
  */
@@ -464,16 +482,19 @@ export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellAp
     : { sequence: stored.sequence, event: { threadId: stored.event.threadId } };
 }
 
+/** The aggregate a shell event refreshes; only its newest event matters to a shell subscriber. */
+function shellApplicationEventKey(stored: ShellApplicationEvent): string {
+  return "aggregateKind" in stored
+    ? `project:${stored.aggregateId}`
+    : `thread:${stored.event.threadId}`;
+}
+
 function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
   events: ReadonlyArray<A>,
 ): ReadonlyArray<A> {
   const latestByAggregate = new Map<string, A>();
   for (const stored of events) {
-    const key =
-      "aggregateKind" in stored
-        ? `project:${stored.aggregateId}`
-        : `thread:${stored.event.threadId}`;
-    latestByAggregate.set(key, stored);
+    latestByAggregate.set(shellApplicationEventKey(stored), stored);
   }
   return Array.from(latestByAggregate.values()).sort(
     (left, right) => left.sequence - right.sequence,
@@ -687,6 +708,10 @@ export function makeThreadShellVersions() {
 export function makeShellDeltaAdmission() {
   const lastSent = new Map<ThreadId, { readonly version: number; readonly sentAt: number }>();
   return {
+    /** The subscriber shows a fresh base now: what was sent before it means nothing. */
+    reset(): void {
+      lastSent.clear();
+    },
     admit({ item, version }: VersionedShellDelta, now: number): boolean {
       if (item.kind === "thread.removed") {
         lastSent.delete(item.threadId);

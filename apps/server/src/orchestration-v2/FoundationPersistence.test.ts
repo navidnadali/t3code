@@ -27,6 +27,7 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Arr from "effect/Array";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -35,6 +36,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
@@ -310,6 +312,7 @@ it.effect("paces scheduled compaction while preserving retention state and fixed
     yield* seedCompaction();
     const completed = yield* Deferred.make<void>();
     const pauseStarted = yield* Deferred.make<void>();
+    const pauseRegistered = yield* Queue.unbounded<void>();
     let activeNanos = 0n;
     let eventPages = 0;
     const pauses: number[] = [];
@@ -351,8 +354,13 @@ it.effect("paces scheduled compaction while preserving retention state and fixed
       yield* sql`INSERT INTO orchestration_command_receipts (
           command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, command_type
         ) VALUES ('after-start', 'thread', 'imported', '2026-10-17', 0, 'accepted', 'legacy')`;
-      yield* TestClock.adjust("10 seconds");
-      yield* Deferred.await(completed);
+      // The pass's working set answers from a worker thread, a real round trip between pauses: fire
+      // one pause at a time and wait for the next one (or completion) to be registered.
+      yield* Queue.take(pauseRegistered);
+      while (!(yield* Deferred.isDone(completed))) {
+        yield* TestClock.adjust("270 millis");
+        yield* Effect.raceFirst(Queue.take(pauseRegistered), Deferred.await(completed));
+      }
     }).pipe(
       Effect.provide(
         DatabaseStorage.layer.pipe(
@@ -369,6 +377,7 @@ it.effect("paces scheduled compaction while preserving retention state and fixed
           if (millis < 60_000) {
             pauses.push(millis);
             Deferred.doneUnsafe(pauseStarted, Effect.void);
+            Queue.offerUnsafe(pauseRegistered, undefined);
           } else if (millis === 6 * 60 * 60_000) {
             Deferred.doneUnsafe(completed, Effect.void);
           }
@@ -1051,6 +1060,123 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }),
   );
 
+  // A file restore of a checkpoint whose run recorded no workspace (recorded before runs kept one)
+  // reads every cwd its scope was created with: compaction must keep every scope creation, or a
+  // thread that ran in two worktrees would look like it ran in one and restore the other's files.
+  it.effect(
+    "keeps every checkpoint scope creation, which places a checkpoint recorded before workspaces",
+    () =>
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+        const sql = yield* SqlClient.SqlClient;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread:foundation-compact-scopes");
+        const thread = makeThread(threadId, now);
+        const scopeId = CheckpointScopeId.make("checkpoint-scope:foundation-compact-scopes:root");
+        const nodeId = NodeId.make("node:foundation-compact-scopes");
+        const checkpointId = CheckpointId.make("checkpoint:foundation-compact-scopes:0");
+        const scopeCreated = (suffix: string, cwd: string): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`event:foundation-compact-scopes:scope:${suffix}`),
+          type: "checkpoint-scope.created",
+          threadId,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: scopeId,
+            threadId,
+            runId: null,
+            nodeId,
+            parentScopeId: null,
+            providerThreadId: null,
+            kind: "root_run",
+            ordinalWithinParent: 0,
+            advancesAppRunCount: true,
+            cwd,
+            createdAt: now,
+          },
+        });
+        const nodeUpdated = (
+          suffix: string,
+          status: "running" | "completed",
+        ): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`event:foundation-compact-scopes:node:${suffix}`),
+          type: "node.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: nodeId,
+            threadId,
+            runId: null,
+            parentNodeId: null,
+            rootNodeId: nodeId,
+            kind: "assistant_message",
+            status,
+            countsForRun: false,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: now,
+            completedAt: status === "completed" ? now : null,
+          },
+        });
+        // Before the upgrade the one root scope was re-created in each run's workspace: A, B, then A.
+        yield* eventSink.write({
+          events: [
+            threadCreatedEvent({ id: "event:foundation-compact-scopes:thread", thread, now }),
+            scopeCreated("a", "/worktrees/a"),
+            nodeUpdated("1", "running"),
+            scopeCreated("b", "/worktrees/b"),
+            nodeUpdated("2", "running"),
+            scopeCreated("a-again", "/worktrees/a"),
+            nodeUpdated("3", "completed"),
+            {
+              id: EventId.make("event:foundation-compact-scopes:checkpoint"),
+              type: "checkpoint.captured",
+              threadId,
+              nodeId,
+              providerInstanceId,
+              occurredAt: now,
+              payload: {
+                id: checkpointId,
+                threadId,
+                scopeId,
+                runId: null,
+                nodeId,
+                parentCheckpointId: null,
+                ordinalWithinScope: 0,
+                appRunOrdinal: null,
+                ref: CheckpointRef.make("refs/t3/foundation-compact-scopes/0"),
+                status: "ready",
+                files: [],
+                capturedAt: now,
+              },
+            },
+          ],
+        });
+        const summary = yield* maintenance.compactEventStore();
+        // The pass did compact this thread (a node state between its first and last goes); every
+        // scope creation stays.
+        assert.isAtLeast(summary.deletedEventCount, 1);
+        const kept = yield* sql<{ readonly event_id: string }>`
+        SELECT event_id FROM orchestration_events
+        WHERE aggregate_kind = 'thread' AND stream_id = ${threadId}
+          AND event_type = 'checkpoint-scope.created'
+        ORDER BY sequence ASC`;
+        assert.deepEqual(
+          kept.map((row) => row.event_id),
+          ["a", "b", "a-again"].map((suffix) => `event:foundation-compact-scopes:scope:${suffix}`),
+        );
+        assert.sameMembers(
+          [...(yield* projections.getCheckpointWorkspaces(threadId, checkpointId))],
+          ["/worktrees/a", "/worktrees/b"],
+        );
+      }),
+  );
+
   it.effect("verifies and rebuilds projections with cross-thread subagent relations", () =>
     Effect.gen(function* () {
       const eventSink = yield* EventSink.EventSinkV2;
@@ -1371,9 +1497,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
         rows.push(eventRow(++ordinal, { commandId: exactPageCommandId }));
       }
       const inserted = yield* Effect.forEach(
-        Array.from({ length: Math.ceil(rows.length / 400) }, (_, chunk) =>
-          rows.slice(chunk * 400, (chunk + 1) * 400),
-        ),
+        Arr.chunksOf(rows, 400),
         (chunk) =>
           sql<{
             readonly sequence: number;
@@ -2922,6 +3046,8 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             runRecoveryOnce: Effect.succeed(false),
             runOnce: Effect.succeed(false),
             nextClaimableAt: Effect.succeedNone,
+            nextClaimableAtExcluding: () => Effect.succeedNone,
+            notifyWork: () => Effect.void,
             drain: () => Effect.succeed(0),
           }),
         ),
@@ -3139,6 +3265,8 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             runRecoveryOnce: Effect.succeed(false),
             runOnce: Effect.succeed(false),
             nextClaimableAt: Effect.succeedNone,
+            nextClaimableAtExcluding: () => Effect.succeedNone,
+            notifyWork: () => Effect.void,
             drain: () => Effect.succeed(0),
           }),
         ),

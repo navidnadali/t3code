@@ -104,6 +104,7 @@ it.effect.each(["initial", "waiting"])(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
             getThread,
             getCheckpointRollbackContext,
+            getCheckpointWorkspaces: () => Effect.succeed([projection.scope!.cwd]),
             getShellSnapshot: () =>
               Effect.succeed({
                 schemaVersion: 1,
@@ -216,6 +217,7 @@ it.effect.each([
       targetAttempt: undefined,
       rolledBackAttemptIds: [],
       staleCheckpoints: [],
+      otherRootScopes: [],
       rootNodes: [],
       providerTurns: [],
     } as unknown as ProjectionStore.ProjectionCheckpointRollbackContext;
@@ -268,6 +270,7 @@ it.effect.each([
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
             getThread: () => Effect.succeed(projection.thread),
             getCheckpointRollbackContext: () => Effect.succeed(projection),
+            getCheckpointWorkspaces: () => Effect.succeed([worktreePath]),
             getShellSnapshot: () =>
               Effect.succeed({
                 schemaVersion: 1,
@@ -346,298 +349,356 @@ it.effect.each([
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-const seedRollbackHistory = Effect.gen(function* () {
-  const store = yield* ProjectionStore.ProjectionStoreV2;
-  const now = yield* DateTime.now;
-  const threadId = ThreadId.make("rollback-history");
-  const providerThreadId = ProviderThreadId.make("rollback-history-provider");
-  const providerSessionId = ProviderSessionId.make("rollback-history-session");
-  const providerInstanceId = ProviderInstanceId.make("codex");
-  const driver = ProviderDriverKind.make("codex");
-  const modelSelection = { instanceId: providerInstanceId, model: "test" };
-  const scopeId = CheckpointScopeId.make("rollback-history-root");
-  const otherScopeId = CheckpointScopeId.make("rollback-history-child");
-  const runId = (ordinal: number) => RunId.make(`rollback-history-run-${ordinal}`);
-  const nodeId = (ordinal: number) => NodeId.make(`rollback-history-node-${ordinal}`);
-  const attemptId = (ordinal: number) => RunAttemptId.make(`rollback-history-attempt-${ordinal}`);
-  const turnId = (ordinal: number) => ProviderTurnId.make(`rollback-history-turn-${ordinal}`);
-  const checkpointId = (ordinal: number) =>
-    CheckpointId.make(`rollback-history-checkpoint-${ordinal}`);
-  type EventInput<Event = OrchestrationV2DomainEvent> = Event extends OrchestrationV2DomainEvent
-    ? Omit<Event, "id" | "occurredAt" | "threadId">
-    : never;
-  let sequence = 0;
-  const apply = (event: EventInput) =>
-    store.apply({
-      ...event,
-      id: EventId.make(`rollback-history-event-${sequence++}`),
-      threadId,
-      occurredAt: now,
-    } as OrchestrationV2DomainEvent);
-  yield* apply({
-    type: "thread.created",
-    payload: {
-      id: threadId,
-      createdBy: "user",
-      creationSource: "web",
-      projectId: ProjectId.make("rollback-history-project"),
-      title: "Rollback history",
+// With secondWorkspace, runs 5 and 6 ran in another workspace, which has its own root scope (and a
+// baseline taken at run 5's start).
+const seedRollbackHistory = (options: { readonly secondWorkspace?: string } = {}) =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("rollback-history");
+    const providerThreadId = ProviderThreadId.make("rollback-history-provider");
+    const providerSessionId = ProviderSessionId.make("rollback-history-session");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const driver = ProviderDriverKind.make("codex");
+    const modelSelection = { instanceId: providerInstanceId, model: "test" };
+    const scopeId = CheckpointScopeId.make("rollback-history-root");
+    const otherScopeId = CheckpointScopeId.make("rollback-history-child");
+    const workspaceScopeId = CheckpointScopeId.make("rollback-history-workspace-b");
+    const runId = (ordinal: number) => RunId.make(`rollback-history-run-${ordinal}`);
+    const nodeId = (ordinal: number) => NodeId.make(`rollback-history-node-${ordinal}`);
+    const attemptId = (ordinal: number) => RunAttemptId.make(`rollback-history-attempt-${ordinal}`);
+    const turnId = (ordinal: number) => ProviderTurnId.make(`rollback-history-turn-${ordinal}`);
+    const checkpointId = (ordinal: number) =>
+      CheckpointId.make(`rollback-history-checkpoint-${ordinal}`);
+    type EventInput<Event = OrchestrationV2DomainEvent> = Event extends OrchestrationV2DomainEvent
+      ? Omit<Event, "id" | "occurredAt" | "threadId">
+      : never;
+    let sequence = 0;
+    const apply = (event: EventInput) =>
+      store.apply({
+        ...event,
+        id: EventId.make(`rollback-history-event-${sequence++}`),
+        threadId,
+        occurredAt: now,
+      } as OrchestrationV2DomainEvent);
+    yield* apply({
+      type: "thread.created",
+      payload: {
+        id: threadId,
+        createdBy: "user",
+        creationSource: "web",
+        projectId: ProjectId.make("rollback-history-project"),
+        title: "Rollback history",
+        providerInstanceId,
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+        activeProviderThreadId: providerThreadId,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      },
+    });
+    const providerThread = {
+      id: providerThreadId,
+      driver,
       providerInstanceId,
-      modelSelection,
-      runtimeMode: "full-access",
-      interactionMode: "default",
-      branch: null,
-      worktreePath: process.cwd(),
-      activeProviderThreadId: providerThreadId,
-      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      providerSessionId,
+      appThreadId: threadId,
+      ownerNodeId: null,
+      nativeThreadRef: null,
+      nativeConversationHeadRef: null,
+      status: "idle" as const,
+      firstRunOrdinal: 1,
+      lastRunOrdinal: 6,
+      handoffIds: [],
       forkedFrom: null,
       createdAt: now,
       updatedAt: now,
-      archivedAt: null,
-      settledOverride: null,
-      settledAt: null,
-      lastVisitedAt: null,
-      deletedAt: null,
-    },
-  });
-  const providerThread = {
-    id: providerThreadId,
-    driver,
-    providerInstanceId,
-    providerSessionId,
-    appThreadId: threadId,
-    ownerNodeId: null,
-    nativeThreadRef: null,
-    nativeConversationHeadRef: null,
-    status: "idle" as const,
-    firstRunOrdinal: 1,
-    lastRunOrdinal: 6,
-    handoffIds: [],
-    forkedFrom: null,
-    createdAt: now,
-    updatedAt: now,
-  };
-  yield* apply({ type: "provider-thread.updated", payload: providerThread });
-  for (const id of [scopeId, otherScopeId]) {
-    yield* apply({
-      type: "checkpoint-scope.created",
-      payload: {
-        id,
-        threadId,
-        runId: runId(1),
-        nodeId: nodeId(1),
-        parentScopeId: id === scopeId ? null : scopeId,
-        providerThreadId,
-        kind: id === scopeId ? "root_run" : "subagent",
-        ordinalWithinParent: 0,
-        advancesAppRunCount: id === scopeId,
-        cwd: process.cwd(),
-        createdAt: now,
-      },
-    });
-  }
-  const statuses = [
-    "completed",
-    "completed",
-    "completed",
-    "interrupted",
-    "failed",
-    "cancelled",
-    "rolled_back",
-  ] as const;
-  for (const [index, status] of statuses.entries()) {
-    const ordinal = index + 1;
-    yield* apply({
-      type: "run.created",
-      payload: {
-        id: runId(ordinal),
-        threadId,
-        ordinal,
-        providerInstanceId,
-        modelSelection,
-        providerThreadId,
-        userMessageId: MessageId.make(`rollback-history-message-${ordinal}`),
-        rootNodeId: nodeId(ordinal),
-        activeAttemptId: attemptId(ordinal),
-        status,
-        requestedAt: now,
-        startedAt: now,
-        completedAt: now,
-        checkpointId: checkpointId(ordinal),
-        contextHandoffId: null,
-      },
-    });
-    yield* apply({
-      type: "node.updated",
-      payload: {
-        id: nodeId(ordinal),
-        threadId,
-        runId: runId(ordinal),
-        parentNodeId: null,
-        rootNodeId: nodeId(ordinal),
-        kind: "root_turn",
-        status,
-        countsForRun: true,
-        providerThreadId,
-        providerTurnId: turnId(ordinal),
-        nativeItemRef: null,
-        runtimeRequestId: null,
-        checkpointScopeId: scopeId,
-        startedAt: now,
-        completedAt: now,
-      },
-    });
-    // Rollback must exclude every attempt of discarded runs, including an inactive retry.
-    for (const attemptOrdinal of ordinal === 7 ? [6.5, 7] : [ordinal]) {
+    };
+    yield* apply({ type: "provider-thread.updated", payload: providerThread });
+    for (const id of [scopeId, otherScopeId]) {
       yield* apply({
-        type: "run-attempt.created",
-        runId: runId(ordinal),
+        type: "checkpoint-scope.created",
         payload: {
-          id: attemptId(attemptOrdinal),
-          runId: runId(ordinal),
-          attemptOrdinal: attemptOrdinal === ordinal ? 2 : 1,
-          rootNodeId: nodeId(ordinal),
-          providerInstanceId,
+          id,
+          threadId,
+          runId: runId(1),
+          nodeId: nodeId(1),
+          parentScopeId: id === scopeId ? null : scopeId,
           providerThreadId,
-          providerTurnId: turnId(attemptOrdinal),
-          reason: "initial",
-          status: "completed",
-          startedAt: now,
-          completedAt: now,
-        },
-      });
-      yield* apply({
-        type: "provider-turn.updated",
-        payload: {
-          id: turnId(attemptOrdinal),
-          providerThreadId,
-          nodeId: nodeId(ordinal),
-          runAttemptId: attemptId(attemptOrdinal),
-          nativeTurnRef: { driver, nativeId: `native-turn-${attemptOrdinal}`, strength: "strong" },
-          ordinal: attemptOrdinal * 2,
-          status: status === "rolled_back" ? "completed" : status,
-          startedAt: now,
-          completedAt: now,
+          kind: id === scopeId ? "root_run" : "subagent",
+          ordinalWithinParent: 0,
+          advancesAppRunCount: id === scopeId,
+          cwd: process.cwd(),
+          createdAt: now,
         },
       });
     }
-  }
-  // A continuation shares the target attempt; its first provider turn is no longer the boundary.
-  yield* apply({
-    type: "provider-turn.updated",
-    payload: {
-      id: turnId(2.5),
-      providerThreadId,
-      nodeId: nodeId(2),
-      runAttemptId: attemptId(2),
-      nativeTurnRef: { driver, nativeId: "native-turn-2-continuation", strength: "strong" },
-      ordinal: 5,
-      status: "completed",
-      startedAt: now,
-      completedAt: now,
-    },
-  });
-  for (let ordinal = 0; ordinal <= 8; ordinal++) {
+    if (options.secondWorkspace !== undefined) {
+      yield* apply({
+        type: "checkpoint-scope.created",
+        payload: {
+          id: workspaceScopeId,
+          threadId,
+          runId: runId(5),
+          nodeId: nodeId(5),
+          parentScopeId: null,
+          providerThreadId,
+          kind: "root_run",
+          ordinalWithinParent: 1,
+          advancesAppRunCount: true,
+          cwd: options.secondWorkspace,
+          createdAt: now,
+        },
+      });
+    }
+    const statuses = [
+      "completed",
+      "completed",
+      "completed",
+      "interrupted",
+      "failed",
+      "cancelled",
+      "rolled_back",
+    ] as const;
+    for (const [index, status] of statuses.entries()) {
+      const ordinal = index + 1;
+      yield* apply({
+        type: "run.created",
+        payload: {
+          id: runId(ordinal),
+          threadId,
+          ordinal,
+          providerInstanceId,
+          modelSelection,
+          providerThreadId,
+          userMessageId: MessageId.make(`rollback-history-message-${ordinal}`),
+          rootNodeId: nodeId(ordinal),
+          activeAttemptId: attemptId(ordinal),
+          status,
+          requestedAt: now,
+          startedAt: now,
+          completedAt: now,
+          checkpointId: checkpointId(ordinal),
+          contextHandoffId: null,
+        },
+      });
+      yield* apply({
+        type: "node.updated",
+        payload: {
+          id: nodeId(ordinal),
+          threadId,
+          runId: runId(ordinal),
+          parentNodeId: null,
+          rootNodeId: nodeId(ordinal),
+          kind: "root_turn",
+          status,
+          countsForRun: true,
+          providerThreadId,
+          providerTurnId: turnId(ordinal),
+          nativeItemRef: null,
+          runtimeRequestId: null,
+          checkpointScopeId: scopeId,
+          startedAt: now,
+          completedAt: now,
+        },
+      });
+      // Rollback must exclude every attempt of discarded runs, including an inactive retry.
+      for (const attemptOrdinal of ordinal === 7 ? [6.5, 7] : [ordinal]) {
+        yield* apply({
+          type: "run-attempt.created",
+          runId: runId(ordinal),
+          payload: {
+            id: attemptId(attemptOrdinal),
+            runId: runId(ordinal),
+            attemptOrdinal: attemptOrdinal === ordinal ? 2 : 1,
+            rootNodeId: nodeId(ordinal),
+            providerInstanceId,
+            providerThreadId,
+            providerTurnId: turnId(attemptOrdinal),
+            reason: "initial",
+            status: "completed",
+            startedAt: now,
+            completedAt: now,
+          },
+        });
+        yield* apply({
+          type: "provider-turn.updated",
+          payload: {
+            id: turnId(attemptOrdinal),
+            providerThreadId,
+            nodeId: nodeId(ordinal),
+            runAttemptId: attemptId(attemptOrdinal),
+            nativeTurnRef: {
+              driver,
+              nativeId: `native-turn-${attemptOrdinal}`,
+              strength: "strong",
+            },
+            ordinal: attemptOrdinal * 2,
+            status: status === "rolled_back" ? "completed" : status,
+            startedAt: now,
+            completedAt: now,
+          },
+        });
+      }
+    }
+    // A continuation shares the target attempt; its first provider turn is no longer the boundary.
     yield* apply({
-      type: "checkpoint.captured",
+      type: "provider-turn.updated",
       payload: {
-        id: checkpointId(ordinal),
-        threadId,
-        scopeId: ordinal === 8 ? otherScopeId : scopeId,
-        runId: ordinal === 0 ? null : runId(Math.min(ordinal, 7)),
-        nodeId: nodeId(Math.max(1, Math.min(ordinal, 7))),
-        parentCheckpointId: null,
-        ordinalWithinScope: ordinal,
-        appRunOrdinal: ordinal === 0 ? null : ordinal,
-        ref: CheckpointRef.make(`refs/t3/rollback-history/${ordinal}`),
-        status: ordinal === 7 ? "stale" : "ready",
-        files: [],
-        capturedAt: now,
+        id: turnId(2.5),
+        providerThreadId,
+        nodeId: nodeId(2),
+        runAttemptId: attemptId(2),
+        nativeTurnRef: { driver, nativeId: "native-turn-2-continuation", strength: "strong" },
+        ordinal: 5,
+        status: "completed",
+        startedAt: now,
+        completedAt: now,
       },
     });
-  }
-
-  const rollbackCounts: number[] = [];
-  const restored: CheckpointId[] = [];
-  const deletedRefs: CheckpointId[] = [];
-  const committed: OrchestrationV2DomainEvent[] = [];
-  const serviceLayer = layerCheckpointRollbackService.pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        ThreadCommandExecutor.layer,
-        IdAllocator.layer,
-        Layer.mock(CheckpointService.CheckpointServiceV2)({
-          restore: ({ checkpoint }) =>
-            Effect.sync(() => {
-              restored.push(checkpoint.id);
-            }),
-          deleteStaleRefs: ({ checkpoints }) =>
-            Effect.sync(() => {
-              deletedRefs.push(...checkpoints.map((checkpoint) => checkpoint.id));
-            }),
-        }),
-        Layer.mock(EventSink.EventSinkV2)({
-          write: ({ events }) =>
-            Effect.gen(function* () {
-              for (const event of events) yield* store.apply(event);
-              committed.push(...events);
-              return [];
-            }).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new EventSink.EventSinkWriteError({
-                    eventCount: events.length,
-                    cause,
-                  }),
-              ),
-            ),
-        }),
-        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
-          open: () =>
-            Effect.succeed({
-              rollbackThread: (input: ProviderAdapter.ProviderAdapterV2RollbackThreadInput) =>
-                Effect.gen(function* () {
-                  rollbackCounts.push(yield* resolveCodexRollbackTurnCount(input));
-                  return { providerThread: input.providerThread };
-                }),
-            } as never),
-        }),
-        Layer.mock(RuntimePolicy.RuntimePolicyV2)({ resolve: () => Effect.succeed({} as never) }),
-      ),
-    ),
-  );
-  const rollback = (ordinal: number) =>
-    Effect.gen(function* () {
-      const service = yield* CheckpointRollbackService.CheckpointRollbackServiceV2;
-      yield* service.execute({
-        threadId,
-        providerThreadId,
-        scopeId,
-        checkpointId: checkpointId(ordinal),
+    for (let ordinal = 0; ordinal <= 8; ordinal++) {
+      yield* apply({
+        type: "checkpoint.captured",
+        payload: {
+          id: checkpointId(ordinal),
+          threadId,
+          scopeId:
+            ordinal === 8
+              ? otherScopeId
+              : options.secondWorkspace !== undefined && (ordinal === 5 || ordinal === 6)
+                ? workspaceScopeId
+                : scopeId,
+          runId: ordinal === 0 ? null : runId(Math.min(ordinal, 7)),
+          nodeId: nodeId(Math.max(1, Math.min(ordinal, 7))),
+          parentCheckpointId: null,
+          ordinalWithinScope: ordinal,
+          appRunOrdinal: ordinal === 0 ? null : ordinal,
+          ref: CheckpointRef.make(`refs/t3/rollback-history/${ordinal}`),
+          status: ordinal === 7 ? "stale" : "ready",
+          files: [],
+          capturedAt: now,
+        },
       });
-    }).pipe(Effect.provide(serviceLayer));
+    }
 
-  return {
-    store,
-    now,
-    threadId,
-    runId,
-    nodeId,
-    checkpointId,
-    rollback,
-    rollbackCounts,
-    restored,
-    deletedRefs,
-    committed,
-  };
-});
+    if (options.secondWorkspace !== undefined) {
+      yield* apply({
+        type: "checkpoint.captured",
+        payload: {
+          id: CheckpointId.make("rollback-history-checkpoint-b-4"),
+          threadId,
+          scopeId: workspaceScopeId,
+          runId: null,
+          nodeId: nodeId(5),
+          parentCheckpointId: null,
+          ordinalWithinScope: 4,
+          appRunOrdinal: null,
+          ref: CheckpointRef.make("refs/t3/rollback-history/b-4"),
+          status: "ready",
+          files: [],
+          capturedAt: now,
+        },
+      });
+    }
+
+    const rollbackCounts: number[] = [];
+    const restored: CheckpointId[] = [];
+    const deletedRefs: CheckpointId[] = [];
+    const deletions: Array<{ readonly cwd: string; readonly ids: ReadonlyArray<CheckpointId> }> =
+      [];
+    const committed: OrchestrationV2DomainEvent[] = [];
+    const serviceLayer = layerCheckpointRollbackService.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ThreadCommandExecutor.layer,
+          IdAllocator.layer,
+          Layer.mock(CheckpointService.CheckpointServiceV2)({
+            restore: ({ checkpoint }) =>
+              Effect.sync(() => {
+                restored.push(checkpoint.id);
+              }),
+            deleteStaleRefs: ({ scope, checkpoints }) =>
+              Effect.sync(() => {
+                deletedRefs.push(...checkpoints.map((checkpoint) => checkpoint.id));
+                deletions.push({
+                  cwd: scope.cwd,
+                  ids: checkpoints.map((checkpoint) => checkpoint.id).toSorted(),
+                });
+              }),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            write: ({ events }) =>
+              Effect.gen(function* () {
+                for (const event of events) yield* store.apply(event);
+                committed.push(...events);
+                return [];
+              }).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new EventSink.EventSinkWriteError({
+                      eventCount: events.length,
+                      cause,
+                    }),
+                ),
+              ),
+          }),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+            open: () =>
+              Effect.succeed({
+                rollbackThread: (input: ProviderAdapter.ProviderAdapterV2RollbackThreadInput) =>
+                  Effect.gen(function* () {
+                    rollbackCounts.push(yield* resolveCodexRollbackTurnCount(input));
+                    return { providerThread: input.providerThread };
+                  }),
+              } as never),
+          }),
+          Layer.mock(RuntimePolicy.RuntimePolicyV2)({ resolve: () => Effect.succeed({} as never) }),
+        ),
+      ),
+    );
+    const rollback = (ordinal: number) =>
+      Effect.gen(function* () {
+        const service = yield* CheckpointRollbackService.CheckpointRollbackServiceV2;
+        yield* service.execute({
+          threadId,
+          providerThreadId,
+          scopeId,
+          checkpointId: checkpointId(ordinal),
+        });
+      }).pipe(Effect.provide(serviceLayer));
+
+    return {
+      store,
+      now,
+      threadId,
+      runId,
+      nodeId,
+      checkpointId,
+      rollback,
+      rollbackCounts,
+      restored,
+      deletedRefs,
+      deletions,
+      committed,
+    };
+  });
 
 it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
   "rollback history reads",
   (it) => {
     it.effect("rolls back later terminal runs despite obsolete unrelated SQLite payloads", () =>
       Effect.gen(function* () {
-        const history = yield* seedRollbackHistory;
+        const history = yield* seedRollbackHistory();
         const sql = yield* SqlClient.SqlClient;
         const { threadId, runId, nodeId, checkpointId } = history;
         yield* sql`
@@ -700,7 +761,7 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
       "rewinds stopped runs repeatedly without counting discarded provider turns again",
       () =>
         Effect.gen(function* () {
-          const history = yield* seedRollbackHistory;
+          const history = yield* seedRollbackHistory();
           yield* history.rollback(5);
           yield* history.rollback(2);
           yield* history.rollback(0);
@@ -728,6 +789,43 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
             [history.checkpointId(0), history.checkpointId(8)],
           );
         }),
+    );
+
+    // A workspace that no longer exists may share its repository (and refs) with one that does: its
+    // refs are dropped through the thread's other workspaces, and its checkpoints are still stale.
+    it.effect.each(["exists", "was removed"] as const)(
+      "marks stale the later checkpoints of every workspace scope and drops their refs (second workspace %s)",
+      (secondWorkspace) =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const directory = path.join(
+            yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-rollback-workspace-b-" }),
+            "worktree",
+          );
+          if (secondWorkspace === "exists") yield* fileSystem.makeDirectory(directory);
+          const history = yield* seedRollbackHistory({ secondWorkspace: directory });
+          const sql = yield* SqlClient.SqlClient;
+          const { checkpointId } = history;
+          const baselineB = CheckpointId.make("rollback-history-checkpoint-b-4");
+
+          yield* history.rollback(2);
+
+          assert.sameDeepMembers(history.deletions, [
+            { cwd: process.cwd(), ids: [3, 4].map(checkpointId).toSorted() },
+            {
+              cwd: secondWorkspace === "exists" ? directory : process.cwd(),
+              ids: [baselineB, ...[5, 6].map(checkpointId)].toSorted(),
+            },
+          ]);
+          const checkpoints = yield* sql<{ id: string; status: string }>`
+            SELECT checkpoint_id AS id, status FROM orchestration_v2_projection_checkpoints
+            WHERE thread_id = ${history.threadId}`;
+          assert.sameDeepMembers(
+            checkpoints.filter((checkpoint) => checkpoint.status === "stale").map(({ id }) => id),
+            [baselineB, ...[3, 4, 5, 6, 7].map(checkpointId)],
+          );
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
   },
 );

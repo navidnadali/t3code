@@ -3,6 +3,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -18,6 +19,7 @@ import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
+import * as Redacted from "effect/Redacted";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
@@ -27,6 +29,7 @@ import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import { spawnerProcessIds } from "./spawnerProcesses.ts";
 import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
 
 // Windows keeps the main-thread spawner, so the worker cases run elsewhere.
@@ -283,7 +286,56 @@ describe("WorkerChildProcessSpawner", () => {
           expect((yield* collect(remoteSpawner, commands[9]!)).stdout).toHaveLength(
             3 * 1024 * 1024,
           );
-        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+    );
+
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: gives the child Redacted arguments and environment values, like the Node spawner`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          const command = ChildProcess.make(
+            process.execPath,
+            [
+              "-e",
+              "process.stdout.write(JSON.stringify([process.argv[1], process.env.T3_REDACTED_ENV]))",
+              Redacted.make("secret-argument"),
+            ],
+            { env: { T3_REDACTED_ENV: Redacted.make("secret-env") }, extendEnv: true },
+          );
+          const expected = yield* collect(nodeSpawner, command);
+          expect(expected.stdout.toString()).toBe(
+            JSON.stringify(["secret-argument", "secret-env"]),
+          );
+          expect(yield* collect(remoteSpawner, command)).toEqual(expected);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+    );
+
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: keeps Redacted values out of spawn errors, like the Node spawner`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          for (const command of [
+            ChildProcess.make("t3-missing-executable-redacted", [Redacted.make("secret-missing")]),
+            ChildProcess.make(process.execPath, ["-e", "1", Redacted.make("secret\0nul")]),
+          ]) {
+            const expected = yield* spawnError(nodeSpawner, command);
+            expect(JSON.stringify(expected)).not.toContain("secret");
+            expect(yield* spawnError(remoteSpawner, command)).toEqual(expected);
+          }
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
     );
 
     it.live.skipIf(!workerPlatform)(
@@ -305,7 +357,10 @@ describe("WorkerChildProcessSpawner", () => {
           expect(yield* spawnError(remoteSpawner, missingCwd)).toEqual(
             yield* spawnError(nodeSpawner, missingCwd),
           );
-        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
     );
 
     it.live.skipIf(!workerPlatform)(
@@ -332,7 +387,10 @@ describe("WorkerChildProcessSpawner", () => {
             expect(result).toEqual(yield* killed(nodeSpawner, ignoreSigterm));
             expect(result.exit.causeMessage).toContain(ignoreSigterm ? "SIGKILL" : "SIGTERM");
           }
-        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
     );
   }
 
@@ -358,7 +416,7 @@ describe("WorkerChildProcessSpawner", () => {
       expect((yield* collect(windowsSpawner, onWindows)).stdout.toString()).toBe("windows");
       onMain.push(onWindows);
       expect(calls).toEqual(onMain);
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -398,7 +456,7 @@ describe("WorkerChildProcessSpawner", () => {
             expect(kill).not.toHaveBeenCalledWith(-handle.pid, 0);
           }).pipe(Effect.scoped, Effect.ensuring(Effect.sync(() => kill.mockRestore())));
         }
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -439,7 +497,7 @@ describe("WorkerChildProcessSpawner", () => {
             }),
           ),
         );
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -470,7 +528,7 @@ describe("WorkerChildProcessSpawner", () => {
         }).pipe(Effect.scoped, Effect.ensuring(Effect.sync(() => kill.mockRestore())));
         expect(ownGroupCalls).toEqual([]);
         expect(calls).toEqual([]);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live("runs the command on the fallback spawner when the worker cannot start", () =>
@@ -483,7 +541,7 @@ describe("WorkerChildProcessSpawner", () => {
       const command = node("process.stdout.write('fallback')");
       expect((yield* collect(workerSpawner, command)).stdout.toString()).toBe("fallback");
       expect(calls).toEqual([command]);
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -503,7 +561,7 @@ describe("WorkerChildProcessSpawner", () => {
         expect(calls).toHaveLength(0);
         expect((yield* collect(workerSpawner, command)).stdout.toString()).toBe("after");
         expect(calls).toEqual([command]);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -540,7 +598,7 @@ describe("WorkerChildProcessSpawner", () => {
           yield* handle.kill({ killSignal: "SIGKILL" });
           expect(yield* handle.exitCode).toBe(0);
         }).pipe(Effect.scoped);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -968,7 +1026,7 @@ describe("WorkerChildProcessSpawner", () => {
       });
       expect(yield* fs.exists(received)).toBe(false);
       expect(calls).toEqual([]);
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -1030,7 +1088,7 @@ describe("WorkerChildProcessSpawner", () => {
         // As a command's own timeout does.
         yield* Fiber.interrupt(pending);
         yield* watch.closed(socket);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   for (const unusable of [
@@ -1109,7 +1167,7 @@ describe("WorkerChildProcessSpawner", () => {
         expect(() => process.kill(spawnerPid, 0)).toThrow(
           expect.objectContaining({ code: "ESRCH" }),
         );
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -1142,7 +1200,7 @@ describe("WorkerChildProcessSpawner", () => {
         expect(yield* Effect.flip(Fiber.join(socket.pending))).toMatchObject({
           message: expect.stringContaining("spawn"),
         });
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -1176,7 +1234,7 @@ describe("WorkerChildProcessSpawner", () => {
           method: "spawn",
           causeMessage: "The process spawner stopped",
         });
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   for (const failure of ["throws", "is sent SIGTERM"] as const) {
@@ -1252,7 +1310,7 @@ describe("WorkerChildProcessSpawner", () => {
           return yield* watch.connected;
         }).pipe(Effect.scoped);
         yield* watch.closed(socket);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -1278,7 +1336,7 @@ describe("WorkerChildProcessSpawner", () => {
           );
           yield* watch.closed(socket);
         }).pipe(Effect.scoped);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live.skipIf(!workerPlatform)(
@@ -1316,7 +1374,7 @@ describe("WorkerChildProcessSpawner", () => {
         host.kill("SIGKILL");
         yield* Effect.forEach(sockets, watch.closed);
         expect(yield* Deferred.await(stderrEnded)).toBe("");
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   for (const sibling of [false, true]) {
@@ -1367,9 +1425,28 @@ describe("WorkerChildProcessSpawner", () => {
             ? (yield* fs.readFileString(invocations)).trim().split("\n")
             : [];
           expect(ran).toEqual(sibling ? [] : [expect.stringMatching(/^__process-spawner /)]);
-        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
     );
   }
+
+  it.live.skipIf(!workerPlatform)("the server knows its spawner process's PID while it runs", () =>
+    Effect.gen(function* () {
+      const spawnerPid = yield* Effect.gen(function* () {
+        const spawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(
+          yield* ChildProcessSpawner,
+        );
+        const parent = Number(
+          yield* spawner.string(node("process.stdout.write(String(process.ppid))")),
+        );
+        expect(spawnerProcessIds.has(parent)).toBe(true);
+        return parent;
+      }).pipe(Effect.scoped);
+      expect(spawnerProcessIds.has(spawnerPid)).toBe(false);
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
 
   it.live.skipIf(!workerPlatform)(
     "VCS layers provided per WebSocket connection reuse the server's spawner process",
@@ -1420,20 +1497,25 @@ describe("WorkerChildProcessSpawner", () => {
             .map(([, pid]) => Number(pid));
           expect(spawners).toEqual([serverSpawner]);
         }).pipe(Effect.provide(server));
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live(
-    `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} and ${WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV} move VCS commands off the main spawner, results and errors unchanged`,
+    `${WorkerChildProcessSpawner.VCS_SPAWN_WORKER_ENV} and ${WorkerChildProcessSpawner.PROCESS_SPAWNER_ENV} move VCS and the server's ProcessRunner commands off the main spawner, results and errors unchanged`,
     () =>
       Effect.gen(function* () {
         const outcome = (knobs: Record<string, string>) =>
           Effect.gen(function* () {
             const { calls, spawner } = yield* recordingSpawner;
             const { logs, layer: logLayer } = capturedLogs();
-            // As in server.ts, a shared ProcessRunner is provided outside VcsProcess too.
-            const layer = Layer.mergeAll(VcsProcess.layer, GitVcsDriver.layer).pipe(
-              Layer.provide(ProcessRunner.layer),
+            // As in server.ts: the server's ProcessRunner is provided outside, and services
+            // inside its unwrapped layer provide ProcessRunner.layer themselves.
+            const layer = Layer.unwrap(
+              Effect.succeed(
+                Layer.mergeAll(VcsProcess.layer, GitVcsDriver.layer, ProcessRunner.layer),
+              ),
+            ).pipe(
+              Layer.provide(WorkerChildProcessSpawner.layerProcessRunner),
               Layer.provide(
                 ServerConfig.layerTest(process.cwd(), { prefix: "t3-worker-spawner-test-" }),
               ),
@@ -1476,6 +1558,11 @@ describe("WorkerChildProcessSpawner", () => {
                 args: ["-e", "process.stdout.write(String(process.ppid))"],
                 cwd: process.cwd(),
               });
+              const runner = yield* ProcessRunner.ProcessRunner;
+              const runnerParent = yield* runner.run({
+                command: process.execPath,
+                args: ["-e", "process.stdout.write(String(process.ppid))"],
+              });
               return {
                 version: {
                   exitCode: version.exitCode,
@@ -1494,6 +1581,8 @@ describe("WorkerChildProcessSpawner", () => {
                   cause: summarizeError(missingCwd.cause as PlatformError.PlatformError),
                 },
                 spawnedBy: Number(parent.stdout) === process.pid ? "server" : "spawner process",
+                runnerSpawnedBy:
+                  Number(runnerParent.stdout) === process.pid ? "server" : "spawner process",
                 mainSpawns: calls.length,
                 errors: logs
                   .filter(({ level }) => level === "Error")
@@ -1505,15 +1594,20 @@ describe("WorkerChildProcessSpawner", () => {
         const { VCS_SPAWN_WORKER_ENV: worker, PROCESS_SPAWNER_ENV: spawner } =
           WorkerChildProcessSpawner;
         const onNode = yield* outcome({ [spawner]: "default" });
-        expect(onNode).toMatchObject({ mainSpawns: 5, spawnedBy: "server", errors: [] });
+        expect(onNode).toMatchObject({
+          mainSpawns: 6,
+          spawnedBy: "server",
+          runnerSpawnedBy: "server",
+          errors: [],
+        });
         expect(onNode.missing.tag).toBe("VcsProcessSpawnError");
         expect(onNode.missingCwd).toMatchObject({
           tag: "GitCommandError",
           cause: { reason: "NotFound" },
         });
-        const onWorker = { ...onNode, mainSpawns: workerPlatform ? 0 : 5 };
+        const onWorker = { ...onNode, mainSpawns: workerPlatform ? 0 : 6 };
         const onSpawnerProcess = workerPlatform
-          ? { ...onWorker, spawnedBy: "spawner process" }
+          ? { ...onWorker, spawnedBy: "spawner process", runnerSpawnedBy: "spawner process" }
           : onWorker;
         // Unset is the spawner process on Linux and macOS.
         expect(yield* outcome({})).toEqual(onSpawnerProcess);
@@ -1536,6 +1630,6 @@ describe("WorkerChildProcessSpawner", () => {
             errors: [expect.stringContaining(`${spawner}=\\"${value}\\"`)],
           });
         }
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 });

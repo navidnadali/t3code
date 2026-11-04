@@ -22,8 +22,10 @@ import type * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
+  checkpointRestorePlace,
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
+  UNPLACED_RESTORE_MESSAGE,
 } from "./CheckpointRestoreSafety.ts";
 import { CheckpointRestoreError, CheckpointServiceV2 } from "./CheckpointService.ts";
 import { EventSinkV2 } from "./EventSink.ts";
@@ -48,10 +50,13 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
       "provider-turn-unavailable",
       "unexpected-failure",
       "shared-workspace",
+      "another-worktree",
     ]),
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,
     checkpointId: CheckpointId,
+    /** Why another-worktree refused the file restore, as the user reads it. */
+    refusal: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -65,6 +70,8 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
         return `Provider turn for rollback target ${this.checkpointId} is unavailable on provider thread ${this.providerThreadId}.`;
       case "shared-workspace":
         return SHARED_WORKSPACE_RESTORE_MESSAGE;
+      case "another-worktree":
+        return this.refusal ?? UNPLACED_RESTORE_MESSAGE;
       case "unexpected-failure":
         return ROLLBACK_FAILED_MESSAGE;
     }
@@ -83,6 +90,7 @@ const isRuntimePolicyAboveCeilingError = Schema.is(RuntimePolicyAboveCeilingErro
  */
 export function rollbackFailureClientMessage(error: CheckpointRollbackExecutionError): string {
   if (isRuntimePolicyAboveCeilingError(error.cause)) return error.cause.message;
+  if (error.reason === "another-worktree") return error.message;
   const restoreCause = isCheckpointRestoreError(error.cause) ? error.cause.cause : undefined;
   return isVcsProcessExitError(restoreCause) && restoreCause.detail === GIT_INDEX_LOCKED_DETAIL
     ? GIT_INDEX_LOCKED_DETAIL
@@ -234,9 +242,30 @@ export const layer: Layer.Layer<
         }
       }
 
+      // Admission checked this too; the thread may have moved to another worktree since. The files are
+      // restored where the checkpoint was taken, which an old root scope may not name.
+      const place =
+        input.restoreFiles === false
+          ? { refusal: null, workspace: undefined }
+          : yield* checkpointRestorePlace(context.thread, input.checkpointId, {
+              fileSystem,
+              path,
+              projections,
+            });
+      if (place.refusal !== null) {
+        return yield* new CheckpointRollbackExecutionError({
+          reason: "another-worktree",
+          threadId: input.threadId,
+          providerThreadId: input.providerThreadId,
+          checkpointId: input.checkpointId,
+          refusal: place.refusal,
+        });
+      }
+      const restoreScope =
+        place.workspace === undefined ? scope : { ...scope, cwd: place.workspace };
       if (
         input.restoreFiles !== false &&
-        !(yield* isCheckpointRestoreIsolated(context.thread, scope, {
+        !(yield* isCheckpointRestoreIsolated(context.thread, restoreScope, {
           fileSystem,
           projections,
           projects,
@@ -289,9 +318,55 @@ export const layer: Layer.Layer<
               target: rollbackTarget,
               providerThreadTurns,
             });
-      if (input.restoreFiles !== false) yield* checkpoints.restore({ scope, checkpoint });
-      if (staleCheckpoints.length > 0) {
-        yield* checkpoints.deleteStaleRefs({ scope, checkpoints: staleCheckpoints });
+      if (input.restoreFiles !== false) {
+        yield* checkpoints.restore({ scope: restoreScope, checkpoint });
+      }
+      // A scope's refs live in its workspace's repository: where its runs worked, or the workspace's
+      // real path (a spelling may be a removed or retargeted symlink, so only scopes recorded without
+      // one use it). With none left, the repository may be another workspace's (worktrees share
+      // refs): drop them through every workspace that remains; deleting a ref it lacks is a no-op.
+      const rootScopes = [scope, ...context.otherRootScopes];
+      const existing = (cwds: ReadonlyArray<string | null | undefined>) =>
+        Effect.filter(
+          [...new Set(cwds.filter((cwd): cwd is string => typeof cwd === "string"))],
+          (cwd) => fileSystem.exists(cwd),
+        );
+      const ranIn = (scopeId: string) =>
+        runsToRollback
+          .filter(
+            (run) =>
+              context.rootNodes.find((node) => node.id === run.rootNodeId)?.checkpointScopeId ===
+              scopeId,
+          )
+          .map((run) => run.workspaceCwd);
+      const remaining = yield* existing([
+        context.thread.worktreePath,
+        ...rootScopes.map((candidate) => candidate.realCwd ?? candidate.cwd),
+        ...runsToRollback.map((run) => run.workspaceCwd),
+      ]);
+      for (const staleScope of rootScopes) {
+        const stale = staleCheckpoints.filter((candidate) => candidate.scopeId === staleScope.id);
+        if (stale.length === 0) continue;
+        const ranThere = yield* existing(ranIn(staleScope.id));
+        const targets =
+          ranThere.length > 0 ? ranThere : yield* existing([staleScope.realCwd ?? staleScope.cwd]);
+        for (const cwd of targets) {
+          yield* checkpoints.deleteStaleRefs({ scope: { ...staleScope, cwd }, checkpoints: stale });
+        }
+        if (targets.length > 0) continue;
+        for (const cwd of remaining) {
+          yield* checkpoints
+            .deleteStaleRefs({ scope: { ...staleScope, cwd }, checkpoints: stale })
+            .pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("orchestration V2 stale checkpoint refs not dropped", {
+                  scopeId: staleScope.id,
+                  cwd,
+                  cause: String(cause),
+                }),
+              ),
+            );
+        }
       }
 
       // Lock against full-row thread writes that could restore the old native session after rollback.

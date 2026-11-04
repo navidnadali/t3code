@@ -29,6 +29,8 @@ import {
   SERVICE_STOP_MARKER_FILE,
 } from "./cloud/serviceProtocol.ts";
 
+import { serverChildEnvironment } from "./youngGeneration.ts";
+
 const HANDOFF_DELAY_MS = 2_000;
 /**
  * Migrations count toward it and can scale with the database: tens of GB on a cold page cache
@@ -59,9 +61,12 @@ const runtimePaths = (baseDir: string, version: string) => {
   };
 };
 
-const runtimeSpawnArguments = (paths: ReturnType<typeof runtimePaths>) => ({
+// Node options reach every runtime through NODE_OPTIONS, which Node validates itself (its
+// allowlist, AT_SECURE); a command-line `--node-options=` would bypass that, so none is ever passed.
+const runtimeSpawnArguments = (paths: ReturnType<typeof runtimePaths>, env: NodeJS.ProcessEnv) => ({
   command: paths.entryPath,
   args: ["serve"],
+  env: serverChildEnvironment(env),
 });
 
 const DB_FILE_SUFFIXES = ["", "-wal", "-shm"] as const;
@@ -577,9 +582,13 @@ export class Launcher {
       childVersion: version,
       ...(update === undefined ? {} : { update }),
     };
-    const spawnArguments = runtimeSpawnArguments(paths);
+    // The server cannot relaunch itself over this IPC channel, so its Node options come from here.
+    const spawnArguments = runtimeSpawnArguments(paths, {
+      ...this.#environment,
+      [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify(context),
+    });
     const child = NodeChildProcess.spawn(spawnArguments.command, spawnArguments.args, {
-      env: { ...this.#environment, [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify(context) },
+      env: { ...spawnArguments.env },
       stdio: ["inherit", "inherit", "inherit", "ipc"],
     });
     await new Promise<void>((resolve, reject) => {

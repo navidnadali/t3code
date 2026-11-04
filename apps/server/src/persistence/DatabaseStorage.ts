@@ -108,7 +108,9 @@ const make = Effect.gen(function* () {
       yield* Effect.sleep((Number(elapsed) / 1_000_000) * 9);
       sliceStarted = yield* Clock.monotonicTimeNanos;
     });
-    const result = yield* maintenance.compactEventStore(betweenPages);
+    // The pass's working set lives in this file, replaced at every pass start and removed at its end.
+    const scratchPath = path.join(path.dirname(config.dbPath), "compaction-scratch.sqlite");
+    const result = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
     const completedAt = yield* Clock.currentTimeMillis;
     yield* fs.writeFileString(compactedAtPath, String(completedAt)).pipe(Effect.ignore);
     if (result.deletedEventCount > 0 || result.deletedReceiptCount > 0) {

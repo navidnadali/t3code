@@ -1,3 +1,4 @@
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -65,7 +66,11 @@ export class VcsProcess extends Context.Service<
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
+// Eight git processes at once suffice: the bench measured no wait for a slot at up to 26 git
+// commands/s (a heavy session load with a 1 s turn gap); `vcs.permit_wait_ms` shows any wait.
 const VCS_PROCESS_CONCURRENCY = 8;
+// Forge CLIs can take seconds per call; cap them together so git, checkpoints included, keeps slots.
+const NON_GIT_PROCESS_CONCURRENCY = VCS_PROCESS_CONCURRENCY / 2;
 
 /** Shown to users when a Git command fails because another process holds the index lock. */
 export const GIT_INDEX_LOCKED_DETAIL =
@@ -184,6 +189,7 @@ export const make = Effect.gen(function* () {
   const processRunner = yield* ProcessRunner.ProcessRunner;
   const hostPlatform = yield* HostProcess.Platform;
   const vcsProcesses = yield* Semaphore.make(VCS_PROCESS_CONCURRENCY);
+  const nonGitProcesses = yield* Semaphore.make(NON_GIT_PROCESS_CONCURRENCY);
   const keyedProcesses = new Map<string, Semaphore.Semaphore>();
   const keyedPermit = (concurrency: NonNullable<VcsProcessInput["concurrency"]>) => {
     let semaphore = keyedProcesses.get(concurrency.key);
@@ -346,7 +352,20 @@ export const make = Effect.gen(function* () {
   });
 
   const run = Effect.fn("VcsProcess.run")(function* (input: VcsProcessInput) {
-    const bounded = vcsProcesses.withPermits(1)(runUnbounded(input));
+    // Time waiting for a slot, keyed and shared, summed over retries; a retry times only its own wait.
+    let permitWaitMs = 0;
+    let queuedAtMs: number | undefined = yield* Clock.currentTimeMillis;
+    const bounded = Effect.gen(function* () {
+      const attemptQueuedAtMs = queuedAtMs ?? (yield* Clock.currentTimeMillis);
+      queuedAtMs = undefined;
+      return yield* vcsProcesses.withPermits(1)(
+        Effect.gen(function* () {
+          permitWaitMs += (yield* Clock.currentTimeMillis) - attemptQueuedAtMs;
+          yield* Effect.annotateCurrentSpan("vcs.permit_wait_ms", permitWaitMs);
+          return yield* runUnbounded(input);
+        }),
+      );
+    });
     if (
       input.command === "git" &&
       input.operation === CHECKPOINT_CAPTURE_OPERATION &&
@@ -366,16 +385,15 @@ export const make = Effect.gen(function* () {
         }),
       );
     }
-    return yield* input.concurrency === undefined
-      ? bounded
-      : keyedPermit(input.concurrency)(bounded);
+    const shared = input.command === "git" ? bounded : nonGitProcesses.withPermits(1)(bounded);
+    return yield* input.concurrency === undefined ? shared : keyedPermit(input.concurrency)(shared);
   });
 
   return VcsProcess.of({ run });
 });
 
-// Fresh: the server shares a ProcessRunner built on the main-thread spawner, which would
-// otherwise be reused here and bypass the worker spawner.
+// Fresh: a ProcessRunner provided around this one (a CLI's, a test's) may be built on Node's
+// spawner, and would otherwise be reused here and bypass the spawner the knobs choose.
 export const layer = Layer.effect(VcsProcess, make).pipe(
   Layer.provide(Layer.fresh(ProcessRunner.layer)),
   Layer.provide(WorkerChildProcessSpawner.layerFromConfig),

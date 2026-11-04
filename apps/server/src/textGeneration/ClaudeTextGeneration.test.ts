@@ -13,6 +13,10 @@ import { expect } from "vite-plus/test";
 import * as ServerConfig from "../config.ts";
 import { processProbeSource } from "../testUtils/processProbe.ts";
 import {
+  commandsLeaveTheServer,
+  withServerCommandSpawner,
+} from "../testUtils/serverCommandSpawner.ts";
+import {
   SYNTHETIC_CLAUDE_CAPABLE_MODEL,
   SYNTHETIC_CLAUDE_COLLIDING_ALIAS,
   SYNTHETIC_CLAUDE_MODEL_CATALOG,
@@ -303,6 +307,31 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
           },
         }),
     ),
+  );
+
+  it.effect.skipIf(!commandsLeaveTheServer)(
+    "starts the Claude CLI from the server's command spawner",
+    () =>
+      Effect.gen(function* () {
+        const { result, ambientCommands } = yield* withServerCommandSpawner(
+          withFakeClaudeEnv(
+            { output: JSON.stringify({ structured_output: { title: "Off the server" } }) },
+            (textGeneration) =>
+              textGeneration.generateThreadTitle({
+                cwd: process.cwd(),
+                message: "Name this thread",
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("claudeAgent"),
+                  model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+                },
+              }),
+          ),
+        );
+        expect({ title: result.title, ambientCommands }).toEqual({
+          title: sanitizeThreadTitle("Off the server"),
+          ambientCommands: [],
+        });
+      }),
   );
 
   it.effect("runs Claude text generation with the configured CLAUDE_CONFIG_DIR", () =>

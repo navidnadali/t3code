@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import type { ThreadId } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "@t3tools/provider-acp-registry/settings";
@@ -40,7 +41,9 @@ function layerAcpRegistryProviderAdapterRegistryReplay(
   transcript: AcpReplayTranscript,
   options: { readonly replayGate?: ProviderReplayGate } = {},
 ) {
-  const layerHost = TestProviderHost.layer().pipe(Layer.provide(NodeServices.layer));
+  const layerHost = TestProviderHost.layer().pipe(
+    Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+  );
 
   return ProviderAdapterRegistry.layerFromAdaptersEffect(
     Effect.gen(function* () {
@@ -92,6 +95,7 @@ function layerAcpRegistryProviderAdapterRegistryReplay(
       Layer.mergeAll(
         layerHost,
         NodeServices.layer,
+        NodeCrypto.layer,
         IdAllocator.layer,
         Layer.mock(AcpRegistrySupport.AcpRegistryCatalog)({
           resolve: () => Effect.die("ACP registry resolver must not run during replay"),

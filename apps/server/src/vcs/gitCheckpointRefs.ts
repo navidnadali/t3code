@@ -1,0 +1,587 @@
+// @effect-diagnostics nodeBuiltinImport:off - reads loose refs, packed-refs and loose objects as the files Git writes; Effect's FileSystem has no inflate and its stat lacks the inode.
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeZlib from "node:zlib";
+
+import * as Effect from "effect/Effect";
+
+const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+export const isObjectId = (value: string): boolean => OBJECT_ID.test(value);
+
+/** What `git log --format=%T %P %ct` prints for a commit. */
+export interface CommitFacts {
+  readonly tree: string;
+  readonly parents: ReadonlyArray<string>;
+  readonly committerTime: string;
+}
+
+export interface CheckpointRepository {
+  readonly commonDir: string;
+  readonly objectsDir: string;
+}
+
+export interface CheckpointRefMemory {
+  /**
+   * A ref this process wrote or resolved, so a loose file still holding `oid` answers without Git.
+   * Remembered per object store (directory and alternates): the commit must stay findable.
+   */
+  readonly rememberRef: (
+    repository: CheckpointRepository,
+    ref: string,
+    oid: string,
+  ) => Effect.Effect<void>;
+  readonly forgetRef: (repository: CheckpointRepository, ref: string) => Effect.Effect<void>;
+  /**
+   * The commit a remembered ref names, or undefined when Git must answer: an unknown ref, another
+   * value, a symbolic ref, an unreadable or oversized store, a reftable store, a ref found neither
+   * loose nor packed (rev-parse then tries other names), or an environment that moves refs.
+   */
+  readonly resolveRef: (
+    repository: CheckpointRepository,
+    ref: string,
+  ) => Effect.Effect<string | undefined>;
+  /**
+   * Everything that decides whether Git reads commits as their objects say (shallow boundary,
+   * grafts, replacements, the environment), as one string; null when it does not.
+   */
+  readonly historyState: (commonDir: string) => Effect.Effect<string | null>;
+  /** Keeps facts Git reported, when the history state is the one taken before Git ran. */
+  readonly rememberCommits: (
+    repository: CheckpointRepository,
+    facts: ReadonlyArray<readonly [oid: string, facts: CommitFacts]>,
+    stateBefore: string | null,
+  ) => Effect.Effect<void>;
+  /** Facts from memory or the loose object; null when Git must answer. */
+  readonly commitFacts: (
+    repository: CheckpointRepository,
+    oid: string,
+  ) => Effect.Effect<CommitFacts | null>;
+  /** Entries currently kept from packed-refs files, for tests and diagnostics. */
+  readonly packedRefsEntries: () => number;
+  /** Loose objects read and inflated so far, for tests and diagnostics. */
+  readonly looseObjectReads: () => number;
+}
+
+// Caches, not state: an evicted entry costs the Git command it would have replaced. A turn keeps
+// two refs and two commits live, so these cover more than a thousand concurrent threads.
+const REFS_CAPACITY = 16_384;
+const COMMITS_CAPACITY = 16_384;
+// Parsed packed-refs files kept, and the entries they may hold in all; a file with more is left to Git.
+const PACKED_REFS_CAPACITY = 256;
+const PACKED_REFS_ENTRY_BUDGET = 16_384;
+// A cold parse runs on the main thread at about 1.8 ms and 1.2 MB per MiB of file (review bench:
+// 6.2 MB → 11 ms, 62 MB → 184 ms), against 19–25 ms for a `git rev-parse` child; 8 MiB keeps one
+// parse below one child. Larger files are left to Git.
+const PACKED_REFS_MAX_BYTES = 8 * 1024 * 1024;
+// A commit object is a few hundred bytes, a signed or long-messaged one a few KiB; anything that
+// is larger on disk or inflates past this is left to Git, which bounds the work a planted
+// object can cause. Objects that failed are remembered by file, so one costs one read.
+const COMMIT_OBJECT_MAX_BYTES = 1024 * 1024;
+// A loose ref or HEAD is one line.
+const SMALL_FILE_MAX_BYTES = 4096;
+const OBJECT_FAILURES_CAPACITY = 4_096;
+// Only refs under this prefix are kept from packed-refs; others are asked of Git.
+const PACKED_REFS_PREFIX = "refs/t3/";
+const REPLACE_REFS_PREFIX = "refs/replace/";
+// The generated names: base64url scope keys, "ordinal" and decimal ordinals.
+const CHECKPOINT_REF_NAME = /^refs\/t3\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)+$/;
+// Variables that move refs or change which commits Git sees; any of them set disables the fast paths.
+const HISTORY_ENVIRONMENT = [
+  "GIT_NAMESPACE",
+  "GIT_GRAFT_FILE",
+  "GIT_SHALLOW_FILE",
+  "GIT_REPLACE_REF_BASE",
+] as const;
+
+class BoundedMap<K, V> {
+  readonly #entries = new Map<K, V>();
+  readonly #capacity: number;
+  constructor(capacity: number) {
+    this.#capacity = capacity;
+  }
+  get(key: K): V | undefined {
+    const value = this.#entries.get(key);
+    if (value !== undefined) {
+      this.#entries.delete(key);
+      this.#entries.set(key, value);
+    }
+    return value;
+  }
+  set(key: K, value: V): void {
+    if (!this.#entries.has(key) && this.#entries.size >= this.#capacity) {
+      this.#entries.delete(this.#entries.keys().next().value!);
+    }
+    this.#entries.delete(key);
+    this.#entries.set(key, value);
+  }
+  delete(key: K): void {
+    this.#entries.delete(key);
+  }
+}
+
+type LooseRef =
+  | { readonly kind: "oid"; readonly oid: string }
+  | { readonly kind: "missing" }
+  | { readonly kind: "other" };
+
+// Git reads a symbolic link's target as a ref name, so a link is never read as a file here.
+const readLooseRef = (file: string) =>
+  Effect.promise(
+    () =>
+      new Promise<LooseRef>((resolve) => {
+        try {
+          NodeFS.lstat(file, (statError, stats) => {
+            if (statError) {
+              resolve(
+                statError.code === "ENOENT" || statError.code === "ENOTDIR"
+                  ? { kind: "missing" }
+                  : { kind: "other" },
+              );
+              return;
+            }
+            if (!stats.isFile()) {
+              resolve({ kind: "other" });
+              return;
+            }
+            void readBoundedFileAsync(file, SMALL_FILE_MAX_BYTES).then((read) => {
+              if (read.kind !== "bytes") {
+                resolve({ kind: "other" });
+                return;
+              }
+              const content = read.bytes.toString("latin1").trimEnd();
+              resolve(OBJECT_ID.test(content) ? { kind: "oid", oid: content } : { kind: "other" });
+            });
+          });
+        } catch {
+          resolve({ kind: "other" });
+        }
+      }),
+  );
+
+/** A small regular file's text (a ref or HEAD), or null when it cannot be read as one. */
+export const readTextFile = (file: string): Effect.Effect<string | null> =>
+  Effect.map(readBoundedFile(file, SMALL_FILE_MAX_BYTES), (read) =>
+    read.kind === "bytes" ? read.bytes.toString("utf8") : null,
+  );
+
+/** Whether the path is a symbolic link; null when it cannot be examined. */
+export const isSymbolicLink = (file: string): Effect.Effect<boolean | null> =>
+  Effect.promise(
+    () =>
+      new Promise<boolean | null>((resolve) => {
+        try {
+          NodeFS.lstat(file, (error, stats) => resolve(error ? null : stats.isSymbolicLink()));
+        } catch {
+          resolve(null);
+        }
+      }),
+  );
+
+interface StatInfo {
+  readonly fingerprint: string;
+  readonly size: number;
+}
+
+const fingerprintOf = (stats: NodeFS.BigIntStats) =>
+  `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+
+export type BoundedRead =
+  | { readonly kind: "bytes"; readonly fingerprint: string; readonly bytes: Buffer }
+  | { readonly kind: "oversize"; readonly fingerprint: string }
+  | { readonly kind: "unchanged"; readonly fingerprint: string }
+  | { readonly kind: "unreadable" };
+
+/**
+ * The file's bytes, or "oversize" past `maxBytes`, or "unchanged" when the descriptor's stat is
+ * `knownFingerprint` (nothing is read then). The size is taken from the descriptor that is then
+ * read, at most `maxBytes + 1` bytes into a buffer sized by that stat, so a file swapped after the
+ * check is not the one read and one that grows is not read whole.
+ */
+export const readBoundedFileAsync = (
+  file: string,
+  maxBytes: number,
+  knownFingerprint?: string,
+): Promise<BoundedRead> =>
+  new Promise<BoundedRead>((resolve) => {
+    try {
+      // Non-blocking, so a FIFO or device planted at the path cannot hold a pool thread; only a
+      // regular file is then read (a FIFO, socket, device or directory is not).
+      NodeFS.open(
+        file,
+        NodeFS.constants.O_RDONLY | NodeFS.constants.O_NONBLOCK,
+        (openError, fd) => {
+          if (openError) {
+            resolve({ kind: "unreadable" });
+            return;
+          }
+          const finish = (result: BoundedRead) => NodeFS.close(fd, () => resolve(result));
+          NodeFS.fstat(fd, { bigint: true }, (statError, stats) => {
+            if (statError || !stats.isFile()) {
+              finish({ kind: "unreadable" });
+              return;
+            }
+            const fingerprint = fingerprintOf(stats);
+            if (fingerprint === knownFingerprint) {
+              finish({ kind: "unchanged", fingerprint });
+              return;
+            }
+            if (stats.size > BigInt(maxBytes)) {
+              finish({ kind: "oversize", fingerprint });
+              return;
+            }
+            // One byte past the size, so a file that grew (or a pipe) shows without reading on.
+            let buffer = Buffer.allocUnsafe(Number(stats.size) + 1);
+            let offset = 0;
+            const step = () =>
+              NodeFS.read(fd, buffer, offset, buffer.length - offset, null, (readError, read) => {
+                if (readError) {
+                  finish({ kind: "unreadable" });
+                  return;
+                }
+                offset += read;
+                if (read === 0) {
+                  finish({ kind: "bytes", fingerprint, bytes: buffer.subarray(0, offset) });
+                  return;
+                }
+                if (offset > maxBytes) {
+                  finish({ kind: "oversize", fingerprint });
+                  return;
+                }
+                if (offset === buffer.length) {
+                  const grown = Buffer.allocUnsafe(maxBytes + 1);
+                  buffer.copy(grown, 0, 0, offset);
+                  buffer = grown;
+                }
+                step();
+              });
+            step();
+          });
+        },
+      );
+    } catch {
+      resolve({ kind: "unreadable" });
+    }
+  });
+
+export const readBoundedFile = (
+  file: string,
+  maxBytes: number,
+  knownFingerprint?: string,
+): Effect.Effect<BoundedRead> =>
+  Effect.promise(() => readBoundedFileAsync(file, maxBytes, knownFingerprint));
+
+const statInfo = (file: string) =>
+  new Promise<StatInfo>((resolve) => {
+    try {
+      NodeFS.stat(file, { bigint: true }, (error, stats) =>
+        resolve(
+          error
+            ? { fingerprint: `!${error.code ?? "error"}`, size: 0 }
+            : { fingerprint: fingerprintOf(stats), size: Number(stats.size) },
+        ),
+      );
+    } catch {
+      resolve({ fingerprint: "!invalid", size: 0 });
+    }
+  });
+
+const statFingerprint = (file: string) => statInfo(file).then((info) => info.fingerprint);
+
+export interface ParsedPackedRefs {
+  // Null when the file holds more refs under the prefix than `maxEntries`.
+  readonly refs: ReadonlyMap<string, string> | null;
+  // Null when the content was not parsed (more than `maxBytes`), so replacements are unknown.
+  readonly replaceRefs: boolean | null;
+}
+
+// `<oid> <name>` lines; `#` is the header and `^` the peeled object of the tag above it. The
+// content is latin1, one byte per character, so its length is the file's size as read.
+export const parsePackedRefs = (
+  content: string,
+  prefix: string,
+  maxEntries: number,
+  maxBytes: number,
+): ParsedPackedRefs => {
+  if (content.length > maxBytes) return { refs: null, replaceRefs: null };
+  let refs: Map<string, string> | null = new Map();
+  let replaceRefs = false;
+  for (const line of content.split("\n")) {
+    if (line.length === 0 || line.startsWith("#") || line.startsWith("^")) continue;
+    const separator = line.indexOf(" ");
+    if (separator === -1) continue;
+    const name = line.slice(separator + 1);
+    if (name.startsWith(REPLACE_REFS_PREFIX)) replaceRefs = true;
+    if (refs === null || !name.startsWith(prefix)) continue;
+    const oid = line.slice(0, separator);
+    if (!OBJECT_ID.test(oid)) continue;
+    if (refs.size >= maxEntries) refs = null;
+    else refs.set(name, oid);
+  }
+  return { refs, replaceRefs };
+};
+
+interface PackedRefs extends ParsedPackedRefs {
+  readonly fingerprint: string;
+}
+
+// Read from one descriptor: the fingerprint and size are those of the bytes read, and a file
+// above the cap is not read whole; null when unreadable.
+const readPackedRefs = Effect.fnUntraced(function* (
+  commonDir: string,
+  cached: PackedRefs | undefined,
+) {
+  const file = NodePath.join(commonDir, "packed-refs");
+  const read = yield* readBoundedFile(file, PACKED_REFS_MAX_BYTES, cached?.fingerprint);
+  if (read.kind === "unreadable") {
+    const { fingerprint } = yield* Effect.promise(() => statInfo(file));
+    return fingerprint === "!ENOENT" ? { fingerprint, refs: new Map(), replaceRefs: false } : null;
+  }
+  if (read.kind === "unchanged") return cached!;
+  if (read.kind === "oversize")
+    return { fingerprint: read.fingerprint, refs: null, replaceRefs: null };
+  return {
+    fingerprint: read.fingerprint,
+    ...parsePackedRefs(
+      read.bytes.toString("latin1"),
+      PACKED_REFS_PREFIX,
+      PACKED_REFS_ENTRY_BUDGET,
+      PACKED_REFS_MAX_BYTES,
+    ),
+  };
+});
+
+const environmentPlain = () => HISTORY_ENVIRONMENT.every((name) => process.env[name] === undefined);
+
+// The shallow file, grafts and loose replacements as one string, or null when any is present
+// (deleting the last replacement can leave its directory; only entries count). The directories
+// that would hold them are part of the string: their mtime and inode move on every entry added or
+// removed, so a file that existed only between two readings still shows.
+const historyFiles = (commonDir: string) =>
+  Effect.promise(async () => {
+    const [shallow, grafts, replaceRefs, ...directories] = await Promise.all([
+      statFingerprint(NodePath.join(commonDir, "shallow")),
+      statFingerprint(NodePath.join(commonDir, "info", "grafts")),
+      new Promise<ReadonlyArray<string> | null>((resolve) => {
+        try {
+          NodeFS.readdir(NodePath.join(commonDir, "refs", "replace"), (error, names) =>
+            resolve(
+              error ? (error.code === "ENOENT" || error.code === "ENOTDIR" ? [] : null) : names,
+            ),
+          );
+        } catch {
+          resolve(null);
+        }
+      }),
+      ...[".", "info", "refs", NodePath.join("refs", "replace")].map((directory) =>
+        statFingerprint(NodePath.resolve(commonDir, directory)),
+      ),
+    ]);
+    return shallow === "!ENOENT" && grafts === "!ENOENT" && replaceRefs?.length === 0
+      ? `${shallow}\n${grafts}\n${directories.join("\n")}\n`
+      : null;
+  });
+
+/**
+ * A commit object's header as `git log` reads it: the tree on the first line, parents right after
+ * it, then the author and the committer with `<email> <time> <zone>`; null for anything else,
+ * which Git rejects or reads differently.
+ */
+export const parseCommitObject = (object: Buffer): CommitFacts | null => {
+  const headerEnd = object.indexOf(0);
+  if (headerEnd === -1) return null;
+  const header = object.toString("latin1", 0, headerEnd);
+  if (!header.startsWith("commit ") || Number(header.slice(7)) !== object.length - headerEnd - 1) {
+    return null;
+  }
+  const lines = object.toString("latin1", headerEnd + 1).split("\n");
+  const tree = lines[0]?.startsWith("tree ") ? lines[0].slice(5) : null;
+  if (tree === null || !OBJECT_ID.test(tree)) return null;
+  const parents: string[] = [];
+  let index = 1;
+  while (lines[index]?.startsWith("parent ")) {
+    const parent = lines[index]!.slice(7);
+    if (!OBJECT_ID.test(parent)) return null;
+    parents.push(parent);
+    index++;
+  }
+  if (!lines[index]?.startsWith("author ")) return null;
+  const committer = /^committer [^<>\n]*<[^<>\n]*> (\d+) [+-]\d{4}$/.exec(lines[index + 1] ?? "");
+  if (committer === null) return null;
+  return { tree, parents, committerTime: committer[1]! };
+};
+
+// The inflated object when the bytes are one zlib stream inflating within the bound, else null
+// (Git refuses bytes after the stream as a corrupt object).
+const inflateObject = (bytes: Buffer): Buffer | null => {
+  try {
+    // `info` makes the convenience method return the engine too; the types omit that form.
+    const inflated = NodeZlib.inflateSync(bytes, {
+      maxOutputLength: COMMIT_OBJECT_MAX_BYTES,
+      info: true,
+    } as NodeZlib.ZlibOptions) as unknown as {
+      readonly buffer: Buffer | ArrayBuffer;
+      readonly engine: { readonly bytesWritten: number };
+    };
+    if (inflated.engine.bytesWritten !== bytes.length) return null;
+    const buffer: unknown = inflated.buffer;
+    return Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer as ArrayBuffer);
+  } catch {
+    return null;
+  }
+};
+
+// Read as Git would: from one descriptor, bounded, every byte part of the zlib stream, and
+// accepted only when the object's hash is the id asked for (SHA-1 for 40-hex ids, SHA-256 for
+// 64-hex ones). Null hands the question to Git. Untraced: it runs per commit per turn.
+const readLooseCommit = Effect.fnUntraced(function* (
+  objectsDir: string,
+  oid: string,
+  failures: BoundedMap<string, string>,
+  counter: { reads: number },
+) {
+  const file = NodePath.join(objectsDir, oid.slice(0, 2), oid.slice(2));
+  const key = `${objectsDir}\0${oid}`;
+  // A file known to fail, still as it was, is not read again.
+  const read = yield* readBoundedFile(file, COMMIT_OBJECT_MAX_BYTES, failures.get(key));
+  if (read.kind === "unreadable" || read.kind === "unchanged") return null;
+  const fail = () => {
+    failures.set(key, read.fingerprint);
+    return null;
+  };
+  if (read.kind === "oversize") return fail();
+  counter.reads++;
+  const object = inflateObject(read.bytes);
+  if (object === null) return fail();
+  const algorithm = oid.length === 64 ? "sha256" : "sha1";
+  if (NodeCrypto.createHash(algorithm).update(object).digest("hex") !== oid) return fail();
+  const facts = parseCommitObject(object);
+  return facts === null ? fail() : facts;
+});
+
+export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
+  const refs = new BoundedMap<string, string>(REFS_CAPACITY);
+  const commits = new BoundedMap<string, CommitFacts>(COMMITS_CAPACITY);
+  // Objects that could not be read as the commit they claim to be, by the file's stat.
+  const objectFailures = new BoundedMap<string, string>(OBJECT_FAILURES_CAPACITY);
+  const objectReads = { reads: 0 };
+  // Parsed packed-refs per common directory (insertion order = age), bounded in files and entries.
+  const packed = new Map<string, PackedRefs>();
+  let packedEntries = 0;
+  // The store a ref was resolved against, taken where Git looks and resolved now (a retargeted
+  // link is another store); a store with alternates borrows through links that can change, so
+  // it has no key and Git answers.
+  const refKey = (repository: CheckpointRepository, ref: string) =>
+    Effect.promise(async () => {
+      if ((process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? "") !== "") return null;
+      const configured = process.env.GIT_OBJECT_DIRECTORY;
+      // Git reads a relative one from each command's own directory.
+      if (configured !== undefined && !NodePath.isAbsolute(configured)) return null;
+      const store = await new Promise<string | null>((resolve) => {
+        try {
+          NodeFS.realpath.native(
+            configured ?? NodePath.join(repository.commonDir, "objects"),
+            (error, resolved) => resolve(error ? null : resolved),
+          );
+        } catch {
+          resolve(null);
+        }
+      });
+      if (store === null) return null;
+      const alternates = await statFingerprint(NodePath.join(store, "info", "alternates"));
+      if (alternates !== "!ENOENT") return null;
+      return `${repository.commonDir}\0${store}\0${ref}`;
+    });
+
+  const packedRefs = Effect.fnUntraced(function* (commonDir: string) {
+    const current = yield* readPackedRefs(commonDir, packed.get(commonDir));
+    // Concurrent reloads of one file: account for what the map holds after the read, not before.
+    const present = packed.get(commonDir);
+    if (current === null || current === present) return current;
+    if (present !== undefined) {
+      packed.delete(commonDir);
+      packedEntries -= present.refs?.size ?? 0;
+    }
+    const size = current.refs?.size ?? 0;
+    for (const [key, entry] of packed) {
+      if (packed.size < PACKED_REFS_CAPACITY && packedEntries + size <= PACKED_REFS_ENTRY_BUDGET) {
+        break;
+      }
+      packed.delete(key);
+      packedEntries -= entry.refs?.size ?? 0;
+    }
+    packed.set(commonDir, current);
+    packedEntries += size;
+    return current;
+  });
+
+  // Git's files backend: the loose file wins, then packed-refs. A reftable store (which only the
+  // repository's own config declares, so the snapshot may still say files) keeps neither, and a
+  // name absent from both is one rev-parse would try under refs/heads and the like, so Git answers.
+  const resolveRef = Effect.fnUntraced(function* (repository: CheckpointRepository, ref: string) {
+    const { commonDir } = repository;
+    if (!CHECKPOINT_REF_NAME.test(ref) || !environmentPlain()) return undefined;
+    const key = yield* refKey(repository, ref);
+    const known = key === null ? undefined : refs.get(key);
+    if (known === undefined) return undefined;
+    const reftable = yield* Effect.promise(() =>
+      statFingerprint(NodePath.join(commonDir, "reftable")),
+    );
+    if (reftable !== "!ENOENT") return undefined;
+    const loose = yield* readLooseRef(NodePath.join(commonDir, ref));
+    if (loose.kind === "oid") return loose.oid === known ? known : undefined;
+    if (loose.kind === "other") return undefined;
+    const current = yield* packedRefs(commonDir);
+    if (current === null || current.refs === null) return undefined;
+    const entry = current.refs.get(ref);
+    return entry === known ? known : undefined;
+  });
+
+  const historyState = Effect.fnUntraced(function* (commonDir: string) {
+    if (!environmentPlain()) return null;
+    const files = yield* historyFiles(commonDir);
+    if (files === null) return null;
+    const current = yield* packedRefs(commonDir);
+    if (current === null || current.replaceRefs !== false) return null;
+    return `${files}${current.fingerprint}`;
+  });
+
+  const commitFacts = Effect.fnUntraced(function* (repository: CheckpointRepository, oid: string) {
+    if ((yield* historyState(repository.commonDir)) === null) return null;
+    const remembered = commits.get(oid);
+    if (remembered !== undefined) return remembered;
+    const facts = yield* readLooseCommit(repository.objectsDir, oid, objectFailures, objectReads);
+    if (facts !== null) commits.set(oid, facts);
+    return facts;
+  });
+
+  // Facts Git reported describe the history as it was while Git ran; keep them only when the
+  // state taken before the run is still the state after it.
+  const rememberCommits = Effect.fnUntraced(function* (
+    repository: CheckpointRepository,
+    facts: ReadonlyArray<readonly [oid: string, facts: CommitFacts]>,
+    stateBefore: string | null,
+  ) {
+    if (facts.length === 0 || stateBefore === null) return;
+    if ((yield* historyState(repository.commonDir)) !== stateBefore) return;
+    for (const [oid, commit] of facts) commits.set(oid, commit);
+  });
+
+  return {
+    rememberRef: (repository, ref, oid) =>
+      Effect.map(refKey(repository, ref), (key) => {
+        if (key !== null) refs.set(key, oid);
+      }),
+    forgetRef: (repository, ref) =>
+      Effect.map(refKey(repository, ref), (key) => {
+        if (key !== null) refs.delete(key);
+      }),
+    resolveRef,
+    historyState,
+    rememberCommits,
+    commitFacts,
+    packedRefsEntries: () => packedEntries,
+    looseObjectReads: () => objectReads.reads,
+  };
+};

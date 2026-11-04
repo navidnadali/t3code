@@ -10,6 +10,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
@@ -165,7 +166,7 @@ const withRunner = <A, E>(
         }),
       ),
       Layer.provide(Layer.succeed(ClaudeAgentSdkWorkerPool, pool)),
-      Layer.provide(NodeServices.layer),
+      Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
     );
     return yield* Effect.gen(function* () {
       return yield* use({ runner: yield* ClaudeAgentSdkQueryRunner, logs, recorded });
@@ -1018,10 +1019,9 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     permissionCase("throws an Error whose message has toJSON", () =>
       Promise.reject(Object.assign(new Error(), { message: new KeyedJson() })),
     ),
-    // In-thread the SDK cannot write this error, so the CLI gets no response.
-    permissionCase("throws an Error whose message JSON cannot write", () =>
-      Promise.reject(Object.assign(new Error(), { message: 1n })),
-    ),
+    // No "throws an Error whose message JSON cannot write" case: from SDK 0.3.284 the failed
+    // write escapes the SDK's control-request handler as an unhandled rejection in-thread. A
+    // worker-only test below pins what a worker does instead.
     // Each of these clones without error but not as the SDK's JSON writes it.
     permissionCase("answers with values JSON converts", () =>
       Promise.resolve({
@@ -1281,6 +1281,110 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
         assert.deepStrictEqual(inWorker.calls, inThread.calls);
         assert.deepStrictEqual(inWorker.frames, inThread.frames);
       }),
+  );
+
+  // From SDK 0.3.284 an error response the SDK cannot write escapes its control-request handler as an
+  // unhandled rejection, so in-thread is no oracle here: on a worker it must fail only that request.
+  const unwritableErrors: ReadonlyArray<readonly [string, () => unknown, string]> = [
+    [
+      "a BigInt message",
+      () => Object.assign(new Error(), { message: 1n }),
+      "A T3 Code callback failed with an error that cannot be sent to Claude: Do not know how to serialize a BigInt",
+    ],
+    [
+      "a message whose JSON fails with an error that cannot be printed",
+      () =>
+        Object.assign(new Error(), {
+          message: {
+            toJSON: () => {
+              throw Object.assign(new Error(), { message: Symbol("unprintable") });
+            },
+          },
+        }),
+      "A T3 Code callback failed with an error that cannot be sent to Claude",
+    ],
+    // JSON-escaped, this reason would pass V8's longest string; only its first 1,024 characters are named.
+    [
+      "a message whose JSON fails with a huge error",
+      () =>
+        Object.assign(new Error(), {
+          message: {
+            toJSON: () => {
+              throw new Error("\u0000".repeat(1e8));
+            },
+          },
+        }),
+      `A T3 Code callback failed with an error that cannot be sent to Claude: ${"\u0000".repeat(1024)} [truncated]`,
+    ],
+  ];
+
+  it.effect.each(unwritableErrors)(
+    "fails a callback whose error has %s, clearly and alone, and keeps its worker",
+    ([, rejection, expected]) =>
+      withRunner(
+        "worker",
+        ({ runner, recorded }) =>
+          Effect.gen(function* () {
+            const unwritable = new FakeClaudeCli();
+            const neighbour = new FakeClaudeCli();
+            yield* runner.open(
+              openInput(unwritable, { canUseTool: () => Promise.reject(rejection()) }),
+            );
+            yield* runner.open(
+              openInput(neighbour, {
+                canUseTool: async () => ({ behavior: "allow", updatedInput: { allowed: true } }),
+              }),
+            );
+            // A dead worker kills its sessions' CLIs; a throw on main is an unhandled rejection there.
+            const unhandled = Promise.withResolvers<{ readonly unhandled: unknown }>();
+            const onUnhandled = (reason: unknown) => unhandled.resolve({ unhandled: reason });
+            process.on("unhandledRejection", onUnhandled);
+            const outcome = (cli: FakeClaudeCli, toolUseId: string) =>
+              Promise.race([
+                cli.request(permissionRequest(toolUseId)).then((response) => ({ response })),
+                new Promise<{ readonly killed: true }>((resolve) =>
+                  cli.once("exit", () => resolve({ killed: true })),
+                ),
+                unhandled.promise,
+              ]);
+            // A second round on both shows the worker outlived the failure.
+            const rounds = [];
+            for (const round of [0, 1]) {
+              rounds.push({
+                failed: yield* Effect.promise(() =>
+                  outcome(unwritable, `toolu-unwritable-${round}`),
+                ),
+                answered: yield* Effect.promise(() =>
+                  outcome(neighbour, `toolu-neighbour-${round}`),
+                ),
+              });
+            }
+            process.off("unhandledRejection", onUnhandled);
+
+            assert.deepStrictEqual(recorded.opens, [true, true]);
+            assert.deepStrictEqual(
+              rounds,
+              [0, 1].map((round) => ({
+                failed: {
+                  response: { subtype: "error", request_id: `cli-${round}`, error: expected },
+                },
+                answered: {
+                  response: {
+                    subtype: "success",
+                    request_id: `cli-${round}`,
+                    response: {
+                      behavior: "allow",
+                      updatedInput: { allowed: true },
+                      toolUseID: `toolu-neighbour-${round}`,
+                    },
+                  },
+                },
+              })),
+            );
+            assert.deepStrictEqual([unwritable.kills, neighbour.kills], [[], []]);
+          }),
+        { workers: 1 },
+      ),
   );
 
   // Answers once its request is cancelled, recording whether its signal said so.
@@ -1756,7 +1860,7 @@ const runWired = (env: Record<string, string>) =>
       Layer.provide(
         Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
       ),
-      Layer.provide(NodeServices.layer),
+      Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
     );
     const openedBefore = workers.opened.length;
     const messages = yield* Effect.gen(function* () {
@@ -1770,7 +1874,7 @@ const runWired = (env: Record<string, string>) =>
       stages: workers.opened.slice(openedBefore).map((opened) => opened.stage),
       last: messages.at(-1)?.type,
     };
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
 
 describe("Claude Agent SDK worker wiring", () => {
   it.effect("runs Claude queries on a worker when the environment opts in", () =>

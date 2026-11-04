@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
@@ -52,6 +53,7 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
+import * as CheckpointService from "./CheckpointService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
@@ -191,6 +193,7 @@ function startWithMissingWorktree(
           tryHandlePromptCommand: () => Effect.succeed(false),
         }),
         Layer.mock(RunExecutionService.RunExecutionServiceV2)({ startRootRun }),
+        Layer.mock(CheckpointService.CheckpointServiceV2)({}),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({}),
       ),
     ),
@@ -268,6 +271,8 @@ it.each([
 
 function makeLocalCommandHarness(input: {
   readonly text: string;
+  /** The run's scope was created at a real path: its stored spelling and realCwd are this cwd. */
+  readonly scopeAtRealPath?: boolean;
   readonly worktreePath?: string;
   readonly worktreesDir?: string;
   readonly workspaceRoot?: string;
@@ -460,6 +465,7 @@ function makeLocalCommandHarness(input: {
         ordinalWithinParent: 0,
         advancesAppRunCount: true,
         cwd: "/tmp/native-account-command",
+        ...(input.scopeAtRealPath === true ? { realCwd: "/tmp/native-account-command" } : {}),
         createdAt: now,
       },
     ],
@@ -843,6 +849,7 @@ function makeLocalCommandHarness(input: {
           return { committed, storedEvents: [] };
         }),
   );
+  const prepareRootRunScope = vi.fn(() => Effect.succeed(projection.checkpointScopes[0]!));
   const resolveRuntimePolicy = vi.fn(
     ({ thread }: Parameters<RuntimePolicy.RuntimePolicyV2Shape["resolve"]>[0]) =>
       Effect.succeed({
@@ -954,6 +961,8 @@ function makeLocalCommandHarness(input: {
           turnCompleted: () => Effect.void,
           runSettled: (report) => Effect.sync(() => void settledRuns.push(report.status)),
         }),
+        // The turn starts in the workspace its run was scoped in: the same scope.
+        Layer.mock(CheckpointService.CheckpointServiceV2)({ prepareRootRunScope }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
           resolve: resolveRuntimePolicy,
         }),
@@ -968,6 +977,7 @@ function makeLocalCommandHarness(input: {
       projection = next;
     },
     resolveRuntimePolicy,
+    prepareRootRunScope,
     createWorktree,
     open,
     writeIfRunCurrent,
@@ -1188,7 +1198,29 @@ effectIt.effect(
         },
       ]);
       expect(JSON.stringify(harness.events)).not.toContain("private git diagnostic");
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
+
+// A run whose scope was created at the real path its turn starts in keeps that scope without reading
+// the thread's scopes or looking up a path.
+effectIt.effect("keeps a scope created at the turn's real path without choosing it again", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      scopeAtRealPath: true,
+      previousTurn: { runStatus: "failed", turnStatus: "running", liveSession: false },
+    });
+
+    yield* harness.start;
+
+    expect(harness.startRootRun).toHaveBeenCalledOnce();
+    expect(harness.prepareRootRunScope).not.toHaveBeenCalled();
+    expect(
+      harness.getThreadRecords.mock.calls.filter(([, fields]) =>
+        fields.includes("checkpointScopes"),
+      ),
+    ).toEqual([]);
+  }),
 );
 
 effectIt.effect("recovers an abandoned failed turn before continuing its native conversation", () =>
@@ -1442,7 +1474,7 @@ effectIt.effect.each(["cleanup-first", "startup-first"])(
           runtimePolicy: expect.objectContaining({ cwd: worktreePath }),
         }),
       );
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
 effectIt.effect("reads current startup state after waiting for the workspace lease", () =>

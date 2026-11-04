@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -414,7 +415,7 @@ const adapterRow = <
           })),
           Effect.orDie,
         ),
-      ).pipe(Layer.provide(NodeServices.layer));
+      ).pipe(Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
       // As in the server: sessions find the pool and the line offloads in their context.
       const services = yield* Layer.build(
         Layer.mergeAll(
@@ -468,7 +469,11 @@ const adapterRow = <
         row.freshIds === true,
       );
       return { capture, pool: use };
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.orDie),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+      Effect.orDie,
+    ),
 });
 
 const replayHarness =
@@ -528,14 +533,15 @@ const claudeWireHarness = (services: Layer.Layer<ProviderIoServices>, input: Rep
           Layer.effect(
             ServerConfig.ServerConfig,
             makeReplayServerConfig(input.fixtureName).pipe(Effect.orDie),
-          ).pipe(Layer.provide(NodeServices.layer)),
+          ).pipe(Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
         ),
       ),
     );
     return {
       driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
       decodeTranscript: Effect.succeed,
-      makeProviderAdapterRegistryLayer: () => layerRegistry.pipe(Layer.orDie),
+      makeProviderAdapterRegistryLayer: () =>
+        layerRegistry.pipe(Layer.provide(NodeCrypto.layer), Layer.orDie),
     } satisfies OrchestratorV2ProviderReplayHarness<ProviderReplayTranscript, never>;
   }).pipe(Effect.orDie);
 

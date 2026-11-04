@@ -4,7 +4,7 @@ import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serve
 import { currentDesktopBootstrapToken } from "@t3tools/shared/desktopBootstrapToken";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
 import * as FileSystem from "effect/FileSystem";
@@ -15,6 +15,10 @@ import * as Schema from "effect/Schema";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import serverPackageJson from "../../../server/package.json" with { type: "json" };
+import {
+  INHERITED_NODE_OPTIONS_ENV,
+  serverChildEnvironment,
+} from "@t3tools/shared/youngGenerationEnv";
 
 import * as DesktopBackendManager from "./DesktopBackendManager.ts";
 import * as DesktopCliShim from "../app/DesktopCliShim.ts";
@@ -118,6 +122,21 @@ const WSL_SERVER_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 const nodeBinDirOf = (nodePath: string): string => {
   const lastSlash = nodePath.lastIndexOf("/");
   return lastSlash > 0 ? nodePath.slice(0, lastSlash) : "/usr/bin";
+};
+
+/** The backend's young-generation cap, with the marker that gives its children the desktop's own NODE_OPTIONS. */
+const youngGenerationEnv = (): {
+  readonly NODE_OPTIONS: string | undefined;
+  readonly [INHERITED_NODE_OPTIONS_ENV]: string | undefined;
+} => {
+  const given = serverChildEnvironment({
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    T3CODE_V8_MAX_SEMI_SPACE_MB: process.env.T3CODE_V8_MAX_SEMI_SPACE_MB,
+  });
+  return {
+    NODE_OPTIONS: given.NODE_OPTIONS,
+    [INHERITED_NODE_OPTIONS_ENV]: given[INHERITED_NODE_OPTIONS_ENV],
+  };
 };
 
 const backendChildEnvPatch = (): Record<string, string | undefined> =>
@@ -531,6 +550,7 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       cwd: environment.backendCwd,
       env: {
         ...backendChildEnvPatch(),
+        ...youngGenerationEnv(),
         ELECTRON_RUN_AS_NODE: "1",
         T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING: "1",
         T3CODE_CLI_PATH: Option.getOrUndefined(input.cliPath),
@@ -692,6 +712,9 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
     runtime.kind === "executable"
       ? `${WSL_SERVER_SYSTEM_PATH}:${preflight.resolvedPath}`
       : `${nodeBinDirOf(runtime.nodePath)}:${WSL_SERVER_SYSTEM_PATH}:${preflight.resolvedPath}`;
+  // The WSL backend gets nothing from the young-generation default: the Linux
+  // executable has the cap built in, the node fallback runs Node's default, and the bootstrap
+  // descriptor rules a relaunch out either way.
   const command =
     runtime.kind === "executable"
       ? [runtime.entryPath]
@@ -723,14 +746,14 @@ export const make = Effect.gen(function* () {
   const wslEnvironment = yield* DesktopWslEnvironment.DesktopWslEnvironment;
   const wslServerTree = yield* DesktopWslServerTree.DesktopWslServerTree;
   const settings = yield* DesktopAppSettings.DesktopAppSettings;
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
   // Random generation yields; serialize it so concurrent backends cannot capture distinct bootstrap secrets.
   const secretRef = yield* SynchronizedRef.make(Option.none<string>());
   const getOrCreateBootstrapSecret = SynchronizedRef.modifyEffect(secretRef, (current) =>
     Option.match(current, {
       onSome: (secret) => Effect.succeed([secret, current] as const),
       onNone: () =>
-        crypto.randomBytes(32).pipe(
+        random.randomBytes(32).pipe(
           Effect.map((bytes) => {
             const secret = Hex.encode(bytes);
             return [secret, Option.some(secret)] as const;

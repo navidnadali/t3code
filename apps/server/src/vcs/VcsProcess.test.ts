@@ -437,6 +437,257 @@ describe("VcsProcess.run", () => {
     }),
   );
 
+  it.effect("a slow forge call never delays a git command", () =>
+    Effect.gen(function* () {
+      const forgeGate = yield* Deferred.make<void>();
+      const gitGate = yield* Deferred.make<void>();
+      const gitStarts = yield* Queue.unbounded<void>();
+      const forgeStarts = yield* Queue.unbounded<void>();
+      // A small machine: git's pool is the floor of 8, so forge calls holding git permits would show.
+      const service = yield* VcsProcess.makeWith({ parallelism: 8, cpuQuota: null }).pipe(
+        Effect.provideService(
+          ProcessRunner.ProcessRunner,
+          ProcessRunner.ProcessRunner.of({
+            run: (input) =>
+              Effect.gen(function* () {
+                if (input.command === "git") {
+                  yield* Queue.offer(gitStarts, undefined);
+                  yield* Deferred.await(gitGate);
+                } else {
+                  yield* Queue.offer(forgeStarts, undefined);
+                  yield* Deferred.await(forgeGate);
+                }
+                return {
+                  stdout: "",
+                  stderr: "",
+                  code: ChildProcessSpawner.ExitCode(0),
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                };
+              }),
+          }),
+        ),
+      );
+
+      // Forge calls fill their own pool and stay there (a merge-request detail can take 30 s).
+      const forgeRuns = yield* Effect.forEach(Array.from({ length: 12 }), () =>
+        service
+          .run({
+            operation: "GitLabPullRequestCli.getMergeRequestDetail",
+            command: "glab",
+            args: ["mr", "view", "1"],
+            cwd: "/workspace",
+          })
+          .pipe(Effect.forkChild({ startImmediately: true })),
+      );
+      // The forge pool is full (its four permits taken) before any git command is asked for.
+      yield* Effect.all(Array.from({ length: 4 }, () => Queue.take(forgeStarts)));
+      // Meanwhile eight checkpoint commands must all start: forge calls hold no git permit.
+      const gitRuns = yield* Effect.forEach(Array.from({ length: 8 }), () =>
+        service
+          .run({
+            ...baseInput,
+            operation: VcsProcess.CHECKPOINT_CAPTURE_OPERATION,
+            args: ["rev-parse", "HEAD"],
+          })
+          .pipe(Effect.forkChild({ startImmediately: true })),
+      );
+      const allStarted = yield* Effect.all(
+        Array.from({ length: 8 }, () => Queue.take(gitStarts)),
+      ).pipe(Effect.timeoutOption("1 second"), Effect.forkChild({ startImmediately: true }));
+      yield* TestClock.adjust("1 second");
+      const started = yield* Fiber.join(allStarted);
+
+      yield* Deferred.succeed(gitGate, undefined);
+      yield* Deferred.succeed(forgeGate, undefined);
+      yield* Fiber.joinAll([...gitRuns, ...forgeRuns]);
+      expect(Option.isSome(started), "git commands waited behind forge CLI runs").toBe(true);
+    }),
+  );
+
+  it.effect("git concurrency follows the machine's parallelism", () =>
+    Effect.gen(function* () {
+      // A quarter of the cores, between 8 and 32: 8 on small machines, 16 on a 64-core host.
+      expect(VcsProcess.gitProcessConcurrency(2, null)).toBe(8);
+      expect(VcsProcess.gitProcessConcurrency(16, null)).toBe(8);
+      expect(VcsProcess.gitProcessConcurrency(64, null)).toBe(16);
+      expect(VcsProcess.gitProcessConcurrency(128, null)).toBe(32);
+      expect(VcsProcess.gitProcessConcurrency(256, null)).toBe(32);
+      expect(VcsProcess.gitProcessConcurrency(64, 48)).toBe(12);
+      expect(VcsProcess.gitProcessConcurrency(64, 3)).toBe(8);
+
+      const gate = yield* Deferred.make<void>();
+      const starts = yield* Queue.unbounded<void>();
+      const active = yield* Ref.make(0);
+      const peak = yield* Ref.make(0);
+      const service = yield* VcsProcess.makeWith({ parallelism: 64, cpuQuota: null }).pipe(
+        Effect.provideService(
+          ProcessRunner.ProcessRunner,
+          ProcessRunner.ProcessRunner.of({
+            run: () =>
+              Effect.gen(function* () {
+                const count = yield* Ref.updateAndGet(active, (held) => held + 1);
+                yield* Ref.update(peak, (held) => Math.max(held, count));
+                yield* Queue.offer(starts, undefined);
+                yield* Deferred.await(gate);
+                return {
+                  stdout: "",
+                  stderr: "",
+                  code: ChildProcessSpawner.ExitCode(0),
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                };
+              }).pipe(Effect.ensuring(Ref.update(active, (count) => count - 1))),
+          }),
+        ),
+      );
+      const burst = yield* Effect.all(
+        Array.from({ length: 40 }, () => service.run(baseInput)),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.forkChild);
+      yield* Effect.all(Array.from({ length: 16 }, () => Queue.take(starts)));
+      yield* Effect.yieldNow;
+      expect(yield* Queue.size(starts)).toBe(0);
+      expect(yield* Ref.get(peak)).toBe(16);
+      yield* Deferred.succeed(gate, undefined);
+      yield* Fiber.join(burst);
+      expect(yield* Ref.get(peak)).toBe(16);
+    }),
+  );
+
+  it.effect("reads the CPU quota of the process's own cgroup, and the tightest ancestor's", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-cgroup-" });
+      const write = (relative: string, content: string) =>
+        fileSystem
+          .makeDirectory(path.dirname(path.join(root, relative)), { recursive: true })
+          .pipe(Effect.andThen(fileSystem.writeFileString(path.join(root, relative), content)));
+      // The mounts are discovered, not assumed: cgroup2 here sits at a hybrid layout's `unified`,
+      // and the v1 cpu controller's mount is named in another order than the membership lists.
+      const mounts = [
+        `36 35 0:30 / ${path.join(root, "sys", "unified")} rw,nosuid - cgroup2 cgroup2 rw`,
+        `37 35 0:31 / ${path.join(root, "sys", "cpu,cpuacct")} rw,nosuid - cgroup cgroup rw,cpu,cpuacct`,
+        `38 35 0:32 / ${path.join(root, "sys", "memory")} rw,nosuid - cgroup cgroup rw,memory`,
+      ].join("\n");
+      yield* write("mountinfo", `${mounts}\n`);
+      const quota = (selfCgroup: string) =>
+        VcsProcess.cgroupCpuQuota({
+          mountinfo: path.join(root, "mountinfo"),
+          selfCgroup: path.join(root, selfCgroup),
+        });
+
+      // cgroup v2: a systemd service's quota sits in its own cgroup, the root has no cpu.max.
+      yield* write("sys/unified/system.slice/cpu.max", "max 100000\n");
+      yield* write("sys/unified/system.slice/t3.service/cpu.max", "1200000 100000\n");
+      yield* write("proc-v2", "0::/system.slice/t3.service\n");
+      expect(quota("proc-v2")).toBe(12);
+      // The tightest quota along the path applies.
+      yield* write("sys/unified/system.slice/cpu.max", "400000 100000\n");
+      expect(quota("proc-v2")).toBe(4);
+      // No quota anywhere on the path: unlimited.
+      yield* write("proc-root", "0::/\n");
+      expect(quota("proc-root")).toBeNull();
+      // cgroup v1 through the combined cpu,cpuacct controller mount, listed as cpuacct,cpu.
+      yield* write("sys/cpu,cpuacct/docker/abc/cpu.cfs_quota_us", "350000\n");
+      yield* write("sys/cpu,cpuacct/docker/abc/cpu.cfs_period_us", "100000\n");
+      yield* write("proc-v1", "3:cpuacct,cpu:/docker/abc\n2:memory:/docker/abc\n");
+      expect(quota("proc-v1")).toBe(3.5);
+      // A fractional quota is not rounded before sizing: 35.5 cores is still eight permits.
+      yield* write("sys/unified/system.slice/t3.service/cpu.max", "3550000 100000\n");
+      yield* write("sys/unified/system.slice/cpu.max", "max 100000\n");
+      expect(quota("proc-v2")).toBe(35.5);
+      expect(VcsProcess.gitProcessConcurrency(64, 35.5)).toBe(8);
+      // A cgroup path may itself contain a colon: everything after the second one is the path.
+      yield* write("sys/unified/system.slice/t3:colon.service/cpu.max", "600000 100000\n");
+      yield* write("proc-colon", "0::/system.slice/t3:colon.service\n");
+      expect(quota("proc-colon")).toBe(6);
+      // A process outside its cgroup namespace's root reports `..` segments: no limit is read from
+      // there, and nothing above the mount is ever read.
+      yield* write("sys/cpu.max", "100000 100000\n");
+      yield* write("proc-outside", "0::/../../outside\n");
+      expect(quota("proc-outside")).toBeNull();
+      // A mount whose root is a subtree (a container's cgroup mounted at /sys/fs/cgroup): the
+      // membership path is relative to the hierarchy, the files sit under the mount minus that root.
+      const tenant = [
+        `40 35 0:30 /tenant ${path.join(root, "sys", "tenant-unified")} rw,nosuid - cgroup2 cgroup2 rw`,
+        `41 35 0:31 /tenant ${path.join(root, "sys", "tenant-cpu")} rw,nosuid - cgroup cgroup rw,cpu,cpuacct`,
+      ].join("\n");
+      yield* write("mountinfo-tenant", `${tenant}\n`);
+      yield* write("sys/tenant-unified/t3.service/cpu.max", "1200000 100000\n");
+      yield* write("sys/tenant-unified/tenant/t3.service/cpu.max", "max 100000\n");
+      yield* write("proc-tenant", "0::/tenant/t3.service\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          mountinfo: path.join(root, "mountinfo-tenant"),
+          selfCgroup: path.join(root, "proc-tenant"),
+        }),
+      ).toBe(12);
+      yield* write("sys/tenant-cpu/t3.service/cpu.cfs_quota_us", "500000\n");
+      yield* write("sys/tenant-cpu/t3.service/cpu.cfs_period_us", "100000\n");
+      yield* write("proc-tenant-v1", "3:cpu,cpuacct:/tenant/t3.service\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          mountinfo: path.join(root, "mountinfo-tenant"),
+          selfCgroup: path.join(root, "proc-tenant-v1"),
+        }),
+      ).toBe(5);
+      // A membership outside the mount's root subtree is not under this mount at all.
+      yield* write("proc-elsewhere", "0::/other/t3.service\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          mountinfo: path.join(root, "mountinfo-tenant"),
+          selfCgroup: path.join(root, "proc-elsewhere"),
+        }),
+      ).toBeNull();
+      // A nested quota bounds the git pool: 128 cores under a 12-core quota is the floor of 8.
+      expect(VcsProcess.gitProcessConcurrency(128, 12)).toBe(8);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("names the pool a command waited for", () =>
+    Effect.gen(function* () {
+      const spans: Array<Tracer.NativeSpan> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: () =>
+            Effect.succeed({
+              stdout: "",
+              stderr: "",
+              code: ChildProcessSpawner.ExitCode(0),
+              timedOut: false,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              stdoutInvalidUtf8: false,
+              stderrInvalidUtf8: false,
+            }),
+        }),
+      );
+      yield* service.run(baseInput).pipe(Effect.withTracer(tracer));
+      yield* service
+        .run({ operation: "forge.test", command: "glab", args: ["mr", "list"], cwd: "/workspace" })
+        .pipe(Effect.withTracer(tracer));
+      const pools = spans
+        .filter((span) => span.name === "VcsProcess.run")
+        .map((span) => span.attributes.get("vcs.pool"));
+      expect(pools).toEqual(["git", "forge"]);
+    }),
+  );
+
   it.effect("keeps git from opening a folder laid out as a bare repository", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

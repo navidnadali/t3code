@@ -2,6 +2,16 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.6-perf.4 (2026-11-04)
+
+Hotfix: forge CLIs in their own pool, runs finish without waiting for PR refresh
+
+Upstream base: 12ec17ce4c64.
+
+- Forge CLIs (GitHub and GitLab) run in their own process pool; git's pool follows the machine's size.
+- A run finishes without waiting for its pull request refresh.
+- Bench parameters in tools/server-bench set to chosen defaults.
+
 ## v0.1.6-perf.3 (2026-11-04)
 
 Admission gate, encode-once fan-out and fewer git commands per turn

@@ -442,7 +442,9 @@ describe("VcsProcess.run", () => {
       const forgeGate = yield* Deferred.make<void>();
       const gitGate = yield* Deferred.make<void>();
       const gitStarts = yield* Queue.unbounded<void>();
-      const service = yield* VcsProcess.make.pipe(
+      const forgeStarts = yield* Queue.unbounded<void>();
+      // A small machine: git's pool is the floor of 8, so forge calls holding git permits would show.
+      const service = yield* VcsProcess.makeWith({ parallelism: 8, cpuQuota: null }).pipe(
         Effect.provideService(
           ProcessRunner.ProcessRunner,
           ProcessRunner.ProcessRunner.of({
@@ -452,6 +454,7 @@ describe("VcsProcess.run", () => {
                   yield* Queue.offer(gitStarts, undefined);
                   yield* Deferred.await(gitGate);
                 } else {
+                  yield* Queue.offer(forgeStarts, undefined);
                   yield* Deferred.await(forgeGate);
                 }
                 return {
@@ -480,6 +483,8 @@ describe("VcsProcess.run", () => {
           })
           .pipe(Effect.forkChild({ startImmediately: true })),
       );
+      // The forge pool is full (its four permits taken) before any git command is asked for.
+      yield* Effect.all(Array.from({ length: 4 }, () => Queue.take(forgeStarts)));
       // Meanwhile eight checkpoint commands must all start: forge calls hold no git permit.
       const gitRuns = yield* Effect.forEach(Array.from({ length: 8 }), () =>
         service
@@ -554,6 +559,56 @@ describe("VcsProcess.run", () => {
       yield* Fiber.join(burst);
       expect(yield* Ref.get(peak)).toBe(16);
     }),
+  );
+
+  it.effect("reads the CPU quota of the process's own cgroup, and the tightest ancestor's", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-cgroup-" });
+      const write = (relative: string, content: string) =>
+        fileSystem
+          .makeDirectory(path.dirname(path.join(root, relative)), { recursive: true })
+          .pipe(Effect.andThen(fileSystem.writeFileString(path.join(root, relative), content)));
+      // cgroup v2: a systemd service's quota sits in its own cgroup, the root has no cpu.max.
+      yield* write("sys/system.slice/cpu.max", "max 100000\n");
+      yield* write("sys/system.slice/t3.service/cpu.max", "1200000 100000\n");
+      yield* write("proc-v2", "0::/system.slice/t3.service\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          root: path.join(root, "sys"),
+          selfCgroup: path.join(root, "proc-v2"),
+        }),
+      ).toBe(12);
+      // The tightest quota along the path applies.
+      yield* write("sys/system.slice/cpu.max", "400000 100000\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          root: path.join(root, "sys"),
+          selfCgroup: path.join(root, "proc-v2"),
+        }),
+      ).toBe(4);
+      // No quota anywhere on the path: unlimited.
+      yield* write("proc-root", "0::/\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          root: path.join(root, "sys"),
+          selfCgroup: path.join(root, "proc-root"),
+        }),
+      ).toBeNull();
+      // cgroup v1 with the combined cpu,cpuacct controller mount.
+      yield* write("sys1/cpu,cpuacct/docker/abc/cpu.cfs_quota_us", "350000\n");
+      yield* write("sys1/cpu,cpuacct/docker/abc/cpu.cfs_period_us", "100000\n");
+      yield* write("proc-v1", "3:cpu,cpuacct:/docker/abc\n2:memory:/docker/abc\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          root: path.join(root, "sys1"),
+          selfCgroup: path.join(root, "proc-v1"),
+        }),
+      ).toBe(4);
+      // A nested quota bounds the git pool: 128 cores under a 12-core quota is the floor of 8.
+      expect(VcsProcess.gitProcessConcurrency(128, 12)).toBe(8);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("names the pool a command waited for", () =>

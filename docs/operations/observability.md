@@ -896,6 +896,46 @@ History reads each hold one of `T3CODE_SQLITE_READER_POOL` minus one permits, at
 before their read transaction until their rows are decoded, which bounds the history rows held at
 once. Waiting for a permit is not part of `db.lock_wait_ms`; waiting for a reader is.
 
+Orchestration effect workers. Turn starts, checkpoint captures, interrupts, steers, restarts, runtime
+request answers and title generation are outbox effects that `T3CODE_EFFECT_WORKERS` (`1` to `256`,
+default `4`) fibers claim and run, one effect per thread at a time, so this is how many threads can be
+starting a turn at once. The default stays at 4 whatever the host: a turn start's history reads hold
+reader permits (three with the default reader pool) and are decoded on the main thread, and on the
+bench more workers than that moved the queue from the outbox to the readers — at 50 sessions a gain,
+from about 120 sessions on every small read (thread shells, dispatch, thread switches) waited behind
+the extra turn starts and the heap grew with the history they held. Raise it only together with more
+read capacity and watch `db.lock_wait_ms`. The trace shows each effect's wait in `EffectWorker.runEffect`
+(`effect.type`, `effect.queue_wait_ms`, `effect.attempt`) and each git command's wait for one of the 8
+process slots in `VcsProcess.run` (`vcs.permit_wait_ms`); the server also exports the timer
+`t3_orchestration_effect_queue_wait` by `effect_type`.
+
+Effect admission. While the main thread's latency suffers, the workers leave the effects that start
+turn work — turn starts, restarted-run continuations, checkpoint captures and title generation — in the
+outbox beyond an allowance, so that user-facing work keeps its latency: interrupts, steers, runtime
+request answers, detaches, stops and cleanups are always claimed (behind an older effect of their own
+thread, as ever). The signal is the event loop's delay — the p99 of a 10 ms-resolution histogram over
+each second, or the sampler's own lateness when the histogram holds fewer than ten samples because
+a block spanned its ticks — not CPU time or
+event loop utilization: a loop can be busy for most of a second yet schedule interactive work
+promptly, and utilization counts every moment it is not idle. After two seconds at or above
+`T3CODE_EFFECT_ADMISSION_DELAY_MS` (default `40`; `0` turns the gate off; otherwise at least `30`, so
+that the reopen mark at three quarters stays above the histogram's resolution and an idle loop's
+delay) only half the workers, at least one, may run such effects, and after two seconds below three
+quarters of that delay
+all of them may again. With one worker no gate is built: the saturated allowance equals the worker
+count, so it could change nothing. The histogram and its 1 Hz sampler run only while the gate can act — from the
+saturated allowance's worth of such effects in flight until the gate is open with fewer — so an idle
+server or a single session pays no wake-ups for it; the price is that the first close after the
+sampler starts takes its two samples from then. Effects already running are never stopped, a slot
+counts against the allowance for ten minutes at most (a safety valve against hung starts, well past
+the slow tail of production turn starts, which average about 92 s — not a tuning value), the last
+slot given back wakes one idle worker — after its claim took work, gated
+or not, or when it expired; a claim that found nothing returns it without a wake-up — and a
+reopened gate wakes them all. The time an
+effect waited in the outbox is its queue wait (`effect.queue_wait_ms` on `EffectWorker.runEffect`,
+which also carries `effect.gated`; the timer `t3_orchestration_effect_queue_wait`), and each switch
+is logged ("Orchestration effect admission changed", with the delay that caused it).
+
 Provider I/O workers. `T3CODE_PROVIDER_IO_WORKERS` (`0` to `32`; unset or `0` is off) starts worker
 threads that parse long lines of Codex app-server and ACP agent output off the main thread and, for
 Codex, build their provider-log records. The main thread still reads and splits the output, decodes

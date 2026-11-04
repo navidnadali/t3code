@@ -32,6 +32,11 @@ import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import { DEFAULT_SLOW_SPAN_THRESHOLD_MS } from "../diagnostics/TraceDiagnostics.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
+import {
+  EFFECT_ADMISSION_MAX_DELAY_MS,
+  EFFECT_ADMISSION_MIN_DELAY_MS,
+  EFFECT_WORKER_MAX_CONCURRENCY,
+} from "../orchestration-v2/EffectWorker.ts";
 import { PROVIDER_IO_MAX_WORKERS } from "../provider/io/ProviderIoWorkerPool.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 
@@ -221,6 +226,19 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  effectWorkers: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: EFFECT_WORKER_MAX_CONCURRENCY })),
+    "T3CODE_EFFECT_WORKERS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  effectAdmissionDelayMs: Config.schema(
+    Schema.Int.check(
+      Schema.isBetween({ minimum: 0, maximum: EFFECT_ADMISSION_MAX_DELAY_MS }),
+      Schema.makeFilter((ms: number) => ms === 0 || ms >= EFFECT_ADMISSION_MIN_DELAY_MS, {
+        message: `T3CODE_EFFECT_ADMISSION_DELAY_MS must be 0 (off) or at least ${EFFECT_ADMISSION_MIN_DELAY_MS} ms: the gate reopens at three quarters the mark, which must stay above the 10 ms histogram resolution and an idle loop's delay`,
+      }),
+    ),
+    "T3CODE_EFFECT_ADMISSION_DELAY_MS",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
@@ -582,6 +600,10 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     ...(env.providerIoAcpOffloadMinChars === undefined
       ? {}
       : { providerIoAcpOffloadMinChars: env.providerIoAcpOffloadMinChars }),
+    ...(env.effectWorkers === undefined ? {} : { effectWorkers: env.effectWorkers }),
+    ...(env.effectAdmissionDelayMs === undefined
+      ? {}
+      : { effectAdmissionDelayMs: env.effectAdmissionDelayMs }),
     ...(env.providerIoClaudeSdk === undefined
       ? {}
       : { providerIoClaudeSdk: env.providerIoClaudeSdk }),

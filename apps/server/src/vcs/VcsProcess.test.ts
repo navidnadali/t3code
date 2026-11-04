@@ -12,6 +12,8 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
 import { ChildProcessSpawner } from "effect/process";
 
 import { VcsProcessExitError, VcsProcessSpawnError } from "@t3tools/contracts";
@@ -313,6 +315,70 @@ describe("VcsProcess.run", () => {
       yield* Fiber.join(burst);
       expect(yield* Ref.get(total)).toBe(32);
       expect(yield* Ref.get(peak)).toBe(4);
+    }),
+  );
+
+  it.effect("records only the wait for a process slot, not an earlier attempt's run time", () =>
+    Effect.gen(function* () {
+      const spans: Array<Tracer.NativeSpan> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      const firstStarted = yield* Deferred.make<void>();
+      const firstMayFinish = yield* Deferred.make<void>();
+      let attempts = 0;
+      const output = {
+        stdout: "",
+        timedOut: false,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        stdoutInvalidUtf8: false,
+        stderrInvalidUtf8: false,
+      };
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: () =>
+            Effect.gen(function* () {
+              attempts += 1;
+              if (attempts > 1) {
+                return { ...output, code: ChildProcessSpawner.ExitCode(0), stderr: "" };
+              }
+              yield* Deferred.succeed(firstStarted, undefined);
+              yield* Deferred.await(firstMayFinish);
+              return {
+                ...output,
+                code: ChildProcessSpawner.ExitCode(128),
+                stderr:
+                  "fatal: Unable to create '/workspace/.git/refs/heads/main.lock': File exists.",
+              };
+            }),
+        }),
+      );
+
+      const capture = yield* service
+        .run({
+          operation: VcsProcess.CHECKPOINT_CAPTURE_OPERATION,
+          command: "git",
+          args: ["commit", "--quiet", "-m", "checkpoint"],
+          cwd: "/workspace",
+        })
+        .pipe(Effect.withTracer(tracer), Effect.forkChild);
+      // The first attempt runs for ten seconds, fails with a transient lock error and is retried
+      // after the 75 ms backoff; the slot was free both times.
+      yield* Deferred.await(firstStarted);
+      yield* TestClock.adjust("10 seconds");
+      yield* Deferred.succeed(firstMayFinish, undefined);
+      yield* TestClock.adjust("75 millis");
+      const result = yield* Fiber.join(capture);
+
+      expect(result.exitCode).toBe(0);
+      expect(attempts).toBe(2);
+      const runSpan = spans.find((span) => span.name === "VcsProcess.run");
+      expect(runSpan?.attributes.get("vcs.permit_wait_ms")).toBe(0);
     }),
   );
 

@@ -979,6 +979,70 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect("accepts 1 to 256 orchestration effect workers and rejects any other count", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-effect-workers-" })),
+      );
+      const resolveWorkers = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.effectWorkers),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveWorkers({})).toBeUndefined();
+      expect(yield* resolveWorkers({ T3CODE_EFFECT_WORKERS: "1" })).toBe(1);
+      expect(yield* resolveWorkers({ T3CODE_EFFECT_WORKERS: "256" })).toBe(256);
+      for (const count of ["0", "257", "2.5"]) {
+        const error = yield* resolveWorkers({ T3CODE_EFFECT_WORKERS: count }).pipe(Effect.flip);
+        expect(String(error)).toContain('at ["T3CODE_EFFECT_WORKERS"]');
+      }
+    }),
+  );
+
+  it.effect(
+    "accepts an effect admission delay of 0 (off) or 30 to 60000 ms and rejects any other",
+    () =>
+      Effect.gen(function* () {
+        const baseDir = yield* FileSystem.FileSystem.pipe(
+          Effect.flatMap((fs) =>
+            fs.makeTempDirectoryScoped({ prefix: "t3-cli-effect-admission-" }),
+          ),
+        );
+        const resolve = (env: Record<string, string>) =>
+          resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+            Effect.map((config) => config.effectAdmissionDelayMs),
+            Effect.provide(
+              Layer.mergeAll(
+                ConfigProvider.layer(ConfigProvider.fromEnv({ env })),
+                NetService.layer,
+              ),
+            ),
+          );
+
+        expect(yield* resolve({})).toBeUndefined();
+        expect(yield* resolve({ T3CODE_EFFECT_ADMISSION_DELAY_MS: "0" })).toBe(0);
+        expect(yield* resolve({ T3CODE_EFFECT_ADMISSION_DELAY_MS: "30" })).toBe(30);
+        expect(yield* resolve({ T3CODE_EFFECT_ADMISSION_DELAY_MS: "40" })).toBe(40);
+        expect(yield* resolve({ T3CODE_EFFECT_ADMISSION_DELAY_MS: "60000" })).toBe(60000);
+        for (const value of ["60001", "-1", "2.5", "high"]) {
+          const error = yield* resolve({ T3CODE_EFFECT_ADMISSION_DELAY_MS: value }).pipe(
+            Effect.flip,
+          );
+          expect(String(error)).toContain('at ["T3CODE_EFFECT_ADMISSION_DELAY_MS"]');
+        }
+        // Below 30 ms the reopen mark at half would sit inside an idle loop's own delay.
+        for (const value of ["1", "29"]) {
+          const error = yield* resolve({ T3CODE_EFFECT_ADMISSION_DELAY_MS: value }).pipe(
+            Effect.flip,
+          );
+          expect(String(error)).toContain("must be 0 (off) or at least 30 ms");
+        }
+      }),
+  );
+
   it.effect("reads SQLite page cache and memory map sizes and refuses ones SQLite cannot use", () =>
     Effect.gen(function* () {
       const { join } = yield* Path.Path;

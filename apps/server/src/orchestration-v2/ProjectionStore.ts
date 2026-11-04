@@ -998,6 +998,8 @@ export function applyToProjection(
 type PayloadRow = {
   readonly payload_json: string;
 };
+/** A message row with its id, so a read can name its messages before decoding them. */
+type MessagePayloadRow = PayloadRow & { readonly message_id: string };
 
 type ShellPendingTurnItemRow = PayloadRow & {
   readonly thread_id: string;
@@ -3613,8 +3615,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               matchesNothing(filter?.messageIds, filter?.messageRoles, filter?.messageRunIds))
               ? Effect.succeed([])
               : window === undefined
-                ? sql<PayloadRow>`
-                SELECT payload_json FROM orchestration_v2_projection_messages
+                ? sql<MessagePayloadRow>`
+                SELECT payload_json, message_id FROM orchestration_v2_projection_messages
                 WHERE thread_id = ${threadId}
                   ${filter?.messageIds === undefined ? sql`` : sql`AND message_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageIds)}))`}
                   ${filter?.messageRoles === undefined ? sql`` : sql`AND role IN (SELECT value FROM json_each(${encodeIdList(filter.messageRoles)}))`}
@@ -3622,8 +3624,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   ${filter?.messageRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageRunIds)}))`}
                 ORDER BY created_at ASC, message_id ASC
               `
-                : sql<PayloadRow>`
-                SELECT payload_json FROM orchestration_v2_projection_messages AS message
+                : sql<MessagePayloadRow>`
+                SELECT payload_json, message_id FROM orchestration_v2_projection_messages AS message
                 WHERE message.thread_id = ${threadId}
                   AND (
                     message.message_id IN (
@@ -3740,6 +3742,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ],
           { concurrency: yield* NodeSqliteClient.readConcurrency },
         );
+        // A narrow read needs only its own messages' ordinals; a broad one keeps the plain read.
+        const loadedMessageIds =
+          filter?.messageIds === undefined &&
+          filter?.messageRunIds === undefined &&
+          (filter?.messageRoles === undefined ||
+            (filter.messageRoles.includes("user") && filter.messageRoles.includes("assistant")))
+            ? undefined
+            : messageRows.map((row) => row.message_id);
         // Fork migration 2 indexes exactly this expression, type list and json_valid term: changing
         // any, even the IN order, silently drops the index. ProjectionStore.test.ts asserts the plan.
         const messageOrdinalRows =
@@ -3749,6 +3759,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             FROM orchestration_v2_projection_turn_items
             WHERE thread_id = ${threadId} AND type IN ('user_message', 'assistant_message')
               AND json_valid(payload_json)
+              ${loadedMessageIds === undefined ? sql`` : sql`AND json_extract(payload_json, '$.messageId') IN (SELECT value FROM json_each(${encodeIdList(loadedMessageIds)}))`}
             GROUP BY json_extract(payload_json, '$.messageId')
           `
             : [];

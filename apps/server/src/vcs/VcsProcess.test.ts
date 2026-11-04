@@ -437,6 +437,159 @@ describe("VcsProcess.run", () => {
     }),
   );
 
+  it.effect("a slow forge call never delays a git command", () =>
+    Effect.gen(function* () {
+      const forgeGate = yield* Deferred.make<void>();
+      const gitGate = yield* Deferred.make<void>();
+      const gitStarts = yield* Queue.unbounded<void>();
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(
+          ProcessRunner.ProcessRunner,
+          ProcessRunner.ProcessRunner.of({
+            run: (input) =>
+              Effect.gen(function* () {
+                if (input.command === "git") {
+                  yield* Queue.offer(gitStarts, undefined);
+                  yield* Deferred.await(gitGate);
+                } else {
+                  yield* Deferred.await(forgeGate);
+                }
+                return {
+                  stdout: "",
+                  stderr: "",
+                  code: ChildProcessSpawner.ExitCode(0),
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                };
+              }),
+          }),
+        ),
+      );
+
+      // Forge calls fill their own pool and stay there (a merge-request detail can take 30 s).
+      const forgeRuns = yield* Effect.forEach(Array.from({ length: 12 }), () =>
+        service
+          .run({
+            operation: "GitLabPullRequestCli.getMergeRequestDetail",
+            command: "glab",
+            args: ["mr", "view", "1"],
+            cwd: "/workspace",
+          })
+          .pipe(Effect.forkChild({ startImmediately: true })),
+      );
+      // Meanwhile eight checkpoint commands must all start: forge calls hold no git permit.
+      const gitRuns = yield* Effect.forEach(Array.from({ length: 8 }), () =>
+        service
+          .run({
+            ...baseInput,
+            operation: VcsProcess.CHECKPOINT_CAPTURE_OPERATION,
+            args: ["rev-parse", "HEAD"],
+          })
+          .pipe(Effect.forkChild({ startImmediately: true })),
+      );
+      const allStarted = yield* Effect.all(
+        Array.from({ length: 8 }, () => Queue.take(gitStarts)),
+      ).pipe(Effect.timeoutOption("1 second"), Effect.forkChild({ startImmediately: true }));
+      yield* TestClock.adjust("1 second");
+      const started = yield* Fiber.join(allStarted);
+
+      yield* Deferred.succeed(gitGate, undefined);
+      yield* Deferred.succeed(forgeGate, undefined);
+      yield* Fiber.joinAll([...gitRuns, ...forgeRuns]);
+      expect(Option.isSome(started), "git commands waited behind forge CLI runs").toBe(true);
+    }),
+  );
+
+  it.effect("git concurrency follows the machine's parallelism", () =>
+    Effect.gen(function* () {
+      expect(VcsProcess.gitProcessConcurrency(2, null)).toBe(8);
+      expect(VcsProcess.gitProcessConcurrency(16, null)).toBe(16);
+      expect(VcsProcess.gitProcessConcurrency(64, null)).toBe(64);
+      expect(VcsProcess.gitProcessConcurrency(128, null)).toBe(64);
+      expect(VcsProcess.gitProcessConcurrency(64, 12)).toBe(12);
+      expect(VcsProcess.gitProcessConcurrency(64, 3)).toBe(8);
+
+      const gate = yield* Deferred.make<void>();
+      const starts = yield* Queue.unbounded<void>();
+      const active = yield* Ref.make(0);
+      const peak = yield* Ref.make(0);
+      const service = yield* VcsProcess.makeWith({ parallelism: 16, cpuQuota: null }).pipe(
+        Effect.provideService(
+          ProcessRunner.ProcessRunner,
+          ProcessRunner.ProcessRunner.of({
+            run: () =>
+              Effect.gen(function* () {
+                const count = yield* Ref.updateAndGet(active, (held) => held + 1);
+                yield* Ref.update(peak, (held) => Math.max(held, count));
+                yield* Queue.offer(starts, undefined);
+                yield* Deferred.await(gate);
+                return {
+                  stdout: "",
+                  stderr: "",
+                  code: ChildProcessSpawner.ExitCode(0),
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                };
+              }).pipe(Effect.ensuring(Ref.update(active, (count) => count - 1))),
+          }),
+        ),
+      );
+      const burst = yield* Effect.all(
+        Array.from({ length: 40 }, () => service.run(baseInput)),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.forkChild);
+      yield* Effect.all(Array.from({ length: 16 }, () => Queue.take(starts)));
+      yield* Effect.yieldNow;
+      expect(yield* Queue.size(starts)).toBe(0);
+      expect(yield* Ref.get(peak)).toBe(16);
+      yield* Deferred.succeed(gate, undefined);
+      yield* Fiber.join(burst);
+      expect(yield* Ref.get(peak)).toBe(16);
+    }),
+  );
+
+  it.effect("names the pool a command waited for", () =>
+    Effect.gen(function* () {
+      const spans: Array<Tracer.NativeSpan> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: () =>
+            Effect.succeed({
+              stdout: "",
+              stderr: "",
+              code: ChildProcessSpawner.ExitCode(0),
+              timedOut: false,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              stdoutInvalidUtf8: false,
+              stderrInvalidUtf8: false,
+            }),
+        }),
+      );
+      yield* service.run(baseInput).pipe(Effect.withTracer(tracer));
+      yield* service
+        .run({ operation: "forge.test", command: "glab", args: ["mr", "list"], cwd: "/workspace" })
+        .pipe(Effect.withTracer(tracer));
+      const pools = spans
+        .filter((span) => span.name === "VcsProcess.run")
+        .map((span) => span.attributes.get("vcs.pool"));
+      expect(pools).toEqual(["git", "forge"]);
+    }),
+  );
+
   it.effect("keeps git from opening a folder laid out as a bare repository", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

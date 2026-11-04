@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  ProjectId,
   RunId,
   ThreadId,
   type OrchestrationV2ThreadShell,
@@ -240,4 +241,41 @@ it.effect("replaces a still-running PR lookup when a newer turn finishes", () =>
     yield* Deferred.await(secondLookedUp);
     assert.strictEqual(lookups, 2);
   }).pipe(Effect.provide(layer));
+});
+
+// The observer's dependencies with the pull request service's after-turn refresh replaced.
+const afterTurnObserverLayer = (refreshAfterTurn: (projectId: ProjectId) => Effect.Effect<void>) =>
+  RunFinalization.layerObserver.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(WorkspaceEntries.WorkspaceEntries)({ refresh: () => Effect.void }),
+        Layer.mock(PullRequestService.PullRequestService)({ refreshAfterTurn }),
+        Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+      ),
+    ),
+  );
+
+it.effect("coalesces a burst of after-turn refreshes on one project into at most two", () => {
+  const projectId = ProjectId.make("project-burst");
+  const gate = Deferred.makeUnsafe<void>();
+  const refreshes: Array<ProjectId> = [];
+  return Effect.gen(function* () {
+    const observer = yield* RunFinalization.RunFinalizationObserver;
+    // Ten turns on the project finish while its first refresh waits on the forge.
+    const requests = yield* Effect.forEach(Array.from({ length: 10 }), () =>
+      observer.refreshAfterTurn(projectId).pipe(Effect.forkChild({ startImmediately: true })),
+    );
+    yield* Deferred.succeed(gate, undefined);
+    yield* Fiber.joinAll(requests);
+    // Let the background refreshes, and any re-run they owe, run out.
+    for (let step = 0; step < 50; step++) yield* Effect.yieldNow;
+    assert.deepEqual(refreshes, [projectId, projectId]);
+  }).pipe(
+    Effect.provide(
+      afterTurnObserverLayer((id) =>
+        Effect.sync(() => refreshes.push(id)).pipe(Effect.andThen(Deferred.await(gate))),
+      ),
+    ),
+  );
 });

@@ -82,7 +82,6 @@ const clientLaunchHarness = (input: {
             },
           }),
     }),
-    NodeCrypto.layer,
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
       environmentId: EnvironmentId.make("environment"),
       requestNamespace: "client:session-1",
@@ -171,7 +170,7 @@ const clientLaunchHarness = (input: {
         Layer.provide(NodeServices.layer),
       ),
     ),
-    Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
   return { projectId, modelSelection, projectDefaults, dependencies: layerDependencies };
 };

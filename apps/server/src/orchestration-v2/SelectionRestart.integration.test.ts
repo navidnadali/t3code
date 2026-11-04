@@ -514,6 +514,17 @@ it.live("Stop during a restart interrupts the turn the restart could not stop", 
         yield* worker.drain();
         yield* Fiber.join(running);
         const runId = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!.id;
+        // The harness's daemon worker may claim the Stop before drain does, so drain can return
+        // while it still runs; the turn's interruption is the end to wait for.
+        const interrupted = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "provider-turn.updated" && event.payload.status === "interrupted",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped({ startImmediately: true }),
+        );
 
         yield* orchestrator.dispatch({
           type: "message.dispatch",
@@ -534,6 +545,7 @@ it.live("Stop during a restart interrupts the turn the restart could not stop", 
           runId,
         });
         yield* worker.drain();
+        yield* Fiber.join(interrupted).pipe(Effect.timeout("10 seconds"));
         return {
           projection: yield* orchestrator.getThreadProjection(threadId),
           captured: yield* Ref.get(state),

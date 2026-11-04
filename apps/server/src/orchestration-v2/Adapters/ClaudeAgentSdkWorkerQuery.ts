@@ -197,13 +197,34 @@ const answerJson = (call: ClaudeAgentSdkCallbackCall, value: unknown): string | 
 };
 
 // The SDK's error field for a callback that throws, as it writes it (an Error's message whatever its
-// type, else the error as a string), or undefined when it cannot and sends nothing. In-thread, a
-// rejection whose string form throws is also an unhandled rejection in the SDK; here it is not.
-const errorJson = (error: unknown): string | undefined => {
+// type, else the error as a string). One it cannot write escapes the SDK (0.3.284) as an unhandled
+// rejection that would end the worker, so that request fails with a clear error instead.
+const errorJson = (error: unknown): string => {
   try {
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
+  } catch (cause) {
+    try {
+      return JSON.stringify({ error: `${UNSENDABLE_ERROR}${unsendableReason(cause)}` });
+    } catch {
+      return UNSENDABLE_ERROR_JSON;
+    }
+  }
+};
+
+const UNSENDABLE_ERROR = "A T3 Code callback failed with an error that cannot be sent to Claude";
+const UNSENDABLE_ERROR_JSON = JSON.stringify({ error: UNSENDABLE_ERROR });
+const UNSENDABLE_REASON_CHARS = 1024;
+
+// Why JSON failed, when that can be read as text, cut to 1,024 characters; reading it must not throw.
+const unsendableReason = (cause: unknown) => {
+  try {
+    const message: unknown = cause instanceof Error ? cause.message : undefined;
+    if (typeof message !== "string") return "";
+    return message.length > UNSENDABLE_REASON_CHARS
+      ? `: ${message.slice(0, UNSENDABLE_REASON_CHARS)} [truncated]`
+      : `: ${message}`;
   } catch {
-    return undefined;
+    return "";
   }
 };
 
@@ -231,8 +252,8 @@ const STDOUT_BUFFER_BYTES = 1024 * 1024;
 // The SDK's close: end the CLI's input, SIGTERM after this grace, SIGKILL after the second wait.
 const CLOSE_GRACE = Duration.seconds(2);
 const CLOSE_KILL_AFTER = Duration.seconds(5);
-// The SDK's own error for a call once its transport has closed.
-const QUERY_ENDED = "ProcessTransport is not ready for writing";
+// The SDK's own error for a control call once its query has been cleaned up (SDK 0.3.284).
+const QUERY_ENDED = "Query closed before response received";
 // The signals the SDK sends its CLI; `kill` throws on an unknown name.
 const CLI_SIGNALS: ReadonlySet<string> = new Set(["SIGTERM", "SIGKILL", "SIGINT"]);
 

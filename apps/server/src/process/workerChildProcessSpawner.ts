@@ -17,10 +17,12 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Predicate from "effect/Predicate";
+import * as Redacted from "effect/Redacted";
 import * as Sink from "effect/Sink";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
+import * as CommandLine from "effect/process/CommandLine";
 import {
   type ChildProcessHandle,
   ChildProcessSpawner,
@@ -1408,11 +1410,47 @@ const openSpawnerProcess =
   };
 
 // Mirrors @effect/platform-node-shared's internal handleErrnoException, which the package does not export.
+// A Redacted word reaches only the child; errors show it as `<redacted>`, as Node's spawner does.
+const reveal = (word: CommandLine.Word): string =>
+  Redacted.isRedacted(word) ? Redacted.value(word) : word;
+
+const revealEnv = (
+  env: NonNullable<ChildProcess.CommandOptions["env"]>,
+): Record<string, string | undefined> =>
+  Object.fromEntries(
+    Object.entries(env).map(([name, value]) => [
+      name,
+      value === undefined ? undefined : reveal(value),
+    ]),
+  );
+
+// Node's own NUL check throws an error that holds the value, so NUL is refused before spawning.
+const findNulCharacter = (command: ChildProcess.StandardCommand): string | undefined => {
+  if (command.command.includes("\0")) return "The command contains a NUL character";
+  const index = command.args.findIndex((arg) => reveal(arg).includes("\0"));
+  if (index !== -1) return `Argument ${index + 1} contains a NUL character`;
+  for (const [name, value] of Object.entries(command.options.env ?? {})) {
+    if (value !== undefined && reveal(value).includes("\0")) {
+      return `The environment variable ${name} contains a NUL character`;
+    }
+  }
+  return undefined;
+};
+
 const toPlatformError = (
   method: string,
   error: NodeJS.ErrnoException,
   command: ChildProcess.StandardCommand,
 ): PlatformError.PlatformError => {
+  // Node copies the arguments into `spawnargs`.
+  if (command.args.some(Redacted.isRedacted)) {
+    Object.assign(error, {
+      spawnargs: [
+        command.command,
+        ...command.args.map((arg) => (Redacted.isRedacted(arg) ? "<redacted>" : arg)),
+      ],
+    });
+  }
   const reason: PlatformError.SystemErrorTag =
     error.code === "ENOENT"
       ? "NotFound"
@@ -1429,7 +1467,8 @@ const toPlatformError = (
     _tag: reason,
     module: "ChildProcess",
     method,
-    pathOrDescriptor: `${command.command} ${command.args.join(" ")}`,
+    // Windows commands always run on Node's spawner, so these are POSIX command lines.
+    pathOrDescriptor: CommandLine.display([command.command, ...command.args], { format: "posix" }),
     syscall: error.syscall,
     cause: error,
   });
@@ -1626,13 +1665,23 @@ const makeChildHandles = Effect.fnUntraced(function* () {
     command: ChildProcess.StandardCommand,
     backend: ChildBackend<C, E>,
   ) {
+    const nulCharacter = findNulCharacter(command);
+    if (nulCharacter !== undefined) {
+      return yield* PlatformError.badArgument({
+        module: "ChildProcess",
+        method: "spawn",
+        description: nulCharacter,
+      });
+    }
     const stdinConfig = resolveStdinOption(command.options);
     let isReferenced = true;
     const cwd = yield* resolveWorkingDirectory(command.options);
+    const commandEnv =
+      command.options.env === undefined ? undefined : revealEnv(command.options.env);
     // Node reads process.env at spawn time when env is unset; the worker's copy can be stale.
     const env = command.options.extendEnv
-      ? { ...globalThis.process.env, ...command.options.env }
-      : (command.options.env ?? { ...globalThis.process.env });
+      ? { ...globalThis.process.env, ...commandEnv }
+      : (commandEnv ?? { ...globalThis.process.env });
     const detached = command.options.detached ?? platform !== "win32";
     const spawnOptions = {
       cwd,
@@ -1746,7 +1795,7 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
   const relayed: ChildBackend<RemoteChild, never> = {
     start: (command, spawnOptions) =>
       Effect.callback<RemoteChild, PlatformError.PlatformError>((resume) => {
-        const child = host.spawn(command.command, command.args, spawnOptions, {
+        const child = host.spawn(command.command, command.args.map(reveal), spawnOptions, {
           onSpawn: () => resume(Effect.succeed(child)),
           onError: (error) => resume(Effect.fail(toPlatformError("spawn", error, command))),
           onThrow: (error) => resume(Effect.die(error)),
@@ -2062,7 +2111,7 @@ const makeHandoffSpawner = Effect.fnUntraced(function* (
         (resume) => {
           const child = host.spawnHandoff(
             command.command,
-            command.args,
+            command.args.map(reveal),
             { ...spawnOptions, stdio: ["ignore", "ignore", "ignore"] },
             { fds: [0, 1, 2] },
             {

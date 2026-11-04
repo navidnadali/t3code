@@ -43,6 +43,7 @@ export const PROVIDER_IO_STAGE_PROVIDERS: ReadonlySet<string> = new Set([
   "fx",
   "opencode",
   "antigravity",
+  "kiro",
   "pi",
   "muse",
   "acpRegistry",

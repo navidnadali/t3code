@@ -107,21 +107,40 @@ const readText = (file: string) => {
   }
 };
 
-// Mount points of cgroup2 and of the v1 mounts carrying the cpu controller, from mountinfo lines
-// `… <mount point> … - <fstype> <source> <super options>`.
+interface CgroupMount {
+  readonly mountPoint: string;
+  // The hierarchy subtree the mount shows (mountinfo's root field), as path segments.
+  readonly rootSegments: ReadonlyArray<string>;
+}
+
+const pathSegments = (value: string) => value.split("/").filter((segment) => segment.length > 0);
+
+// cgroup2 mounts and the v1 mounts carrying the cpu controller, from mountinfo lines
+// `… <root> <mount point> … - <fstype> <source> <super options>`.
 const cgroupMounts = (mountinfo: string) => {
-  const v2: string[] = [];
-  const v1Cpu: string[] = [];
+  const v2: CgroupMount[] = [];
+  const v1Cpu: CgroupMount[] = [];
   for (const line of mountinfo.split("\n")) {
     const separator = line.indexOf(" - ");
     if (separator === -1) continue;
-    const mountPoint = line.slice(0, separator).split(" ")[4];
+    const fields = line.slice(0, separator).split(" ");
     const [type, , options = ""] = line.slice(separator + 3).split(" ");
-    if (mountPoint === undefined) continue;
-    if (type === "cgroup2") v2.push(mountPoint);
-    else if (type === "cgroup" && options.split(",").includes("cpu")) v1Cpu.push(mountPoint);
+    const mountRoot = fields[3];
+    const mountPoint = fields[4];
+    if (mountRoot === undefined || mountPoint === undefined) continue;
+    const mount = { mountPoint, rootSegments: pathSegments(mountRoot) };
+    if (type === "cgroup2") v2.push(mount);
+    else if (type === "cgroup" && options.split(",").includes("cpu")) v1Cpu.push(mount);
   }
   return { v2, v1Cpu };
+};
+
+// Where a cgroup (a hierarchy path) sits under a mount that shows only its root subtree: the
+// path below the mount point, or null when the cgroup is outside that subtree.
+const cgroupDirectory = (mount: CgroupMount, segments: ReadonlyArray<string>) => {
+  const { rootSegments } = mount;
+  if (rootSegments.some((segment, index) => segments[index] !== segment)) return null;
+  return segments.slice(rootSegments.length);
 };
 
 /**
@@ -141,17 +160,16 @@ export const cgroupCpuQuota = (location: CgroupLocation = {}): number | null => 
     const second = first === -1 ? -1 : line.indexOf(":", first + 1);
     if (second === -1) continue;
     const controllers = line.slice(first + 1, second).split(",");
-    const segments = line
-      .slice(second + 1)
-      .split("/")
-      .filter((segment) => segment.length > 0);
+    const segments = pathSegments(line.slice(second + 1));
     // A process outside its cgroup namespace's root reports `..`: no limit is read from there.
     if (segments.includes("..")) continue;
     const isV2 = controllers.length === 1 && controllers[0] === "";
     if (!isV2 && !controllers.includes("cpu")) continue;
     for (const mount of isV2 ? mounts.v2 : mounts.v1Cpu) {
-      for (let depth = segments.length; depth >= 0; depth--) {
-        const directory = NodePath.join(mount, ...segments.slice(0, depth));
+      const below = cgroupDirectory(mount, segments);
+      if (below === null) continue;
+      for (let depth = below.length; depth >= 0; depth--) {
+        const directory = NodePath.join(mount.mountPoint, ...below.slice(0, depth));
         const cores = isV2
           ? parseCpuMax(readText(NodePath.join(directory, "cpu.max")))
           : parseCfs(

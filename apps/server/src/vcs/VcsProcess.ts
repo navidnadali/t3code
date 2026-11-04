@@ -93,11 +93,36 @@ export const gitProcessConcurrency = (parallelism: number, cpuQuota: number | nu
 };
 
 export interface CgroupLocation {
-  /** The cgroup filesystem root, /sys/fs/cgroup. */
-  readonly root?: string;
+  /** The mount table, /proc/self/mountinfo: where cgroup2 and the v1 cpu controller are mounted. */
+  readonly mountinfo?: string;
   /** The process's cgroup membership file, /proc/self/cgroup. */
   readonly selfCgroup?: string;
 }
+
+const readText = (file: string) => {
+  try {
+    return NodeFS.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+};
+
+// Mount points of cgroup2 and of the v1 mounts carrying the cpu controller, from mountinfo lines
+// `… <mount point> … - <fstype> <source> <super options>`.
+const cgroupMounts = (mountinfo: string) => {
+  const v2: string[] = [];
+  const v1Cpu: string[] = [];
+  for (const line of mountinfo.split("\n")) {
+    const separator = line.indexOf(" - ");
+    if (separator === -1) continue;
+    const mountPoint = line.slice(0, separator).split(" ")[4];
+    const [type, , options = ""] = line.slice(separator + 3).split(" ");
+    if (mountPoint === undefined) continue;
+    if (type === "cgroup2") v2.push(mountPoint);
+    else if (type === "cgroup" && options.split(",").includes("cpu")) v1Cpu.push(mountPoint);
+  }
+  return { v2, v1Cpu };
+};
 
 /**
  * The CPU quota in cores that applies to this process: the tightest `cpu.max` (cgroup v2) or
@@ -105,51 +130,53 @@ export interface CgroupLocation {
  * an ancestor's binds it too; null when none is enforced or the files cannot be read.
  */
 export const cgroupCpuQuota = (location: CgroupLocation = {}): number | null => {
-  const root = location.root ?? "/sys/fs/cgroup";
-  const read = (file: string) => {
-    try {
-      return NodeFS.readFileSync(file, "utf8").trim();
-    } catch {
-      return null;
-    }
-  };
-  const membership = read(location.selfCgroup ?? "/proc/self/cgroup");
-  if (membership === null) return null;
-  // Each line is hierarchy:controllers:path; v2 has one line with empty controllers.
+  const mountinfo = readText(location.mountinfo ?? "/proc/self/mountinfo");
+  const membership = readText(location.selfCgroup ?? "/proc/self/cgroup");
+  if (mountinfo === null || membership === null) return null;
+  const mounts = cgroupMounts(mountinfo);
   const quotas: Array<number> = [];
+  // Each line is hierarchy:controllers:path; the path may itself contain colons.
   for (const line of membership.split("\n")) {
-    const [, controllers, cgroupPath] = line.split(":");
-    if (cgroupPath === undefined) continue;
-    const isV2 = controllers === "";
-    if (!isV2 && !controllers!.split(",").includes("cpu")) continue;
-    const base = isV2 ? root : NodePath.join(root, controllers!);
-    const segments = cgroupPath.split("/").filter((segment) => segment.length > 0);
-    for (let depth = segments.length; depth >= 0; depth--) {
-      const directory = NodePath.join(base, ...segments.slice(0, depth));
-      const cores = isV2
-        ? parseCpuMax(read(NodePath.join(directory, "cpu.max")))
-        : parseCfs(
-            read(NodePath.join(directory, "cpu.cfs_quota_us")),
-            read(NodePath.join(directory, "cpu.cfs_period_us")),
-          );
-      if (cores !== null) quotas.push(cores);
+    const first = line.indexOf(":");
+    const second = first === -1 ? -1 : line.indexOf(":", first + 1);
+    if (second === -1) continue;
+    const controllers = line.slice(first + 1, second).split(",");
+    const segments = line
+      .slice(second + 1)
+      .split("/")
+      .filter((segment) => segment.length > 0);
+    // A process outside its cgroup namespace's root reports `..`: no limit is read from there.
+    if (segments.includes("..")) continue;
+    const isV2 = controllers.length === 1 && controllers[0] === "";
+    if (!isV2 && !controllers.includes("cpu")) continue;
+    for (const mount of isV2 ? mounts.v2 : mounts.v1Cpu) {
+      for (let depth = segments.length; depth >= 0; depth--) {
+        const directory = NodePath.join(mount, ...segments.slice(0, depth));
+        const cores = isV2
+          ? parseCpuMax(readText(NodePath.join(directory, "cpu.max")))
+          : parseCfs(
+              readText(NodePath.join(directory, "cpu.cfs_quota_us")),
+              readText(NodePath.join(directory, "cpu.cfs_period_us")),
+            );
+        if (cores !== null) quotas.push(cores);
+      }
     }
   }
-  return quotas.length === 0 ? null : Math.ceil(Math.min(...quotas));
+  return quotas.length === 0 ? null : Math.min(...quotas);
 };
 
 // "max 100000" is unlimited; "<quota> <period>" in microseconds.
 const parseCpuMax = (content: string | null): number | null => {
   if (content === null) return null;
-  const [quota, period] = content.split(/\s+/);
+  const [quota, period] = content.trim().split(/\s+/);
   if (quota === undefined || quota === "max") return null;
   const cores = Number(quota) / Number(period ?? "100000");
   return Number.isFinite(cores) && cores > 0 ? cores : null;
 };
 
 const parseCfs = (quota: string | null, period: string | null): number | null => {
-  const quotaUs = Number(quota ?? "-1");
-  const periodUs = Number(period ?? "100000");
+  const quotaUs = Number((quota ?? "-1").trim());
+  const periodUs = Number((period ?? "100000").trim());
   return quotaUs > 0 && periodUs > 0 ? quotaUs / periodUs : null;
 };
 

@@ -614,6 +614,39 @@ describe("VcsProcess.run", () => {
       yield* write("sys/cpu.max", "100000 100000\n");
       yield* write("proc-outside", "0::/../../outside\n");
       expect(quota("proc-outside")).toBeNull();
+      // A mount whose root is a subtree (a container's cgroup mounted at /sys/fs/cgroup): the
+      // membership path is relative to the hierarchy, the files sit under the mount minus that root.
+      const tenant = [
+        `40 35 0:30 /tenant ${path.join(root, "sys", "tenant-unified")} rw,nosuid - cgroup2 cgroup2 rw`,
+        `41 35 0:31 /tenant ${path.join(root, "sys", "tenant-cpu")} rw,nosuid - cgroup cgroup rw,cpu,cpuacct`,
+      ].join("\n");
+      yield* write("mountinfo-tenant", `${tenant}\n`);
+      yield* write("sys/tenant-unified/t3.service/cpu.max", "1200000 100000\n");
+      yield* write("sys/tenant-unified/tenant/t3.service/cpu.max", "max 100000\n");
+      yield* write("proc-tenant", "0::/tenant/t3.service\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          mountinfo: path.join(root, "mountinfo-tenant"),
+          selfCgroup: path.join(root, "proc-tenant"),
+        }),
+      ).toBe(12);
+      yield* write("sys/tenant-cpu/t3.service/cpu.cfs_quota_us", "500000\n");
+      yield* write("sys/tenant-cpu/t3.service/cpu.cfs_period_us", "100000\n");
+      yield* write("proc-tenant-v1", "3:cpu,cpuacct:/tenant/t3.service\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          mountinfo: path.join(root, "mountinfo-tenant"),
+          selfCgroup: path.join(root, "proc-tenant-v1"),
+        }),
+      ).toBe(5);
+      // A membership outside the mount's root subtree is not under this mount at all.
+      yield* write("proc-elsewhere", "0::/other/t3.service\n");
+      expect(
+        VcsProcess.cgroupCpuQuota({
+          mountinfo: path.join(root, "mountinfo-tenant"),
+          selfCgroup: path.join(root, "proc-elsewhere"),
+        }),
+      ).toBeNull();
       // A nested quota bounds the git pool: 128 cores under a 12-core quota is the floor of 8.
       expect(VcsProcess.gitProcessConcurrency(128, 12)).toBe(8);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

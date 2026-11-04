@@ -16,6 +16,7 @@ import type {
   ProviderDriver,
   ProviderUsageReaderEnv,
 } from "@t3tools/provider-core/server/driver";
+import { KiroDriver, type KiroDriverEnv } from "@t3tools/provider-kiro/server";
 import * as Effect from "effect/Effect";
 import { ChildProcessSpawner } from "effect/process";
 
@@ -29,6 +30,7 @@ export type BuiltInDriversEnv =
   | CursorDriverEnv
   | FxDriverEnv
   | GrokDriverEnv
+  | KiroDriverEnv
   | OpenCodeDriverEnv
   | PiDriverEnv
   | MuseDriverEnv;
@@ -69,6 +71,7 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
   FxDriver,
   launchedByServer(OpenCodeDriver),
   AntigravityDriver,
+  KiroDriver,
   launchedByServer(PiDriver),
   checkedByServer(MuseDriver),
   AcpRegistryDriver,

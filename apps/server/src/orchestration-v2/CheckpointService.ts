@@ -12,7 +12,7 @@ import {
 } from "@t3tools/contracts";
 import * as NodeFS from "node:fs";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -168,9 +168,9 @@ export class CheckpointServiceV2 extends Context.Service<
 
 export const checkpointRefForScopeOrdinal = Effect.fn("checkpointRefForScopeOrdinal")(
   function* (input: { readonly scopeId: CheckpointScopeId; readonly ordinalWithinScope: number }) {
-    const crypto = yield* Crypto.Crypto;
+    const crypto = yield* Digest.Digest;
     const digest = yield* crypto
-      .digest("SHA-256", new TextEncoder().encode(input.scopeId))
+      .digest(Digest.sha256, new TextEncoder().encode(input.scopeId))
       .pipe(Effect.orDie);
     const scopeKey = Hex.encode(digest).slice(0, 32);
     return CheckpointRef.make(
@@ -262,9 +262,9 @@ const makeRootRunScope = Effect.fn("CheckpointService.makeRootRunScope")(functio
       : rootScope === undefined || sameAsRoot
         ? ([rootScopeId, 0] as const)
         : yield* Effect.gen(function* () {
-            const crypto = yield* Crypto.Crypto;
+            const crypto = yield* Digest.Digest;
             const digest = yield* crypto
-              .digest("SHA-256", new TextEncoder().encode(workspace))
+              .digest(Digest.sha256, new TextEncoder().encode(workspace))
               .pipe(Effect.orDie);
             const workspaceScopeId = yield* input.idAllocator.allocate.checkpointScope({
               threadId: input.threadId,
@@ -327,15 +327,15 @@ function makeCheckpoint(input: {
 export const layer: Layer.Layer<
   CheckpointServiceV2,
   never,
-  CheckpointStore.CheckpointStore | Crypto.Crypto | IdAllocator.IdAllocatorV2 | Path.Path
+  CheckpointStore.CheckpointStore | Digest.Digest | IdAllocator.IdAllocatorV2 | Path.Path
 > = Layer.effect(
   CheckpointServiceV2,
   Effect.gen(function* () {
     const checkpointStore = yield* CheckpointStore.CheckpointStore;
     const path = yield* Path.Path;
-    const crypto = yield* Crypto.Crypto;
+    const crypto = yield* Digest.Digest;
     const checkpointRefFor = (input: Parameters<typeof checkpointRefForScopeOrdinal>[0]) =>
-      checkpointRefForScopeOrdinal(input).pipe(Effect.provideService(Crypto.Crypto, crypto));
+      checkpointRefForScopeOrdinal(input).pipe(Effect.provideService(Digest.Digest, crypto));
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const workspaceLocks = yield* KeyedLock.make<string>();
     const withWorkspaceLock = <A, E, R>(cwd: string, effect: Effect.Effect<A, E, R>) =>
@@ -660,7 +660,7 @@ export const layer: Layer.Layer<
           idAllocator,
           resolve: (cwd) => resolveWorkspaceNow(path, cwd),
         }).pipe(
-          Effect.provideService(Crypto.Crypto, crypto),
+          Effect.provideService(Digest.Digest, crypto),
           Effect.mapError(
             (cause) =>
               new CheckpointRootScopePrepareError({

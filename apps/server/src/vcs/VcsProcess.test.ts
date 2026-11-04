@@ -505,18 +505,20 @@ describe("VcsProcess.run", () => {
 
   it.effect("git concurrency follows the machine's parallelism", () =>
     Effect.gen(function* () {
+      // A quarter of the cores, between 8 and 32: 8 on small machines, 16 on a 64-core host.
       expect(VcsProcess.gitProcessConcurrency(2, null)).toBe(8);
-      expect(VcsProcess.gitProcessConcurrency(16, null)).toBe(16);
-      expect(VcsProcess.gitProcessConcurrency(64, null)).toBe(64);
-      expect(VcsProcess.gitProcessConcurrency(128, null)).toBe(64);
-      expect(VcsProcess.gitProcessConcurrency(64, 12)).toBe(12);
+      expect(VcsProcess.gitProcessConcurrency(16, null)).toBe(8);
+      expect(VcsProcess.gitProcessConcurrency(64, null)).toBe(16);
+      expect(VcsProcess.gitProcessConcurrency(128, null)).toBe(32);
+      expect(VcsProcess.gitProcessConcurrency(256, null)).toBe(32);
+      expect(VcsProcess.gitProcessConcurrency(64, 48)).toBe(12);
       expect(VcsProcess.gitProcessConcurrency(64, 3)).toBe(8);
 
       const gate = yield* Deferred.make<void>();
       const starts = yield* Queue.unbounded<void>();
       const active = yield* Ref.make(0);
       const peak = yield* Ref.make(0);
-      const service = yield* VcsProcess.makeWith({ parallelism: 16, cpuQuota: null }).pipe(
+      const service = yield* VcsProcess.makeWith({ parallelism: 64, cpuQuota: null }).pipe(
         Effect.provideService(
           ProcessRunner.ProcessRunner,
           ProcessRunner.ProcessRunner.of({

@@ -70,11 +70,13 @@ export class VcsProcess extends Context.Service<
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
-// Git is I/O plus short CPU, so one process per core keeps up without oversubscribing the spawner's
-// hand-off bound (max(2, cores)). The floor is upstream's constant (no slot wait at 26 commands/s on
-// the bench); past the ceiling the disk, not the CPU, bounds concurrent index copies.
+// A quarter of the cores, between 8 (upstream's constant: no slot wait at 26 commands/s on the
+// bench) and 32: git is I/O plus short CPU, and this leaves headroom for the host's other work,
+// since more git processes than it can run in parallel only move the queue from this semaphore
+// into the OS run queue, where it slows everything else on the box.
 const GIT_PROCESS_CONCURRENCY_FLOOR = 8;
-const GIT_PROCESS_CONCURRENCY_CEILING = 64;
+const GIT_PROCESS_CONCURRENCY_CEILING = 32;
+const GIT_PROCESS_CORES_SHARE = 4;
 // Forge CLIs (glab, gh, tea) are bounded for the remote's sake, not the machine's: each call is a
 // network conversation of seconds, more at once gains nothing and risks the API's rate limit. They
 // hold no git permit, so a forge call never delays a git command.
@@ -83,9 +85,9 @@ const FORGE_PROCESS_CONCURRENCY = 4;
 /** Git processes allowed at once on a machine with `parallelism` cores and a cgroup CPU quota. */
 export const gitProcessConcurrency = (parallelism: number, cpuQuota: number | null): number => {
   const cores = cpuQuota === null ? parallelism : Math.min(parallelism, cpuQuota);
-  return Math.min(
-    GIT_PROCESS_CONCURRENCY_CEILING,
-    Math.max(GIT_PROCESS_CONCURRENCY_FLOOR, Math.floor(cores)),
+  return Math.max(
+    GIT_PROCESS_CONCURRENCY_FLOOR,
+    Math.min(GIT_PROCESS_CONCURRENCY_CEILING, Math.floor(cores / GIT_PROCESS_CORES_SHARE)),
   );
 };
 

@@ -1,4 +1,9 @@
 import * as Clock from "effect/Clock";
+// @effect-diagnostics nodeBuiltinImport:off - the git pool is sized from the machine (os) and its cgroup CPU quota (fs).
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -66,11 +71,137 @@ export class VcsProcess extends Context.Service<
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
-// Eight git processes at once suffice: the bench measured no wait for a slot at up to 26 git
-// commands/s (170 sessions, and the 1 s turn-gap profile); `vcs.permit_wait_ms` shows any wait.
-const VCS_PROCESS_CONCURRENCY = 8;
-// Forge CLIs can take seconds per call; cap them together so git, checkpoints included, keeps slots.
-const NON_GIT_PROCESS_CONCURRENCY = VCS_PROCESS_CONCURRENCY / 2;
+// A quarter of the cores, between 8 (upstream's constant: no slot wait at 26 commands/s on the
+// bench) and 32: git is I/O plus short CPU, and this leaves headroom for the host's other work,
+// since more git processes than it can run in parallel only move the queue from this semaphore
+// into the OS run queue, where it slows everything else on the box.
+const GIT_PROCESS_CONCURRENCY_FLOOR = 8;
+const GIT_PROCESS_CONCURRENCY_CEILING = 32;
+const GIT_PROCESS_CORES_SHARE = 4;
+// Forge CLIs (glab, gh, tea) are bounded for the remote's sake, not the machine's: each call is a
+// network conversation of seconds, more at once gains nothing and risks the API's rate limit. They
+// hold no git permit, so a forge call never delays a git command.
+const FORGE_PROCESS_CONCURRENCY = 4;
+
+/** Git processes allowed at once on a machine with `parallelism` cores and a cgroup CPU quota. */
+export const gitProcessConcurrency = (parallelism: number, cpuQuota: number | null): number => {
+  const cores = cpuQuota === null ? parallelism : Math.min(parallelism, cpuQuota);
+  return Math.max(
+    GIT_PROCESS_CONCURRENCY_FLOOR,
+    Math.min(GIT_PROCESS_CONCURRENCY_CEILING, Math.floor(cores / GIT_PROCESS_CORES_SHARE)),
+  );
+};
+
+export interface CgroupLocation {
+  /** The mount table, /proc/self/mountinfo: where cgroup2 and the v1 cpu controller are mounted. */
+  readonly mountinfo?: string;
+  /** The process's cgroup membership file, /proc/self/cgroup. */
+  readonly selfCgroup?: string;
+}
+
+const readText = (file: string) => {
+  try {
+    return NodeFS.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+};
+
+interface CgroupMount {
+  readonly mountPoint: string;
+  // The hierarchy subtree the mount shows (mountinfo's root field), as path segments.
+  readonly rootSegments: ReadonlyArray<string>;
+}
+
+const pathSegments = (value: string) => value.split("/").filter((segment) => segment.length > 0);
+
+// cgroup2 mounts and the v1 mounts carrying the cpu controller, from mountinfo lines
+// `… <root> <mount point> … - <fstype> <source> <super options>`.
+const cgroupMounts = (mountinfo: string) => {
+  const v2: CgroupMount[] = [];
+  const v1Cpu: CgroupMount[] = [];
+  for (const line of mountinfo.split("\n")) {
+    const separator = line.indexOf(" - ");
+    if (separator === -1) continue;
+    const fields = line.slice(0, separator).split(" ");
+    const [type, , options = ""] = line.slice(separator + 3).split(" ");
+    const mountRoot = fields[3];
+    const mountPoint = fields[4];
+    if (mountRoot === undefined || mountPoint === undefined) continue;
+    const mount = { mountPoint, rootSegments: pathSegments(mountRoot) };
+    if (type === "cgroup2") v2.push(mount);
+    else if (type === "cgroup" && options.split(",").includes("cpu")) v1Cpu.push(mount);
+  }
+  return { v2, v1Cpu };
+};
+
+// Where a cgroup (a hierarchy path) sits under a mount that shows only its root subtree: the
+// path below the mount point, or null when the cgroup is outside that subtree.
+const cgroupDirectory = (mount: CgroupMount, segments: ReadonlyArray<string>) => {
+  const { rootSegments } = mount;
+  if (rootSegments.some((segment, index) => segments[index] !== segment)) return null;
+  return segments.slice(rootSegments.length);
+};
+
+/**
+ * The CPU quota in cores that applies to this process: the tightest `cpu.max` (cgroup v2) or
+ * cfs quota (v1) along its own cgroup path, since a service's limit sits in its own cgroup and
+ * an ancestor's binds it too; null when none is enforced or the files cannot be read.
+ */
+export const cgroupCpuQuota = (location: CgroupLocation = {}): number | null => {
+  const mountinfo = readText(location.mountinfo ?? "/proc/self/mountinfo");
+  const membership = readText(location.selfCgroup ?? "/proc/self/cgroup");
+  if (mountinfo === null || membership === null) return null;
+  const mounts = cgroupMounts(mountinfo);
+  const quotas: Array<number> = [];
+  // Each line is hierarchy:controllers:path; the path may itself contain colons.
+  for (const line of membership.split("\n")) {
+    const first = line.indexOf(":");
+    const second = first === -1 ? -1 : line.indexOf(":", first + 1);
+    if (second === -1) continue;
+    const controllers = line.slice(first + 1, second).split(",");
+    const segments = pathSegments(line.slice(second + 1));
+    // A process outside its cgroup namespace's root reports `..`: no limit is read from there.
+    if (segments.includes("..")) continue;
+    const isV2 = controllers.length === 1 && controllers[0] === "";
+    if (!isV2 && !controllers.includes("cpu")) continue;
+    for (const mount of isV2 ? mounts.v2 : mounts.v1Cpu) {
+      const below = cgroupDirectory(mount, segments);
+      if (below === null) continue;
+      for (let depth = below.length; depth >= 0; depth--) {
+        const directory = NodePath.join(mount.mountPoint, ...below.slice(0, depth));
+        const cores = isV2
+          ? parseCpuMax(readText(NodePath.join(directory, "cpu.max")))
+          : parseCfs(
+              readText(NodePath.join(directory, "cpu.cfs_quota_us")),
+              readText(NodePath.join(directory, "cpu.cfs_period_us")),
+            );
+        if (cores !== null) quotas.push(cores);
+      }
+    }
+  }
+  return quotas.length === 0 ? null : Math.min(...quotas);
+};
+
+// "max 100000" is unlimited; "<quota> <period>" in microseconds.
+const parseCpuMax = (content: string | null): number | null => {
+  if (content === null) return null;
+  const [quota, period] = content.trim().split(/\s+/);
+  if (quota === undefined || quota === "max") return null;
+  const cores = Number(quota) / Number(period ?? "100000");
+  return Number.isFinite(cores) && cores > 0 ? cores : null;
+};
+
+const parseCfs = (quota: string | null, period: string | null): number | null => {
+  const quotaUs = Number((quota ?? "-1").trim());
+  const periodUs = Number((period ?? "100000").trim());
+  return quotaUs > 0 && periodUs > 0 ? quotaUs / periodUs : null;
+};
+
+export interface VcsProcessPools {
+  readonly parallelism?: number;
+  readonly cpuQuota?: number | null;
+}
 
 /** Shown to users when a Git command fails because another process holds the index lock. */
 export const GIT_INDEX_LOCKED_DETAIL =
@@ -185,11 +316,16 @@ const canRetryFullFsync = (stderr: string) =>
   /fsync error on [^\r\n]+: operation not supported\r?$/im.test(stderr) ||
   /cannot update ref [^\r\n]+: couldn't write '[^\r\n]+\.lock'\r?$/im.test(stderr);
 
-export const make = Effect.gen(function* () {
+export const makeWith = Effect.fn("VcsProcess.makeWith")(function* (pools: VcsProcessPools) {
   const processRunner = yield* ProcessRunner.ProcessRunner;
   const hostPlatform = yield* HostProcess.Platform;
-  const vcsProcesses = yield* Semaphore.make(VCS_PROCESS_CONCURRENCY);
-  const nonGitProcesses = yield* Semaphore.make(NON_GIT_PROCESS_CONCURRENCY);
+  const gitProcesses = yield* Semaphore.make(
+    gitProcessConcurrency(
+      pools.parallelism ?? NodeOS.availableParallelism(),
+      pools.cpuQuota === undefined ? cgroupCpuQuota() : pools.cpuQuota,
+    ),
+  );
+  const forgeProcesses = yield* Semaphore.make(FORGE_PROCESS_CONCURRENCY);
   const keyedProcesses = new Map<string, Semaphore.Semaphore>();
   const keyedPermit = (concurrency: NonNullable<VcsProcessInput["concurrency"]>) => {
     let semaphore = keyedProcesses.get(concurrency.key);
@@ -352,13 +488,19 @@ export const make = Effect.gen(function* () {
   });
 
   const run = Effect.fn("VcsProcess.run")(function* (input: VcsProcessInput) {
-    // Time waiting for a slot, keyed and shared, summed over retries; a retry times only its own wait.
+    // Each command waits only for its own pool: git's, sized by the machine, or the forge CLIs'.
+    const pool =
+      input.command === "git"
+        ? { name: "git", processes: gitProcesses }
+        : { name: "forge", processes: forgeProcesses };
+    yield* Effect.annotateCurrentSpan("vcs.pool", pool.name);
+    // Time waiting for a slot, keyed and pooled, summed over retries; a retry times only its own wait.
     let permitWaitMs = 0;
     let queuedAtMs: number | undefined = yield* Clock.currentTimeMillis;
     const bounded = Effect.gen(function* () {
       const attemptQueuedAtMs = queuedAtMs ?? (yield* Clock.currentTimeMillis);
       queuedAtMs = undefined;
-      return yield* vcsProcesses.withPermits(1)(
+      return yield* pool.processes.withPermits(1)(
         Effect.gen(function* () {
           permitWaitMs += (yield* Clock.currentTimeMillis) - attemptQueuedAtMs;
           yield* Effect.annotateCurrentSpan("vcs.permit_wait_ms", permitWaitMs);
@@ -385,12 +527,15 @@ export const make = Effect.gen(function* () {
         }),
       );
     }
-    const shared = input.command === "git" ? bounded : nonGitProcesses.withPermits(1)(bounded);
-    return yield* input.concurrency === undefined ? shared : keyedPermit(input.concurrency)(shared);
+    return yield* input.concurrency === undefined
+      ? bounded
+      : keyedPermit(input.concurrency)(bounded);
   });
 
   return VcsProcess.of({ run });
 });
+
+export const make = makeWith({});
 
 // Fresh: a ProcessRunner provided around this one (a CLI's, a test's) may be built on Node's
 // spawner, and would otherwise be reused here and bypass the spawner the knobs choose.

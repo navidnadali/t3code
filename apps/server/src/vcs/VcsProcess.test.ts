@@ -570,42 +570,50 @@ describe("VcsProcess.run", () => {
         fileSystem
           .makeDirectory(path.dirname(path.join(root, relative)), { recursive: true })
           .pipe(Effect.andThen(fileSystem.writeFileString(path.join(root, relative), content)));
+      // The mounts are discovered, not assumed: cgroup2 here sits at a hybrid layout's `unified`,
+      // and the v1 cpu controller's mount is named in another order than the membership lists.
+      const mounts = [
+        `36 35 0:30 / ${path.join(root, "sys", "unified")} rw,nosuid - cgroup2 cgroup2 rw`,
+        `37 35 0:31 / ${path.join(root, "sys", "cpu,cpuacct")} rw,nosuid - cgroup cgroup rw,cpu,cpuacct`,
+        `38 35 0:32 / ${path.join(root, "sys", "memory")} rw,nosuid - cgroup cgroup rw,memory`,
+      ].join("\n");
+      yield* write("mountinfo", `${mounts}\n`);
+      const quota = (selfCgroup: string) =>
+        VcsProcess.cgroupCpuQuota({
+          mountinfo: path.join(root, "mountinfo"),
+          selfCgroup: path.join(root, selfCgroup),
+        });
+
       // cgroup v2: a systemd service's quota sits in its own cgroup, the root has no cpu.max.
-      yield* write("sys/system.slice/cpu.max", "max 100000\n");
-      yield* write("sys/system.slice/t3.service/cpu.max", "1200000 100000\n");
+      yield* write("sys/unified/system.slice/cpu.max", "max 100000\n");
+      yield* write("sys/unified/system.slice/t3.service/cpu.max", "1200000 100000\n");
       yield* write("proc-v2", "0::/system.slice/t3.service\n");
-      expect(
-        VcsProcess.cgroupCpuQuota({
-          root: path.join(root, "sys"),
-          selfCgroup: path.join(root, "proc-v2"),
-        }),
-      ).toBe(12);
+      expect(quota("proc-v2")).toBe(12);
       // The tightest quota along the path applies.
-      yield* write("sys/system.slice/cpu.max", "400000 100000\n");
-      expect(
-        VcsProcess.cgroupCpuQuota({
-          root: path.join(root, "sys"),
-          selfCgroup: path.join(root, "proc-v2"),
-        }),
-      ).toBe(4);
+      yield* write("sys/unified/system.slice/cpu.max", "400000 100000\n");
+      expect(quota("proc-v2")).toBe(4);
       // No quota anywhere on the path: unlimited.
       yield* write("proc-root", "0::/\n");
-      expect(
-        VcsProcess.cgroupCpuQuota({
-          root: path.join(root, "sys"),
-          selfCgroup: path.join(root, "proc-root"),
-        }),
-      ).toBeNull();
-      // cgroup v1 with the combined cpu,cpuacct controller mount.
-      yield* write("sys1/cpu,cpuacct/docker/abc/cpu.cfs_quota_us", "350000\n");
-      yield* write("sys1/cpu,cpuacct/docker/abc/cpu.cfs_period_us", "100000\n");
-      yield* write("proc-v1", "3:cpu,cpuacct:/docker/abc\n2:memory:/docker/abc\n");
-      expect(
-        VcsProcess.cgroupCpuQuota({
-          root: path.join(root, "sys1"),
-          selfCgroup: path.join(root, "proc-v1"),
-        }),
-      ).toBe(4);
+      expect(quota("proc-root")).toBeNull();
+      // cgroup v1 through the combined cpu,cpuacct controller mount, listed as cpuacct,cpu.
+      yield* write("sys/cpu,cpuacct/docker/abc/cpu.cfs_quota_us", "350000\n");
+      yield* write("sys/cpu,cpuacct/docker/abc/cpu.cfs_period_us", "100000\n");
+      yield* write("proc-v1", "3:cpuacct,cpu:/docker/abc\n2:memory:/docker/abc\n");
+      expect(quota("proc-v1")).toBe(3.5);
+      // A fractional quota is not rounded before sizing: 35.5 cores is still eight permits.
+      yield* write("sys/unified/system.slice/t3.service/cpu.max", "3550000 100000\n");
+      yield* write("sys/unified/system.slice/cpu.max", "max 100000\n");
+      expect(quota("proc-v2")).toBe(35.5);
+      expect(VcsProcess.gitProcessConcurrency(64, 35.5)).toBe(8);
+      // A cgroup path may itself contain a colon: everything after the second one is the path.
+      yield* write("sys/unified/system.slice/t3:colon.service/cpu.max", "600000 100000\n");
+      yield* write("proc-colon", "0::/system.slice/t3:colon.service\n");
+      expect(quota("proc-colon")).toBe(6);
+      // A process outside its cgroup namespace's root reports `..` segments: no limit is read from
+      // there, and nothing above the mount is ever read.
+      yield* write("sys/cpu.max", "100000 100000\n");
+      yield* write("proc-outside", "0::/../../outside\n");
+      expect(quota("proc-outside")).toBeNull();
       // A nested quota bounds the git pool: 128 cores under a 12-core quota is the floor of 8.
       expect(VcsProcess.gitProcessConcurrency(128, 12)).toBe(8);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

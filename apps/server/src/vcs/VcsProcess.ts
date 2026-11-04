@@ -1,4 +1,8 @@
 import * as Clock from "effect/Clock";
+// @effect-diagnostics nodeBuiltinImport:off - the git pool is sized from the machine (os) and its cgroup CPU quota (fs).
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -66,11 +70,51 @@ export class VcsProcess extends Context.Service<
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
-// Eight git processes at once suffice: the bench measured no wait for a slot at up to 26 git
-// commands/s (170 sessions, and the 1 s turn-gap profile); `vcs.permit_wait_ms` shows any wait.
-const VCS_PROCESS_CONCURRENCY = 8;
-// Forge CLIs can take seconds per call; cap them together so git, checkpoints included, keeps slots.
-const NON_GIT_PROCESS_CONCURRENCY = VCS_PROCESS_CONCURRENCY / 2;
+// Git is I/O plus short CPU, so one process per core keeps up without oversubscribing the spawner's
+// hand-off bound (max(2, cores)). The floor is upstream's constant (no slot wait at 26 commands/s on
+// the bench); past the ceiling the disk, not the CPU, bounds concurrent index copies.
+const GIT_PROCESS_CONCURRENCY_FLOOR = 8;
+const GIT_PROCESS_CONCURRENCY_CEILING = 64;
+// Forge CLIs (glab, gh, tea) are bounded for the remote's sake, not the machine's: each call is a
+// network conversation of seconds, more at once gains nothing and risks the API's rate limit. They
+// hold no git permit, so a forge call never delays a git command.
+const FORGE_PROCESS_CONCURRENCY = 4;
+
+/** Git processes allowed at once on a machine with `parallelism` cores and a cgroup CPU quota. */
+export const gitProcessConcurrency = (parallelism: number, cpuQuota: number | null): number => {
+  const cores = cpuQuota === null ? parallelism : Math.min(parallelism, cpuQuota);
+  return Math.min(
+    GIT_PROCESS_CONCURRENCY_CEILING,
+    Math.max(GIT_PROCESS_CONCURRENCY_FLOOR, Math.floor(cores)),
+  );
+};
+
+// The container's CPU quota in cores (cgroup v2 `cpu.max`, else v1 cfs files); null when unlimited.
+export const cgroupCpuQuota = (): number | null => {
+  const read = (file: string) => {
+    try {
+      return NodeFS.readFileSync(file, "utf8").trim();
+    } catch {
+      return null;
+    }
+  };
+  const v2 = read("/sys/fs/cgroup/cpu.max");
+  if (v2 !== null) {
+    const [quota, period] = v2.split(/\s+/);
+    if (quota === undefined || quota === "max") return null;
+    const cores = Number(quota) / Number(period ?? "100000");
+    return Number.isFinite(cores) && cores > 0 ? Math.ceil(cores) : null;
+  }
+  const quota = Number(read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") ?? "-1");
+  const period = Number(read("/sys/fs/cgroup/cpu/cpu.cfs_period_us") ?? "100000");
+  if (!(quota > 0) || !(period > 0)) return null;
+  return Math.ceil(quota / period);
+};
+
+export interface VcsProcessPools {
+  readonly parallelism?: number;
+  readonly cpuQuota?: number | null;
+}
 
 /** Shown to users when a Git command fails because another process holds the index lock. */
 export const GIT_INDEX_LOCKED_DETAIL =
@@ -185,11 +229,16 @@ const canRetryFullFsync = (stderr: string) =>
   /fsync error on [^\r\n]+: operation not supported\r?$/im.test(stderr) ||
   /cannot update ref [^\r\n]+: couldn't write '[^\r\n]+\.lock'\r?$/im.test(stderr);
 
-export const make = Effect.gen(function* () {
+export const makeWith = Effect.fn("VcsProcess.makeWith")(function* (pools: VcsProcessPools) {
   const processRunner = yield* ProcessRunner.ProcessRunner;
   const hostPlatform = yield* HostProcess.Platform;
-  const vcsProcesses = yield* Semaphore.make(VCS_PROCESS_CONCURRENCY);
-  const nonGitProcesses = yield* Semaphore.make(NON_GIT_PROCESS_CONCURRENCY);
+  const gitProcesses = yield* Semaphore.make(
+    gitProcessConcurrency(
+      pools.parallelism ?? NodeOS.availableParallelism(),
+      pools.cpuQuota === undefined ? cgroupCpuQuota() : pools.cpuQuota,
+    ),
+  );
+  const forgeProcesses = yield* Semaphore.make(FORGE_PROCESS_CONCURRENCY);
   const keyedProcesses = new Map<string, Semaphore.Semaphore>();
   const keyedPermit = (concurrency: NonNullable<VcsProcessInput["concurrency"]>) => {
     let semaphore = keyedProcesses.get(concurrency.key);
@@ -352,13 +401,19 @@ export const make = Effect.gen(function* () {
   });
 
   const run = Effect.fn("VcsProcess.run")(function* (input: VcsProcessInput) {
-    // Time waiting for a slot, keyed and shared, summed over retries; a retry times only its own wait.
+    // Each command waits only for its own pool: git's, sized by the machine, or the forge CLIs'.
+    const pool =
+      input.command === "git"
+        ? { name: "git", processes: gitProcesses }
+        : { name: "forge", processes: forgeProcesses };
+    yield* Effect.annotateCurrentSpan("vcs.pool", pool.name);
+    // Time waiting for a slot, keyed and pooled, summed over retries; a retry times only its own wait.
     let permitWaitMs = 0;
     let queuedAtMs: number | undefined = yield* Clock.currentTimeMillis;
     const bounded = Effect.gen(function* () {
       const attemptQueuedAtMs = queuedAtMs ?? (yield* Clock.currentTimeMillis);
       queuedAtMs = undefined;
-      return yield* vcsProcesses.withPermits(1)(
+      return yield* pool.processes.withPermits(1)(
         Effect.gen(function* () {
           permitWaitMs += (yield* Clock.currentTimeMillis) - attemptQueuedAtMs;
           yield* Effect.annotateCurrentSpan("vcs.permit_wait_ms", permitWaitMs);
@@ -385,12 +440,15 @@ export const make = Effect.gen(function* () {
         }),
       );
     }
-    const shared = input.command === "git" ? bounded : nonGitProcesses.withPermits(1)(bounded);
-    return yield* input.concurrency === undefined ? shared : keyedPermit(input.concurrency)(shared);
+    return yield* input.concurrency === undefined
+      ? bounded
+      : keyedPermit(input.concurrency)(bounded);
   });
 
   return VcsProcess.of({ run });
 });
+
+export const make = makeWith({});
 
 // Fresh: a ProcessRunner provided around this one (a CLI's, a test's) may be built on Node's
 // spawner, and would otherwise be reused here and bypass the spawner the knobs choose.

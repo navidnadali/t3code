@@ -1674,6 +1674,43 @@ const messageOrdinalsReadThroughTheirIndex = Effect.gen(function* () {
     indexed.messages.map((message) => message.id),
     [first.user, first.assistant, second.user, second.assistant],
   );
+  // A narrow read (ids, runs or one role) recovers only its own messages' ordinals, through the
+  // same index; the statement it sends, rerun with its bindings, returns just those rows.
+  const narrowReads = [
+    {
+      filter: { messageIds: [second.assistant, first.user] },
+      loaded: [first.user, second.assistant],
+    },
+    { filter: { messageRunIds: [RunId.make("run:first")] }, loaded: [first.user, first.assistant] },
+    { filter: { messageRoles: ["user" as const] }, loaded: [first.user, second.user] },
+  ];
+  for (const { filter, loaded } of narrowReads) {
+    const narrow = traceSqlStatements();
+    const narrowed = yield* store
+      .getThreadRecords(threadId, ["messages"], filter)
+      .pipe(Effect.withTracer(narrow.tracer));
+    assert.deepEqual(
+      narrowed.messages.map((message) => message.id),
+      loaded,
+    );
+    const bounded = narrow.statements.find((statement) =>
+      statement.includes("MIN(ordinal) AS ordinal"),
+    );
+    assert.include(bounded, "IN (SELECT value FROM json_each(");
+    assert.deepEqual(yield* queryPlan(bounded), [
+      "SEARCH orchestration_v2_projection_turn_items USING INDEX orchestration_v2_projection_turn_items_message_ordinal_idx (thread_id=? AND <expr>=?)",
+      "LIST SUBQUERY 1",
+      "SCAN json_each VIRTUAL TABLE INDEX 1:",
+    ]);
+    const rows = yield* sql.unsafe<{ readonly message_id: string }>(bounded!, [
+      threadId,
+      JSON.stringify(loaded),
+    ]);
+    assert.sameMembers(
+      rows.map((row) => row.message_id),
+      loaded,
+    );
+  }
   yield* sql`DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx`;
   assert.deepEqual(
     (yield* store.getThreadRecords(threadId, ["messages"])).messages,

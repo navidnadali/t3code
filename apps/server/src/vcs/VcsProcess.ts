@@ -2,6 +2,7 @@ import * as Clock from "effect/Clock";
 // @effect-diagnostics nodeBuiltinImport:off - the git pool is sized from the machine (os) and its cgroup CPU quota (fs).
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
@@ -91,8 +92,20 @@ export const gitProcessConcurrency = (parallelism: number, cpuQuota: number | nu
   );
 };
 
-// The container's CPU quota in cores (cgroup v2 `cpu.max`, else v1 cfs files); null when unlimited.
-export const cgroupCpuQuota = (): number | null => {
+export interface CgroupLocation {
+  /** The cgroup filesystem root, /sys/fs/cgroup. */
+  readonly root?: string;
+  /** The process's cgroup membership file, /proc/self/cgroup. */
+  readonly selfCgroup?: string;
+}
+
+/**
+ * The CPU quota in cores that applies to this process: the tightest `cpu.max` (cgroup v2) or
+ * cfs quota (v1) along its own cgroup path, since a service's limit sits in its own cgroup and
+ * an ancestor's binds it too; null when none is enforced or the files cannot be read.
+ */
+export const cgroupCpuQuota = (location: CgroupLocation = {}): number | null => {
+  const root = location.root ?? "/sys/fs/cgroup";
   const read = (file: string) => {
     try {
       return NodeFS.readFileSync(file, "utf8").trim();
@@ -100,17 +113,44 @@ export const cgroupCpuQuota = (): number | null => {
       return null;
     }
   };
-  const v2 = read("/sys/fs/cgroup/cpu.max");
-  if (v2 !== null) {
-    const [quota, period] = v2.split(/\s+/);
-    if (quota === undefined || quota === "max") return null;
-    const cores = Number(quota) / Number(period ?? "100000");
-    return Number.isFinite(cores) && cores > 0 ? Math.ceil(cores) : null;
+  const membership = read(location.selfCgroup ?? "/proc/self/cgroup");
+  if (membership === null) return null;
+  // Each line is hierarchy:controllers:path; v2 has one line with empty controllers.
+  const quotas: Array<number> = [];
+  for (const line of membership.split("\n")) {
+    const [, controllers, cgroupPath] = line.split(":");
+    if (cgroupPath === undefined) continue;
+    const isV2 = controllers === "";
+    if (!isV2 && !controllers!.split(",").includes("cpu")) continue;
+    const base = isV2 ? root : NodePath.join(root, controllers!);
+    const segments = cgroupPath.split("/").filter((segment) => segment.length > 0);
+    for (let depth = segments.length; depth >= 0; depth--) {
+      const directory = NodePath.join(base, ...segments.slice(0, depth));
+      const cores = isV2
+        ? parseCpuMax(read(NodePath.join(directory, "cpu.max")))
+        : parseCfs(
+            read(NodePath.join(directory, "cpu.cfs_quota_us")),
+            read(NodePath.join(directory, "cpu.cfs_period_us")),
+          );
+      if (cores !== null) quotas.push(cores);
+    }
   }
-  const quota = Number(read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") ?? "-1");
-  const period = Number(read("/sys/fs/cgroup/cpu/cpu.cfs_period_us") ?? "100000");
-  if (!(quota > 0) || !(period > 0)) return null;
-  return Math.ceil(quota / period);
+  return quotas.length === 0 ? null : Math.ceil(Math.min(...quotas));
+};
+
+// "max 100000" is unlimited; "<quota> <period>" in microseconds.
+const parseCpuMax = (content: string | null): number | null => {
+  if (content === null) return null;
+  const [quota, period] = content.split(/\s+/);
+  if (quota === undefined || quota === "max") return null;
+  const cores = Number(quota) / Number(period ?? "100000");
+  return Number.isFinite(cores) && cores > 0 ? cores : null;
+};
+
+const parseCfs = (quota: string | null, period: string | null): number | null => {
+  const quotaUs = Number(quota ?? "-1");
+  const periodUs = Number(period ?? "100000");
+  return quotaUs > 0 && periodUs > 0 ? quotaUs / periodUs : null;
 };
 
 export interface VcsProcessPools {

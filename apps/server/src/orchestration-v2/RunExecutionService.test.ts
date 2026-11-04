@@ -32,11 +32,13 @@ import * as Exit from "effect/Exit";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 import { CodexAppServerRequestError } from "effect-codex-app-server/errors";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
@@ -53,6 +55,9 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
+import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import * as VcsStatusBroadcaster from "../vcs/VcsStatusBroadcaster.ts";
+import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
@@ -3309,6 +3314,41 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
   }),
 );
 
+it.effect("completes a run while its after-turn pull request refresh waits on the forge", () =>
+  Effect.gen(function* () {
+    const refreshStarted = yield* Deferred.make<void>();
+    const capture = yield* captureRootRunTermination({
+      key: "pull-request-refresh:forge-waits",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) => Stream.make(rootTerminalEvent(ids, "completed")),
+      // The server's observer, whose pull request refresh never gets its forge answer.
+      observer: RunFinalizationService.layerObserver.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(WorkspaceEntries.WorkspaceEntries)({}),
+            Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+            Layer.mock(PullRequestService.PullRequestService)({
+              refreshAfterTurn: () =>
+                Deferred.succeed(refreshStarted, undefined).pipe(Effect.andThen(Effect.never)),
+            }),
+          ),
+        ),
+      ),
+      // The run's ingestion ends, and its refresh was requested and is still waiting.
+      afterStart: (closed) =>
+        Deferred.await(closed).pipe(Effect.andThen(Deferred.await(refreshStarted))),
+    }).pipe(Effect.timeoutOption("1 minute"), Effect.forkChild({ startImmediately: true }));
+    yield* TestClock.adjust("1 minute");
+    const result = yield* Fiber.join(capture);
+    assert.isTrue(
+      Option.isSome(result),
+      "the run's finalization waited for the after-turn pull request refresh",
+    );
+    if (Option.isSome(result)) assert.deepEqual(result.value.observed, ["run:waiting"]);
+  }),
+);
+
 function captureRootRunTermination(input: {
   readonly key: string;
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
@@ -3330,6 +3370,8 @@ function captureRootRunTermination(input: {
     error: RunExecutionService.RunExecutionServiceV2Error,
   ) => Effect.Effect<void>;
   readonly refreshAfterTurn?: Effect.Effect<void>;
+  // Replaces the recording observer, e.g. with the server's own (a reference: no requirement).
+  readonly observer?: Layer.Layer<never>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
@@ -3428,13 +3470,14 @@ function captureRootRunTermination(input: {
               ProviderEventIngestor.PROVIDER_EVENT_BATCH_MAX_BYTES,
           }),
           ServerSettings.layerTest(),
-          Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
-            refresh: () => Effect.void,
-            refreshAfterTurn: () =>
-              Ref.update(observed, (current) => [...current, "pull-requests-refreshed"]).pipe(
-                Effect.andThen(input.refreshAfterTurn ?? Effect.void),
-              ),
-          }),
+          input.observer ??
+            Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
+              refresh: () => Effect.void,
+              refreshAfterTurn: () =>
+                Ref.update(observed, (current) => [...current, "pull-requests-refreshed"]).pipe(
+                  Effect.andThen(input.refreshAfterTurn ?? Effect.void),
+                ),
+            }),
         ),
       ),
       Layer.provideMerge(PreviewAgentActivity.layer),

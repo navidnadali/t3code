@@ -368,6 +368,8 @@ export interface ProjectionRecordFilter {
   readonly subagentRunIds?: ReadonlyArray<RunId>;
   readonly subagentChildThreadIds?: ReadonlyArray<ThreadId>;
   readonly contextTransferSourceThreadIds?: ReadonlyArray<ThreadId>;
+  /** Only transfers whose target is the thread. */
+  readonly contextTransfersIntoThread?: true;
   readonly nodeIds?: ReadonlyArray<NodeId>;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
@@ -3308,7 +3310,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ? yield* sql<PayloadRow>`
                 SELECT payload_json
                 FROM orchestration_v2_projection_turn_items
-                WHERE thread_id = ${threadId}
+                -- Rows named by node or message seek their own index, not the thread's history.
+                WHERE ${filter?.turnItemNodeIds === undefined && filter?.turnItemMessageIds === undefined ? sql`thread_id` : sql`+thread_id`} = ${threadId}
                   ${filter?.turnItemTypes === undefined ? sql`` : sql`AND type IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemTypes)}))`}
                   ${filter?.turnItemStatuses === undefined ? sql`` : sql`AND status IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemStatuses)}))`}
                   ${filter?.turnItemRunId === undefined ? sql`` : sql`AND run_id = ${filter.turnItemRunId}`}
@@ -3317,8 +3320,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     // The message-ordinal index's own expression and WHERE, so SQLite seeks it.
                     filter?.turnItemMessageIds === undefined
                       ? sql``
-                      : sql`AND type IN ('user_message', 'assistant_message') AND json_valid(payload_json)
-                    AND json_extract(payload_json, '$.messageId') IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemMessageIds)}))`
+                      : sql`AND turn_item_id IN (
+                    SELECT turn_item_id FROM orchestration_v2_projection_turn_items
+                    WHERE thread_id = ${threadId} AND type IN ('user_message', 'assistant_message')
+                      AND json_valid(payload_json)
+                      AND json_extract(payload_json, '$.messageId') IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemMessageIds)}))
+                  )`
                   }
                   ${filter?.turnItemRunIds === undefined ? sql`` : sql`AND (run_id IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemRunIds.filter((id): id is RunId => id !== null))})) OR (${filter.turnItemRunIds.includes(null) ? 1 : 0} = 1 AND run_id IS NULL))`}
                 ORDER BY ordinal ASC, turn_item_id ASC
@@ -3444,7 +3451,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_runs
-            WHERE thread_id = ${threadId}
+            WHERE ${filter?.runIds === undefined ? sql`thread_id` : sql`+thread_id`} = ${threadId}
               ${filter?.runIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.runIds)}))`}
               ${
                 filter?.runStatuses === undefined
@@ -3503,7 +3510,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_nodes AS node
-            WHERE node.thread_id = ${threadId}
+            WHERE ${filter?.nodeIds === undefined ? sql`node.thread_id` : sql`+node.thread_id`} = ${threadId}
               ${filter?.nodeIds === undefined ? sql`` : sql`AND node.node_id IN (SELECT value FROM json_each(${encodeIdList(filter.nodeIds)}))`}
               ${
                 filter?.omitSettledLeafNodes === true
@@ -3546,7 +3553,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_subagents AS subagent
-            WHERE thread_id = ${threadId}
+            WHERE ${filter?.subagentIds === undefined && filter?.subagentChildThreadIds === undefined ? sql`thread_id` : sql`+thread_id`} = ${threadId}
               ${filter?.subagentIds === undefined ? sql`` : sql`AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentIds)}))`}
               ${filter?.subagentRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentRunIds)}))`}
               ${
@@ -3651,7 +3658,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_provider_turns
-            WHERE thread_id = ${threadId}
+            WHERE ${filter?.providerTurnIds === undefined ? sql`thread_id` : sql`+thread_id`} = ${threadId}
               ${filter?.providerTurnAttemptIds === undefined ? sql`` : sql`AND run_attempt_id IN (SELECT value FROM json_each(${encodeIdList(filter.providerTurnAttemptIds)}))`}
               ${filter?.providerTurnIds === undefined ? sql`` : sql`AND provider_turn_id IN (SELECT value FROM json_each(${encodeIdList(filter.providerTurnIds)}))`}
               ${filter?.providerTurnThreadIds === undefined ? sql`` : sql`AND provider_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.providerTurnThreadIds)}))`}
@@ -3698,7 +3705,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               : window === undefined
                 ? sql<MessagePayloadRow>`
                 SELECT payload_json, message_id FROM orchestration_v2_projection_messages
-                WHERE thread_id = ${threadId}
+                WHERE ${filter?.messageIds === undefined ? sql`thread_id` : sql`+thread_id`} = ${threadId}
                   ${filter?.messageIds === undefined ? sql`` : sql`AND message_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageIds)}))`}
                   ${filter?.messageRoles === undefined ? sql`` : sql`AND role IN (SELECT value FROM json_each(${encodeIdList(filter.messageRoles)}))`}
                   ${filter?.monitorNotificationsOnly === true ? sql`AND json_extract(payload_json, '$.notification.source.kind') = 'monitor'` : sql``}
@@ -3806,7 +3813,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_context_transfers
-            WHERE (source_thread_id = ${threadId} OR target_thread_id = ${threadId})
+            WHERE ${
+              filter?.contextTransfersIntoThread === true
+                ? sql`target_thread_id = ${threadId}`
+                : sql`(source_thread_id = ${threadId} OR target_thread_id = ${threadId})`
+            }
               ${
                 filter?.contextTransferSourceThreadIds === undefined
                   ? sql``
@@ -6114,6 +6125,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         turnItemTypes: ["user_message"],
         turnItemMessageIds: input.messageIds,
         contextTransferStatuses: ["pending"],
+        contextTransfersIntoThread: true,
       } satisfies ProjectionRecordFilter;
     });
 

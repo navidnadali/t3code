@@ -1730,6 +1730,51 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
+  it.effect("a shared branch PR refresh joins a lookup in flight", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/in-flight"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/in-flight"]);
+      const gate = { started: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() };
+      const { manager, providerCalls } = yield* makeManager({
+        providerScenario: {
+          prListGate: gate,
+          prListOtherwise: [
+            {
+              number: 303,
+              title: "In flight",
+              url: "https://github.com/pingdotgg/codething-mvp/pull/303",
+              baseRefName: "main",
+              headRefName: "feature/in-flight",
+            },
+          ],
+        },
+      });
+      const lookup = (refresh: boolean | "shared") =>
+        manager.branchPullRequest({ cwd: repoDir, branch: "feature/in-flight" }, { refresh });
+
+      const first = yield* Effect.forkChild(lookup(true));
+      yield* Deferred.await(gate.started);
+      const shared = yield* Effect.forkChild(
+        Effect.all([lookup("shared"), lookup("shared"), lookup(false)], {
+          concurrency: "unbounded",
+        }),
+      );
+      yield* Deferred.succeed(gate.release, undefined);
+      yield* Fiber.join(first);
+      const answers = yield* Fiber.join(shared);
+
+      expect(answers.map((answer) => answer?.number)).toEqual([303, 303, 303]);
+      expect(listed(providerCalls)).toHaveLength(1);
+      // A plain refresh still asks the host again.
+      yield* lookup(true);
+      expect(listed(providerCalls)).toHaveLength(2);
+    }),
+  );
+
   it.effect("thread turns ending on one branch share its pull request lookup", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");

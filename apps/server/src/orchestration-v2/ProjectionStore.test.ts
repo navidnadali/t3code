@@ -1828,15 +1828,39 @@ const parentRecordsNarrowToOneChild = Effect.gen(function* () {
     narrowed.contextTransfers.map((candidate) => String(candidate.id)),
     ["transfer:child-result", "transfer:child-follow-up"],
   );
-  for (const table of ["subagents", "context_transfers"]) {
+  // Each read seeks the child's rows through its own index, never the parent's whole history.
+  for (const [table, index] of [
+    ["subagents", "orchestration_v2_projection_subagents_child_thread_idx (child_thread_id=?)"],
+    [
+      "context_transfers",
+      "orchestration_v2_projection_context_transfers_source_thread_idx (source_thread_id=?)",
+    ],
+  ]) {
     const plan = yield* queryPlan(
       statements.find((statement) =>
         statement.includes(`FROM orchestration_v2_projection_${table}`),
       ),
     );
-    assert.match(plan[0] ?? "", /^(MULTI-INDEX OR|SEARCH \S+ USING INDEX )/);
+    assert.include(plan[0] ?? "", `USING INDEX ${index}`);
     assert.notOk(plan.some((detail) => detail.startsWith("SCAN orchestration_v2_projection")));
   }
+  // Several children read through the id list.
+  const both = yield* store.getThreadRecords(parent, fields, {
+    subagentChildThreadIds: [child, sibling],
+    contextTransferSourceThreadIds: [child, sibling],
+  });
+  assert.deepEqual(
+    both.subagents,
+    full.subagents.filter(
+      (candidate) => candidate.childThreadId === child || candidate.childThreadId === sibling,
+    ),
+  );
+  assert.deepEqual(
+    both.contextTransfers,
+    full.contextTransfers.filter(
+      (candidate) => candidate.sourceThreadId === child || candidate.sourceThreadId === sibling,
+    ),
+  );
   const none = yield* store.getThreadRecords(parent, fields, {
     subagentChildThreadIds: [],
     contextTransferSourceThreadIds: [],

@@ -11,6 +11,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Context from "effect/Context";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -18,9 +19,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Result from "effect/Result";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 import { expect } from "vite-plus/test";
 import type {
@@ -28,6 +31,10 @@ import type {
   GitActionProgressEvent,
   GitPreparePullRequestThreadInput,
   ModelSelection,
+  OrchestrationProjectShell,
+  OrchestrationV2DomainEvent,
+  OrchestrationV2ServerCommand,
+  OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 
 import {
@@ -59,8 +66,13 @@ import * as GitWorkflowService from "./GitWorkflowService.ts";
 import type { SourceControlProvider } from "@t3tools/source-control-core/server/SourceControlProvider";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as ServerConfig from "../config.ts";
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as ThreadPullRequestService from "../orchestration-v2/ThreadPullRequestService.ts";
+import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import * as ServerActivation from "../serverActivation.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
@@ -1715,6 +1727,208 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         .pipe(Effect.flip);
       expect(refreshError._tag).toBe("SourceControlProviderError");
       expect(listed(providerCalls)).toHaveLength(1);
+    }),
+  );
+
+  it.effect("thread turns ending on one branch share its pull request lookup", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      for (const branch of ["feature/shared-turns", "feature/new-request"]) {
+        yield* runGit(repoDir, ["checkout", "-b", branch, "main"]);
+        yield* runGit(repoDir, ["push", "-u", "origin", branch]);
+      }
+      const pullRequest = (number: number, headRefName: string): FakeChangeRequest => ({
+        number,
+        title: headRefName,
+        url: `https://github.com/pingdotgg/codething-mvp/pull/${number}`,
+        baseRefName: "main",
+        headRefName,
+      });
+      const prListByHeadSelector: Record<string, ReadonlyArray<FakeChangeRequest>> = {
+        "feature/shared-turns": [pullRequest(301, "feature/shared-turns")],
+      };
+      const { manager, providerCalls } = yield* makeManager({
+        providerScenario: { prListByHeadSelector },
+      });
+      const lookupsOf = (branch: string) =>
+        listedSelectors(providerCalls).filter((selector) => selector === branch).length;
+
+      const createdAt = DateTime.makeUnsafe("2026-09-20T00:00:00.000Z");
+      const project: OrchestrationProjectShell = {
+        id: ProjectId.make("project-1"),
+        title: "Project",
+        workspaceRoot: repoDir,
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      };
+      const threadShell = (
+        id: string,
+        branch: string,
+        parent?: ThreadId,
+      ): OrchestrationV2ThreadShell => ({
+        id: ThreadId.make(id),
+        projectId: project.id,
+        title: id,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch,
+        worktreePath: repoDir,
+        activeProviderThreadId: null,
+        lineage:
+          parent === undefined
+            ? { rootThreadId: ThreadId.make(id), parentThreadId: null, relationshipToParent: null }
+            : { rootThreadId: parent, parentThreadId: parent, relationshipToParent: "subagent" },
+        forkedFrom: null,
+        createdBy: "user",
+        creationSource: "web",
+        activeRunId: null,
+        latestRunId: null,
+        status: "idle",
+        pendingRuntimeRequest: null,
+        latestVisibleMessage: null,
+        latestUserMessageAt: null,
+        hasActionableProposedPlan: false,
+        itemCount: 0,
+        visibleItemCount: 0,
+        createdAt,
+        updatedAt: createdAt,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      });
+      const parent = threadShell("parent", "feature/shared-turns");
+      const subagents = [1, 2, 3, 4].map((index) =>
+        threadShell(`subagent-${index}`, "feature/shared-turns", parent.id),
+      );
+      const creator = threadShell("creator", "feature/new-request");
+      const threads = [parent, ...subagents, creator];
+
+      const activation = yield* Deferred.make<void>();
+      const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
+      const threadReads = yield* Queue.unbounded<ThreadId>();
+      const commands: Array<OrchestrationV2ServerCommand> = [];
+      const dependencies = Layer.mergeAll(
+        Layer.succeed(GitManager.GitManager, manager),
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          streamDomainEvents: Stream.fromQueue(domainEvents),
+          getShellSnapshot: () =>
+            Effect.succeed({
+              schemaVersion: 2,
+              snapshotSequence: 1,
+              threads: [],
+              archivedThreads: [],
+            }),
+          getThreadEventSequence: (threadId) =>
+            Queue.offer(threadReads, threadId).pipe(Effect.as(1)),
+          getThreadShell: (threadId) =>
+            Effect.succeed(threads.find((thread) => thread.id === threadId) ?? null),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              commands.push(command);
+              return { sequence: 2, storedEvents: [] };
+            }),
+        }),
+        Layer.mock(ProjectStore.ProjectStoreV2)({
+          listShells: () => Effect.succeed([project]),
+          getShell: () => Effect.succeedSome(project),
+        }),
+        Layer.mock(PullRequestService.PullRequestService)({}),
+        Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+          resolve: () =>
+            Effect.succeed({
+              canonicalKey: "github.com/pingdotgg/codething-mvp",
+              locator: {
+                source: "git-remote" as const,
+                remoteName: "origin",
+                remoteUrl: "git@github.com:pingdotgg/codething-mvp.git",
+              },
+              provider: SourceControlProviderKind.make("github"),
+              owner: "pingdotgg",
+              name: "codething-mvp",
+            }),
+        }),
+        Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+          shouldRunOpportunisticWork: Effect.succeed(false),
+        }),
+        Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
+        Layer.succeed(
+          SecureRandom.SecureRandom,
+          SecureRandom.make((size) => new Uint8Array(size).fill(1)),
+        ),
+      );
+      const turnEnded = (threadId: ThreadId): ReadonlyArray<OrchestrationV2DomainEvent> => [
+        { type: "checkpoint.captured", threadId } as OrchestrationV2DomainEvent,
+        {
+          type: "run.updated",
+          threadId,
+          payload: { status: "completed" },
+        } as OrchestrationV2DomainEvent,
+      ];
+
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadPullRequestService.make;
+        const handle = Effect.fnUntraced(function* (
+          events: ReadonlyArray<OrchestrationV2DomainEvent>,
+        ) {
+          yield* Queue.offerAll(domainEvents, events);
+          for (const _ of events) yield* Queue.take(threadReads);
+          yield* service.drain;
+        });
+        yield* service.start();
+        yield* Deferred.succeed(activation, undefined);
+
+        // The parent's turn and four subagent turns on its checkout end together.
+        yield* handle([parent, ...subagents].flatMap((thread) => turnEnded(thread.id)));
+        expect(lookupsOf("feature/shared-turns")).toBe(1);
+
+        // Past the reuse window the parent's next turn looks again; its subagents still share.
+        yield* TestClock.adjust("31 seconds");
+        yield* handle([...subagents, parent].flatMap((thread) => turnEnded(thread.id)));
+        expect(lookupsOf("feature/shared-turns")).toBe(2);
+
+        // A turn finds no pull request; its agent then opens one with the host's CLI.
+        yield* handle(turnEnded(creator.id));
+        expect(lookupsOf("feature/new-request")).toBe(1);
+        prListByHeadSelector["feature/new-request"] = [pullRequest(302, "feature/new-request")];
+        yield* handle([
+          {
+            type: "thread.pull-request-synced",
+            threadId: creator.id,
+            payload: {
+              ...creator,
+              pullRequests: [
+                {
+                  host: "github.com",
+                  repository: "pingdotgg/codething-mvp",
+                  number: 302,
+                  url: "https://github.com/pingdotgg/codething-mvp/pull/302",
+                  source: "created",
+                  linkedAt: "2026-09-20T00:00:00.000Z",
+                  snapshot: null,
+                  stack: null,
+                },
+              ],
+            },
+          } as unknown as OrchestrationV2DomainEvent,
+        ]);
+        expect(lookupsOf("feature/new-request")).toBe(2);
+        expect(
+          commands.findLast(
+            (command) =>
+              command.type === "thread.pull-request.sync" && command.threadId === creator.id,
+          ),
+        ).toMatchObject({ branchPullRequest: { number: 302 } });
+      }).pipe(Effect.provide(dependencies));
     }),
   );
 

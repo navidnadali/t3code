@@ -101,7 +101,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const activation = yield* Deferred.make<void>();
         const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
         const turnLookup = yield* Deferred.make<void>();
-        const lookups: Array<{ readonly refresh: boolean }> = [];
+        const lookups: Array<{ readonly refresh: boolean | "shared" }> = [];
         const dependencies = Layer.mergeAll(
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.fromQueue(domainEvents),
@@ -331,7 +331,8 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
         const sweeps = yield* Queue.unbounded<void>();
         const childLookup = yield* Deferred.make<void>();
-        const lookups: Array<{ readonly branch: string; readonly refresh: boolean }> = [];
+        const lookups: Array<{ readonly branch: string; readonly refresh: boolean | "shared" }> =
+          [];
         const dependencies = Layer.mergeAll(
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.fromQueue(domainEvents),
@@ -413,7 +414,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
 
           expect(sweepLookups).toEqual([parent.branch, parent.branch]);
           expect(lookups.slice(sweepLookups.length)).toEqual([
-            { branch: child.branch, refresh: true },
+            { branch: child.branch, refresh: "shared" },
           ]);
         }).pipe(Effect.provide(dependencies));
       }),

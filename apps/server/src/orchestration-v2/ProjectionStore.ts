@@ -3576,12 +3576,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     : sql`AND child_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentChildThreadIds)}))`
               }
               ${
-                filter?.omitSettledSubagents !== undefined
-                  ? sql`AND (${
+                filter?.omitSettledSubagents === undefined
+                  ? sql``
+                  : sql`AND (${
                       filter.omitSettledSubagents === true
-                        ? sql`0`
-                        : sql`subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.omitSettledSubagents.except)}))`
-                    } OR subagent.rowid IN (
+                        ? sql``
+                        : sql`subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.omitSettledSubagents.except)})) OR `
+                    }subagent.rowid IN (
                       -- The settled index covers this filter; the table keeps the delivery state
                       -- past each task's payload.
                       SELECT unsettled.rowid FROM orchestration_v2_projection_subagents AS unsettled
@@ -3596,7 +3597,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                         )
                       )
                     ))`
-                  : sql``
               }
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `

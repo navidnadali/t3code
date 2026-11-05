@@ -1935,8 +1935,18 @@ it.effect("command reads find open tasks through the settled index", () =>
         ),
         plan.join("\n"),
       );
+      assert.isTrue(
+        plan.some((detail) =>
+          /^SEARCH subagent USING INTEGER PRIMARY KEY \(rowid=\?\)$/.test(detail),
+        ),
+        plan.join("\n"),
+      );
       assert.notOk(
-        plan.some((detail) => detail.includes("orchestration_v2_projection_subagents_thread_idx")),
+        plan.some(
+          (detail) =>
+            detail.includes("orchestration_v2_projection_subagents_thread_idx") ||
+            /^SCAN (subagent|orchestration_v2_projection_subagents)\b/.test(detail),
+        ),
         plan.join("\n"),
       );
     }

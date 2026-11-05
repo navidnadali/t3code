@@ -214,14 +214,17 @@ function snapshotFieldsOf(summary: PullRequestSummary): SnapshotFields {
   };
 }
 
-// GitHub briefly returns unknown after base pushes; other hosts may mean a lasting condition.
+// GitHub briefly returns unknown after base pushes, as GitLab does while it checks (unchecked,
+// checking, preparing); other hosts may mean a lasting condition.
+const RECHECKING_PROVIDERS: ReadonlySet<string> = new Set(["github", "gitlab"]);
+
 function withKnownMergeability(
   previous: ThreadPullRequestSnapshot | null,
   fields: SnapshotFields,
   provider: PullRequestSummary["provider"],
 ): SnapshotFields {
   if (
-    provider !== "github" ||
+    !RECHECKING_PROVIDERS.has(provider) ||
     fields.state !== "open" ||
     fields.mergeability !== "unknown" ||
     previous?.updatedAt !== fields.updatedAt

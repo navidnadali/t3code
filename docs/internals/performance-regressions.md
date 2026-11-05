@@ -134,7 +134,11 @@ state it derives from the whole history, and their attempts, turns, nodes, provi
 messages), and a run's model switch walks the runs back from the latest. A dispatch change that
 reads more of the projection must add those rows there, or send that path to the whole command
 read in `readMessageDispatchProjection`. `MessageDispatchReads.test.ts` fails when a dispatch read
-returns more rows on a longer history.
+returns more rows on a longer history. A turn start reads its tasks' status and threads as columns,
+not their payloads, and only the transfers its handoffs name, any into its run, and a run fork's own
+fork transfer. The open-task filter selects row ids through the settled index, which covers it: the
+delivery state column sits past each task's payload, so reading it from the table reads every
+prompt and result.
 
 Command palette results keep live VCS and linked pull-request queries leased to the visible
 viewport, including a small overscan region. Cached badges remain available while leases are

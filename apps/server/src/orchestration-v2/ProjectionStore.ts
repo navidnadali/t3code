@@ -644,7 +644,6 @@ export interface ProjectionStoreV2Shape {
       | "runs"
       | "attempts"
       | "nodes"
-      | "subagents"
       | "providerSessions"
       | "providerThreads"
       | "providerTurns"
@@ -653,7 +652,13 @@ export interface ProjectionStoreV2Shape {
       | "contextHandoffs"
       | "contextTransfers"
       | "turnItems"
-    > & { readonly hasConversation: boolean },
+    > & {
+      readonly hasConversation: boolean;
+      /** Tasks not interrupted, failed or cancelled, without their prompts and results. */
+      readonly subagentThreads: ReadonlyArray<
+        Pick<OrchestrationV2Subagent, "status" | "childThreadId" | "providerThreadId">
+      >;
+    },
     ProjectionStoreV2Error
   >;
   readonly getTurnStartHistory: (
@@ -3553,7 +3558,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_subagents AS subagent
-            WHERE ${filter?.subagentIds === undefined && filter?.subagentChildThreadIds === undefined ? sql`thread_id` : sql`+thread_id`} = ${threadId}
+            WHERE ${
+              filter?.subagentIds === undefined &&
+              filter?.subagentChildThreadIds === undefined &&
+              filter?.omitSettledSubagents === undefined
+                ? sql`thread_id`
+                : sql`+thread_id`
+            } = ${threadId}
               ${filter?.subagentIds === undefined ? sql`` : sql`AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentIds)}))`}
               ${filter?.subagentRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentRunIds)}))`}
               ${
@@ -3570,14 +3581,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       filter.omitSettledSubagents === true
                         ? sql`0`
                         : sql`subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.omitSettledSubagents.except)}))`
-                    } OR NOT (
-                      subagent.status IN ('completed', 'failed', 'cancelled', 'interrupted')
-                      AND COALESCE(subagent.completion_delivery_state, '')
-                        IN ('acknowledged', 'delivered', 'disposed')
-                      AND NOT EXISTS (
-                        SELECT 1 FROM orchestration_v2_projection_runs AS run
-                        WHERE run.run_id = subagent.run_id
-                          AND run.status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+                    } OR subagent.rowid IN (
+                      -- The settled index covers this filter; the table keeps the delivery state
+                      -- past each task's payload.
+                      SELECT unsettled.rowid FROM orchestration_v2_projection_subagents AS unsettled
+                      WHERE unsettled.thread_id = ${threadId} AND NOT (
+                        unsettled.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                        AND COALESCE(unsettled.completion_delivery_state, '')
+                          IN ('acknowledged', 'delivered', 'disposed')
+                        AND NOT EXISTS (
+                          SELECT 1 FROM orchestration_v2_projection_runs AS run
+                          WHERE run.run_id = unsettled.run_id
+                            AND run.status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+                        )
                       )
                     ))`
                   : sql``
@@ -4721,8 +4737,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               decodeNodePayload,
               threadId,
             )(nodeRows).pipe(Effect.result);
-            const subagentRows = yield* sql<PayloadRow>`
-              SELECT payload_json FROM orchestration_v2_projection_subagents
+            const subagentThreads = yield* sql<{
+              readonly status: OrchestrationV2Subagent["status"];
+              readonly child_thread_id: ThreadId | null;
+              readonly provider_thread_id: ProviderThreadId | null;
+            }>`
+              SELECT status, child_thread_id, provider_thread_id FROM orchestration_v2_projection_subagents
               WHERE thread_id = ${threadId} AND status NOT IN ('interrupted','failed','cancelled') ORDER BY subagent_id ASC
             `;
             const providerThreadRows = yield* sql<PayloadRow>`
@@ -4741,9 +4761,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               SELECT payload_json FROM orchestration_v2_projection_context_handoffs
               WHERE thread_id = ${threadId} ORDER BY rowid ASC
             `;
+            // What turn start looks at: transfers its handoffs name, any into this run, and for a fork
+            // of a run, the fork into it. A thread's tasks leave two transfers each.
             const contextTransferRows = yield* sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_context_transfers
-              WHERE source_thread_id = ${threadId} OR target_thread_id = ${threadId} ORDER BY rowid ASC
+              WHERE (+source_thread_id = ${threadId} OR +target_thread_id = ${threadId})
+                AND (
+                  context_transfer_id IN (
+                    SELECT json_extract(payload_json, '$.transferId')
+                    FROM orchestration_v2_projection_context_handoffs
+                    WHERE thread_id = ${threadId}
+                  )
+                  OR target_run_id = ${runId}
+                  ${thread.forkedFrom?.type === "run" ? sql`OR (target_thread_id = ${threadId} AND type = 'fork')` : sql``}
+                )
+              ORDER BY rowid ASC
             `;
             const turnItemRows = yield* sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_turn_items
@@ -4782,7 +4814,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               runRows,
               attemptRows,
               nodes,
-              subagentRows,
+              subagentThreads,
               providerThreadRows,
               providerTurnRows,
               checkpointScopeRows,
@@ -4801,7 +4833,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               runs: decodeTakenRows(rows, "runRows", decodeRunPayload, threadId),
               attempts: decodeTakenRows(rows, "attemptRows", decodeRunAttemptPayload, threadId),
               nodes: Effect.fromResult(rows.nodes),
-              subagents: decodeTakenRows(rows, "subagentRows", decodeSubagentPayload, threadId),
               providerThreads: decodeTakenRows(
                 rows,
                 "providerThreadRows",
@@ -4853,7 +4884,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 runs: decoded.runs,
                 attempts: decoded.attempts,
                 nodes: decoded.nodes,
-                subagents: decoded.subagents,
+                subagentThreads: rows.subagentThreads.map((row) => ({
+                  status: row.status,
+                  childThreadId: row.child_thread_id,
+                  providerThreadId: row.provider_thread_id,
+                })),
                 providerSessions: decoded.providerSessions,
                 providerThreads: decoded.providerThreads,
                 providerTurns: decoded.providerTurns,

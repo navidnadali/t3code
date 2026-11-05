@@ -740,3 +740,221 @@ it.effect(
       assert.deepEqual(yield* decodedRows(40), yield* decodedRows(4));
     }).pipe(Effect.provide(layerDatabase)),
 );
+
+// Turn start uses its tasks' threads to route their late events, a transfer only to tell whether a
+// handoff carries a task's result, to find a pending native fork into its run, and to tell whether
+// a fork of a run inherits a conversation: each reads the same from its narrowed rows as from all.
+it.effect(
+  "a turn start finds the same task threads, result handoffs and fork as the whole thread",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread:turn-start-same");
+      const sourceId = ThreadId.make("thread:turn-start-same-source");
+      const runId = yield* seedDelegatingThread(threadId, 3);
+      const instanceId = ProviderInstanceId.make("codex");
+      const driver = ProviderDriverKind.make("codex");
+      let sequence = 0;
+      const apply = (event: Record<string, unknown>) =>
+        store.apply({
+          id: EventId.make(`event:turn-start-same:extra:${++sequence}`),
+          threadId,
+          occurredAt: now,
+          ...event,
+        } as never);
+      const thread = yield* store.getThread(threadId);
+      yield* apply({
+        type: "thread.metadata-updated",
+        payload: {
+          ...thread,
+          lineage: {
+            parentThreadId: sourceId,
+            relationshipToParent: "fork",
+            rootThreadId: sourceId,
+          },
+          forkedFrom: {
+            type: "run",
+            threadId: sourceId,
+            runId: RunId.make("run:turn-start-same-source"),
+          },
+        },
+      });
+      for (const [name, status, childThreadId] of [
+        ["running", "running", ThreadId.make("thread:turn-start-same:running")],
+        ["idle", "idle", ThreadId.make("thread:turn-start-same:idle")],
+        ["failed", "failed", ThreadId.make("thread:turn-start-same:failed")],
+        ["cancelled", "cancelled", ThreadId.make("thread:turn-start-same:cancelled")],
+        ["interrupted", "interrupted", ThreadId.make("thread:turn-start-same:interrupted")],
+        ["native", "completed", null],
+      ] as const) {
+        const taskId = NodeId.make(`node:turn-start-same:${name}`);
+        yield* apply({
+          type: "subagent.updated",
+          nodeId: taskId,
+          payload: {
+            id: taskId,
+            threadId,
+            runId: null,
+            parentNodeId: NodeId.make(`node:${threadId}:root`),
+            origin: childThreadId === null ? "provider_native" : "app_owned",
+            createdBy: "agent",
+            driver,
+            providerInstanceId: instanceId,
+            providerThreadId:
+              childThreadId === null
+                ? null
+                : ProviderThreadId.make(`provider-thread:${childThreadId}`),
+            childThreadId,
+            nativeTaskRef: null,
+            prompt: name,
+            title: name,
+            model: null,
+            status,
+            result: null,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+          },
+        });
+      }
+      const transfer = (
+        id: string,
+        type: string,
+        source: ThreadId,
+        target: ThreadId,
+        targetRunId: RunId | null,
+        status: string,
+      ) => ({
+        type: "context-transfer.created",
+        threadId: target,
+        payload: {
+          id: ContextTransferId.make(id),
+          type,
+          sourceThreadId: source,
+          targetThreadId: target,
+          sourcePoint: { threadId: source },
+          basePoint: null,
+          sourceProviderInstanceId: instanceId,
+          targetProviderInstanceId: instanceId,
+          targetRunId,
+          status,
+          resolution: null,
+          createdBy: "user",
+          error: null,
+          createdAt: now,
+          updatedAt: now,
+          consumedAt: null,
+        },
+      });
+      yield* apply(
+        transfer(
+          "transfer:turn-start-same:made-fork",
+          "fork",
+          sourceId,
+          threadId,
+          null,
+          "consumed",
+        ),
+      );
+      yield* apply(
+        transfer(
+          "transfer:turn-start-same:native-fork",
+          "fork",
+          sourceId,
+          threadId,
+          runId,
+          "pending",
+        ),
+      );
+      yield* apply(
+        transfer(
+          "transfer:turn-start-same:handoff",
+          "provider_handoff",
+          threadId,
+          threadId,
+          null,
+          "consumed",
+        ),
+      );
+      for (const [name, transferId] of [
+        ["provider", ContextTransferId.make("transfer:turn-start-same:handoff")],
+        ["none", null],
+      ] as const) {
+        yield* apply({
+          type: "context-handoff.updated",
+          runId,
+          payload: {
+            id: ContextHandoffId.make(`handoff:turn-start-same:${name}`),
+            transferId,
+            threadId,
+            targetRunId: runId,
+            fromProviderThreadIds: [],
+            toProviderThreadId: ProviderThreadId.make(`provider-thread:${threadId}`),
+            coveredRunOrdinals: { from: 1, to: 1 },
+            strategy: "full_thread_summary",
+            status: "ready",
+            summaryMessageId: null,
+            summaryText: name,
+            createdByProviderInstanceId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+      }
+
+      const context = yield* store.getTurnStartContext(threadId, runId);
+      const whole = yield* store.getThreadRecords(threadId, [
+        "subagents",
+        "contextTransfers",
+        "contextHandoffs",
+      ]);
+      assert.deepStrictEqual(
+        context.subagentThreads,
+        whole.subagents
+          .filter((task) => !["interrupted", "failed", "cancelled"].includes(task.status))
+          .map(({ status, childThreadId, providerThreadId }) => ({
+            status,
+            childThreadId,
+            providerThreadId,
+          })),
+      );
+      const resultIds = (transfers: typeof whole.contextTransfers) =>
+        new Set(transfers.filter((item) => item.type === "subagent_result").map((item) => item.id));
+      assert.deepStrictEqual(
+        whole.contextHandoffs.map(
+          (handoff) =>
+            handoff.transferId != null &&
+            resultIds(context.contextTransfers).has(handoff.transferId),
+        ),
+        whole.contextHandoffs.map(
+          (handoff) =>
+            handoff.transferId != null && resultIds(whole.contextTransfers).has(handoff.transferId),
+        ),
+      );
+      assert.deepEqual(
+        whole.contextHandoffs
+          .map(
+            (handoff) =>
+              handoff.transferId != null &&
+              resultIds(whole.contextTransfers).has(handoff.transferId),
+          )
+          .toSorted(),
+        [false, false, true],
+      );
+      const nativeFork = (transfers: typeof whole.contextTransfers) =>
+        transfers.find(
+          (item) =>
+            item.type === "fork" &&
+            item.targetThreadId === threadId &&
+            item.targetRunId === runId &&
+            item.status === "pending" &&
+            item.resolution === null,
+        )?.id;
+      assert.equal(nativeFork(context.contextTransfers), "transfer:turn-start-same:native-fork");
+      assert.equal(nativeFork(context.contextTransfers), nativeFork(whole.contextTransfers));
+      const madeBy = (transfers: typeof whole.contextTransfers) =>
+        transfers.find((item) => item.type === "fork" && item.targetThreadId === threadId)?.id;
+      assert.equal(madeBy(context.contextTransfers), madeBy(whole.contextTransfers));
+    }).pipe(Effect.provide(layerDatabase)),
+);

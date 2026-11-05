@@ -835,8 +835,8 @@ describe("PullRequestSyncReactor", () => {
           const reactor = yield* startAndSweep(fixture);
           assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
 
-          // An unchanged old PR uses main's five-minute quiet polling cadence.
-          yield* TestClock.adjust("5 minutes");
+          // An unchanged PR quiet for a day and a half is read hourly.
+          yield* TestClock.adjust("60 minutes");
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);

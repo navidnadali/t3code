@@ -40,10 +40,13 @@ import { isTerminalRunStatus } from "./ThreadManagementService.ts";
 
 const SLOW_SYNC_INTERVAL_MS = 15 * 60 * 1_000;
 // Every server polls every open linked pull request, and most of them sit untouched for days.
-// One nobody has updated for QUIET_AFTER_MS is read on the quiet cadence instead of each sweep;
-// requested refreshes, watches and a host CLI's merge command still read it at once.
+// One nobody has updated for QUIET_AFTER_MS is read again after a sixth of the time it has been
+// quiet, within the bounds below; requested refreshes, watches and a host CLI's merge command
+// still read it at once.
 const QUIET_AFTER_MS = 30 * 60 * 1_000;
-const QUIET_SYNC_INTERVAL_MS = 5 * 60 * 1_000;
+const QUIET_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1_000;
+const QUIET_SYNC_MAX_INTERVAL_MS = 60 * 60 * 1_000;
+const QUIET_SYNC_BACKOFF_DIVISOR = 6;
 
 const isChangeRequestCloseCommand = (command: string) =>
   sourceControlDefinitions.definitions.some(
@@ -365,11 +368,18 @@ export const make = Effect.gen(function* () {
     const sinceLastMs = last === undefined ? Number.POSITIVE_INFINITY : nowMs - last;
     const open = active.filter((entry) => entry.link.snapshot?.state === "open");
     if (open.length > 0) {
-      const quiet = open.every((entry) => {
-        const updatedAt = entry.link.snapshot?.updatedAt;
-        return updatedAt != null && nowMs - Date.parse(updatedAt) >= QUIET_AFTER_MS;
-      });
-      return !quiet || sinceLastMs >= QUIET_SYNC_INTERVAL_MS;
+      // NaN, from a missing or unparsable updatedAt, counts as recently updated.
+      const quietForMs = Math.min(
+        ...open.map((entry) => nowMs - Date.parse(entry.link.snapshot?.updatedAt ?? "")),
+      );
+      if (!(quietForMs >= QUIET_AFTER_MS)) return true;
+      return (
+        sinceLastMs >=
+        Math.min(
+          QUIET_SYNC_MAX_INTERVAL_MS,
+          Math.max(QUIET_SYNC_MIN_INTERVAL_MS, quietForMs / QUIET_SYNC_BACKOFF_DIVISOR),
+        )
+      );
     }
     return sinceLastMs >= SLOW_SYNC_INTERVAL_MS;
   };
@@ -561,8 +571,9 @@ export const make = Effect.gen(function* () {
           }
         }
       }
-      // The host answered, so the cadence clock ticks even if a dispatch below is rejected.
-      lastSyncedAt.set(key, nowMs);
+      // The host answered, so the cadence clock ticks even if a dispatch below is rejected. It
+      // counts from the answer: a read that queued for the host is due no sooner for the wait.
+      lastSyncedAt.set(key, yield* Clock.currentTimeMillis);
       requested.delete(key);
       yield* Effect.forEach(
         entries,

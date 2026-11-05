@@ -241,6 +241,8 @@ it.effect(
           getNextTurnItemOrdinal: () => Effect.die("unused ordinal read"),
           getTurnItem: () => Effect.die("unused turn item read"),
           getThreadRecords: () => Effect.die("unused record read"),
+          getMessageDispatchRecords: () => Effect.die("unused getMessageDispatchRecords"),
+          getRunsLatestFirst: () => Effect.die("unused getRunsLatestFirst"),
           getRuntimeRequest: () => Effect.die("unused getRuntimeRequest"),
           getRunningTurnContext: () => Effect.die("unused getRunningTurnContext"),
           getThreadProviderContext: () => Effect.die("unused getThreadProviderContext"),

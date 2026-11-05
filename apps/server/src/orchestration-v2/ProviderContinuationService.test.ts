@@ -5,6 +5,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
+  RunAttemptId,
   RunId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
@@ -22,6 +23,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import type { ProjectionRecordFilter } from "./ProjectionStore.ts";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
@@ -154,6 +156,121 @@ describe("ProviderContinuationService", () => {
         Effect.scoped,
       );
     }),
+  );
+
+  it.effect(
+    "reads a delivery's runs and provider turns by id, not every run and turn of the thread",
+    () =>
+      Effect.gen(function* () {
+        const dispatched = yield* Queue.unbounded<unknown>();
+        const original = delegatedProjection();
+        const joinedRunId = RunId.make("joined-mailbox-run");
+        const joinedAttemptId = RunAttemptId.make("joined-mailbox-attempt");
+        // A steer joined a run whose turn then completed, so the delivery goes out again.
+        const thread = {
+          ...original,
+          runs: [
+            ...original.runs,
+            ...Array.from({ length: 20 }, (_, index) => ({
+              id: RunId.make(`history-run-${index}`),
+              status: "completed",
+              userMessageId: MessageId.make(`history-input-${index}`),
+              activeAttemptId: RunAttemptId.make(`history-attempt-${index}`),
+            })),
+            {
+              id: joinedRunId,
+              status: "running",
+              userMessageId: MessageId.make("joined-input"),
+              activeAttemptId: joinedAttemptId,
+            },
+          ],
+          providerTurns: [
+            ...Array.from({ length: 20 }, (_, index) => ({
+              runAttemptId: RunAttemptId.make(`history-attempt-${index}`),
+              ordinal: index,
+              status: "completed",
+            })),
+            { runAttemptId: joinedAttemptId, ordinal: 30, status: "completed" },
+          ],
+          messages: [
+            {
+              id: delegatedMessageId,
+              runId: joinedRunId,
+              delegatedCompletion: { parentRunId, generation: 1, taskIds: [] },
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const reads: Array<{
+          readonly fields: ReadonlyArray<string>;
+          readonly filter: ProjectionRecordFilter | undefined;
+        }> = [];
+        // The store's id filters; an absent one keeps every row.
+        const keep = <A>(
+          rows: ReadonlyArray<A>,
+          ids: ReadonlyArray<unknown> | undefined,
+          id: (row: A) => unknown,
+        ) => (ids === undefined ? rows : rows.filter((row) => ids.includes(id(row))));
+        const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: ((
+            _threadId: ThreadId,
+            fields: ReadonlyArray<string>,
+            filter?: ProjectionRecordFilter,
+          ) => {
+            reads.push({ fields, filter });
+            return Effect.succeed({
+              ...thread,
+              messages: keep(thread.messages, filter?.messageIds, (row) => row.id),
+              runs: keep(thread.runs, filter?.runIds, (row) => row.id),
+              providerTurns: keep(
+                thread.providerTurns,
+                filter?.providerTurnAttemptIds,
+                (row) => row.runAttemptId,
+              ),
+            });
+          }) as never,
+          dispatch: (command) => Queue.offer(dispatched, command).pipe(Effect.as({} as never)),
+        });
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* requests.offer({
+            threadId,
+            providerThreadId,
+            driver,
+            detail: null,
+            delivery: "message_text",
+            delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+          });
+          const command = (yield* Queue.take(dispatched)) as { readonly messageId: MessageId };
+          assert.equal(command.messageId, delegatedMessageId);
+        }).pipe(
+          Effect.provide(
+            Layer.merge(
+              ProviderContinuationRequests.layer,
+              ProviderContinuationService.layer.pipe(
+                Layer.provide(
+                  Layer.mergeAll(
+                    IdAllocator.layer,
+                    ProviderContinuationRequests.layer,
+                    layerThreads,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Effect.scoped,
+        );
+        assert.isNotEmpty(reads);
+        assert.deepEqual(
+          reads.flatMap(({ fields, filter }) => [
+            ...(fields.includes("runs") && filter?.runIds === undefined ? ["runs"] : []),
+            ...(fields.includes("providerTurns") && filter?.providerTurnAttemptIds === undefined
+              ? ["providerTurns"]
+              : []),
+          ]),
+          [],
+          "a continuation read takes every run or turn of the thread",
+        );
+      }),
   );
 
   it.effect("delivers a message_text wake as a real prompt, not a buffered wake", () => {

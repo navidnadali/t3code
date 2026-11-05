@@ -1,6 +1,7 @@
 import {
   CommandId,
   type OrchestrationProjectShell,
+  type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ThreadShell,
   type ThreadId,
@@ -26,6 +27,7 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { forkParked } from "../serverActivation.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
+import { visibleThreadPullRequests } from "../sourceControl/threadPullRequests.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 
 class ThreadPullRequestServiceV2 extends Context.Service<
@@ -91,8 +93,22 @@ const BACKFILL_ATTEMPTS = 5;
 
 interface RefreshRequest {
   readonly threadId: ThreadId | null;
-  readonly refresh: boolean;
+  /** A turn's "shared" refresh settles for a lookup of its branch made moments earlier. */
+  readonly refresh: boolean | "shared";
   readonly backfill?: boolean;
+}
+
+/** A link an agent's create command added that this thread's branch lookup has not found yet. */
+function hasUndiscoveredCreatedLink(thread: OrchestrationV2AppThread): boolean {
+  const discovered = thread.branchPullRequest;
+  return visibleThreadPullRequests(thread.pullRequests ?? []).some(
+    (link) =>
+      link.source === "created" &&
+      link.snapshot === null &&
+      (discovered == null ||
+        discovered.number !== link.number ||
+        discovered.repository.toLowerCase() !== link.repository.toLowerCase()),
+  );
 }
 
 export const make = Effect.gen(function* () {
@@ -133,6 +149,32 @@ export const make = Effect.gen(function* () {
           const thread = yield* orchestrator.getThreadShell(threadId);
           return { snapshotSequence, threads: thread === null ? [] : [thread] };
         });
+
+  // Subagents mostly work in their parent's checkout, whose own turns look its branch up.
+  const lookupRefresh = (
+    refresh: RefreshRequest["refresh"],
+    thread: OrchestrationV2ThreadShell,
+  ) => {
+    const parentThreadId = thread.lineage.parentThreadId;
+    if (
+      refresh !== "shared" ||
+      thread.lineage.relationshipToParent !== "subagent" ||
+      parentThreadId === null
+    ) {
+      return Effect.succeed(refresh);
+    }
+    return orchestrator.getThreadShell(parentThreadId).pipe(
+      Effect.map((parent) =>
+        parent !== null &&
+        parent.projectId === thread.projectId &&
+        parent.worktreePath === thread.worktreePath &&
+        parent.branch === thread.branch
+          ? false
+          : refresh,
+      ),
+      Effect.orElseSucceed(() => refresh),
+    );
+  };
 
   const synchronize = Effect.fn("ThreadPullRequestServiceV2.synchronize")(function* (
     request: RefreshRequest,
@@ -185,9 +227,10 @@ export const make = Effect.gen(function* () {
           const first = group[0]!;
           const project = projects.get(first.projectId);
           if (project === undefined) return finishBackfill(group);
+          const refresh = yield* lookupRefresh(request.refresh, first);
           const { project: resolvedProject, repository } =
             yield* resolveProjectForPullRequestDiscovery(project, repositoryIdentities, {
-              refresh: request.refresh,
+              refresh: refresh !== false,
             });
           if (first.branch !== null && repository === null) return finishBackfill(group);
           // A worktree folder can outlive its .git, and git there fails with not_a_repository.
@@ -202,10 +245,7 @@ export const make = Effect.gen(function* () {
           const detected =
             first.branch === null
               ? null
-              : yield* git.branchPullRequest(
-                  { cwd, branch: first.branch },
-                  { refresh: request.refresh },
-                );
+              : yield* git.branchPullRequest({ cwd, branch: first.branch }, { refresh });
           if (detected !== null && !pullRequestMatchesProject(detected, resolvedProject)) {
             return finishBackfill(group);
           }
@@ -375,8 +415,10 @@ export const make = Effect.gen(function* () {
       case "thread.metadata-updated":
         return worker.enqueue({ threadId: event.threadId, refresh: false });
       case "thread.unsettled":
-      case "checkpoint.captured":
         return worker.enqueue({ threadId: event.threadId, refresh: true });
+      // A finished turn emits both; they share one lookup.
+      case "checkpoint.captured":
+        return worker.enqueue({ threadId: event.threadId, refresh: "shared" });
       case "run.updated":
         if (
           event.payload.status === "completed" ||
@@ -384,6 +426,12 @@ export const make = Effect.gen(function* () {
           event.payload.status === "cancelled" ||
           event.payload.status === "interrupted"
         ) {
+          return worker.enqueue({ threadId: event.threadId, refresh: "shared" });
+        }
+        break;
+      // A shared lookup may predate the change request the agent just opened.
+      case "thread.pull-request-synced":
+        if (hasUndiscoveredCreatedLink(event.payload)) {
           return worker.enqueue({ threadId: event.threadId, refresh: true });
         }
         break;

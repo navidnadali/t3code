@@ -2,6 +2,16 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.6-perf.5 (2026-11-05)
+
+Bounded reads and quieter pull request sync
+
+Upstream base: 12ec17ce4c64.
+
+- Message dispatch, subagent finalisation, continuation and turn start read only the rows they use.
+- Pull request sync: GitLab mergeability is kept while unchanged, quiet merge requests are read less often, and branch lookups are shared within a turn.
+- Bench parameters in tools/server-bench set to chosen defaults.
+
 ## v0.1.6-perf.4 (2026-11-04)
 
 Hotfix: forge CLIs in their own pool, runs finish without waiting for PR refresh

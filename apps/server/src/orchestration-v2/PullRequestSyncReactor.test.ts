@@ -835,8 +835,8 @@ describe("PullRequestSyncReactor", () => {
           const reactor = yield* startAndSweep(fixture);
           assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
 
-          // An unchanged old PR uses main's five-minute quiet polling cadence.
-          yield* TestClock.adjust("5 minutes");
+          // An unchanged PR quiet for a day and a half is read hourly.
+          yield* TestClock.adjust("60 minutes");
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);
@@ -853,6 +853,7 @@ describe("PullRequestSyncReactor", () => {
 
   it.effect.each([
     { provider: "github" as const, updatedAt: "2026-08-28T00:00:00.000Z" },
+    { provider: "gitlab" as const, updatedAt: "2026-08-28T00:00:00.000Z" },
     { provider: "forgejo" as const, updatedAt: "2026-08-27T00:00:00.000Z" },
   ])("persists unknown mergeability for $provider at $updatedAt", ({ provider, updatedAt }) =>
     Effect.scoped(
@@ -880,6 +881,150 @@ describe("PullRequestSyncReactor", () => {
             commands.map((command) => command.snapshot.mergeability),
             ["unknown"],
           );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("writes nothing while GitLab rechecks an unchanged merge request", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const key = { host: "gitlab.com", repository: "group/project", number: 42 };
+        // GitLab answers unchecked or checking (mapped to unknown) after every target-branch push.
+        const answers = yield* Ref.make<ReadonlyArray<"unknown" | "mergeable">>([
+          "unknown",
+          "mergeable",
+          "unknown",
+        ]);
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("one", {
+              pullRequests: [
+                makeLink(
+                  42,
+                  { mergeability: "mergeable" },
+                  { ...key, url: "https://gitlab.com/group/project/-/merge_requests/42" },
+                ),
+              ],
+            }),
+          ]),
+          summary: (input) =>
+            Ref.modify(answers, ([next = "mergeable", ...rest]) => [
+              makeSummary(input, {
+                provider: SourceControlProviderKind.make("gitlab"),
+                mergeability: next,
+              }),
+              rest,
+            ]),
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          for (let read = 0; read < 2; read += 1) {
+            yield* reactor.requestSync(key);
+            yield* Queue.take(fixture.snapshotReads);
+            yield* reactor.drain;
+          }
+          assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 3);
+          assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("reads a pull request quiet for six hours hourly, and a requested one at once", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const updatedAt = new Map([
+          [1, "2026-08-28T06:00:00.000Z"],
+          [2, NOW],
+        ]);
+        const reads: Array<{ readonly number: number; readonly minute: number }> = [];
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("one", {
+              pullRequests: [...updatedAt].map(([number, at]) =>
+                makeLink(number, { updatedAt: at }),
+              ),
+            }),
+          ]),
+          summary: (input) =>
+            Clock.currentTimeMillis.pipe(
+              Effect.map((nowMs) => {
+                reads.push({ number: input.number, minute: (nowMs - Date.parse(NOW)) / 60_000 });
+                return makeSummary(input, { updatedAt: updatedAt.get(input.number)! });
+              }),
+            ),
+        });
+        const minutesOf = (number: number) =>
+          reads.filter((read) => read.number === number).map((read) => read.minute);
+        const sweepUntil = (
+          reactor: PullRequestSyncReactor.PullRequestSyncReactor["Service"],
+          until: number,
+        ) =>
+          Effect.gen(function* () {
+            while ((yield* Clock.currentTimeMillis) < Date.parse(NOW) + until * 60_000) {
+              yield* sweepAgain(fixture, reactor);
+            }
+          });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          yield* sweepUntil(reactor, 150);
+          yield* requestAndApply(fixture, reactor, 1);
+          yield* sweepUntil(reactor, 200);
+
+          // The requested read restarts the hour.
+          assert.deepStrictEqual(minutesOf(1), [0, 60, 120, 150]);
+          // One updated less than half an hour ago is still read on every sweep.
+          assert.deepStrictEqual(
+            minutesOf(2).slice(0, 30),
+            Array.from({ length: 30 }, (_, minute) => minute),
+          );
+          assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("counts a quiet pull request's interval from when its read ends", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const quietSince = "2026-08-28T06:00:00.000Z";
+        const reading = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const reads: Array<number> = [];
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("one", { pullRequests: [makeLink(1, { updatedAt: quietSince })] }),
+          ]),
+          summary: (input) =>
+            Effect.gen(function* () {
+              reads.push(((yield* Clock.currentTimeMillis) - Date.parse(NOW)) / 60_000);
+              if (reads.length === 1) {
+                yield* Deferred.succeed(reading, undefined);
+                yield* Deferred.await(release);
+              }
+              return makeSummary(input, { updatedAt: quietSince });
+            }),
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* PullRequestSyncReactor.PullRequestSyncReactor;
+          yield* reactor.start();
+          yield* Deferred.succeed(fixture.activation, undefined);
+          yield* Queue.take(fixture.snapshotReads);
+          yield* Deferred.await(reading);
+          // The host takes ten minutes to answer the first read.
+          yield* TestClock.adjust("10 minutes");
+          yield* Deferred.succeed(release, undefined);
+          yield* reactor.drain;
+          for (let minute = 11; minute <= 80; minute += 1) yield* sweepAgain(fixture, reactor);
+
+          assert.deepStrictEqual(reads, [0, 70]);
         }).pipe(Effect.provide(fixture.layer));
       }),
     ),

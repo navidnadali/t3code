@@ -468,8 +468,27 @@ it.effect("keeps the results of the reads that hold reader transactions", () =>
         turnStart.messages.map((message) => message.id),
         [MessageId.make("message:results:fork:user")],
       );
-      assert.deepStrictEqual(turnStart.subagents, projection.subagents);
-      assert.deepStrictEqual(turnStart.contextTransfers, projection.contextTransfers);
+      // Turn start reads its tasks' threads, not their prompts and results, and only the transfers
+      // it looks at: a handoff's, any into the run, and the fork into a run fork.
+      assert.deepStrictEqual(
+        turnStart.subagentThreads,
+        projection.subagents
+          .filter((subagent) => !["interrupted", "failed", "cancelled"].includes(subagent.status))
+          .map(({ status, childThreadId, providerThreadId }) => ({
+            status,
+            childThreadId,
+            providerThreadId,
+          })),
+      );
+      assert.deepStrictEqual(
+        turnStart.contextTransfers,
+        projection.contextTransfers.filter(
+          (transfer) =>
+            projection.contextHandoffs.some((handoff) => handoff.transferId === transfer.id) ||
+            transfer.targetRunId === fixture.forkRunId ||
+            (transfer.type === "fork" && transfer.targetThreadId === fixture.fork),
+        ),
+      );
 
       const shell = yield* store.getThreadShell(fixture.fork);
       assert.strictEqual(shell?.id, fixture.fork);
@@ -585,7 +604,8 @@ const readCases: ReadonlyArray<ReadCase> = [
     read: (store, fixture) => store.getTurnStartContext(fixture.fork, fixture.forkRunId),
     statements: 14,
     permit: true,
-    corrupt: corruptRows.subagent,
+    // Turn start no longer decodes task payloads; its run's items still decode after the read.
+    corrupt: corruptRows.forkToolItem,
     error: "ProjectionStoreReadError",
   },
   {

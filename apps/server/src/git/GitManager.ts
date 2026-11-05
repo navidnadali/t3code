@@ -133,10 +133,14 @@ export class GitManager extends Context.Service<
       input: VcsStatusInput,
       options?: GitRemoteStatusOptions,
     ) => Effect.Effect<VcsStatusRemoteResult | null, GitManagerServiceError>;
-    /** refresh queries the host; freshGitState rereads only git state and is required before persisting. */
+    /**
+     * refresh queries the host; "shared" settles for a lookup of the same branch that started
+     * within the last 30 s, even one still in flight. freshGitState rereads only git state and is
+     * required before persisting.
+     */
     readonly branchPullRequest: (
       input: { readonly cwd: string; readonly branch: string },
-      options?: { readonly refresh?: boolean; readonly freshGitState?: boolean },
+      options?: { readonly refresh?: boolean | "shared"; readonly freshGitState?: boolean },
     ) => Effect.Effect<GitBranchPullRequest | null, GitManagerServiceError>;
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
@@ -171,6 +175,7 @@ const PR_LOOKUP_FAILURE_BASE_TTL = Duration.seconds(20);
 const PR_LOOKUP_FAILURE_MAX_TTL = Duration.minutes(15);
 const PR_LOOKUP_CACHE_CAPACITY = 2_048;
 const PR_LOOKUP_GIT_STATE_TTL = Duration.minutes(5);
+const PR_LOOKUP_SHARED_REFRESH_WINDOW = Duration.seconds(30);
 const PR_THREAD_CONTEXT_BYTES = 16_000;
 const PR_THREAD_COMMAND_OUTPUT_CHARS = 2_000;
 const isSourceControlProviderError = Schema.is(SourceControlProviderError);
@@ -1208,6 +1213,16 @@ export const make = Effect.gen(function* () {
         ? Effect.void
         : PubSub.publish(pullRequestStateChanges, key);
     });
+  // When each cached lookup started, so a shared refresh can tell whether it is recent enough.
+  const prLookupStartedAtByKey = new Map<string, number>();
+  const notePrLookupStart = (key: string, startedAtMs: number) => {
+    prLookupStartedAtByKey.delete(key);
+    if (prLookupStartedAtByKey.size >= PR_LOOKUP_CACHE_CAPACITY) {
+      const oldestKey = prLookupStartedAtByKey.keys().next().value;
+      if (oldestKey !== undefined) prLookupStartedAtByKey.delete(oldestKey);
+    }
+    prLookupStartedAtByKey.set(key, startedAtMs);
+  };
   const prLookupCache = yield* Cache.makeWith(
     (key: string) => {
       const [
@@ -1226,6 +1241,7 @@ export const make = Effect.gen(function* () {
         ...(remoteName.length > 0 ? { remoteName } : {}),
       };
       return Effect.gen(function* () {
+        notePrLookupStart(key, yield* Clock.currentTimeMillis);
         const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details);
         if (!lookup) {
           return { latest: null, headContext };
@@ -2473,7 +2489,7 @@ export const make = Effect.gen(function* () {
   const lookupBranchPullRequest = Effect.fn("lookupBranchPullRequest")(function* (
     cacheCwd: string,
     branch: string,
-    options: { readonly refresh: boolean; readonly freshGitState: boolean },
+    options: { readonly refresh: boolean | "shared"; readonly freshGitState: boolean },
   ) {
     const remember = <E>(key: string, read: Effect.Effect<string | null, E>) =>
       rememberPrLookupGitState(cacheCwd, key, options.freshGitState, read);
@@ -2577,11 +2593,22 @@ export const make = Effect.gen(function* () {
       localBranchExists,
       ...(localBranchExists ? {} : { remoteName }),
     });
-    if (options.refresh) {
+    const sharesRecentLookup = Clock.currentTimeMillis.pipe(
+      Effect.map(
+        (nowMs) =>
+          options.refresh === "shared" &&
+          nowMs - (prLookupStartedAtByKey.get(cacheKey) ?? -Infinity) <
+            Duration.toMillis(PR_LOOKUP_SHARED_REFRESH_WINDOW),
+      ),
+    );
+    if (options.refresh !== false && !(yield* sharesRecentLookup)) {
+      // Waits for a lookup in flight, which a shared refresh may then settle for.
       const cached = yield* Cache.getOption(prLookupCache, cacheKey).pipe(
         Effect.orElseSucceed(() => Option.none()),
       );
-      if (Option.isSome(cached)) yield* Cache.invalidate(prLookupCache, cacheKey);
+      if (Option.isSome(cached) && !(yield* sharesRecentLookup)) {
+        yield* Cache.invalidate(prLookupCache, cacheKey);
+      }
     }
     let cached = yield* getPrLookup(cacheKey);
     // Lookup may use a fork instead of the saved upstream; verify the remote actually queried.
@@ -2650,8 +2677,8 @@ export const make = Effect.gen(function* () {
     "branchPullRequest",
   )(function* ({ cwd, branch }, options) {
     const cacheCwd = yield* normalizeStatusCacheKey(cwd);
-    const refresh = options?.refresh === true;
-    const freshGitState = refresh || options?.freshGitState === true;
+    const refresh = options?.refresh ?? false;
+    const freshGitState = refresh !== false || options?.freshGitState === true;
     const pullRequest = yield* lookupBranchPullRequest(cacheCwd, branch, {
       refresh,
       freshGitState,

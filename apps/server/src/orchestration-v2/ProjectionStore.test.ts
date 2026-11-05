@@ -1911,6 +1911,83 @@ it.effect("reads message ordinals through their index and orders messages as wit
   messageOrdinalsReadThroughTheirIndex.pipe(Effect.provide(layerTest)),
 );
 
+// SQLite has no table statistics here, so a usable thread_id term walks the thread's whole
+// history through its thread index; a read that names its rows must seek them by their own.
+it.effect("record reads that name their rows seek them by id, not through the thread", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:records-by-id");
+    yield* store.apply(recordsThreadCreated(threadId));
+    const reads: ReadonlyArray<
+      readonly [
+        ProjectionStore.ProjectionRecordField,
+        ProjectionStore.ProjectionRecordFilter,
+        string,
+      ]
+    > = [
+      [
+        "runs",
+        { runIds: [RunId.make("run:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_runs_1",
+      ],
+      [
+        "nodes",
+        { nodeIds: [NodeId.make("node:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_nodes_1",
+      ],
+      [
+        "subagents",
+        { subagentIds: [NodeId.make("node:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_subagents_1",
+      ],
+      [
+        "subagents",
+        { subagentChildThreadIds: [ThreadId.make("thread:a"), ThreadId.make("thread:b")] },
+        "orchestration_v2_projection_subagents_child_thread_idx",
+      ],
+      [
+        "providerTurns",
+        { providerTurnIds: [ProviderTurnId.make("turn:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_provider_turns_1",
+      ],
+      [
+        "messages",
+        { messageIds: [MessageId.make("message:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_messages_1",
+      ],
+      [
+        "turnItems",
+        { turnItemNodeIds: [NodeId.make("node:by-id")] },
+        "orchestration_v2_projection_turn_items_node_ordinal_idx",
+      ],
+      [
+        "turnItems",
+        { turnItemMessageIds: [MessageId.make("message:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_turn_items_1",
+      ],
+    ];
+    for (const [field, filter, index] of reads) {
+      const { statements, tracer } = traceSqlStatements();
+      yield* store.getThreadRecords(threadId, [field], filter).pipe(Effect.withTracer(tracer));
+      const statement = statements.find(
+        (query) => !query.includes("orchestration_v2_projection_threads"),
+      );
+      const plan = yield* queryPlan(statement);
+      assert.include(plan[0] ?? "", `USING INDEX ${index} `, `${field} ${JSON.stringify(filter)}`);
+      if (filter.turnItemMessageIds !== undefined) {
+        assert.isTrue(
+          plan.some((detail) =>
+            detail.includes(
+              "USING INDEX orchestration_v2_projection_turn_items_message_ordinal_idx",
+            ),
+          ),
+          plan.join("\n"),
+        );
+      }
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
+
 const assertProjectScopedShells = Effect.fn("assertProjectScopedShells")(function* (
   suffix: string,
 ) {

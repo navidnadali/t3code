@@ -18,6 +18,14 @@ export function modelSwitchSince(
   to: ModelSelection,
   baseline?: ModelSelection,
 ): Pick<Extract<OrchestrationV2TurnItem, { type: "user_message" }>, "modelSwitch"> {
+  const from = latestShownRun(projection)?.modelSelection ?? baseline;
+  return from === undefined || modelSelectionsEqual(from, to) ? {} : { modelSwitch: { from, to } };
+}
+
+/** The latest run the timeline shows through its message or its handoff row. */
+export function latestShownRun(
+  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "turnItems">,
+): OrchestrationV2ThreadProjection["runs"][number] | undefined {
   // Clients hide pending queued messages, fold async answers into their question, and replace
   // `/compact` with a compaction row.
   const shown = new Set(
@@ -37,6 +45,5 @@ export function modelSwitchSince(
     if (!shown.has(run.userMessageId) && run.contextHandoffId === null) continue;
     if (previous === undefined || runRanAfter(run, previous)) previous = run;
   }
-  const from = previous?.modelSelection ?? baseline;
-  return from === undefined || modelSelectionsEqual(from, to) ? {} : { modelSwitch: { from, to } };
+  return previous;
 }

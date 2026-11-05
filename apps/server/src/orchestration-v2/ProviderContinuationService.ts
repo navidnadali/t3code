@@ -73,18 +73,46 @@ export const layer = Layer.effectDiscard(
         return [Math.min(100 * 2 ** Math.min(attempt, 6), 5_000), updated] as const;
       });
 
+    // What currentDelegatedCompletionDelivery reads: the delivery's source run and message and, for
+    // a message already dispatched, the run it joined and that run's provider turns.
+    const readDeliveryState = Effect.fnUntraced(function* (
+      request: ProviderContinuationRequests.ProviderContinuationRequest,
+    ) {
+      const completion = request.delegatedCompletion;
+      const records = yield* threads.getThreadRecords(
+        request.threadId,
+        ["messages", "runs", "providerTurns"],
+        {
+          messageIds: completion === undefined ? [] : [completion.messageId],
+          runIds: completion === undefined ? [] : [completion.parentRunId],
+          providerTurnAttemptIds: [],
+        },
+      );
+      const message = records.messages.find((candidate) => candidate.id === completion?.messageId);
+      const joinedRunId = message?.delegatedCompletion === undefined ? null : message.runId;
+      if (joinedRunId === null) return records;
+      const joined =
+        records.runs.find((run) => run.id === joinedRunId) ??
+        (yield* threads.getThreadRecords(request.threadId, ["runs"], { runIds: [joinedRunId] }))
+          .runs[0];
+      if (joined === undefined) return records;
+      const { providerTurns } = yield* threads.getThreadRecords(
+        request.threadId,
+        ["providerTurns"],
+        { providerTurnAttemptIds: joined.activeAttemptId === null ? [] : [joined.activeAttemptId] },
+      );
+      return {
+        ...records,
+        runs: records.runs.some((run) => run.id === joined.id)
+          ? records.runs
+          : [...records.runs, joined],
+        providerTurns,
+      };
+    });
+
     const dispatchContinuation = Effect.fn("ProviderContinuationService.dispatchContinuation")(
       function* (request: ProviderContinuationRequests.ProviderContinuationRequest) {
-        const projection = yield* threads.getThreadRecords(
-          request.threadId,
-          ["messages", "runs", "providerTurns"],
-          {
-            messageIds:
-              request.delegatedCompletion === undefined
-                ? []
-                : [request.delegatedCompletion.messageId],
-          },
-        );
+        const projection = yield* readDeliveryState(request);
         if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
           yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
             threadId: request.threadId,
@@ -250,16 +278,7 @@ export const layer = Layer.effectDiscard(
                 const retryDelay = yield* nextRetryDelay(retryKey);
                 yield* Effect.gen(function* () {
                   yield* Effect.sleep(`${retryDelay} millis`);
-                  const projection = yield* threads.getThreadRecords(
-                    request.threadId,
-                    ["messages", "runs", "providerTurns"],
-                    {
-                      messageIds:
-                        request.delegatedCompletion === undefined
-                          ? []
-                          : [request.delegatedCompletion.messageId],
-                    },
-                  );
+                  const projection = yield* readDeliveryState(request);
                   if (currentDelegatedCompletionDelivery(projection, completion) !== undefined) {
                     yield* requests.offer(request);
                   } else {

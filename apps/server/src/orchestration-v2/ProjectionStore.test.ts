@@ -1828,15 +1828,39 @@ const parentRecordsNarrowToOneChild = Effect.gen(function* () {
     narrowed.contextTransfers.map((candidate) => String(candidate.id)),
     ["transfer:child-result", "transfer:child-follow-up"],
   );
-  for (const table of ["subagents", "context_transfers"]) {
+  // Each read seeks the child's rows through its own index, never the parent's whole history.
+  for (const [table, index] of [
+    ["subagents", "orchestration_v2_projection_subagents_child_thread_idx (child_thread_id=?)"],
+    [
+      "context_transfers",
+      "orchestration_v2_projection_context_transfers_source_thread_idx (source_thread_id=?)",
+    ],
+  ]) {
     const plan = yield* queryPlan(
       statements.find((statement) =>
         statement.includes(`FROM orchestration_v2_projection_${table}`),
       ),
     );
-    assert.match(plan[0] ?? "", /^(MULTI-INDEX OR|SEARCH \S+ USING INDEX )/);
+    assert.include(plan[0] ?? "", `USING INDEX ${index}`);
     assert.notOk(plan.some((detail) => detail.startsWith("SCAN orchestration_v2_projection")));
   }
+  // Several children read through the id list.
+  const both = yield* store.getThreadRecords(parent, fields, {
+    subagentChildThreadIds: [child, sibling],
+    contextTransferSourceThreadIds: [child, sibling],
+  });
+  assert.deepEqual(
+    both.subagents,
+    full.subagents.filter(
+      (candidate) => candidate.childThreadId === child || candidate.childThreadId === sibling,
+    ),
+  );
+  assert.deepEqual(
+    both.contextTransfers,
+    full.contextTransfers.filter(
+      (candidate) => candidate.sourceThreadId === child || candidate.sourceThreadId === sibling,
+    ),
+  );
   const none = yield* store.getThreadRecords(parent, fields, {
     subagentChildThreadIds: [],
     contextTransferSourceThreadIds: [],
@@ -1885,6 +1909,125 @@ it.effect("record reads narrow a parent to one child's tasks and transfers", () 
 );
 it.effect("reads message ordinals through their index and orders messages as without it", () =>
   messageOrdinalsReadThroughTheirIndex.pipe(Effect.provide(layerTest)),
+);
+
+// The settled index covers the open-task filter; the delivery state column sits past each task's
+// payload, so a filter read from the table walks every prompt and result.
+it.effect("command reads find open tasks through the settled index", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:open-tasks");
+    yield* store.apply(recordsThreadCreated(threadId));
+    for (const filter of [
+      { omitSettledSubagents: true },
+      { omitSettledSubagents: { except: [NodeId.make("node:kept")] } },
+    ] satisfies ReadonlyArray<ProjectionStore.ProjectionRecordFilter>) {
+      const { statements, tracer } = traceSqlStatements();
+      yield* store
+        .getThreadRecords(threadId, ["subagents"], filter)
+        .pipe(Effect.withTracer(tracer));
+      const plan = yield* queryPlan(
+        statements.find((query) => query.includes("FROM orchestration_v2_projection_subagents")),
+      );
+      assert.isTrue(
+        plan.some((detail) =>
+          detail.includes("USING COVERING INDEX orchestration_v2_projection_subagents_settled_idx"),
+        ),
+        plan.join("\n"),
+      );
+      assert.isTrue(
+        plan.some((detail) =>
+          /^SEARCH subagent USING INTEGER PRIMARY KEY \(rowid=\?\)$/.test(detail),
+        ),
+        plan.join("\n"),
+      );
+      assert.notOk(
+        plan.some(
+          (detail) =>
+            detail.includes("orchestration_v2_projection_subagents_thread_idx") ||
+            /^SCAN (subagent|orchestration_v2_projection_subagents)\b/.test(detail),
+        ),
+        plan.join("\n"),
+      );
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
+
+// SQLite has no table statistics here, so a usable thread_id term walks the thread's whole
+// history through its thread index; a read that names its rows must seek them by their own.
+it.effect("record reads that name their rows seek them by id, not through the thread", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:records-by-id");
+    yield* store.apply(recordsThreadCreated(threadId));
+    const reads: ReadonlyArray<
+      readonly [
+        ProjectionStore.ProjectionRecordField,
+        ProjectionStore.ProjectionRecordFilter,
+        string,
+      ]
+    > = [
+      [
+        "runs",
+        { runIds: [RunId.make("run:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_runs_1",
+      ],
+      [
+        "nodes",
+        { nodeIds: [NodeId.make("node:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_nodes_1",
+      ],
+      [
+        "subagents",
+        { subagentIds: [NodeId.make("node:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_subagents_1",
+      ],
+      [
+        "subagents",
+        { subagentChildThreadIds: [ThreadId.make("thread:a"), ThreadId.make("thread:b")] },
+        "orchestration_v2_projection_subagents_child_thread_idx",
+      ],
+      [
+        "providerTurns",
+        { providerTurnIds: [ProviderTurnId.make("turn:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_provider_turns_1",
+      ],
+      [
+        "messages",
+        { messageIds: [MessageId.make("message:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_messages_1",
+      ],
+      [
+        "turnItems",
+        { turnItemNodeIds: [NodeId.make("node:by-id")] },
+        "orchestration_v2_projection_turn_items_node_ordinal_idx",
+      ],
+      [
+        "turnItems",
+        { turnItemMessageIds: [MessageId.make("message:by-id")] },
+        "sqlite_autoindex_orchestration_v2_projection_turn_items_1",
+      ],
+    ];
+    for (const [field, filter, index] of reads) {
+      const { statements, tracer } = traceSqlStatements();
+      yield* store.getThreadRecords(threadId, [field], filter).pipe(Effect.withTracer(tracer));
+      const statement = statements.find(
+        (query) => !query.includes("orchestration_v2_projection_threads"),
+      );
+      const plan = yield* queryPlan(statement);
+      assert.include(plan[0] ?? "", `USING INDEX ${index} `, `${field} ${JSON.stringify(filter)}`);
+      if (filter.turnItemMessageIds !== undefined) {
+        assert.isTrue(
+          plan.some((detail) =>
+            detail.includes(
+              "USING INDEX orchestration_v2_projection_turn_items_message_ordinal_idx",
+            ),
+          ),
+          plan.join("\n"),
+        );
+      }
+    }
+  }).pipe(Effect.provide(layerTest)),
 );
 
 const assertProjectScopedShells = Effect.fn("assertProjectScopedShells")(function* (

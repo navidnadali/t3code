@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  ContextHandoffId,
   ContextTransferId,
   NodeId,
   EventId,
@@ -8,6 +9,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
   RunId,
   RuntimeRequestId,
   ThreadId,
@@ -19,6 +21,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -553,5 +556,187 @@ it.effect(
       yield* userMessage(forkId, forkRunId, "/compact");
 
       assert.isTrue((yield* store.getTurnStartContext(forkId, forkRunId)).hasConversation);
+    }).pipe(Effect.provide(layerDatabase)),
+);
+
+/**
+ * A thread whose history holds settled delegated tasks, each with its result and spawn transfers, and
+ * a starting run whose context handoff names one of those results.
+ */
+const seedDelegatingThread = Effect.fn("seedDelegatingThread")(function* (
+  threadId: ThreadId,
+  tasks: number,
+) {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const now = yield* DateTime.now;
+  const instanceId = ProviderInstanceId.make("codex");
+  const driver = ProviderDriverKind.make("codex");
+  const runId = RunId.make(`run:${threadId}:start`);
+  const providerThreadId = ProviderThreadId.make(`provider-thread:${threadId}`);
+  let sequence = 0;
+  const apply = (event: Record<string, unknown>) =>
+    store.apply({
+      id: EventId.make(`event:${threadId}:${++sequence}`),
+      threadId,
+      occurredAt: now,
+      ...event,
+    } as never);
+  yield* apply({
+    type: "thread.created",
+    payload: {
+      id: threadId,
+      projectId: ProjectId.make(`project:${threadId}`),
+      title: "Delegating",
+      providerInstanceId: instanceId,
+      modelSelection: { instanceId, model: "test" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: providerThreadId,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdBy: "user",
+      creationSource: "web",
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    },
+  });
+  yield* apply({
+    type: "run.updated",
+    runId,
+    payload: {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId: instanceId,
+      modelSelection: { instanceId, model: "test" },
+      providerThreadId,
+      userMessageId: MessageId.make(`message:${threadId}:start`),
+      rootNodeId: NodeId.make(`node:${threadId}:root`),
+      activeAttemptId: null,
+      status: "starting",
+      requestedAt: now,
+      startedAt: null,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+    },
+  });
+  const transfer = (id: string, type: string, source: ThreadId, target: ThreadId) => ({
+    type: "context-transfer.created",
+    threadId: target,
+    payload: {
+      id: ContextTransferId.make(id),
+      type,
+      sourceThreadId: source,
+      targetThreadId: target,
+      sourcePoint: { threadId: source },
+      basePoint: null,
+      sourceProviderInstanceId: instanceId,
+      targetProviderInstanceId: instanceId,
+      targetRunId: null,
+      status: "consumed",
+      resolution: null,
+      createdBy: "agent",
+      error: null,
+      createdAt: now,
+      updatedAt: now,
+      consumedAt: now,
+    },
+  });
+  for (let task = 1; task <= tasks; task++) {
+    const taskId = NodeId.make(`node:${threadId}:task:${task}`);
+    const childThreadId = ThreadId.make(`thread:${threadId}:child:${task}`);
+    yield* apply({
+      type: "subagent.updated",
+      nodeId: taskId,
+      payload: {
+        id: taskId,
+        threadId,
+        runId: null,
+        parentNodeId: NodeId.make(`node:${threadId}:root`),
+        origin: "app_owned",
+        createdBy: "agent",
+        driver,
+        providerInstanceId: instanceId,
+        providerThreadId: ProviderThreadId.make(`provider-thread:${childThreadId}`),
+        childThreadId,
+        nativeTaskRef: null,
+        prompt: `Task ${task}`,
+        title: `Task ${task}`,
+        model: null,
+        status: "completed",
+        result: `Result ${task}`,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+      },
+    });
+    yield* apply(
+      transfer(`transfer:${threadId}:spawn:${task}`, "subagent_spawn", threadId, childThreadId),
+    );
+    yield* apply(
+      transfer(`transfer:${threadId}:result:${task}`, "subagent_result", childThreadId, threadId),
+    );
+  }
+  yield* apply({
+    type: "context-handoff.updated",
+    runId,
+    payload: {
+      id: ContextHandoffId.make(`handoff:${threadId}`),
+      transferId: ContextTransferId.make(`transfer:${threadId}:result:1`),
+      threadId,
+      targetRunId: runId,
+      fromProviderThreadIds: [],
+      toProviderThreadId: providerThreadId,
+      coveredRunOrdinals: { from: 1, to: 1 },
+      strategy: "full_thread_summary",
+      status: "ready",
+      summaryMessageId: null,
+      summaryText: "Earlier work.",
+      createdByProviderInstanceId: null,
+      createdAt: now,
+      updatedAt: now,
+    },
+  });
+  return runId;
+});
+
+it.effect(
+  "a turn start decodes as many task and transfer rows on a long history as on a short one",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const decodedRows = Effect.fn("decodedRows")(function* (tasks: number) {
+        const threadId = ThreadId.make(`thread:turn-start-reads:${tasks}`);
+        const runId = yield* seedDelegatingThread(threadId, tasks);
+        const statements: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+        yield* store.getTurnStartContext(threadId, runId).pipe(
+          Effect.provideService(Statement.CurrentTransformer, (statement) => {
+            const [query, params] = statement.compile();
+            if (
+              /SELECT payload_json\s+FROM orchestration_v2_projection_(subagents|context_transfers)\b/.test(
+                query,
+              )
+            ) {
+              statements.push([query, params]);
+            }
+            return Effect.succeed(statement);
+          }),
+        );
+        const rows: Array<number> = [];
+        for (const [query, params] of statements) {
+          rows.push((yield* sql.unsafe(query, params as Array<never>)).length);
+        }
+        return rows;
+      });
+      assert.deepEqual(yield* decodedRows(40), yield* decodedRows(4));
     }).pipe(Effect.provide(layerDatabase)),
 );

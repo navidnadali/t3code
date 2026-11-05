@@ -1911,6 +1911,38 @@ it.effect("reads message ordinals through their index and orders messages as wit
   messageOrdinalsReadThroughTheirIndex.pipe(Effect.provide(layerTest)),
 );
 
+// The settled index covers the open-task filter; the delivery state column sits past each task's
+// payload, so a filter read from the table walks every prompt and result.
+it.effect("command reads find open tasks through the settled index", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:open-tasks");
+    yield* store.apply(recordsThreadCreated(threadId));
+    for (const filter of [
+      { omitSettledSubagents: true },
+      { omitSettledSubagents: { except: [NodeId.make("node:kept")] } },
+    ] satisfies ReadonlyArray<ProjectionStore.ProjectionRecordFilter>) {
+      const { statements, tracer } = traceSqlStatements();
+      yield* store
+        .getThreadRecords(threadId, ["subagents"], filter)
+        .pipe(Effect.withTracer(tracer));
+      const plan = yield* queryPlan(
+        statements.find((query) => query.includes("FROM orchestration_v2_projection_subagents")),
+      );
+      assert.isTrue(
+        plan.some((detail) =>
+          detail.includes("USING COVERING INDEX orchestration_v2_projection_subagents_settled_idx"),
+        ),
+        plan.join("\n"),
+      );
+      assert.notOk(
+        plan.some((detail) => detail.includes("orchestration_v2_projection_subagents_thread_idx")),
+        plan.join("\n"),
+      );
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
+
 // SQLite has no table statistics here, so a usable thread_id term walks the thread's whole
 // history through its thread index; a read that names its rows must seek them by their own.
 it.effect("record reads that name their rows seek them by id, not through the thread", () =>

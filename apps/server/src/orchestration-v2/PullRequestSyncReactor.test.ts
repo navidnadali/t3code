@@ -853,6 +853,7 @@ describe("PullRequestSyncReactor", () => {
 
   it.effect.each([
     { provider: "github" as const, updatedAt: "2026-08-28T00:00:00.000Z" },
+    { provider: "gitlab" as const, updatedAt: "2026-08-28T00:00:00.000Z" },
     { provider: "forgejo" as const, updatedAt: "2026-08-27T00:00:00.000Z" },
   ])("persists unknown mergeability for $provider at $updatedAt", ({ provider, updatedAt }) =>
     Effect.scoped(
@@ -880,6 +881,53 @@ describe("PullRequestSyncReactor", () => {
             commands.map((command) => command.snapshot.mergeability),
             ["unknown"],
           );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("writes nothing while GitLab rechecks an unchanged merge request", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const key = { host: "gitlab.com", repository: "group/project", number: 42 };
+        // GitLab answers unchecked or checking (mapped to unknown) after every target-branch push.
+        const answers = yield* Ref.make<ReadonlyArray<"unknown" | "mergeable">>([
+          "unknown",
+          "mergeable",
+          "unknown",
+        ]);
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("one", {
+              pullRequests: [
+                makeLink(
+                  42,
+                  { mergeability: "mergeable" },
+                  { ...key, url: "https://gitlab.com/group/project/-/merge_requests/42" },
+                ),
+              ],
+            }),
+          ]),
+          summary: (input) =>
+            Ref.modify(answers, ([next = "mergeable", ...rest]) => [
+              makeSummary(input, {
+                provider: SourceControlProviderKind.make("gitlab"),
+                mergeability: next,
+              }),
+              rest,
+            ]),
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          for (let read = 0; read < 2; read += 1) {
+            yield* reactor.requestSync(key);
+            yield* Queue.take(fixture.snapshotReads);
+            yield* reactor.drain;
+          }
+          assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 3);
+          assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
         }).pipe(Effect.provide(fixture.layer));
       }),
     ),

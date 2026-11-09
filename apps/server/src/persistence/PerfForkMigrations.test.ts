@@ -15,6 +15,7 @@ import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { migrationManifest, runMigrations } from "./Migrations.ts";
+import { runPerfForkMigrations } from "./PerfForkMigrations.ts";
 
 const FORK_TABLE = "t3_perf_fork_migrations";
 const FORK_CHAIN: Array<[number, string]> = [
@@ -242,7 +243,8 @@ describe("performance fork migrations", () => {
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         const expectedSchema = yield* freshSchema;
-        yield* runMigrations();
+        yield* runMigrations({ toMigrationInclusive: RC1_UPSTREAM_HEAD });
+        yield* runPerfForkMigrations();
         yield* toRc1(recorded);
         if (dropIndex) {
           yield* sql`DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx`;
@@ -273,7 +275,8 @@ describe("performance fork migrations", () => {
   it.effect("keeps the fork's own rows when release candidate 1 ran again on the database", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations();
+      yield* runMigrations({ toMigrationInclusive: RC1_UPSTREAM_HEAD });
+      yield* runPerfForkMigrations();
       yield* toRc1([1, 2]);
       yield* sql`
         CREATE TABLE ${sql(FORK_TABLE)} (

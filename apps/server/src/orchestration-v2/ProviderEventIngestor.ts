@@ -251,7 +251,7 @@ const BATCHABLE_EVENT_TYPES = new Set<ProviderAdapter.ProviderAdapterV2Event["ty
   "plan.updated",
 ]);
 
-export const canIngestInBatch = (event: ProviderAdapter.ProviderAdapterV2Event): boolean =>
+const canIngestInBatch = (event: ProviderAdapter.ProviderAdapterV2Event): boolean =>
   BATCHABLE_EVENT_TYPES.has(event.type);
 
 // One batch is one writer transaction: past a few hundred events or about a MiB it holds the
@@ -640,6 +640,26 @@ export const layer: Layer.Layer<
               ];
             case "runtime_request.updated":
               return [
+                ...(input.event.artifacts === undefined
+                  ? []
+                  : [
+                      yield* makeDomainEvent(input, {
+                        type: "node.updated",
+                        threadId: input.event.artifacts.node.threadId,
+                        runId: input.event.artifacts.node.runId,
+                        nodeId: input.event.artifacts.node.id,
+                        payload: input.event.artifacts.node,
+                      }),
+                      yield* makeDomainEvent(input, {
+                        type: "turn-item.updated",
+                        threadId: input.event.artifacts.turnItem.threadId,
+                        runId: input.event.artifacts.turnItem.runId,
+                        nodeId: input.event.artifacts.turnItem.nodeId,
+                        payload: boundFileChangeForStorage(
+                          stripUnservedToolOutputImageBytes(input.event.artifacts.turnItem),
+                        ),
+                      }),
+                    ]),
                 yield* makeDomainEvent(input, {
                   type: "runtime-request.updated",
                   ...(input.event.threadId === undefined ? {} : { threadId: input.event.threadId }),

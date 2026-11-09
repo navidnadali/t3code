@@ -56,6 +56,10 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.steer"),
+    durableDelivery: Schema.optional(Schema.Literal(true)),
+    deliveryIntent: Schema.optional(Schema.Literal("auto")),
+    deliveryPhase: Schema.optional(Schema.Literals(["invoked", "accepted", "follow_up"])),
+    acceptDelegatedCompletion: Schema.optional(Schema.Boolean),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
@@ -197,12 +201,21 @@ export class EffectOutboxError extends Schema.TaggedError<EffectOutboxError>()(
 
 const isEffectOutboxError = Schema.is(EffectOutboxError);
 
+export type ControlLane = "interrupt" | "reply" | "steer-reply";
+
 export interface EffectOutboxV2Shape {
   readonly awaitAvailable: Effect.Effect<void>;
+  readonly awaitControlAvailable: (type: ControlLane) => Effect.Effect<void>;
   readonly notifyAvailable: (count?: number) => Effect.Effect<void>;
   /** Persist rows only. Notify workers after the surrounding transaction commits. */
   readonly enqueue: (
     effects: ReadonlyArray<PendingOrchestrationEffectV2>,
+  ) => Effect.Effect<void, EffectOutboxError>;
+  /** Persist the provider-call boundary before an automatic steer can reach the adapter. */
+  readonly recordSteerDelivery: (
+    effectId: string,
+    leaseOwner: string | null,
+    phase: "invoked" | "accepted" | "follow_up",
   ) => Effect.Effect<void, EffectOutboxError>;
   readonly get: (
     effectId: string,
@@ -227,10 +240,14 @@ export interface EffectOutboxV2Shape {
   readonly claimNext: (input: {
     readonly workerId: string;
     readonly excludeRestartContinuations?: boolean;
+    readonly controlLane?: ControlLane;
     /** Effect types left in the outbox for now; an older one still blocks its thread's newer effects. */
     readonly excludeEffectTypes?: ReadonlyArray<string>;
   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
   readonly nextClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
+  readonly nextControlClaimableAt: (
+    type: ControlLane,
+  ) => Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly nextClaimableAtExcluding: (
     excludeEffectTypes: ReadonlyArray<string>,
   ) => Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
@@ -302,6 +319,12 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
     // One token per worker is the most that is ever useful: a reopened gate wakes the whole pool
     // with one call, so the queue holds as many as the largest pool the knob allows.
     const available = yield* Queue.dropping<void>(EFFECT_WORKER_MAX_CONCURRENCY);
+    // A reserved control worker must not consume another worker's only wake-up.
+    const controlAvailable = {
+      interrupt: yield* Queue.dropping<void>(1),
+      reply: yield* Queue.dropping<void>(1),
+      "steer-reply": yield* Queue.dropping<void>(1),
+    };
     const cancellationSignals = new Map<string, Deferred.Deferred<void>>();
     const settledSignals = new Map<string, Deferred.Deferred<void>>();
     const signalSettled = (effectIds: ReadonlyArray<string>) =>
@@ -322,12 +345,34 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           { length: Math.min(EFFECT_WORKER_MAX_CONCURRENCY, Math.max(0, Math.floor(count))) },
           () => undefined,
         ),
-      ).pipe(Effect.asVoid);
+      ).pipe(
+        Effect.andThen(
+          count > 0
+            ? Effect.forEach(
+                Object.values(controlAvailable),
+                (queue) => Queue.offer(queue, undefined),
+                { discard: true },
+              )
+            : Effect.void,
+        ),
+        Effect.asVoid,
+      );
+    const trackedSteer = sql`(effect_type = 'provider-turn.steer'
+      AND (COALESCE(json_extract(payload_json, '$.durableDelivery'), 0) = 1
+        OR COALESCE(json_extract(payload_json, '$.deliveryIntent'), '') = 'auto'))`;
+    const matchingRunningSteer = (beforeActive = false) => sql`EXISTS (
+      SELECT 1 FROM orchestration_v2_effect_outbox AS steering
+      WHERE steering.thread_id = candidate.thread_id AND steering.status = 'running'
+        AND ${trackedSteer}
+        AND json_extract(steering.payload_json, '$.providerSessionId') = json_extract(candidate.payload_json, '$.providerSessionId')
+        AND ${beforeActive ? sql`steering.rowid < active.rowid` : sql`1 = 1`}
+    )`;
     // Retry backoff must block later effects so turns cannot race a pending rollback.
     const claimableCandidatePredicate = (
       availableBefore?: string,
       excludeRestartContinuations = false,
       excludeEffectTypes: ReadonlyArray<string> = [],
+      controlLane?: ControlLane,
     ) =>
       sql`
         ${
@@ -336,6 +381,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             : sql`candidate.available_at <= ${availableBefore}`
         }
         AND candidate.status = 'pending'
+        AND ${controlLane === undefined ? sql`1 = 1` : controlLane === "steer-reply" ? sql`candidate.effect_type = 'runtime-request.respond' AND ${matchingRunningSteer()}` : sql`candidate.effect_type = ${controlLane === "interrupt" ? "provider-turn.interrupt" : "runtime-request.respond"}`}
         AND ${
           excludeEffectTypes.length === 0
             ? sql`1 = 1`
@@ -345,6 +391,18 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           SELECT 1
           FROM orchestration_v2_effect_outbox AS active
           WHERE active.thread_id = candidate.thread_id
+            -- Stop and a same-session preflight answer can reach a provider awaiting a steer ACK.
+            -- All other later work still waits for that steer's durable outcome.
+            AND NOT (${trackedSteer} AND (
+              candidate.effect_type = 'provider-turn.interrupt'
+              OR (candidate.effect_type = 'runtime-request.respond'
+                AND json_extract(candidate.payload_json, '$.providerSessionId') = json_extract(active.payload_json, '$.providerSessionId'))
+            ))
+            -- Housekeeping queued behind that steer cannot block the response that releases it.
+            AND NOT (active.status = 'pending'
+              AND active.effect_type IN ('attachment.cleanup', 'scheduled-tasks.cleanup', 'terminal.cleanup', 'preview.cleanup', 'checkpoint.capture')
+              AND candidate.effect_type IN ('provider-turn.interrupt', 'runtime-request.respond')
+              AND ${matchingRunningSteer(true)})
             AND (
               active.status = 'running'
               OR (
@@ -386,11 +444,11 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
 
     // Untraced: the workers ask on every idle poll, and the statement itself is kept out of traces.
     const nextClaimableAtFor = Effect.fnUntraced(
-      function* (excludeEffectTypes: ReadonlyArray<string>) {
+      function* (excludeEffectTypes: ReadonlyArray<string>, controlLane?: ControlLane) {
         const rows = yield* sql<{ readonly available_at: string | null }>`
           SELECT MIN(candidate.available_at) AS available_at
           FROM orchestration_v2_effect_outbox AS candidate
-          WHERE ${claimableCandidatePredicate(undefined, false, excludeEffectTypes)}
+          WHERE ${claimableCandidatePredicate(undefined, false, excludeEffectTypes, controlLane)}
         `.pipe(NodeSqliteClient.readOnly, Effect.withTracerEnabled(false));
         const availableAt = rows[0]?.available_at;
         if (availableAt === undefined || availableAt === null) return Option.none();
@@ -410,7 +468,36 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       ),
     );
 
+    const replayableSteer = sql`(${trackedSteer}
+      AND COALESCE(json_extract(payload_json, '$.deliveryPhase'), '') != 'invoked')`;
+
     const service: EffectOutboxV2Shape = {
+      recordSteerDelivery: Effect.fn("EffectOutbox.recordSteerDelivery")(
+        function* (effectId, leaseOwner, phase) {
+          const rows = yield* sql`
+            UPDATE orchestration_v2_effect_outbox
+            SET payload_json = json_set(payload_json, '$.deliveryPhase', ${phase})
+            WHERE effect_id = ${effectId} AND effect_type = 'provider-turn.steer'
+              AND status = 'running' AND lease_owner = ${leaseOwner}
+              AND (json_extract(payload_json, '$.deliveryPhase') IS NULL
+                OR (${phase} IN ('accepted', 'follow_up') AND json_extract(payload_json, '$.deliveryPhase') IN ('invoked', ${phase})))
+            RETURNING effect_id
+          `;
+          if (rows.length !== 1)
+            return yield* new EffectOutboxError({
+              operation: "record-steer-delivery",
+              effectId,
+              cause: "The worker no longer owns the steer effect.",
+            });
+        },
+        (effect, effectId) =>
+          effect.pipe(
+            Effect.mapError(
+              (cause) =>
+                new EffectOutboxError({ operation: "record-steer-delivery", effectId, cause }),
+            ),
+          ),
+      ),
       enqueue: Effect.fn("EffectOutbox.enqueue")(
         function* (effects) {
           const now = yield* DateTime.now;
@@ -465,6 +552,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           Effect.mapError((cause) => new EffectOutboxError({ operation: "get", effectId, cause })),
         ),
       awaitAvailable: Queue.take(available),
+      awaitControlAvailable: (type) => Queue.take(controlAvailable[type]),
       notifyAvailable,
       listByCommandId: (commandId) =>
         sql<EffectRow>`
@@ -485,6 +573,17 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         function* ({ threadId, effectTypes, reason }) {
           if (effectTypes.length === 0) return [];
           const now = DateTime.formatIso(yield* DateTime.now);
+          // Accepted steering survives turn replacement, Stop and runtime recovery. Retire its
+          // old provider target instead; follow-up dispatch rechecks the durable Stop barrier.
+          // A live lease also retains an invoked steer until its ACK establishes delivery or
+          // refusal. Process-loss recovery still cancels invoked rows rather than replaying them.
+          yield* sql`
+            UPDATE orchestration_v2_effect_outbox
+            SET payload_json = json_set(payload_json, '$.deliveryPhase', 'follow_up'), updated_at = ${now}
+            WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+              AND effect_type IN ${sql.in(effectTypes)} AND ${replayableSteer}
+              AND json_extract(payload_json, '$.deliveryPhase') IS NULL
+          `;
           const rows = yield* sql<{ readonly effect_id: string }>`
             UPDATE orchestration_v2_effect_outbox
             SET
@@ -496,6 +595,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             WHERE thread_id = ${threadId}
               AND status IN ('pending', 'running')
               AND effect_type IN ${sql.in(effectTypes)}
+              AND NOT (${replayableSteer}
+                OR (status = 'running' AND lease_owner IS NOT NULL AND ${trackedSteer}))
             RETURNING effect_id
           `;
           return rows.map(({ effect_id }) => effect_id);
@@ -541,6 +642,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             last_error = 'Cancelled because the server process ended before the effect completed.'
           WHERE status IN ('pending', 'running')
             AND effect_type IN ${sql.in(PROCESS_BOUND_EFFECT_TYPES)}
+            AND NOT ${replayableSteer}
           RETURNING effect_id
         `;
         const requeuedRows = yield* sql<{ readonly effect_id: string }>`
@@ -552,7 +654,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             updated_at = ${now},
             last_error = 'Requeued after the previous server process ended.'
           WHERE status = 'running'
-            AND effect_type IN ${sql.in(REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS)}
+            AND (effect_type IN ${sql.in(REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS)} OR ${replayableSteer})
           RETURNING effect_id
         `;
         if (requeuedRows.length > 0) yield* notifyAvailable(requeuedRows.length);
@@ -564,7 +666,12 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       ),
       // The worker polls for the next effect even when there is no work to claim.
       claimNext: Effect.fnUntraced(
-        function* ({ workerId, excludeRestartContinuations = false, excludeEffectTypes = [] }) {
+        function* ({
+          workerId,
+          excludeRestartContinuations = false,
+          excludeEffectTypes = [],
+          controlLane,
+        }) {
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);
           // Idle claims return empty; tracing their full SQL on every poll overwhelms useful traces.
@@ -579,7 +686,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             WHERE effect_id = (
               SELECT candidate.effect_id
               FROM orchestration_v2_effect_outbox AS candidate
-              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations, excludeEffectTypes)}
+              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations, excludeEffectTypes, controlLane)}
                 AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
               ORDER BY candidate.available_at ASC, candidate.created_at ASC, candidate.effect_id ASC
               LIMIT 1
@@ -595,6 +702,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         Effect.mapError((cause) => new EffectOutboxError({ operation: "claim", cause })),
       ),
       nextClaimableAt: nextClaimableAtFor([]),
+      nextControlClaimableAt: (type) => nextClaimableAtFor([], type),
       nextClaimableAtExcluding: nextClaimableAtFor,
       succeed: Effect.fn("EffectOutbox.succeed")(
         function* ({ effectId, workerId }) {

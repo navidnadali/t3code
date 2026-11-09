@@ -2,6 +2,18 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.7-perf.6 (2026-11-09)
+
+Durable inter-agent steering and in-order delivery
+
+Upstream base: d5290e9167cc.
+
+- Automatic message delivery is resolved under the dispatch lock, in first-in, first-out order for ordinary and automatic work, without starving cross-agent messages.
+- Native steering outcomes are tracked durably; confirmed undelivered messages are kept through Stop and restart, and worker capacity is reserved for Stop and dialog replies.
+- Restart input is claimed when the native agent is admitted, cancellation stays with its owner through provider startup, and unsubmitted messages held through Stop are released once on Resume.
+- Provider request artifacts are published atomically.
+- Bench parameters in tools/server-bench set to chosen defaults.
+
 ## v0.1.6-perf.5 (2026-11-05)
 
 Bounded reads and quieter pull request sync

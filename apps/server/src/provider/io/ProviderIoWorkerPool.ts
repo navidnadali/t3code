@@ -670,9 +670,7 @@ export const make = Effect.fn("ProviderIoWorkerPool.make")(function* (options: {
             slot.load -= 1;
           }),
         );
-        const ready = yield* restore(Deferred.await(slot.handshake)).pipe(
-          Effect.match({ onFailure: () => false, onSuccess: () => true }),
-        );
+        const ready = yield* restore(Deferred.await(slot.handshake)).pipe(Effect.isSuccess);
         if (!ready) return Option.none();
         return yield* makeSession(slot, input);
       }),

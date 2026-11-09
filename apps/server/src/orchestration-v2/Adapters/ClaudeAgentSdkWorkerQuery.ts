@@ -61,11 +61,13 @@ export type ClaudeQueryControl = Pick<
   | "applyFlagSettings"
   | "setPermissionMode"
   | "stopTask"
+  | "mcpServerStatus"
+  | "readMcpResource"
   | "backgroundTasks"
   | "interrupt"
   | "close"
   | typeof Symbol.asyncDispose
->;
+> & { readonly request?: (payload: Record<string, unknown>) => Promise<unknown> };
 
 export interface StartedClaudeQuery<E> {
   readonly query: ClaudeQueryControl;
@@ -609,6 +611,9 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     setPermissionMode: (mode) => request({ type: "setPermissionMode", mode }),
     stopTask: (taskId) => request({ type: "stopTask", taskId }),
     backgroundTasks: (toolUseId) => request({ type: "backgroundTasks", toolUseId }),
+    mcpServerStatus: () => request({ type: "mcpServerStatus" }),
+    readMcpResource: (server, uri) => request({ type: "readMcpResource", server, uri }),
+    request: (payload) => request({ type: "controlRequest", payload }),
     interrupt: () => request({ type: "interrupt" }),
     // After the stdout main has read, so the worker's SDK closes where in-thread it would have. A
     // control request the SDK reads in the same tick as an in-thread close may still start its

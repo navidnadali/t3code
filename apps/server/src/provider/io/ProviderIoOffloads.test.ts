@@ -330,8 +330,8 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
           const offloaded = yield* withOffloads({ codex: minChars, acp: minChars }, (offloads) =>
             runAcp(chunks, offloads),
           );
-          // Every session update but the one of an unknown kind, which is warned about once.
-          assert.equal(inThread.seen.length, 39);
+          // Session updates and elicitation completion, excluding the unknown kind warned about once.
+          assert.equal(inThread.seen.length, 40);
           assert.lengthOf(inThread.warnings, 1);
           assert.deepStrictEqual(offloaded, inThread);
         }

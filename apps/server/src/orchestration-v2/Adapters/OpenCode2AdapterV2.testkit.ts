@@ -169,7 +169,7 @@ const replayHttpClient = (
           return new Response(body, { headers: { "content-type": "text/event-stream" } });
         }
         // Recorded responses are the raw HTTP bodies; `null` is an empty 204.
-        const body = await controller.response(operation.type);
+        const body = await controller.response(operation.type, replayGate?.beforeEmit);
         if (body === "<hang>") return new Promise<Response>(() => {});
         if (typeof body === "object" && body !== null && "status" in body && "body" in body) {
           return new Response(encodeJson(body.body), {

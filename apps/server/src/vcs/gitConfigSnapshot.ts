@@ -557,7 +557,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       snapshotSupported = false;
     } else {
       const listed = gitConfigListDependencies(entries, {
-        home: process.env.HOME,
+        home: (yield* HostProcess.Environment).HOME,
         windows,
         isAbsolute: path.isAbsolute,
       });

@@ -75,14 +75,14 @@ export function withCodexReplayChildMetadata(
     ...client,
     raw: {
       ...client.raw,
-      request: (method, params) =>
+      request: (method, params, requestOptions) =>
         (method === "thread/read" || method === "thread/resume") &&
         Predicate.isObject(params) &&
         (method === "thread/read" ? params.includeTurns === false : params.excludeTurns === true) &&
         typeof params.threadId === "string" &&
         childThreadIds.has(params.threadId)
           ? readMetadata(params.threadId, method)
-          : client.raw.request(method, params),
+          : client.raw.request(method, params, requestOptions),
     },
   };
 }

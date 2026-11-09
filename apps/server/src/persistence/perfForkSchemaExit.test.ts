@@ -10,7 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import { migrationManifest, runMigrations, type RunMigrationsOptions } from "./Migrations.ts";
-import { PERF_FORK_MIGRATIONS_TABLE } from "./PerfForkMigrations.ts";
+import { PERF_FORK_MIGRATIONS_TABLE, runPerfForkMigrations } from "./PerfForkMigrations.ts";
 
 const EXIT_SCRIPT = new URL("../../../../scripts/perf-fork-schema-exit.sql", import.meta.url);
 // Upstream's last migration when release candidate 1 recorded the fork's at 77 and 78.
@@ -189,7 +189,8 @@ it.effect("leaves release candidate 1's schema so upstream's migrations start on
     const exitScript = NodeFS.readFileSync(EXIT_SCRIPT, "utf8");
     const upstreamIds = migrationManifest.map(([id]) => id);
 
-    yield* migrate(filename);
+    yield* migrate(filename, { toMigrationInclusive: RC1_UPSTREAM_HEAD });
+    yield* runPerfForkMigrations().pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
     yield* withDatabase(filename, (db) => {
       db.exec(`
         DROP TABLE ${PERF_FORK_MIGRATIONS_TABLE};

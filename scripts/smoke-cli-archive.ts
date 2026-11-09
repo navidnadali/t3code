@@ -240,6 +240,15 @@ const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
     });
   }
 
+  // The service launcher loads outside the embedded CLI; without T3CODE_HOME it exits right away.
+  const launcher = yield* runExecutable(executable, ["__service-launcher"], contentDir);
+  if (launcher.exitCode !== 1 || !launcher.stderr.includes("T3CODE_HOME is required")) {
+    return yield* new CliArchiveSmokeError({
+      step: "running __service-launcher",
+      detail: `exit ${String(launcher.exitCode)}\n${launcher.stdout}${launcher.stderr}`,
+    });
+  }
+
   const net = yield* NetService.NetService;
   const port = yield* net.findAvailablePort(47700);
   const home = path.join(scratch, "home");

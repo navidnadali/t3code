@@ -47,7 +47,7 @@ export const linuxArm64SeaConfig = (input: {
   useCodeCache: false,
   ...(input.sea.execArgv === undefined || input.sea.execArgv.length === 0
     ? {}
-    : { execArgv: [...input.sea.execArgv] }),
+    : { execArgv: [...(input.sea.execArgv ?? [])] }),
   execArgvExtension: input.sea.execArgvExtension,
 });
 
@@ -55,6 +55,7 @@ export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (
   /** What to bake and how options may extend it: the server's cap and cli mode, or nothing for the spawner. */
   readonly sea: Partial<SeaBuildOptions> & Pick<SeaBuildOptions, "execArgvExtension">;
   bundlePath: string;
+  cliAssetPath?: string;
   outputPath: string;
   nodeVersion: string;
   verbose: boolean;
@@ -73,14 +74,20 @@ export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (
   const configPath = path.join(temp, "sea.json");
   yield* fs.writeFileString(
     configPath,
-    yield* encodeJson(
-      linuxArm64SeaConfig({
+    yield* encodeJson({
+      ...linuxArm64SeaConfig({
         bundlePath: input.bundlePath,
         blobPath,
         ...(input.mainFormat === undefined ? {} : { mainFormat: input.mainFormat }),
         sea: input.sea,
       }),
-    ),
+      ...(input.cliAssetPath === undefined
+        ? {}
+        : {
+            assets: { "binMain.mjs": input.cliAssetPath },
+            execArgv: [...(input.sea.execArgv ?? []), "--require-module"],
+          }),
+    }),
   );
   yield* run(["--experimental-sea-config", configPath], input.verbose);
   yield* fs.copyFile(process.execPath, input.outputPath);

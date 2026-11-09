@@ -305,6 +305,17 @@ export const claudeAgentSdkStage: ProviderIoStage<
           return started().stopTask(request.taskId);
         case "backgroundTasks":
           return started().backgroundTasks(request.toolUseId);
+        case "mcpServerStatus":
+          return started().mcpServerStatus();
+        case "readMcpResource":
+          return started().readMcpResource(request.server, request.uri);
+        case "controlRequest": {
+          const runtime = started();
+          const send: unknown = Reflect.get(runtime, "request");
+          if (typeof send !== "function")
+            throw new Error("Claude SDK has no control request method");
+          return Reflect.apply(send, runtime, [request.payload]);
+        }
         case "interrupt":
           return started().interrupt();
         case "close":

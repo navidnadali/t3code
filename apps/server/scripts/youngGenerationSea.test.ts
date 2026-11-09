@@ -83,7 +83,7 @@ describe("young-generation default in the single executable", () => {
       // The default is baked in: a bare start runs with it and never relaunches.
       const bare = nodeFlags(executable, {});
       expect(bare.sea).toBe(true);
-      expect(bare.execArgv).toEqual(["--max-semi-space-size=64"]);
+      expect(bare.execArgv).toEqual(["--max-semi-space-size=64", "--require-module"]);
       expect(bare, bare.keptReason).toMatchObject({
         applied: true,
         maxSemiSpaceMb: 64,
@@ -98,7 +98,7 @@ describe("young-generation default in the single executable", () => {
         nodeOptionsForChildren: userOptions,
         keptReason: "the young-generation cap is already in effect",
       });
-      expect(role.execArgv).toEqual(["--max-semi-space-size=64"]);
+      expect(role.execArgv).toEqual(["--max-semi-space-size=64", "--require-module"]);
       expect(role.heapSizeLimitMiB!).toBeGreaterThan(12000);
       // The built-in cap cannot be changed from the environment; the server says so for the log.
       const off = nodeFlags(executable, { T3CODE_V8_MAX_SEMI_SPACE_MB: "0" });

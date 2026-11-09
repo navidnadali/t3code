@@ -36,7 +36,7 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
-import type * as Effect from "effect/Effect";
+import * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
@@ -147,6 +147,13 @@ export const ProviderAdapterV2Event = Schema.Union([
     driver: ProviderDriverKind,
     threadId: Schema.optional(ThreadId),
     runtimeRequest: OrchestrationV2RuntimeRequest,
+    // Keep a new or refreshed request and its visible artifacts in one persistence commit.
+    artifacts: Schema.optional(
+      Schema.Struct({
+        node: OrchestrationV2ExecutionNode,
+        turnItem: OrchestrationV2TurnItem,
+      }),
+    ),
   }),
   Schema.Struct({
     type: Schema.Literal("plan.updated"),
@@ -232,6 +239,24 @@ export class ProviderAdapterResumeThreadError extends Schema.TaggedError<Provide
 ) {
   override get message(): string {
     return `Failed to resume ${this.driver} provider thread ${this.providerThreadId}.`;
+  }
+}
+
+/**
+ * The native thread is live in another process that owns its writes. Starting
+ * a replacement would split the conversation, so callers must not fall back.
+ */
+export class ProviderAdapterThreadInUseError extends Schema.TaggedError<ProviderAdapterThreadInUseError>()(
+  "ProviderAdapterThreadInUseError",
+  {
+    driver: ProviderDriverKind,
+    providerThreadId: ProviderThreadId,
+    detail: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return this.detail;
   }
 }
 
@@ -321,6 +346,10 @@ export class ProviderAdapterSteerRunError extends Schema.TaggedError<ProviderAda
     driver: ProviderDriverKind,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
+    /** The adapter confirmed that the provider did not consume this input. */
+    deliveryNotSent: Schema.optional(Schema.Literal(true)),
+    /** The native thread is gone and its cached loaded binding must be invalidated. */
+    threadDisposition: Schema.optional(Schema.Literal("broken")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -328,6 +357,11 @@ export class ProviderAdapterSteerRunError extends Schema.TaggedError<ProviderAda
     return `Failed to steer active run ${this.providerTurnId} on ${this.driver} provider thread ${this.providerThreadId}.`;
   }
 }
+
+export const isProviderAdapterSteerRunError = Schema.is(ProviderAdapterSteerRunError);
+export const isProviderAdapterSteerRunUnsupportedError = Schema.is(
+  ProviderAdapterSteerRunUnsupportedError,
+);
 
 export class ProviderAdapterInterruptError extends Schema.TaggedError<ProviderAdapterInterruptError>()(
   "ProviderAdapterInterruptError",
@@ -406,11 +440,21 @@ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAda
   }
 }
 
+export class ProviderAdapterSessionStoppedError extends Schema.TaggedError<ProviderAdapterSessionStoppedError>()(
+  "ProviderAdapterSessionStoppedError",
+  { driver: ProviderDriverKind },
+) {
+  override get message(): string {
+    return `No running ${this.driver} session owns this thread.`;
+  }
+}
+
 export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterCapabilitiesError,
   ProviderAdapterOpenSessionError,
   ProviderAdapterCloseSessionError,
   ProviderAdapterResumeThreadError,
+  ProviderAdapterThreadInUseError,
   ProviderAdapterEnsureThreadError,
   ProviderAdapterReadThreadSnapshotError,
   ProviderAdapterRollbackThreadError,
@@ -423,6 +467,7 @@ export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterRuntimeRequestResponseError,
   ProviderAdapterEventStreamError,
   ProviderAdapterProtocolError,
+  ProviderAdapterSessionStoppedError,
 ]);
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
@@ -447,6 +492,8 @@ export interface ProviderAdapterV2EnsureThreadInput {
 }
 
 export interface ProviderAdapterV2TurnInput {
+  /** Atomically claim and enqueue restart input at native agent admission after adapter preparation. */
+  readonly submit?: (enqueue: () => void) => Effect.Effect<void, ProviderAdapterTurnStartError>;
   readonly appThread: OrchestrationV2AppThread;
   readonly threadId: ThreadId;
   readonly runId: RunId;
@@ -463,7 +510,28 @@ export interface ProviderAdapterV2TurnInput {
   readonly appContext?: ReadonlyArray<{ readonly key: string; readonly text: string }>;
 }
 
+export const startSubmissionFetch = Effect.fnUntraced(function* (
+  submit: NonNullable<ProviderAdapterV2TurnInput["submit"]>,
+  nativeFetch: typeof globalThis.fetch,
+) {
+  const run = Effect.runPromiseWith(yield* Effect.context<never>());
+  return ((request, init) => {
+    let response: Promise<Response> | undefined;
+    return run(
+      submit(() => {
+        response = nativeFetch(request, init);
+      }),
+    ).then(() => {
+      if (response === undefined)
+        throw new Error("Provider submission did not invoke its transport.");
+      return response;
+    });
+  }) satisfies typeof globalThis.fetch;
+});
+
 export interface ProviderAdapterV2SteerInput {
+  /** If supplied, run after preparation immediately before submitting the input. */
+  readonly beforeSubmit?: Effect.Effect<void, ProviderAdapterSteerRunError>;
   readonly threadId: ThreadId;
   readonly runId: RunId;
   readonly providerThread: OrchestrationV2ProviderThread;
@@ -538,6 +606,8 @@ export interface ProviderAdapterV2HistoricalContext {
 
 export interface ProviderAdapterV2McpTool {
   readonly name: string;
+  // Apps reject a `hostContext.toolInfo.tool` without one.
+  readonly inputSchema: unknown;
   readonly _meta?: unknown;
   readonly annotations?: unknown;
 }
@@ -578,6 +648,8 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly driver: ProviderDriverKind;
   readonly providerSessionId: ProviderSessionId;
   readonly providerSession: OrchestrationV2ProviderSession;
+  /** False keeps conversations alive when the provider cannot restore them after a restart. */
+  readonly canResumeAfterRestart?: boolean;
   readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
   /** Manager runtimes broadcast independent subscriptions; adapters may expose only a single-consumer stream. */
   readonly subscribeEvents?: Effect.Effect<ProviderAdapterV2EventSubscription>;

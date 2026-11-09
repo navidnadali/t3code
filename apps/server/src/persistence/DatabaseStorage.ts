@@ -31,7 +31,6 @@ export class DatabaseStorage extends Context.Service<
   }
 >()("t3/persistence/DatabaseStorage") {}
 
-// Deleted events have newer retained replacements; old cursors replay to the same state.
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
@@ -108,9 +107,7 @@ const make = Effect.gen(function* () {
       yield* Effect.sleep((Number(elapsed) / 1_000_000) * 9);
       sliceStarted = yield* Clock.monotonicTimeNanos;
     });
-    // The pass's working set lives in this file, replaced at every pass start and removed at its end.
-    const scratchPath = path.join(path.dirname(config.dbPath), "compaction-scratch.sqlite");
-    const result = yield* maintenance.compactEventStore(betweenPages, { scratchPath });
+    const result = yield* maintenance.pruneEventStore(betweenPages);
     const completedAt = yield* Clock.currentTimeMillis;
     yield* fs.writeFileString(compactedAtPath, String(completedAt)).pipe(Effect.ignore);
     if (result.deletedEventCount > 0 || result.deletedReceiptCount > 0) {

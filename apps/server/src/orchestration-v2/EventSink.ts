@@ -11,6 +11,7 @@ import {
   NodeId,
   type ProjectId,
   ThreadId,
+  type TurnItemId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -328,6 +329,7 @@ const layerBase: Layer.Layer<
       Effect.fnUntraced(function* (events: ReadonlyArray<OrchestrationV2DomainEvent>) {
         const staleRequests = new Set<RuntimeRequestId>();
         const staleNodes = new Set<NodeId>();
+        const cancelledOpenItems = new Set<TurnItemId>();
         for (const event of events) {
           if (
             event.type !== "runtime-request.updated" ||
@@ -347,6 +349,40 @@ const layerBase: Layer.Layer<
           ) {
             staleRequests.add(event.payload.id);
             staleNodes.add(event.payload.nodeId);
+            // Stop may already have cancelled the request and node before the
+            // provider closes its visible question. Settle only that still-open item.
+            if (
+              current?.status === "cancelled" &&
+              current.kind === "user_input" &&
+              current.nodeId === event.payload.nodeId &&
+              current.providerTurnId === event.payload.providerTurnId &&
+              current.responseCapability.type !== "message"
+            ) {
+              for (const candidate of events) {
+                if (
+                  candidate.type !== "turn-item.updated" ||
+                  candidate.threadId !== event.threadId ||
+                  candidate.payload.type !== "user_input_request" ||
+                  candidate.payload.status !== "cancelled" ||
+                  candidate.payload.requestId !== current.id ||
+                  candidate.payload.nodeId !== current.nodeId ||
+                  candidate.payload.providerTurnId !== current.providerTurnId
+                )
+                  continue;
+                const item = yield* projectionStore.getTurnItem({
+                  threadId: candidate.threadId,
+                  itemId: candidate.payload.id,
+                });
+                if (
+                  item?.type === "user_input_request" &&
+                  item.requestId === current.id &&
+                  item.nodeId === current.nodeId &&
+                  item.providerTurnId === current.providerTurnId &&
+                  ["pending", "running", "waiting"].includes(item.status)
+                )
+                  cancelledOpenItems.add(item.id);
+              }
+            }
           }
         }
         return events.filter((event) => {
@@ -359,7 +395,8 @@ const layerBase: Layer.Layer<
               return (
                 event.payload.type !== "user_input_request" ||
                 event.payload.status !== "cancelled" ||
-                !staleRequests.has(event.payload.requestId)
+                !staleRequests.has(event.payload.requestId) ||
+                cancelledOpenItems.has(event.payload.id)
               );
             default:
               return true;

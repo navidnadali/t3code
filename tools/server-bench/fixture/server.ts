@@ -362,13 +362,10 @@ export const runnableWork = Effect.gen(function* () {
 
 export const isRunnable = (work: RunnableWork) => Object.values(work).some((count) => count > 0);
 
-/**
- * The server's event-store compaction, as a first boot runs it: superseded snapshot events and
- * the v1 events of imported threads go now, so booting the fixture deletes nothing.
- */
+/** Run the server's retention maintenance on the isolated fixture. */
 export const compactEvents = Effect.gen(function* () {
   const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
-  return yield* maintenance.compactEventStore();
+  return yield* maintenance.pruneEventStore();
 });
 
 export const withMaintenance = (filename: string) =>

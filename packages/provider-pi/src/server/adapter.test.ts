@@ -626,6 +626,11 @@ describe("PiAdapterV2", () => {
           observed.push(event);
           return event.type === "runtime_request.updated";
         });
+        const pending = observed.at(-1);
+        assert.isTrue(pending?.type === "runtime_request.updated");
+        if (pending?.type !== "runtime_request.updated") return;
+        assert.strictEqual(pending.artifacts?.node.id, pending.runtimeRequest.nodeId);
+        assert.strictEqual(pending.artifacts?.turnItem.nodeId, pending.runtimeRequest.nodeId);
         assert.deepInclude(runtime.providerSession, {
           extensionStatuses: [{ key: "watch", text: "Watching 4 files" }],
         });
@@ -1883,15 +1888,15 @@ describe("PiAdapterV2", () => {
           if (
             event.type === "runtime_request.updated" &&
             event.runtimeRequest.id === dialog.runtimeRequest.id
-          )
+          ) {
             requestCancelled = event.runtimeRequest.status === "cancelled";
-          if (event.type === "node.updated" && event.node.id === dialog.runtimeRequest.nodeId)
-            nodeCancelled = event.node.status === "cancelled";
-          if (
-            event.type === "turn_item.updated" &&
-            event.turnItem.nodeId === dialog.runtimeRequest.nodeId
-          )
-            itemCancelled = event.turnItem.status === "cancelled";
+            nodeCancelled =
+              event.artifacts?.node.id === dialog.runtimeRequest.nodeId &&
+              event.artifacts.node.status === "cancelled";
+            itemCancelled =
+              event.artifacts?.turnItem.nodeId === dialog.runtimeRequest.nodeId &&
+              event.artifacts.turnItem.status === "cancelled";
+          }
           return (
             event.type === "provider_session.updated" &&
             event.providerSession.status ===
@@ -3894,13 +3899,17 @@ describe("PiAdapterV2", () => {
       });
       const event = yield* takeEvent(
         (event) =>
-          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+          event.type === "runtime_request.updated" &&
+          event.artifacts?.turnItem.type === "user_input_request",
       );
-      if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request") {
+      if (
+        event.type !== "runtime_request.updated" ||
+        event.artifacts?.turnItem.type !== "user_input_request"
+      ) {
         return assert.fail("expected a user input request");
       }
-      assert.equal(event.turnItem.questions[0]?.header, "Name");
-      assert.equal(event.turnItem.questions[0]?.question, "Your name");
+      assert.equal(event.artifacts.turnItem.questions[0]?.header, "Name");
+      assert.equal(event.artifacts.turnItem.questions[0]?.question, "Your name");
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
@@ -3922,12 +3931,16 @@ describe("PiAdapterV2", () => {
       });
       const event = yield* takeEvent(
         (event) =>
-          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+          event.type === "runtime_request.updated" &&
+          event.artifacts?.turnItem.type === "user_input_request",
       );
-      if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request") {
+      if (
+        event.type !== "runtime_request.updated" ||
+        event.artifacts?.turnItem.type !== "user_input_request"
+      ) {
         return assert.fail("expected a user input request");
       }
-      const questions = decodeUserInputQuestions(event.turnItem.questions);
+      const questions = decodeUserInputQuestions(event.artifacts.turnItem.questions);
       assert.deepEqual(
         questions[0]?.options.map((option) => [option.label, option.value]),
         [
@@ -3938,7 +3951,7 @@ describe("PiAdapterV2", () => {
       assert.equal(questions[0]?.header, "Question");
       assert.equal(questions[0]?.question, "Pick a tag");
       yield* runtime.respondToRuntimeRequest({
-        requestId: event.turnItem.requestId,
+        requestId: event.artifacts.turnItem.requestId,
         answers: { "ui-select": "" },
       });
       const response = yield* fake.takeRequest("extension_ui_response");
@@ -3966,15 +3979,25 @@ describe("PiAdapterV2", () => {
       });
       const event = yield* takeEvent(
         (event) =>
-          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+          event.type === "runtime_request.updated" &&
+          event.artifacts?.turnItem.type === "user_input_request",
       );
-      if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request") {
+      if (
+        event.type !== "runtime_request.updated" ||
+        event.artifacts?.turnItem.type !== "user_input_request"
+      ) {
         return assert.fail("expected a user input request");
       }
-      assert.equal(decodeUserInputQuestions(event.turnItem.questions)[0]?.header, "Question");
-      assert.equal(decodeUserInputQuestions(event.turnItem.questions)[0]?.question, title);
+      assert.equal(
+        decodeUserInputQuestions(event.artifacts.turnItem.questions)[0]?.header,
+        "Question",
+      );
+      assert.equal(
+        decodeUserInputQuestions(event.artifacts.turnItem.questions)[0]?.question,
+        title,
+      );
       yield* runtime.respondToRuntimeRequest({
-        requestId: event.turnItem.requestId,
+        requestId: event.artifacts.turnItem.requestId,
         answers: { "ui-input": "SQLite" },
       });
       const response = yield* fake.takeRequest("extension_ui_response");
@@ -4001,17 +4024,21 @@ describe("PiAdapterV2", () => {
       });
       const event = yield* takeEvent(
         (event) =>
-          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+          event.type === "runtime_request.updated" &&
+          event.artifacts?.turnItem.type === "user_input_request",
       );
-      if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request")
+      if (
+        event.type !== "runtime_request.updated" ||
+        event.artifacts?.turnItem.type !== "user_input_request"
+      )
         return;
-      assert.equal(event.turnItem.questions[0]?.initialAnswer, prefill);
-      assert.deepEqual(event.turnItem.questions[0]?.options, []);
-      assert.equal(event.turnItem.questions[0]?.header, "Question");
-      assert.equal(event.turnItem.questions[0]?.question, "Commit message");
+      assert.equal(event.artifacts.turnItem.questions[0]?.initialAnswer, prefill);
+      assert.deepEqual(event.artifacts.turnItem.questions[0]?.options, []);
+      assert.equal(event.artifacts.turnItem.questions[0]?.header, "Question");
+      assert.equal(event.artifacts.turnItem.questions[0]?.question, "Commit message");
       const edited = "  fix(server): edited commit message\n\n";
       yield* runtime.respondToRuntimeRequest({
-        requestId: event.turnItem.requestId,
+        requestId: event.artifacts.turnItem.requestId,
         answers: { "ui-editor": edited },
       });
       const response = yield* fake.takeRequest("extension_ui_response");
@@ -4026,14 +4053,19 @@ describe("PiAdapterV2", () => {
       });
       const cleared = yield* takeEvent(
         (event) =>
-          event.type === "turn_item.updated" &&
-          event.turnItem.type === "user_input_request" &&
-          event.turnItem.questions.some((question) => question.id === "ui-editor-cleared"),
+          event.type === "runtime_request.updated" &&
+          event.artifacts?.turnItem.type === "user_input_request" &&
+          event.artifacts.turnItem.questions.some(
+            (question) => question.id === "ui-editor-cleared",
+          ),
       );
-      if (cleared.type !== "turn_item.updated" || cleared.turnItem.type !== "user_input_request")
+      if (
+        cleared.type !== "runtime_request.updated" ||
+        cleared.artifacts?.turnItem.type !== "user_input_request"
+      )
         return;
       yield* runtime.respondToRuntimeRequest({
-        requestId: cleared.turnItem.requestId,
+        requestId: cleared.artifacts.turnItem.requestId,
         answers: { "ui-editor-cleared": "" },
       });
       const emptyResponse = yield* fake.takeRequest("extension_ui_response");
@@ -4061,12 +4093,13 @@ describe("PiAdapterV2", () => {
         yield* fake.emit({ type: "extension_ui_request", id, method: "confirm", title });
         const item = yield* takeEvent(
           (event) =>
-            event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
+            event.type === "runtime_request.updated" &&
+            event.artifacts?.turnItem.type === "approval_request",
         );
         assert.isTrue(
-          item.type === "turn_item.updated" &&
-            item.turnItem.type === "approval_request" &&
-            item.turnItem.requestKind === requestKind,
+          item.type === "runtime_request.updated" &&
+            item.artifacts?.turnItem.type === "approval_request" &&
+            item.artifacts.turnItem.requestKind === requestKind,
           `${title} should be ${requestKind}`,
         );
       }

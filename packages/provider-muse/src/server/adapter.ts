@@ -958,9 +958,8 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           driver: MUSE_PROVIDER,
           threadId: input.threadId,
           runtimeRequest: entry.request,
+          artifacts: { node: entry.node, turnItem: entry.item },
         });
-        yield* emit({ type: "node.updated", driver: MUSE_PROVIDER, node: entry.node });
-        yield* emit({ type: "turn_item.updated", driver: MUSE_PROVIDER, turnItem: entry.item });
       });
       const finish = Effect.fnUntraced(function* (
         turn: ActiveTurn,
@@ -1114,9 +1113,8 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           driver: MUSE_PROVIDER,
           threadId: entry.node.threadId,
           runtimeRequest: entry.request,
+          artifacts: { node: entry.node, turnItem: entry.item },
         });
-        yield* emit({ type: "node.updated", driver: MUSE_PROVIDER, node: entry.node });
-        yield* emit({ type: "turn_item.updated", driver: MUSE_PROVIDER, turnItem: entry.item });
         yield* updateSession("waiting");
       });
       /**

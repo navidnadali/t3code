@@ -339,6 +339,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           [];
         const dependencies = Layer.mergeAll(
           Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadShell: (threadId) => Effect.succeed(threadId === parent.id ? parent : child),
             streamDomainEvents: Stream.fromQueue(domainEvents),
             getPullRequestSnapshot: ({ threadId }) =>
               threadId !== undefined

@@ -125,6 +125,64 @@ const byEntity = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
   for (const { event } of storedEvents) {
     records.set(entityOf(event), event.payload as Readonly<Record<string, unknown>>);
   }
+  // A buffered interrupted answer can commit just after the steer that cancels it.
+  // Canonicalize only that adjacent pair; replacement answers, ties and other positions stay exact.
+  const items = [...records.values()].filter((record) => typeof record.ordinal === "number");
+  const ordinalSwaps = new Map<unknown, { readonly from: number; readonly to: number }>();
+  for (const steer of items) {
+    if (steer.type !== "user_message" || steer.inputIntent !== "steer") continue;
+    const next = [...records.values()].find(
+      (record) =>
+        record.reason === "steering_restart" &&
+        record.rootNodeId === steer.nodeId &&
+        record.runId === steer.runId,
+    );
+    if (next === undefined || typeof next.attemptOrdinal !== "number") continue;
+    const previousOrdinal = next.attemptOrdinal - 1;
+    const previous = [...records.values()].find(
+      (record) =>
+        record.status === "superseded" &&
+        record.runId === steer.runId &&
+        record.attemptOrdinal === previousOrdinal,
+    );
+    if (previous === undefined) continue;
+    const interruptedTurn = [...records.values()].find(
+      (record) => record.runAttemptId === previous.id,
+    );
+    if (interruptedTurn?.status !== "interrupted") continue;
+    const position = steer.ordinal as number;
+    const buffered = items.find(
+      (record) =>
+        record.type === "assistant_message" &&
+        record.threadId === steer.threadId &&
+        record.runId === steer.runId &&
+        record.providerTurnId === interruptedTurn.id &&
+        record.ordinal === position + 1,
+    );
+    if (buffered === undefined) continue;
+    const occupants = items.filter(
+      (record) =>
+        record.threadId === steer.threadId &&
+        (record.ordinal === position || record.ordinal === position + 1),
+    );
+    if (occupants.length !== 2) continue;
+    const history = storedEvents.flatMap(({ event }) =>
+      event.type === "turn-item.updated" ? [event.payload] : [],
+    );
+    if (
+      history.some((item) =>
+        item.id === steer.id
+          ? item.ordinal !== position
+          : item.id === buffered.id
+            ? item.ordinal !== position + 1
+            : item.threadId === steer.threadId &&
+              (item.ordinal === position || item.ordinal === position + 1),
+      )
+    )
+      continue;
+    ordinalSwaps.set(steer.id, { from: position, to: position + 1 });
+    ordinalSwaps.set(buffered.id, { from: position + 1, to: position });
+  }
   // The provider turn's run, through its attempt, as the settle effect's decider finds it.
   const interrupted = (providerTurnId: string) => {
     const attemptId = records.get(`provider-turn ${providerTurnId}`)?.runAttemptId;
@@ -133,7 +191,15 @@ const byEntity = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
   };
   const entities = new Map<string, Array<unknown>>();
   for (const { commandId, event } of storedEvents) {
-    const { id: _id, ...write } = event;
+    const { id: _id, ...rawWrite } = event;
+    const swap =
+      event.type === "turn-item.updated" ? ordinalSwaps.get(event.payload.id) : undefined;
+    const write =
+      swap !== undefined &&
+      event.type === "turn-item.updated" &&
+      event.payload.ordinal === swap.from
+        ? { ...rawWrite, payload: { ...event.payload, ordinal: swap.to } }
+        : rawWrite;
     const { nodeId, runId, ...unattributed } = write as typeof write & {
       readonly nodeId?: unknown;
       readonly runId?: unknown;
@@ -733,6 +799,99 @@ describe("provider I/O at 0 and 2 workers", () => {
     assert.notDeepEqual(
       sinkWrites([write("c", "run.updated", { runId: "r1", nodeId: "n2" })]),
       ordinary,
+    );
+
+    const restartItems = (
+      old: number,
+      steer: number,
+      answer: number,
+      oldHistory: ReadonlyArray<number> = [old],
+    ) =>
+      sinkWrites([
+        write(
+          null,
+          "run-attempt.updated",
+          { runId: "r1" },
+          {
+            id: "old-attempt",
+            runId: "r1",
+            status: "superseded",
+            attemptOrdinal: 1,
+            providerTurnId: "old-turn",
+          },
+        ),
+        write(
+          null,
+          "run-attempt.updated",
+          { runId: "r1" },
+          {
+            id: "new-attempt",
+            runId: "r1",
+            reason: "steering_restart",
+            attemptOrdinal: 2,
+            rootNodeId: "new-root",
+          },
+        ),
+        write(
+          null,
+          "provider-turn.updated",
+          { runId: "r1" },
+          { id: "old-turn", runAttemptId: "old-attempt", status: "interrupted" },
+        ),
+        ...oldHistory.map((ordinal) =>
+          write(
+            null,
+            "turn-item.updated",
+            { runId: "r1" },
+            {
+              id: "old",
+              type: "assistant_message",
+              threadId: "t",
+              runId: "r1",
+              providerTurnId: "old-turn",
+              ordinal,
+            },
+          ),
+        ),
+        write(
+          "steer",
+          "turn-item.updated",
+          { runId: "r1" },
+          {
+            id: "steer",
+            type: "user_message",
+            inputIntent: "steer",
+            threadId: "t",
+            runId: "r1",
+            nodeId: "new-root",
+            ordinal: steer,
+          },
+        ),
+        write(
+          null,
+          "turn-item.updated",
+          { runId: "r1" },
+          {
+            id: "answer",
+            type: "assistant_message",
+            threadId: "t",
+            runId: "r1",
+            providerTurnId: "new-turn",
+            ordinal: answer,
+          },
+        ),
+      ]);
+    const ordered = restartItems(1_000_001, 1_000_002, 1_000_003);
+    assert.deepStrictEqual(restartItems(1_000_002, 1_000_001, 1_000_003), ordered);
+    // A replacement answer before its steer or a cross-writer tie is never a harmless swap.
+    assert.notDeepEqual(restartItems(1_000_001, 1_000_003, 1_000_002), ordered);
+    assert.notDeepEqual(restartItems(1_000_001, 1_000_002, 1_000_002), ordered);
+    assert.notDeepEqual(restartItems(1_000_002, 1_000_001, 1_000_002), ordered);
+    assert.notDeepEqual(restartItems(1_000_001, 1_000_001, 1_000_003), ordered);
+    assert.notDeepEqual(restartItems(1_000_001, 1_000_004, 1_000_005), ordered);
+    assert.notDeepEqual(
+      restartItems(1_000_002, 1_000_001, 1_000_003, [1_000_001, 1_000_002]),
+      restartItems(1_000_001, 1_000_002, 1_000_003, [1_000_001, 1_000_001]),
     );
 
     // Run r2 (root node n2) was interrupted through provider turn `turn`; r1 (root n1) ran before.

@@ -1942,15 +1942,15 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         Layer.succeed(GitManager.GitManager, manager),
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.fromQueue(domainEvents),
-          getShellSnapshot: () =>
-            Effect.succeed({
-              schemaVersion: 2,
-              snapshotSequence: 1,
-              threads: [],
-              archivedThreads: [],
-            }),
-          getThreadEventSequence: (threadId) =>
-            Queue.offer(threadReads, threadId).pipe(Effect.as(1)),
+          getPullRequestSnapshot: ({ threadId }) =>
+            threadId === undefined
+              ? Effect.succeed({ snapshotSequence: 1, threads: [] })
+              : Queue.offer(threadReads, threadId).pipe(
+                  Effect.as({
+                    snapshotSequence: 1,
+                    threads: threads.filter((thread) => thread.id === threadId),
+                  }),
+                ),
           getThreadShell: (threadId) =>
             Effect.succeed(threads.find((thread) => thread.id === threadId) ?? null),
           dispatch: (command) =>

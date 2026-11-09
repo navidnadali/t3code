@@ -147,6 +147,13 @@ export const ProviderAdapterV2Event = Schema.Union([
     driver: ProviderDriverKind,
     threadId: Schema.optional(ThreadId),
     runtimeRequest: OrchestrationV2RuntimeRequest,
+    // Keep a new or refreshed request and its visible artifacts in one persistence commit.
+    artifacts: Schema.optional(
+      Schema.Struct({
+        node: OrchestrationV2ExecutionNode,
+        turnItem: OrchestrationV2TurnItem,
+      }),
+    ),
   }),
   Schema.Struct({
     type: Schema.Literal("plan.updated"),

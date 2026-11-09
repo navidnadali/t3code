@@ -1387,20 +1387,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           driver: PI_PROVIDER,
           threadId: pending.node.threadId,
           runtimeRequest: pending.runtimeRequest,
-        });
-        yield* emit({
-          type: "node.updated",
-          driver: PI_PROVIDER,
-          node: { ...pending.node, status: "cancelled", completedAt: resolvedAt },
-        });
-        yield* emit({
-          type: "turn_item.updated",
-          driver: PI_PROVIDER,
-          turnItem: {
-            ...pending.turnItem,
-            status: "cancelled",
-            completedAt: resolvedAt,
-            updatedAt: resolvedAt,
+          artifacts: {
+            node: { ...pending.node, status: "cancelled", completedAt: resolvedAt },
+            turnItem: {
+              ...pending.turnItem,
+              status: "cancelled",
+              completedAt: resolvedAt,
+              updatedAt: resolvedAt,
+            },
           },
         });
       });
@@ -1600,9 +1594,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           driver: PI_PROVIDER,
           threadId,
           runtimeRequest,
+          artifacts: { node, turnItem },
         });
-        yield* emit({ type: "node.updated", driver: PI_PROVIDER, node });
-        yield* emit({ type: "turn_item.updated", driver: PI_PROVIDER, turnItem });
         if (expiresAt !== null) {
           const now = yield* DateTime.now;
           pending.expirationFiber = yield* Effect.sleep(
@@ -3133,20 +3126,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               driver: PI_PROVIDER,
               threadId: pending.node.threadId,
               runtimeRequest: pending.runtimeRequest,
-            });
-            yield* emit({
-              type: "node.updated",
-              driver: PI_PROVIDER,
-              node: { ...pending.node, status: "completed", completedAt: resolvedAt },
-            });
-            yield* emit({
-              type: "turn_item.updated",
-              driver: PI_PROVIDER,
-              turnItem: {
-                ...pending.turnItem,
-                status: "completed",
-                completedAt: resolvedAt,
-                updatedAt: resolvedAt,
+              artifacts: {
+                node: { ...pending.node, status: "completed", completedAt: resolvedAt },
+                turnItem: {
+                  ...pending.turnItem,
+                  status: "completed",
+                  completedAt: resolvedAt,
+                  updatedAt: resolvedAt,
+                },
               },
             });
           },

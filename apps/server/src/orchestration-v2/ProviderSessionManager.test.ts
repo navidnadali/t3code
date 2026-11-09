@@ -939,16 +939,7 @@ function makePendingRuntimeRequestEvents(input: {
         driver: CODEX_DRIVER,
         threadId: input.threadId,
         runtimeRequest: request,
-      },
-      {
-        type: "node.updated" as const,
-        driver: CODEX_DRIVER,
-        node,
-      },
-      {
-        type: "turn_item.updated" as const,
-        driver: CODEX_DRIVER,
-        turnItem,
+        artifacts: { node, turnItem },
       },
     ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>;
     return { events, providerEvents, requestId, nodeId };
@@ -3447,6 +3438,14 @@ it.effect("ProviderSessionManagerV2 settles a request the event pump persists du
         (candidate) => candidate.id === pendingRequest.requestId,
       );
       assert.equal(request?.responseCapability.type, "not_resumable");
+      assert.equal(
+        projection.nodes.find((node) => node.id === pendingRequest.nodeId)?.status,
+        "cancelled",
+      );
+      assert.equal(
+        projection.turnItems.find((item) => item.nodeId === pendingRequest.nodeId)?.status,
+        "cancelled",
+      );
     });
 
     yield* effect.pipe(

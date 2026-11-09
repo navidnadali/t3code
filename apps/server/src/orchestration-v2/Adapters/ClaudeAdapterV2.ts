@@ -579,6 +579,7 @@ export interface ClaudeAgentSdkQuerySession {
   readonly offer: (
     message: SDKUserMessage,
     onQueued?: () => void,
+    submit?: ProviderAdapter.ProviderAdapterV2TurnInput["submit"],
   ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly setModel: (model: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly applyFlagSettings: (
@@ -1468,11 +1469,15 @@ export const layerQueryRunner: Layer.Layer<
                 }),
               ),
             ),
-            offer: (message, onQueued) =>
+            offer: (message, onQueued, submit) =>
               Effect.uninterruptibleMask((restore) =>
-                restore(Queue.offer(promptQueue, message)).pipe(
-                  Effect.tap(() => Effect.sync(() => onQueued?.())),
-                ),
+                restore(
+                  submit === undefined
+                    ? Queue.offer(promptQueue, message)
+                    : submit(() => {
+                        Queue.offerUnsafe(promptQueue, message);
+                      }).pipe(Effect.mapError((cause) => queryRunnerError(cause, "offer"))),
+                ).pipe(Effect.tap(() => Effect.sync(() => onQueued?.()))),
               ).pipe(
                 Effect.asVoid,
                 Effect.tap(() =>
@@ -11378,9 +11383,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               yield* startUserTurnForWakeReports(nativeThreadId);
               yield* Effect.uninterruptibleMask((restore) =>
                 restore(
-                  querySession.query.offer(userMessage, () => {
-                    pdfReservation.commit();
-                  }),
+                  querySession.query.offer(
+                    userMessage,
+                    () => {
+                      pdfReservation.commit();
+                    },
+                    turnInput.submit,
+                  ),
                 ).pipe(
                   Effect.tap(() =>
                     Effect.sync(() => {

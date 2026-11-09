@@ -6788,7 +6788,26 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ...(yield* Ref.get(settledTurns)),
               ...(yield* Ref.get(activeTurns)),
             ]);
-            const started = yield* client.request("turn/start", turnStartParams);
+            const started = yield* client.request(
+              "turn/start",
+              turnStartParams,
+              turnInput.submit === undefined
+                ? undefined
+                : {
+                    submit: (enqueue) =>
+                      turnInput.submit!(enqueue).pipe(
+                        Effect.mapError(
+                          (cause) =>
+                            new CodexErrors.CodexAppServerRequestError({
+                              code: -32800,
+                              operation: "enqueue-request",
+                              method: "turn/start",
+                              errorMessage: cause.message,
+                            }),
+                        ),
+                      ),
+                  },
+            );
             const previousTurn =
               previousTurns.get(started.turn.id) ??
               (yield* Ref.get(activeTurns)).get(started.turn.id);
@@ -7162,15 +7181,36 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 new Map(current).set(threadId, turnInput),
               );
               // Clear on interruption; a late turn/started must not be adopted after an interrupted start.
-              yield* client.request("thread/compact/start", { threadId }).pipe(
-                Effect.onError(() =>
-                  Ref.update(pendingRootTurns, (current) => {
-                    const next = new Map(current);
-                    next.delete(threadId);
-                    return next;
-                  }),
-                ),
-              );
+              yield* client
+                .request(
+                  "thread/compact/start",
+                  { threadId },
+                  turnInput.submit === undefined
+                    ? undefined
+                    : {
+                        submit: (enqueue) =>
+                          turnInput.submit!(enqueue).pipe(
+                            Effect.mapError(
+                              (cause) =>
+                                new CodexErrors.CodexAppServerRequestError({
+                                  code: -32800,
+                                  operation: "enqueue-request",
+                                  method: "thread/compact/start",
+                                  errorMessage: cause.message,
+                                }),
+                            ),
+                          ),
+                      },
+                )
+                .pipe(
+                  Effect.onError(() =>
+                    Ref.update(pendingRootTurns, (current) => {
+                      const next = new Map(current);
+                      next.delete(threadId);
+                      return next;
+                    }),
+                  ),
+                );
             },
             (effect, turnInput) =>
               effect.pipe(

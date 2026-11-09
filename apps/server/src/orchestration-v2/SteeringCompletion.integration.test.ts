@@ -46,6 +46,11 @@ import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
+import { makeCursorAdapterV2 } from "@t3tools/provider-cursor/testing";
+import * as CursorAgentSdk from "@t3tools/provider-cursor/server/CursorAgentSdk";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
@@ -577,6 +582,8 @@ const nextTurnSelectionHarness = Effect.fn("nextTurnSelectionHarness")(function*
     void,
     ProviderAdapter.ProviderAdapterSteerRunError
   > = Effect.void,
+  startPreparation: Effect.Effect<void> = Effect.void,
+  announceBeforePreparation = false,
 ) {
   const cwd = yield* checkpointWorkspace(name);
   const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
@@ -625,7 +632,15 @@ const nextTurnSelectionHarness = Effect.fn("nextTurnSelectionHarness")(function*
           });
         const startTurn = (turn: ProviderAdapter.ProviderAdapterV2TurnInput) =>
           Effect.gen(function* () {
-            started.push(turn);
+            if (started.length > 0) {
+              if (announceBeforePreparation) yield* turnUpdated(turn, "running");
+              yield* startPreparation;
+            }
+            if (turn.submit === undefined) started.push(turn);
+            else
+              yield* turn.submit(() => {
+                started.push(turn);
+              });
             yield* turnUpdated(turn, "running");
           });
         return {
@@ -1053,14 +1068,105 @@ it.effect(
 );
 
 it.effect.each([
-  { mode: "auto", preparing: true, submitted: false },
-  { mode: "auto", preparing: false, submitted: true },
-  { mode: "restart", preparing: false, submitted: false },
-  { mode: "promoted", preparing: false, submitted: false },
-  { mode: "explicit", preparing: false, submitted: false },
+  {
+    mode: "auto",
+    preparing: true,
+    submitted: false,
+    running: false,
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "auto",
+    preparing: false,
+    submitted: true,
+    running: false,
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "restart",
+    preparing: false,
+    submitted: false,
+    running: false,
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "restart",
+    preparing: false,
+    submitted: false,
+    running: "projected",
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "restart",
+    preparing: false,
+    submitted: false,
+    running: "native",
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "restart",
+    preparing: false,
+    submitted: false,
+    running: "announced",
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "restart",
+    preparing: false,
+    submitted: false,
+    running: "claiming",
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "promoted",
+    preparing: false,
+    submitted: false,
+    running: false,
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "explicit",
+    preparing: false,
+    submitted: false,
+    running: false,
+    resumedEarly: false,
+    stopAgain: false,
+  },
+  {
+    mode: "auto",
+    preparing: false,
+    submitted: true,
+    running: false,
+    resumedEarly: true,
+    stopAgain: false,
+  },
+  {
+    mode: "auto",
+    preparing: false,
+    submitted: true,
+    running: false,
+    resumedEarly: true,
+    stopAgain: true,
+  },
+  {
+    mode: "auto",
+    preparing: false,
+    submitted: true,
+    running: false,
+    resumedEarly: "client",
+    stopAgain: false,
+  },
 ] as const)(
-  "holds $mode steering when Stop wins before provider submission (preparing: $preparing, submitted: $submitted)",
-  ({ mode, preparing, submitted }) =>
+  "preserves $mode steering through Stop (preparing: $preparing, submitted: $submitted, running: $running, resumedEarly: $resumedEarly, stopAgain: $stopAgain)",
+  ({ mode, preparing, submitted, running, resumedEarly, stopAgain }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const entered = yield* Deferred.make<void>();
@@ -1096,11 +1202,42 @@ it.effect.each([
                   ),
                 )
               : Effect.void,
+            running === "native" || running === "announced"
+              ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+              : Effect.void,
+            running === "announced",
           );
         yield* Effect.gen(function* () {
           const threadId = yield* startFirstTurn;
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          const write = sink.writeIfRunCurrent;
+          const waitForStop = Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+          );
+          using _startGate = running
+            ? vi
+                .spyOn(sink, "writeIfRunCurrent")
+                .mockImplementation((input) =>
+                  running === "claiming" &&
+                  input.events.some(
+                    (event) =>
+                      event.type === "run-attempt.updated" &&
+                      event.payload.providerStartState === "invoked",
+                  )
+                    ? waitForStop.pipe(Effect.andThen(write(input)))
+                    : write(input).pipe(
+                        Effect.tap((result) =>
+                          running === "projected" &&
+                          result.committed &&
+                          input.expectedStatus === "starting"
+                            ? waitForStop
+                            : Effect.void,
+                        ),
+                      ),
+                )
+            : undefined;
           const messageId = MessageId.make("message:stop-before-submit");
           yield* orchestrator.dispatch({
             type: "message.dispatch",
@@ -1132,19 +1269,85 @@ it.effect.each([
               targetRunId: started[0]!.runId,
             });
           }
+          const announced =
+            running === "announced"
+              ? yield* orchestrator.streamDomainEvents.pipe(
+                  Stream.filter(
+                    (event) =>
+                      event.type === "provider-turn.updated" &&
+                      event.payload.runAttemptId !== started[0]!.attemptId,
+                  ),
+                  Stream.take(1),
+                  Stream.runDrain,
+                  Effect.forkScoped,
+                )
+              : undefined;
           const pending =
-            preparing || submitted ? yield* worker.runOnce.pipe(Effect.forkScoped) : null;
-          if (preparing || submitted) yield* Deferred.await(entered);
-          yield* orchestrator.dispatch({
+            preparing || submitted || running
+              ? yield* worker.runOnce.pipe(Effect.forkScoped)
+              : null;
+          if (preparing || submitted || running) yield* Deferred.await(entered);
+          if (announced !== undefined) yield* Fiber.join(announced);
+          if (running) {
+            const before = yield* orchestrator.getThreadProjection(threadId);
+            const replacement = before.runs.find((run) => run.userMessageId === messageId)!;
+            const attempt = before.attempts.find(
+              (candidate) => candidate.id === replacement.activeAttemptId,
+            )!;
+            assert.equal(replacement.status, "running");
+            assert.equal(attempt.status, "running");
+            assert.isNull(attempt.providerTurnId);
+            assert.lengthOf(started, 1);
+          }
+          const stop = orchestrator.dispatch({
             type: "thread.stop",
             commandId: CommandId.make("stop-before-submit-commit"),
             threadId,
           });
+          if (running === "claiming") {
+            const stopping = yield* Deferred.make<void>();
+            const stopFiber = yield* Deferred.succeed(stopping, undefined).pipe(
+              Effect.andThen(stop),
+              Effect.forkScoped,
+            );
+            yield* Deferred.await(stopping);
+            assert.isUndefined(stopFiber.pollUnsafe());
+            yield* Deferred.succeed(release, undefined);
+            yield* Fiber.join(stopFiber);
+          } else yield* stop;
           if (submitted) {
             // Stop must reach the provider while the steer still awaits its native reply.
             yield* worker.runOnce;
             assert.lengthOf(interrupted, 1);
             assert.isUndefined(pending!.pollUnsafe());
+          }
+          if (resumedEarly) {
+            yield* orchestrator.dispatch(
+              resumedEarly === "client"
+                ? {
+                    type: "message.dispatch",
+                    commandId: CommandId.make("resume-before-refusal"),
+                    threadId,
+                    messageId: MessageId.make("client-release"),
+                    text: "Continue",
+                    attachments: [],
+                    createdBy: "user",
+                    creationSource: "web",
+                    deliveryIntent: "auto",
+                    dispatchMode: { type: "start_immediately" },
+                  }
+                : {
+                    type: "queue.resume",
+                    commandId: CommandId.make("resume-before-refusal"),
+                    threadId,
+                  },
+            );
+            if (stopAgain)
+              yield* orchestrator.dispatch({
+                type: "thread.stop",
+                commandId: CommandId.make("stop-after-early-resume"),
+                threadId,
+              });
           }
           if (pending !== null) {
             yield* Deferred.succeed(release, undefined);
@@ -1156,12 +1359,22 @@ it.effect.each([
           const held = paused.runs.filter(
             (run) => run.userMessageId === messageId && run.status === "queued",
           );
-          assert.lengthOf(held, 1);
-          assert.isTrue(held[0]?.queueHeld);
+          const resumed = resumedEarly && !stopAgain;
+          assert.lengthOf(
+            held,
+            running === "claiming" || (resumed && resumedEarly !== "client") ? 0 : 1,
+          );
+          if (running !== "claiming" && !resumed) assert.isTrue(held[0]?.queueHeld);
           assert.lengthOf(
             paused.messages.filter((message) => message.id === messageId),
             1,
           );
+          if (resumedEarly === "client") {
+            // The new client turn owns the provider; the original follows it without another Resume.
+            assert.isFalse(held[0]?.queueHeld ?? false);
+            assert.equal(started.at(-1)?.message.messageId, MessageId.make("client-release"));
+            return;
+          }
           yield* orchestrator.dispatch({
             type: "queue.resume",
             commandId: CommandId.make("resume-after-steer-stop"),
@@ -2289,60 +2502,90 @@ it.effect("marks the model switch on a promoted message that restarts the turn",
   ),
 );
 
-it.effect("keeps a queued message queued when promoted into a run that Stop reached", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const { started, steered, layer, startFirstTurn } =
-        yield* nextTurnSelectionHarness("steering-after-stop");
-      yield* Effect.gen(function* () {
-        const orchestrator = yield* Orchestrator.OrchestratorV2;
-        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-        const threadId = yield* startFirstTurn;
-        const first = started[0]!;
-        yield* orchestrator.dispatch({
-          type: "message.dispatch",
-          commandId: CommandId.make("queued"),
-          threadId,
-          messageId: MessageId.make("message:queued"),
-          text: "queued",
-          attachments: [],
-          modelSelection: runSelection,
-          dispatchMode: { type: "queue_after_active" },
-          createdBy: "user",
-          creationSource: "web",
-        });
-        const queuedRun = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
-          (run) => run.status === "queued",
-        )!;
-        // The worker has not delivered the interrupt yet, so the run still reads as running.
-        yield* orchestrator.dispatch({
-          type: "run.interrupt",
-          commandId: CommandId.make("stop"),
-          threadId,
-          runId: first.runId,
-          holdQueue: true,
-        });
-
-        const promoteError = yield* orchestrator
-          .dispatch({
-            type: "queued-message.promote-to-steer",
-            commandId: CommandId.make("promote"),
+it.effect.each(["promoted", "settling", "settled", "resumed", "client"] as const)(
+  "honors an empty-queue Stop when a message arrives (%s)",
+  (flow) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { started, steered, layer, startFirstTurn } =
+          yield* nextTurnSelectionHarness("steering-after-stop");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = yield* startFirstTurn;
+          const first = started[0]!;
+          const messageId = MessageId.make("message:queued");
+          const send = orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("queued"),
             threadId,
-            queuedRunId: queuedRun.id,
-            targetRunId: first.runId,
-          })
-          .pipe(Effect.flip);
-        yield* worker.drain();
-
-        const projection = yield* orchestrator.getThreadProjection(threadId);
-        assert.equal(promoteError._tag, "OrchestratorDispatchError");
-        assert.deepEqual(steered, []);
-        const queued = projection.runs.find((run) => run.id === queuedRun.id);
-        assert.equal(queued?.status, "queued");
-        assert.isTrue(queued?.queueHeld);
-      }).pipe(Effect.provide(layer));
-    }),
-  ),
+            messageId,
+            text: "queued",
+            attachments: [],
+            modelSelection: runSelection,
+            dispatchMode: { type: "queue_after_active" },
+            ...(flow === "promoted" ? {} : { deliveryIntent: "auto" as const }),
+            createdBy: flow === "client" || flow === "promoted" ? "user" : "agent",
+            creationSource: flow === "client" || flow === "promoted" ? "web" : "mcp",
+          });
+          if (flow === "promoted") yield* send;
+          // The worker has not delivered the interrupt yet, so the run still reads as running.
+          yield* orchestrator.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make("stop"),
+            threadId,
+            runId: first.runId,
+            holdQueue: true,
+          });
+          if (flow === "settled" || flow === "resumed") yield* worker.drain();
+          if (flow === "resumed")
+            yield* orchestrator.dispatch({
+              type: "queue.resume",
+              commandId: CommandId.make("early-resume"),
+              threadId,
+            });
+          if (flow !== "promoted") yield* send;
+          else {
+            const queuedRun = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+              (run) => run.status === "queued",
+            )!;
+            const promoteError = yield* orchestrator
+              .dispatch({
+                type: "queued-message.promote-to-steer",
+                commandId: CommandId.make("promote"),
+                threadId,
+                queuedRunId: queuedRun.id,
+                targetRunId: first.runId,
+              })
+              .pipe(Effect.flip);
+            assert.equal(promoteError._tag, "OrchestratorDispatchError");
+          }
+          yield* worker.drain();
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          assert.deepEqual(steered, []);
+          if (flow !== "resumed" && flow !== "client") {
+            const queued = projection.runs.find((run) => run.userMessageId === messageId);
+            assert.equal(queued?.status, "queued");
+            assert.isTrue(queued?.queueHeld);
+            assert.lengthOf(started, 1);
+          }
+          yield* orchestrator.dispatch({
+            type: "queue.resume",
+            commandId: CommandId.make("resume-original"),
+            threadId,
+          });
+          yield* worker.drain();
+          assert.lengthOf(
+            started.filter((turn) => turn.message.messageId === messageId),
+            1,
+          );
+        }).pipe(
+          Effect.provide(
+            EffectWorker.layerWithOptions({ maxAttempts: 1 }).pipe(Layer.provideMerge(layer)),
+          ),
+        );
+      }),
+    ),
 );
 
 // A worktree of the workspace's repo on a branch of its own: it shares the repo's refs.
@@ -4160,4 +4403,168 @@ it.effect("a side chat that opens with /goal gets its context on the next questi
       }).pipe(Effect.provide(layer));
     }),
   ),
+);
+
+// Cursor has its own SDK path. A real adapter must propagate the transport claim;
+// an accepted replacement must never become a second prompt when Resume runs.
+it.effect.each([true, false])(
+  "preserves Cursor restart ownership through Stop, preparing=%s",
+  (preparing) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("cursor-restart-stop");
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const sent: string[] = [];
+        const cursorId = ProviderInstanceId.make("cursor");
+        const threadId = ThreadId.make("thread:cursor-restart-stop");
+        const pick = { instanceId: cursorId, model: "composer-2.5" };
+        const runner = Layer.succeed(CursorAgentSdk.CursorAgentSdkRunner, {
+          assertComplete: Effect.void,
+          open: () =>
+            Effect.succeed({
+              agentId: "cursor-restart",
+              listMessages: Effect.succeed([]),
+              close: Effect.void,
+              send: (input) =>
+                Effect.gen(function* () {
+                  if (preparing && sent.length > 0) {
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(release);
+                  }
+                  const enqueue = () => {
+                    sent.push(
+                      typeof input.message === "string" ? input.message : input.message.text,
+                    );
+                  };
+                  if (input.submit === undefined) enqueue();
+                  else
+                    yield* input.submit(enqueue).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new CursorAgentSdk.CursorAgentSdkRunnerError({
+                            method: "run.start",
+                            cause,
+                          }),
+                      ),
+                    );
+                  const runId = `cursor-native-${sent.length}`;
+                  const cancelled = yield* Deferred.make<void>();
+                  return {
+                    runId,
+                    agentId: "cursor-restart",
+                    wait: Deferred.await(cancelled).pipe(
+                      Effect.as({
+                        id: runId,
+                        requestId: runId,
+                        status: "cancelled" as const,
+                        model: { id: pick.model },
+                        durationMs: 1,
+                      }),
+                    ),
+                    cancel: Deferred.succeed(cancelled, undefined).pipe(Effect.asVoid),
+                  };
+                }),
+            }),
+        });
+        const adapter = Layer.unwrap(
+          makeCursorAdapterV2({ instanceId: cursorId, environment: {} }).pipe(
+            Effect.map(ProviderAdapterRegistry.layerSingle),
+            Effect.provide(
+              Layer.mergeAll(
+                runner,
+                TestProviderHost.layer({ cwd }),
+                IdAllocator.layer,
+                McpProviderSessions.layer,
+                NodeCrypto.layer,
+              ).pipe(Layer.provideMerge(NodeServices.layer)),
+            ),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          const o = yield* Orchestrator.OrchestratorV2;
+          const w = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const watch = (ordinal: number) =>
+            o.streamDomainEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.type === "provider-turn.updated" &&
+                  event.payload.status === "running" &&
+                  event.payload.ordinal === ordinal,
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped,
+            );
+          const message = (name: string) => ({
+            type: "message.dispatch" as const,
+            threadId,
+            commandId: CommandId.make(name),
+            messageId: MessageId.make(`message:${name}`),
+            text: name,
+            attachments: [],
+            createdBy: "agent" as const,
+            creationSource: "mcp" as const,
+            dispatchMode: { type: "start_immediately" as const },
+          });
+          yield* o.dispatch({
+            type: "thread.create",
+            threadId,
+            commandId: CommandId.make("cursor-create"),
+            projectId: ProjectId.make("project:cursor-restart"),
+            title: "Cursor restart",
+            modelSelection: pick,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const first = yield* watch(1);
+          yield* o.dispatch(message("Initial cursor prompt"));
+          yield* w.drain();
+          yield* Fiber.join(first);
+          const second = preparing ? undefined : yield* watch(2);
+          const replacement = message("Original cursor replacement");
+          yield* o.dispatch({ ...replacement, deliveryIntent: "auto" });
+          const pending = yield* w.drain().pipe(Effect.forkScoped);
+          if (preparing) yield* Deferred.await(entered);
+          else {
+            yield* Fiber.join(pending);
+            yield* Fiber.join(second!);
+          }
+          yield* o.dispatch({
+            type: "thread.stop",
+            threadId,
+            commandId: CommandId.make("cursor-stop"),
+          });
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(pending);
+          yield* w.drain();
+          const paused = yield* o.getThreadProjection(threadId);
+          const held = paused.runs.filter(
+            (run) => run.userMessageId === replacement.messageId && run.status === "queued",
+          );
+          assert.lengthOf(held, preparing ? 1 : 0);
+          if (preparing) assert.isTrue(held[0]?.queueHeld);
+          yield* o.dispatch({
+            type: "queue.resume",
+            threadId,
+            commandId: CommandId.make("cursor-resume"),
+          });
+          yield* w.drain();
+          assert.lengthOf(
+            sent.filter((text) => text.includes(replacement.text)),
+            1,
+          );
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry({ name: "cursor-restart-stop" }, adapter, {
+              runEffectWorker: false,
+            }),
+          ),
+        );
+      }),
+    ),
 );

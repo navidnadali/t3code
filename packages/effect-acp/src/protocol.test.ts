@@ -92,6 +92,65 @@ const makeHandle = (env?: Record<string, string>) =>
   });
 
 it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
+  it.effect.each([false, true])(
+    "claims prepared restart input at native enqueue, stopped=%s",
+    (stopped) =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const prepared = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let claims = 0;
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(),
+          logOutgoing: true,
+          logger: (event) =>
+            event.direction === "outgoing" && event.stage === "raw"
+              ? Deferred.succeed(prepared, undefined).pipe(Effect.andThen(Deferred.await(release)))
+              : Effect.void,
+        });
+        const submit = (enqueue: () => void) =>
+          Effect.suspend(() => {
+            claims += 1;
+            return stopped
+              ? Effect.fail(
+                  new AcpError.AcpRequestError({
+                    code: -32800,
+                    operation: "enqueue-request",
+                    errorMessage: "Stopped during preparation",
+                  }),
+                )
+              : Effect.sync(enqueue);
+          });
+        const sending = yield* transport
+          .request("session/prompt", { text: "once" })
+          .pipe(
+            Effect.provideService(AcpProtocol.AcpOutgoingSubmit, submit),
+            Effect.exit,
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(prepared);
+        assert.equal(claims, 0);
+        assert.equal(yield* Queue.size(output), 0);
+        yield* Deferred.succeed(release, undefined);
+        if (!stopped) {
+          const line = yield* Queue.take(output);
+          assert.include(line, '"method":"session/prompt"');
+          yield* Queue.offer(
+            input,
+            new TextEncoder().encode(
+              JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(line).id, result: { ok: true } }) +
+                "\n",
+            ),
+          );
+        }
+        const result = yield* Fiber.join(sending);
+        assert.equal(result._tag, stopped ? "Failure" : "Success");
+        assert.equal(claims, 1);
+        assert.equal(yield* Queue.size(output), 0);
+      }),
+  );
+
   it.effect(
     "emits exact JSON-RPC notifications and decodes inbound session/update and elicitation completion",
     () =>

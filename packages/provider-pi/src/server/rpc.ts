@@ -72,7 +72,10 @@ export interface PiRpcSpawnOptions {
 }
 
 export interface PiRpcConnection {
-  readonly send: (record: PiRpcRecord) => Effect.Effect<void, PiRpcError>;
+  readonly send: (
+    record: PiRpcRecord,
+    submit?: (enqueue: () => void) => Effect.Effect<void, PiRpcError>,
+  ) => Effect.Effect<void, PiRpcError>;
   readonly request: (
     record: PiRpcRecord,
     timeoutMs?: number,
@@ -372,11 +375,17 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
 
   const send =
     /* Protocol records and writes include streaming deltas; avoid a span per record. */
-    Effect.fnUntraced(function* (record: PiRpcRecord): Effect.fn.Return<void, PiRpcError> {
-      const accepted = yield* Queue.offer(
-        outgoing,
-        new TextEncoder().encode(`${encodeJsonLine(record)}\n`),
-      );
+    Effect.fnUntraced(function* (
+      record: PiRpcRecord,
+      submit?: (enqueue: () => void) => Effect.Effect<void, PiRpcError>,
+    ): Effect.fn.Return<void, PiRpcError> {
+      const encoded = new TextEncoder().encode(`${encodeJsonLine(record)}\n`);
+      let accepted = false;
+      if (submit === undefined) accepted = yield* Queue.offer(outgoing, encoded);
+      else
+        yield* submit(() => {
+          accepted = Queue.offerUnsafe(outgoing, encoded);
+        });
       if (!accepted) {
         return yield* Deferred.await(transportDown);
       }

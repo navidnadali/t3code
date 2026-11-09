@@ -176,6 +176,10 @@ export const AcpOutgoingGuard = Context.Reference<(() => boolean) | undefined>(
   { defaultValue: () => undefined },
 );
 
+export const AcpOutgoingSubmit = Context.Reference<
+  ((enqueue: () => void) => Effect.Effect<void, AcpError.AcpError>) | undefined
+>("effect-acp/protocol/AcpOutgoingSubmit", { defaultValue: () => undefined });
+
 export interface AcpPatchedProtocol {
   readonly clientProtocol: RpcClient.Protocol["Service"];
   readonly serverProtocol: RpcServer.Protocol["Service"];
@@ -361,20 +365,26 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         payload: encoded,
         ...(acknowledgement === undefined ? {} : { acknowledgement }),
       };
+      const submit = yield* AcpOutgoingSubmit;
+      let submitted = false;
       yield* (
-        canEnqueue === undefined
-          ? Queue.offer(outgoing, entry)
-          : Effect.suspend(() => {
-              if (!canEnqueue())
-                return new AcpError.AcpRequestError({
-                  code: -32800,
-                  errorMessage: "Request cancelled before enqueue.",
-                  operation: "enqueue-request",
-                  ...(method === undefined ? {} : { method }),
-                });
-              // Keep the target check and ordered native queue insertion in one synchronous step.
-              return Effect.succeed(Queue.offerUnsafe(outgoing, entry));
-            })
+        submit !== undefined
+          ? submit(() => {
+              submitted = canEnqueue?.() !== false && Queue.offerUnsafe(outgoing, entry);
+            }).pipe(Effect.map(() => submitted))
+          : canEnqueue === undefined
+            ? Queue.offer(outgoing, entry)
+            : Effect.suspend(() => {
+                if (!canEnqueue())
+                  return new AcpError.AcpRequestError({
+                    code: -32800,
+                    errorMessage: "Request cancelled before enqueue.",
+                    operation: "enqueue-request",
+                    ...(method === undefined ? {} : { method }),
+                  });
+                // Keep the target check and ordered native queue insertion in one synchronous step.
+                return Effect.succeed(Queue.offerUnsafe(outgoing, entry));
+              })
       ).pipe(
         Effect.mapError((cause) =>
           cause._tag === "AcpRequestError" && cause.operation === "enqueue-request"

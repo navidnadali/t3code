@@ -15,6 +15,8 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -39,6 +41,126 @@ import { loadCursorSdk } from "./sdk.ts";
 const { ConfigurationError } = loadCursorSdk();
 
 describe("CursorAdapterV2", () => {
+  it.effect("cancels a Cursor run interrupted during adapter registration", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const workspace = yield* fs.makeTempDirectoryScoped({ prefix: "cursor-handoff-" });
+        const instanceId = ProviderInstanceId.make("cursor");
+        const threadId = ThreadId.make("cursor-handoff");
+        const modelSelection = { instanceId, model: "composer-2.5" };
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        let interrupt = true;
+        let cancellations = 0;
+        const adapter = yield* makeCursorAdapterV2({
+          instanceId,
+          environment: { HOME: workspace },
+        }).pipe(
+          Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, {
+            assertComplete: Effect.void,
+            open: () =>
+              Effect.succeed({
+                agentId: "cursor-handoff",
+                listMessages: Effect.succeed([]),
+                close: Effect.void,
+                send: () =>
+                  Effect.succeed({
+                    agentId: "cursor-handoff",
+                    runId: "cursor-handoff-run",
+                    wait: Effect.never,
+                    cancel: Effect.sync(() => {
+                      cancellations += 1;
+                    }),
+                  }),
+              }),
+          }),
+          Effect.provideService(IdAllocator.IdAllocatorV2, {
+            ...ids,
+            derive: {
+              ...ids.derive,
+              providerTurn: (input) => {
+                if (interrupt) Fiber.getCurrent()?.interruptUnsafe();
+                return ids.derive.providerTurn(input);
+              },
+            },
+          }),
+          Effect.provide(TestProviderHost.layer({ cwd: workspace })),
+        );
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("cursor-handoff"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const input: ProviderAdapter.ProviderAdapterV2TurnInput = {
+          threadId,
+          providerThread,
+          modelSelection,
+          runtimePolicy,
+          runId: RunId.make("cursor-start-handoff-run"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("cursor-start-handoff-attempt"),
+          rootNodeId: NodeId.make("cursor-start-handoff-root"),
+          appThread: {
+            id: threadId,
+            projectId: ProjectId.make("cursor-start-handoff-project"),
+            createdBy: "user",
+            creationSource: "web",
+            title: "Cursor lifecycle",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          message: {
+            messageId: MessageId.make("cursor-start-handoff-message"),
+            createdBy: "user",
+            creationSource: "web",
+            text: "Review the code.",
+            attachments: [],
+          },
+        };
+        const starting = yield* runtime.startTurn(input).pipe(Effect.forkScoped);
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(starting)));
+        assert.equal(cancellations, 1);
+        interrupt = false;
+        yield* runtime.startTurn({
+          ...input,
+          runId: RunId.make("cursor-handoff-resumed"),
+          runOrdinal: 2,
+        });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect.each([
     { status: "finished", model: undefined, lateModel: undefined },
     { status: "cancelled", model: "claude-opus-4-6", lateModel: undefined },

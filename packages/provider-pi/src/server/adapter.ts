@@ -59,6 +59,7 @@ import {
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import {
   makePiRpcConnection,
+  PiRpcError,
   parsePiModelSlug,
   piRecordField as recordField,
   piRecordNumber as recordNumber,
@@ -407,6 +408,7 @@ function piApprovalRequestKind(title: string): "command" | "file-change" {
 const PI_COMPACTING_PROMPT_REJECTION = "Cannot submit a prompt while compaction is in progress";
 
 interface PiPromptSend {
+  readonly submit?: ProviderAdapter.ProviderAdapterV2TurnInput["submit"];
   readonly providerTurnId: OrchestrationV2ProviderTurn["id"];
   readonly kind: "turn_start" | "steer";
   readonly record: PiRpcRecord;
@@ -607,6 +609,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       // after it; they precede every prompt held since.
       let rejectedHeldCount = 0;
 
+      const nativeSubmission = (submit: ProviderAdapter.ProviderAdapterV2TurnInput["submit"]) =>
+        submit === undefined
+          ? undefined
+          : (enqueue: () => void) =>
+              submit(enqueue).pipe(
+                Effect.mapError((cause) => new PiRpcError({ operation: "submit", cause })),
+              );
       const sendPrompt = Effect.fnUntraced(function* (prompt: PiPromptSend) {
         if (nativeCompacting) {
           heldPrompts.push(prompt);
@@ -615,7 +624,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const id = `t3-prompt:${++nextPromptId}`;
         pendingPromptResponses.set(id, prompt);
         yield* connection
-          .send({ ...prompt.record, id })
+          .send({ ...prompt.record, id }, nativeSubmission(prompt.submit))
           .pipe(Effect.tapError(() => Effect.sync(() => pendingPromptResponses.delete(id))));
       });
       // A just-released prompt has not started its run yet, so a settle probe
@@ -2831,7 +2840,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               state.activeTurn = activeTurn;
               activeTurn.adoptedWake = wake !== null && !continuation;
               if (compactCommand !== null) {
-                yield* connection.send(compactRpcRecord(compactCommand));
+                yield* connection.send(
+                  compactRpcRecord(compactCommand),
+                  nativeSubmission(turnInput.submit),
+                );
                 pendingCompactResponses.push({
                   providerTurnId: providerTurn.id,
                   kind: "turn_start",
@@ -2840,6 +2852,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 yield* sendPrompt({
                   providerTurnId: providerTurn.id,
                   kind: "turn_start",
+                  ...(turnInput.submit === undefined ? {} : { submit: turnInput.submit }),
                   record: {
                     type: "prompt",
                     message: payload.message,

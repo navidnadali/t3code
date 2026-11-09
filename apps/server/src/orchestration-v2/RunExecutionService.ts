@@ -54,6 +54,7 @@ import {
 } from "@t3tools/provider-core/server/failure";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { userFacingDatabaseErrorMessage } from "./UserFacingErrors.ts";
 
 export interface ProviderEventRoutingState {
@@ -608,6 +609,7 @@ export const layer: Layer.Layer<
     const scope = yield* Effect.scope;
     const checkpointService = yield* CheckpointService.CheckpointServiceV2;
     const eventSink = yield* EventSink.EventSinkV2;
+    const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -884,6 +886,7 @@ export const layer: Layer.Layer<
 
     return RunExecutionServiceV2.of({
       startRootRun: Effect.fn("RunExecutionService.startRootRun")(function* (input) {
+        let activeAttempt = input.attempt;
         const rootTurnOrigin: ProviderUsageAnalytics.ProviderTurnOrigin = {
           createdBy: input.message.createdBy,
           creationSource: input.message.creationSource,
@@ -972,7 +975,7 @@ export const layer: Layer.Layer<
                 rootNode: input.rootNode,
                 checkpointScope: input.checkpointScope,
                 providerThread: input.providerThread,
-                attempt: input.attempt,
+                attempt: activeAttempt,
                 terminal: makeFailedTerminalEvent(
                   makeProviderFailure({
                     cause: Cause.squash(cause),
@@ -1088,7 +1091,7 @@ export const layer: Layer.Layer<
             rootNode: input.rootNode,
             checkpointScope: input.checkpointScope,
             providerThread,
-            attempt: input.attempt,
+            attempt: activeAttempt,
             ...(input.shouldFinalizeRun === undefined
               ? {}
               : {
@@ -1607,7 +1610,7 @@ export const layer: Layer.Layer<
                     rootNode: input.rootNode,
                     checkpointScope: input.checkpointScope,
                     providerThread,
-                    attempt: input.attempt,
+                    attempt: activeAttempt,
                     writeIfRunCurrent: {
                       activeAttemptId: input.attempt.id,
                       expectedStatus: "running",
@@ -1694,6 +1697,54 @@ export const layer: Layer.Layer<
           key: `mcp_app_${entry.itemId.replace(/[^\w.-]/g, "_")}`,
           text: entry.text,
         }));
+        // Provider preparation may await context, files, setup RPCs, and protocol logging.
+        // Only its final synchronous transport enqueue can consume the original input.
+        const submit: NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["submit"]> = (
+          enqueue,
+        ) =>
+          threadDispatch
+            .withLock(
+              input.run.threadId,
+              Effect.gen(function* () {
+                const invokedAttempt = { ...activeAttempt, providerStartState: "invoked" as const };
+                const claimed = yield* eventSink.writeIfRunCurrent({
+                  threadId: input.run.threadId,
+                  runId: input.run.id,
+                  activeAttemptId: input.attemptId,
+                  expectedStatus: "running",
+                  events: [
+                    {
+                      id: yield* idAllocator.allocate.event({ threadId: input.run.threadId }),
+                      type: "run-attempt.updated",
+                      threadId: input.run.threadId,
+                      runId: input.run.id,
+                      nodeId: input.rootNode.id,
+                      providerInstanceId: input.run.providerInstanceId,
+                      occurredAt: yield* DateTime.now,
+                      payload: invokedAttempt,
+                    },
+                  ],
+                });
+                if (!claimed.committed)
+                  return yield* Effect.fail("The restart was stopped before submission.");
+                activeAttempt = invokedAttempt;
+                enqueue();
+              }),
+            )
+            .pipe(
+              // Cancellation cannot split a committed claim from its synchronous native enqueue.
+              Effect.uninterruptible,
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterTurnStartError({
+                    driver: input.session.driver,
+                    threadId: input.run.threadId,
+                    providerThreadId: input.providerThread.id,
+                    runId: input.run.id,
+                    cause,
+                  }),
+              ),
+            );
         const turnInput = {
           appThread: input.appThread,
           threadId: input.run.threadId,
@@ -1715,13 +1766,11 @@ export const layer: Layer.Layer<
           modelSelection: input.modelSelection,
           runtimePolicy: input.runtimePolicy,
           ...(appContext.length === 0 ? {} : { appContext }),
+          ...(activeAttempt.providerStartState === "pending" ? { submit } : {}),
         };
-        // Check after the context read: ingestion can settle the run while
-        // it awaits. A failed ownership read fails the start below.
-        const shouldStart =
-          input.shouldStartProviderTurn === undefined
-            ? Exit.succeed(true)
-            : yield* Effect.exit(input.shouldStartProviderTurn());
+        const shouldStart = yield* Effect.exit(
+          input.shouldStartProviderTurn?.() ?? Effect.succeed(true),
+        );
         if (Exit.isSuccess(shouldStart) && !shouldStart.value) {
           yield* Fiber.interrupt(providerEventFiber);
           return;
@@ -1768,7 +1817,7 @@ export const layer: Layer.Layer<
                           rootNode: input.rootNode,
                           checkpointScope: input.checkpointScope,
                           providerThread,
-                          attempt: input.attempt,
+                          attempt: activeAttempt,
                           writeIfRunCurrent: {
                             activeAttemptId: input.attempt.id,
                             expectedStatus: "running",
@@ -1803,7 +1852,7 @@ export const layer: Layer.Layer<
       }),
     } satisfies RunExecutionServiceV2Shape);
   }),
-);
+).pipe(Layer.provide(ThreadCommandExecutor.layer));
 
 /**
  * Clients send Stop without a reason; server callers acting for an agent

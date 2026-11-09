@@ -45,6 +45,7 @@ import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
@@ -3413,6 +3414,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       turn: ActiveTurn,
     ) {
       const sessionID = Session.ID.make(sessionId);
+      const nativeFetch = yield* FetchHttpClient.Fetch;
+      const withSubmission =
+        turnInput.submit === undefined
+          ? nativeFetch
+          : yield* ProviderAdapter.startSubmissionFetch(turnInput.submit, nativeFetch);
       const sending = () => {
         if (state.active !== turn || turn.interrupted) return false;
         turn.unsent = false;
@@ -3423,7 +3429,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const id = turnPromptId(sessionId, turnInput.attemptId);
       if (bare && text === "/compact") {
         if (!sending()) return;
-        return yield* client.session.compact({ sessionID, id }).pipe(Effect.asVoid);
+        return yield* client.session
+          .compact({ sessionID, id })
+          .pipe(Effect.provideService(FetchHttpClient.Fetch, withSubmission), Effect.asVoid);
       }
       const location = { directory: turnInput.runtimePolicy.cwd ?? host.paths.cwd };
       const command = bare ? commandOf(text) : undefined;
@@ -3438,7 +3446,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const newest = yield* client.message.list({ sessionID, order: "desc", limit: 1 });
           yield* markBefore(sessionId, newest.data[0]?.id ?? null);
           if (!sending()) return;
-          return yield* client.session.command({ sessionID, ...command });
+          return yield* client.session
+            .command({ sessionID, ...command })
+            .pipe(Effect.provideService(FetchHttpClient.Fetch, withSubmission));
         }
       }
       const mentions = skillMentions(text);
@@ -3456,7 +3466,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             ? {}
             : { skills: skills.map((id) => ({ id: Skill.ID.make(id) })) }),
         })
-        .pipe(Effect.asVoid);
+        .pipe(Effect.provideService(FetchHttpClient.Fetch, withSubmission), Effect.asVoid);
     });
 
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {

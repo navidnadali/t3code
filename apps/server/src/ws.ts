@@ -1189,6 +1189,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
 export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subscribeShell")(
   function* (input: {
     readonly afterSequence?: number;
+    readonly httpSnapshotFallback?: true;
     readonly requestCompletionMarker?: boolean;
     readonly omitIdleSubagents?: boolean;
     readonly omitOlderSettled?: boolean;
@@ -1447,14 +1448,20 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         });
       }
 
-      const fromSnapshot = Effect.gen(function* () {
-        const loaded = yield* loadSnapshot();
-        return composeShellStreamWithEnrichment({
-          initial: initialSnapshotItems(loaded),
-          tail: completionThenLive(loaded.snapshot.snapshotSequence),
-          enrichment: enrichmentRefreshes,
-        });
+      const snapshotRequired: Stream.Stream<OrchestrationV2ShellStreamItem> = Stream.make({
+        kind: "snapshot-required",
       });
+      const fromSnapshot =
+        input.httpSnapshotFallback === true
+          ? Effect.succeed(snapshotRequired)
+          : Effect.gen(function* () {
+              const loaded = yield* loadSnapshot();
+              return composeShellStreamWithEnrichment({
+                initial: initialSnapshotItems(loaded),
+                tail: completionThenLive(loaded.snapshot.snapshotSequence),
+                enrichment: enrichmentRefreshes,
+              });
+            });
       const highWater = yield* applicationEvents.latestApplicationSequence;
       if (!(yield* canReplayPersistedRange(input.afterSequence, highWater, SHELL_RESUME_MAX_GAP))) {
         return yield* fromSnapshot;

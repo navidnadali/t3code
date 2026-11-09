@@ -1495,6 +1495,9 @@ export const layer: Layer.Layer<
       };
       const runningAttempt: OrchestrationV2RunAttempt = {
         ...attempt,
+        ...(attempt.reason === "steering_restart"
+          ? { providerStartState: "pending" as const }
+          : {}),
         ...(runningProviderThread.nativeThreadRef?.nativeId == null
           ? {}
           : { nativeThreadId: runningProviderThread.nativeThreadRef.nativeId }),

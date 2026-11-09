@@ -98,6 +98,7 @@ export interface CodexAppServerPatchedProtocolOptions {
 export interface CodexAppServerRequestOptions {
   /** Evaluated synchronously with queue insertion, after encoding and outbound logging. */
   readonly canEnqueue?: () => boolean;
+  readonly submit?: (enqueue: () => void) => Effect.Effect<void, CodexError.CodexAppServerError>;
 }
 
 export interface CodexAppServerPatchedProtocol {
@@ -286,7 +287,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           stage: "raw",
           payload: encoded,
         });
-        const accepted = yield* Effect.suspend(() => {
+        const enqueue = Effect.suspend(() => {
           if (requestOptions?.canEnqueue?.() === false) {
             return new CodexError.CodexAppServerRequestError({
               code: -32800,
@@ -298,6 +299,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           // No yield between the target check and insertion into the ordered native stream.
           return Effect.succeed(Queue.offerUnsafe(outgoing, encoded));
         });
+        let accepted = false;
+        if (requestOptions?.submit === undefined) accepted = yield* enqueue;
+        else
+          yield* requestOptions.submit(() => {
+            accepted =
+              requestOptions.canEnqueue?.() !== false && Queue.offerUnsafe(outgoing, encoded);
+          });
         if (!accepted) {
           const closed = yield* Ref.get(terminationFailure);
           return yield* Option.getOrElse(

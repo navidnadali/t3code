@@ -9,6 +9,9 @@ import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as HttpClient from "effect/http/HttpClient";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { ProviderDriverKind, ThreadId, ProviderThreadId, RunId } from "@t3tools/contracts";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import { describe } from "vite-plus/test";
 
@@ -167,3 +170,78 @@ describe("OpenCode2Client message history", () => {
     }),
   );
 });
+
+// Exercise the installed SDK and its fetch transport: the creation context must not
+// hide the final request's submission gate, and the gate must not await the reply.
+it.effect.each([false, true])("gates a prepared native prompt, stopped=%s", (stopped) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const response = Promise.withResolvers<Response>();
+      const claimed = yield* Deferred.make<void>();
+      let sent = 0;
+      const nativeFetch: typeof globalThis.fetch = () => {
+        sent += 1;
+        return response.promise;
+      };
+      const submit: NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["submit"]> = (enqueue) =>
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.andThen(
+            Effect.suspend(() =>
+              stopped
+                ? Effect.fail(
+                    new ProviderAdapter.ProviderAdapterTurnStartError({
+                      driver: ProviderDriverKind.make("opencode"),
+                      threadId: ThreadId.make("thread:submit"),
+                      providerThreadId: ProviderThreadId.make("provider:submit"),
+                      runId: RunId.make("run:submit"),
+                      cause: "Stopped before native submission",
+                    }),
+                  )
+                : Effect.sync(enqueue).pipe(Effect.andThen(Deferred.succeed(claimed, undefined))),
+            ),
+          ),
+        );
+      const guardedFetch = yield* ProviderAdapter.startSubmissionFetch(submit, nativeFetch);
+      const opencode = yield* OpenCode2Client.make.pipe(Effect.provide(FetchHttpClient.layer));
+      const { client } = yield* opencode.connect({
+        baseUrl: "http://127.0.0.1:4096",
+        password: "test",
+      });
+      const pending = yield* client.session
+        .prompt({ sessionID: Session.ID.make("ses_submit"), text: "once" })
+        .pipe(
+          Effect.provideService(FetchHttpClient.Fetch, guardedFetch),
+          Effect.exit,
+          Effect.forkScoped,
+        );
+      yield* Deferred.await(entered);
+      assert.equal(sent, 0);
+      yield* Deferred.succeed(release, undefined);
+      if (!stopped) {
+        yield* Deferred.await(claimed);
+        assert.isUndefined(pending.pollUnsafe());
+        response.resolve(
+          new Response(
+            JSON.stringify({
+              data: {
+                id: "msg_0eb735d41001NJee1EvVePJAK5",
+                sessionID: "ses_submit",
+                time: { created: 1790656601410 },
+                type: "user",
+                payload: { text: "once" },
+                delivery: "steer",
+              },
+            }),
+            { headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      const result = yield* Fiber.join(pending);
+      assert.equal(result._tag, stopped ? "Failure" : "Success");
+      assert.equal(sent, stopped ? 0 : 1);
+    }),
+  ),
+);

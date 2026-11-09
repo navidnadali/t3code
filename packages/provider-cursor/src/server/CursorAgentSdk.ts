@@ -1,8 +1,11 @@
+// @effect-diagnostics nodeBuiltinImport:off -- AsyncLocalStorage carries per-send ownership through the SDK's native promise preparation.
+import * as NodeAsyncHooks from "node:async_hooks";
 import type {
   AgentMessage,
   AgentOptions,
   InteractionUpdate,
   RunResult,
+  Run,
   SDKUserMessage,
   SendOptions,
 } from "@cursor/sdk";
@@ -19,7 +22,78 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as CursorSdk from "./CursorSdk.ts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+
+interface CursorSubmission {
+  readonly stopped: () => boolean;
+  readonly submit: (enqueue: () => void) => Promise<void>;
+  readonly track: (abort: () => void) => void;
+}
+
+const cursorStarts = new Map<string, Promise<void>>();
+
+function serializeCursorStart(agentId: string, start: () => Promise<Run>): Promise<Run> {
+  // Interrupted SDK promises still own their persisted reservation until preparation settles.
+  const pending = (cursorStarts.get(agentId) ?? Promise.resolve()).then(start);
+  const settled = pending.then(
+    () => {},
+    () => {},
+  );
+  cursorStarts.set(agentId, settled);
+  void settled.then(() => {
+    if (cursorStarts.get(agentId) === settled) cursorStarts.delete(agentId);
+  });
+  return pending;
+}
+
+const cursorSubmission = new NodeAsyncHooks.AsyncLocalStorage<CursorSubmission>();
+const guardedExecutors = new WeakMap<
+  object,
+  typeof import("@cursor/sdk").CursorAgentPlatform.prototype.acquireLocalExecutor
+>();
+
+function guardCursorExecutors(sdk: typeof import("@cursor/sdk")): void {
+  const prototype = sdk.CursorAgentPlatform.prototype;
+  if (guardedExecutors.get(prototype) === prototype.acquireLocalExecutor) return;
+  const acquire = prototype.acquireLocalExecutor;
+  // The SDK caches leases across sends; consult the current send at execution, not acquisition.
+  prototype.acquireLocalExecutor = async function (options) {
+    if (cursorSubmission.getStore()?.stopped())
+      throw new Error("Cursor start was stopped during preparation.");
+    const lease = await acquire.call(this, options);
+    const nativeRun = lease.handle.run;
+    return {
+      cacheMiss: lease.cacheMiss,
+      release: () => lease.release(),
+      handle: {
+        ...(lease.handle.reload === undefined ? {} : { reload: () => lease.handle.reload!() }),
+        ...(lease.handle.dispose === undefined ? {} : { dispose: () => lease.handle.dispose!() }),
+        run: async (...args: never) => {
+          const submission = cursorSubmission.getStore();
+          if (submission === undefined) return Reflect.apply(nativeRun, lease.handle, args);
+          if (submission.stopped()) throw new Error("Cursor start was stopped during preparation.");
+          // executor.run admits the input to the native agent loop, which may then do model I/O.
+          // Once admitted, Stop cancels that run; Resume must not replay an uncertain execution.
+          let pending: Promise<unknown>;
+          await submission.submit(() => {
+            pending = Reflect.apply(nativeRun, lease.handle, args);
+          });
+          const controller = await pending!;
+          if (
+            typeof controller !== "object" ||
+            controller === null ||
+            typeof Reflect.get(controller, "abort") !== "function"
+          )
+            throw new Error("Cursor executor returned no cancellation controller.");
+          submission.track(() => Reflect.apply(Reflect.get(controller, "abort"), controller, []));
+          return controller;
+        },
+      },
+    };
+  };
+  guardedExecutors.set(prototype, prototype.acquireLocalExecutor);
+}
 
 export const CURSOR_AGENT_SDK_PROTOCOL = "cursor-agent-sdk.local" as const;
 export const CURSOR_PROVIDER = ProviderDriverKind.make("cursor");
@@ -86,6 +160,7 @@ export interface CursorAgentSdkOpenInput {
 }
 
 export interface CursorAgentSdkSendInput<Error> {
+  readonly submit?: ProviderAdapter.ProviderAdapterV2TurnInput["submit"];
   readonly message: string | SDKUserMessage;
   readonly options?: Omit<SendOptions, "onDelta">;
   readonly onDelta?: (update: InteractionUpdate) => Effect.Effect<void, Error>;
@@ -380,10 +455,12 @@ export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(fu
 
   return CursorAgentSdkRunner.of({
     open: Effect.fn("CursorAgentSdkRunner.open")(function* (input) {
-      const { Agent } = yield* Effect.try({
+      const loaded = yield* Effect.try({
         try: sdk.load,
         catch: (cause) => runnerError(cause, `agent.${input.operation}`),
       });
+      guardCursorExecutors(loaded);
+      const { Agent } = loaded;
       if (input.options.local?.sandboxOptions?.enabled === false) {
         yield* primeCursorSandboxSupport(input.options);
       }
@@ -433,49 +510,61 @@ export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(fu
       return {
         agentId: agent.agentId,
         send: Effect.fn("CursorAgentSdkSession.send")(function* (sendInput) {
-          const context = yield* Effect.context();
-          yield* log({
-            direction: "outgoing",
-            stage: "decoded",
-            payload: {
-              type: "run.start",
-              message: sendInput.message,
-              options: loggedCursorSendOptions(sendInput.options),
-            },
-          });
+          let stopped = false;
+          let currentRun: Run | undefined;
+          const controllers = new Set<() => void>();
+          return yield* Effect.gen(function* () {
+            const context = yield* Effect.context<never>();
+            const submission: CursorSubmission = {
+              stopped: () => stopped,
+              submit: (enqueue) =>
+                Effect.runPromiseWith(context)(sendInput.submit?.(enqueue) ?? Effect.sync(enqueue)),
+              track: (abort) => {
+                controllers.add(abort);
+                if (stopped) abort();
+              },
+            };
+            yield* log({
+              direction: "outgoing",
+              stage: "decoded",
+              payload: {
+                type: "run.start",
+                message: sendInput.message,
+                options: loggedCursorSendOptions(sendInput.options),
+              },
+            });
 
-          let callbacksReady = false;
-          const pendingUpdates: Array<InteractionUpdate> = [];
-          let callbackFailure: { readonly cause: unknown } | undefined;
-          let callbackChain = Promise.resolve();
-          let runId = "";
-          const dispatchUpdate = (update: InteractionUpdate): Promise<void> => {
-            callbackChain = callbackChain
-              .then(() => {
-                if (callbackFailure !== undefined) {
-                  return;
-                }
-                return Effect.runPromiseWith(context)(
-                  log({
-                    direction: "incoming",
-                    stage: "decoded",
-                    payload: {
-                      type: "interaction.update",
-                      runId,
-                      update,
-                    },
-                  }).pipe(Effect.andThen(sendInput.onDelta?.(update) ?? Effect.void)),
-                );
-              })
-              .catch((cause) => {
-                callbackFailure ??= { cause };
-              });
-            return callbackChain;
-          };
+            let callbacksReady = false;
+            const pendingUpdates: Array<InteractionUpdate> = [];
+            let callbackFailure: { readonly cause: unknown } | undefined;
+            let callbackChain = Promise.resolve();
+            let runId = "";
+            const dispatchUpdate = (update: InteractionUpdate): Promise<void> => {
+              callbackChain = callbackChain
+                .then(() => {
+                  if (callbackFailure !== undefined) {
+                    return;
+                  }
+                  return Effect.runPromiseWith(context)(
+                    log({
+                      direction: "incoming",
+                      stage: "decoded",
+                      payload: {
+                        type: "interaction.update",
+                        runId,
+                        update,
+                      },
+                    }).pipe(Effect.andThen(sendInput.onDelta?.(update) ?? Effect.void)),
+                  );
+                })
+                .catch((cause) => {
+                  callbackFailure ??= { cause };
+                });
+              return callbackChain;
+            };
 
-          const startRun = () =>
-            Effect.tryPromise({
-              try: () =>
+            const startRun = Effect.fnUntraced(function* () {
+              const invoke = () =>
                 sendInput.summarize === true
                   ? agent.summarize()
                   : agent.send(sendInput.message, {
@@ -487,106 +576,147 @@ export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(fu
                         }
                         await dispatchUpdate(update);
                       },
+                    });
+              return yield* Effect.tryPromise({
+                try: () =>
+                  cursorSubmission.run(submission, () =>
+                    serializeCursorStart(agent.agentId, async () => {
+                      if (stopped)
+                        throw new Error("Cursor start was stopped before SDK preparation.");
+                      const run = await invoke();
+                      currentRun = run;
+                      if (stopped) await run.cancel();
+                      return run;
                     }),
-              catch: (cause) => runnerError(cause, "run.start"),
+                  ),
+                catch: (cause) => runnerError(cause, "run.start"),
+              });
             });
-          const run = yield* startRun().pipe(
-            Effect.catchIf(
-              (error) => abandonedRunRecoveryAvailable && isActiveRunConflict(error.cause),
-              (error) =>
-                Effect.gen(function* () {
-                  abandonedRunRecoveryAvailable = false;
-                  const latestRun = yield* Effect.tryPromise({
-                    try: () => Agent.listRuns(agent.agentId, { ...runOptions, limit: 1 }),
-                    catch: (cause) => runnerError(cause, "agent.listRuns"),
-                  });
-                  const activeRun = latestRun.items.find(
-                    (candidate) => candidate.status === "running",
-                  );
-                  if (activeRun === undefined) {
-                    return yield* error;
-                  }
-                  yield* log({
-                    direction: "outgoing",
-                    stage: "decoded",
-                    payload: { type: "run.cancel", runId: activeRun.id },
-                  });
-                  yield* Effect.tryPromise({
-                    try: () => Agent.cancelRun(activeRun.id, runOptions),
-                    catch: (cause) => runnerError(cause, "agent.cancelRun"),
-                  });
-                  return yield* startRun();
-                }),
-            ),
-          );
-          abandonedRunRecoveryAvailable = false;
-          runId = run.id;
-          yield* log({
-            direction: "incoming",
-            stage: "decoded",
-            payload: {
-              type: "run.started",
-              runId: run.id,
-              agentId: run.agentId,
-            },
-          });
-          callbacksReady = true;
-          for (const update of pendingUpdates) {
-            yield* Effect.tryPromise({
-              try: () => dispatchUpdate(update),
-              catch: (cause) => runnerError(cause, "run.onDelta"),
-            });
-          }
-
-          return {
-            runId: run.id,
-            agentId: run.agentId,
-            wait: Effect.tryPromise({
-              try: async () => {
-                const result = await run.wait();
-                await callbackChain;
-                if (callbackFailure !== undefined) {
-                  throw callbackFailure.cause;
-                }
-                return result;
-              },
-              catch: (cause) => runnerError(cause, "run.wait"),
-            }).pipe(
-              Effect.tap((result) =>
-                log({
-                  direction: "incoming",
-                  stage: "decoded",
-                  payload: {
-                    type: "run.completed",
-                    result,
-                  },
-                }),
+            const run = yield* startRun().pipe(
+              Effect.catchIf(
+                (error) => abandonedRunRecoveryAvailable && isActiveRunConflict(error.cause),
+                (error) =>
+                  Effect.gen(function* () {
+                    abandonedRunRecoveryAvailable = false;
+                    const latestRun = yield* Effect.tryPromise({
+                      try: () => Agent.listRuns(agent.agentId, { ...runOptions, limit: 1 }),
+                      catch: (cause) => runnerError(cause, "agent.listRuns"),
+                    });
+                    const activeRun = latestRun.items.find(
+                      (candidate) => candidate.status === "running",
+                    );
+                    if (activeRun === undefined) {
+                      return yield* error;
+                    }
+                    yield* log({
+                      direction: "outgoing",
+                      stage: "decoded",
+                      payload: { type: "run.cancel", runId: activeRun.id },
+                    });
+                    yield* Effect.tryPromise({
+                      try: () => Agent.cancelRun(activeRun.id, runOptions),
+                      catch: (cause) => runnerError(cause, "agent.cancelRun"),
+                    });
+                    return yield* startRun();
+                  }),
               ),
-            ),
-            cancel: log({
-              direction: "outgoing",
+            );
+            abandonedRunRecoveryAvailable = false;
+            runId = run.id;
+            yield* log({
+              direction: "incoming",
               stage: "decoded",
               payload: {
-                type: "run.cancel",
+                type: "run.started",
                 runId: run.id,
+                agentId: run.agentId,
               },
-            }).pipe(
-              Effect.andThen(
-                Effect.tryPromise({
-                  try: async () => {
-                    try {
-                      await run.cancel();
-                    } catch (cause) {
-                      if (!isCursorCancellationError(cause)) {
-                        throw cause;
+            });
+            callbacksReady = true;
+            for (const update of pendingUpdates) {
+              yield* Effect.tryPromise({
+                try: () => dispatchUpdate(update),
+                catch: (cause) => runnerError(cause, "run.onDelta"),
+              });
+            }
+
+            return {
+              runId: run.id,
+              agentId: run.agentId,
+              wait: Effect.tryPromise({
+                try: async () => {
+                  const result = await run.wait();
+                  await callbackChain;
+                  if (callbackFailure !== undefined) {
+                    throw callbackFailure.cause;
+                  }
+                  return result;
+                },
+                catch: (cause) => runnerError(cause, "run.wait"),
+              }).pipe(
+                Effect.tap((result) =>
+                  log({
+                    direction: "incoming",
+                    stage: "decoded",
+                    payload: {
+                      type: "run.completed",
+                      result,
+                    },
+                  }),
+                ),
+              ),
+              cancel: log({
+                direction: "outgoing",
+                stage: "decoded",
+                payload: {
+                  type: "run.cancel",
+                  runId: run.id,
+                },
+              }).pipe(
+                Effect.andThen(
+                  Effect.tryPromise({
+                    try: async () => {
+                      try {
+                        await run.cancel();
+                      } catch (cause) {
+                        if (!isCursorCancellationError(cause)) {
+                          throw cause;
+                        }
                       }
-                    }
-                  },
-                  catch: (cause) => runnerError(cause, "run.cancel"),
-                }),
+                    },
+                    catch: (cause) => runnerError(cause, "run.cancel"),
+                  }),
+                ),
+              ),
+            } satisfies CursorAgentSdkRun;
+          }).pipe(
+            Effect.onInterrupt(() =>
+              Effect.sync(() => {
+                stopped = true;
+              }).pipe(
+                Effect.andThen(
+                  Effect.suspend(() =>
+                    currentRun === undefined
+                      ? Effect.forEach(
+                          controllers,
+                          (abort) =>
+                            Effect.try({
+                              try: abort,
+                              catch: (cause) => runnerError(cause, "run.cancel"),
+                            }).pipe(Effect.ignore),
+                          {
+                            discard: true,
+                          },
+                        )
+                      : Effect.tryPromise({
+                          try: () => currentRun!.cancel(),
+                          catch: (cause) => runnerError(cause, "run.cancel"),
+                        }).pipe(Effect.ignore),
+                  ),
+                ),
               ),
             ),
-          } satisfies CursorAgentSdkRun;
+          );
         }),
         listMessages: log({
           direction: "outgoing",

@@ -3006,6 +3006,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           beforeSubmit?: Effect.Effect<void, ProviderAdapter.ProviderAdapterSteerRunError>,
           validateSubmit?: () => ProviderAdapter.ProviderAdapterSteerRunError | undefined,
           admitSubmit?: () => void,
+          startSubmit?: ProviderAdapter.ProviderAdapterV2TurnInput["submit"],
         ) {
           const text = payload.parts
             ?.filter((part) => part.type === "text")
@@ -3047,7 +3048,12 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             // @effect-diagnostics-next-line globalFetch:off - This is the SDK's synchronous transport boundary.
             return fetch(request, init);
           };
-          const fetchOptions = validateSubmit === undefined ? {} : { fetch: guardedFetch };
+          const fetchOptions =
+            startSubmit !== undefined
+              ? { fetch: yield* ProviderAdapter.startSubmissionFetch(startSubmit, guardedFetch) }
+              : validateSubmit === undefined
+                ? {}
+                : { fetch: guardedFetch };
           const preserveTransportRefusal = <E>(cause: E) =>
             transportRefusal ??
             (validateSubmit !== undefined && !transportStarted
@@ -3358,13 +3364,20 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               });
               yield* updateProviderSession("running", null);
               if (isCompaction) {
+                const compactFetch =
+                  turnInput.submit === undefined
+                    ? undefined
+                    : yield* ProviderAdapter.startSubmissionFetch(turnInput.submit, fetch);
                 yield* sdkCall(
                   "session.summarize",
                   { sessionID: sessionId, ...parsedModel, auto: false },
                   (signal) =>
                     client.session.summarize(
                       { sessionID: sessionId, ...parsedModel, auto: false },
-                      { signal: AbortSignal.any([signal, admissionAbortController!.signal]) },
+                      {
+                        signal: AbortSignal.any([signal, admissionAbortController!.signal]),
+                        ...(compactFetch === undefined ? {} : { fetch: compactFetch }),
+                      },
                     ),
                 ).pipe(
                   Effect.tap(() =>
@@ -3395,6 +3408,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   parts,
                 },
                 admissionAbortController!,
+                undefined,
+                undefined,
+                undefined,
+                turnInput.submit,
               ).pipe(
                 Effect.tapError((cause) =>
                   admissionAbortController!.signal.aborted

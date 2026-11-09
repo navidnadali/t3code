@@ -456,6 +456,8 @@ export const OrchestrationV2AppThread = Schema.Struct({
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
+  /** Advances when Resume supersedes earlier Stop holds, including in-flight steering. */
+  queueReleaseGeneration: Schema.optional(NonNegativeInt),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
@@ -741,6 +743,8 @@ export const OrchestrationV2RunAttempt = Schema.Struct({
   id: RunAttemptId,
   // Provider-thread rows can be reused after recovery; retain the native input destination.
   nativeThreadId: Schema.optional(Schema.String),
+  // Running can include preparation; only pending starts are safe to queue again after Stop.
+  providerStartState: Schema.optional(Schema.Literals(["pending", "invoked"])),
   runId: RunId,
   attemptOrdinal: PositiveInt,
   rootNodeId: NodeId,
@@ -1729,6 +1733,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     type: Schema.Literal("run_interrupt_request"),
     message: Schema.String,
     holdQueue: Schema.optionalKey(Schema.Boolean),
+    queueHoldGeneration: Schema.optionalKey(NonNegativeInt),
     /** Set when the provider did not confirm the stop in time; clients then offer Force stop. */
     unresponsiveAt: Schema.optionalKey(Schema.DateTimeUtc),
   }),
@@ -2248,6 +2253,13 @@ export const OrchestrationV2ShellStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("synchronized"),
   }),
+  /**
+   * The only item of a resume the server cannot replay when the client asked for
+   * `httpSnapshotFallback`: load the HTTP snapshot and subscribe again from its cursor.
+   */
+  Schema.Struct({
+    kind: Schema.Literal("snapshot-required"),
+  }),
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
     snapshot: OrchestrationV2ShellSnapshot,
@@ -2561,6 +2573,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     type: Schema.Literal("run_interrupt_request"),
     message: Schema.String,
     holdQueue: Schema.optionalKey(Schema.Boolean),
+    queueHoldGeneration: Schema.optionalKey(NonNegativeInt),
     unresponsiveAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
   }),
   Schema.Struct({
@@ -3700,6 +3713,11 @@ export type OrchestrationV2GetThreadProjectionInput =
 
 export const OrchestrationV2SubscribeShellInput = Schema.Struct({
   afterSequence: Schema.optionalKey(NonNegativeInt),
+  /**
+   * With `afterSequence`, a gap the server cannot replay answers `snapshot-required` instead of
+   * a socket snapshot, which clients without transport compression download over gzip HTTP.
+   */
+  httpSnapshotFallback: Schema.optionalKey(Schema.Literal(true)),
   requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
   /**
    * Snapshots leave out idle subagent children; read them with `getThreadFamily`. Send only to

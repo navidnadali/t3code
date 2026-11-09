@@ -8375,9 +8375,26 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 ? runtime.prompt({ prompt: promptParts!.prompt }, promptOptions)
                 : Deferred.succeed(context.promptDispatched, undefined).pipe(
                     Effect.andThen(compactSession(runtime, requestedSessionId)),
-                    Effect.as({ stopReason: "end_turn" } satisfies EffectAcpSchema.PromptResponse),
+                    Effect.as<EffectAcpSchema.PromptResponse>({ stopReason: "end_turn" }),
                   )
             ).pipe(
+              Effect.provideService(
+                EffectAcpProtocol.AcpOutgoingSubmit,
+                turnInput.submit === undefined
+                  ? undefined
+                  : (enqueue) =>
+                      turnInput.submit!(enqueue).pipe(
+                        Effect.mapError(
+                          (cause) =>
+                            new EffectAcpErrors.AcpRequestError({
+                              code: -32800,
+                              operation: "enqueue-request",
+                              method: "session/prompt",
+                              errorMessage: cause.message,
+                            }),
+                        ),
+                      ),
+              ),
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
                   // Native compaction sends no prompt, so no instructions reached the agent.

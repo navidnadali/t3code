@@ -36,7 +36,7 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
-import type * as Effect from "effect/Effect";
+import * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
@@ -485,6 +485,8 @@ export interface ProviderAdapterV2EnsureThreadInput {
 }
 
 export interface ProviderAdapterV2TurnInput {
+  /** Atomically claim and enqueue restart input at native agent admission after adapter preparation. */
+  readonly submit?: (enqueue: () => void) => Effect.Effect<void, ProviderAdapterTurnStartError>;
   readonly appThread: OrchestrationV2AppThread;
   readonly threadId: ThreadId;
   readonly runId: RunId;
@@ -500,6 +502,25 @@ export interface ProviderAdapterV2TurnInput {
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
   readonly appContext?: ReadonlyArray<{ readonly key: string; readonly text: string }>;
 }
+
+export const startSubmissionFetch = Effect.fnUntraced(function* (
+  submit: NonNullable<ProviderAdapterV2TurnInput["submit"]>,
+  nativeFetch: typeof globalThis.fetch,
+) {
+  const run = Effect.runPromiseWith(yield* Effect.context<never>());
+  return ((request, init) => {
+    let response: Promise<Response> | undefined;
+    return run(
+      submit(() => {
+        response = nativeFetch(request, init);
+      }),
+    ).then(() => {
+      if (response === undefined)
+        throw new Error("Provider submission did not invoke its transport.");
+      return response;
+    });
+  }) satisfies typeof globalThis.fetch;
+});
 
 export interface ProviderAdapterV2SteerInput {
   /** If supplied, run after preparation immediately before submitting the input. */

@@ -6,7 +6,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
-import * as Data from "effect/Data";
+import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -2066,9 +2066,10 @@ export const layerCommandSpawner = Layer.effect(
 
 export const PROVIDER_SPAWNER_ENV = "T3CODE_PROVIDER_SPAWNER";
 
-class HandoffUnavailableError extends Data.TaggedError("HandoffUnavailableError")<{
-  readonly cause: Error;
-}> {}
+class HandoffUnavailableError extends Schema.TaggedError<HandoffUnavailableError>()(
+  "HandoffUnavailableError",
+  { cause: Schema.instanceOf(Error) },
+) {}
 
 interface HandoffView extends ChildView {
   readonly child: HandoffChild;

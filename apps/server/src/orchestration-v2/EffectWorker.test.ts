@@ -40,6 +40,21 @@ import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationServic
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
+// These admission fixtures model the regular pool. The reserved control worker
+// is exercised against the real outbox in FoundationPersistence.test.ts.
+const mockNormalOutbox = (input: Partial<EffectOutbox.EffectOutboxV2Shape>) =>
+  Layer.mock(EffectOutbox.EffectOutboxV2)({
+    awaitControlAvailable: () => Effect.never,
+    nextControlClaimableAt: () => Effect.succeedNone,
+    ...input,
+    ...(input.claimNext === undefined
+      ? {}
+      : {
+          claimNext: (options) =>
+            options.controlLane !== undefined ? Effect.succeedNone : input.claimNext!(options),
+        }),
+  });
+
 const threadId = ThreadId.make("thread:effect-worker-restart");
 const oldSessionId = ProviderSessionId.make("provider-session:effect-worker-restart:old");
 const providerThreadId = ProviderThreadId.make("provider-thread:effect-worker-restart");
@@ -165,6 +180,7 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
+        mockNormalOutbox({ recordSteerDelivery: () => Effect.void }),
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(
           input.continueAfterRestart === true ? { continueThreadsAfterServerUpdate: true } : {},
@@ -355,7 +371,7 @@ it.effect("requeues a claim when a pre-execution worker check fails", () =>
       }>
     >([]);
     const executionCount = yield* Ref.make(0);
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: () => Effect.succeedSome(claimedEffect),
       get: () =>
         Effect.fail(
@@ -421,7 +437,7 @@ it.effect("arms cancellation before the durable pre-execution check", () =>
     let cancellationArmed = false;
     const executionCount = yield* Ref.make(0);
     const settlementCount = yield* Ref.make(0);
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: () => Effect.succeedSome(claimedEffect),
       awaitCancellation: () => {
         cancellationArmed = true;
@@ -487,7 +503,7 @@ it.effect("terminalizes a process-bound claim when success settlement fails", ()
     const retries = yield* Ref.make(0);
     const terminalErrors = yield* Ref.make<ReadonlyArray<string>>([]);
     const executionCount = yield* Ref.make(0);
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: () => Effect.succeedSome(claimedEffect),
       get: () => Effect.succeedSome(claimedEffect),
       awaitCancellation: () => Effect.never,
@@ -710,7 +726,7 @@ it.effect("claims only ungated effects once the admission slots are taken", () =
     const exclusions = yield* Ref.make<ReadonlyArray<ReadonlyArray<string>>>([]);
     const started = yield* Ref.make<ReadonlyArray<string>>([]);
     const finishTurnStarts = yield* Deferred.make<void>();
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: ({ excludeEffectTypes = [] }) =>
         Ref.update(exclusions, (seen) => [...seen, excludeEffectTypes]).pipe(
           Effect.map(() => {
@@ -798,7 +814,7 @@ const saturatedDaemon = (options: {
     const claimable = (excludeEffectTypes: ReadonlyArray<string>) =>
       pending.filter((effect) => !excludeEffectTypes.includes(effect.request.type));
     const claims: Array<ReadonlyArray<string>> = [];
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: ({ excludeEffectTypes = [] }) =>
         Effect.sync(() => {
           claims.push(excludeEffectTypes);
@@ -944,7 +960,7 @@ it.effect("builds no gate for one worker, whose allowance a gate could not chang
     const finish = yield* Deferred.make<void>();
     const acquired = yield* Ref.make(0);
     const wakeUps = yield* Ref.make(0);
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: () => Effect.sync(() => Option.fromUndefinedOr(pending.shift())),
       nextClaimableAt: Effect.succeedNone,
       nextClaimableAtExcluding: () => Effect.succeedNone,
@@ -1012,7 +1028,7 @@ it.effect("an expired slot wakes an idle worker, which claims the turn start hel
     const available = yield* Queue.unbounded<void>();
     const started = yield* Queue.unbounded<string>();
     const finishFirst = yield* Deferred.make<void>();
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: ({ excludeEffectTypes = [] }) =>
         Effect.sync(() => {
           const next = pending.find((effect) => !excludeEffectTypes.includes(effect.request.type));
@@ -1101,7 +1117,7 @@ it.effect("requeues a claim whose timestamp cannot be parsed, as before", () =>
     };
     const retries = yield* Ref.make<ReadonlyArray<string>>([]);
     const executionCount = yield* Ref.make(0);
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: () => Effect.succeedSome(claimedEffect),
       get: () => Effect.succeedNone,
       retry: (input) =>
@@ -1132,7 +1148,7 @@ it.effect("requeues a claim whose timestamp cannot be parsed, as before", () =>
 it.effect("gives the admission slot back when the claim itself fails", () =>
   Effect.gen(function* () {
     const workerId = "worker-claim-failure";
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: () =>
         Effect.fail(
           new EffectOutbox.EffectOutboxError({
@@ -1185,7 +1201,7 @@ it.effect("a freed slot wakes one worker, which claims the next turn start", () 
     const available = yield* Queue.unbounded<void>();
     const started = yield* Queue.unbounded<string>();
     const finishFirst = yield* Deferred.make<void>();
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: ({ excludeEffectTypes = [] }) =>
         Effect.sync(() => {
           const next = pending.find((effect) => !excludeEffectTypes.includes(effect.request.type));
@@ -1267,7 +1283,7 @@ it.effect("an empty claim gives its slot back without waking a worker", () =>
     const available = yield* Queue.unbounded<void>();
     const claims = yield* Ref.make(0);
     const wakeUps = yield* Ref.make(0);
-    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+    const layerOutbox = mockNormalOutbox({
       claimNext: () => Ref.update(claims, (count) => count + 1).pipe(Effect.as(Option.none())),
       nextClaimableAt: Effect.succeedNone,
       nextClaimableAtExcluding: () => Effect.succeedNone,
@@ -1326,7 +1342,7 @@ it.effect(
         }),
       ];
       const freed = yield* Ref.make(0);
-      const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      const layerOutbox = mockNormalOutbox({
         claimNext: () => Effect.sync(() => Option.fromUndefinedOr(pending.shift())),
         get: () => Effect.succeedNone,
         awaitCancellation: () => Effect.never,

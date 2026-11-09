@@ -3,7 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 
 describe("queued run delivery order", () => {
-  it("keeps automatic completion delivery ahead of visible queued messages", () => {
+  it("does not let automatic completions overtake already queued messages", () => {
     const projection = {
       messages: [
         { id: "message:visible-first" },
@@ -43,9 +43,9 @@ describe("queued run delivery order", () => {
     } as never;
 
     expect(queuedRunsInDeliveryOrder(projection).map((run) => run.id)).toEqual([
-      "run:automatic",
       "run:visible-first",
       "run:visible-second",
+      "run:automatic",
     ]);
   });
 });

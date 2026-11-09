@@ -9,20 +9,6 @@ import * as DatabaseMaintenance from "../persistence/DatabaseMaintenance.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 import * as CliService from "./service.ts";
 
-const compactionSkippedLine = (
-  skipped:
-    | {
-        readonly scratchPath: string;
-        readonly requiredBytes: number;
-        readonly freeBytes: number;
-        readonly stage: "before" | "during";
-      }
-    | undefined,
-) =>
-  skipped === undefined
-    ? ""
-    : `\nCompaction of history was ${skipped.stage === "before" ? "skipped" : "stopped early"}: not enough free space beside the database for its working set (${skipped.scratchPath} needs ${formatBytes(skipped.requiredBytes)}, ${formatBytes(skipped.freeBytes)} free).`;
-
 const formatBytes = (bytes: number) =>
   bytes >= 1024 ** 3
     ? `${(bytes / 1024 ** 3).toFixed(2)} GiB`
@@ -117,23 +103,19 @@ export const runDoctor = Effect.fn("runDoctor")(function* (
     yield* Console.log("\nReclaiming database space. This can take several minutes...");
     // Report the repair before restarting, which can fail independently.
     yield* service.withStopped(
-      maintenance.compact(databasePath).pipe(
-        Effect.tap((result) =>
-          Console.log(
-            `Done: ${formatBytes(result.beforeBytes)} -> ${formatBytes(result.afterBytes)}, ${result.deletedEventCount} superseded events removed${
-              result.repairedItemCountThreads > 0
-                ? `, item counts recounted on ${result.repairedItemCountThreads} threads`
-                : ""
-            }.${compactionSkippedLine(result.skipped)}`,
+      maintenance
+        .compact(databasePath)
+        .pipe(
+          Effect.tap((result) =>
+            Console.log(
+              `Done: ${formatBytes(result.beforeBytes)} -> ${formatBytes(result.afterBytes)}, ${result.deletedEventCount} superseded events removed${
+                result.repairedItemCountThreads > 0
+                  ? `, item counts recounted on ${result.repairedItemCountThreads} threads`
+                  : ""
+              }.`,
+            ),
           ),
         ),
-        // A VACUUM on a full disk fails after the compaction; what the compaction found is still said.
-        Effect.tapError((error) =>
-          error._tag === "DatabaseCompactError" && error.compaction?.skipped !== undefined
-            ? Console.log(compactionSkippedLine(error.compaction.skipped).trimStart())
-            : Effect.void,
-        ),
-      ),
     );
   }
   if (selected.includes("legacy")) {

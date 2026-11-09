@@ -87,7 +87,7 @@ import {
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import { OPENCODE_PROVIDER, openCodePermissionRequestKind } from "../adapter.ts";
-import { openCodeToolTurnItem } from "../toolItems.ts";
+import { openCodeCommandFailed, openCodeToolTurnItem } from "../toolItems.ts";
 
 const OpenCode2ProviderCapabilities = {
   sessions: {
@@ -227,6 +227,7 @@ interface ActiveTurn {
       }
     | undefined;
   interrupted: boolean;
+  stopGeneration: number;
   unsent: boolean;
   readonly steers: Set<string>;
   readonly settledInbox: Set<string>;
@@ -545,6 +546,7 @@ const ACTIVE_CHECK_TIMEOUT = "5 seconds";
 const CLEAR_PROMPT_REJECTIONS: ReadonlySet<string> = new Set([
   "InvalidRequestError",
   "ConflictError",
+  "SessionNotFoundError",
   "UnauthorizedError",
   "CommandNotFoundError",
   "SkillNotFoundError",
@@ -627,7 +629,7 @@ const agentFor = (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
   input.runtimePolicy.interactionMode === "plan" ? "plan" : "build";
 
 const commandOf = (text: string) => {
-  const match = /^\/([^\s/]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
+  const match = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(text.trim());
   return match === null ? undefined : { name: match[1]!, text: match[2] ?? "" };
 };
 
@@ -996,7 +998,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       turn: ActiveTurn,
       id: string,
       status: "running" | "completed" | "failed" | "interrupted",
-      result?: { readonly output: string | undefined; readonly metadata: unknown },
+      result?: {
+        readonly output: string | undefined;
+        readonly metadata: unknown;
+        readonly files?: ReadonlyArray<{ readonly uri: string; readonly mime: string }>;
+      },
     ) {
       const tool = turn.tools.get(id);
       if (tool === undefined) return;
@@ -1004,16 +1010,21 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const startedAt = turn.startedAt.get(id) ?? updatedAt;
       const completedAt = status === "running" ? null : updatedAt;
       const nativeId = `${turn.scope}${id}`;
-      yield* emitNode(state, turn, nativeId, "tool_call", status, startedAt, completedAt);
+      const settled =
+        status === "completed" && openCodeCommandFailed(tool.name, result?.metadata)
+          ? "failed"
+          : status;
+      yield* emitNode(state, turn, nativeId, "tool_call", settled, startedAt, completedAt);
       yield* emit({
         type: "turn_item.updated",
         driver,
         turnItem: openCodeToolTurnItem(
-          itemBase(state, turn, nativeId, status, startedAt, completedAt, updatedAt),
+          itemBase(state, turn, nativeId, settled, startedAt, completedAt, updatedAt),
           {
             name: tool.name,
             input: tool.input,
             output: result?.output,
+            files: result?.files,
             completedMetadata: status === "completed" ? result?.metadata : undefined,
           },
         ),
@@ -1149,6 +1160,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       compactions: 0,
       retry: undefined,
       interrupted: false,
+      stopGeneration: 0,
       unsent: false,
       steers: new Set(),
       settledInbox: new Set(),
@@ -1677,6 +1689,35 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       }
     });
 
+    // A typed missing-session reply proves the input was not admitted.
+    const forgetMissingSession = Effect.fn("OpenCode2Adapter.forgetMissingSession")(function* (
+      state: ThreadState,
+    ) {
+      if (threads.get(state.sessionId) !== state) return;
+      yield* finishTurn(
+        state,
+        {
+          status: "failed",
+          failure: makeProviderFailure({
+            message:
+              "The OpenCode session no longer exists. The next message will use a new session.",
+            class: "provider_error",
+          }),
+        },
+        "broken",
+      );
+      // A terminal event can precede the 404; the manager must still forget its loaded binding.
+      if (state.providerThread.status !== "error") {
+        state.providerThread = {
+          ...state.providerThread,
+          status: "error",
+          updatedAt: yield* DateTime.now,
+        };
+        yield* emitProviderThread(state);
+      }
+      if (threads.get(state.sessionId) === state) threads.delete(state.sessionId);
+    });
+
     // OpenCode waits forever on unanswered requests; stop that run and keep its end from settling the next.
     const abandonRequest = Effect.fnUntraced(function* (state: ThreadState, reason: string) {
       yield* Effect.logWarning("Could not answer an OpenCode request; ending its turn.", {
@@ -1879,13 +1920,14 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         native,
       });
       yield* emit({ type: "node.updated", driver, node });
+      yield* emit({ type: "turn_item.updated", driver, turnItem: item });
+      // A response can commit as soon as the actionable request is published.
       yield* emit({
         type: "runtime_request.updated",
         driver,
         threadId: turn.input.threadId,
         runtimeRequest: request,
       });
-      yield* emit({ type: "turn_item.updated", driver, turnItem: item });
       yield* setSessionStatus("waiting", null);
     });
 
@@ -2093,6 +2135,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const output = textOf(event.data.content);
           yield* emitTool(state, turn, event.data.id, "completed", {
             output,
+            files: event.data.content.flatMap((part) => (part.type === "file" ? [part] : [])),
             metadata: event.data.metadata,
           });
           turn.tools.delete(event.data.id);
@@ -2551,6 +2594,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           if (part.state.status === "completed") {
             yield* emitTool(state, turn, part.id, "completed", {
               output: textOf(part.state.content),
+              files: part.state.content.flatMap((content) =>
+                content.type === "file" ? [content] : [],
+              ),
               metadata: part.state.metadata,
             });
             turn.tools.delete(part.id);
@@ -3666,19 +3712,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           yield* submit(sessionId, turnInput, state, turn).pipe(
             // Forget externally deleted sessions so the next turn recreates them with handoff.
             Effect.catchTags({
-              SessionNotFoundError: () =>
-                finishTurn(
-                  state,
-                  {
-                    status: "failed",
-                    failure: makeProviderFailure({
-                      message:
-                        "The OpenCode session no longer exists. Send the message again to continue in a new session.",
-                      class: "provider_error",
-                    }),
-                  },
-                  "broken",
-                ).pipe(Effect.andThen(Effect.sync(() => threads.delete(sessionId)))),
+              SessionNotFoundError: () => forgetMissingSession(state),
             }),
             Effect.tapError((cause) =>
               state.active === turn
@@ -3719,11 +3753,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             turn.providerTurn.id !== steerInput.providerTurnId ||
             turn.interrupted
           ) {
-            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
               driver: OPENCODE_PROVIDER,
-              detail: `OpenCode turn ${steerInput.providerTurnId} is not active`,
+              providerThreadId: steerInput.providerThread.id,
+              providerTurnId: steerInput.providerTurnId,
+              deliveryNotSent: true,
+              cause: `OpenCode turn ${steerInput.providerTurnId} is not active`,
             });
           }
+          const stopGeneration = turn.stopGeneration;
           const inboxID = steerPromptId(sessionId, steerInput.message.messageId);
           if (turn.settledInbox.has(inboxID)) return;
           turn.steers.add(inboxID);
@@ -3748,7 +3786,21 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               ),
             ),
           );
-          if (state.active !== turn || turn.interrupted) {
+          if (steerInput.beforeSubmit !== undefined)
+            yield* steerInput.beforeSubmit.pipe(
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit)
+                  ? lock.withPermit(
+                      Effect.gen(function* () {
+                        turn.steers.delete(inboxID);
+                        state.strandedSteers.delete(inboxID);
+                        if (state.active === turn) yield* endIfSettled(state, turn);
+                      }),
+                    )
+                  : Effect.void,
+              ),
+            );
+          if (state.active !== turn || turn.interrupted || turn.stopGeneration !== stopGeneration) {
             yield* lock.withPermit(
               Effect.gen(function* () {
                 turn.steers.delete(inboxID);
@@ -3762,9 +3814,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 }
               }),
             );
-            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
               driver: OPENCODE_PROVIDER,
-              detail: `OpenCode turn ${steerInput.providerTurnId} is not active`,
+              providerThreadId: steerInput.providerThread.id,
+              providerTurnId: steerInput.providerTurnId,
+              deliveryNotSent: true,
+              cause: `OpenCode turn ${steerInput.providerTurnId} is not active`,
             });
           }
           yield* client.session
@@ -3780,10 +3835,27 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 lock.withPermit(
                   Effect.gen(function* () {
                     turn.steers.delete(inboxID);
-                    if (!CLEAR_PROMPT_REJECTIONS.has(cause._tag)) state.strandedSteers.add(inboxID);
-                    if (state.active === turn) yield* endIfSettled(state, turn);
+                    if (CLEAR_PROMPT_REJECTIONS.has(cause._tag))
+                      state.strandedSteers.delete(inboxID);
+                    else state.strandedSteers.add(inboxID);
+                    if (cause._tag === "SessionNotFoundError") yield* forgetMissingSession(state);
+                    else if (state.active === turn) yield* endIfSettled(state, turn);
                   }),
                 ),
+              ),
+              Effect.mapError((cause) =>
+                CLEAR_PROMPT_REJECTIONS.has(cause._tag)
+                  ? new ProviderAdapter.ProviderAdapterSteerRunError({
+                      driver: OPENCODE_PROVIDER,
+                      providerThreadId: steerInput.providerThread.id,
+                      providerTurnId: steerInput.providerTurnId,
+                      deliveryNotSent: true,
+                      ...(cause._tag === "SessionNotFoundError"
+                        ? { threadDisposition: "broken" as const }
+                        : {}),
+                      cause,
+                    })
+                  : cause,
               ),
             );
         },
@@ -3807,6 +3879,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const state = threads.get(sessionId);
           if (state === undefined) return;
           const turn = state.active;
+          // A failed Stop still invalidates input already being prepared.
+          if (turn?.providerTurn.id === interruptInput.providerTurnId) turn.stopGeneration += 1;
           // User Stop must end background children and their report execution; steering leaves them running.
           if (interruptInput.requestRuntimeRestart === true) yield* stopBackground(state);
           if (turn === undefined || turn.providerTurn.id !== interruptInput.providerTurnId) {

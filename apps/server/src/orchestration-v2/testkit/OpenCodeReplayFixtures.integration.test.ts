@@ -1,8 +1,12 @@
-import { describe, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import type { ProviderReplayEntry } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
-import { OpenCodeOrchestratorReplayHarness } from "../Adapters/OpenCodeAdapterV2.testkit.ts";
+import {
+  OpenCodeOrchestratorReplayHarness,
+  OpenCodeReplayController,
+} from "../Adapters/OpenCodeAdapterV2.testkit.ts";
+import { makeProviderReplayGate } from "@t3tools/provider-testing/replayGate";
 import {
   OPENCODE2_HTTP_PROTOCOL,
   OpenCode2OrchestratorReplayHarness,
@@ -28,6 +32,28 @@ function runOpenCodeReplayFixture(input: ReplayFixtureCase) {
 
 describe("OpenCode replay fixtures", () => {
   itRunsReplayFixtures("opencode", runOpenCodeReplayFixture);
+
+  it.each([false, true])("owns each concurrent replay response once, gated=%s", async (gated) => {
+    const gate = makeProviderReplayGate(["first", "second"]);
+    const controller = new OpenCodeReplayController({
+      provider: OpenCodeOrchestratorReplayHarness.driver,
+      protocol: OPENCODE2_HTTP_PROTOCOL,
+      version: "2.0.18",
+      scenario: "concurrent_responses",
+      entries: ["first", "second"].map((label) => ({
+        type: "emit_inbound",
+        label,
+        frame: { type: "sdk.response", operation: "session.get", data: label },
+      })),
+    });
+    const replies = [
+      controller.response("session.get", gated ? gate.beforeEmit : undefined),
+      controller.response("session.get", gated ? gate.beforeEmit : undefined),
+    ];
+    gate.releaseAll();
+    assert.deepEqual(await Promise.all(replies), ["first", "second"]);
+    controller.assertComplete();
+  });
 
   it.effect.each(
     (

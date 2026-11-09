@@ -335,6 +335,27 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       (session) => session.backgroundTasks("toolu-1"),
       { subtype: "background_tasks", tool_use_id: "toolu-1" },
     ],
+    ["mcpServerStatus", (session) => session.mcpServerStatus, { subtype: "mcp_status" }],
+    [
+      "readMcpResource",
+      (session) => session.readMcpResource({ server: "fixture", uri: "test://resource" }),
+      { subtype: "mcp_read_resource", serverName: "fixture", uri: "test://resource" },
+    ],
+    [
+      "controlRequest",
+      (session) => session.callMcpTool({ tool: "mcp__fixture__test", arguments: { value: 1 } }),
+      {
+        subtype: "mcp_call",
+        tool: "mcp__fixture__test",
+        arguments: { value: 1 },
+        result_not_for_model: true,
+      },
+    ],
+    [
+      "controlRequest",
+      (session) => session.listPermissionRules,
+      { subtype: "list_permission_rules" },
+    ],
     ["interrupt", (session) => session.interrupt, { subtype: "interrupt" }],
   ];
 
@@ -360,8 +381,20 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     "relays %s to the worker's query and back",
     ([method, act, request]) =>
       Effect.gen(function* () {
-        const inThread = yield* runControl("thread", act);
-        const inWorker = yield* runControl("worker", act);
+        const options: FakeClaudeCliOptions = {
+          control: (request) =>
+            request.subtype === "mcp_status"
+              ? { response: { mcpServers: [] } }
+              : request.subtype === "mcp_read_resource"
+                ? { response: { contents: [{ uri: "test://resource", text: "fixture" }] } }
+                : request.subtype === "list_permission_rules"
+                  ? { response: { state: { rules: [] } } }
+                  : request.subtype === "mcp_call"
+                    ? { response: { content: [{ type: "text", text: "tool result" }] } }
+                    : undefined,
+        };
+        const inThread = yield* runControl("thread", act, options);
+        const inWorker = yield* runControl("worker", act, options);
 
         assert.include(inWorker.recorded.requests, method);
         assert.deepStrictEqual(inWorker.result, inThread.result);

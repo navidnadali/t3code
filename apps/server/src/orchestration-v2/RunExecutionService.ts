@@ -35,7 +35,6 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
-import * as Stream from "effect/Stream";
 
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
@@ -105,9 +104,6 @@ const NATIVE_SUBAGENT_TURN_ORIGIN: ProviderUsageAnalytics.ProviderTurnOrigin = {
   scheduled: false,
   subagent: true,
 };
-
-// Smaller takes mean the run keeps up; this keeps the backlog span off the per-event path.
-const PROVIDER_EVENT_BACKLOG_SPAN_MIN = 32;
 
 const backgroundCapableTurnItemTypes: ReadonlySet<OrchestrationV2TurnItem["type"]> = new Set([
   "command_execution",
@@ -614,7 +610,6 @@ export const layer: Layer.Layer<
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
-    const providerEventBatching = yield* ProviderEventIngestor.ProviderEventBatching;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const mcpAppModelContext = yield* McpAppModelContext.McpAppModelContext;
     const previewAgentActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
@@ -939,7 +934,6 @@ export const layer: Layer.Layer<
             input.appThread.lineage.sideChat === true
               ? Effect.void
               : checkpointService.captureBaseline({
-                  // Where the run works; its scope keeps the spelling it was first reached by.
                   scope: {
                     ...input.checkpointScope,
                     cwd: input.run.workspaceCwd ?? input.checkpointScope.cwd,
@@ -1126,38 +1120,26 @@ export const layer: Layer.Layer<
           }
           yield* Ref.set(rootRunFinalized, true);
         });
-        // The event's changes to the run's child and background tracking, applied after its write.
-        // Membership that would not change is left out, so a repeated running update tracks nothing.
-        const childLifecycleUpdates = (
+        // Runs for every provider event, including streamed text updates; avoid a per-event span.
+        const trackChildLifecycle = Effect.fnUntraced(function* (
           event: ProviderAdapter.ProviderAdapterV2Event,
           deliverable: boolean,
-          routing: ProviderEventRoutingState,
-          tracked: {
-            readonly childProviderTurns: ReadonlySet<ProviderTurnId>;
-            readonly backgroundTurnItems: ReadonlySet<OrchestrationV2TurnItem["id"]>;
-          },
-        ) => {
-          const updates: Array<Effect.Effect<void>> = [];
+        ) {
+          const routing = yield* Ref.get(eventRouting);
           if (event.type === "provider_turn.updated") {
             const isRoot =
               event.providerTurn.runAttemptId === input.attempt.id ||
               event.providerTurn.id === routing.rootProviderTurnId;
-            if (
-              !isRoot &&
-              isTerminalProviderTurnStatus(event.providerTurn.status) ===
-                tracked.childProviderTurns.has(event.providerTurn.id)
-            ) {
-              updates.push(
-                Ref.update(activeChildProviderTurns, (current) => {
-                  const next = new Set(current);
-                  if (isTerminalProviderTurnStatus(event.providerTurn.status)) {
-                    next.delete(event.providerTurn.id);
-                  } else {
-                    next.add(event.providerTurn.id);
-                  }
-                  return next;
-                }),
-              );
+            if (!isRoot) {
+              yield* Ref.update(activeChildProviderTurns, (current) => {
+                const next = new Set(current);
+                if (isTerminalProviderTurnStatus(event.providerTurn.status)) {
+                  next.delete(event.providerTurn.id);
+                } else {
+                  next.add(event.providerTurn.id);
+                }
+                return next;
+              });
             }
           }
           if (event.type === "subagent.updated") {
@@ -1166,17 +1148,15 @@ export const layer: Layer.Layer<
               event.subagent.threadId !== input.run.threadId &&
               routing.ownedThreadIds.has(event.subagent.threadId);
             if (belongsToRootRun || belongsToOwnedChildThread) {
-              updates.push(
-                Ref.update(activeChildSubagents, (current) => {
-                  const next = new Map(current);
-                  if (isSettledSubagentStatus(event.subagent.status)) {
-                    next.delete(event.subagent.id);
-                  } else {
-                    next.set(event.subagent.id, event.subagent.threadId);
-                  }
-                  return next;
-                }),
-              );
+              yield* Ref.update(activeChildSubagents, (current) => {
+                const next = new Map(current);
+                if (isSettledSubagentStatus(event.subagent.status)) {
+                  next.delete(event.subagent.id);
+                } else {
+                  next.set(event.subagent.id, event.subagent.threadId);
+                }
+                return next;
+              });
             }
             // Preserve childThreadId linkage for the root-run lifetime even after the subagent
             // row terminalizes, so open child-thread nodes can still be proven linked on a
@@ -1188,18 +1168,16 @@ export const layer: Layer.Layer<
                 event.subagent.runId === null &&
                 event.subagent.origin === "provider_native")
             ) {
-              updates.push(
-                Ref.update(openRunOwnedSubagents, (current) => {
-                  const withLink = withLinkedChildThreadId(current, event.subagent.childThreadId);
-                  const subagents = new Map(withLink.subagents);
-                  if (isSettledSubagentStatus(event.subagent.status)) {
-                    subagents.delete(event.subagent.id);
-                  } else {
-                    subagents.set(event.subagent.id, event.subagent);
-                  }
-                  return { ...withLink, subagents };
-                }),
-              );
+              yield* Ref.update(openRunOwnedSubagents, (current) => {
+                const withLink = withLinkedChildThreadId(current, event.subagent.childThreadId);
+                const subagents = new Map(withLink.subagents);
+                if (isSettledSubagentStatus(event.subagent.status)) {
+                  subagents.delete(event.subagent.id);
+                } else {
+                  subagents.set(event.subagent.id, event.subagent);
+                }
+                return { ...withLink, subagents };
+              });
             }
           }
           if (event.type === "node.updated") {
@@ -1215,19 +1193,17 @@ export const layer: Layer.Layer<
                 (event.node.runId === null || event.node.runId === input.run.id)
               )
             ) {
-              return updates;
+              return;
             }
-            updates.push(
-              Ref.update(openRunOwnedSubagents, (current) => {
-                const nodes = new Map(current.nodes);
-                if (isOpenExecutionNodeStatus(event.node.status)) {
-                  nodes.set(event.node.id, event.node);
-                } else {
-                  nodes.delete(event.node.id);
-                }
-                return { ...current, nodes };
-              }),
-            );
+            yield* Ref.update(openRunOwnedSubagents, (current) => {
+              const nodes = new Map(current.nodes);
+              if (isOpenExecutionNodeStatus(event.node.status)) {
+                nodes.set(event.node.id, event.node);
+              } else {
+                nodes.delete(event.node.id);
+              }
+              return { ...current, nodes };
+            });
           }
           if (event.type === "turn_item.updated") {
             const belongsToRootRun = event.turnItem.runId === input.run.id;
@@ -1240,57 +1216,48 @@ export const layer: Layer.Layer<
               inheritedBackgroundTurnItemsById.get(event.turnItem.id) === event.turnItem.runId;
             if (
               backgroundCapableTurnItemTypes.has(event.turnItem.type) &&
-              (belongsToRootRun || belongsToOwnedChildThread || belongsToInheritedBackgroundItem) &&
-              isSettledTurnItemStatus(event.turnItem.status) ===
-                tracked.backgroundTurnItems.has(event.turnItem.id)
+              (belongsToRootRun || belongsToOwnedChildThread || belongsToInheritedBackgroundItem)
             ) {
-              updates.push(
-                Ref.update(activeBackgroundTurnItems, (current) => {
-                  const next = new Set(current);
-                  if (isSettledTurnItemStatus(event.turnItem.status)) {
-                    next.delete(event.turnItem.id);
-                  } else {
-                    next.add(event.turnItem.id);
-                  }
-                  return next;
-                }),
-              );
+              yield* Ref.update(activeBackgroundTurnItems, (current) => {
+                const next = new Set(current);
+                if (isSettledTurnItemStatus(event.turnItem.status)) {
+                  next.delete(event.turnItem.id);
+                } else {
+                  next.add(event.turnItem.id);
+                }
+                return next;
+              });
             }
             if (
               belongsToOwnedChildThread &&
               (event.turnItem.runId === null || belongsToRootRun) &&
               deliverable
             ) {
-              updates.push(
-                Ref.update(openRunOwnedSubagents, (current) => {
-                  const childTurnItems = new Map(current.childTurnItems);
-                  if (isSettledTurnItemStatus(event.turnItem.status)) {
-                    childTurnItems.delete(event.turnItem.id);
-                  } else {
-                    childTurnItems.set(event.turnItem.id, event.turnItem);
-                  }
-                  return { ...current, childTurnItems };
-                }),
-              );
+              yield* Ref.update(openRunOwnedSubagents, (current) => {
+                const childTurnItems = new Map(current.childTurnItems);
+                if (isSettledTurnItemStatus(event.turnItem.status)) {
+                  childTurnItems.delete(event.turnItem.id);
+                } else {
+                  childTurnItems.set(event.turnItem.id, event.turnItem);
+                }
+                return { ...current, childTurnItems };
+              });
             }
             if (belongsToRootRun && event.turnItem.type === "subagent") {
               const subagentItem = event.turnItem;
-              updates.push(
-                Ref.update(openRunOwnedSubagents, (current) => {
-                  const withLink = withLinkedChildThreadId(current, subagentItem.childThreadId);
-                  const turnItems = new Map(withLink.turnItems);
-                  if (isSettledTurnItemStatus(subagentItem.status)) {
-                    turnItems.delete(subagentItem.subagentId);
-                  } else {
-                    turnItems.set(subagentItem.subagentId, subagentItem);
-                  }
-                  return { ...withLink, turnItems };
-                }),
-              );
+              yield* Ref.update(openRunOwnedSubagents, (current) => {
+                const withLink = withLinkedChildThreadId(current, subagentItem.childThreadId);
+                const turnItems = new Map(withLink.turnItems);
+                if (isSettledTurnItemStatus(subagentItem.status)) {
+                  turnItems.delete(subagentItem.subagentId);
+                } else {
+                  turnItems.set(subagentItem.subagentId, subagentItem);
+                }
+                return { ...withLink, turnItems };
+              });
             }
           }
-          return updates;
-        };
+        });
         const agentTurnsSettled = Effect.gen(function* () {
           if (!(yield* Ref.get(rootTerminalSeen))) {
             return false;
@@ -1357,429 +1324,350 @@ export const layer: Layer.Layer<
         // Ends once the root turn and the children it drives settle. Background commands such
         // as a dev server keep this consumer alive afterwards and must not pin preview focus.
         const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
-        // Events that writing can defer until the end of what was queued, up to the batch limits;
-        // they are written before anything that reads or orders against them.
-        const deferredIngest: Array<ProviderEventIngestor.ProviderEventIngestInput> = [];
-        let deferredBytes = 0;
-        const flushDeferredIngest = Effect.suspend(() => {
-          deferredBytes = 0;
-          const events = deferredIngest.splice(0);
-          return events.length === 0
-            ? Effect.void
-            : events.length === 1
-              ? providerEventIngestor.ingestNormalized(events[0]!).pipe(Effect.asVoid)
-              : providerEventIngestor.ingestNormalizedBatch({ events }).pipe(Effect.asVoid);
-        });
-        const providerEventFiber = yield* eventSubscription.events.pipe(
-          Stream.chunks,
-          // A take holds everything that was queued for this run, so its size is the backlog.
-          Stream.tap((events) =>
-            events.length < PROVIDER_EVENT_BACKLOG_SPAN_MIN
-              ? Effect.void
-              : Effect.void.pipe(
-                  Effect.withSpan("RunExecutionService.providerEventBacklog", {
-                    attributes: {
-                      "orchestration_v2.run_id": input.run.id,
-                      "orchestration_v2.ingest.queued": events.length,
-                    },
-                  }),
+        // Per-event routing and lifecycle bookkeeping share the run's tracing boundary.
+        const routeEvent = Effect.fnUntraced(function* (
+          event: ProviderAdapter.ProviderAdapterV2Event,
+        ) {
+          const previous = yield* Ref.get(eventRouting);
+          const [accepted, routing] = routeProviderEvent(event, routeIdentity, previous);
+          yield* Ref.set(eventRouting, routing);
+          if (
+            event.type === "subagent.updated" &&
+            event.subagent.childThreadId !== null &&
+            previous.ownedThreadIds.has(event.subagent.childThreadId) &&
+            !routing.ownedThreadIds.has(event.subagent.childThreadId)
+          ) {
+            const moved = event.subagent;
+            const detached = yield* Ref.modify(openRunOwnedSubagents, (current) => {
+              const subagentIds = new Set([moved.id]);
+              for (const subagent of current.subagents.values()) {
+                if (subagent.threadId === moved.childThreadId) subagentIds.add(subagent.id);
+              }
+              const childTurnItems = new Map(
+                [...current.childTurnItems].filter(
+                  ([, item]) => item.threadId !== moved.childThreadId,
                 ),
-          ),
-          Stream.flatMap((events) =>
-            Stream.fromIterable(
-              events.map((event, index) => ({ event, lastQueued: index === events.length - 1 })),
-            ),
-          ),
-          Stream.mapEffect(({ event, lastQueued }) =>
-            Effect.gen(function* () {
-              const previous = yield* Ref.get(eventRouting);
-              const [accepted, routing] = routeProviderEvent(event, routeIdentity, previous);
-              // Deferred writes must commit before state that failure cleanup reads moves past them.
-              if (
-                !ProviderEventIngestor.canIngestInBatch(event) ||
-                routing.rootProviderTurnId !== previous.rootProviderTurnId ||
-                routing.rootTurnEnded !== previous.rootTurnEnded
-              ) {
-                yield* flushDeferredIngest;
-              }
-              yield* Ref.set(eventRouting, routing);
-              if (
-                event.type === "subagent.updated" &&
-                event.subagent.childThreadId !== null &&
-                previous.ownedThreadIds.has(event.subagent.childThreadId) &&
-                !routing.ownedThreadIds.has(event.subagent.childThreadId)
-              ) {
-                const moved = event.subagent;
-                const detached = yield* Ref.modify(openRunOwnedSubagents, (current) => {
-                  const subagentIds = new Set([moved.id]);
-                  for (const subagent of current.subagents.values()) {
-                    if (subagent.threadId === moved.childThreadId) subagentIds.add(subagent.id);
-                  }
-                  const childTurnItems = new Map(
-                    [...current.childTurnItems].filter(
-                      ([, item]) => item.threadId !== moved.childThreadId,
-                    ),
-                  );
-                  const turnItems = new Map(current.turnItems);
-                  turnItems.delete(moved.id);
-                  const detachedItems = new Set(
-                    [...current.childTurnItems.values(), ...current.turnItems.values()]
-                      .filter(
-                        (item) => item.threadId === moved.childThreadId || item.nodeId === moved.id,
-                      )
-                      .map((item) => item.id),
-                  );
-                  return [
-                    { itemIds: detachedItems, subagentIds },
-                    {
-                      subagents: new Map(
-                        [...current.subagents].filter(([id]) => !subagentIds.has(id)),
-                      ),
-                      turnItems,
-                      childTurnItems,
-                      nodes: new Map(
-                        [...current.nodes].filter(
-                          ([id, node]) => id !== moved.id && node.threadId !== moved.childThreadId,
-                        ),
-                      ),
-                      linkedChildThreadIds: new Set(
-                        [...current.linkedChildThreadIds].filter(
-                          (id) => id !== moved.childThreadId,
-                        ),
-                      ),
-                    },
-                  ];
-                });
-                yield* Ref.update(
-                  activeChildSubagents,
-                  (current) =>
-                    new Map(
-                      [...current].filter(
-                        ([id, threadId]) =>
-                          !detached.subagentIds.has(id) && threadId !== moved.childThreadId,
-                      ),
-                    ),
-                );
-                yield* Ref.update(
-                  activeChildProviderTurns,
-                  (current) =>
-                    new Set([...current].filter((id) => routing.ownedProviderTurns.has(id))),
-                );
-                for (const id of pendingBackgroundProviderTurns) {
-                  if (!routing.ownedProviderTurns.has(id)) {
-                    pendingBackgroundProviderTurns.delete(id);
-                  }
-                }
-                yield* Ref.update(
-                  activeBackgroundTurnItems,
-                  (current) => new Set([...current].filter((id) => !detached.itemIds.has(id))),
-                );
-              }
-              return { event, accepted, lastQueued };
-            }),
-          ),
-          Stream.tap(({ event, accepted, lastQueued }) =>
-            Effect.gen(function* () {
-              if (!accepted) {
-                if (lastQueued) yield* flushDeferredIngest;
-                return;
-              }
-              if (
-                event.type === "provider_turn.updated" &&
-                event.providerTurn.runAttemptId === input.attempt.id &&
-                event.providerTurn.providerThreadId === input.providerThread.id
-              ) {
-                yield* Ref.set(latestRootProviderTurn, event.providerTurn);
-              }
-              let storedEventCount = 0;
-              const deliveredEvent = filterAssistantEvent(
-                event,
-                DateTime.toEpochMillis(yield* DateTime.now),
               );
-              const lifecycleUpdates = childLifecycleUpdates(
-                event,
-                deliveredEvent !== null,
-                yield* Ref.get(eventRouting),
+              const turnItems = new Map(current.turnItems);
+              turnItems.delete(moved.id);
+              const detachedItems = new Set(
+                [...current.childTurnItems.values(), ...current.turnItems.values()]
+                  .filter(
+                    (item) => item.threadId === moved.childThreadId || item.nodeId === moved.id,
+                  )
+                  .map((item) => item.id),
+              );
+              return [
+                { itemIds: detachedItems, subagentIds },
                 {
-                  childProviderTurns: yield* Ref.get(activeChildProviderTurns),
-                  backgroundTurnItems: yield* Ref.get(activeBackgroundTurnItems),
+                  subagents: new Map([...current.subagents].filter(([id]) => !subagentIds.has(id))),
+                  turnItems,
+                  childTurnItems,
+                  nodes: new Map(
+                    [...current.nodes].filter(
+                      ([id, node]) => id !== moved.id && node.threadId !== moved.childThreadId,
+                    ),
+                  ),
+                  linkedChildThreadIds: new Set(
+                    [...current.linkedChildThreadIds].filter((id) => id !== moved.childThreadId),
+                  ),
                 },
-              );
-              if (deliveredEvent) {
-                const rootTerminalAlreadySeen = yield* Ref.get(rootTerminalSeen);
-                const isRootProviderThreadUpdate =
-                  event.type === "provider_thread.updated" &&
-                  event.providerThread.id === input.providerThread.id;
-                const nativeChildTurn =
-                  event.type === "provider_turn.updated" &&
-                  event.providerTurn.providerThreadId !== input.providerThread.id;
-                if (event.type === "provider_turn.updated" && !nativeChildTurn) {
-                  firstRootProviderTurnId ??= event.providerTurn.id;
-                }
-                const ingestInput: ProviderEventIngestor.ProviderEventIngestInput = {
-                  analyticsContext: nativeChildTurn
-                    ? {
-                        ...analyticsContext,
-                        origin: NATIVE_SUBAGENT_TURN_ORIGIN,
-                        segment: "native_child",
-                      }
-                    : {
-                        ...analyticsContext,
-                        segment:
-                          event.type === "provider_turn.updated" &&
-                          event.providerTurn.id !== firstRootProviderTurnId
-                            ? "continuation"
-                            : input.attempt.reason,
-                      },
-                  providerSessionId: input.providerSessionId,
-                  providerInstanceId: input.run.providerInstanceId,
-                  threadId: input.run.threadId,
-                  runId: input.run.id,
-                  nodeId: input.rootNode.id,
-                  event: deliveredEvent,
-                  ...(isRootProviderThreadUpdate
-                    ? rootTerminalAlreadySeen
-                      ? {
-                          writeIfProviderThreadOwner: {
-                            providerThreadId: input.providerThread.id,
-                            runId: input.run.id,
-                            activeAttemptId: input.attempt.id,
-                            expectedLastRunOrdinal: input.run.ordinal,
-                          },
-                        }
-                      : {
-                          writeIfRunCurrent: {
-                            runId: input.run.id,
-                            activeAttemptId: input.attempt.id,
-                            expectedStatus: "running" as const,
-                          },
-                        }
-                    : {}),
-                };
-                // An event that changes child or background tracking is written first, so that
-                // tracking only ever reflects committed events.
-                if (
-                  providerEventBatching.maxEvents > 1 &&
-                  lifecycleUpdates.length === 0 &&
-                  ProviderEventIngestor.canIngestInBatch(deliveredEvent)
-                ) {
-                  deferredIngest.push(ingestInput);
-                  // @effect-diagnostics-next-line preferSchemaOverJson:off - a size estimate for the budget, not a codec.
-                  deferredBytes += JSON.stringify(deliveredEvent).length;
-                  if (
-                    deferredIngest.length >= providerEventBatching.maxEvents ||
-                    deferredBytes >= providerEventBatching.maxBytes
-                  ) {
-                    yield* flushDeferredIngest;
+              ];
+            });
+            yield* Ref.update(
+              activeChildSubagents,
+              (current) =>
+                new Map(
+                  [...current].filter(
+                    ([id, threadId]) =>
+                      !detached.subagentIds.has(id) && threadId !== moved.childThreadId,
+                  ),
+                ),
+            );
+            yield* Ref.update(
+              activeChildProviderTurns,
+              (current) => new Set([...current].filter((id) => routing.ownedProviderTurns.has(id))),
+            );
+            for (const id of pendingBackgroundProviderTurns) {
+              if (!routing.ownedProviderTurns.has(id)) {
+                pendingBackgroundProviderTurns.delete(id);
+              }
+            }
+            yield* Ref.update(
+              activeBackgroundTurnItems,
+              (current) => new Set([...current].filter((id) => !detached.itemIds.has(id))),
+            );
+          }
+          return { event, accepted };
+        });
+        const ingestEvent = Effect.fnUntraced(function* ({
+          event,
+          accepted,
+        }: {
+          event: ProviderAdapter.ProviderAdapterV2Event;
+          accepted: boolean;
+        }) {
+          if (!accepted) return;
+          if (
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.runAttemptId === input.attempt.id &&
+            event.providerTurn.providerThreadId === input.providerThread.id
+          ) {
+            yield* Ref.set(latestRootProviderTurn, event.providerTurn);
+          }
+          let storedEventCount = 0;
+          const deliveredEvent = filterAssistantEvent(
+            event,
+            DateTime.toEpochMillis(yield* DateTime.now),
+          );
+          if (deliveredEvent) {
+            const rootTerminalAlreadySeen = yield* Ref.get(rootTerminalSeen);
+            const isRootProviderThreadUpdate =
+              event.type === "provider_thread.updated" &&
+              event.providerThread.id === input.providerThread.id;
+            const nativeChildTurn =
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.providerThreadId !== input.providerThread.id;
+            if (event.type === "provider_turn.updated" && !nativeChildTurn) {
+              firstRootProviderTurnId ??= event.providerTurn.id;
+            }
+            const storedEvents = yield* providerEventIngestor.ingestNormalized({
+              analyticsContext: nativeChildTurn
+                ? {
+                    ...analyticsContext,
+                    origin: NATIVE_SUBAGENT_TURN_ORIGIN,
+                    segment: "native_child",
                   }
-                } else {
-                  yield* flushDeferredIngest;
-                  storedEventCount = (yield* providerEventIngestor.ingestNormalized(ingestInput))
-                    .length;
-                }
-                if (
-                  isRootProviderThreadUpdate &&
-                  rootTerminalAlreadySeen &&
-                  storedEventCount === 0
-                ) {
-                  yield* Ref.set(providerThreadOwnerLost, true);
-                }
-              } else if (
-                event.type === "turn_item.updated" &&
-                (event.turnItem.type === "assistant_message" ||
-                  event.turnItem.type === "reasoning") &&
-                event.turnItem.streaming &&
-                !reservedHeldTurnItemIds.has(event.turnItem.id)
-              ) {
-                yield* flushDeferredIngest;
-                yield* turnItemPositions.allocate({
-                  threadId: event.turnItem.threadId,
-                  turnItemId: event.turnItem.id,
-                  runId: event.turnItem.runId,
-                });
-                reservedHeldTurnItemIds.add(event.turnItem.id);
-              }
-              if (event.type === "provider_thread.updated") {
-                if (event.providerThread.id === input.providerThread.id && storedEventCount > 0) {
-                  yield* Ref.set(latestProviderThread, event.providerThread);
-                }
-              }
-              if (
-                event.type === "turn_item.updated" &&
-                event.turnItem.providerTurnId === (yield* Ref.get(eventRouting)).rootProviderTurnId
-              ) {
-                yield* Ref.update(latestTurnItemOrdinal, (current) =>
-                  Math.max(current, event.turnItem.ordinal),
-                );
-              }
-              if (event.type === "turn.terminal") {
-                yield* flushDeferredIngest;
-                yield* Ref.set(terminalEvent, event);
-                yield* Ref.set(rootTerminalSeen, true);
-                yield* finalizeRootRun(event);
-              }
-              if (event.type === "background_work.updated") {
-                if (event.pending) {
-                  pendingBackgroundProviderTurns.add(event.providerTurnId);
-                } else {
-                  pendingBackgroundProviderTurns.delete(event.providerTurnId);
-                }
-              }
-              yield* Effect.all(lifecycleUpdates, { discard: true });
-              if (lastQueued) yield* flushDeferredIngest;
-            }),
-          ),
-          // Also after events this run does not accept, such as a child handed to another run.
-          Stream.tap(() =>
+                : {
+                    ...analyticsContext,
+                    segment:
+                      event.type === "provider_turn.updated" &&
+                      event.providerTurn.id !== firstRootProviderTurnId
+                        ? "continuation"
+                        : input.attempt.reason,
+                  },
+              providerSessionId: input.providerSessionId,
+              providerInstanceId: input.run.providerInstanceId,
+              threadId: input.run.threadId,
+              runId: input.run.id,
+              nodeId: input.rootNode.id,
+              event: deliveredEvent,
+              ...(isRootProviderThreadUpdate
+                ? rootTerminalAlreadySeen
+                  ? {
+                      writeIfProviderThreadOwner: {
+                        providerThreadId: input.providerThread.id,
+                        runId: input.run.id,
+                        activeAttemptId: input.attempt.id,
+                        expectedLastRunOrdinal: input.run.ordinal,
+                      },
+                    }
+                  : {
+                      writeIfRunCurrent: {
+                        runId: input.run.id,
+                        activeAttemptId: input.attempt.id,
+                        expectedStatus: "running" as const,
+                      },
+                    }
+                : {}),
+            });
+            storedEventCount = storedEvents.length;
+            if (isRootProviderThreadUpdate && rootTerminalAlreadySeen && storedEventCount === 0) {
+              yield* Ref.set(providerThreadOwnerLost, true);
+            }
+          } else if (
+            event.type === "turn_item.updated" &&
+            (event.turnItem.type === "assistant_message" || event.turnItem.type === "reasoning") &&
+            event.turnItem.streaming &&
+            !reservedHeldTurnItemIds.has(event.turnItem.id)
+          ) {
+            yield* turnItemPositions.allocate({
+              threadId: event.turnItem.threadId,
+              turnItemId: event.turnItem.id,
+              runId: event.turnItem.runId,
+            });
+            reservedHeldTurnItemIds.add(event.turnItem.id);
+          }
+          if (event.type === "provider_thread.updated") {
+            if (event.providerThread.id === input.providerThread.id && storedEventCount > 0) {
+              yield* Ref.set(latestProviderThread, event.providerThread);
+            }
+          }
+          if (
+            event.type === "turn_item.updated" &&
+            event.turnItem.providerTurnId === (yield* Ref.get(eventRouting)).rootProviderTurnId
+          ) {
+            yield* Ref.update(latestTurnItemOrdinal, (current) =>
+              Math.max(current, event.turnItem.ordinal),
+            );
+          }
+          if (event.type === "turn.terminal") {
+            yield* Ref.set(terminalEvent, event);
+            yield* Ref.set(rootTerminalSeen, true);
+            yield* finalizeRootRun(event);
+          }
+          if (event.type === "background_work.updated") {
+            if (event.pending) {
+              pendingBackgroundProviderTurns.add(event.providerTurnId);
+            } else {
+              pendingBackgroundProviderTurns.delete(event.providerTurnId);
+            }
+          }
+          yield* trackChildLifecycle(event, deliveredEvent !== null);
+        });
+        const providerEventFiber = yield* eventSink
+          .consumeProviderEvents(
+            eventSubscription.events,
+            (event) =>
+              Effect.gen(function* () {
+                yield* ingestEvent(yield* routeEvent(event));
+              }),
             Effect.gen(function* () {
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
+              return yield* shouldStopProviderEventIngestion;
             }),
-          ),
-          Stream.takeUntilEffect(() =>
-            shouldStopProviderEventIngestion.pipe(
-              Effect.tap((stop) => (stop ? flushDeferredIngest : Effect.void)),
-            ),
-          ),
-          Stream.runDrain,
-          Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
-          Effect.flatMap(() =>
-            Effect.gen(function* () {
-              const terminal = yield* Ref.get(terminalEvent);
-              if (terminal === null) {
-                // A session release interrupts or fails the stream; a clean
-                // end without a terminal means the run would never settle.
-                return yield* new RunExecutionIngestError({
-                  runId: input.run.id,
-                  cause: new ProviderAdapter.ProviderAdapterEventStreamError({
-                    driver: input.providerThread.driver,
-                    providerSessionId: input.providerSessionId,
-                    cause: "Provider event stream ended without a root terminal.",
-                  }),
-                });
-              }
-              yield* finalizeRootRun(terminal);
-            }),
-          ),
-          // Server shutdown interrupts the subscription and leaves the run to
-          // restart recovery; every other failure fails the run.
-          Effect.catchCauseIf(
-            (cause) => !Cause.hasInterruptsOnly(cause),
-            (cause) =>
+            Ref.get(rootTerminalSeen).pipe(Effect.map((seen) => !seen)),
+          )
+          .pipe(
+            Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
+            Effect.flatMap(() =>
               Effect.gen(function* () {
-                const completedAt = yield* DateTime.now;
-                yield* Effect.logWarning("orchestration V2 provider event ingestion failed", {
-                  runId: input.run.id,
-                  cause,
-                });
-                if (yield* Ref.get(rootRunFinalized)) return;
-                const providerThread = yield* Ref.get(latestProviderThread);
-                const routing = yield* Ref.get(eventRouting);
-                const rootProviderTurn = yield* Ref.get(latestRootProviderTurn);
-                // Stop background work too; the failed consumer cannot persist terminal events.
-                const abandonedProviderTurn =
-                  routing.rootProviderTurnId !== null && !routing.rootTurnEnded
-                    ? yield* input.session
-                        .interruptTurn({
-                          providerThread,
-                          providerTurnId: routing.rootProviderTurnId,
-                          requestRuntimeRestart: true,
-                        })
-                        .pipe(
-                          Effect.as(true),
-                          Effect.catchCauseIf(
-                            (interruptCause) => !Cause.hasInterruptsOnly(interruptCause),
-                            (interruptCause) =>
-                              Effect.logWarning(
-                                "orchestration V2 failed to interrupt turn after ingestion failure",
-                                { runId: input.run.id, cause: interruptCause },
-                              ).pipe(Effect.as(false)),
-                          ),
-                          // A failed interrupt leaves the stored turn running so the next start
-                          // retries it. The snapshot is cached before it is published, so it may
-                          // not be stored: replay a terminal one as-is.
-                          Effect.map((interrupted) =>
-                            !interrupted || rootProviderTurn === null
-                              ? null
-                              : isTerminalProviderTurnStatus(rootProviderTurn.status)
-                                ? rootProviderTurn
-                                : {
-                                    ...rootProviderTurn,
-                                    status: "interrupted" as const,
-                                    completedAt,
-                                  },
-                          ),
-                        )
-                    : null;
-                const latestItemOrdinal = yield* Ref.get(latestTurnItemOrdinal);
-                const openSubagents = yield* Ref.get(openRunOwnedSubagents);
-                const squashed = Cause.squash(cause);
-                let nextRetryWarningAt = completedAt;
-                yield* writeFinalRunEvents({
-                  run: input.run,
-                  rootNode: input.rootNode,
-                  checkpointScope: input.checkpointScope,
-                  providerThread,
-                  attempt: input.attempt,
-                  writeIfRunCurrent: {
-                    activeAttemptId: input.attempt.id,
-                    expectedStatus: "running",
-                  },
-                  openRunOwnedSubagents: openSubagents,
-                  ...(abandonedProviderTurn === null ? {} : { abandonedProviderTurn }),
-                  completedAt,
-                  terminal: makeFailedTerminalEvent(
-                    makeProviderFailure({
-                      cause: squashed,
-                      message:
-                        knownProviderFailureMessage(squashed) ??
-                        userFacingDatabaseErrorMessage(squashed),
-                      class: "unknown",
+                const terminal = yield* Ref.get(terminalEvent);
+                if (terminal === null) {
+                  // A session release interrupts or fails the stream; a clean
+                  // end without a terminal means the run would never settle.
+                  return yield* new RunExecutionIngestError({
+                    runId: input.run.id,
+                    cause: new ProviderAdapter.ProviderAdapterEventStreamError({
+                      driver: input.providerThread.driver,
+                      providerSessionId: input.providerSessionId,
+                      cause: "Provider event stream ended without a root terminal.",
                     }),
-                    latestItemOrdinal + 1,
-                  ),
-                  failureItemPersisted: false,
-                  refreshAfterTurn,
-                }).pipe(
-                  // Storage failures can be defects; retry both failure channels.
-                  Effect.catchCause((writeCause) =>
-                    Effect.gen(function* () {
-                      if (Cause.hasInterruptsOnly(writeCause)) {
-                        return yield* Effect.failCause(writeCause);
-                      }
-                      const now = yield* DateTime.now;
-                      if (DateTime.isGreaterThanOrEqualTo(now, nextRetryWarningAt)) {
-                        yield* Effect.logWarning(
-                          "orchestration V2 run failure finalization retry",
-                          {
-                            runId: input.run.id,
-                            attemptId: input.attempt.id,
-                            cause: writeCause,
-                          },
-                        );
-                        // Persistent storage failures must not flood the same disk.
-                        nextRetryWarningAt = DateTime.add(now, { minutes: 10 });
-                      }
-                      return yield* Effect.fail(writeCause);
-                    }),
-                  ),
-                  Effect.retry({
-                    schedule: Schedule.exponential("1 second").pipe(
-                      Schedule.modifyDelay(({ duration }) =>
-                        Effect.succeed(Duration.min(duration, Duration.seconds(30))),
-                      ),
-                    ),
-                  }),
-                  // Startup may cancel the consumer and fail its own terminal
-                  // write. Only service shutdown or the atomic gate ends recovery.
-                  Effect.forkIn(scope),
-                  Effect.flatMap(Fiber.join),
-                );
+                  });
+                }
+                yield* finalizeRootRun(terminal);
               }),
-          ),
-          Effect.ensuring(endPreviewActivity),
-          Effect.ensuring(eventSubscription.close),
-          Effect.forkDetach,
-        );
+            ),
+            // Server shutdown interrupts the subscription and leaves the run to
+            // restart recovery; every other failure fails the run.
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              (cause) =>
+                Effect.gen(function* () {
+                  const completedAt = yield* DateTime.now;
+                  yield* Effect.logWarning("orchestration V2 provider event ingestion failed", {
+                    runId: input.run.id,
+                    cause,
+                  });
+                  if (yield* Ref.get(rootRunFinalized)) return;
+                  const providerThread = yield* Ref.get(latestProviderThread);
+                  const routing = yield* Ref.get(eventRouting);
+                  const rootProviderTurn = yield* Ref.get(latestRootProviderTurn);
+                  // Stop background work too; the failed consumer cannot persist terminal events.
+                  const abandonedProviderTurn =
+                    routing.rootProviderTurnId !== null && !routing.rootTurnEnded
+                      ? yield* input.session
+                          .interruptTurn({
+                            providerThread,
+                            providerTurnId: routing.rootProviderTurnId,
+                            requestRuntimeRestart: true,
+                          })
+                          .pipe(
+                            Effect.as(true),
+                            Effect.catchCauseIf(
+                              (interruptCause) => !Cause.hasInterruptsOnly(interruptCause),
+                              (interruptCause) =>
+                                Effect.logWarning(
+                                  "orchestration V2 failed to interrupt turn after ingestion failure",
+                                  { runId: input.run.id, cause: interruptCause },
+                                ).pipe(Effect.as(false)),
+                            ),
+                            // A failed interrupt leaves the stored turn running so the next start
+                            // retries it. The snapshot is cached before it is published, so it may
+                            // not be stored: replay a terminal one as-is.
+                            Effect.map((interrupted) =>
+                              !interrupted || rootProviderTurn === null
+                                ? null
+                                : isTerminalProviderTurnStatus(rootProviderTurn.status)
+                                  ? rootProviderTurn
+                                  : {
+                                      ...rootProviderTurn,
+                                      status: "interrupted" as const,
+                                      completedAt,
+                                    },
+                            ),
+                          )
+                      : null;
+                  const latestItemOrdinal = yield* Ref.get(latestTurnItemOrdinal);
+                  const openSubagents = yield* Ref.get(openRunOwnedSubagents);
+                  const squashed = Cause.squash(cause);
+                  let nextRetryWarningAt = completedAt;
+                  yield* writeFinalRunEvents({
+                    run: input.run,
+                    rootNode: input.rootNode,
+                    checkpointScope: input.checkpointScope,
+                    providerThread,
+                    attempt: input.attempt,
+                    writeIfRunCurrent: {
+                      activeAttemptId: input.attempt.id,
+                      expectedStatus: "running",
+                    },
+                    openRunOwnedSubagents: openSubagents,
+                    ...(abandonedProviderTurn === null ? {} : { abandonedProviderTurn }),
+                    completedAt,
+                    terminal: makeFailedTerminalEvent(
+                      makeProviderFailure({
+                        cause: squashed,
+                        message:
+                          knownProviderFailureMessage(squashed) ??
+                          userFacingDatabaseErrorMessage(squashed),
+                        class: "unknown",
+                      }),
+                      latestItemOrdinal + 1,
+                    ),
+                    failureItemPersisted: false,
+                    refreshAfterTurn,
+                  }).pipe(
+                    // Storage failures can be defects; retry both failure channels.
+                    Effect.catchCause((writeCause) =>
+                      Effect.gen(function* () {
+                        if (Cause.hasInterruptsOnly(writeCause)) {
+                          return yield* Effect.failCause(writeCause);
+                        }
+                        const now = yield* DateTime.now;
+                        if (DateTime.isGreaterThanOrEqualTo(now, nextRetryWarningAt)) {
+                          yield* Effect.logWarning(
+                            "orchestration V2 run failure finalization retry",
+                            {
+                              runId: input.run.id,
+                              attemptId: input.attempt.id,
+                              cause: writeCause,
+                            },
+                          );
+                          // Persistent storage failures must not flood the same disk.
+                          nextRetryWarningAt = DateTime.add(now, { minutes: 10 });
+                        }
+                        return yield* Effect.fail(writeCause);
+                      }),
+                    ),
+                    Effect.retry({
+                      schedule: Schedule.exponential("1 second").pipe(
+                        Schedule.modifyDelay(({ duration }) =>
+                          Effect.succeed(Duration.min(duration, Duration.seconds(30))),
+                        ),
+                      ),
+                    }),
+                    // Startup may cancel the consumer and fail its own terminal
+                    // write. Only service shutdown or the atomic gate ends recovery.
+                    Effect.forkIn(scope),
+                    Effect.flatMap(Fiber.join),
+                  );
+                }),
+            ),
+            Effect.ensuring(endPreviewActivity),
+            Effect.ensuring(eventSubscription.close),
+            Effect.forkDetach,
+          );
 
         // A provider turn is a sign that the session is still alive. Keep
         // its already-issued MCP credential valid even when the agent goes

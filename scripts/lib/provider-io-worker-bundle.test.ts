@@ -4,11 +4,16 @@ import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import { Rolldown } from "vite-plus/pack";
 
 import { providerIoWorkerBundle } from "./provider-io-worker-bundle.ts";
+
+class BundleTestError extends Schema.TaggedError<BundleTestError>()("BundleTestError", {
+  cause: Schema.Defect(),
+}) {}
 
 const placeholderSource = "export const placeholder = (): string | undefined => undefined;\n";
 
@@ -28,15 +33,17 @@ const buildHost = (worker: string, options: { readonly pluginPlaceholder?: strin
       entry: path.join(dir, "worker.ts"),
       placeholder: options.pluginPlaceholder ?? path.join(dir, "placeholder.ts"),
     });
-    return yield* Effect.tryPromise(() =>
-      Rolldown.build({
-        input: path.join(dir, "host.ts"),
-        platform: "node",
-        write: false,
-        logLevel: "silent",
-        plugins: [plugin],
-      }),
-    ).pipe(Effect.map(({ output }) => output[0].code));
+    return yield* Effect.tryPromise({
+      try: () =>
+        Rolldown.build({
+          input: path.join(dir, "host.ts"),
+          platform: "node",
+          write: false,
+          logLevel: "silent",
+          plugins: [plugin],
+        }),
+      catch: (cause) => new BundleTestError({ cause }),
+    }).pipe(Effect.map(({ output }) => output[0].code));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 const rejection = (worker: string) =>

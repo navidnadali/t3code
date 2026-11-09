@@ -170,6 +170,12 @@ export const AcpOutgoingQueued = Context.Reference<Deferred.Deferred<void> | und
   { defaultValue: () => undefined },
 );
 
+/** A native target check evaluated synchronously with its request's queue insertion. */
+export const AcpOutgoingGuard = Context.Reference<(() => boolean) | undefined>(
+  "effect-acp/protocol/AcpOutgoingGuard",
+  { defaultValue: () => undefined },
+);
+
 export interface AcpPatchedProtocol {
   readonly clientProtocol: RpcClient.Protocol["Service"];
   readonly serverProtocol: RpcServer.Protocol["Service"];
@@ -181,6 +187,17 @@ export interface AcpPatchedProtocol {
 interface AcpPendingRequest {
   readonly deferred: Deferred.Deferred<unknown, AcpError.AcpError>;
   readonly method: string;
+}
+
+/** A decoded wire message and the length of the JSON line it arrived on. */
+interface AcpDecodedWireMessage {
+  readonly message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded;
+  readonly lineLength: number;
+}
+
+interface AcpBufferedRawNotification {
+  readonly notification: AcpIncomingNotification;
+  readonly lineLength: number;
 }
 
 interface AcpOutgoingWrite {
@@ -200,6 +217,7 @@ const decodeElicitationComplete = (payload: unknown) =>
   Effect.fromResult(AcpWire.decodeElicitationComplete(payload));
 const parserFactory = RpcSerialization.ndJsonRpc();
 const MAX_BUFFERED_RAW_NOTIFICATIONS = 32;
+const MAX_BUFFERED_RAW_NOTIFICATION_JSON_LENGTH = 16 * 1024 * 1024;
 const encodeJsonRpcNotification = Schema.encodeUnknownExit(
   Schema.fromJsonString(
     Schema.Struct({
@@ -240,9 +258,14 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const splitLines = lineOffload === undefined ? undefined : AcpWire.makeLineSplitter();
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
-  const notificationQueue = yield* Queue.sliding<AcpIncomingNotification>(
-    MAX_BUFFERED_RAW_NOTIFICATIONS,
-  );
+  const rawNotifications = yield* Queue.unbounded<AcpBufferedRawNotification, Cause.Done<void>>();
+  // JSON length of the notifications offered since the queue was last empty.
+  // `incoming` takes the whole backlog on every pull, so an empty queue holds
+  // nothing, and a read can only make this an overestimate.
+  let rawNotificationsJsonLength = 0;
+  // Raw readers finish with the connection: termination ends the queue, and so
+  // does closing the scope, which interrupts the reader before it terminates.
+  yield* Effect.addFinalizer(() => Queue.end(rawNotifications));
   const disconnects = yield* Queue.unbounded<number>();
   const outgoing = yield* Queue.unbounded<AcpOutgoingWrite, AcpError.AcpError | Cause.Done<void>>();
   const outgoingWriterState = yield* Ref.make<AcpOutgoingWriterState>({
@@ -333,16 +356,33 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       if (options.testHooks?.onOutgoingWriteAdmitted !== undefined) {
         yield* options.testHooks.onOutgoingWriteAdmitted();
       }
-      yield* Queue.offer(outgoing, {
+      const canEnqueue = yield* AcpOutgoingGuard;
+      const entry = {
         payload: encoded,
         ...(acknowledgement === undefined ? {} : { acknowledgement }),
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new AcpError.AcpTransportError({
-              detail: "Failed to queue an outgoing ACP message",
-              cause,
-            }),
+      };
+      yield* (
+        canEnqueue === undefined
+          ? Queue.offer(outgoing, entry)
+          : Effect.suspend(() => {
+              if (!canEnqueue())
+                return new AcpError.AcpRequestError({
+                  code: -32800,
+                  errorMessage: "Request cancelled before enqueue.",
+                  operation: "enqueue-request",
+                  ...(method === undefined ? {} : { method }),
+                });
+              // Keep the target check and ordered native queue insertion in one synchronous step.
+              return Effect.succeed(Queue.offerUnsafe(outgoing, entry));
+            })
+      ).pipe(
+        Effect.mapError((cause) =>
+          cause._tag === "AcpRequestError" && cause.operation === "enqueue-request"
+            ? cause
+            : new AcpError.AcpTransportError({
+                detail: "Failed to queue an outgoing ACP message",
+                cause,
+              }),
         ),
         Effect.filterOrFail(
           (accepted) => accepted,
@@ -416,8 +456,27 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       ),
     );
 
-  const dispatchNotification = (notification: AcpIncomingNotification) =>
-    Queue.offer(notificationQueue, notification).pipe(
+  // Offer first so an ended queue rejects the notification without evicting the
+  // backlog readers are still draining. Offer and eviction share one sync block,
+  // so readers never see more than the limits allow.
+  const bufferRawNotification = (notification: AcpIncomingNotification, lineLength: number) =>
+    Effect.sync(() => {
+      if (Queue.sizeUnsafe(rawNotifications) === 0) rawNotificationsJsonLength = 0;
+      if (!Queue.offerUnsafe(rawNotifications, { notification, lineLength })) return;
+      rawNotificationsJsonLength += lineLength;
+      while (
+        Queue.sizeUnsafe(rawNotifications) > MAX_BUFFERED_RAW_NOTIFICATIONS ||
+        (Queue.sizeUnsafe(rawNotifications) > 1 &&
+          rawNotificationsJsonLength > MAX_BUFFERED_RAW_NOTIFICATION_JSON_LENGTH)
+      ) {
+        const dropped = Queue.takeUnsafe(rawNotifications);
+        if (dropped === undefined || Exit.isFailure(dropped)) break;
+        rawNotificationsJsonLength -= dropped.value.lineLength;
+      }
+    });
+
+  const dispatchNotification = (notification: AcpIncomingNotification, lineLength: number) =>
+    bufferRawNotification(notification, lineLength).pipe(
       Effect.andThen(
         // A failing or dying handler must not stop the reader, or every later
         // message on the connection goes unanswered.
@@ -450,6 +509,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       return [
         Effect.gen(function* () {
           yield* Queue.offer(disconnects, 0);
+          yield* Queue.end(rawNotifications);
           // A dead offload kills the agent, so its error explains the input end that follows.
           const error = yield* offloadFailure === undefined
             ? classify()
@@ -568,18 +628,21 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     );
   };
 
-  const handleRequestEncoded = (message: RpcMessage.RequestEncoded) => {
+  const handleRequestEncoded = (message: RpcMessage.RequestEncoded, lineLength: number) => {
     if (message.id === "") {
       if (message.tag === CLIENT_METHODS.session_update) {
         return timeStage(timing, "decode", 0, () => decodeSessionUpdate(message.payload)).pipe(
           Effect.matchEffect({
             onFailure: dropUndecodableNotification(CLIENT_METHODS.session_update),
             onSuccess: (params) =>
-              dispatchNotification({
-                _tag: "SessionUpdate",
-                method: CLIENT_METHODS.session_update,
-                params: options.transformSessionUpdate?.(params) ?? params,
-              }),
+              dispatchNotification(
+                {
+                  _tag: "SessionUpdate",
+                  method: CLIENT_METHODS.session_update,
+                  params: options.transformSessionUpdate?.(params) ?? params,
+                },
+                lineLength,
+              ),
           }),
         );
       }
@@ -592,15 +655,14 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           Effect.matchEffect({
             onFailure: dropUndecodableNotification(method),
             onSuccess: (params) =>
-              dispatchNotification({ _tag: "ElicitationComplete", method, params }),
+              dispatchNotification({ _tag: "ElicitationComplete", method, params }, lineLength),
           }),
         );
       }
-      return dispatchNotification({
-        _tag: "ExtNotification",
-        method: message.tag,
-        params: message.payload,
-      });
+      return dispatchNotification(
+        { _tag: "ExtNotification", method: message.tag, params: message.payload },
+        lineLength,
+      );
     }
 
     const observeIncoming =
@@ -676,12 +738,13 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       }),
     );
 
-  const routeDecodedMessage = (
-    message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
-  ): Effect.Effect<void, AcpError.AcpError> => {
+  const routeDecodedMessage = ({
+    message,
+    lineLength,
+  }: AcpDecodedWireMessage): Effect.Effect<void, AcpError.AcpError> => {
     switch (message._tag) {
       case "Request":
-        return handleRequestEncoded(message);
+        return handleRequestEncoded(message, lineLength);
       case "Exit":
         return handleExitEncoded(message);
       case "Chunk":
@@ -722,7 +785,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
 
   const readChunk = (
     data: Uint8Array,
-    decode: () => Effect.Effect<ReadonlyArray<AcpWire.WireMessage>, AcpError.AcpError>,
+    decode: () => Effect.Effect<ReadonlyArray<AcpDecodedWireMessage>, AcpError.AcpError>,
   ) =>
     (!options.logIncoming
       ? Effect.void
@@ -733,8 +796,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       Effect.flatMap(decode),
       Effect.tap((messages) =>
         timing === undefined
-          ? logIncomingDecoded(messages)
-          : timeSync(timing, "logShape", () => logIncomingDecoded(messages)),
+          ? logIncomingDecoded(messages.map(({ message }) => message))
+          : timeSync(timing, "logShape", () =>
+              logIncomingDecoded(messages.map(({ message }) => message)),
+            ),
       ),
       Effect.tapErrorTag("AcpProtocolParseError", (error) =>
         logProtocol({
@@ -756,12 +821,12 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     offload: AcpLineOffload,
     lines: ReadonlyArray<string>,
     offloaded: Iterator<OffloadOutcome>,
-  ): Effect.Effect<ReadonlyArray<AcpWire.WireMessage>, AcpError.AcpError> =>
+  ): Effect.Effect<ReadonlyArray<AcpDecodedWireMessage>, AcpError.AcpError> =>
     Effect.suspend(() => {
-      const messages: Array<AcpWire.WireMessage> = [];
+      const messages: Array<AcpDecodedWireMessage> = [];
       // Not a spread: a JSON-RPC batch can hold more messages than a call takes arguments.
-      const append = (decoded: ReadonlyArray<AcpWire.WireMessage>) => {
-        for (const message of decoded) messages.push(message);
+      const append = (decoded: ReadonlyArray<AcpWire.WireMessage>, lineLength: number) => {
+        for (const message of decoded) messages.push({ message, lineLength });
       };
       for (const line of lines) {
         const outcome: OffloadOutcome | undefined = isOffloaded(offload, line)
@@ -783,7 +848,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             ? AcpWire.decodeWireChunk(parser, `${line}\n`)
             : AcpWire.normalizeOffloadedMessages(decoded.messages);
         if (Result.isFailure(result)) return Effect.fail(result.failure);
-        append(result.success);
+        append(result.success, line.length);
       }
       return Effect.succeed(messages);
     });
@@ -879,11 +944,23 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     lineOffload === undefined || splitLines === undefined
       ? options.stdio.stdin.pipe(
           Stream.runForEach((data) =>
-            readChunk(data, () => Effect.fromResult(AcpWire.decodeWireChunk(parser, data))),
+            readChunk(data, () => Effect.fromResult(AcpWire.decodeFramedWireChunk(parser, data))),
           ),
         )
       : readAhead(lineOffload, splitLines)
   ).pipe(
+    Effect.andThen(
+      Effect.suspend(() => {
+        if (splitLines === undefined)
+          return Effect.forEach(parser.endWithLengths(), routeDecodedMessage, { discard: true });
+        const last = splitLines.end();
+        if (last.trim() === "") return Effect.void;
+        const decoded = AcpWire.decodeFramedWireChunk(parser, `${last}\n`);
+        return Result.isFailure(decoded)
+          ? Effect.void
+          : Effect.forEach(decoded.success, routeDecodedMessage, { discard: true });
+      }),
+    ),
     // Anything that ends the reader, including a defect in a callback it runs,
     // terminates the connection so pending requests fail instead of hanging.
     Effect.matchCauseEffect({
@@ -1145,7 +1222,9 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     clientProtocol,
     serverProtocol,
     get incoming() {
-      return Stream.fromQueue(notificationQueue);
+      return Stream.fromQueue(rawNotifications).pipe(
+        Stream.map(({ notification }) => notification),
+      );
     },
     request: sendRequest,
     notify: sendNotification,

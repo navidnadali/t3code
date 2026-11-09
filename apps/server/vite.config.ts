@@ -34,11 +34,14 @@ if (!TELEMETRY_CHANNELS.includes(telemetryChannel)) {
 }
 
 // tsdown SEA needs one chunk (sourcemaps count) and Node >=25.7, so package separately.
+// "bundle" emits the embedded CLI. "1" builds dist-exe/t3 from the bootstrap.
 // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
-// "1" builds dist-exe/t3 here; "bundle" stops at bin.mjs for scripts/cli.ts to inject (linux-arm64).
+// "bootstrap" stops at bin.mjs for scripts/cli.ts to inject (linux-arm64).
 const packMode = process.env.T3CODE_PACK_EXE;
-const packExecutable = packMode === "1" || packMode === "bundle";
-// Where the executable and its bundle go; a release check builds beside itself, not over dist-exe.
+const packBootstrap = packMode === "1" || packMode === "bootstrap";
+const packExecutable = packBootstrap || packMode === "bundle";
+const cliAssetDir = process.env.T3CODE_CLI_ASSET_DIR ?? "";
+if (packExecutable && !cliAssetDir) throw new Error("Build the executable with build:exe.");
 const packExecutableOutDir = process.env.T3CODE_PACK_EXE_OUT_DIR?.trim() || "dist-exe";
 // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
 // No linux-arm64: --build-sea output cannot load on 16/64 KiB page kernels, so it builds natively.
@@ -93,18 +96,23 @@ export default mergeConfig(
     },
     pack: {
       // SEA embeds one entry; expose the history worker as a hidden subcommand.
-      entry: packExecutable ? ["src/bin.ts"] : ["src/bin.ts", "src/claude-history-worker.ts"],
-      outDir: packExecutable ? packExecutableOutDir : "dist",
+      entry: packBootstrap
+        ? ["src/bin.ts"]
+        : packExecutable
+          ? ["src/binMain.ts"]
+          : ["src/bin.ts", "src/claude-history-worker.ts"],
+      outDir: packBootstrap ? packExecutableOutDir : packExecutable ? cliAssetDir : "dist",
       sourcemap: !packExecutable,
       clean: true,
-      plugins: [
-        providerIoWorkerBundle({
-          entry: NodePath.join(providerIoDir, "providerIoWorker.ts"),
-          placeholder: NodePath.join(providerIoDir, "embeddedProviderIoWorker.ts"),
-        }),
-      ],
-      // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
-      // SEA can only resolve built-ins; keep dynamic imports inside its one module.
+      // SEA can only resolve built-ins; keep dynamic imports inside each emitted module.
+      plugins: packBootstrap
+        ? []
+        : [
+            providerIoWorkerBundle({
+              entry: NodePath.join(providerIoDir, "providerIoWorker.ts"),
+              placeholder: NodePath.join(providerIoDir, "embeddedProviderIoWorker.ts"),
+            }),
+          ],
       ...(packExecutable ? { outputOptions: { codeSplitting: false } } : {}),
       ...(packMode === "1"
         ? {
@@ -115,9 +123,9 @@ export default mergeConfig(
               // Node SEA useCodeCache breaks import(), which the server needs.
               seaConfig: {
                 useCodeCache: false,
-                // The young-generation default, baked in: no start of the executable relaunches.
-                execArgv: [...packSeaOptions.execArgv],
+                execArgv: [...packSeaOptions.execArgv, "--require-module"],
                 execArgvExtension: packSeaOptions.execArgvExtension,
+                assets: { "binMain.mjs": NodePath.join(cliAssetDir, "binMain.mjs") },
               },
             },
           }
@@ -125,7 +133,8 @@ export default mergeConfig(
       deps: {
         // alwaysBundle=false has no opinion; neverBundle must retain transitive native acceleration.
         alwaysBundle: shouldBundleCliDependency,
-        neverBundle: (id: string) => isExternalCliDependency(id),
+        neverBundle: (id: string) =>
+          (packBootstrap && id === "./binMain.ts") || isExternalCliDependency(id),
         onlyBundle: false,
       },
       banner: {

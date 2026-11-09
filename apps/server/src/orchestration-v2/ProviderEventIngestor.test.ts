@@ -76,8 +76,7 @@ const layerGit = GitVcsDriver.layer.pipe(
 );
 
 const layerEmptyInstances = Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
-  // @effect-diagnostics-next-line effectSucceedWithVoid:off - Optional instances require undefined rather than void.
-  getInstance: () => Effect.succeed(undefined),
+  getInstance: () => Effect.undefined,
 });
 const makeLayerTest = <E>(
   ingestorEventSink: Layer.Layer<EventSink.EventSinkV2, E>,
@@ -261,6 +260,7 @@ it.effect("refreshes the failing instance snapshot after a committed usage_limit
           generatePrContent: () => Effect.die("unused"),
           generateThreadTitle: () => Effect.die("unused"),
           generateReviewGuide: () => Effect.die("unused"),
+          generateTranscriptionPostProcessing: () => Effect.die("unused"),
         },
         snapshot: {
           refreshUsage: Deferred.succeed(refreshed, undefined).pipe(Effect.asVoid),
@@ -548,8 +548,12 @@ layer("ProviderEventIngestorV2", (it) => {
           event: { type: "node.updated", driver: CODEX_DRIVER, node: sent },
         });
 
-      assert.lengthOf(yield* ingestNode(node), 1);
-      assert.isEmpty(yield* ingestNode({ ...node }));
+      yield* eventSink.withProviderBatch(
+        Effect.gen(function* () {
+          assert.lengthOf(yield* ingestNode(node), 1);
+          assert.isEmpty(yield* ingestNode({ ...node }));
+        }),
+      );
       yield* eventSink.write({
         events: [
           {

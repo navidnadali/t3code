@@ -95,12 +95,18 @@ export interface CodexAppServerPatchedProtocolOptions {
   readonly onTermination?: (error: CodexError.CodexAppServerError) => Effect.Effect<void, never>;
 }
 
+export interface CodexAppServerRequestOptions {
+  /** Evaluated synchronously with queue insertion, after encoding and outbound logging. */
+  readonly canEnqueue?: () => boolean;
+}
+
 export interface CodexAppServerPatchedProtocol {
   readonly incomingNotifications: Stream.Stream<CodexAppServerIncomingNotification>;
   readonly incomingRequests: Stream.Stream<CodexAppServerIncomingRequest>;
   readonly request: (
     method: string,
     payload?: unknown,
+    options?: CodexAppServerRequestOptions,
   ) => Effect.Effect<unknown, CodexError.CodexAppServerError>;
   readonly notify: (
     method: string,
@@ -262,7 +268,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
 
     const offerOutgoing =
       /* Every protocol write reaches this helper; request spans cover the operation. */
-      Effect.fnUntraced(function* (message: Record<string, unknown>) {
+      Effect.fnUntraced(function* (
+        message: Record<string, unknown>,
+        requestOptions?: CodexAppServerRequestOptions,
+      ) {
         const failure = yield* Ref.get(terminationFailure);
         if (Option.isSome(failure)) return yield* failure.value;
 
@@ -277,7 +286,18 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           stage: "raw",
           payload: encoded,
         });
-        const accepted = yield* Queue.offer(outgoing, encoded);
+        const accepted = yield* Effect.suspend(() => {
+          if (requestOptions?.canEnqueue?.() === false) {
+            return new CodexError.CodexAppServerRequestError({
+              code: -32800,
+              errorMessage: "Request cancelled before enqueue.",
+              operation: "enqueue-request",
+              ...(typeof message.method === "string" ? { method: message.method } : {}),
+            });
+          }
+          // No yield between the target check and insertion into the ordered native stream.
+          return Effect.succeed(Queue.offerUnsafe(outgoing, encoded));
+        });
         if (!accepted) {
           const closed = yield* Ref.get(terminationFailure);
           return yield* Option.getOrElse(
@@ -667,6 +687,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const request = Effect.fn("CodexAppServerProtocol.request")(function* (
       method: string,
       payload?: unknown,
+      requestOptions?: CodexAppServerRequestOptions,
     ) {
       const requestId = yield* Ref.modify(
         nextRequestId,
@@ -685,11 +706,14 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         ),
         () =>
           Effect.gen(function* () {
-            yield* offerOutgoing({
-              id: requestId,
-              method,
-              ...(payload !== undefined ? { params: payload } : {}),
-            }).pipe(Effect.withSpan("CodexAppServerProtocol.request.enqueue", { attributes }));
+            yield* offerOutgoing(
+              {
+                id: requestId,
+                method,
+                ...(payload !== undefined ? { params: payload } : {}),
+              },
+              requestOptions,
+            ).pipe(Effect.withSpan("CodexAppServerProtocol.request.enqueue", { attributes }));
             // Includes queue/stdin delivery, Codex work and response routing, not just T3 CPU.
             return yield* Deferred.await(deferred).pipe(
               Effect.withSpan("CodexAppServerProtocol.request.awaitResponse", { attributes }),

@@ -4,6 +4,7 @@ import type * as SchemaIssue from "effect/SchemaIssue";
 const CodexAppServerRequestOperation = Schema.Literals([
   "decode-payload",
   "encode-payload",
+  "enqueue-request",
   "handle-request",
   "receive-response",
 ]);

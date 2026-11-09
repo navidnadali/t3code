@@ -9,12 +9,15 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { isSqlError } from "effect/sql/SqlError";
 
-import * as CompactionScratch from "../orchestration-v2/CompactionScratch.ts";
-import * as EventStore from "../orchestration-v2/EventStore.ts";
-import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as EventStore from "../orchestration-v2/EventStore.ts";
+import { verifyProjectionIntegrity } from "../orchestration-v2/ProjectionIntegrity.ts";
+import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import { rebuildMessageSearch } from "../orchestration-v2/messageSearchIndex.ts";
-import { recountTurnItems } from "../orchestration-v2/turnItemCounts.ts";
+import {
+  recountTurnItems,
+  driftedTurnItemCountThreads,
+} from "../orchestration-v2/turnItemCounts.ts";
 
 export class DatabaseMissingError extends Schema.TaggedError<DatabaseMissingError>()(
   "DatabaseMissingError",
@@ -34,15 +37,6 @@ export class DatabaseInUseError extends Schema.TaggedError<DatabaseInUseError>()
   }
 }
 
-export class DatabaseProjectionsInvalidError extends Schema.TaggedError<DatabaseProjectionsInvalidError>()(
-  "DatabaseProjectionsInvalidError",
-  { path: Schema.String },
-) {
-  override get message() {
-    return "Database projections need repair before compaction. Start T3 Code once so it rebuilds them, then run doctor again. If this CLI is older than the one that wrote the database, update T3 Code first.";
-  }
-}
-
 export class DatabaseInspectError extends Schema.TaggedError<DatabaseInspectError>()(
   "DatabaseInspectError",
   { path: Schema.String, cause: Schema.Defect() },
@@ -52,19 +46,24 @@ export class DatabaseInspectError extends Schema.TaggedError<DatabaseInspectErro
   }
 }
 
+class DatabaseProjectionsInvalidError extends Schema.TaggedError<DatabaseProjectionsInvalidError>()(
+  "DatabaseProjectionsInvalidError",
+  {
+    path: Schema.String,
+    missingThreadIds: Schema.Array(Schema.String),
+    unreadableThreadIds: Schema.Array(Schema.String),
+  },
+) {
+  override get message() {
+    return "Database projections are missing, unreadable, or behind their events. History was not pruned; restore or repair the projections before compacting.";
+  }
+}
+
 /** What a compaction did before a later step failed, so a failure never hides it. */
 const CompactionOutcome = Schema.Struct({
   deletedEventCount: Schema.Number,
   deletedReceiptCount: Schema.Number,
   repairedItemCountThreads: Schema.Number,
-  skipped: Schema.optional(
-    Schema.Struct({
-      scratchPath: Schema.String,
-      requiredBytes: Schema.Number,
-      freeBytes: Schema.Number,
-      stage: Schema.Literals(["before", "during"]),
-    }),
-  ),
 });
 
 export class DatabaseCompactError extends Schema.TaggedError<DatabaseCompactError>()(
@@ -107,13 +106,8 @@ export class DatabaseMaintenance extends Context.Service<
         readonly deletedReceiptCount: number;
         /** Threads whose drifted turn-item counts were recounted before compacting. */
         readonly repairedItemCountThreads: number;
-        /** Present when the disk could not hold the pass's working set. */
-        readonly skipped?: CompactionScratch.CompactionSkipped | undefined;
       },
-      | DatabaseMissingError
-      | DatabaseInUseError
-      | DatabaseProjectionsInvalidError
-      | DatabaseCompactError
+      DatabaseMissingError | DatabaseInUseError | DatabaseCompactError
     >;
     /** Deletes only the pre-0.1.0 database; earlier versions still use it. */
     readonly removeLegacyDatabase: (
@@ -122,9 +116,7 @@ export class DatabaseMaintenance extends Context.Service<
   }
 >()("t3/persistence/DatabaseMaintenance") {}
 
-const isDomainError = Schema.is(
-  Schema.Union([DatabaseMissingError, DatabaseInUseError, DatabaseProjectionsInvalidError]),
-);
+const isDomainError = Schema.is(Schema.Union([DatabaseMissingError, DatabaseInUseError]));
 const isCompactError = Schema.is(DatabaseCompactError);
 
 const readStorage = Effect.gen(function* () {
@@ -202,30 +194,25 @@ const make = Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         yield* lockExclusively(databasePath);
         const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
-        let verification = yield* maintenance.verify;
-        // Nothing else repairs drifted item counts, and the items they count are intact.
-        const repairedItemCountThreads = verification.turnItemCountDriftThreadIds.length;
-        if (repairedItemCountThreads > 0) {
-          yield* recountTurnItems(sql);
-          verification = yield* maintenance.verify;
-        }
-        if (!verification.valid) {
-          return yield* new DatabaseProjectionsInvalidError({ path: databasePath });
-        }
-        const summary = yield* maintenance.compactEventStore(Effect.void, {
-          scratchPath: path.join(path.dirname(databasePath), "compaction-scratch.sqlite"),
-        });
+        const repairedItemCountThreads = (yield* driftedTurnItemCountThreads(sql)).length;
+        if (repairedItemCountThreads > 0) yield* recountTurnItems(sql);
+        const verified = yield* verifyProjectionIntegrity.pipe(
+          Effect.provide(Layer.merge(ProjectionStore.layer, EventStore.layer)),
+        );
+        if (!verified.valid)
+          return yield* new DatabaseProjectionsInvalidError({
+            path: databasePath,
+            missingThreadIds: verified.missingThreadIds,
+            unreadableThreadIds: verified.unreadableThreadIds,
+          });
+        const summary = yield* maintenance.pruneEventStore();
         const compaction = {
           deletedEventCount: summary.deletedEventCount,
           deletedReceiptCount: summary.deletedReceiptCount,
           repairedItemCountThreads,
-          ...(summary.skipped === undefined ? {} : { skipped: summary.skipped }),
         };
         // What follows can fail on the very disk the compaction ran out of; its outcome travels with the failure.
         yield* Effect.gen(function* () {
-          if (!(yield* maintenance.verify).valid) {
-            return yield* new DatabaseProjectionsInvalidError({ path: databasePath });
-          }
           // VACUUM is required to enable incremental auto_vacuum on existing databases.
           yield* sql`PRAGMA auto_vacuum = INCREMENTAL`;
           yield* sql`VACUUM`;
@@ -242,7 +229,6 @@ const make = Effect.gen(function* () {
       }).pipe(
         Effect.provide(
           ProjectionMaintenance.layer.pipe(
-            Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
             Layer.provideMerge(NodeSqliteClient.layer({ filename: databasePath })),
           ),
         ),
@@ -254,7 +240,6 @@ const make = Effect.gen(function* () {
         deletedEventCount: result.deletedEventCount,
         deletedReceiptCount: result.deletedReceiptCount,
         repairedItemCountThreads: result.repairedItemCountThreads,
-        ...(result.skipped === undefined ? {} : { skipped: result.skipped }),
       };
     },
     (effect, databasePath) =>

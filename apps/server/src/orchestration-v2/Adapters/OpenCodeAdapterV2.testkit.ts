@@ -194,18 +194,22 @@ export class OpenCodeReplayController {
     }
   }
 
-  async response(operation: string): Promise<unknown> {
+  async response(
+    operation: string,
+    beforeEmit?: (label: string | undefined) => Promise<void>,
+  ): Promise<unknown> {
     while (true) {
       this.throwFailure();
       const entry = this.transcript.entries[this.cursor];
       if (entry?.type === "emit_inbound") {
         const frame = frameRecord(entry.frame);
         if (frame?.type === "sdk.response" && frame.operation === operation) {
+          const data = materializeMessageIds(frame.data, this.messageIds);
+          this.advance();
+          await beforeEmit?.(entry.label);
           if (entry.afterMs !== undefined && entry.afterMs > 0) {
             await Effect.runPromise(Effect.sleep(Duration.millis(entry.afterMs)));
           }
-          const data = materializeMessageIds(frame.data, this.messageIds);
-          this.advance();
           return data;
         }
       }

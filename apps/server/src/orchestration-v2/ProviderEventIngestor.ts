@@ -251,7 +251,7 @@ const BATCHABLE_EVENT_TYPES = new Set<ProviderAdapter.ProviderAdapterV2Event["ty
   "plan.updated",
 ]);
 
-export const canIngestInBatch = (event: ProviderAdapter.ProviderAdapterV2Event): boolean =>
+const canIngestInBatch = (event: ProviderAdapter.ProviderAdapterV2Event): boolean =>
   BATCHABLE_EVENT_TYPES.has(event.type);
 
 // One batch is one writer transaction: past a few hundred events or about a MiB it holds the

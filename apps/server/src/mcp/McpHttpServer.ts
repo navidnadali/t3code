@@ -262,8 +262,12 @@ const MAX_SNAPSHOT_IDENTIFIER_CHARS = 2_048;
 
 const encodeJsonText = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const utf8Length = (text: string) => Buffer.byteLength(text, "utf8");
-const cutText = (text: string, max: number) =>
-  text.length > max ? `${text.slice(0, max)}…` : text;
+const cutText = (text: string, max: number) => {
+  if (text.length <= max) return text;
+  // Half an emoji serializes to a lone surrogate escape, which provider JSON parsers reject.
+  const last = text.charCodeAt(max - 1);
+  return `${text.slice(0, last >= 0xd800 && last <= 0xdbff ? max - 1 : max)}…`;
+};
 
 const cutEntryStrings = <A>(entry: A): A =>
   typeof entry === "object" && entry !== null
@@ -553,11 +557,19 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
                   readonly width: number;
                   readonly height: number;
                 };
+                readonly fullScreenshot?: { readonly data: string };
               };
-              const { screenshot, ...page } = snapshot;
+              const { screenshot, fullScreenshot, ...page } = snapshot;
               const png = new Uint8Array(Buffer.from(screenshot.data, "base64"));
               const screenshotPath =
-                payload?.save === true ? yield* saveScreenshot(snapshot.url, png) : undefined;
+                payload?.save === true
+                  ? yield* saveScreenshot(
+                      snapshot.url,
+                      fullScreenshot
+                        ? new Uint8Array(Buffer.from(fullScreenshot.data, "base64"))
+                        : png,
+                    )
+                  : undefined;
               // Providers replay images on later requests, and some reject them; include images only when requested.
               const includeImage = payload?.includeImage === true;
               if (screenshotPath !== undefined && !includeImage) {

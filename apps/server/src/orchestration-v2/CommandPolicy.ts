@@ -93,8 +93,14 @@ export function resolveMessageDispatchIntent(
   projection: OrchestrationV2ThreadProjection,
   requestedMode: MessageDispatchMode,
   deliveryIntent?: "auto" | "steer" | "restart",
+  preferRestartSteering = false,
 ): MessageDispatchMode {
-  const mode = resolveDeliveryIntent(projection, requestedMode, deliveryIntent);
+  const mode = resolveDeliveryIntent(
+    projection,
+    requestedMode,
+    deliveryIntent,
+    preferRestartSteering,
+  );
   if (mode.type !== "steer_active") return mode;
   // Compaction and sign-out cannot accept steers; queue follow-ups.
   const target = projection.runs.find((run) => run.id === mode.targetRunId);
@@ -145,6 +151,7 @@ function resolveDeliveryIntent(
   projection: OrchestrationV2ThreadProjection,
   requestedMode: MessageDispatchMode,
   deliveryIntent?: "auto" | "steer" | "restart",
+  preferRestartSteering = false,
 ): MessageDispatchMode {
   if (deliveryIntent === undefined) return requestedMode;
 
@@ -169,7 +176,14 @@ function resolveDeliveryIntent(
   }
 
   const capabilities = providerTurnCapabilities(projection, activeRun);
-  if (capabilities?.supportsActiveSteering === true) {
+  // MCP automatic sends have always used restart steering where the provider supports it.
+  // Resolve that preference only after confirming this attempt still has a live provider turn.
+  if (
+    capabilities?.supportsActiveSteering === true ||
+    (preferRestartSteering &&
+      capabilities?.supportsInterrupt === true &&
+      capabilities.supportsSteeringByInterruptRestart === true)
+  ) {
     return { type: "steer_active", targetRunId: activeRun.id };
   }
   if (capabilities?.supportsQueuedMessages === true) {

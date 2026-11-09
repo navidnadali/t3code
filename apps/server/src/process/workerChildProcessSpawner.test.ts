@@ -1,3 +1,4 @@
+// @effect-diagnostics processEnvInEffect:off -- These subprocess and cache-invalidation tests deliberately change the real inherited process environment.
 // @effect-diagnostics nodeBuiltinImport:off - Children prove they are gone by closing a socket; a server process is killed outright.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeNet from "node:net";

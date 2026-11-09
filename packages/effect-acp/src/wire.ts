@@ -35,7 +35,7 @@ export const decodeElicitationComplete = Schema.decodeUnknownResult(
 export const makeLineSplitter = () => {
   const decoder = new TextDecoder();
   let buffer = "";
-  return (bytes: Uint8Array | string): ReadonlyArray<string> => {
+  const split = (bytes: Uint8Array | string): ReadonlyArray<string> => {
     const chunk = typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
     const lastNewline = chunk.lastIndexOf("\n");
     // Splitting the whole buffer per chunk is quadratic for multi-megabyte lines.
@@ -47,30 +47,53 @@ export const makeLineSplitter = () => {
     buffer = chunk.slice(lastNewline + 1);
     return lines;
   };
+  return Object.assign(split, {
+    end: () => {
+      const line = buffer + decoder.decode();
+      buffer = "";
+      return line;
+    },
+  });
 };
 
 // ndJsonRpc skips lines that are not JSON. A malformed agent line has to end the
 // session, so frames are split here and each one goes through the strict codec.
+export interface FramedWireMessage {
+  readonly message: WireMessage;
+  readonly lineLength: number;
+}
 export const makeStrictNdJsonRpcParser = (timing?: AcpStageTiming) => {
   const codec = RpcSerialization.jsonRpc().makeUnsafe();
   const split = makeLineSplitter();
+  const decodeLine = (line: string): ReadonlyArray<FramedWireMessage> => {
+    const startedAt = timing?.now() ?? 0;
+    const messages = codec.decode(line) as ReadonlyArray<WireMessage>;
+    timing?.record("json", timing.now() - startedAt, Buffer.byteLength(line, "utf8"));
+    return messages.map((message) => ({
+      message: normalizeAcpJsonRpcError(message),
+      lineLength: line.length,
+    }));
+  };
+  const decodeWithLengths = (bytes: Uint8Array | string): ReadonlyArray<FramedWireMessage> => {
+    const startedAt = timing?.now() ?? 0;
+    const lines = split(bytes);
+    timing?.record(
+      "framing",
+      timing.now() - startedAt,
+      typeof bytes === "string" ? Buffer.byteLength(bytes, "utf8") : bytes.byteLength,
+    );
+    return lines.flatMap(decodeLine);
+  };
   return {
-    decode: (bytes: Uint8Array | string): ReadonlyArray<unknown> => {
-      const startedAt = timing?.now() ?? 0;
-      const lines = split(bytes);
-      if (timing === undefined) return lines.flatMap((line) => codec.decode(line));
-      timing.record(
-        "framing",
-        timing.now() - startedAt,
-        typeof bytes === "string" ? Buffer.byteLength(bytes, "utf8") : bytes.byteLength,
-      );
-      return lines.flatMap((line) => {
-        const lineBytes = Buffer.byteLength(line, "utf8");
-        const lineStartedAt = timing.now();
-        const messages = codec.decode(line);
-        timing.record("json", timing.now() - lineStartedAt, lineBytes);
-        return messages;
-      });
+    decode: (bytes: Uint8Array | string) => decodeWithLengths(bytes).map(({ message }) => message),
+    decodeWithLengths,
+    endWithLengths: () => {
+      const line = split.end();
+      try {
+        return line.trim() === "" ? [] : decodeLine(line);
+      } catch {
+        return [];
+      }
     },
     encode: (response: Parameters<typeof codec.encode>[0]) => {
       const encoded = codec.encode(response);
@@ -92,6 +115,16 @@ export const decodeWireChunk = (
         operation: "decode-wire-message",
         cause,
       }),
+  });
+
+export const decodeFramedWireChunk = (
+  parser: StrictNdJsonRpcParser,
+  data: Uint8Array | string,
+): Result.Result<ReadonlyArray<FramedWireMessage>, AcpError.AcpProtocolParseError> =>
+  Result.try({
+    try: () => parser.decodeWithLengths(data),
+    catch: (cause) =>
+      new AcpError.AcpProtocolParseError({ operation: "decode-wire-message", cause }),
   });
 
 export const decodeFailureDiagnostics = (error: AcpError.AcpProtocolParseError) => ({

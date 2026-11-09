@@ -4,8 +4,10 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as OpenCodeServerLedger from "./OpenCodeServerLedger.ts";
 import { assert, describe, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { OpencodeClient, ToolPart } from "@opencode-ai/sdk/v2";
+import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2";
+import { toolOutputImages } from "@t3tools/shared/toolOutput";
 import {
   CheckpointId,
   NodeId,
@@ -29,11 +31,13 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
+import * as Result from "effect/Result";
 import * as Queue from "effect/Queue";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
@@ -155,6 +159,7 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
   turnSettings: {
     readonly options?: ReadonlyArray<ProviderOptionSelection>;
     readonly interactionMode?: ProviderAdapter.ProviderAdapterV2RuntimePolicy["interactionMode"];
+    readonly nativeEventLogger?: ProviderEventLoggers.EventNdjsonLogger;
   } = {},
 ) {
   const instanceId = ProviderInstanceId.make(`opencode-${suffix}`);
@@ -172,6 +177,9 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
     instanceId,
     settings: OPEN_CODE_TEST_SETTINGS,
     environment: {},
+    ...(turnSettings.nativeEventLogger
+      ? { nativeEventLogger: turnSettings.nativeEventLogger }
+      : {}),
   }).pipe(
     Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, {
       connectToOpenCodeServer: () => Effect.succeed({ url: "http://test.invalid", external: true }),
@@ -711,6 +719,10 @@ describe("OpenCodeAdapterV2", () => {
         }),
       );
       const events = yield* Fiber.join(received);
+      assert.deepEqual(
+        events.map((event) => event.type),
+        ["turn_item.updated", "runtime_request.updated"],
+      );
       const item = events.find((event) => event.type === "turn_item.updated");
       const request = events.find((event) => event.type === "runtime_request.updated");
       assert.equal(item?.type, "turn_item.updated");
@@ -783,19 +795,35 @@ describe("OpenCodeAdapterV2", () => {
             error: "Command failed",
             time: { start: 3, end: 4 },
           },
+          {
+            status: "error",
+            input: { command: "sleep 60" },
+            error: "Interrupted",
+            metadata: { interrupted: true },
+            time: { start: 5, end: 6 },
+          },
+          // OpenCode 1.3 reports a stopped tool only through this message.
+          {
+            status: "error",
+            input: { command: "sleep 90" },
+            error: "Tool execution aborted",
+            time: { start: 6, end: 7 },
+          },
         ] satisfies ReadonlyArray<ToolPart["state"]>;
         for (const state of states) {
+          const callID =
+            state.status === "error" ? `call-ended-${state.time.start}` : "call-working";
           yield* Effect.promise(() =>
             nativeEvents.push({
               type: "message.part.updated",
               properties: {
                 sessionID: nativeSessionId,
                 part: {
-                  id: state.status === "error" ? "part-failed" : "part-working",
+                  id: `part-${callID}`,
                   sessionID: nativeSessionId,
                   messageID: "late-assistant",
                   type: "tool",
-                  callID: state.status === "error" ? "call-failed" : "call-working",
+                  callID,
                   tool: "bash",
                   state,
                 },
@@ -803,6 +831,58 @@ describe("OpenCodeAdapterV2", () => {
             }),
           );
         }
+        for (const error of ["Task cancelled", "Task failed"]) {
+          yield* Effect.promise(() =>
+            nativeEvents.push({
+              type: "message.part.updated",
+              properties: {
+                sessionID: nativeSessionId,
+                part: {
+                  id: `part-${error}`,
+                  sessionID: nativeSessionId,
+                  messageID: "late-assistant",
+                  type: "tool",
+                  callID: `call-${error}`,
+                  tool: "task",
+                  state: {
+                    status: "error",
+                    input: {
+                      description: "Sleep task",
+                      prompt: "sleep 120",
+                      subagent_type: "general",
+                    },
+                    error,
+                    time: { start: 7, end: 8 },
+                  },
+                },
+              },
+            }),
+          );
+        }
+        yield* Effect.promise(() =>
+          nativeEvents.push({
+            type: "message.part.updated",
+            properties: {
+              sessionID: nativeSessionId,
+              part: {
+                id: "part-exit",
+                sessionID: nativeSessionId,
+                messageID: "late-assistant",
+                type: "tool",
+                callID: "call-exit",
+                tool: "bash",
+                state: {
+                  status: "completed",
+                  input: { command: "vp test" },
+                  output: "1 failed\n",
+                  title: "Run tests",
+                  metadata: { output: "1 failed\n", exit: 1, truncated: false },
+                  time: { start: 4, end: 5 },
+                },
+              },
+            },
+          }),
+        );
         yield* Effect.promise(() =>
           nativeEvents.push({
             type: "message.part.updated",
@@ -877,14 +957,31 @@ describe("OpenCodeAdapterV2", () => {
         const commands = items.filter((item) => item.type === "command_execution");
         assert.deepEqual(
           commands.map((item) => item.status),
-          ["pending", "running", "completed", "failed"],
+          ["pending", "running", "completed", "failed", "interrupted", "interrupted", "failed"],
         );
         assert.deepEqual(
           commands.map((item) => item.input),
-          ["pwd", "pwd", "pwd", "pwd"],
+          ["pwd", "pwd", "pwd", "pwd", "sleep 60", "sleep 90", "vp test"],
         );
         assert.equal(commands[2]?.output, "/repo\n");
         assert.equal(commands[3]?.output, "Command failed");
+        assert.equal(commands[6]?.exitCode, 1);
+        assert.equal(
+          events
+            .flatMap((event) => (event.type === "node.updated" ? [event.node] : []))
+            .findLast((node) => node.id === commands[6]?.nodeId)?.status,
+          "failed",
+        );
+        assert.deepEqual(
+          items.filter((item) => item.type === "subagent").map((item) => item.status),
+          ["interrupted", "failed"],
+        );
+        assert.deepEqual(
+          events.flatMap((event) =>
+            event.type === "subagent.updated" ? [event.subagent.status] : [],
+          ),
+          ["interrupted", "failed"],
+        );
         assert.isTrue(
           events.some(
             (event) =>
@@ -1242,6 +1339,13 @@ describe("OpenCodeAdapterV2", () => {
                   title: "Edit remote document",
                   metadata: {},
                   output,
+                  attachments: [
+                    {
+                      type: "file",
+                      mime: "image/png",
+                      url: "data:image/png;base64,iVBORw0KGgo=",
+                    },
+                  ],
                   error: "failed",
                   time: { start: 1, end: 2 },
                 },
@@ -1334,7 +1438,9 @@ describe("OpenCodeAdapterV2", () => {
         });
         assert.deepEqual(item.input, { document: "remote-doc" });
       }
-      assert.equal(items[1]?.output, output);
+      assert.deepEqual(toolOutputImages(items[1]?.output), [
+        { mimeType: "image/png", data: "iVBORw0KGgo=" },
+      ]);
       assert.equal(items[3]?.toolName, "ambiguous_server_edit_document");
       assert.isUndefined(items[3]?.toolSource);
       assert.equal(statusReads, 1);
@@ -1363,7 +1469,7 @@ describe("OpenCodeAdapterV2", () => {
             return { stream: nativeEvents.stream };
           },
         },
-        command: { list: async () => ({ data: [{ name: "review" }] }) },
+        command: { list: async () => ({ data: [{ name: "git/review" }] }) },
         session: {
           create: async () => ({ data: { id: sessionId, time: { created: 1, updated: 1 } } }),
           command: async (input: {
@@ -1382,9 +1488,9 @@ describe("OpenCodeAdapterV2", () => {
           },
         },
       });
-      const start = yield* harness.startTurn("/review staged changes").pipe(Effect.forkScoped);
+      const start = yield* harness.startTurn("/git/review staged changes").pipe(Effect.forkScoped);
       const call = yield* Queue.take(calls);
-      assert.equal(call.command, "review");
+      assert.equal(call.command, "git/review");
       assert.equal(call.arguments, "staged changes");
       assert.equal(call.model, "anthropic/claude-sonnet");
       yield* Effect.promise(() =>
@@ -1596,60 +1702,91 @@ describe("OpenCodeAdapterV2", () => {
     ),
   );
 
-  it.effect("steers with the turn's agent, reasoning variant and system instructions", () =>
-    Effect.gen(function* () {
-      const nativeEvents = asyncEventStream();
-      const promptInputs: Array<{ agent?: string; variant?: string; system?: string }> = [];
-      const harness = yield* makeOpenCodeRuntimeHarness(
-        "steer-agent",
-        "root",
-        {
-          event: { subscribe: async () => ({ stream: nativeEvents.stream }) },
-          session: {
-            create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
-            get: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
-            messages: async () => ({ data: [] }),
-            promptAsync: async (input: { agent?: string; variant?: string; system?: string }) => {
+  it.effect.each(["mock", "sdk", "sdk-error"])(
+    "steers with the turn's options through %s",
+    (transport) =>
+      Effect.gen(function* () {
+        const nativeEvents = asyncEventStream();
+        const promptInputs: Array<{ agent?: string; variant?: string; system?: string }> = [];
+        const sdk = createOpencodeClient({ baseUrl: "http://test.invalid", throwOnError: true });
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            vi.spyOn(globalThis, "fetch").mockImplementation(async (request) => {
+              assert.instanceOf(request, Request);
+              const input = await (request as Request).json();
               promptInputs.push(input);
-              return { data: true };
+              if (transport === "sdk-error") throw new Error("Transport failed after submission");
+              return Response.json(true);
+            }),
+          ),
+          (spy) => Effect.sync(() => spy.mockRestore()),
+        );
+        const harness = yield* makeOpenCodeRuntimeHarness(
+          "steer-agent",
+          "root",
+          {
+            event: { subscribe: async () => ({ stream: nativeEvents.stream }) },
+            session: {
+              create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+              get: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+              messages: async () => ({ data: [] }),
+              promptAsync: async (
+                input: { agent?: string; variant?: string; system?: string },
+                options: { signal: AbortSignal },
+              ) => {
+                if (transport !== "mock" && promptInputs.length > 0)
+                  return sdk.session.promptAsync(
+                    input as Parameters<typeof sdk.session.promptAsync>[0],
+                    options,
+                  );
+                promptInputs.push(input);
+                return { data: true };
+              },
+              abort: async () => ({ data: true }),
+              children: async () => ({ data: [] }),
             },
-            abort: async () => ({ data: true }),
-            children: async () => ({ data: [] }),
           },
-        },
-        {},
-        { options: [{ id: "variant", value: "high" }], interactionMode: "plan" },
-      );
-      yield* harness.startTurn();
-      const snapshot = yield* harness.runtime.readThreadSnapshot({
-        providerThread: harness.providerThread,
-      });
-      yield* harness.runtime.steerTurn({
-        threadId: harness.threadId,
-        runId: harness.runId,
-        providerThread: harness.providerThread,
-        providerTurnId: snapshot.providerTurns.at(-1)!.id,
-        message: {
-          messageId: MessageId.make("message-opencode-steer-agent"),
-          text: "also cover the README",
-          attachments: [],
-          createdBy: "user",
-          creationSource: "web",
-        },
-      });
+          {},
+          { options: [{ id: "variant", value: "high" }], interactionMode: "plan" },
+        );
+        yield* harness.startTurn();
+        const snapshot = yield* harness.runtime.readThreadSnapshot({
+          providerThread: harness.providerThread,
+        });
+        const steering = harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: harness.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: snapshot.providerTurns.at(-1)!.id,
+          message: {
+            messageId: MessageId.make("message-opencode-steer-agent"),
+            text: "also cover the README",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+          },
+        });
 
-      const [start, steer] = promptInputs;
-      assert.equal(start?.agent, "plan");
-      assert.equal(start?.variant, "high");
-      assert.include(start?.system ?? "", "OpenCode");
-      assert.deepEqual(
-        { agent: steer?.agent, variant: steer?.variant, system: steer?.system },
-        { agent: start?.agent, variant: start?.variant, system: start?.system },
-      );
-    }).pipe(
-      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
-      Effect.scoped,
-    ),
+        if (transport === "sdk-error") {
+          const error = yield* steering.pipe(Effect.flip);
+          assert.isTrue(ProviderAdapter.isProviderAdapterSteerRunError(error));
+          assert.isNotTrue(
+            ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+          );
+        } else yield* steering;
+        assert.equal(promptInputs.length, 2);
+        const [start, steer] = promptInputs;
+        assert.equal(start?.agent, "plan");
+        assert.equal(start?.variant, "high");
+        assert.include(start?.system ?? "", "OpenCode");
+        assert.deepEqual(
+          { agent: steer?.agent, variant: steer?.variant, system: steer?.system },
+          { agent: start?.agent, variant: start?.variant, system: start?.system },
+        );
+      }).pipe(
+        Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+        Effect.scoped,
+      ),
   );
 
   it.effect("keeps a newly admitted prompt alive across stale idle and delayed busy evidence", () =>
@@ -1667,6 +1804,26 @@ describe("OpenCodeAdapterV2", () => {
       let promptCalls = 0;
       let statusCalls = 0;
       const promptInputs: Array<{ readonly messageID?: string }> = [];
+      const sdk = createOpencodeClient({ baseUrl: "http://test.invalid", throwOnError: true });
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi.spyOn(globalThis, "fetch").mockImplementation(async (request) => {
+            assert.instanceOf(request, Request);
+            if (promptCalls === 2) {
+              steerPromptStarted.resolve();
+              await steerPrompt.promise;
+            } else {
+              stopPromptStarted.resolve();
+              const signal = (request as Request).signal;
+              await new Promise<void>((_resolve, reject) =>
+                signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+              );
+            }
+            return Response.json(true);
+          }),
+        ),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
       const client = {
         event: {
           subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
@@ -1690,18 +1847,12 @@ describe("OpenCodeAdapterV2", () => {
             if (promptCalls === 1) {
               promptStarted.resolve();
               await prompt.promise;
-            } else if (promptCalls === 2) {
-              steerPromptStarted.resolve();
-              await steerPrompt.promise;
-            } else {
-              stopPromptStarted.resolve();
-              await new Promise<void>((_resolve, reject) =>
-                options?.signal?.addEventListener("abort", () => reject(options.signal!.reason), {
-                  once: true,
-                }),
-              );
+              return { data: true };
             }
-            return { data: true };
+            return sdk.session.promptAsync(
+              input as Parameters<typeof sdk.session.promptAsync>[0],
+              options,
+            );
           },
           status: async () => ({
             data: (() => {
@@ -1972,12 +2123,58 @@ describe("OpenCodeAdapterV2", () => {
     ),
   );
 
-  it.effect("rejects steering when stop wins the extracted-text lookup", () =>
+  it.effect.each([
+    { phase: "extraction", command: false },
+    { phase: "submission", command: false },
+    { phase: "logging", command: false },
+    { phase: "logging", command: true },
+    { phase: "logging-timeout", command: false },
+    { phase: "logging-timeout", command: true },
+    { phase: "fork", command: true },
+    { phase: "sdk", command: false },
+    { phase: "sdk", command: true },
+    { phase: "sdk-timeout", command: false },
+    { phase: "sdk-timeout", command: true },
+    { phase: "sdk-validation", command: false },
+    { phase: "sdk-validation", command: true },
+    { phase: "sdk-rejection", command: false },
+    { phase: "sdk-rejection", command: true },
+    { phase: "sdk-failed-stop", command: false },
+    { phase: "sdk-failed-stop", command: true },
+    { phase: "extraction-failed-stop", command: false },
+  ])("preserves unsent steering during $phase with command=$command", ({ phase, command }) =>
     Effect.gen(function* () {
       const events = asyncEventStream();
       const lookup = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
+      const queuedStop = yield* Deferred.make<void, ProviderAdapter.ProviderAdapterV2Error>();
+      const scope = yield* Effect.scope;
       let prompts = 0;
+      let steering = false;
+      let initialMessageId = "";
+      let abortFailed = false;
+      const nativePreparation = promiseGate<void>();
+      const nativeFetch: typeof fetch = async (request) => {
+        assert.instanceOf(request, Request);
+        (request as Request).signal.throwIfAborted();
+        prompts++;
+        return Response.json(true);
+      };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => vi.spyOn(globalThis, "fetch").mockImplementation(nativeFetch)),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      const sdk = createOpencodeClient({
+        baseUrl: "http://test.invalid",
+        throwOnError: true,
+        requestValidator: async () => {
+          Deferred.doneUnsafe(lookup, Effect.void);
+          await nativePreparation.promise;
+          if (phase === "sdk-validation" || phase === "sdk-rejection")
+            throw new DOMException("Cancelled before fetch", "AbortError");
+        },
+        fetch: nativeFetch,
+      });
       const harness = yield* makeOpenCodeRuntimeHarness(
         "extraction-stop",
         "root",
@@ -1988,43 +2185,125 @@ describe("OpenCodeAdapterV2", () => {
               return { stream: events.stream };
             },
           },
+          command: { list: async () => ({ data: [{ name: "review" }] }) },
           session: {
             create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
             get: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
-            promptAsync: async () => {
+            promptAsync: async (input: unknown, options: { signal: AbortSignal }) => {
+              if (phase.startsWith("sdk") && steering)
+                return sdk.session.promptAsync(
+                  input as Parameters<typeof sdk.session.promptAsync>[0],
+                  options,
+                );
+              options.signal.throwIfAborted();
+              if (!steering) initialMessageId = (input as { messageID: string }).messageID;
+              prompts++;
+              return { data: true };
+            },
+            command: async (input: unknown, options: { signal: AbortSignal }) => {
+              if (phase.startsWith("sdk"))
+                return sdk.session.command(
+                  input as Parameters<typeof sdk.session.command>[0],
+                  options,
+                );
+              options.signal.throwIfAborted();
               prompts++;
               return { data: true };
             },
             status: async () => ({ data: { root: { type: "busy" } } }),
             messages: async () => ({ data: [] }),
             children: async () => ({ data: [] }),
-            abort: async () => ({ data: true }),
+            abort: async () => {
+              if (phase.endsWith("failed-stop") && !abortFailed) {
+                abortFailed = true;
+                throw new Error("Native abort failed");
+              }
+              return { data: true };
+            },
           },
           mcp: { add: async () => ({ data: true }) },
         },
         {
           resolveAttachmentPath: () => "/workspace/report.docx",
           resolveExtractedTextPath: () =>
-            Deferred.succeed(lookup, undefined).pipe(
-              Effect.andThen(Deferred.await(release)),
-              Effect.as("/workspace/report.docx.txt"),
-            ),
+            !phase.startsWith("extraction")
+              ? Effect.succeed("/workspace/report.docx.txt")
+              : Deferred.succeed(lookup, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as("/workspace/report.docx.txt"),
+                ),
+        },
+        {
+          nativeEventLogger: {
+            filePath: "/tmp/opencode-steer-stop.ndjson",
+            write: (event) => {
+              const record = (
+                event as { event: { payload: { direction?: string; method?: string } } }
+              ).event.payload;
+              return phase.startsWith("logging") &&
+                steering &&
+                record.direction === "outgoing" &&
+                record.method === (command ? "session.command" : "session.promptAsync")
+                ? Deferred.succeed(lookup, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void;
+            },
+            close: () => Effect.void,
+          },
         },
       );
       yield* harness.startTurn();
+      yield* Effect.promise(() =>
+        events.push({
+          type: "message.updated",
+          properties: {
+            sessionID: "root",
+            info: {
+              id: initialMessageId,
+              sessionID: "root",
+              role: "user",
+              time: { created: DateTime.toEpochMillis(harness.now) },
+            },
+          },
+        }),
+      );
       const snapshot = yield* harness.runtime.readThreadSnapshot({
         providerThread: harness.providerThread,
       });
       const turn = snapshot.providerTurns.at(-1)!;
+      let submitCalls = 0;
+      steering = true;
       const steer = yield* harness.runtime
         .steerTurn({
+          beforeSubmit: Effect.sync(() => {
+            submitCalls += 1;
+          }).pipe(
+            Effect.andThen(
+              phase === "fork"
+                ? Deferred.complete(
+                    queuedStop,
+                    harness.runtime.interruptTurn({
+                      providerThread: harness.providerThread,
+                      providerTurnId: turn.id,
+                    }),
+                  ).pipe(
+                    Effect.forkIn(scope),
+                    Effect.andThen(Deferred.succeed(lookup, undefined)),
+                    Effect.asVoid,
+                  )
+                : phase === "submission"
+                  ? Deferred.succeed(lookup, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    )
+                  : Effect.void,
+            ),
+          ),
           threadId: harness.threadId,
           runId: harness.runId,
           providerThread: harness.providerThread,
           providerTurnId: turn.id,
           message: {
             messageId: MessageId.make("steer-extraction-stop"),
-            text: "read this",
+            text: command ? "/review" : "read this",
             createdBy: "user",
             creationSource: "web",
             attachments: [
@@ -2038,14 +2317,33 @@ describe("OpenCodeAdapterV2", () => {
             ],
           },
         })
-        .pipe(Effect.exit, Effect.forkScoped);
+        .pipe(Effect.result, Effect.forkScoped);
       yield* Deferred.await(lookup);
-      yield* harness.runtime.interruptTurn({
-        providerThread: harness.providerThread,
-        providerTurnId: turn.id,
-      });
+      const stopping =
+        phase === "sdk-rejection"
+          ? Effect.void
+          : phase === "fork"
+            ? Deferred.await(queuedStop)
+            : harness.runtime.interruptTurn({
+                providerThread: harness.providerThread,
+                providerTurnId: turn.id,
+              });
+      const stop = yield* stopping.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }));
+      const stopResult = yield* Fiber.join(stop);
+      assert.equal(Exit.isFailure(stopResult), phase.endsWith("failed-stop"));
+      if (phase.endsWith("timeout")) yield* TestClock.adjust("10 seconds");
+      nativePreparation.resolve();
       yield* Deferred.succeed(release, undefined);
-      assert.isTrue(Exit.isFailure(yield* Fiber.join(steer)));
+      const outcome = yield* Fiber.join(steer);
+      assert.isTrue(Result.isFailure(outcome));
+      const error = Result.isFailure(outcome) ? outcome.failure : undefined;
+      assert.isTrue(
+        ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+      );
+      assert.equal(
+        submitCalls,
+        phase === "submission" || phase === "fork" || phase.startsWith("sdk") ? 1 : 0,
+      );
       assert.equal(prompts, 1);
       yield* Effect.promise(() =>
         events.push({
@@ -2056,7 +2354,10 @@ describe("OpenCodeAdapterV2", () => {
       const stopped = yield* harness.runtime.readThreadSnapshot({
         providerThread: harness.providerThread,
       });
-      assert.equal(stopped.providerTurns.at(-1)?.status, "interrupted");
+      assert.equal(
+        stopped.providerTurns.at(-1)?.status,
+        phase === "sdk-rejection" || phase.endsWith("failed-stop") ? "completed" : "interrupted",
+      );
     }).pipe(
       Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
       Effect.scoped,
@@ -2507,7 +2808,14 @@ describe("OpenCodeAdapterV2", () => {
         method: "session.prompt",
         payload: { prompt: secret, nested: { token: secret } },
       });
+      yield* logProtocolEvent({
+        direction: "incoming",
+        messageKind: "notification",
+        method: "message.part.delta",
+        payload: { type: "message.part.delta", properties: { delta: secret } },
+      });
 
+      assert.lengthOf(records, 1);
       const serialized = encodeUnknownJson(records);
       assert.notInclude(serialized, secret);
       assert.include(serialized, '"protocol":"opencode-sdk.sse"');

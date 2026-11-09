@@ -32,6 +32,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
@@ -165,11 +166,15 @@ interface FakePi {
   readonly deferNextState: () => void;
   readonly resolveDeferredState: (data: unknown) => Effect.Effect<void>;
   readonly failNextState: () => void;
+  readonly failNextThinking: () => void;
   readonly deferNextLifecycle: (type: "switch_session" | "new_session" | "fork" | "abort") => void;
   readonly deferNextModelSelection: () => void;
+  readonly deferNextPrompt: () => void;
   readonly queueModels: (models: ReadonlyArray<unknown>) => void;
   readonly vetoNextNewSession: () => void;
   readonly allRequests: () => ReadonlyArray<PiRpcRecord>;
+  readonly promptThinkingLevels: ReadonlyArray<string>;
+  readonly promptModels: ReadonlyArray<string>;
   readonly queueStats: (data: unknown) => void;
   /** Pi before 0.84.4 answers clear_queue as an unknown command. */
   readonly setClearQueue: (
@@ -213,6 +218,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
   let deferState = false;
   let deferredStateRequest: PiRpcRecord | undefined;
   let failState = false;
+  let failThinking = false;
   let vetoSwitch = false;
   let vetoNewSession = false;
   let deferredLifecycle: string | undefined;
@@ -222,10 +228,22 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
   let isStreaming: boolean | null = null;
   let isCompacting = false;
   let clearQueue: Parameters<FakePi["setClearQueue"]>[0] = { steering: [], followUp: [] };
+  const pendingPromptReplies: Array<unknown> = [];
   let stdinBuffer = "";
+  let thinkingLevel = "high";
+  const promptThinkingLevels: Array<string> = [];
+  const promptModels: Array<string> = [];
+  let currentModel = "default";
 
   const emit = (record: PiRpcRecord, chunkBytes?: number) =>
     Effect.gen(function* () {
+      if (record["type"] === "response" && record["command"] === "prompt") {
+        const index = record["id"] === undefined ? 0 : pendingPromptReplies.indexOf(record["id"]);
+        if (index >= 0 && index < pendingPromptReplies.length) {
+          const [id] = pendingPromptReplies.splice(index, 1);
+          record = { ...record, id };
+        }
+      }
       const bytes = new TextEncoder().encode(`${encodeJsonLine(record)}\n`);
       const size = chunkBytes ?? bytes.byteLength;
       for (let offset = 0; offset < bytes.byteLength; offset += size) {
@@ -234,6 +252,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
     });
 
   const respondTo = (record: PiRpcRecord): PiRpcRecord | null => {
+    if (record["type"] === "prompt" && isStreaming === null && !isCompacting) return null;
     if (
       typeof record["id"] !== "string" &&
       !(record["type"] === "prompt" && (isStreaming !== null || isCompacting))
@@ -259,6 +278,18 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
             ...stateQueue.shift(),
           },
         };
+      case "set_model":
+        // Pi reapplies the target model's configured thinking default.
+        thinkingLevel = "low";
+        currentModel = `${String(record["provider"])}/${String(record["modelId"])}`;
+        return base;
+      case "set_thinking_level":
+        if (failThinking) {
+          failThinking = false;
+          return { ...base, success: false, error: "thinking unavailable" };
+        }
+        thinkingLevel = String(record["level"]);
+        return base;
       case "prompt":
         if (isCompacting) {
           return { ...base, success: false, error: PI_COMPACTING_PROMPT_ERROR };
@@ -312,6 +343,11 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         stdinBuffer = stdinBuffer.slice(newline + 1);
         if (line.length === 0) continue;
         const record = decodeJsonLine(line) as PiRpcRecord;
+        if (record["type"] === "prompt") {
+          pendingPromptReplies.push(record["id"]);
+          promptThinkingLevels.push(thinkingLevel);
+          promptModels.push(currentModel);
+        }
         allRequests.push(record);
         yield* Queue.offer(requests, record);
         if (record["type"] === "get_state" && deferState) {
@@ -366,6 +402,11 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
 
   return {
     spawner,
+    failNextThinking: () => {
+      failThinking = true;
+    },
+    promptThinkingLevels,
+    promptModels,
     emit,
     takeRequest,
     queueEntries: (data) => entriesQueue.push(data),
@@ -391,6 +432,9 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
     },
     deferNextLifecycle: (type) => {
       deferredLifecycle = type;
+    },
+    deferNextPrompt: () => {
+      deferredLifecycle = "prompt";
     },
     deferNextModelSelection: () => {
       deferredLifecycle = "set_model";
@@ -550,6 +594,419 @@ const startTurn = Effect.fnUntraced(function* (
 });
 
 describe("PiAdapterV2", () => {
+  it.effect(
+    "replaces keyed extension statuses while idle without producing conversation items",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const updates = [
+          { statusKey: "watch", statusText: "\u001b[32mWatching 3 files\u001b[0m\u0007" },
+          { statusKey: "lint", statusText: "Lint clean" },
+          { statusKey: "watch", statusText: "Watching 4 files" },
+          { statusKey: "watch", statusText: "Watching 4 files" },
+          { statusKey: "watch", statusText: "\u001b[32mWatching 4 files\u001b[0m" },
+          { statusKey: "lint", statusText: "" },
+          { statusKey: "missing" },
+          { statusKey: "watch" },
+          { statusKey: "watch", statusText: "Watching 4 files" },
+        ];
+        for (const update of updates) {
+          yield* fake.emit({ type: "extension_ui_request", method: "setStatus", ...update });
+        }
+        // The following dialog is an observable milestone after the preceding native notifications.
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "status-barrier",
+          method: "input",
+          title: "Continue?",
+        });
+        const observed: ProviderAdapter.ProviderAdapterV2Event[] = [];
+        yield* takeEvent((event) => {
+          observed.push(event);
+          return event.type === "runtime_request.updated";
+        });
+        assert.deepInclude(runtime.providerSession, {
+          extensionStatuses: [{ key: "watch", text: "Watching 4 files" }],
+        });
+        const snapshots = observed.filter((event) => event.type === "provider_session.updated");
+        assert.lengthOf(snapshots, 6);
+        assert.deepInclude(snapshots[0]?.providerSession, {
+          extensionStatuses: [{ key: "watch", text: "Watching 3 files" }],
+        });
+        assert.deepInclude(snapshots[2]?.providerSession, {
+          extensionStatuses: [
+            { key: "watch", text: "Watching 4 files" },
+            { key: "lint", text: "Lint clean" },
+          ],
+        });
+        assert.isFalse(observed.some((event) => event.type === "message.updated"));
+        assert.isFalse(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" && event.turnItem.type !== "user_input_request",
+          ),
+        );
+        assert.isFalse(
+          fake.allRequests().some((request) => request["type"] === "extension_ui_response"),
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("bounds native extension statuses and lets cleared keys free capacity", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      for (let index = 0; index < 35; index++) {
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setStatus",
+          statusKey: `key-${index}`,
+          statusText: index === 1 ? "w".repeat(20000) : "Watching",
+        });
+      }
+      for (const update of [
+        { statusKey: "" },
+        { statusKey: "x".repeat(257) },
+        { statusKey: "malformed", statusText: null },
+      ]) {
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setStatus",
+          statusText: "Invalid",
+          ...update,
+        });
+      }
+      yield* fake.emit({ type: "extension_ui_request", method: "setStatus", statusKey: "key-0" });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setStatus",
+        statusKey: "replacement",
+        statusText: "New status",
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        id: "status-barrier",
+        method: "input",
+        title: "Continue?",
+      });
+      yield* takeEvent((event) => event.type === "runtime_request.updated");
+      const statuses = runtime.providerSession.extensionStatuses ?? [];
+      assert.lengthOf(statuses, 32);
+      assert.equal(statuses[0]?.key, "key-1");
+      assert.equal(statuses[0]?.text.length, 4096);
+      assert.deepEqual(statuses.at(-1), { key: "replacement", text: "New status" });
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("publishes extension status while native work awaits adoption", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const offers =
+        yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+      const { runtime, takeEvent } = yield* openRuntime(
+        fake,
+        "default",
+        THREAD_ID,
+        SESSION_ID,
+        undefined,
+        { offer: (offer) => Queue.offer(offers, offer).pipe(Effect.asVoid) },
+      );
+      yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* fake.emit({ type: "agent_start" });
+      yield* Queue.take(offers);
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setStatus",
+        statusKey: "watch",
+        statusText: "Native wake",
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        id: "status-barrier",
+        method: "input",
+        title: "Continue?",
+      });
+      yield* takeEvent((event) => event.type === "runtime_request.updated");
+      assert.deepEqual(runtime.providerSession.extensionStatuses, [
+        { key: "watch", text: "Native wake" },
+      ]);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "keeps extension status through turn settlement and clears it on native session replacement",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setStatus",
+          statusKey: "watch",
+          statusText: "Watching",
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.deepInclude(runtime.providerSession, {
+          status: "ready",
+          extensionStatuses: [{ key: "watch", text: "Watching" }],
+        });
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "anthropic/other-model",
+          [],
+          "Hello again",
+          undefined,
+          2,
+        );
+        assert.deepEqual(runtime.providerSession.extensionStatuses, [
+          { key: "watch", text: "Watching" },
+        ]);
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        assert.deepInclude(runtime.providerSession, { extensionStatuses: [] });
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["model error", "rejected prompt", "failed compact"] as const)(
+    "keeps extension status through a reusable %s and the next turn",
+    (failure) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setStatus",
+          statusKey: "watch",
+          statusText: "Watching 3 files",
+        });
+        const command = failure === "failed compact" ? "compact" : "prompt";
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          command === "compact" ? "/compact" : "Hello pi",
+        );
+        yield* fake.takeRequest(command);
+        if (failure === "model error") {
+          yield* fake.emit({
+            type: "message_end",
+            message: { role: "assistant", stopReason: "error", errorMessage: "Rate limited" },
+          });
+          yield* fake.emit({ type: "agent_settled" });
+        } else {
+          yield* fake.emit({
+            type: "response",
+            command,
+            success: false,
+            error: "Request rejected",
+          });
+        }
+        const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "failed");
+        assert.deepInclude(runtime.providerSession, {
+          status: "error",
+          extensionStatuses: [{ key: "watch", text: "Watching 3 files" }],
+        });
+
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setStatus",
+          statusKey: "watch",
+          statusText: "Watching 4 files",
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "failed-turn-status-barrier",
+          method: "input",
+          title: "Continue?",
+        });
+        yield* takeEvent((event) => event.type === "runtime_request.updated");
+        assert.deepInclude(runtime.providerSession, {
+          status: "error",
+          extensionStatuses: [{ key: "watch", text: "Watching 4 files" }],
+        });
+
+        yield* startTurn(runtime, providerThread, "default", [], "Hello again", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_settled" });
+        const nextTerminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(nextTerminal.type === "turn.terminal" && nextTerminal.status === "completed");
+        assert.deepInclude(runtime.providerSession, {
+          id: SESSION_ID,
+          status: "ready",
+          extensionStatuses: [{ key: "watch", text: "Watching 4 files" }],
+        });
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("preserves extension statuses when a native session switch is vetoed", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setStatus",
+        statusKey: "watch",
+        statusText: "Watching",
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        id: "status-barrier",
+        method: "input",
+        title: "Continue?",
+      });
+      yield* takeEvent((event) => event.type === "runtime_request.updated");
+      fake.vetoNextSwitch();
+      const exit = yield* runtime.resumeThread({ providerThread }).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(exit));
+      assert.deepEqual(runtime.providerSession.extensionStatuses, [
+        { key: "watch", text: "Watching" },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["success", "cancelled", "error"] as const)(
+    "handles native status publications during session switch hooks, outcome=%s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        for (const key of ["watch", "lint"])
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setStatus",
+            statusKey: key,
+            statusText: key === "lint" ? "Lint clean" : "Watching",
+          });
+        fake.deferNextLifecycle("switch_session");
+        const switching = yield* runtime
+          .resumeThread({ providerThread })
+          .pipe(Effect.exit, Effect.forkScoped);
+        const request = yield* fake.takeRequest("switch_session");
+        yield* fake.emit({ type: "extension_ui_request", method: "setStatus", statusKey: "watch" });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setStatus",
+          statusKey: "startup",
+          statusText: "Fresh status",
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "switch-hook",
+          method: "input",
+          title: "Continue?",
+        });
+        yield* takeEvent((event) => event.type === "runtime_request.updated");
+        yield* fake.emit({
+          type: "response",
+          id: request["id"],
+          command: "switch_session",
+          success: outcome !== "error",
+          data: { cancelled: outcome === "cancelled" },
+          ...(outcome === "error" ? { error: "Session replacement failed" } : {}),
+        });
+        const exit = yield* Fiber.join(switching);
+        assert.equal(Exit.isFailure(exit), outcome !== "success");
+        if (outcome === "error") {
+          const reuse = yield* runtime.resumeThread({ providerThread }).pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(reuse));
+          yield* takeEvent(
+            (event) =>
+              event.type === "provider_session.updated" && event.providerSession.status === "error",
+          );
+          assert.deepEqual(runtime.providerSession.extensionStatuses, []);
+          return;
+        }
+        assert.deepEqual(runtime.providerSession.extensionStatuses, [
+          ...(outcome === "cancelled" ? [{ key: "lint", text: "Lint clean" }] : []),
+          { key: "startup", text: "Fresh status" },
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["stop", "transport death"] as const)(
+    "clears extension statuses on %s",
+    (retirement) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        const turnStarted = yield* takeEvent((event) => event.type === "provider_turn.updated");
+        assert.equal(turnStarted.type, "provider_turn.updated");
+        if (turnStarted.type !== "provider_turn.updated") return;
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setStatus",
+          statusKey: "watch",
+          statusText: "Watching",
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "status-barrier",
+          method: "input",
+          title: "Continue?",
+        });
+        yield* takeEvent((event) => event.type === "runtime_request.updated");
+        assert.deepInclude(runtime.providerSession, {
+          extensionStatuses: [{ key: "watch", text: "Watching" }],
+        });
+        if (retirement === "stop") {
+          yield* runtime.interruptTurn({
+            providerThread,
+            providerTurnId: turnStarted.providerTurn.id,
+            requestRuntimeRestart: true,
+          });
+        } else yield* fake.closeStdout;
+        yield* takeEvent(
+          (event) =>
+            event.type === "provider_session.updated" &&
+            event.providerSession.status === (retirement === "stop" ? "stopped" : "error"),
+        );
+        assert.deepInclude(runtime.providerSession, { extensionStatuses: [] });
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("keeps native image bytes and the saved path in the prompt", () =>
     Effect.gen(function* () {
       const host = yield* ProviderHost.ProviderHost;
@@ -1533,7 +1990,10 @@ describe("PiAdapterV2", () => {
   it.effect("gives notify and extension-error items distinct ids in each thread", () =>
     Effect.gen(function* () {
       const itemIds = new Set<string>();
-      for (const threadId of [THREAD_ID, ThreadId.make("thread-pi-test-2")]) {
+      for (const [threadId, extensionPath] of [
+        [THREAD_ID, "/ext/a.ts"],
+        [ThreadId.make("thread-pi-test-2"), "/ext/a/index.ts"],
+      ] as const) {
         const fake = yield* makeFakePi;
         const { runtime, takeEvent } = yield* openRuntime(fake, "default", threadId);
         const providerThread = yield* runtime.ensureThread({
@@ -1558,7 +2018,7 @@ describe("PiAdapterV2", () => {
           method: "notify",
           message: "note",
         });
-        yield* fake.emit({ type: "extension_error", extensionPath: "/ext/a.ts", error: "boom" });
+        yield* fake.emit({ type: "extension_error", extensionPath, error: "boom" });
         for (const prefix of ["notify:", "extension-error:"]) {
           const item = yield* takeEvent(
             (event) =>
@@ -1566,6 +2026,9 @@ describe("PiAdapterV2", () => {
               event.turnItem.nativeItemRef?.nativeId?.startsWith(prefix) === true,
           );
           if (item.type === "turn_item.updated") itemIds.add(item.turnItem.id);
+          if (item.type === "turn_item.updated" && prefix === "extension-error:") {
+            assert.equal(item.turnItem.title, "a");
+          }
         }
       }
       assert.equal(itemIds.size, 4);
@@ -1795,55 +2258,149 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
-  it.effect("resets applied thinking when returning to Pi default", () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakePi;
-      fake.queueState({
-        model: { provider: "xai", id: "grok-4.6" },
-        thinkingLevel: "medium",
-        sessionFile: FAKE_SESSION_FILE,
-        sessionId: "abc",
-      });
-      const { runtime, takeEvent } = yield* openRuntime(fake);
-      const providerThread = yield* runtime.ensureThread({
-        threadId: THREAD_ID,
-        modelSelection: modelSelection("default"),
-        runtimePolicy,
-      });
-
-      yield* startTurn(runtime, providerThread, "default", [], "Hello pi", {
-        instanceId: PI_INSTANCE_ID,
-        model: "xai/grok-4.6",
-        options: [{ id: "thinking", value: "high" }],
-      });
-      const modelRequest = yield* fake.takeRequest("set_model");
-      assert.equal(modelRequest["provider"], "xai");
-      assert.equal(modelRequest["modelId"], "grok-4.6");
-      const levelRequest = yield* fake.takeRequest("set_thinking_level");
-      assert.equal(levelRequest["level"], "high");
-      yield* fake.emit({ type: "agent_start" });
-      yield* fake.emit({ type: "agent_end", messages: [], willRetry: false });
-      yield* fake.emit({ type: "agent_settled" });
-      yield* takeEvent((event) => event.type === "turn.terminal");
-
-      yield* startTurn(
-        runtime,
-        providerThread,
-        "default",
-        [],
-        "Hello pi",
-        {
+  it.effect.each(["anthropic/model-b", "default"])(
+    "preserves explicit thinking when switching models to %s in the same runtime",
+    (targetModel) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        fake.queueState({
+          model: { provider: "anthropic", id: "model-b" },
+          thinkingLevel: "high",
+          sessionFile: FAKE_SESSION_FILE,
+        });
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const selection = (model: string): ModelSelection => ({
           instanceId: PI_INSTANCE_ID,
-          model: "default",
-        },
-        2,
-      );
-      const replayModel = yield* fake.takeRequest("set_model");
-      assert.equal(replayModel["provider"], "xai");
-      assert.equal(replayModel["modelId"], "grok-4.6");
-      const resetLevel = yield* fake.takeRequest("set_thinking_level");
-      assert.equal(resetLevel["level"], "medium");
-    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+          model,
+          options: [{ id: "thinking", value: "high" }],
+        });
+
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          "First",
+          selection("anthropic/model-a"),
+        );
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        yield* fake.emit({ type: "agent_end", messages: [], willRetry: false });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          "Second",
+          selection(targetModel),
+          2,
+        );
+        yield* fake.takeRequest("prompt");
+        assert.deepEqual(fake.promptThinkingLevels, ["high", "high"]);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([false, true, "previous"] as const)(
+    "resets applied thinking when returning to Pi default (failed first restore: %s)",
+    (failFirstRestore) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        fake.queueState({
+          model: { provider: "xai", id: "grok-4.6" },
+          thinkingLevel: "medium",
+          sessionFile: FAKE_SESSION_FILE,
+          sessionId: "abc",
+        });
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+
+        yield* startTurn(runtime, providerThread, "default", [], "Hello pi", {
+          instanceId: PI_INSTANCE_ID,
+          model: "anthropic/model-a",
+          options: [{ id: "thinking", value: "high" }],
+        });
+        const modelRequest = yield* fake.takeRequest("set_model");
+        assert.equal(modelRequest["provider"], "anthropic");
+        assert.equal(modelRequest["modelId"], "model-a");
+        const levelRequest = yield* fake.takeRequest("set_thinking_level");
+        assert.equal(levelRequest["level"], "high");
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        yield* fake.emit({ type: "agent_end", messages: [], willRetry: false });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+
+        if (failFirstRestore) {
+          fake.failNextThinking();
+          const result = yield* startTurn(
+            runtime,
+            providerThread,
+            "default",
+            [],
+            "Hello pi",
+            {
+              instanceId: PI_INSTANCE_ID,
+              model: "default",
+            },
+            2,
+          ).pipe(Effect.exit);
+          assert.equal(result._tag, "Failure");
+          yield* fake.takeRequest("set_model");
+          yield* fake.takeRequest("set_thinking_level");
+        }
+
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          "Hello pi",
+          {
+            instanceId: PI_INSTANCE_ID,
+            model: failFirstRestore === "previous" ? "anthropic/model-a" : "default",
+            ...(failFirstRestore === "previous"
+              ? { options: [{ id: "thinking", value: "high" }] }
+              : {}),
+          },
+          2,
+        );
+        yield* fake.takeRequest("prompt");
+        assert.deepEqual(fake.promptThinkingLevels, [
+          "high",
+          failFirstRestore === "previous" ? "high" : "medium",
+        ]);
+        assert.deepEqual(fake.promptModels, [
+          "anthropic/model-a",
+          failFirstRestore === "previous" ? "anthropic/model-a" : "xai/grok-4.6",
+        ]);
+        const replayModel = fake
+          .allRequests()
+          .findLast((request) => request["type"] === "set_model")!;
+        assert.equal(
+          replayModel["provider"],
+          failFirstRestore === "previous" ? "anthropic" : "xai",
+        );
+        assert.equal(
+          replayModel["modelId"],
+          failFirstRestore === "previous" ? "model-a" : "grok-4.6",
+        );
+        const resetLevel = fake
+          .allRequests()
+          .findLast((request) => request["type"] === "set_thinking_level")!;
+        assert.equal(resetLevel["level"], failFirstRestore === "previous" ? "high" : "medium");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   it.effect.each([
@@ -2322,7 +2879,10 @@ describe("PiAdapterV2", () => {
           if (event.type !== "turn_item.updated" || event.turnItem.type !== "dynamic_tool")
             return yield* Effect.die("Expected a read image tool item");
           assert.deepEqual(event.turnItem.output, { content: imageContent, structuredContent });
-          assert.equal(turnItemOutputText(event.turnItem), note);
+          assert.equal(
+            turnItemOutputText(event.turnItem),
+            JSON.stringify(structuredContent, null, 2),
+          );
         }
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
@@ -2379,7 +2939,7 @@ describe("PiAdapterV2", () => {
           assert.equal(event.turnItem.toolName, tool.name);
           assert.equal(event.turnItem.status, "completed");
           assert.deepEqual(event.turnItem.output, { content, structuredContent: metadata });
-          assert.equal(turnItemOutputText(event.turnItem), "Screenshot captured");
+          assert.equal(turnItemOutputText(event.turnItem), JSON.stringify(metadata, null, 2));
           const image = toolOutputImages(event.turnItem.output)[0];
           assert.equal(image?.mimeType, "image/png");
           assert.deepEqual(Buffer.from(image!.data!, "base64"), pixels);
@@ -4383,77 +4943,297 @@ describe("PiAdapterV2", () => {
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
-  it.effect("delivers a steer sent during in-turn compaction once it ends", () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakePi;
-      const { runtime, takeEvent } = yield* openRuntime(fake);
-      const providerThread = yield* runtime.ensureThread({
-        threadId: THREAD_ID,
-        modelSelection: modelSelection("default"),
-        runtimePolicy,
-      });
-      yield* startTurn(runtime, providerThread);
-      yield* fake.takeRequest("prompt");
-      const running = yield* takeEvent(
-        (event) =>
-          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
-      );
-      const providerTurnId =
-        running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
-      assert.isDefined(providerTurnId);
-      yield* fake.emit({ type: "agent_start" });
-      fake.queueState({ isStreaming: false, isCompacting: true, pendingMessageCount: 0 });
-      yield* fake.emit({ type: "agent_settled" });
-      yield* fake.takeRequest("get_state");
-      fake.setCompacting(true);
-      yield* fake.emit({ type: "compaction_start", reason: "manual" });
-      yield* takeEvent(
-        (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
-      );
+  it.effect.each(["accepted", "rejected", "closed", "timeout", "stopped", "failed-stop"] as const)(
+    "waits for a tracked steer acknowledgement without blocking dialogs, outcome=%s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "response", command: "prompt", success: true });
+        yield* fake.emit({ type: "agent_start" });
+        const running = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        );
+        if (running.type !== "provider_turn.updated") throw new Error("Expected running turn");
+        if (outcome === "stopped" || outcome === "failed-stop") fake.setStreaming(false);
+        const pending = yield* runtime
+          .steerTurn({
+            threadId: THREAD_ID,
+            runId: RunId.make("run:thread-pi-test:1"),
+            providerThread,
+            providerTurnId: running.providerTurn.id,
+            beforeSubmit:
+              outcome === "failed-stop"
+                ? Effect.gen(function* () {
+                    fake.deferNextLifecycle("abort");
+                    const stopping = yield* runtime
+                      .interruptTurn({ providerThread, providerTurnId: running.providerTurn.id })
+                      .pipe(Effect.exit, Effect.forkScoped);
+                    const abort = yield* fake.takeRequest("abort");
+                    yield* fake.emit({
+                      type: "response",
+                      id: abort["id"],
+                      command: "abort",
+                      success: false,
+                      error: "Stop failed",
+                    });
+                    assert.isTrue(Exit.isFailure(yield* Fiber.join(stopping)));
+                  }).pipe(Effect.scoped)
+                : outcome === "stopped"
+                  ? runtime
+                      .interruptTurn({ providerThread, providerTurnId: running.providerTurn.id })
+                      .pipe(Effect.orDie)
+                  : Effect.void,
+            message: {
+              messageId: "message:tracked-ack" as never,
+              text: "Tracked steer",
+              attachments: [],
+              createdBy: "user",
+              creationSource: "web",
+            },
+          })
+          .pipe(Effect.forkScoped);
+        if (outcome === "stopped" || outcome === "failed-stop") {
+          const error = yield* Fiber.join(pending).pipe(Effect.flip);
+          assert.isTrue(
+            ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+          );
+          assert.equal(
+            fake.allRequests().filter((request) => request["type"] === "prompt").length,
+            1,
+          );
+          return;
+        }
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "steer-dialog",
+          method: "confirm",
+          title: "Accept input?",
+        });
+        const dialog = yield* takeEvent((event) => event.type === "runtime_request.updated");
+        assert.isUndefined(
+          pending.pollUnsafe(),
+          "A transport write is not a native acknowledgement",
+        );
+        if (dialog.type !== "runtime_request.updated") throw new Error("Expected dialog");
+        yield* runtime.respondToRuntimeRequest({
+          requestId: dialog.runtimeRequest.id,
+          decision: "accept",
+        });
+        yield* fake.takeRequest("extension_ui_response");
+        if (outcome === "closed") yield* fake.closeStdout;
+        else if (outcome === "timeout") yield* TestClock.adjust("15 seconds");
+        else
+          yield* fake.emit({
+            type: "response",
+            command: "prompt",
+            success: outcome === "accepted",
+            error: "Extension failed after handling input",
+          });
+        if (outcome === "accepted") yield* Fiber.join(pending);
+        else {
+          const error = yield* Fiber.join(pending).pipe(Effect.flip);
+          assert.isTrue(ProviderAdapter.isProviderAdapterSteerRunError(error));
+          assert.isFalse(
+            ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+            "An uncertain outcome must not be replayed",
+          );
+        }
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
 
-      yield* runtime.steerTurn({
-        threadId: THREAD_ID,
-        runId: RunId.make("run:thread-pi-test:1"),
-        providerThread,
-        providerTurnId: providerTurnId!,
-        message: {
-          messageId: "message:thread-pi-test:steer-during-compaction" as never,
-          text: "Steer during compaction",
-          attachments: [],
-          createdBy: "user",
-          creationSource: "web",
-        },
-      });
-      fake.setCompacting(false);
-      const compactionEnded = fake.allRequests().length;
-      yield* fake.emit({
-        type: "compaction_end",
-        reason: "manual",
-        result: { summary: "smaller", tokensBefore: 10_000, estimatedTokensAfter: 2_000 },
-        aborted: false,
-        willRetry: false,
-      });
-      const delivered = yield* fake.takeRequest("prompt");
-      assert.equal(delivered["message"], "Steer during compaction");
-      yield* fake.emit({ type: "agent_start" });
-      fake.queueState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
-      yield* fake.emit({ type: "agent_settled" });
-      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
-      assert.equal(
-        fake
-          .allRequests()
-          .slice(compactionEnded)
-          .filter(
-            (request) =>
-              request["type"] === "prompt" && request["message"] === "Steer during compaction",
-          ).length,
-        1,
-      );
-      assert.isTrue(
-        terminal.type === "turn.terminal" && terminal.status === "completed",
-        `turn ended ${terminal.type === "turn.terminal" ? terminal.status : terminal.type}`,
-      );
-    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  it.effect.each([
+    { tracked: false, race: false, lateStartAck: false },
+    { tracked: true, race: false, lateStartAck: false },
+    { tracked: true, race: true, lateStartAck: false },
+    { tracked: true, race: true, lateStartAck: true },
+  ])(
+    "preserves a steer during in-turn compaction, tracked=$tracked, race=$race, lateStartAck=$lateStartAck",
+    ({ tracked, race, lateStartAck }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        const initialPrompt = yield* fake.takeRequest("prompt");
+        if (!lateStartAck)
+          yield* fake.emit({
+            type: "response",
+            id: initialPrompt["id"],
+            command: "prompt",
+            success: true,
+          });
+        const running = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        );
+        const providerTurnId =
+          running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
+        assert.isDefined(providerTurnId);
+        yield* fake.emit({ type: "agent_start" });
+        if (!race) {
+          fake.queueState({ isStreaming: false, isCompacting: true, pendingMessageCount: 0 });
+          yield* fake.emit({ type: "agent_settled" });
+          yield* fake.takeRequest("get_state");
+          fake.setCompacting(true);
+          yield* fake.emit({ type: "compaction_start", reason: "manual" });
+          yield* takeEvent(
+            (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
+          );
+        }
+
+        const steering: ProviderAdapter.ProviderAdapterV2SteerInput = {
+          threadId: THREAD_ID,
+          runId: RunId.make("run:thread-pi-test:1"),
+          providerThread,
+          providerTurnId: providerTurnId!,
+          message: {
+            messageId: "message:thread-pi-test:steer-during-compaction" as never,
+            text: "Steer during compaction",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+          },
+        };
+        if (tracked) {
+          if (race) fake.deferNextPrompt();
+          let submitted = 0;
+          const pending = yield* runtime
+            .steerTurn({
+              ...steering,
+              beforeSubmit: Effect.gen(function* () {
+                submitted += 1;
+                if (race) {
+                  fake.setCompacting(true);
+                  yield* fake.emit({ type: "compaction_start", reason: "manual" });
+                }
+              }),
+            })
+            .pipe(Effect.flip, Effect.forkScoped);
+          if (race) {
+            const steerPrompt = yield* fake.takeRequest("prompt");
+            yield* fake.emit({
+              type: "response",
+              id: steerPrompt["id"],
+              command: "prompt",
+              success: false,
+              error: "Cannot submit a prompt while compaction is in progress",
+            });
+          }
+          if (lateStartAck)
+            yield* fake.emit({
+              type: "response",
+              id: initialPrompt["id"],
+              command: "prompt",
+              success: true,
+            });
+          const refused = yield* Fiber.join(pending);
+          assert.isTrue(
+            ProviderAdapter.isProviderAdapterSteerRunError(refused) &&
+              refused.deliveryNotSent === true,
+          );
+          assert.equal(submitted, race ? 1 : 0);
+          yield* runtime.interruptTurn({ providerThread, providerTurnId: providerTurnId! });
+          fake.setCompacting(false);
+          yield* fake.emit({
+            type: "compaction_end",
+            reason: "manual",
+            result: null,
+            aborted: true,
+          });
+          yield* fake.closeStdout;
+          const stopped = yield* takeEvent((event) => event.type === "turn.terminal");
+          assert.isTrue(stopped.type === "turn.terminal" && stopped.status === "interrupted");
+          assert.equal(
+            fake.allRequests().filter((request) => request["message"] === steering.message.text)
+              .length,
+            race ? 1 : 0,
+          );
+
+          // The durable worker retains the refused input until Resume starts a fresh runtime.
+          const resumedFake = yield* makeFakePi;
+          const resumed = yield* openRuntime(resumedFake);
+          const resumedThread = yield* resumed.runtime.ensureThread({
+            threadId: THREAD_ID,
+            modelSelection: modelSelection("default"),
+            runtimePolicy,
+          });
+          const resumedRun = RunId.make(`run:${THREAD_ID}:2`);
+          yield* resumed.runtime.startTurn({
+            appThread: yield* makeAppThread("default"),
+            threadId: THREAD_ID,
+            runId: resumedRun,
+            runOrdinal: 2,
+            providerTurnOrdinal: 2,
+            attemptId: RunAttemptId.make(`run-attempt:${resumedRun}:1`),
+            rootNodeId: NodeId.make(`node:${resumedRun}:root`),
+            providerThread: resumedThread,
+            message: steering.message,
+            modelSelection: modelSelection("default"),
+            runtimePolicy,
+          });
+          const delivered = yield* resumedFake.takeRequest("prompt");
+          assert.equal(delivered["message"], steering.message.text);
+          yield* resumedFake.emit({ type: "agent_start" });
+          yield* resumedFake.emit({ type: "agent_settled" });
+          const completed = yield* resumed.takeEvent((event) => event.type === "turn.terminal");
+          assert.isTrue(completed.type === "turn.terminal" && completed.status === "completed");
+          assert.equal(
+            resumedFake.allRequests().filter((request) => request["type"] === "prompt").length,
+            1,
+          );
+          return;
+        }
+        yield* runtime.steerTurn(steering);
+        fake.setCompacting(false);
+        const compactionEnded = fake.allRequests().length;
+        yield* fake.emit({
+          type: "compaction_end",
+          reason: "manual",
+          result: { summary: "smaller", tokensBefore: 10_000, estimatedTokensAfter: 2_000 },
+          aborted: false,
+          willRetry: false,
+        });
+        const delivered = yield* fake.takeRequest("prompt");
+        assert.equal(delivered["message"], "Steer during compaction");
+        yield* fake.emit({ type: "agent_start" });
+        fake.queueState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+        yield* fake.emit({ type: "agent_settled" });
+        const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.equal(
+          fake
+            .allRequests()
+            .slice(compactionEnded)
+            .filter(
+              (request) =>
+                request["type"] === "prompt" && request["message"] === "Steer during compaction",
+            ).length,
+          1,
+        );
+        assert.isTrue(
+          terminal.type === "turn.terminal" && terminal.status === "completed",
+          `turn ended ${terminal.type === "turn.terminal" ? terminal.status : terminal.type}`,
+        );
+        const count = fake.allRequests().length;
+        const late = yield* runtime.steerTurn(steering).pipe(Effect.flip);
+        assert.isTrue(
+          ProviderAdapter.isProviderAdapterSteerRunError(late) && late.deliveryNotSent === true,
+        );
+        assert.equal(fake.allRequests().length, count);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   it.effect("keeps working after a settle probe fails before detached compaction", () =>
@@ -4534,82 +5314,107 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
-  it.effect("ignores an idle snapshot made stale by a steer", () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakePi;
-      const { runtime, takeEvent } = yield* openRuntime(fake);
-      const providerThread = yield* runtime.ensureThread({
-        threadId: THREAD_ID,
-        modelSelection: modelSelection("default"),
-        runtimePolicy,
-      });
-      yield* startTurn(runtime, providerThread);
-      yield* fake.takeRequest("prompt");
-      const running = yield* takeEvent(
-        (event) =>
-          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
-      );
-      assert.equal(running.type, "provider_turn.updated");
-      const providerTurnId =
-        running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
-      assert.isDefined(providerTurnId);
-      yield* fake.emit({ type: "agent_start" });
+  it.effect.each([false, true])(
+    "ignores a stale idle snapshot and settles a refused steer, rejected=%s",
+    (rejected) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        const initialPrompt = yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "response",
+          id: initialPrompt["id"],
+          command: "prompt",
+          success: true,
+        });
+        const running = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        );
+        assert.equal(running.type, "provider_turn.updated");
+        const providerTurnId =
+          running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
+        assert.isDefined(providerTurnId);
+        yield* fake.emit({ type: "agent_start" });
 
-      fake.deferNextState();
-      yield* fake.emit({ type: "agent_settled" });
-      yield* fake.takeRequest("get_state");
-      yield* runtime.steerTurn({
-        threadId: THREAD_ID,
-        runId: RunId.make("run:thread-pi-test:1"),
-        providerThread,
-        providerTurnId: providerTurnId!,
-        message: {
-          messageId: "message:thread-pi-test:late-steer" as never,
-          text: "Continue after settlement",
-          attachments: [],
-          createdBy: "user",
-          creationSource: "web",
-        },
-      });
-      yield* fake.takeRequest("prompt");
-      yield* fake.resolveDeferredState({
-        isStreaming: false,
-        isCompacting: false,
-        pendingMessageCount: 0,
-      });
+        fake.deferNextState();
+        yield* fake.emit({ type: "agent_settled" });
+        yield* fake.takeRequest("get_state");
+        const steering = yield* runtime
+          .steerTurn({
+            ...(rejected ? { beforeSubmit: Effect.void } : {}),
+            threadId: THREAD_ID,
+            runId: RunId.make("run:thread-pi-test:1"),
+            providerThread,
+            providerTurnId: providerTurnId!,
+            message: {
+              messageId: "message:thread-pi-test:late-steer" as never,
+              text: "Continue after settlement",
+              attachments: [],
+              createdBy: "user",
+              creationSource: "web",
+            },
+          })
+          .pipe(Effect.forkScoped);
+        const steerPrompt = yield* fake.takeRequest("prompt");
+        yield* fake.resolveDeferredState({
+          isStreaming: false,
+          isCompacting: false,
+          pendingMessageCount: 0,
+        });
 
-      yield* fake.emit({ type: "agent_start" });
-      yield* fake.emit({ type: "message_start", message: { role: "assistant" } });
-      yield* fake.emit({
-        type: "message_update",
-        assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Recovered" },
-      });
-      yield* fake.emit({
-        type: "message_end",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "Recovered" }],
-          stopReason: "stop",
-        },
-      });
-      const assistantItem = yield* takeEvent(
-        (event) =>
-          event.type === "turn_item.updated" &&
-          event.turnItem.type === "assistant_message" &&
-          event.turnItem.streaming === false,
-      );
-      assert.isTrue(
-        assistantItem.type === "turn_item.updated" &&
-          assistantItem.turnItem.type === "assistant_message" &&
-          assistantItem.turnItem.text === "Recovered",
-      );
+        if (rejected) {
+          yield* fake.emit({
+            type: "response",
+            id: steerPrompt["id"],
+            command: "prompt",
+            success: false,
+            error: "Model unavailable",
+          });
+          yield* Fiber.join(steering).pipe(Effect.flip);
+          const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+          assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+          return;
+        }
+        yield* Fiber.join(steering);
+        yield* fake.emit({ type: "agent_start" });
+        yield* fake.emit({ type: "message_start", message: { role: "assistant" } });
+        yield* fake.emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Recovered" },
+        });
+        yield* fake.emit({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Recovered" }],
+            stopReason: "stop",
+          },
+        });
+        const assistantItem = yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "assistant_message" &&
+            event.turnItem.streaming === false,
+        );
+        assert.isTrue(
+          assistantItem.type === "turn_item.updated" &&
+            assistantItem.turnItem.type === "assistant_message" &&
+            assistantItem.turnItem.text === "Recovered",
+        );
 
-      fake.queueState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
-      yield* fake.emit({ type: "agent_settled" });
-      yield* fake.takeRequest("get_state");
-      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
-      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
-    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+        fake.queueState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* fake.takeRequest("get_state");
+        const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 });
 
@@ -4730,5 +5535,37 @@ describe("PiRpc early process exit", () => {
       assert.isFalse(error.message.includes("API_KEY"));
       assert.isFalse(error.message.includes("super-secret"));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("PiRpc teardown", () => {
+  // Like pi, quits once stdin ends; it survives SIGTERM, so teardown's SIGKILL ends it otherwise.
+  const recordShutdownCues = `
+const fs = require("node:fs");
+const note = (cue) => fs.appendFileSync(process.argv[1], cue + "\\n");
+process.on("SIGTERM", () => note("SIGTERM"));
+process.stdin.on("end", () => note("stdin end")).resume();
+process.stdout.write('{"type":"ready"}\\n');
+`;
+
+  it.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+    "signals pi before its stdin reaches EOF",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const cuesPath = `${yield* fileSystem.makeTempDirectoryScoped()}/cues`;
+        yield* Effect.gen(function* () {
+          const connection = yield* makePiRpcConnection({
+            command: process.execPath,
+            args: ["-e", recordShutdownCues, cuesPath],
+            cwd: undefined,
+            env: {},
+          });
+          assert.equal((yield* Queue.take(connection.events))["type"], "ready");
+        }).pipe(Effect.scoped);
+
+        const cues = (yield* fileSystem.readFileString(cuesPath)).split("\n").filter(Boolean);
+        assert.deepEqual(cues, ["SIGTERM"]);
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

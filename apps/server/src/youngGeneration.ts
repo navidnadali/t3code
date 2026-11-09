@@ -46,6 +46,7 @@ export const NON_SERVER_COMMANDS: ReadonlySet<string> = new Set([
   "acp-mcp-bridge",
   "acp-mcp-call",
   "__document-text",
+  "__speech-worker",
   "__managed-chatgpt-token",
   "__process-spawner",
   "__claude-history",
@@ -399,6 +400,11 @@ export interface YoungGenerationOutcome {
 }
 
 let lastOutcome: YoungGenerationOutcome | undefined;
+
+/** Carries the bootstrap decision into the separately bundled CLI without applying it twice. */
+export const recordYoungGenerationOutcome = (outcome: YoungGenerationOutcome): void => {
+  lastOutcome = outcome;
+};
 
 /**
  * Applies the default on the way in: a process whose NODE_OPTIONS already carry the cap restores

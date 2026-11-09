@@ -8,7 +8,6 @@ import {
   type ThreadLinkedPullRequest,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
-import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -22,6 +21,7 @@ import * as Stream from "effect/Stream";
 
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as GitManager from "../git/GitManager.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
@@ -136,24 +136,14 @@ export const make = Effect.gen(function* () {
   };
 
   const readThreadSnapshot = ({ threadId, backfill }: RefreshRequest) =>
-    threadId === null
-      ? orchestrator
-          .getShellSnapshot({
-            location: "active",
-            unsettledOnly: !(backfill || pendingBackfill.size > 0),
-          })
-          .pipe(NodeSqliteClient.readOnly)
-      : Effect.gen(function* () {
-          // Read sequence first so guarded sync rejects intervening changes.
-          const snapshotSequence = yield* orchestrator.getThreadEventSequence(threadId);
-          const thread = yield* orchestrator.getThreadShell(threadId);
-          return { snapshotSequence, threads: thread === null ? [] : [thread] };
-        });
+    orchestrator.getPullRequestSnapshot(
+      threadId === null ? { unsettledOnly: !(backfill || pendingBackfill.size > 0) } : { threadId },
+    );
 
   // Subagents mostly work in their parent's checkout, whose own turns look its branch up.
   const lookupRefresh = (
     refresh: RefreshRequest["refresh"],
-    thread: OrchestrationV2ThreadShell,
+    thread: Pick<OrchestrationV2ThreadShell, "lineage" | "projectId" | "worktreePath" | "branch">,
   ) => {
     const parentThreadId = thread.lineage.parentThreadId;
     if (
@@ -398,6 +388,7 @@ export const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker((request: RefreshRequest) =>
     synchronize(request).pipe(
+      Effect.provideService(GitVcsDriver.BackgroundGitWork, true),
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
         (cause) =>

@@ -12,11 +12,115 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqlite from "node:sqlite";
 
+import {
+  ThreadId,
+  ProjectId,
+  ProviderInstanceId,
+  EventId,
+  MessageId,
+  TurnItemId,
+} from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as EventStore from "../orchestration-v2/EventStore.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as DatabaseMaintenance from "./DatabaseMaintenance.ts";
 import * as Sqlite from "./Sqlite.ts";
-import * as EventStore from "../orchestration-v2/EventStore.ts";
-import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
-import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+
+const seedThread = (dbPath: string) =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("thread-1");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const messageId = MessageId.make("message-1");
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("thread-created"),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: threadId,
+            projectId: ProjectId.make("project-1"),
+            title: "Doctor",
+            providerInstanceId,
+            modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            deletedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            createdBy: "user",
+            creationSource: "web",
+          },
+        },
+        {
+          id: EventId.make("message-created"),
+          type: "message.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: messageId,
+            threadId,
+            runId: null,
+            nodeId: null,
+            role: "assistant",
+            text: "needle",
+            attachments: [],
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            createdBy: "agent",
+            creationSource: "provider",
+          },
+        },
+        {
+          id: EventId.make("item-created"),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make("item-1"),
+            threadId,
+            runId: null,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "completed",
+            title: null,
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "assistant_message",
+            messageId,
+            text: "needle",
+            streaming: false,
+          },
+        },
+      ],
+    });
+  }).pipe(
+    Effect.provide(
+      EventSink.layer.pipe(
+        Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
+        Layer.provide(Sqlite.layerFromPath(dbPath)),
+      ),
+    ),
+  );
 
 it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))(
   "DatabaseMaintenance",
@@ -113,17 +217,7 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         const maintenance = yield* DatabaseMaintenance.DatabaseMaintenance;
         const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-compact-full-" });
         const dbPath = path.join(baseDir, "userdata", "statev2.sqlite");
-        yield* Effect.flatMap(
-          ProjectionMaintenance.ProjectionMaintenanceV2,
-          (projections) => projections.rebuild,
-        ).pipe(
-          Effect.provide(
-            ProjectionMaintenance.layer.pipe(
-              Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
-              Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
-            ),
-          ),
-        );
+        yield* Effect.void.pipe(Effect.provide(Sqlite.layerFromPath(dbPath)));
         // VACUUM fails as it does on a full disk; everything before it ran.
         const run = NodeSqlite.StatementSync.prototype.run;
         const all = NodeSqlite.StatementSync.prototype.all;
@@ -178,6 +272,47 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
       }).pipe(Effect.scoped),
     );
 
+    it.effect.each(["missing", "unreadable"] as const)(
+      "refuses to prune a database with a %s thread projection",
+      (damage) =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const maintenance = yield* DatabaseMaintenance.DatabaseMaintenance;
+          const dbPath = path.join(
+            yield* fs.makeTempDirectoryScoped({ prefix: "t3-damaged-projection-" }),
+            "statev2.sqlite",
+          );
+          yield* seedThread(dbPath);
+          yield* Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            if (damage === "missing")
+              yield* sql`DELETE FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-1'`;
+            else
+              yield* sql`UPDATE orchestration_v2_projection_threads SET payload_json = '{}' WHERE thread_id = 'thread-1'`;
+            yield* sql`INSERT INTO orchestration_v2_projection_metadata (projection_name, schema_version, last_sequence, updated_at)
+            VALUES ('event-log-prune-mark', 2, 3, '1960-01-01T00:00:00.000Z')`;
+          }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
+          const failed = yield* maintenance.compact(dbPath).pipe(Effect.flip);
+          assert.equal(failed._tag, "DatabaseCompactError");
+          assert.equal(
+            failed._tag === "DatabaseCompactError" && (failed.cause as { _tag?: string })._tag,
+            "DatabaseProjectionsInvalidError",
+          );
+          yield* Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            assert.deepEqual(
+              yield* sql`SELECT event_id FROM orchestration_events ORDER BY sequence`,
+              [
+                { event_id: "thread-created" },
+                { event_id: "message-created" },
+                { event_id: "item-created" },
+              ],
+            );
+          }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath, readonly: true })));
+        }).pipe(Effect.scoped),
+    );
+
     it.effect("compacts an existing database offline only once its server has stopped", () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -185,17 +320,8 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         const maintenance = yield* DatabaseMaintenance.DatabaseMaintenance;
         const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-compact-" });
         const dbPath = path.join(baseDir, "userdata", "statev2.sqlite");
-        yield* Effect.flatMap(
-          ProjectionMaintenance.ProjectionMaintenanceV2,
-          (projections) => projections.rebuild,
-        ).pipe(
-          Effect.provide(
-            ProjectionMaintenance.layer.pipe(
-              Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
-              Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
-            ),
-          ),
-        );
+        // Opening the database migrates it.
+        yield* seedThread(dbPath);
         yield* Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           yield* sql`PRAGMA auto_vacuum = NONE`;
@@ -205,29 +331,13 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           yield* sql`CREATE TABLE discarded_data (value BLOB)`;
           yield* sql`INSERT INTO discarded_data VALUES (zeroblob(4194304))`;
           yield* sql`DROP TABLE discarded_data`;
-          yield* sql`
-            INSERT INTO orchestration_v2_projection_messages (
-              message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json
-            )
-            VALUES (
-              'message-1', 'thread-1', NULL, NULL, 'user', 0,
-              '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z', '{"text":"needle"}'
-            )
-          `;
+
           // An index that drifted from its rows, as a renumbering VACUUM would leave it.
           yield* sql`
             INSERT INTO orchestration_v2_message_search (orchestration_v2_message_search)
             VALUES ('delete-all')
           `;
-          yield* sql`
-            INSERT INTO orchestration_v2_projection_turn_items (
-              turn_item_id, thread_id, run_id, ordinal, type, status, updated_at, payload_json
-            )
-            VALUES (
-              'item-1', 'thread-1', NULL, 1, 'assistant_message', 'completed',
-              '2026-09-01T00:00:00.000Z', '{}'
-            )
-          `;
+
           // Item counts that drifted from their items: one too high, one with no items at all.
           yield* sql`
             UPDATE orchestration_v2_projection_turn_item_counts SET item_count = 3

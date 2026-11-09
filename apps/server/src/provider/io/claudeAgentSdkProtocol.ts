@@ -86,6 +86,9 @@ export type ClaudeAgentSdkWorkerRequest =
       readonly type: "backgroundTasks";
       readonly toolUseId: Parameters<Query["backgroundTasks"]>[0];
     }
+  | { readonly type: "mcpServerStatus" }
+  | { readonly type: "readMcpResource"; readonly server: string; readonly uri: string }
+  | { readonly type: "controlRequest"; readonly payload: Record<string, unknown> }
   | { readonly type: "interrupt" }
   | { readonly type: "close" }
   | { readonly type: "asyncDispose" }

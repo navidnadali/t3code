@@ -44,6 +44,8 @@ import {
   ClaudeAgentSdkQueryRunner,
   type ClaudeAgentSdkQueryOpenInput,
   layerQueryRunner,
+  makeClaudeDescendantTracker,
+  parseClaudeProcessTable,
   spawnClaudeProcessGroup,
 } from "./ClaudeAdapterV2.ts";
 
@@ -631,21 +633,28 @@ it.effect.each([
   }).pipe(Effect.provide(realQueryRunner)),
 );
 
-// Answers every `ps` with `table()` at once, so the clock alone decides when the CLIs are polled.
-const processTableSpawner = (table: () => string, onRead: () => void = () => {}) =>
+// Answers every `ps` with `table()` at once (a failed `ps` when it is undefined, or when an
+// effect succeeds), so the clock alone decides when the CLIs are polled.
+const processTableSpawner = (
+  table: () => string | undefined | Effect.Effect<string>,
+  onRead: () => void = () => {},
+) =>
   Layer.succeed(
     ChildProcessSpawner.ChildProcessSpawner,
     ChildProcessSpawner.make((command) =>
       Effect.sync(() => {
         if (command._tag === "StandardCommand" && command.command === "ps") onRead();
+        const output = table();
         return ChildProcessSpawner.makeHandle({
           pid: ChildProcessSpawner.ProcessId(1),
-          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(output === undefined ? 1 : 0)),
           isRunning: Effect.succeed(false),
           kill: () => Effect.void,
           unref: Effect.succeed(Effect.void),
           stdin: Sink.drain,
-          stdout: Stream.encodeText(Stream.make(table())),
+          stdout: Stream.encodeText(
+            typeof output === "object" ? Stream.fromEffect(output) : Stream.make(output ?? ""),
+          ),
           stderr: Stream.empty,
           all: Stream.empty,
           getInputFd: () => Sink.drain,
@@ -862,9 +871,13 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     );
   });
 
-  // The shared table names each CLI's own job, which only that CLI's exit stops.
+  // The shared table names each CLI's own job, which only that CLI's exit stops: also after a
+  // poll whose `ps` failed or came back empty, and once the job is re-parented.
   it.effect("stops the job each CLI moved out of its group, found by one shared poll", () => {
-    const rows: Array<string> = [];
+    const jobRows: Array<{ readonly pid: number | undefined; readonly cliPid: string }> = [];
+    let read: "table" | "failed" | "empty" = "table";
+    let reparented = false;
+    let tableReads = 0;
     const agents = countedAgents(2);
     return Effect.gen(function* () {
       const dirs = [0, 1].map(() =>
@@ -895,11 +908,19 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
           // Its own group, so the CLI's group kill misses it.
           const job = NodeChildProcess.spawn("sleep", ["600"], { detached: true, stdio: "ignore" });
           yield* Effect.addFinalizer(() => Effect.sync(() => job.kill("SIGKILL")));
-          rows.push(`${job.pid} ${cliPid} ${job.pid} Sat Nov 14 22:00:00 2026`);
+          jobRows.push({ pid: job.pid, cliPid });
           return job;
         }),
       );
       yield* TestClock.adjust("1 second");
+      const before = tableReads;
+      read = "failed";
+      yield* TestClock.adjust("1 second");
+      read = "empty";
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual(tableReads - before, 2);
+      read = "table";
+      reparented = true;
       const stopped = jobs.map((job) => new Promise((resolve) => job.once("exit", resolve)));
       for (const dir of dirs) {
         yield* Effect.promise(() => NodeFS.promises.writeFile(NodePath.join(dir, "go"), "\n"));
@@ -909,10 +930,156 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     }).pipe(
       Effect.provide(
         fakeTableRunner(
-          processTableSpawner(() => rows.join("\n")),
+          processTableSpawner(
+            () =>
+              read === "failed"
+                ? undefined
+                : read === "empty"
+                  ? ""
+                  : jobRows
+                      .map(
+                        ({ pid, cliPid }) =>
+                          `${pid} ${reparented ? 1 : cliPid} ${pid} Sat Nov 14 22:00:00 2026`,
+                      )
+                      .join("\n"),
+            () => tableReads++,
+          ),
           agents.layer,
         ),
       ),
+    );
+  });
+
+  // A close records what started since the last poll, but its read can begin before a poll
+  // that ends first: the job that poll found is still stopped when the CLI exits.
+  it.effect("stops a job a poll found while the close's own earlier read was running", () => {
+    const agents = countedAgents(1);
+    const firstRead = Deferred.makeUnsafe<void>();
+    const closeReadStarted = Deferred.makeUnsafe<void>();
+    const closeReadHeld = Deferred.makeUnsafe<void>();
+    let phase: "open" | "closing" | "polling" | "exiting" = "open";
+    let cliPid = "";
+    let jobPid: number | undefined;
+    const table = () => {
+      const cli = `${cliPid} 10 ${cliPid} Sun Nov 15 10:00:00 2026`;
+      const job = (ppid: string) => `${jobPid} ${ppid} ${jobPid} Sun Nov 15 10:00:01 2026`;
+      switch (phase) {
+        case "open":
+          Deferred.doneUnsafe(firstRead, Effect.void);
+          return cli;
+        case "closing":
+          Deferred.doneUnsafe(closeReadStarted, Effect.void);
+          return Deferred.await(closeReadHeld).pipe(Effect.as(cli));
+        case "polling":
+          return [cli, job(cliPid)].join("\n");
+        case "exiting":
+          return job("1");
+      }
+    };
+    return Effect.gen(function* () {
+      const dir = NodePath.dirname(
+        fakeClaudeCli(
+          ['dir=$(dirname "$0")', 'echo $$ > "$dir/pid"', "cat > /dev/null"].join("\n"),
+        ),
+      );
+      NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "pid")]);
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
+      );
+      const session = yield* openNumberedFakeCli(NodePath.join(dir, "claude"), 0);
+      yield* agents.allStarted;
+      cliPid = (yield* Effect.promise(() =>
+        NodeFS.promises.readFile(NodePath.join(dir, "pid"), "utf8"),
+      )).trim();
+      yield* Deferred.await(firstRead);
+      const job = NodeChildProcess.spawn("sleep", ["600"], { detached: true, stdio: "ignore" });
+      yield* Effect.addFinalizer(() => Effect.sync(() => job.kill("SIGKILL")));
+      jobPid = job.pid;
+      const stopped = new Promise((resolve) => job.once("exit", resolve));
+      phase = "closing";
+      const closing = yield* session.close.pipe(Effect.forkChild);
+      yield* Deferred.await(closeReadStarted);
+      phase = "polling";
+      yield* TestClock.adjust("1 second");
+      phase = "exiting";
+      Deferred.doneUnsafe(closeReadHeld, Effect.void);
+      yield* Effect.promise(() => stopped);
+      yield* Fiber.join(closing);
+    }).pipe(Effect.provide(fakeTableRunner(processTableSpawner(table), agents.layer)));
+  });
+
+  // The nth of a series of reads, each begun after the one before it ended.
+  const psTable = (
+    rows: ReadonlyArray<readonly [pid: number, ppid: number, started: number]>,
+    read: number,
+  ) =>
+    parseClaudeProcessTable(
+      rows
+        .map(([pid, ppid, started]) => `${pid} ${ppid} ${pid} Sun Nov 15 10:00:0${started} 2026`)
+        .join("\n"),
+      { began: 2 * read, ended: 2 * read + 1 },
+    );
+  const byNumber = (left: number, right: number) => left - right;
+
+  // Each poll walked every job each CLI had ever run; with many long-lived CLIs that blocked the
+  // server on every poll.
+  it("keeps only the descendants each CLI still has running, however many jobs it ran", () => {
+    const clis = [1000, 2000, 3000];
+    const trackers = clis.map(makeClaudeDescendantTracker);
+    const jobs = (cli: number, poll: number) =>
+      [0, 1, 2, 3].map((job) => cli + 100 + poll * 4 + job);
+    for (let poll = 0; poll < 50; poll++) {
+      const table = psTable(
+        clis.flatMap((cli) => [
+          [cli, 10, 0] as const,
+          [cli + 1, cli, 0] as const,
+          // A job that outlives the shell that started it is re-parented.
+          ...(poll === 0 ? [[cli + 3, cli, 0] as const] : []),
+          [cli + 2, poll === 0 ? cli + 3 : 1, 0] as const,
+          ...jobs(cli, poll).map((pid) => [pid, cli + 1, 1] as const),
+        ]),
+        poll,
+      );
+      for (const tracker of trackers) tracker.record(table);
+    }
+    assert.deepStrictEqual(
+      trackers.map((tracker) => tracker.tracked.size),
+      clis.map(() => 6),
+    );
+    assert.deepStrictEqual(
+      trackers.map((tracker) =>
+        [...tracker.tracked.values()].map((row) => row.pid).toSorted(byNumber),
+      ),
+      clis.map((cli) => [cli + 1, cli + 2, ...jobs(cli, 49)].toSorted(byNumber)),
+    );
+  });
+
+  it("stops at exit only what the CLI left running, never a process that took a job's pid", () => {
+    const tracker = makeClaudeDescendantTracker(1000);
+    const orphan = [1300, 1, 1] as const;
+    tracker.record(
+      psTable(
+        [
+          [1000, 10, 0],
+          [1001, 1000, 0],
+          [1100, 1001, 1],
+          [1200, 1001, 1],
+          [1300, 1001, 1],
+        ],
+        0,
+      ),
+    );
+    tracker.record(psTable([[1000, 10, 0], orphan], 1));
+    // Unrelated processes take both finished jobs' pids, one in the second its job started.
+    const unrelated = [
+      [1100, 1, 2],
+      [1200, 1, 1],
+    ] as const;
+    tracker.record(psTable([[1000, 10, 0], ...unrelated, orphan], 2));
+    tracker.cliExited();
+    assert.deepStrictEqual(
+      tracker.leftovers(psTable([...unrelated, orphan], 3)).map((row) => row.pid),
+      [1300],
     );
   });
 

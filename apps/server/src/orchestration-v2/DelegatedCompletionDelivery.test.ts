@@ -19,6 +19,7 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
+  RunAttemptId,
   RunId,
   RuntimeRequestId,
   ThreadId,
@@ -2562,6 +2563,160 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
         let wake = yield* requests.take;
         while (wake.threadId !== threadId) wake = yield* requests.take;
         assert.equal(wake.delegatedCompletion?.generation, delivery.generation + 1);
+      }),
+    );
+
+    // The parent's other cohorts each have a queued wake. A child's capture, and its retry, offer
+    // its own task's cohort and read none of the others, so the parent's lock is held briefly.
+    it.effect("a child's checkpoint capture offers only its own task's cohort", () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread:capture-own-cohort");
+        const projectId = ProjectId.make("project:capture-own-cohort");
+        const runId = RunId.make("run:capture-own-cohort");
+        const rootNodeId = NodeId.make("node:capture-own-cohort");
+        const providerThreadId = parentProviderThreadId(threadId);
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId,
+          runId,
+          rootNodeId,
+          taskId: NodeId.make("node:capture-own-cohort-seed"),
+          deliveryState: "acknowledged",
+          now,
+        });
+        const backlog = Array.from({ length: 6 }, (_, index) => ({
+          runId: RunId.make(`run:capture-own-cohort:backlog-${index}`),
+          wakeRunId: RunId.make(`run:capture-own-cohort:wake-${index}`),
+          messageId: MessageId.make(`message:capture-own-cohort:wake-${index}`),
+          taskId: NodeId.make(`node:capture-own-cohort:backlog-${index}`),
+        }));
+        yield* sink.write({
+          commandId: reconcileCommandId("capture-own-cohort-backlog"),
+          events: backlog.flatMap((cohort, index) => {
+            const wake = runEvent({
+              threadId,
+              runId: cohort.wakeRunId,
+              ordinal: 100 + index,
+              status: "queued",
+              now,
+              providerThreadId,
+              userMessageId: cohort.messageId,
+            });
+            return [
+              runEvent({
+                threadId,
+                runId: cohort.runId,
+                ordinal: 2 + index,
+                status: "completed",
+                now,
+                providerThreadId,
+                delegatedCompletion: {
+                  disposition: "open",
+                  nextGeneration: 2,
+                  delivery: {
+                    generation: 1,
+                    messageId: cohort.messageId,
+                    taskIds: [cohort.taskId],
+                  },
+                },
+              }),
+              {
+                ...wake,
+                payload: {
+                  ...wake.payload,
+                  activeAttemptId: RunAttemptId.make(`attempt:${cohort.wakeRunId}`),
+                  startedAt: null,
+                  completedAt: null,
+                },
+              },
+              {
+                id: EventId.make(`event:${cohort.messageId}`),
+                type: "message.updated" as const,
+                threadId,
+                runId: cohort.wakeRunId,
+                occurredAt: now,
+                payload: {
+                  id: cohort.messageId,
+                  threadId,
+                  runId: cohort.wakeRunId,
+                  nodeId: null,
+                  createdBy: "agent" as const,
+                  creationSource: "server" as const,
+                  role: "user" as const,
+                  text: `Delegated task ${cohort.taskId} reached a terminal state.`,
+                  attachments: [],
+                  streaming: false,
+                  createdAt: now,
+                  updatedAt: now,
+                  delegatedCompletion: {
+                    parentRunId: cohort.runId,
+                    generation: 1,
+                    taskIds: [cohort.taskId],
+                  },
+                },
+              },
+            ];
+          }),
+        });
+        const child = yield* seedRestartCancelledChild({
+          parentThreadId: threadId,
+          projectId,
+          parentRunId: runId,
+          rootNodeId,
+          name: "capture-own-cohort-child",
+          completionWake: "always",
+          continuationPending: false,
+          runStatus: "completed",
+          now,
+        });
+        const backlogIds = backlog.flatMap((cohort) => [
+          cohort.runId,
+          cohort.wakeRunId,
+          cohort.messageId,
+        ]);
+        const otherCohortReads: Array<string> = [];
+        const observe: Statement.Transformer = (statement) => {
+          const [query, params] = statement.compile();
+          if (
+            params.includes(threadId) &&
+            ((/FROM orchestration_v2_projection_runs\b/.test(query) && !/run_id IN/.test(query)) ||
+              params.some(
+                (param) => typeof param === "string" && backlogIds.some((id) => param.includes(id)),
+              ))
+          ) {
+            otherCohortReads.push(query);
+          }
+          return Effect.succeed(statement);
+        };
+        using offer = vi.spyOn(requests, "offer");
+        const capture = orchestrator
+          .recoverDelegatedTask(child.childThreadId, { completedRunId: child.childRunId })
+          .pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+        yield* capture;
+        const delivery = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+          (run) => run.id === runId,
+        )!.delegatedCompletion!.delivery!;
+        assert.deepEqual(delivery.taskIds, [child.taskId]);
+        const ownWake = {
+          parentRunId: runId,
+          generation: delivery.generation,
+          messageId: delivery.messageId,
+        };
+        assert.deepEqual(
+          offer.mock.calls.map(([request]) => request.delegatedCompletion),
+          [ownWake],
+        );
+        // A capture retry offers the same wake again, which its consumer dispatches only once.
+        yield* capture;
+        assert.deepEqual(
+          offer.mock.calls.map(([request]) => request.delegatedCompletion),
+          [ownWake, ownWake],
+        );
+        assert.deepEqual(otherCohortReads, [], "the capture read another cohort of the parent");
       }),
     );
 

@@ -2211,6 +2211,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     });
 
+  /** A child's results join only the cohorts of its own tasks' runs; the parent's others are not its to offer. */
+  const offerChildCompletionDeliveries =
+    /* The enclosing operation owns the span. */
+    Effect.fnUntraced(function* (parentThreadId: ThreadId, childThreadId: ThreadId) {
+      const { subagents } = yield* projectionStore.getThreadRecords(parentThreadId, ["subagents"], {
+        subagentChildThreadIds: [childThreadId],
+      });
+      const parentRunIds = new Set(
+        subagents.flatMap((task) => {
+          const state = task.completionDelivery?.state;
+          return task.origin === "app_owned" &&
+            task.childThreadId === childThreadId &&
+            task.runId !== null &&
+            (task.result === null ||
+              (state !== "delivered" && state !== "acknowledged" && state !== "disposed"))
+            ? [task.runId]
+            : [];
+        }),
+      );
+      for (const parentRunId of parentRunIds) {
+        yield* offerDelegatedCompletionDelivery(parentThreadId, parentRunId);
+      }
+    });
+
   /** Marks a wake the provider received delivered and reserves the next one for pending siblings. */
   const acceptDelegatedCompletionDelivery = Effect.fn(
     "Orchestrator.acceptDelegatedCompletionDelivery",
@@ -16438,7 +16462,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return;
       yield* threadDispatch.withLock(
         parentThreadId,
-        offerDelegatedCompletionDeliveries(parentThreadId).pipe(
+        offerChildCompletionDeliveries(parentThreadId, threadId).pipe(
           Effect.andThen(
             finalizeAppOwnedSubagent(
               threadId,

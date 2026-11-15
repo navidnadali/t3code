@@ -2,6 +2,18 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.9-perf.8 (2026-11-15)
+
+Hotfix: checkpoint cohorts and descendant process tracking
+
+Upstream base: e82050b8b97c.
+
+No upstream change and no new migrations.
+
+- A child agent's checkpoint capture offers only its own tasks' cohorts (upstream #34568).
+- A Claude CLI's descendant record drops jobs that have ended, and only a process-table read that began after they ended prunes it (upstream #34505).
+- Bench parameters in tools/server-bench set to chosen defaults.
+
 ## v0.1.9-perf.7 (2026-11-15)
 
 Upstream 0.1.9, Node 26.13.1 and a round of correctness fixes

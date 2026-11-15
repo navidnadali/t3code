@@ -502,7 +502,13 @@ interface ClaudeProcessRow {
   readonly started: string;
 }
 
-interface ClaudeProcessTable {
+// Ticks of one counter taken when a read began and when it ended.
+interface ClaudeProcessRead {
+  readonly began: number;
+  readonly ended: number;
+}
+
+interface ClaudeProcessTable extends ClaudeProcessRead {
   readonly running: ReadonlySet<string>;
   readonly children: ReadonlyMap<number, ReadonlyArray<ClaudeProcessRow>>;
 }
@@ -510,7 +516,10 @@ interface ClaudeProcessTable {
 const claudeProcessIdentity = (row: ClaudeProcessRow) => `${row.pid} ${row.started}`;
 
 /** Parses `ps -A -o pid=,ppid=,pgid=,lstart=`; pid plus start time tells a process from a reused pid. */
-function parseClaudeProcessTable(table: string): ClaudeProcessTable {
+export function parseClaudeProcessTable(
+  table: string,
+  read: ClaudeProcessRead,
+): ClaudeProcessTable | undefined {
   const rows = table.split("\n").flatMap((line) => {
     const [pid, ppid, pgid, ...started] = line.trim().split(/\s+/);
     const row = {
@@ -526,7 +535,10 @@ function parseClaudeProcessTable(table: string): ClaudeProcessTable {
       ? [row]
       : [];
   });
+  // `ps -A` lists itself, so a table without a process is a failed read.
+  if (rows.length === 0) return undefined;
   return {
+    ...read,
     running: new Set(rows.map(claudeProcessIdentity)),
     children: Map.groupBy(rows, (row) => row.ppid),
   };
@@ -556,6 +568,43 @@ function claudeDescendants(
     }
   }
   return found;
+}
+
+/** What a CLI started, by pid and start time, recorded from each process table while it runs. */
+export function makeClaudeDescendantTracker(cliPid: number) {
+  const tracked = new Map<string, ClaudeProcessRow>();
+  let cliRunning = true;
+  let lastEnded = 0;
+  // A failed read (undefined) says nothing. A pid and start time missing from a read that began
+  // after every read recorded here ended are gone for good; reads overlap (a poll and a close or
+  // exit read), and an overlapping one only adds.
+  const record = (table: ClaudeProcessTable | undefined) => {
+    if (table === undefined) return;
+    const prune = table.began > lastEnded;
+    lastEnded = Math.max(lastEnded, table.ended);
+    const roots = cliRunning ? [cliPid] : [];
+    for (const [identity, row] of tracked) {
+      if (table.running.has(identity)) roots.push(row.pid);
+      else if (prune) tracked.delete(identity);
+    }
+    for (const row of claudeDescendants(table, roots)) {
+      tracked.set(claudeProcessIdentity(row), row);
+    }
+  };
+  return {
+    tracked: tracked as ReadonlyMap<string, ClaudeProcessRow>,
+    record,
+    // After exit the CLI's pid may belong to an unrelated process, so only tracked jobs are roots.
+    cliExited: () => {
+      cliRunning = false;
+    },
+    /** Records a table read after the CLI exited and returns what it left still running. */
+    leftovers: (table: ClaudeProcessTable | undefined) => {
+      record(table);
+      if (table === undefined) return [];
+      return [...tracked].flatMap(([identity, row]) => (table.running.has(identity) ? [row] : []));
+    },
+  };
 }
 
 export const ClaudeProviderCapabilitiesV2 = {
@@ -1437,18 +1486,27 @@ export const layerQueryRunner: Layer.Layer<
     const processRunner = yield* ProcessRunner.make().pipe(
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
-    const noProcesses: ClaudeProcessTable = { running: new Set(), children: new Map() };
-    const readProcessTable = processRunner
-      .run({ command: "ps", args: ["-A", "-o", "pid=,ppid=,pgid=,lstart="], timeout: "5 seconds" })
-      .pipe(
-        Effect.map((result) =>
-          result.code === 0 ? parseClaudeProcessTable(result.stdout) : noProcesses,
-        ),
-        Effect.orElseSucceed(() => noProcesses),
-      );
+    let processTableTicks = 0;
+    const readProcessTable = Effect.suspend(() => {
+      const began = ++processTableTicks;
+      return processRunner
+        .run({
+          command: "ps",
+          args: ["-A", "-o", "pid=,ppid=,pgid=,lstart="],
+          timeout: "5 seconds",
+        })
+        .pipe(
+          Effect.map((result) =>
+            result.code === 0
+              ? parseClaudeProcessTable(result.stdout, { began, ended: ++processTableTicks })
+              : undefined,
+          ),
+          Effect.orElseSucceed(() => undefined),
+        );
+    });
     // One table per poll serves every CLI. A table read before a CLI started never reaches it:
     // the CLI's pid may then have named another process.
-    const descendantRecorders = new Set<(table: ClaudeProcessTable) => void>();
+    const descendantRecorders = new Set<(table: ClaudeProcessTable | undefined) => void>();
     let descendantPolling: Fiber.Fiber<unknown, unknown> | undefined;
     const pollDescendants = Effect.suspend(() => {
       const recorders = [...descendantRecorders];
@@ -1462,40 +1520,24 @@ export const layerQueryRunner: Layer.Layer<
     // re-parented once the CLI exits. So the CLI's tree is recorded while it runs, and what is
     // still the same process (pid and start time) is stopped after it exits.
     const trackDescendants = (cliPid: number) => {
-      const tracked = new Map<string, ClaudeProcessRow>();
-      let cliRunning = true;
-      // After exit the CLI's pid may belong to an unrelated process, so only tracked jobs are roots.
-      const record = (table: ClaudeProcessTable) => {
-        const roots = [
-          ...(cliRunning ? [cliPid] : []),
-          ...[...tracked.values()].flatMap((row) =>
-            table.running.has(claudeProcessIdentity(row)) ? [row.pid] : [],
-          ),
-        ];
-        for (const row of claudeDescendants(table, roots)) {
-          tracked.set(claudeProcessIdentity(row), row);
-        }
-      };
-      descendantRecorders.add(record);
+      const tracker = makeClaudeDescendantTracker(cliPid);
+      descendantRecorders.add(tracker.record);
       descendantPolling ??= runFork(pollDescendants);
       // Called when the CLI exits.
       const stop = () => {
-        cliRunning = false;
-        descendantRecorders.delete(record);
+        tracker.cliExited();
+        descendantRecorders.delete(tracker.record);
         if (descendantRecorders.size === 0 && descendantPolling !== undefined) {
           runFork(Fiber.interrupt(descendantPolling));
           descendantPolling = undefined;
         }
         return readProcessTable.pipe(
           Effect.map((table) => {
-            record(table);
-            for (const row of tracked.values()) {
-              if (table.running.has(claudeProcessIdentity(row))) killClaudeDescendant(row);
-            }
+            for (const row of tracker.leftovers(table)) killClaudeDescendant(row);
           }),
         );
       };
-      return { refresh: readProcessTable.pipe(Effect.map(record)), stop };
+      return { refresh: readProcessTable.pipe(Effect.map(tracker.record)), stop };
     };
 
     return ClaudeAgentSdkQueryRunner.of({

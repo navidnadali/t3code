@@ -5,19 +5,23 @@ import type * as NodeWorkerThreads from "node:worker_threads";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import { ThreadId } from "@t3tools/contracts";
-import type * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import { CodexSettings, ProviderInstanceId, ProviderSessionId, ThreadId } from "@t3tools/contracts";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as References from "effect/References";
+import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
+import { ChildProcessSpawner } from "effect/process";
 import * as AcpClient from "effect-acp/client";
 import * as AcpError from "effect-acp/errors";
 import * as CodexClient from "effect-codex-app-server/client";
@@ -27,7 +31,12 @@ import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime"
 import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../../config.ts";
-import { makeCodexAppServerProtocolLogger } from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import {
+  CodexAppServerClientFactory,
+  layerAppServerClientFactory,
+  makeCodexAppServerProtocolLogger,
+} from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import * as PortScanner from "../../preview/PortScanner.ts";
 import { serializedRecordProblem, serializeEventNdjsonRecord } from "../EventNdjsonRecord.ts";
 import * as ProviderIoOffloads from "./ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "./ProviderIoWorkerPool.ts";
@@ -53,6 +62,7 @@ const fixturesDir = NodePath.join(import.meta.dirname, "../../orchestration-v2/t
 const encoder = new TextEncoder();
 const threadId = ThreadId.make("thread-offload");
 const providerSessionId = "provider-session-offload";
+const defaultCodexSettings = Schema.decodeSync(CodexSettings)({});
 
 const transcriptFrames = (file: string) =>
   NodeFS.readdirSync(fixturesDir).flatMap((dir) => {
@@ -209,7 +219,6 @@ const runCodex = (
           );
     const logger = makeCodexAppServerProtocolLogger({
       nativeEventLogger: native,
-      threadId,
       providerSessionId: providerSessionId as never,
     })!;
     const client = yield* CodexClient.make(stdio, {
@@ -336,6 +345,120 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
           assert.deepStrictEqual(offloaded, inThread);
         }
       }),
+  );
+
+  // One app-server serves every Codex thread on an instance, opened by whichever thread came first.
+  const codexLogThreads = (codexOffloads: ProviderIoOffloads.CodexLineOffloads["Service"]) =>
+    Effect.gen(function* () {
+      const files: Array<string> = [];
+      let offloaded = 0;
+      const record = (payload: unknown, threadId: ThreadId | null) => {
+        const { event } = payload as { readonly event: { readonly direction: string } };
+        files.push(`${event.direction} ${String(threadId)}`);
+      };
+      const native: ProviderEventLoggers.EventNdjsonLogger = {
+        filePath: "/tmp/provider-events.log",
+        write: (event, threadId) => Effect.sync(() => record(event, threadId)),
+        writeSerialized: (serialized, threadId) =>
+          Effect.sync(() => {
+            offloaded += 1;
+            record(JSON.parse(serialized.payload), threadId);
+          }),
+        close: () => Effect.void,
+      };
+      const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+      const requestSent = yield* Deferred.make<void>();
+      const spawner = ChildProcessSpawner.make(() =>
+        Effect.succeed(
+          ChildProcessSpawner.makeHandle({
+            pid: ChildProcessSpawner.ProcessId(999_999_999),
+            exitCode: Effect.never,
+            isRunning: Effect.succeed(true),
+            kill: () => Effect.void,
+            unref: Effect.succeed(Effect.void),
+            stdin: Sink.forEach(() => Deferred.succeed(requestSent, undefined)),
+            stdout: Stream.fromQueue(stdout),
+            stderr: Stream.empty,
+            all: Stream.empty,
+            getInputFd: () => Sink.drain,
+            getOutputFd: () => Stream.empty,
+          }),
+        ),
+      );
+      const factory = yield* CodexAppServerClientFactory.pipe(
+        Effect.provide(
+          layerAppServerClientFactory.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(PortScanner.PortDiscovery)({ trackAgent: () => () => undefined }),
+                Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                Layer.succeed(ProviderEventLoggers.ProviderEventLoggers, {
+                  native,
+                  canonical: undefined,
+                }),
+                Layer.succeed(ProviderIoOffloads.CodexLineOffloads, codexOffloads),
+              ),
+            ),
+          ),
+        ),
+      );
+      const client = yield* factory.open({
+        instanceId: ProviderInstanceId.make("codex"),
+        threadId: ThreadId.make("thread-a"),
+        providerSessionId: ProviderSessionId.make("session-codex"),
+        runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: "/workspace",
+        }),
+        settings: defaultCodexSettings,
+        environment: {},
+      });
+      const lastHandled = yield* Deferred.make<void>();
+      yield* client.handleUnknownServerNotification((method) =>
+        method === "x/global" ? Deferred.succeed(lastHandled, undefined) : Effect.void,
+      );
+      const started = yield* client.raw
+        .request("thread/start", {
+          config: { "shell_environment_policy.set.T3CODE_THREAD_ID": "thread-b" },
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(requestSent);
+      const send = (frame: unknown) =>
+        Queue.offer(stdout, encoder.encode(`${JSON.stringify(frame)}\n`));
+      // Long frames go to the workers, short ones stay in-thread and rely on what they mapped.
+      const padding = "x".repeat(1024);
+      yield* send({ id: 1, result: { thread: { id: "native-b", padding } } });
+      yield* Fiber.join(started);
+      yield* send({ method: "x/thread", params: { threadId: "native-b" } });
+      yield* send({ method: "x/thread", params: { threadId: "native-b", padding } });
+      yield* send({ method: "x/global-long", params: { padding } });
+      yield* send({ method: "x/global", params: {} });
+      yield* Deferred.await(lastHandled);
+      return { files, offloaded };
+    }).pipe(Effect.scoped);
+
+  it.effect("Codex records of lines read on the workers go to the log of their own thread", () =>
+    Effect.gen(function* () {
+      const inThread = yield* codexLogThreads(
+        ProviderIoOffloads.CodexLineOffloads.of({ open: () => Effect.succeedNone }),
+      );
+      assert.deepEqual(inThread, {
+        files: [
+          "outgoing thread-b",
+          "incoming thread-b",
+          "incoming thread-b",
+          "incoming thread-b",
+          "incoming null",
+          "incoming null",
+        ],
+        offloaded: 0,
+      });
+      const offloaded = yield* withOffloads({ codex: 256, acp: 256 }, (offloads) =>
+        codexLogThreads(offloads.codex),
+      );
+      assert.deepEqual(offloaded, { ...inThread, offloaded: 3 });
+    }),
   );
 
   const deltaLine = (delta: string) =>
@@ -514,7 +637,6 @@ it.layer(NodeServices.layer)("provider I/O line offloads", (it) => {
         logOutgoing: true,
         logger: makeCodexAppServerProtocolLogger({
           nativeEventLogger: native,
-          threadId,
           providerSessionId: providerSessionId as never,
         })!,
         ...(lineOffload === undefined ? {} : { lineOffload }),

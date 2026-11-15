@@ -166,18 +166,18 @@ const synthCopy = (destination: string) => {
 };
 
 /**
- * Fork migration 1's turn item counts against `COUNT(*)` of the items, both ways: rows whose count is
- * off, plus (thread, run) pairs with items but no row.
+ * Upstream migration 85's turn item counts against `COUNT(*)` of the items, both ways: rows whose
+ * count is off, plus (thread, run) pairs with items but no row.
  */
 const turnItemCountsMismatch = (path: string) => ({
   rows: count(path, `SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_item_counts`),
   wrong: count(
     path,
     `SELECT COUNT(*) AS n FROM (
-       SELECT thread_id, COALESCE(run_id, '') AS run_id, COUNT(*) AS items
+       SELECT thread_id, COALESCE(run_id, '') AS run_key, COUNT(*) AS items
        FROM orchestration_v2_projection_turn_items GROUP BY thread_id, COALESCE(run_id, '')) AS i
      FULL OUTER JOIN orchestration_v2_projection_turn_item_counts AS c
-       ON c.thread_id = i.thread_id AND c.run_id = i.run_id
+       ON c.thread_id = i.thread_id AND c.run_key = i.run_key
      WHERE c.item_count IS NOT i.items`,
   ),
 });
@@ -1192,7 +1192,7 @@ describe("fixture CLI", () => {
     expect(Math.abs(result.sizeDeviation)).toBeLessThan(0.1);
     const off = result.tables.filter((row) => row.target > 0 && Math.abs(row.deviation ?? 1) > 0.1);
     expect(off).toEqual([]);
-    // Fork migration 1's turn item counts, kept by its triggers while synth writes: exact.
+    // Upstream migration 85's turn item counts, kept by its triggers while synth writes: exact.
     expect(turnItemCountsMismatch(NodePath.join(directory, "example.sqlite"))).toEqual({
       rows: expect.any(Number),
       wrong: 0,
@@ -1260,7 +1260,7 @@ describe("fixture CLI", () => {
         `SELECT COUNT(*) AS n FROM orchestration_v2_projection_runtime_requests WHERE status = 'pending'`,
       ),
     ).toBe(0);
-    // Fork migration 1's turn item counts stay, exact for the items the fixture holds.
+    // Migration 85's turn item counts stay, exact for the items the fixture holds.
     const counted = turnItemCountsMismatch(clean);
     expect([counted.rows > 0, counted.wrong]).toEqual([true, 0]);
     const settled = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_subagents
@@ -1278,6 +1278,33 @@ describe("fixture CLI", () => {
     const unlinked = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_threads WHERE thread_id = '${kept}'
       AND json_array_length(payload_json, '$.pullRequests') = 0 AND json_extract(payload_json, '$.branch') IS NULL`;
     expect(count(clean, unlinked)).toBe(1);
+  });
+
+  it("sanitise prunes through the source's head past a prune mark under a day old, leaving none", () => {
+    const directory = scratch("young-prune-mark");
+    const seeded = NodePath.join(directory, "seeded.sqlite");
+    synthCopy(seeded);
+    const head = count(seeded, "SELECT MAX(sequence) AS n FROM orchestration_events");
+    // The live server marked the start of its log an hour ago.
+    const marked = new NodeSqlite.DatabaseSync(seeded);
+    marked.exec(`
+      INSERT INTO orchestration_v2_projection_metadata
+        (projection_name, schema_version, last_sequence, updated_at)
+      SELECT 'event-log-prune-mark', schema_version, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 hour')
+      FROM orchestration_v2_projection_metadata WHERE projection_name = 'thread-projections'`);
+    marked.close();
+    const clean = NodePath.join(directory, "clean.sqlite");
+    const result = run(["sanitise", seeded, clean]);
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    const metadata = (name: string) =>
+      count(
+        clean,
+        `SELECT COALESCE(MAX(last_sequence), -1) AS n FROM orchestration_v2_projection_metadata
+         WHERE projection_name = '${name}'`,
+      );
+    expect(metadata("event-log-pruned-through")).toBeGreaterThanOrEqual(head);
+    expect(metadata("event-log-prune-mark")).toBe(-1);
   });
 });
 

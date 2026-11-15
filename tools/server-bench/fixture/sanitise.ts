@@ -54,7 +54,7 @@ export const CLEARED_TABLES: ReadonlyArray<string> = [
   "pull_request_review_guides",
 ];
 
-/** Turn items per thread and run (fork migration 1), kept by triggers: counts and ids. */
+/** Turn items per thread and run (upstream migration 85), kept by triggers: counts and ids. */
 const TURN_ITEM_COUNTS = "orchestration_v2_projection_turn_item_counts";
 
 /**
@@ -863,7 +863,7 @@ export const runSanitise = Effect.fn("fixture.sanitise")(function* (input: {
     const neutralisedThreads = yield* neutraliseThreads.pipe(
       Effect.provide(withEventSink(scratch)),
     );
-    yield* Console.log("Compacting the event store as a first boot would...");
+    yield* Console.log("Pruning the event store through its head, as a day after upgrading...");
     const compaction = yield* compactEvents.pipe(Effect.provide(withMaintenance(scratch)));
     const startup = yield* runnableWork.pipe(Effect.provide(withProjections(scratch)));
     if (isRunnable(startup)) {

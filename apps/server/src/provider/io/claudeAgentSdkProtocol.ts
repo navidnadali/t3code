@@ -13,6 +13,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import type { ProviderIoStage } from "./providerIoProtocol.ts";
+import { MAX_OFFLOADED_RESULT_DEPTH, nestsDeeperThan } from "./resultDepth.ts";
 
 export const CLAUDE_AGENT_SDK_STAGE = "claude-agent-sdk.query";
 
@@ -47,7 +48,6 @@ export type ClaudeAgentSdkWorkerQueryOptions = Omit<
   | "abortController"
   | "canUseTool"
   | "hooks"
-  | "mcpServers"
   | "onElicitation"
   | "onUserDialog"
   | "spawnClaudeCodeProcess"
@@ -74,6 +74,7 @@ export type ClaudeAgentSdkWorkerRequest =
   | { readonly type: "start" }
   | { readonly type: "prompt"; readonly message: SDKUserMessage }
   | { readonly type: "promptEnd" }
+  | { readonly type: "initializationResult" }
   | { readonly type: "setMcpServers"; readonly servers: Parameters<Query["setMcpServers"]>[0] }
   | { readonly type: "setModel"; readonly model: Parameters<Query["setModel"]>[0] }
   | {
@@ -125,8 +126,89 @@ export type ClaudeAgentSdkWorkerEvent =
       readonly id: number;
       readonly after: number;
       readonly call: ClaudeAgentSdkCallbackCall;
+      /** The arguments that cross as their JSON text, by index (see toWorkerCallback). */
+      readonly jsonArgs?: ReadonlyArray<number>;
     }
   | { readonly type: "callbackAbort"; readonly id: number };
+
+// Main cannot read back a structured clone nested past about 2,400 objects (resultDepth.ts), so a value
+// the SDK hands main that nests deeper than the offload limit crosses as its JSON text. The SDK's
+// values are the JSON the CLI wrote, which reads back the same.
+const nestsTooDeep = (value: unknown) => nestsDeeperThan(value, MAX_OFFLOADED_RESULT_DEPTH);
+
+/** An SDK message as it crosses to main, or the JSON text of one nested too deep. */
+export type ClaudeAgentSdkWorkerOutput = SDKMessage | string;
+
+export const toWorkerOutput = (message: SDKMessage): ClaudeAgentSdkWorkerOutput =>
+  nestsTooDeep(message) ? JSON.stringify(message) : message;
+
+export const fromWorkerOutput = (output: ClaudeAgentSdkWorkerOutput): SDKMessage =>
+  typeof output === "string" ? (JSON.parse(output) as SDKMessage) : output;
+
+/** What a call answered as it crosses to main, or the JSON text of an answer nested too deep. */
+export type ClaudeAgentSdkWorkerReply = { readonly value: unknown } | { readonly json: string };
+
+export const toWorkerReply = (value: unknown): ClaudeAgentSdkWorkerReply =>
+  nestsTooDeep(value) ? { json: JSON.stringify(value) } : { value };
+
+export const fromWorkerReply = (reply: ClaudeAgentSdkWorkerReply): unknown =>
+  "json" in reply ? JSON.parse(reply.json) : reply.value;
+
+/** A callback as it crosses to main: each argument nested too deep goes as its JSON text. */
+export const toWorkerCallback = (
+  call: ClaudeAgentSdkCallbackCall,
+): { readonly call: ClaudeAgentSdkCallbackCall; readonly jsonArgs?: ReadonlyArray<number> } => {
+  const jsonArgs = call.args.flatMap((arg, index) => (nestsTooDeep(arg) ? [index] : []));
+  if (jsonArgs.length === 0) return { call };
+  const args = call.args.map((arg, index) =>
+    jsonArgs.includes(index) ? JSON.stringify(arg) : arg,
+  );
+  return { call: { ...call, args } as unknown as ClaudeAgentSdkCallbackCall, jsonArgs };
+};
+
+export const fromWorkerCallback = (
+  call: ClaudeAgentSdkCallbackCall,
+  jsonArgs: ReadonlyArray<number> | undefined,
+): ClaudeAgentSdkCallbackCall =>
+  jsonArgs === undefined
+    ? call
+    : ({
+        ...call,
+        args: call.args.map((arg, index) =>
+          jsonArgs.includes(index) ? JSON.parse(arg as string) : arg,
+        ),
+      } as unknown as ClaudeAgentSdkCallbackCall);
+
+/** An Error the worker's SDK raised, with the own fields a structured clone of it drops. */
+export interface ClaudeAgentSdkWorkerError {
+  readonly sdkError: Error;
+  readonly fields: Readonly<Record<string, string | number | boolean>>;
+}
+
+const isWorkerError = (error: unknown): error is ClaudeAgentSdkWorkerError =>
+  typeof error === "object" &&
+  error !== null &&
+  Object.hasOwn(error, "sdkError") &&
+  (error as { readonly sdkError: unknown }).sdkError instanceof Error;
+
+// A structured clone keeps only an Error's name, message, stack and cause, so an Error with fields of
+// its own (the SDK's errorClass, telemetryMessage, exitCode, signal) crosses with them beside it.
+export const toWorkerError = (error: unknown): unknown => {
+  if (!(error instanceof Error)) return error;
+  try {
+    const fields = Object.fromEntries(
+      Object.entries(error).filter(([, value]) =>
+        ["string", "number", "boolean"].includes(typeof value),
+      ),
+    ) as ClaudeAgentSdkWorkerError["fields"];
+    return Object.keys(fields).length === 0 ? error : { sdkError: error, fields };
+  } catch {
+    return error;
+  }
+};
+
+export const fromWorkerError = (error: unknown): unknown =>
+  isWorkerError(error) ? Object.assign(error.sdkError, error.fields) : error;
 
 // Errors cross threads without their own fields; the SDK reads code and syscall on spawn errors.
 export const toClaudeAgentSdkProcessError = (error: unknown): ClaudeAgentSdkProcessError => {
@@ -154,9 +236,9 @@ export const toClaudeAgentSdkProcessError = (error: unknown): ClaudeAgentSdkProc
  */
 export const claudeAgentSdkStageOnMain: ProviderIoStage<
   ClaudeAgentSdkStageOptions,
-  SDKMessage,
+  ClaudeAgentSdkWorkerOutput,
   ClaudeAgentSdkWorkerRequest,
-  unknown,
+  ClaudeAgentSdkWorkerReply,
   ClaudeAgentSdkWorkerEvent
 > = {
   name: CLAUDE_AGENT_SDK_STAGE,

@@ -18,7 +18,7 @@ import * as Result from "effect/Result";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
-import { it, assert, expect } from "@effect/vitest";
+import { it, assert, expect, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 import * as AcpSchema from "./schema.ts";
@@ -298,6 +298,48 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
 
       const [retained] = yield* transport.incoming.pipe(Stream.take(1), Stream.runCollect);
       assert.equal(decodeIndex(retained?.params).index, 1);
+    }),
+  );
+
+  it.effect("evicts unread raw notifications while a slow reader handles an earlier one", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const handled = yield* Queue.unbounded<number>();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        onNotification: (notification) =>
+          Queue.offer(handled, decodeIndex(notification.params).index).pipe(Effect.asVoid),
+      });
+      const send = (index: number, textLength: number) =>
+        Queue.offer(input, largeNotification(index, textLength)).pipe(
+          Effect.andThen(Queue.take(handled)),
+        );
+
+      yield* send(1, 6 * MIB);
+      yield* send(2, 6 * MIB);
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const reader = yield* transport.incoming.pipe(
+        Stream.map((notification) => decodeIndex(notification.params).index),
+        Stream.tap((index) =>
+          index === 1
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void,
+        ),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(entered);
+
+      // Notification 2 is still unread, so 3 and 4 push it past the budget.
+      yield* send(3, 6 * MIB);
+      yield* send(4, 6 * MIB);
+      yield* send(5, 1);
+      yield* Deferred.succeed(release, undefined);
+
+      assert.deepEqual(yield* Fiber.join(reader), [1, 3, 4, 5]);
     }),
   );
 
@@ -592,6 +634,31 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
     }),
   );
 
+  it.effect("skips blank lines between agent messages", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const outcome = yield* Deferred.make<string>();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        onTermination: (error) => Deferred.succeed(outcome, error._tag).pipe(Effect.asVoid),
+      });
+      yield* transport.incoming.pipe(
+        Stream.runForEach((notification) => Deferred.succeed(outcome, notification._tag)),
+        Effect.forkScoped,
+      );
+
+      const update = encodeUnknownJsonString({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: "session-1", update: { sessionUpdate: "plan", entries: [] } },
+      });
+      yield* Queue.offer(input, encoder.encode(`\n\r\n \t\n${update}\n\n`));
+
+      assert.equal(yield* Deferred.await(outcome), "SessionUpdate");
+    }),
+  );
+
   it.effect("logs decode failures without copying the cause or wire payload", () =>
     Effect.gen(function* () {
       const secret = "acp-wire-secret-sentinel";
@@ -752,6 +819,125 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         method: "x/private",
         requestId: 1,
         operation: "receive-response",
+      });
+    }),
+  );
+
+  it.effect("preserves application error data in outgoing extension responses", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const acknowledged = yield* Deferred.make<string>();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        onExtRequest: () =>
+          Effect.fail(AcpError.AcpRequestError.invalidParams("bad input", { field: "name" })),
+        onOutgoingResponse: (requestId) =>
+          Deferred.succeed(acknowledged, requestId).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: "peer-1",
+            method: "x/test",
+            params: {},
+          }) + "\n",
+        ),
+      );
+
+      assert.deepEqual(JSON.parse(yield* Queue.take(output)), {
+        jsonrpc: "2.0",
+        id: "peer-1",
+        error: { code: -32602, message: "bad input", data: { field: "name" } },
+      });
+      assert.equal(yield* Deferred.await(acknowledged), "peer-1");
+    }),
+  );
+
+  it.effect("completes a batch with successful and failed extension responses", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const acknowledgements = yield* Queue.unbounded<string>();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        onExtRequest: (method) =>
+          method === "x/success"
+            ? Effect.succeed({ ok: true })
+            : Effect.fail(AcpError.AcpRequestError.invalidParams("bad input", { field: "name" })),
+        onOutgoingResponse: (requestId) => Queue.offer(acknowledgements, requestId),
+      });
+
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          encodeUnknownJsonString([
+            { jsonrpc: "2.0", id: 0, method: "x/success", params: {} },
+            { jsonrpc: "2.0", id: "peer-1", method: "x/failure", params: {} },
+          ]) + "\n",
+        ),
+      );
+
+      assert.deepEqual(JSON.parse(yield* Queue.take(output)), [
+        { jsonrpc: "2.0", id: 0, result: { ok: true } },
+        {
+          jsonrpc: "2.0",
+          id: "peer-1",
+          error: { code: -32602, message: "bad input", data: { field: "name" } },
+        },
+      ]);
+      assert.equal(yield* Queue.take(acknowledgements), "peer-1");
+    }),
+  );
+
+  it.effect.each([
+    {
+      name: "typed failure",
+      cause: [{ _tag: "Fail", error: { code: -32602, message: "bad input", data: null } }],
+      error: { code: -32602, message: "bad input", data: null },
+    },
+    {
+      name: "typed failure with interruption",
+      cause: [
+        { _tag: "Fail", error: { code: -32602, message: "bad input", data: { field: "name" } } },
+        { _tag: "Interrupt", fiberId: null },
+      ],
+      error: { code: -32602, message: "bad input", data: { field: "name" } },
+    },
+    {
+      name: "defect",
+      cause: [{ _tag: "Die", defect: "private defect" }],
+      error: { code: -32603, message: "Internal error" },
+    },
+    {
+      name: "failure with a defect",
+      cause: [
+        { _tag: "Fail", error: { code: -32602, message: "bad input" } },
+        { _tag: "Die", defect: "private defect" },
+      ],
+      error: { code: -32603, message: "Internal error" },
+    },
+  ] as const)("emits a standard ACP error for a core $name", ({ cause, error }) =>
+    Effect.gen(function* () {
+      const { stdio, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+
+      yield* transport.serverProtocol.send(0, {
+        _tag: "Exit",
+        requestId: 0,
+        exit: { _tag: "Failure", cause },
+      });
+
+      assert.deepEqual(JSON.parse(yield* Queue.take(output)), {
+        jsonrpc: "2.0",
+        id: 0,
+        error,
       });
     }),
   );
@@ -1407,6 +1593,74 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
     }),
   );
 
+  it.effect.each([{ minChars: 0 }, { minChars: 200 }])(
+    "skips blank lines as in-thread when lines from $minChars chars go off-thread",
+    ({ minChars }) =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const offloaded: Array<string> = [];
+        const outcome = yield* Deferred.make<string>();
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(),
+          lineOffload: { ...makeOffload(offloaded), minChars },
+          onTermination: (error) => Deferred.succeed(outcome, error._tag).pipe(Effect.asVoid),
+        });
+        yield* transport.incoming.pipe(
+          Stream.runForEach((notification) => Deferred.succeed(outcome, notification._tag)),
+          Effect.forkScoped,
+        );
+
+        const blank = " \t\r".repeat(80);
+        yield* Queue.offer(input, encoder.encode(`\n\r\n${blank}\n${update(long)}\n\n`));
+
+        assert.equal(yield* Deferred.await(outcome), "SessionUpdate");
+        assert.deepEqual(offloaded, [update(long)]);
+      }),
+  );
+
+  it.effect("answers a request decoded off-thread with its error data, as in-thread", () =>
+    Effect.gen(function* () {
+      const failure = JSON.stringify({ jsonrpc: "2.0", id: "peer-1", method: "x/failure" });
+      const batch = JSON.stringify([
+        { jsonrpc: "2.0", id: 0, method: "x/success", params: {} },
+        { jsonrpc: "2.0", id: "peer-2", method: "x/failure", params: {} },
+      ]);
+      const run = (lineOffload: AcpProtocol.AcpLineOffload | undefined) =>
+        Effect.gen(function* () {
+          const { stdio, input, output } = yield* makeInMemoryStdio();
+          yield* AcpProtocol.makeAcpPatchedProtocol({
+            stdio,
+            serverRequestMethods: new Set(),
+            ...(lineOffload === undefined ? {} : { lineOffload }),
+            onExtRequest: (method) =>
+              method === "x/success"
+                ? Effect.succeed({ ok: true })
+                : Effect.fail(
+                    AcpError.AcpRequestError.invalidParams("bad input", { field: "name" }),
+                  ),
+          });
+          yield* Queue.offer(input, encoder.encode(`${failure}\n`));
+          const single = JSON.parse(yield* Queue.take(output));
+          yield* Queue.offer(input, encoder.encode(`${batch}\n`));
+          return [single, JSON.parse(yield* Queue.take(output))];
+        }).pipe(Effect.scoped);
+
+      const error = { code: -32602, message: "bad input", data: { field: "name" } };
+      const inThread = yield* run(undefined);
+      assert.deepEqual(inThread, [
+        { jsonrpc: "2.0", id: "peer-1", error },
+        [
+          { jsonrpc: "2.0", id: 0, result: { ok: true } },
+          { jsonrpc: "2.0", id: "peer-2", error },
+        ],
+      ]);
+      const offloaded: Array<string> = [];
+      assert.deepEqual(yield* run({ ...makeOffload(offloaded), minChars: 0 }), inThread);
+      assert.deepEqual(offloaded, [failure]);
+    }),
+  );
+
   it.effect("times framing per chunk, json per short line and offload per long line", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();
@@ -1442,6 +1696,85 @@ it.layer(NodeServices.layer)("effect-acp protocol line offload", (it) => {
         ["offload", update(long).length],
       ]);
     }),
+  );
+
+  // As upstream, a read builds its decoded log record only for incoming logging, timed or not.
+  it.effect.each([
+    { logIncoming: undefined, offload: false },
+    { logIncoming: false, offload: false },
+    { logIncoming: false, offload: true },
+    { logIncoming: true, offload: false },
+    { logIncoming: true, offload: true },
+  ])(
+    "shapes decoded log records only with incoming logging (logIncoming $logIncoming, offload $offload)",
+    ({ logIncoming, offload }) =>
+      Effect.gen(function* () {
+        const reads = [`${update("short")}\n`, `${update(long)}\n`];
+        const read = (stageTiming: AcpProtocol.AcpStageTiming | undefined) =>
+          Effect.gen(function* () {
+            const { stdio, input } = yield* makeInMemoryStdio();
+            const routed = yield* Deferred.make<void>();
+            let count = 0;
+            yield* AcpProtocol.makeAcpPatchedProtocol({
+              stdio,
+              serverRequestMethods: new Set(),
+              ...(logIncoming === undefined ? {} : { logIncoming }),
+              logger: () => Effect.void,
+              ...(stageTiming === undefined ? {} : { stageTiming }),
+              // Every line off-thread: main's parser maps decoded wire messages as the record does.
+              ...(offload ? { lineOffload: { ...makeOffload([]), minChars: 0 } } : {}),
+              onNotification: () =>
+                Effect.suspend(() =>
+                  ++count === reads.length ? Deferred.succeed(routed, undefined) : Effect.void,
+                ).pipe(Effect.asVoid),
+            });
+            for (const chunk of reads) yield* Queue.offer(input, encoder.encode(chunk));
+            yield* Deferred.await(routed);
+          }).pipe(Effect.scoped);
+
+        // The decoded record maps each read's decoded wire messages to their messages.
+        const shaped = yield* Effect.acquireUseRelease(
+          Effect.sync(() => vi.spyOn(Array.prototype, "map")),
+          (map) =>
+            read(undefined).pipe(
+              Effect.map(
+                () =>
+                  map.mock.contexts.filter((source, call) => {
+                    const result = map.mock.results[call];
+                    return (
+                      Array.isArray(source) &&
+                      source.length > 0 &&
+                      result?.type === "return" &&
+                      source.every(
+                        (entry, index) =>
+                          typeof entry === "object" &&
+                          entry !== null &&
+                          "lineLength" in entry &&
+                          "message" in entry &&
+                          result.value[index] === entry.message,
+                      )
+                    );
+                  }).length,
+              ),
+            ),
+          (map) => Effect.sync(() => map.mockRestore()),
+        );
+        let logShapes = 0;
+        yield* read({
+          now: () => 0,
+          record: (stage) => {
+            if (stage === "logShape") logShapes += 1;
+          },
+        });
+
+        // Timed, a raw and a decoded record per read.
+        assert.deepEqual(
+          { shaped, logShapes },
+          logIncoming
+            ? { shaped: reads.length, logShapes: 2 * reads.length }
+            : { shaped: 0, logShapes: 0 },
+        );
+      }),
   );
 
   // Chunks pulled together are handled with no yield between them, so a fiber the first message

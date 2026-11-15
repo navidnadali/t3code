@@ -6,7 +6,6 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { recountTurnItems } from "../turnItemCounts.ts";
 import {
   verifyProjectionIntegrity,
   type ProjectionIntegrityVerification,
@@ -59,7 +58,6 @@ export const layer: Layer.Layer<
           yield* sql`DELETE FROM orchestration_v2_projection_context_handoffs`;
           yield* sql`DELETE FROM orchestration_v2_projection_checkpoints`;
           yield* sql`DELETE FROM orchestration_v2_projection_checkpoint_scopes`;
-          yield* sql`DELETE FROM orchestration_v2_projection_turn_item_counts`;
           yield* sql`DELETE FROM orchestration_v2_projection_turn_items`;
           yield* sql`DELETE FROM orchestration_v2_projection_plans`;
           yield* sql`DELETE FROM orchestration_v2_projection_messages`;
@@ -125,7 +123,6 @@ export const layer: Layer.Layer<
           `;
         }),
       );
-      yield* recountTurnItems(sql);
       return yield* verify;
     });
 

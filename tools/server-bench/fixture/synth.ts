@@ -57,7 +57,7 @@ export interface TableComparison {
   readonly actualBytes: number;
 }
 
-// Kept by the server itself (migrations, search index, positions, the fork's turn item counts).
+// Kept by the server itself (migrations, search index, positions, migration 85's turn item counts).
 const DERIVED_TABLES =
   /^(?:effect_sql_migrations|t3_perf_fork_migrations|sqlite_.*|orchestration_v2_message_search(?:_.*)?|orchestration_v2_projection_metadata|orchestration_v2_projection_turn_item_counts)$/;
 

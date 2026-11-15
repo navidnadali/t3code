@@ -7,7 +7,6 @@ import type {
   HookEvent,
   Options,
   Query,
-  SDKMessage,
   SDKUserMessage,
   SpawnedProcess,
   SpawnOptions,
@@ -21,7 +20,13 @@ import {
   type ClaudeAgentSdkWorkerCallback,
   type ClaudeAgentSdkWorkerEvent,
   type ClaudeAgentSdkWorkerHooks,
+  type ClaudeAgentSdkWorkerOutput,
+  type ClaudeAgentSdkWorkerReply,
   type ClaudeAgentSdkWorkerRequest,
+  toWorkerCallback,
+  toWorkerError,
+  toWorkerOutput,
+  toWorkerReply,
 } from "./claudeAgentSdkProtocol.ts";
 import type { ProviderIoStage, ProviderIoStageHost } from "./providerIoProtocol.ts";
 
@@ -133,9 +138,10 @@ const makeCallbackRelay = (signal: Signal, read: () => number) => {
   // The SDK aborts a request the CLI cancels (or every one when it closes); main aborts its own.
   const relay = (call: ClaudeAgentSdkCallbackCall, abort: AbortSignal) =>
     new Promise<never>((resolve, reject) => {
+      const crossing = toWorkerCallback(call);
       const id = nextId++;
       pending.set(id, { resolve: resolve as (result: unknown) => void, reject });
-      signal({ type: "callback", id, after: read(), call });
+      signal({ type: "callback", id, after: read(), ...crossing });
       const cancel = () => {
         if (pending.has(id)) signal({ type: "callbackAbort", id });
       };
@@ -220,16 +226,24 @@ const makeCallbackRelay = (signal: Signal, read: () => number) => {
   return { callbacks, hooks, settle, drop };
 };
 
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as { readonly then?: unknown }).then === "function";
+
 /** Runs the SDK's `query()` over a CLI that main spawns and owns; SDK messages are its outputs. */
 export const claudeAgentSdkStage: ProviderIoStage<
   ClaudeAgentSdkStageOptions,
-  SDKMessage,
+  ClaudeAgentSdkWorkerOutput,
   ClaudeAgentSdkWorkerRequest,
-  unknown,
+  ClaudeAgentSdkWorkerReply,
   ClaudeAgentSdkWorkerEvent
 > = {
   name: CLAUDE_AGENT_SDK_STAGE,
-  open: (stageOptions, host?: ProviderIoStageHost<SDKMessage, ClaudeAgentSdkWorkerEvent>) => {
+  open: (
+    stageOptions,
+    host?: ProviderIoStageHost<ClaudeAgentSdkWorkerOutput, ClaudeAgentSdkWorkerEvent>,
+  ) => {
     if (host === undefined) throw new Error("The Claude Agent SDK stage runs only on a worker.");
     const prompts = makePromptQueue();
     let read = 0;
@@ -255,10 +269,10 @@ export const claudeAgentSdkStage: ProviderIoStage<
           const next = await running.next();
           if (next.done === true) break;
           read += 1;
-          host.emit(next.value);
+          host.emit(toWorkerOutput(next.value));
         }
       } catch (error) {
-        host.finish(error);
+        host.finish(toWorkerError(error));
         return;
       }
       host.finish();
@@ -283,7 +297,7 @@ export const claudeAgentSdkStage: ProviderIoStage<
       return query;
     };
 
-    const call = (request: ClaudeAgentSdkWorkerRequest): unknown => {
+    const answer = (request: ClaudeAgentSdkWorkerRequest): unknown => {
       switch (request.type) {
         case "start":
           return start();
@@ -293,6 +307,8 @@ export const claudeAgentSdkStage: ProviderIoStage<
         case "promptEnd":
           prompts.end();
           return undefined;
+        case "initializationResult":
+          return started().initializationResult();
         case "setMcpServers":
           return started().setMcpServers(request.servers);
         case "setModel":
@@ -355,7 +371,17 @@ export const claudeAgentSdkStage: ProviderIoStage<
       end: () => {
         child?.stdout.push(null);
       },
-      call,
+      call: (request) => {
+        let result: unknown;
+        try {
+          result = answer(request);
+        } catch (error) {
+          throw toWorkerError(error);
+        }
+        return isThenable(result)
+          ? result.then(toWorkerReply, (error: unknown) => Promise.reject(toWorkerError(error)))
+          : toWorkerReply(result);
+      },
       close: () => {
         prompts.end();
         query?.close();

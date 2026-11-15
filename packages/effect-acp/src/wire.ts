@@ -57,7 +57,7 @@ export const makeLineSplitter = () => {
 };
 
 // ndJsonRpc skips lines that are not JSON. A malformed agent line has to end the
-// session, so frames are split here and each one goes through the strict codec.
+// session, so frames are split here and each nonblank one goes through the strict codec.
 export interface FramedWireMessage {
   readonly message: WireMessage;
   readonly lineLength: number;
@@ -82,7 +82,7 @@ export const makeStrictNdJsonRpcParser = (timing?: AcpStageTiming) => {
       timing.now() - startedAt,
       typeof bytes === "string" ? Buffer.byteLength(bytes, "utf8") : bytes.byteLength,
     );
-    return lines.flatMap(decodeLine);
+    return lines.flatMap((line) => (line.trim() === "" ? [] : decodeLine(line)));
   };
   return {
     decode: (bytes: Uint8Array | string) => decodeWithLengths(bytes).map(({ message }) => message),
@@ -97,11 +97,41 @@ export const makeStrictNdJsonRpcParser = (timing?: AcpStageTiming) => {
     },
     encode: (response: Parameters<typeof codec.encode>[0]) => {
       const encoded = codec.encode(response);
-      return encoded === undefined ? undefined : `${encoded}\n`;
+      if (encoded === undefined) return undefined;
+      const json = typeof encoded === "string" ? encoded : new TextDecoder().decode(encoded);
+      if (!json.includes('"_tag":"Cause"')) return `${json}\n`;
+      return `${JSON.stringify(normalizeOutgoingFrame(JSON.parse(json)))}\n`;
     },
   };
 };
 export type StrictNdJsonRpcParser = ReturnType<typeof makeStrictNdJsonRpcParser>;
+const isCauseResponse = Schema.is(
+  Schema.Struct({
+    error: Schema.TaggedStruct("Cause", { data: Schema.Array(Schema.Unknown) }),
+  }),
+);
+const isProtocolFailure = Schema.is(Schema.TaggedStruct("Fail", { error: AcpSchema.Error }));
+const isInterruptReason = Schema.is(Schema.TaggedStruct("Interrupt", {}));
+
+// Normalize only Effect's error envelope after the codec has completed batch tracking.
+function normalizeOutgoingFrame(frame: unknown): unknown {
+  if (Array.isArray(frame)) return frame.map(normalizeOutgoingFrame);
+  if (!isCauseResponse(frame)) return frame;
+  const reasons = frame.error.data.filter((reason) => !isInterruptReason(reason));
+  const [failure] = reasons;
+  const error =
+    reasons.length === 1 && isProtocolFailure(failure)
+      ? failure.error
+      : AcpError.AcpRequestError.internalError().toProtocolError();
+  return {
+    ...frame,
+    error: {
+      code: error.code,
+      message: error.message,
+      ...(error.data === undefined ? {} : { data: error.data }),
+    },
+  };
+}
 
 /** A malformed line fails the whole chunk, so none of its messages are routed. */
 export const decodeWireChunk = (

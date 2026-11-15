@@ -89,7 +89,11 @@ const makeCodexWireStage = (
         for (const line of framed.lines) handle(line, emit);
         if (framed.exceeded) throw new Error(`Incoming message exceeded ${maxLineBytes} bytes.`);
       },
-      end: (emit) => handle(framer.end(), emit),
+      end: (emit) => {
+        const { tail, exceeded } = framer.end();
+        if (exceeded) throw new Error(`Incoming message exceeded ${maxLineBytes} bytes.`);
+        handle(tail, emit);
+      },
     };
   },
 });
@@ -158,7 +162,7 @@ const makeClaudeSdkLogStage = (
       push: (chunk, emit) => {
         for (const line of framer.push(chunk).lines) handle(line, emit);
       },
-      end: (emit) => handle(framer.end(), emit),
+      end: (emit) => handle(framer.end().tail, emit),
     };
   },
 });
@@ -171,7 +175,8 @@ export const claudeSdkLogStage = makeClaudeSdkLogStage();
 const utf8PerChunk = (chunk: Uint8Array) => new TextDecoder().decode(chunk);
 const BOM = [0xef, 0xbb, 0xbf];
 
-// Wraps the real framer; `onBytes` sees every chunk first and `onEnd` may rewrite the EOF tail.
+// Wraps the real framer; `onBytes` sees every chunk first and `onEnd` may rewrite an EOF tail within
+// the limit.
 const wrapFramer = (
   maxLineBytes: number | undefined,
   hooks: {
@@ -189,7 +194,12 @@ const wrapFramer = (
         ? framed
         : { ...framed, lines: hooks.onLines(framed.lines) };
     },
-    end: () => (hooks.onEnd === undefined ? framer.end() : hooks.onEnd(framer.end())),
+    end: () => {
+      const end = framer.end();
+      return hooks.onEnd === undefined || end.exceeded
+        ? end
+        : { ...end, tail: hooks.onEnd(end.tail) };
+    },
   };
 };
 
@@ -229,11 +239,11 @@ const codexMutants = {
   "ignores the line limit": () => CodexWire.makeLineFramer(),
   "strips the CR of the unterminated tail": (maxLineBytes?: number) =>
     wrapFramer(maxLineBytes, { onEnd: (tail) => tail.replace(/\r$/, "") }),
-  "flushes an incomplete UTF-8 sequence at EOF as U+FFFD": (maxLineBytes?: number) => {
+  "drops an incomplete UTF-8 sequence at EOF": (maxLineBytes?: number) => {
     const shadow = new TextDecoder();
     return wrapFramer(maxLineBytes, {
       onBytes: (chunk) => shadow.decode(chunk, { stream: true }),
-      onEnd: (tail) => tail + shadow.decode(),
+      onEnd: (tail) => tail.slice(0, tail.length - shadow.decode().length),
     });
   },
   "decodes with a fatal decoder": (maxLineBytes?: number) => {

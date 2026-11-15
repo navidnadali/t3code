@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off - The standalone bench driver parses its options without Effect.
+import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 
 import {
@@ -200,9 +202,9 @@ ${PROVIDER_LOAD_USAGE}
   --session-mcp-credentials DIR
                             use the credentials providers write here (one JSON file per session:
                             {"url": …, "authorization": …}); the driver sets the provider
-                            instance's BENCH_MCP_CREDENTIALS_DIR to DIR (the token then needs
-                            settings:write and providers:manage). Without it each session
-                            signs in as its own MCP client
+                            instance's BENCH_MCP_CREDENTIALS_DIR to DIR made absolute (the token
+                            then needs settings:write and providers:manage). Without it each
+                            session signs in as its own MCP client
   --switch-interval DUR     subscribers move to another thread this often; 0 holds (default 30s)
   --turn-gap DUR            pause between a session's turns (default 1s)
   --message-chars N         size of each user message (default 400)
@@ -316,6 +318,10 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
   if (values.taskset !== undefined && !/^[\d,-]+$/u.test(values.taskset)) {
     throw new UsageError("--taskset takes a CPU list such as 8-15 or 0,2,4");
   }
+  const credentials = values["session-mcp-credentials"];
+  if (credentials?.trim() === "") {
+    throw new UsageError("--session-mcp-credentials needs a directory");
+  }
   const options: DriverOptions = {
     url: origin,
     out: values.out,
@@ -338,7 +344,8 @@ export function parseDriverOptions(argv: ReadonlyArray<string>): DriverOptions {
     pollRate: parsePositive(values["poll-rate"], "poll-rate"),
     pollMix: parsePollMix(values["poll-mix"]),
     sessionMcpRatePerMinute: parseNonNegative(values["session-mcp-rate"], "session-mcp-rate"),
-    sessionMcpCredentials: values["session-mcp-credentials"] ?? null,
+    // The fakes run in each session's workspace, so they and the driver use it absolute.
+    sessionMcpCredentials: credentials === undefined ? null : NodePath.resolve(credentials),
     switchIntervalMs: parseDuration(values["switch-interval"], "switch-interval"),
     turnGapMs: parseDuration(values["turn-gap"], "turn-gap"),
     messageChars: parseCount(values["message-chars"], "message-chars", 1),

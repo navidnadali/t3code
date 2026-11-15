@@ -3,6 +3,8 @@ import {
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2Subagent,
+  type OrchestrationV2TurnItem,
   OrchestrationV2StoredEvent,
   ProviderThreadId,
   RunAttemptId,
@@ -13,8 +15,6 @@ import {
   ThreadId,
   type TurnItemId,
 } from "@t3tools/contracts";
-import * as Cause from "effect/Cause";
-import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -81,9 +81,10 @@ const CurrentProviderBatch = Context.Reference<ProviderBatchPublication | undefi
 );
 
 export interface EventSinkV2Shape {
-  readonly consumeProviderEvents: <E, R, E2, R2>(
-    source: Stream.Stream<ProviderAdapter.ProviderAdapterV2Event, E, R>,
-    process: (event: ProviderAdapter.ProviderAdapterV2Event) => Effect.Effect<void, E2, R2>,
+  /** Items that are not provider snapshots, such as a consumer's own control items, never batch. */
+  readonly consumeProviderEvents: <A extends { readonly type: string }, E, R, E2, R2>(
+    source: Stream.Stream<A, E, R>,
+    process: (event: A) => Effect.Effect<void, E2, R2>,
     after: Effect.Effect<boolean, E2, R2>,
     canBatch: Effect.Effect<boolean, never, R2>,
   ) => Effect.Effect<
@@ -122,15 +123,6 @@ export interface EventSinkV2Shape {
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
-  /**
-   * Runs each step and writes its events, in order, in one transaction. A step reads on that
-   * transaction, so it sees what earlier steps wrote. Any failure before the commit, a defect
-   * included, rolls back every step and fails with EventSinkWriteError.
-   */
-  readonly writeSteps: <E>(input: {
-    readonly guardPendingUserInputCancellations?: boolean;
-    readonly steps: ReadonlyArray<Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, E>>;
-  }) => Effect.Effect<ReadonlyArray<ReadonlyArray<OrchestrationV2StoredEvent>>, EventSinkV2Error>;
   readonly writeIfRunCurrent: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
@@ -138,6 +130,11 @@ export interface EventSinkV2Shape {
     readonly runId: RunId;
     readonly activeAttemptId: RunAttemptId;
     readonly expectedStatus: OrchestrationV2Run["status"];
+    /** Also refuse while this run interrupt request is stored without its result. */
+    readonly unlessInterruptRequested?: {
+      readonly requestId: OrchestrationV2TurnItem["id"];
+      readonly resultId: OrchestrationV2TurnItem["id"];
+    };
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects?: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<
@@ -166,6 +163,28 @@ export interface EventSinkV2Shape {
   /** Commits only if the full provider row equals expected; some writers do not advance updatedAt. */
   readonly writeIfProviderThreadUnchanged: (input: {
     readonly expected: OrchestrationV2ProviderThread;
+    readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+  }) => Effect.Effect<
+    {
+      readonly committed: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
+  /** Commits only if the stored turn item still equals expected. */
+  readonly writeIfTurnItemUnchanged: (input: {
+    readonly expected: OrchestrationV2TurnItem;
+    readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+  }) => Effect.Effect<
+    {
+      readonly committed: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
+  /** Commits only if the stored subagent still equals expected. */
+  readonly writeIfSubagentUnchanged: (input: {
+    readonly expected: OrchestrationV2Subagent;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<
     {
@@ -427,15 +446,12 @@ const layerBase: Layer.Layer<
       );
     };
 
-    const applyProjections = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) =>
-      Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
-        concurrency: 1,
-        discard: true,
-      });
-
-    const recordProjectedSequence =
+    const applyStoredEvents =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(function* (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) {
+        yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
+          concurrency: 1,
+        });
         const sequence = storedEvents.at(-1)?.sequence;
         if (sequence !== undefined) {
           const now = DateTime.formatIso(yield* DateTime.now);
@@ -461,13 +477,6 @@ const layerBase: Layer.Layer<
         }
         // Read lineage here, on the connection this transaction holds; see makeRunOutcomeRecorder.
         return yield* runOutcomes.prepare(storedEvents);
-      });
-
-    const applyStoredEvents =
-      /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
-      Effect.fnUntraced(function* (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) {
-        yield* applyProjections(storedEvents);
-        return yield* recordProjectedSequence(storedEvents);
       });
 
     // The enclosing write or commit span already traces this per-event projection merge.
@@ -548,72 +557,6 @@ const layerBase: Layer.Layer<
       return committed;
     });
 
-    // Anything that fails before the commit, defects included, fails with its squashed cause, so a
-    // caller can rely on nothing having been written. Interruption stays interruption.
-    const failBeforeCommit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      effect.pipe(
-        Effect.catchCauseIf(
-          (cause) => !Cause.hasInterruptsOnly(cause),
-          (cause) => Effect.fail(Cause.squash(cause)),
-        ),
-      );
-
-    const writeStepsEffect = Effect.fn("orchestrationV2.EventSink.writeSteps")(function* (
-      input: {
-        readonly guardPendingUserInputCancellations?: boolean;
-        readonly steps: ReadonlyArray<
-          Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, unknown>
-        >;
-      },
-      progress: { events: number },
-    ) {
-      const stored: Array<ReadonlyArray<OrchestrationV2StoredEvent>> = [];
-      // Steps before the first one with events read nothing this batch wrote, so they need no
-      // transaction; a batch without events opens none.
-      let next = 0;
-      let first: ReadonlyArray<OrchestrationV2DomainEvent> = [];
-      while (first.length === 0 && next < input.steps.length) {
-        first = yield* failBeforeCommit(input.steps[next]!);
-        next++;
-        if (first.length === 0) stored.push([]);
-      }
-      if (first.length === 0) return stored;
-      const append = Effect.fnUntraced(function* (
-        events: ReadonlyArray<OrchestrationV2DomainEvent>,
-      ) {
-        progress.events += events.length;
-        const normalized = yield* normalizeEvents(
-          input.guardPendingUserInputCancellations === true
-            ? yield* guardUserInputCancellations(events)
-            : events,
-        );
-        const committed = yield* eventStore.append({ events: normalized });
-        yield* applyProjections(committed);
-        return committed;
-      });
-      const { committed } = yield* commitThenPublish(
-        failBeforeCommit(
-          Effect.gen(function* () {
-            stored.push(yield* append(first));
-            for (const step of input.steps.slice(next)) {
-              const events = yield* step;
-              stored.push(events.length === 0 ? [] : yield* append(events));
-            }
-            const committed = stored.flat();
-            const outcomes = yield* recordProjectedSequence(committed);
-            return { committed, outcomes };
-          }).pipe(Effect.withTracerEnabled(false)),
-        ),
-        ({ committed, outcomes }) => publishStoredEvents(committed, outcomes),
-      );
-      yield* Effect.annotateCurrentSpan({
-        "orchestration_v2.step_count": input.steps.length,
-        "orchestration_v2.event_count": committed.length,
-        "orchestration_v2.thread_id": committed[0]?.event.threadId ?? null,
-      });
-      return stored;
-    });
-
     const writeIfRunCurrentEffect = Effect.fn("orchestrationV2.EventSink.writeIfRunCurrent")(
       function* (input: Parameters<EventSinkV2Shape["writeIfRunCurrent"]>[0]) {
         yield* Effect.annotateCurrentSpan({
@@ -647,6 +590,24 @@ const layerBase: Layer.Layer<
                 committed: false as const,
                 storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
               };
+            }
+            if (input.unlessInterruptRequested !== undefined) {
+              const { requestId, resultId } = input.unlessInterruptRequested;
+              const pending = yield* sql<{ readonly pending: number }>`
+                SELECT EXISTS (
+                  SELECT 1 FROM orchestration_v2_projection_turn_items
+                  WHERE thread_id = ${input.threadId} AND turn_item_id = ${requestId}
+                ) AND NOT EXISTS (
+                  SELECT 1 FROM orchestration_v2_projection_turn_items
+                  WHERE thread_id = ${input.threadId} AND turn_item_id = ${resultId}
+                ) AS pending
+              `;
+              if (pending[0]?.pending === 1) {
+                return {
+                  committed: false as const,
+                  storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+                };
+              }
             }
 
             const normalized = yield* normalizeEvents(
@@ -733,23 +694,15 @@ const layerBase: Layer.Layer<
       );
     });
 
-    const writeIfProviderThreadUnchangedEffect = Effect.fn(
-      "orchestrationV2.EventSink.writeIfProviderThreadUnchanged",
-    )(function* (input: Parameters<EventSinkV2Shape["writeIfProviderThreadUnchanged"]>[0]) {
-      yield* Effect.annotateCurrentSpan({
-        "orchestration_v2.event_count": input.events.length,
-        "orchestration_v2.provider_thread_id": input.expected.id,
-      });
-      const expectedJson = yield* ProjectionStore.encodeProviderThreadPayload(input.expected);
-
-      return yield* commitThenPublish(
+    // Appends the events only if the stored payload still matches, in one transaction.
+    const writeIfStoredPayloadMatches = <E>(
+      readStoredPayload: Effect.Effect<ReadonlyArray<{ readonly payload_json: string }>, E>,
+      expectedJson: string,
+      events: ReadonlyArray<OrchestrationV2DomainEvent>,
+    ) =>
+      commitThenPublish(
         Effect.gen(function* () {
-          const rows = yield* sql<{ readonly payload_json: string }>`
-            SELECT payload_json
-            FROM orchestration_v2_projection_provider_threads
-            WHERE provider_thread_id = ${input.expected.id}
-            LIMIT 1
-          `;
+          const rows = yield* readStoredPayload;
           if (rows[0]?.payload_json !== expectedJson) {
             return {
               committed: false as const,
@@ -757,7 +710,7 @@ const layerBase: Layer.Layer<
             };
           }
 
-          const normalized = yield* normalizeEvents(input.events);
+          const normalized = yield* normalizeEvents(events);
           const storedEvents = yield* eventStore.append({ events: normalized });
           const outcomes = yield* applyStoredEvents(storedEvents);
           return { committed: true as const, storedEvents, outcomes };
@@ -766,6 +719,65 @@ const layerBase: Layer.Layer<
           result.committed
             ? publishStoredEvents(result.storedEvents, result.outcomes)
             : Effect.void,
+      );
+
+    const writeIfProviderThreadUnchangedEffect = Effect.fn(
+      "orchestrationV2.EventSink.writeIfProviderThreadUnchanged",
+    )(function* (input: Parameters<EventSinkV2Shape["writeIfProviderThreadUnchanged"]>[0]) {
+      yield* Effect.annotateCurrentSpan({
+        "orchestration_v2.event_count": input.events.length,
+        "orchestration_v2.provider_thread_id": input.expected.id,
+      });
+      const expectedJson = yield* ProjectionStore.encodeProviderThreadPayload(input.expected);
+      return yield* writeIfStoredPayloadMatches(
+        sql<{ readonly payload_json: string }>`
+          SELECT payload_json
+          FROM orchestration_v2_projection_provider_threads
+          WHERE provider_thread_id = ${input.expected.id}
+          LIMIT 1
+        `,
+        expectedJson,
+        input.events,
+      );
+    });
+
+    const writeIfTurnItemUnchangedEffect = Effect.fn(
+      "orchestrationV2.EventSink.writeIfTurnItemUnchanged",
+    )(function* (input: Parameters<EventSinkV2Shape["writeIfTurnItemUnchanged"]>[0]) {
+      yield* Effect.annotateCurrentSpan({
+        "orchestration_v2.event_count": input.events.length,
+        "orchestration_v2.turn_item_id": input.expected.id,
+      });
+      const expectedJson = yield* ProjectionStore.encodeTurnItemPayload(input.expected);
+      return yield* writeIfStoredPayloadMatches(
+        sql<{ readonly payload_json: string }>`
+          SELECT payload_json
+          FROM orchestration_v2_projection_turn_items
+          WHERE turn_item_id = ${input.expected.id}
+          LIMIT 1
+        `,
+        expectedJson,
+        input.events,
+      );
+    });
+
+    const writeIfSubagentUnchangedEffect = Effect.fn(
+      "orchestrationV2.EventSink.writeIfSubagentUnchanged",
+    )(function* (input: Parameters<EventSinkV2Shape["writeIfSubagentUnchanged"]>[0]) {
+      yield* Effect.annotateCurrentSpan({
+        "orchestration_v2.event_count": input.events.length,
+        "orchestration_v2.subagent_id": input.expected.id,
+      });
+      const expectedJson = yield* ProjectionStore.encodeSubagentPayload(input.expected);
+      return yield* writeIfStoredPayloadMatches(
+        sql<{ readonly payload_json: string }>`
+          SELECT payload_json
+          FROM orchestration_v2_projection_subagents
+          WHERE subagent_id = ${input.expected.id}
+          LIMIT 1
+        `,
+        expectedJson,
+        input.events,
       );
     });
 
@@ -802,6 +814,38 @@ const layerBase: Layer.Layer<
           if (!reserved) {
             const existing = yield* existingCommandResult(input.commandId);
             return { ...existing, committed: false as const, cancelledEffectIds: [] };
+          }
+
+          // Planning does not lock the source. Once deletion commits, maintenance
+          // can remove its checkpoints, so a new fork must not revive that history.
+          if (input.commandType === "thread.fork") {
+            for (const event of input.events) {
+              if (event.type !== "thread.created" || event.payload.forkedFrom?.type !== "run")
+                continue;
+              const sourceId = event.payload.forkedFrom.threadId;
+              const source = yield* sql`
+                SELECT 1 FROM orchestration_v2_projection_threads
+                WHERE thread_id = ${sourceId} AND deleted_at IS NULL
+              `;
+              if (source.length === 0) {
+                const receipt: CommandReceiptStore.CommandReceiptV2 = {
+                  commandId: input.commandId,
+                  threadId: input.threadId,
+                  commandType: input.commandType,
+                  acceptedAt: input.acceptedAt,
+                  resultSequence: yield* eventStore.latestSequence({ threadId: input.threadId }),
+                  status: "rejected",
+                  error: "Cannot fork a missing or deleted thread.",
+                };
+                yield* commandReceipts.upsert(receipt);
+                return {
+                  receipt,
+                  storedEvents: [],
+                  committed: false as const,
+                  cancelledEffectIds: [],
+                };
+              }
+            }
           }
 
           const runId = input.updateDelegatedCompletionOnlyRunId;
@@ -1141,15 +1185,6 @@ const layerBase: Layer.Layer<
               }),
           ),
         ),
-      writeSteps: (input) =>
-        Effect.suspend(() => {
-          const progress = { events: 0 };
-          return writeStepsEffect(input, progress).pipe(
-            Effect.mapError(
-              (cause) => new EventSinkWriteError({ eventCount: progress.events, cause }),
-            ),
-          );
-        }),
       writeIfRunCurrent: (input) =>
         writeIfRunCurrentEffect(input).pipe(
           Effect.mapError(
@@ -1174,6 +1209,18 @@ const layerBase: Layer.Layer<
         ),
       writeIfProviderThreadUnchanged: (input) =>
         writeIfProviderThreadUnchangedEffect(input).pipe(
+          Effect.mapError(
+            (cause) => new EventSinkWriteError({ eventCount: input.events.length, cause }),
+          ),
+        ),
+      writeIfTurnItemUnchanged: (input) =>
+        writeIfTurnItemUnchangedEffect(input).pipe(
+          Effect.mapError(
+            (cause) => new EventSinkWriteError({ eventCount: input.events.length, cause }),
+          ),
+        ),
+      writeIfSubagentUnchanged: (input) =>
+        writeIfSubagentUnchangedEffect(input).pipe(
           Effect.mapError(
             (cause) => new EventSinkWriteError({ eventCount: input.events.length, cause }),
           ),

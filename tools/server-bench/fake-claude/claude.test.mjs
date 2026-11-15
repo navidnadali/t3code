@@ -21,6 +21,7 @@ import {
 const FAKE = NodeURL.fileURLToPath(new URL("./claude.mjs", import.meta.url));
 const SESSION = "11111111-2222-4333-8444-555555555555";
 const PROMPT = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const STEER = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
 const streamArgs = (session = `--session-id=${SESSION}`) => [
   "--output-format",
   "stream-json",
@@ -329,6 +330,48 @@ describe("fake claude process", () => {
   });
 
   it.each([
+    ["after its first frame", false],
+    ["in the same write as its prompt", true],
+  ])(
+    "with BENCH_HOLD_CUT_TURNS, plays a turn the recording's steer cut off up to that cut and ends it at a live steer sent %s",
+    async (_when, together) => {
+      using fake = startFake(STREAM_ARGS, {
+        BENCH_SPEED: "0",
+        BENCH_TRANSCRIPT: "message_steering",
+        BENCH_HOLD_CUT_TURNS: "1",
+      });
+      const prompt = { type: "user", message: { role: "user", content: "hi" }, uuid: PROMPT };
+      const steer = {
+        type: "user",
+        message: { role: "user", content: "instead" },
+        priority: "now",
+        uuid: STEER,
+      };
+      if (together) {
+        fake.send(prompt, steer);
+      } else {
+        fake.send(prompt);
+        await fake.until((line) => frameOf(line)?.subtype === "hook_started");
+        fake.send(steer);
+      }
+      const cut = parseAll(await fake.until(isResult));
+      const steered = parseAll(await fake.until(isResult));
+
+      expect(cut.map((frame) => `${frame.type}/${frame.subtype}`).slice(-3)).toEqual([
+        "system/hook_response",
+        "system/init",
+        "result/error_during_execution",
+      ]);
+      expect(cut.at(-1)).toMatchObject({
+        terminal_reason: "aborted_streaming",
+        errors: ["Error: Request was aborted."],
+        user_message_uuids: [PROMPT],
+      });
+      expect(steered.at(-1)).toMatchObject({ subtype: "success", session_id: SESSION });
+    },
+  );
+
+  it.each([
     ["truncated-frame", { malformed: 1, result: true, exitCode: null }],
     ["truncated-frame-exit", { malformed: 1, result: false, exitCode: 1 }],
     ["bad-shape", { malformed: 1, result: true, exitCode: null }],
@@ -460,6 +503,7 @@ describe("fake claude configuration", () => {
     [{ BENCH_FAULT: "explode" }, "BENCH_FAULT"],
     [{ BENCH_SEED: "-1" }, "BENCH_SEED"],
     [{ BENCH_TRANSCRIPT: "simple:0" }, "BENCH_TRANSCRIPT"],
+    [{ BENCH_HOLD_CUT_TURNS: "yes" }, "BENCH_HOLD_CUT_TURNS"],
   ])("rejects %o", (env, name) => {
     expect(() => readConfig(env)).toThrow(name);
   });

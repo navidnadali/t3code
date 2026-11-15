@@ -56,17 +56,24 @@ describe("CredentialCallers", () => {
   const harness = (limit: number) => {
     const started: Array<string> = [];
     const stopped: Array<string> = [];
+    const made = new Map<string, { ended: boolean }>();
     const signIns: Array<{
       readonly authorization: string;
       readonly finish: () => void;
       readonly fail: () => void;
     }> = [];
     const callers = new CredentialCallers(limit, (_name, credential: McpCredential) => {
-      const done = Promise.withResolvers<{ start: () => void; stop: () => Promise<void> }>();
+      const done = Promise.withResolvers<{
+        ended: boolean;
+        start: () => void;
+        stop: () => Promise<void>;
+      }>();
       const caller = {
+        ended: false,
         start: () => void started.push(credential.authorization),
         stop: async () => void stopped.push(credential.authorization),
       };
+      made.set(credential.authorization, caller);
       signIns.push({
         authorization: credential.authorization,
         finish: () => done.resolve(caller),
@@ -75,7 +82,12 @@ describe("CredentialCallers", () => {
       return done.promise;
     });
     const settle = () => new Promise<void>((resolve) => queueMicrotask(resolve));
-    return { callers, started, stopped, signIns, settle };
+    /** The caller's session ended: its credential was refused. */
+    const end = (authorization: string) => {
+      const caller = made.get(authorization);
+      if (caller !== undefined) caller.ended = true;
+    };
+    return { callers, started, stopped, signIns, settle, end };
   };
   const as = (authorization: string) => ({ url: "http://127.0.0.1:1/mcp", authorization });
 
@@ -137,5 +149,24 @@ describe("CredentialCallers", () => {
       ]),
     );
     expect(signIns.map((signIn) => signIn.authorization)).toEqual(["Bearer a", "Bearer b"]);
+  });
+
+  it("gives an ended caller's slot to a new session's credential, not to its own again", async () => {
+    const { callers, started, signIns, settle, end } = harness(1);
+    callers.update(new Map([["a.json", as("Bearer a")]]));
+    signIns[0]?.finish();
+    await settle();
+    end("Bearer a");
+    callers.update(
+      new Map([
+        ["a.json", as("Bearer a")],
+        ["b.json", as("Bearer b")],
+      ]),
+    );
+    signIns[1]?.finish();
+    await settle();
+    expect(signIns.map((signIn) => signIn.authorization)).toEqual(["Bearer a", "Bearer b"]);
+    expect(started).toEqual(["Bearer a", "Bearer b"]);
+    expect(callers.callers().filter((caller) => !caller.ended)).toHaveLength(1);
   });
 });

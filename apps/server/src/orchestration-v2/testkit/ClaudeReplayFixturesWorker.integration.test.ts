@@ -37,10 +37,11 @@ const CLAUDE_FIXTURES = ORCHESTRATOR_REPLAY_FIXTURES.flatMap((fixture) =>
 type Fixture = (typeof CLAUDE_FIXTURES)[number];
 
 // Each run has its own temp directories and fresh prompt ids, and the scenario's debounce moves the
-// test clock by however many late frames it saw; none of that is what the provider did.
+// test clock by however many late frames it saw; none of that is what the provider did. A directory
+// sits behind either separator, a backslash escaped too in serialized content.
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const RUN_DIRECTORY =
-  /[^\s"']*\/t3-(?:orchestrator-v2|orchestration-v2-replay)-[\w-]*?-[A-Za-z0-9]{6}(?=[/\s"']|$)/g;
+  /[^\s"']*[\\/]t3-(?:orchestrator-v2|orchestration-v2-replay)-[\w-]*?-[A-Za-z0-9]{6}(?=[\\/\s"']|$)/g;
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
 const comparable = (
   value: unknown,
@@ -420,15 +421,16 @@ const comparableStores = (
 };
 
 // What T3 sent and what the CLI sent each keep their order; when a control call's completion is
-// logged relative to frames the CLI sent around its answer is up to the scheduler.
+// logged relative to frames the CLI sent around its answer is up to the scheduler. UUIDs are
+// numbered after the split, so that order does not rename them either.
 const byDirection = (logs: ReadonlyArray<unknown>) => {
-  const normalized = comparable(logs) as ReadonlyArray<{
+  const lines = JSON.parse(JSON.stringify(logs)) as ReadonlyArray<{
     readonly event: { readonly direction: string };
   }>;
-  return {
-    incoming: normalized.filter((line) => line.event.direction === "incoming"),
-    outgoing: normalized.filter((line) => line.event.direction === "outgoing"),
-  };
+  return comparable({
+    incoming: lines.filter((line) => line.event.direction === "incoming"),
+    outgoing: lines.filter((line) => line.event.direction === "outgoing"),
+  });
 };
 
 const runAtWireLevel = ([name, fixture, provider]: Fixture, workers: 0 | 2) =>
@@ -1068,6 +1070,61 @@ describe("Claude replay comparison", () => {
     for (const variant of variants) {
       assert.notDeepEqual(...comparePair(store(variant), subagentFirst));
     }
+  });
+
+  it("compares protocol logs whichever direction's frame arrives first, in each direction's order", () => {
+    const frame = (direction: string, text: string) => ({ event: { direction, payload: text } });
+    const uuid = (index: number) => `0000000${index}-0000-4000-8000-000000000000`;
+    // Each run makes its own UUIDs.
+    const logs = [
+      frame("outgoing", `prompt ${uuid(1)}`),
+      frame("incoming", `assistant ${uuid(2)}`),
+      frame("incoming", `result ${uuid(2)}`),
+    ];
+    const answerFirst = [
+      frame("incoming", `assistant ${uuid(4)}`),
+      frame("outgoing", `prompt ${uuid(3)}`),
+      frame("incoming", `result ${uuid(4)}`),
+    ];
+    const reordered = [
+      frame("outgoing", `prompt ${uuid(3)}`),
+      frame("incoming", `result ${uuid(4)}`),
+      frame("incoming", `assistant ${uuid(4)}`),
+    ];
+
+    assert.deepStrictEqual(byDirection(answerFirst), byDirection(logs));
+    assert.notDeepEqual(byDirection(reordered), byDirection(logs));
+  });
+
+  it.each([
+    ["POSIX", "/tmp", "/"],
+    ["Windows", "C:\\Users\\me\\AppData\\Local\\Temp", "\\"],
+  ])("compares each run's own %s run directory, as is and serialized", (_os, temp, separator) => {
+    const workspace = (suffix: string, file = "notes.txt") => {
+      const directory = `${temp}${separator}t3-orchestration-v2-replay-compare-${suffix}`;
+      const path = `${directory}${separator}${file}`;
+      return { cwd: directory, path, line: JSON.stringify({ cwd: directory, path }) };
+    };
+    const written = (suffix: string, file?: string) =>
+      store([
+        started,
+        [null, item("turn-item:compare:file", "completed", run1, 1)],
+        [
+          null,
+          record("turn-item.updated", "turn-item:compare:file", "completed", run1, {
+            ordinal: 1,
+            ...workspace(suffix, file),
+          }),
+        ],
+      ]);
+
+    assert.deepStrictEqual(comparable([workspace("AbC123")]), comparable([workspace("xYz789")]));
+    assert.deepStrictEqual(...comparePair(written("AbC123"), written("xYz789")));
+    assert.notDeepEqual(
+      comparable([workspace("AbC123")]),
+      comparable([workspace("xYz789", "other.txt")]),
+    );
+    assert.notDeepEqual(...comparePair(written("AbC123"), written("xYz789", "other.txt")));
   });
 });
 

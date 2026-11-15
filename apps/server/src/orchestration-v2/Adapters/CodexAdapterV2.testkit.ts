@@ -16,6 +16,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { ProviderAdapterDriverCreateError } from "@t3tools/provider-core/server/adapterDriver";
+import * as PortScanner from "../../preview/PortScanner.ts";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import {
   makeReplayServerConfig,
@@ -114,16 +115,15 @@ export function layer(input: {
       return CodexAdapterV2.CodexAppServerClientFactory.of({
         open: (openInput) =>
           Effect.gen(function* () {
-            const logger = CodexAdapterV2.makeCodexAppServerProtocolLogger({
+            const protocolLog = CodexAdapterV2.makeCodexAppServerProtocolLog({
               nativeEventLogger,
-              threadId: openInput.threadId,
               providerSessionId: openInput.providerSessionId,
             });
-            const writeSerialized = nativeEventLogger?.writeSerialized;
+            const writeSerialized = protocolLog?.writeSerialized;
             // As the real factory; a replay has no process for a dead worker to stop.
             const lineOffload =
               Option.isNone(offloads) ||
-              (nativeEventLogger !== undefined && writeSerialized === undefined)
+              (protocolLog !== undefined && writeSerialized === undefined)
                 ? undefined
                 : Option.getOrUndefined(
                     yield* offloads.value.open({
@@ -133,14 +133,15 @@ export function layer(input: {
                         : {
                             log: {
                               providerSessionId: openInput.providerSessionId,
-                              writeSerialized: (record) =>
-                                writeSerialized(record, openInput.threadId).pipe(Effect.ignore),
+                              writeSerialized,
                             },
                           }),
                     }),
                   );
             const options = {
-              ...(logger === undefined ? {} : { logIncoming: true, logOutgoing: true, logger }),
+              ...(protocolLog === undefined
+                ? {}
+                : { logIncoming: true, logOutgoing: true, logger: protocolLog.logger }),
               ...(lineOffload === undefined ? {} : { lineOffload }),
             };
             const inbound = Option.isSome(chunking)
@@ -188,6 +189,7 @@ export function layer(input: {
         NodeServices.layer,
         NodeCrypto.layer,
         IdAllocator.layer,
+        PortScanner.layerTest,
       ),
     ),
   );

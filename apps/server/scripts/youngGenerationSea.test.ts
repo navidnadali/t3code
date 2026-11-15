@@ -130,9 +130,7 @@ describe("young-generation default in the single executable", () => {
         expect(injected.signal).toBeNull();
         expect(`${injected.stdout}${injected.stderr}`).not.toMatch(/Debugger listening|debugger/i);
         if (injected.status === 0) {
-          expect((JSON.parse(injected.stdout) as NodeFlagsReport).execArgv).toEqual([
-            "--max-semi-space-size=64",
-          ]);
+          expect((JSON.parse(injected.stdout) as NodeFlagsReport).execArgv).toEqual(bare.execArgv);
         }
       }
       // A helper's heap bound in NODE_OPTIONS reaches V8 the ordinary way.

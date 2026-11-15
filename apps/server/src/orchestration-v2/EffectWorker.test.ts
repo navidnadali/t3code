@@ -3,7 +3,10 @@ import {
   CheckpointId,
   CheckpointScopeId,
   CommandId,
+  MessageId,
   NodeId,
+  ProjectId,
+  ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
@@ -12,6 +15,8 @@ import {
   RuntimeRequestId,
   ThreadId,
   VcsProcessExitError,
+  type OrchestrationV2ServerCommand,
+  type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -24,6 +29,8 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as SqlError from "effect/sql/SqlError";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
@@ -31,6 +38,8 @@ import * as EffectAdmission from "./EffectAdmission.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as Orchestrator from "./Orchestrator.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
@@ -38,6 +47,7 @@ import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
 // These admission fixtures model the regular pool. The reserved control worker
@@ -102,6 +112,8 @@ function layerExecutorFor(input: {
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
+  readonly steer?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["steer"];
+  readonly outbox?: Layer.Layer<EffectOutbox.EffectOutboxV2>;
   readonly rollback?: CheckpointRollbackService.CheckpointRollbackServiceV2Shape["execute"];
   readonly respond?: RuntimeRequestService.RuntimeRequestServiceV2["Service"]["respond"];
 }) {
@@ -111,7 +123,8 @@ function layerExecutorFor(input: {
       ProviderTurnControlService.ProviderTurnControlServiceV2,
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
         interrupt: input.interrupt ?? (() => Effect.void),
-        steer: () => Effect.void,
+        steer: input.steer ?? (() => Effect.void),
+        applyModelSelection: () => Effect.void,
         interruptAndAwaitTerminal: (request) =>
           record(
             request.replacementProviderSessionId === undefined
@@ -133,11 +146,13 @@ function layerExecutorFor(input: {
         detach: () => record("detach"),
         otherWorkingThreads: () => Effect.succeed([]),
         releaseUnlessBusy: () => Effect.succeed(true),
+        subscribePromptSuggestion: () => Stream.empty,
       }),
     ),
     Layer.succeed(
       ProviderTurnStartService.ProviderTurnStartServiceV2,
       ProviderTurnStartService.ProviderTurnStartServiceV2.of({
+        failStartingRun: () => Effect.void,
         start: () =>
           Effect.gen(function* () {
             yield* record("start");
@@ -180,8 +195,9 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
-        mockNormalOutbox({ recordSteerDelivery: () => Effect.void }),
+        input.outbox ?? mockNormalOutbox({ recordSteerDelivery: () => Effect.void }),
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
         ServerSettings.layerTest(
           input.continueAfterRestart === true ? { continueThreadsAfterServerUpdate: true } : {},
         ),
@@ -343,6 +359,114 @@ it.effect("does not report an answer whose last delivery attempt is interrupted"
   }),
 );
 
+it.effect("a declined steer's follow-up keeps its queue place and model when it is retried", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
+    const messageId = MessageId.make("message:effect-worker-declined");
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "declined-steer-model",
+    };
+    const layerOutbox = EffectOutbox.layer.pipe(
+      Layer.provideMerge(SqlitePersistence.layerMemory),
+      Layer.orDie,
+    );
+    const layer = layerExecutorFor({
+      events: yield* Ref.make<ReadonlyArray<string>>([]),
+      outbox: layerOutbox,
+      steer: () =>
+        new ProviderTurnControlService.ProviderTurnControlError({
+          threadId,
+          operation: "steer",
+          providerTurnId,
+          steerDeclined: true,
+          cause: "The provider declined the steer.",
+        }),
+      threads: {
+        getThreadRecords: () =>
+          Effect.succeed({
+            messages: [
+              {
+                id: messageId,
+                runId,
+                text: "steer",
+                attachments: [],
+                createdBy: "user",
+                creationSource: "user",
+              },
+            ],
+            runs: [{ id: runId, modelSelection: null }],
+          } as unknown as OrchestrationV2ThreadProjection),
+        dispatch: (command) =>
+          Ref.updateAndGet(dispatched, (current) => [...current, command]).pipe(
+            Effect.flatMap((current) =>
+              current.length === 1
+                ? Effect.fail(
+                    new Orchestrator.OrchestratorDispatchError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      cause: "The follow-up could not be planned.",
+                    }),
+                  )
+                : Effect.succeed({ sequence: current.length, storedEvents: [] }),
+            ),
+          ),
+      },
+    });
+    yield* Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      yield* outbox.enqueue([
+        {
+          id: "effect:declined-steer",
+          commandId: CommandId.make("command:declined-steer"),
+          threadId,
+          request: {
+            type: "provider-turn.steer",
+            durableDelivery: true,
+            providerSessionId: oldSessionId,
+            providerThreadId,
+            providerTurnId,
+            messageId,
+            modelSelection,
+            steerFollowUpAfterRunOrdinal: 3,
+          },
+        },
+      ]);
+      const claim = () =>
+        outbox
+          .claimNext({ workerId: "test-worker" })
+          .pipe(Effect.flatMap((claimed) => Effect.fromOption(claimed)));
+      yield* Effect.flip(executor.execute(yield* claim()));
+      yield* outbox.retry({
+        effectId: "effect:declined-steer",
+        workerId: "test-worker",
+        error: "The follow-up could not be planned.",
+        delayMs: 0,
+      });
+      yield* executor.execute(yield* claim());
+    }).pipe(Effect.provide(Layer.merge(layer, layerOutbox)));
+    const [first, retried] = (yield* Ref.get(dispatched)).map((command) => {
+      assert.equal(command.type, "message.dispatch");
+      const dispatch = command as Extract<
+        OrchestrationV2ServerCommand,
+        { readonly type: "message.dispatch" }
+      >;
+      return {
+        dispatchMode: dispatch.dispatchMode.type,
+        steerFollowUpAfterRunOrdinal: dispatch.steerFollowUpAfterRunOrdinal,
+        modelSelection: dispatch.modelSelection,
+      };
+    });
+    assert.deepEqual(first, {
+      dispatchMode: "queue_after_active",
+      steerFollowUpAfterRunOrdinal: 3,
+      modelSelection,
+    });
+    assert.deepEqual(retried, first);
+  }),
+);
+
 it.effect("requeues a claim when a pre-execution worker check fails", () =>
   Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
@@ -395,7 +519,7 @@ it.effect("requeues a claim when a pre-execution worker check fails", () =>
     );
 
     const exit = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
-      Effect.flatMap((worker) => worker.runOnce),
+      Effect.flatMap((worker) => worker.runOnce()),
       Effect.provide(layerWorker),
       Effect.exit,
     );
@@ -411,6 +535,138 @@ it.effect("requeues a claim when a pre-execution worker check fails", () =>
     assert.equal(retry.workerId, workerId);
     assert.equal(retry.delayMs, 0);
     assert.include(retry.error, "simulated cancellation-state read failure");
+  }),
+);
+
+it.effect("keeps requeueing a failed claim while the database is locked", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const effectId = "effect:worker-requeue-lock-timeout";
+    const workerId = "worker-requeue-lock-timeout";
+    const claimedEffect: EffectOutbox.OrchestrationEffectV2 = {
+      id: effectId,
+      commandId: CommandId.make("command:worker-requeue-lock-timeout"),
+      threadId,
+      request: { type: "provider-runtime.continue", sourceRunId: runId },
+      status: "running",
+      attemptCount: 1,
+      availableAt: now,
+      leaseOwner: workerId,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      lastError: null,
+    };
+    const lockedWrites = yield* Ref.make(3);
+    const requeued = yield* Ref.make(false);
+    const firstLockTimeout = yield* Deferred.make<void>();
+    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () => Effect.succeedSome(claimedEffect),
+      get: () => Effect.succeedSome(claimedEffect),
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      retry: () =>
+        Effect.gen(function* () {
+          if ((yield* Ref.getAndUpdate(lockedWrites, (count) => count - 1)) > 0) {
+            yield* Deferred.succeed(firstLockTimeout, undefined);
+            return yield* new EffectOutbox.EffectOutboxError({
+              operation: "retry",
+              effectId,
+              cause: new SqlError.SqlError({
+                reason: new SqlError.LockTimeoutError({ cause: null }),
+              }),
+            });
+          }
+          yield* Ref.set(requeued, true);
+          return true;
+        }),
+    });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({
+        execute: () =>
+          Effect.fail(
+            new EffectWorker.OrchestrationEffectExecutionError({
+              effectId,
+              effectType: "provider-runtime.continue",
+              cause: "simulated database is locked",
+            }),
+          ),
+      }),
+    );
+    const layerWorker = EffectWorker.layerWithOptions({ workerId }).pipe(
+      Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+    );
+
+    const workerFiber = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => worker.runOnce()),
+      Effect.provide(layerWorker),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(firstLockTimeout);
+    yield* TestClock.adjust(Duration.millis(99));
+    assert.isFalse(yield* Ref.get(requeued));
+    yield* TestClock.adjust(Duration.seconds(1));
+    yield* Effect.exit(Fiber.join(workerFiber));
+
+    assert.isTrue(yield* Ref.get(requeued));
+  }),
+);
+
+it.effect.each([
+  { name: "requeue", request: { type: "provider-runtime.continue", sourceRunId: runId } },
+  { name: "terminalize", request: { type: "provider-turn.start", runId } },
+] as const)("interrupts $name settlement retries when the worker shuts down", ({ request }) =>
+  Effect.gen(function* () {
+    const claimedEffect: EffectOutbox.OrchestrationEffectV2 = {
+      ...restartEffect(yield* DateTime.now, { type: "detach" }),
+      request,
+    };
+    const settlementStarted = yield* Deferred.make<void>();
+    const releaseLock = yield* Ref.make(false);
+    const lockedWrite = Effect.gen(function* () {
+      yield* Deferred.succeed(settlementStarted, undefined);
+      // An in-flight database write can finish its own wait before noticing shutdown.
+      yield* Effect.sleep(Duration.millis(1));
+      if (yield* Ref.get(releaseLock)) return true;
+      return yield* new EffectOutbox.EffectOutboxError({
+        operation: "settlement",
+        effectId: claimedEffect.id,
+        cause: new SqlError.SqlError({ reason: new SqlError.LockTimeoutError({ cause: null }) }),
+      });
+    });
+    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () => Effect.succeedSome(claimedEffect),
+      get: () => Effect.succeedSome(claimedEffect),
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      succeed: () => Effect.fail(new EffectOutbox.EffectOutboxError({ operation: "succeed" })),
+      retry: () => lockedWrite,
+      fail: () => lockedWrite,
+    });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({ execute: () => Effect.void }),
+    );
+    const layerWorker = EffectWorker.layerWithOptions({ workerId: "test-worker" }).pipe(
+      Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+    );
+
+    const daemon = yield* EffectWorker.runDaemonWithOptions({ concurrency: 1 }).pipe(
+      Effect.provide(layerWorker),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(settlementStarted);
+    const shutdown = yield* Fiber.interrupt(daemon).pipe(
+      Effect.timeoutOption(Duration.millis(100)),
+      Effect.forkChild,
+    );
+    yield* TestClock.adjust(Duration.millis(100));
+    const stopped = yield* Fiber.join(shutdown);
+    yield* Ref.set(releaseLock, true);
+    yield* TestClock.adjust(Duration.seconds(1));
+    yield* Fiber.await(daemon);
+    assert.isTrue(Option.isSome(stopped));
   }),
 );
 
@@ -465,7 +721,7 @@ it.effect("arms cancellation before the durable pre-execution check", () =>
     );
 
     const exit = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
-      Effect.flatMap((worker) => worker.runOnce),
+      Effect.flatMap((worker) => worker.runOnce()),
       Effect.provide(layerWorker),
       Effect.exit,
     );
@@ -531,7 +787,7 @@ it.effect("terminalizes a process-bound claim when success settlement fails", ()
     );
 
     const exit = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
-      Effect.flatMap((worker) => worker.runOnce),
+      Effect.flatMap((worker) => worker.runOnce()),
       Effect.provide(layerWorker),
       Effect.exit,
     );
@@ -770,9 +1026,9 @@ it.effect("claims only ungated effects once the admission slots are taken", () =
       onAllowanceRestored: Effect.void,
       onSlotFreed: Effect.void,
     });
-    const runOnce = worker.runOnce.pipe(
-      Effect.provideService(EffectAdmission.EffectAdmission, admission),
-    );
+    const runOnce = worker
+      .runOnce()
+      .pipe(Effect.provideService(EffectAdmission.EffectAdmission, admission));
 
     const first = yield* Effect.forkChild(runOnce);
     yield* Effect.yieldNow;
@@ -823,9 +1079,10 @@ const saturatedDaemon = (options: {
           pending.splice(pending.indexOf(next), 1);
           return Option.some(next);
         }),
-      nextClaimableAt: Effect.sync(() =>
-        claimable([]).length === 0 ? Option.none() : Option.some(DateTime.makeUnsafe(now)),
-      ),
+      nextClaimableAt: () =>
+        Effect.sync(() =>
+          claimable([]).length === 0 ? Option.none() : Option.some(DateTime.makeUnsafe(now)),
+        ),
       nextClaimableAtExcluding: (excludeEffectTypes) =>
         Effect.sync(() =>
           claimable(excludeEffectTypes).length === 0
@@ -962,7 +1219,7 @@ it.effect("builds no gate for one worker, whose allowance a gate could not chang
     const wakeUps = yield* Ref.make(0);
     const layerOutbox = mockNormalOutbox({
       claimNext: () => Effect.sync(() => Option.fromUndefinedOr(pending.shift())),
-      nextClaimableAt: Effect.succeedNone,
+      nextClaimableAt: () => Effect.succeedNone,
       nextClaimableAtExcluding: () => Effect.succeedNone,
       awaitAvailable: Queue.take(available),
       notifyAvailable: (count = 1) =>
@@ -1036,7 +1293,7 @@ it.effect("an expired slot wakes an idle worker, which claims the turn start hel
           pending.splice(pending.indexOf(next), 1);
           return Option.some(next);
         }),
-      nextClaimableAt: Effect.succeedNone,
+      nextClaimableAt: () => Effect.succeedNone,
       nextClaimableAtExcluding: (excludeEffectTypes) =>
         Effect.sync(() =>
           pending.some((effect) => !excludeEffectTypes.includes(effect.request.type))
@@ -1134,7 +1391,7 @@ it.effect("requeues a claim whose timestamp cannot be parsed, as before", () =>
     );
 
     const exit = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
-      Effect.flatMap((worker) => worker.runOnce),
+      Effect.flatMap((worker) => worker.runOnce()),
       Effect.provide(layerWorker),
       Effect.exit,
     );
@@ -1177,9 +1434,9 @@ it.effect("gives the admission slot back when the claim itself fails", () =>
       onAllowanceRestored: Effect.void,
       onSlotFreed: Effect.void,
     });
-    const runOnce = worker.runOnce.pipe(
-      Effect.provideService(EffectAdmission.EffectAdmission, admission),
-    );
+    const runOnce = worker
+      .runOnce()
+      .pipe(Effect.provideService(EffectAdmission.EffectAdmission, admission));
 
     const exit = yield* Effect.exit(runOnce);
     assert.isTrue(Exit.isFailure(exit));
@@ -1209,7 +1466,7 @@ it.effect("a freed slot wakes one worker, which claims the next turn start", () 
           pending.splice(pending.indexOf(next), 1);
           return Option.some(next);
         }),
-      nextClaimableAt: Effect.succeedNone,
+      nextClaimableAt: () => Effect.succeedNone,
       nextClaimableAtExcluding: (excludeEffectTypes) =>
         Effect.sync(() =>
           pending.some((effect) => !excludeEffectTypes.includes(effect.request.type))
@@ -1282,10 +1539,17 @@ it.effect("an empty claim gives its slot back without waking a worker", () =>
     const workerId = "worker-empty-claim";
     const available = yield* Queue.unbounded<void>();
     const claims = yield* Ref.make(0);
+    const secondClaim = yield* Deferred.make<void>();
     const wakeUps = yield* Ref.make(0);
     const layerOutbox = mockNormalOutbox({
-      claimNext: () => Ref.update(claims, (count) => count + 1).pipe(Effect.as(Option.none())),
-      nextClaimableAt: Effect.succeedNone,
+      claimNext: () =>
+        Ref.updateAndGet(claims, (count) => count + 1).pipe(
+          Effect.tap((count) =>
+            count === 2 ? Deferred.succeed(secondClaim, undefined) : Effect.void,
+          ),
+          Effect.as(Option.none()),
+        ),
+      nextClaimableAt: () => Effect.succeedNone,
       nextClaimableAtExcluding: () => Effect.succeedNone,
       awaitAvailable: Queue.take(available),
       notifyAvailable: (count = 1) =>
@@ -1319,6 +1583,7 @@ it.effect("an empty claim gives its slot back without waking a worker", () =>
       Effect.forkChild,
     );
     yield* Queue.offer(available, undefined);
+    yield* Deferred.await(secondClaim);
     yield* TestClock.adjust("3 seconds");
     // The worker's first probe and the one the wake-up caused, and no wake-up of its own making.
     assert.equal(yield* Ref.get(claims), 2);
@@ -1371,9 +1636,9 @@ it.effect(
         onAllowanceRestored: Effect.void,
         onSlotFreed: Ref.update(freed, (count) => count + 1),
       });
-      const runOnce = worker.runOnce.pipe(
-        Effect.provideService(EffectAdmission.EffectAdmission, admission),
-      );
+      const runOnce = worker
+        .runOnce()
+        .pipe(Effect.provideService(EffectAdmission.EffectAdmission, admission));
       assert.isTrue(yield* runOnce);
       assert.equal(yield* Ref.get(freed), 1);
       // A claim that finds nothing returns the slot unused: nobody was skipped for work it holds.
@@ -1385,5 +1650,62 @@ it.effect(
         saturated: false,
         sampling: false,
       });
+    }),
+);
+
+it.effect.each([3, 4])(
+  "enforces process-loss count %s after 22 minutes through the executor",
+  (processLossCount) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const instanceId = ProviderInstanceId.make("codex");
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const layer = layerExecutorFor({
+        events,
+        continueAfterRestart: true,
+        threads: {
+          getThreadRecords: () =>
+            Effect.succeed({
+              thread: {
+                id: threadId,
+                projectId: ProjectId.make("project:executor-recovery"),
+                providerInstanceId: instanceId,
+                archivedAt: null,
+                deletedAt: null,
+                lineage: { parentThreadId: null, relationshipToParent: null },
+              },
+              runs: [
+                {
+                  id: runId,
+                  providerInstanceId: instanceId,
+                  status: "cancelled",
+                  requestedAt: DateTime.subtract(now, { minutes: 22 }),
+                  completedAt: now,
+                  ordinal: 1,
+                },
+              ],
+              messages: [],
+              providerTurns: [],
+              runtimeRequests: [],
+              turnItems: [],
+              attempts: [],
+            } as unknown as OrchestrationV2ThreadProjection),
+          dispatch: () =>
+            Ref.update(events, (entries) => [...entries, "dispatch"]).pipe(Effect.as({} as never)),
+          recoverDelegatedTask: () =>
+            Ref.update(events, (entries) => [...entries, "recover-child"]),
+        },
+      });
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        yield* executor.execute({
+          ...restartEffect(now, { type: "detach" }),
+          request: { type: "provider-runtime.continue", sourceRunId: runId, processLossCount },
+        });
+      }).pipe(Effect.provide(layer));
+      assert.deepEqual(
+        yield* Ref.get(events),
+        processLossCount > 3 ? ["recover-child"] : ["dispatch", "recover-child"],
+      );
     }),
 );

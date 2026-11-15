@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - Resolves paths as the standalone driver does.
+import * as NodePath from "node:path";
+
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -96,7 +99,19 @@ describe("parseDriverOptions", () => {
     ).toBe(2);
   });
 
+  // The fakes run in each session's workspace, so a relative directory must not reach them.
+  it("makes --session-mcp-credentials absolute, for the driver and the fakes alike", () => {
+    const credentials = (directory: string) =>
+      parseDriverOptions([...required, "--session-mcp-credentials", directory])
+        .sessionMcpCredentials;
+
+    expect(parseDriverOptions(required).sessionMcpCredentials).toBeNull();
+    expect(credentials("./credentials")).toBe(NodePath.resolve("credentials"));
+    expect(credentials("/run/credentials/")).toBe("/run/credentials");
+  });
+
   it.each([
+    [[...required, "--session-mcp-credentials", ""], "--session-mcp-credentials needs a directory"],
     [[...required, "--codex-sessions=-1"], "--codex-sessions must be an integer"],
     [["--out", "/tmp/bench"], "--url is required"],
     [[...required, "--mode", "replay"], "--mode must be fresh or history"],

@@ -11,11 +11,19 @@ import * as Path from "effect/Path";
 
 import { migrationManifest, runMigrations, type RunMigrationsOptions } from "./Migrations.ts";
 import { PERF_FORK_MIGRATIONS_TABLE, runPerfForkMigrations } from "./PerfForkMigrations.ts";
+import { PERF_FORK_RUN_ID_TURN_ITEM_COUNTS } from "./testkit/PerfForkRunIdTurnItemCounts.ts";
 
 const EXIT_SCRIPT = new URL("../../../../scripts/perf-fork-schema-exit.sql", import.meta.url);
+const EXIT_SCRIPT_BEFORE_085 = new URL(
+  "../../../../scripts/perf-fork-schema-exit-before-085.sql",
+  import.meta.url,
+);
 // Upstream's last migration when release candidate 1 recorded the fork's at 77 and 78.
 const RC1_UPSTREAM_HEAD = 76;
+// Upstream's last migration in the last fork build before upstream's migration 85.
+const BEFORE_085_UPSTREAM_HEAD = 80;
 const COUNTS_TABLE = "orchestration_v2_projection_turn_item_counts";
+const ORDINAL_INDEX = "orchestration_v2_projection_turn_items_message_ordinal_idx";
 
 const migrate = (filename: string, options?: RunMigrationsOptions) =>
   runMigrations(options).pipe(
@@ -29,6 +37,15 @@ const withDatabase = <A>(filename: string, use: (db: NodeSqlite.DatabaseSync) =>
     (db) => Effect.sync(() => use(db)),
     (db) => Effect.sync(() => db.close()),
   );
+
+const tempDatabase = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  return path.join(
+    yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-exit-" }),
+    "statev2.sqlite",
+  );
+});
 
 // Every row of every table, each table's rows sorted, so two reads compare whatever their order.
 const contents = (db: NodeSqlite.DatabaseSync) =>
@@ -48,19 +65,35 @@ const contents = (db: NodeSqlite.DatabaseSync) =>
       ]),
   );
 
-const forkObjects = (db: NodeSqlite.DatabaseSync) =>
+const schema = (db: NodeSqlite.DatabaseSync) =>
+  db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all();
+
+const objectsNamed = (db: NodeSqlite.DatabaseSync, where: string) =>
   db
-    .prepare(
-      `SELECT type, name FROM sqlite_master
-       WHERE name LIKE 'orchestration_v2_turn_item_counts_%'
-          OR name IN (
-            '${COUNTS_TABLE}', 'orchestration_v2_projection_turn_items_message_ordinal_idx',
-            '${PERF_FORK_MIGRATIONS_TABLE}'
-          )
-       ORDER BY name`,
-    )
+    .prepare(`SELECT type, name FROM sqlite_master WHERE ${where} ORDER BY name`)
     .all()
     .map(({ type, name }) => `${String(type)}:${String(name)}`);
+
+// The fork's own objects.
+const forkObjects = (db: NodeSqlite.DatabaseSync) =>
+  objectsNamed(db, `name IN ('${ORDINAL_INDEX}', '${PERF_FORK_MIGRATIONS_TABLE}')`);
+
+// The turn-item counts and their triggers: upstream's since its migration 85, the fork's before it.
+const countObjects = (db: NodeSqlite.DatabaseSync) =>
+  objectsNamed(db, `name LIKE 'orchestration_v2_turn_item_counts_%' OR name = '${COUNTS_TABLE}'`);
+
+const COUNT_OBJECTS = [
+  `table:${COUNTS_TABLE}`,
+  "trigger:orchestration_v2_turn_item_counts_delete",
+  "trigger:orchestration_v2_turn_item_counts_insert",
+  "trigger:orchestration_v2_turn_item_counts_update",
+];
+
+const countColumns = (db: NodeSqlite.DatabaseSync) =>
+  db
+    .prepare(`SELECT name FROM pragma_table_info('${COUNTS_TABLE}')`)
+    .all()
+    .map(({ name }) => String(name));
 
 const insertTurnItem = (
   db: NodeSqlite.DatabaseSync,
@@ -76,6 +109,18 @@ const insertTurnItem = (
        ) VALUES (?, ?, ?, 1, 'assistant_message', 'completed', '2026-11-01T00:00:00.000Z', ?)`,
     )
     .run(id, threadId, runId, payloadJson);
+
+// Items, a move to another run and a delete, so the counts take every trigger.
+const writeTurnItems = (db: NodeSqlite.DatabaseSync) => {
+  insertTurnItem(db, "a1", "thread-a", "run-1");
+  insertTurnItem(db, "a2", "thread-a", "run-1");
+  insertTurnItem(db, "a3", "thread-a", null);
+  insertTurnItem(db, "b1", "thread-b", "run-2", "{not json");
+  db.prepare(
+    "UPDATE orchestration_v2_projection_turn_items SET run_id = 'run-3' WHERE turn_item_id = 'a2'",
+  ).run();
+  db.prepare("DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'a1'").run();
+};
 
 const ledgerIds = (db: NodeSqlite.DatabaseSync) =>
   db
@@ -94,30 +139,39 @@ const FORK_CHAIN = [
   [2, "TurnItemMessageOrdinalIndex"],
 ];
 
-const countsAsStored = (db: NodeSqlite.DatabaseSync) =>
+const countsAsStored = (db: NodeSqlite.DatabaseSync, key = "run_key") =>
   db
-    .prepare(`SELECT thread_id, run_id, item_count FROM ${COUNTS_TABLE} ORDER BY thread_id, run_id`)
+    .prepare(
+      `SELECT thread_id, ${key} AS run_key, item_count FROM ${COUNTS_TABLE}
+       ORDER BY thread_id, run_key`,
+    )
     .all();
 
 const countsFromItems = (db: NodeSqlite.DatabaseSync) =>
   db
     .prepare(
-      `SELECT thread_id, COALESCE(run_id, '') AS run_id, COUNT(*) AS item_count
+      `SELECT thread_id, COALESCE(run_id, '') AS run_key, COUNT(*) AS item_count
        FROM orchestration_v2_projection_turn_items
-       GROUP BY thread_id, COALESCE(run_id, '') ORDER BY thread_id, run_id`,
+       GROUP BY thread_id, COALESCE(run_id, '') ORDER BY thread_id, run_key`,
     )
     .all();
+
+// A database as the last fork build before upstream's migration 85 left it: the fork chain
+// recorded, its counts keyed by run_id.
+const forkBefore085 = (filename: string) =>
+  Effect.gen(function* () {
+    yield* migrate(filename, { toMigrationInclusive: BEFORE_085_UPSTREAM_HEAD });
+    yield* withDatabase(filename, (db) => {
+      for (const statement of PERF_FORK_RUN_ID_TURN_ITEM_COUNTS) db.exec(statement);
+    });
+    yield* runPerfForkMigrations().pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
+  });
 
 it.effect(
   "leaves the fork's schema so upstream's migrations start on it with every row kept, and the fork re-applies it",
   () =>
     Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const filename = path.join(
-        yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-exit-" }),
-        "statev2.sqlite",
-      );
+      const filename = yield* tempDatabase;
       const exitScript = NodeFS.readFileSync(EXIT_SCRIPT, "utf8");
 
       assert.deepEqual(
@@ -126,17 +180,58 @@ it.effect(
       );
       const expected = yield* withDatabase(filename, (db) => {
         assert.deepEqual(forkLedger(db), FORK_CHAIN);
-        insertTurnItem(db, "a1", "thread-a", "run-1");
-        insertTurnItem(db, "a2", "thread-a", "run-1");
-        insertTurnItem(db, "a3", "thread-a", null);
-        insertTurnItem(db, "b1", "thread-b", "run-2", "{not json");
-        db.prepare(
-          "UPDATE orchestration_v2_projection_turn_items SET run_id = 'run-3' WHERE turn_item_id = 'a2'",
-        ).run();
-        db.prepare(
-          "DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'a1'",
-        ).run();
+        writeTurnItems(db);
         assert.deepEqual(countsAsStored(db), countsFromItems(db));
+        const { [PERF_FORK_MIGRATIONS_TABLE]: _forkLedger, ...rest } = contents(db);
+        return rest;
+      });
+
+      yield* withDatabase(filename, (db) => {
+        db.exec(exitScript);
+        // Running it again changes nothing.
+        db.exec(exitScript);
+        assert.deepEqual(forkObjects(db), []);
+        // Upstream's migration 85 owns the counts: they stay, with their rows.
+        assert.deepEqual(countObjects(db), COUNT_OBJECTS);
+        assert.deepEqual(contents(db), expected);
+      });
+
+      // Upstream's chain alone, as an upstream build runs it.
+      assert.deepEqual(yield* migrate(filename, { toPerfForkMigrationInclusive: 0 }), []);
+      yield* withDatabase(filename, (db) => {
+        assert.deepEqual(contents(db), expected);
+        insertTurnItem(db, "c1", "thread-c", "run-4");
+        assert.deepEqual(countsAsStored(db), countsFromItems(db));
+      });
+
+      assert.deepEqual(yield* migrate(filename), []);
+      yield* withDatabase(filename, (db) => {
+        assert.deepEqual(forkLedger(db), FORK_CHAIN);
+        assert.deepEqual(forkObjects(db), [
+          `index:${ORDINAL_INDEX}`,
+          `table:${PERF_FORK_MIGRATIONS_TABLE}`,
+        ]);
+        assert.deepEqual(countObjects(db), COUNT_OBJECTS);
+        assert.deepEqual(countsAsStored(db), countsFromItems(db));
+        insertTurnItem(db, "c2", "thread-c", "run-4");
+        assert.deepEqual(countsAsStored(db), countsFromItems(db));
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "leaves a fork database from before upstream's migration 85 so upstream's migrations start on it, and the fork re-applies it",
+  () =>
+    Effect.gen(function* () {
+      const filename = yield* tempDatabase;
+      const exitScript = NodeFS.readFileSync(EXIT_SCRIPT_BEFORE_085, "utf8");
+      const upstreamIds = migrationManifest.map(([id]) => id);
+
+      yield* forkBefore085(filename);
+      const expected = yield* withDatabase(filename, (db) => {
+        assert.deepEqual(forkLedger(db), FORK_CHAIN);
+        writeTurnItems(db);
+        assert.deepEqual(countsAsStored(db, "run_id"), countsFromItems(db));
         const {
           [COUNTS_TABLE]: _counts,
           [PERF_FORK_MIGRATIONS_TABLE]: _forkLedger,
@@ -150,29 +245,31 @@ it.effect(
         // Running it again changes nothing.
         db.exec(exitScript);
         assert.deepEqual(forkObjects(db), []);
+        assert.deepEqual(countObjects(db), []);
         assert.deepEqual(contents(db), expected);
       });
 
-      // Upstream's chain alone, as an upstream build runs it.
-      assert.deepEqual(yield* migrate(filename, { toPerfForkMigrationInclusive: 0 }), []);
+      // Upstream's chain alone, as an upstream build runs it: its migration 85 makes the counts.
+      assert.deepEqual(
+        yield* migrate(filename, { toPerfForkMigrationInclusive: 0 }),
+        upstreamIds.filter((id) => id > BEFORE_085_UPSTREAM_HEAD),
+      );
       yield* withDatabase(filename, (db) => {
-        assert.deepEqual(contents(db), expected);
-        insertTurnItem(db, "c1", "thread-c", "run-4");
+        assert.deepEqual(ledgerIds(db), upstreamIds);
+        assert.deepEqual(forkObjects(db), []);
+        assert.deepEqual(countObjects(db), COUNT_OBJECTS);
+        assert.deepEqual(countColumns(db), ["thread_id", "run_key", "item_count"]);
+        assert.deepEqual(countsAsStored(db), countsFromItems(db));
       });
 
       assert.deepEqual(yield* migrate(filename), []);
       yield* withDatabase(filename, (db) => {
         assert.deepEqual(forkLedger(db), FORK_CHAIN);
         assert.deepEqual(forkObjects(db), [
-          `table:${COUNTS_TABLE}`,
-          "index:orchestration_v2_projection_turn_items_message_ordinal_idx",
-          "trigger:orchestration_v2_turn_item_counts_delete",
-          "trigger:orchestration_v2_turn_item_counts_insert",
-          "trigger:orchestration_v2_turn_item_counts_update",
+          `index:${ORDINAL_INDEX}`,
           `table:${PERF_FORK_MIGRATIONS_TABLE}`,
         ]);
-        assert.deepEqual(countsAsStored(db), countsFromItems(db));
-        insertTurnItem(db, "c2", "thread-c", "run-4");
+        insertTurnItem(db, "c1", "thread-c", "run-4");
         assert.deepEqual(countsAsStored(db), countsFromItems(db));
       });
     }).pipe(Effect.provide(NodeServices.layer)),
@@ -180,26 +277,22 @@ it.effect(
 
 it.effect("leaves release candidate 1's schema so upstream's migrations start on it", () =>
   Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const filename = path.join(
-      yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-exit-" }),
-      "statev2.sqlite",
-    );
-    const exitScript = NodeFS.readFileSync(EXIT_SCRIPT, "utf8");
+    const filename = yield* tempDatabase;
+    const exitScript = NodeFS.readFileSync(EXIT_SCRIPT_BEFORE_085, "utf8");
     const upstreamIds = migrationManifest.map(([id]) => id);
 
     yield* migrate(filename, { toMigrationInclusive: RC1_UPSTREAM_HEAD });
     yield* runPerfForkMigrations().pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
     yield* withDatabase(filename, (db) => {
+      for (const statement of PERF_FORK_RUN_ID_TURN_ITEM_COUNTS) db.exec(statement);
       db.exec(`
         DROP TABLE ${PERF_FORK_MIGRATIONS_TABLE};
-        DELETE FROM effect_sql_migrations WHERE migration_id > ${RC1_UPSTREAM_HEAD};
         INSERT INTO effect_sql_migrations (migration_id, name)
         VALUES (77, 'ProjectionTurnItemCounts'), (78, 'TurnItemMessageOrdinalIndex');
       `);
       db.exec(exitScript);
       assert.deepEqual(forkObjects(db), []);
+      assert.deepEqual(countObjects(db), []);
       assert.deepEqual(
         ledgerIds(db),
         upstreamIds.filter((id) => id <= RC1_UPSTREAM_HEAD),
@@ -210,6 +303,37 @@ it.effect("leaves release candidate 1's schema so upstream's migrations start on
     yield* withDatabase(filename, (db) => {
       assert.deepEqual(ledgerIds(db), upstreamIds);
       assert.deepEqual(forkObjects(db), []);
+      assert.deepEqual(countObjects(db), COUNT_OBJECTS);
     });
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("each exit script refuses the other's database and changes nothing", () =>
+  Effect.gen(function* () {
+    const before085 = yield* tempDatabase;
+    yield* forkBefore085(before085);
+    const after085 = yield* tempDatabase;
+    yield* migrate(after085);
+
+    for (const [filename, script, refusal] of [
+      [
+        before085,
+        EXIT_SCRIPT,
+        "migration 85 has not run: use perf-fork-schema-exit-before-085.sql",
+      ],
+      [after085, EXIT_SCRIPT_BEFORE_085, "migration 85 ran: use perf-fork-schema-exit.sql"],
+    ] as const) {
+      const exitScript = NodeFS.readFileSync(script, "utf8");
+      const read = (db: NodeSqlite.DatabaseSync) => ({
+        schema: schema(db),
+        contents: contents(db),
+      });
+      const before = yield* withDatabase(filename, (db) => {
+        writeTurnItems(db);
+        return read(db);
+      });
+      yield* withDatabase(filename, (db) => assert.throws(() => db.exec(exitScript), refusal));
+      yield* withDatabase(filename, (db) => assert.deepEqual(read(db), before));
+    }
   }).pipe(Effect.provide(NodeServices.layer)),
 );

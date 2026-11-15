@@ -520,6 +520,56 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
     }),
   );
 
+  // As upstream's Stream.decodeText: EOF flushes the decoder, and its U+FFFD counts toward the limit.
+  it.effect.each([
+    ["in-thread", "within"],
+    ["in-thread", "past"],
+    ["with the line offload", "within"],
+    ["with the line offload", "past"],
+  ] as const)(
+    "ends a final line cut inside a UTF-8 sequence with U+FFFD, %s, %s the line limit",
+    ([mode, limit]) =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const notifications: Array<unknown> = [];
+        const termination = yield* Deferred.make<CodexError.CodexAppServerError>();
+        yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          // The line is 16 bytes, 17 with its cut byte and 19 with U+FFFD.
+          maxIncomingMessageBytes: limit === "within" ? 19 : 18,
+          ...(mode === "with the line offload"
+            ? {
+                lineOffload: {
+                  minChars: 1024,
+                  decode: () => Effect.die("short lines stay in-thread"),
+                  writeLog: () => Effect.void,
+                  failure: Effect.never,
+                },
+              }
+            : {}),
+          onNotification: (notification) =>
+            Effect.sync(() => {
+              notifications.push(notification);
+            }),
+          onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+        });
+
+        yield* Queue.offer(input, new Uint8Array([...encoder.encode('{"method":"x/a"}'), 0xc3]));
+        yield* Queue.end(input);
+
+        const error = yield* Deferred.await(termination);
+        assert.deepEqual(notifications, []);
+        if (limit === "within") {
+          assert.instanceOf(error, CodexError.CodexAppServerProtocolParseError);
+          assert.equal(error.operation, "decode-wire-message");
+        } else {
+          assert.instanceOf(error, CodexError.CodexAppServerTransportError);
+          assert.equal(error.operation, "read-input-stream");
+          assert.include(String(error.cause), "Incoming message exceeded 18 bytes.");
+        }
+      }),
+  );
+
   it.effect("keeps processing protocol messages while an approval is pending", () =>
     Effect.gen(function* () {
       const { stdio, input, output } = yield* makeInMemoryStdio();
@@ -1107,6 +1157,84 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol line offload", (i
           ["decoded", { method: "x/last", params: {} }],
         ],
       );
+    }),
+  );
+
+  // A read-ahead decode can finish before earlier lines are handled, so the log of a frame that
+  // depends on the ones before it (a thread router's) is written when its line is handled.
+  it.effect("writes an offloaded line's records with its events in stdout order", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const longFirst = JSON.stringify({ method: "x/first", params: longParams });
+      const longLast = JSON.stringify({ method: "x/last", params: longParams });
+      const logged: Array<CodexProtocol.CodexAppServerProtocolLogEvent> = [];
+      const decoded: Array<string> = [];
+      const firstStarted = yield* Deferred.make<void>();
+      const lastDecoded = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const allRouted = yield* Deferred.make<void>();
+      let routed = 0;
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        logIncoming: true,
+        logger: (event) =>
+          Effect.sync(() => {
+            logged.push(event);
+          }),
+        lineOffload: {
+          minChars: 64,
+          decode: (line) =>
+            (line === longFirst
+              ? Deferred.succeed(firstStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                )
+              : Effect.void
+            ).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  decoded.push(line);
+                  return CodexOffload.decodeOffloadedLine(line, () => ({
+                    stream: "native",
+                    payload: "",
+                  }));
+                }),
+              ),
+              Effect.tap(() =>
+                line === longLast ? Deferred.succeed(lastDecoded, undefined) : Effect.void,
+              ),
+            ),
+          writeLog: (_record, event) =>
+            Effect.sync(() => {
+              logged.push(event);
+            }),
+          failure: Effect.never,
+        },
+        onNotification: () =>
+          Effect.suspend(() => {
+            routed += 1;
+            return routed === 3 ? Deferred.succeed(allRouted, undefined) : Effect.void;
+          }).pipe(Effect.asVoid),
+      });
+
+      yield* Queue.offer(input, encoder.encode(`${longFirst}\n`));
+      yield* Deferred.await(firstStarted);
+      yield* Queue.offer(input, encoder.encode(`${shortLine("x/short")}\n`));
+      yield* Queue.offer(input, encoder.encode(`${longLast}\n`));
+      yield* Deferred.await(lastDecoded);
+      assert.deepEqual(logged, []);
+
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(allRouted);
+
+      assert.deepEqual(decoded, [longLast, longFirst]);
+      assert.deepEqual(logged, [
+        { direction: "incoming", stage: "raw", payload: longFirst },
+        { direction: "incoming", stage: "decoded", payload: JSON.parse(longFirst) },
+        { direction: "incoming", stage: "raw", payload: shortLine("x/short") },
+        { direction: "incoming", stage: "decoded", payload: { method: "x/short", params: {} } },
+        { direction: "incoming", stage: "raw", payload: longLast },
+        { direction: "incoming", stage: "decoded", payload: JSON.parse(longLast) },
+      ]);
     }),
   );
 

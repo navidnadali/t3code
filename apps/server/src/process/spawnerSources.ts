@@ -159,11 +159,13 @@ const resolveExecutable = (command, env, cwd) => {
       return { problem: error && error.code === "EACCES" ? "EACCES" : "ENOENT" };
     }
   };
-  const base = cwd ?? process.cwd();
-  if (command.includes("/")) return check(path.resolve(base, command));
+  // Joined as text, as execvp does: the kernel resolves \`..\` after a symlink, path.resolve before.
+  const base = cwd === undefined ? undefined : path.resolve(cwd);
+  const fromCwd = (file) => (base === undefined || file.startsWith("/") ? file : base + "/" + file);
+  if (command.includes("/")) return check(fromCwd(command));
   let problem = "ENOENT";
   for (const directory of (env.PATH ?? "/usr/bin:/bin").split(":")) {
-    const found = check(path.resolve(base, directory || ".", command));
+    const found = check(fromCwd(directory || ".") + "/" + command);
     if (found.file !== undefined) return found;
     if (found.problem === "EACCES") problem = "EACCES";
   }
@@ -391,15 +393,17 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
 }
 `;
 
-/** What a spawner process says first: the server kills one that says anything else. */
-export const spawnerHandshake = {
-  protocol: NodeCrypto.createHash("sha256")
-    .update(spawnerProcessBody)
-    .update(execAfterGoBody)
-    .digest("hex")
-    .slice(0, 16),
-  build: serverPackage.version,
-};
+const protocol = NodeCrypto.createHash("sha256")
+  .update(spawnerProcessBody)
+  .update(execAfterGoBody)
+  .digest("hex")
+  .slice(0, 16);
+
+/** What a spawner process of `build` says first: the server kills one that says anything else. */
+const spawnerHandshakeFor = (build: string) => ({ protocol, build });
+
+/** The handshake of this server's own build, as its bundle was stamped. */
+export const spawnerHandshake = spawnerHandshakeFor(serverPackage.version);
 
 /**
  * The spawner process: the server's IPC channel closes when the server exits, however it exits,
@@ -407,13 +411,15 @@ export const spawnerHandshake = {
  * fails or is asked to stop. Only a SIGKILL of the spawner between a fork and the PID report
  * written right after it can leave a child the server does not know (Node exposes no PDEATHSIG).
  */
-export const spawnerProcessSource = `"use strict";
-const handshake = { protocol: "${spawnerHandshake.protocol}", build: "${spawnerHandshake.build}" };
+export const spawnerProcessSourceFor = (build: string) => `"use strict";
+const handshake = ${JSON.stringify(spawnerHandshakeFor(build))};
 if (process.argv.includes("${EXEC_AFTER_GO}")) {
 ${execAfterGoBody}
 } else {
 ${spawnerProcessBody}
 }`;
+
+export const spawnerProcessSource = spawnerProcessSourceFor(serverPackage.version);
 
 /** Entry of `t3 __process-spawner <windowBytes>`: single executables cannot evaluate `-e`. */
 export const runProcessSpawner = () => {

@@ -84,7 +84,7 @@ it.layer(layerTest)("claim-time exclusion on the real outbox", (it) => {
       );
       assert.isNull(idOf(yield* outbox.claimNext({ workerId: "w2", excludeEffectTypes: gated })));
       assert.isTrue(Option.isNone(yield* outbox.nextClaimableAtExcluding(gated)));
-      assert.isTrue(Option.isSome(yield* outbox.nextClaimableAt));
+      assert.isTrue(Option.isSome(yield* outbox.nextClaimableAt()));
 
       // Cancelling a held start (interrupt before the turn started) settles it without a claim.
       const cancelled = yield* outbox.cancelUnsettled({

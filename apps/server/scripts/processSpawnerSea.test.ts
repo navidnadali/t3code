@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Starts the built spawner over Node IPC, as the server does.
 import * as NodeChildProcess from "node:child_process";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
@@ -13,6 +15,23 @@ import {
   PROCESS_SPAWNER_EXECUTABLE,
 } from "../../../scripts/lib/process-spawner-sea.ts";
 import * as SpawnerSources from "../src/process/spawnerSources.ts";
+import serverPackage from "../package.json" with { type: "json" };
+
+const serverDir = NodePath.resolve(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "..");
+
+// The first message a spawner sends over its channel: what the server checks before using it.
+const handshakeOf = (executable: string, args: ReadonlyArray<string> = []) =>
+  Effect.callback<unknown>((resume) => {
+    const spawner = NodeChildProcess.spawn(executable, [...args, String(64 * 1024)], {
+      stdio: ["ignore", "ignore", "inherit", "ipc"],
+      serialization: "advanced",
+      detached: true,
+    });
+    spawner.once("message", (message) => {
+      spawner.once("exit", () => resume(Effect.succeed(message)));
+      spawner.disconnect();
+    });
+  });
 
 interface SpawnerReply {
   readonly t: string;
@@ -99,5 +118,38 @@ describe("process spawner single executable", () => {
         });
         expect(became).toBe("its own environment");
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // A release check, run on request as youngGenerationSea.test.ts is (T3_SEA_TEST=1). A packager
+  // stamps the server with APP_VERSION; the spawner beside it must announce that build too, or
+  // the server refuses it and runs its spawner from the whole bundle, without provider hand-off.
+  it.live.skipIf(
+    HostProcess.Platform.defaultValue() === "win32" || process.env.T3_SEA_TEST !== "1",
+  )("ships a spawner whose handshake the stamped server accepts", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-spawner-version-sea-" });
+      const stamped = `${serverPackage.version}-perf.7`;
+      const build = NodeChildProcess.spawnSync(
+        process.execPath,
+        ["scripts/cli.ts", "build-exe", "--out-dir", dir],
+        {
+          cwd: serverDir,
+          env: { ...process.env, NODE_OPTIONS: undefined, APP_VERSION: stamped },
+          encoding: "utf8",
+          timeout: 600_000,
+        },
+      );
+      expect(build.status, build.stderr).toBe(0);
+      // `t3 __process-spawner` runs the spawner from the stamped bundle: what its server expects.
+      const expected = yield* handshakeOf(path.join(dir, "t3"), ["__process-spawner"]);
+      expect(expected).toEqual({
+        t: "ready",
+        protocol: SpawnerSources.spawnerHandshake.protocol,
+        build: stamped,
+      });
+      expect(yield* handshakeOf(path.join(dir, PROCESS_SPAWNER_EXECUTABLE))).toEqual(expected);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

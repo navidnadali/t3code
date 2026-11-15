@@ -71,7 +71,7 @@ export const layer: Layer.Layer<
       readonly runId: RunId;
       readonly scopeId: CheckpointScopeId;
     }) {
-      const { run, rootNode, scope, providerThread, readyCheckpointOrdinals, sideChat } =
+      const { run, rootNode, scope, providerThread, preservedCheckpointOrdinals, sideChat } =
         yield* projections.getCheckpointCaptureContext(input.threadId, input);
       // Stopped runs remain terminal; their checkpoint is the next message's rollback point.
       const stopped = run?.status === "interrupted" || run?.status === "cancelled";
@@ -106,20 +106,32 @@ export const layer: Layer.Layer<
       }
 
       const capturedAt = yield* DateTime.now;
-      // The run's checkpoints are taken where it ran, by real path, which the run then keeps: a scope
-      // may name another workspace or spelling, and a spelling the run used (a symlink) may later
-      // point elsewhere. Runs recorded before the run kept its cwd use the scope's.
-      const workspace = yield* CheckpointService.resolveWorkspacePath(
-        fileSystem,
-        path,
-        run.workspaceCwd ?? scope.cwd,
-      );
+      // The run's checkpoints are taken where it ran, by real path, which the run then keeps: its
+      // scope's, fixed when the run was scoped there, as a spelling the run used (a symlink) may
+      // point elsewhere by now. Older runs and scopes resolve the run's cwd, or the scope's.
+      const workspace =
+        run.workspaceCwd !== undefined && scope.realCwd !== undefined
+          ? scope.realCwd
+          : yield* CheckpointService.resolveWorkspacePath(
+              fileSystem,
+              path,
+              run.workspaceCwd ?? scope.cwd,
+            ).pipe(
+              // Git cannot work where the lookup is refused either: the checkpoint is recorded as an
+              // error there, and the run still completes.
+              Effect.catch((cause) =>
+                Effect.logWarning("orchestration V2 checkpoint workspace lookup failed", {
+                  runId: run.id,
+                  cause: String(cause),
+                }).pipe(Effect.as(path.resolve(run.workspaceCwd ?? scope.cwd))),
+              ),
+            );
       const runScope = { ...scope, cwd: workspace };
       // A run recorded without its workspace keeps none: its scope may name a later one.
       const recorded = run.workspaceCwd === undefined ? {} : { workspaceCwd: workspace };
       const baselineOrdinalWithinScope = Math.max(0, run.ordinal - 1);
-      const hasReadyCheckpoint = (ordinalWithinScope: number) =>
-        readyCheckpointOrdinals.includes(ordinalWithinScope);
+      const isPreserved = (ordinalWithinScope: number) =>
+        preservedCheckpointOrdinals.includes(ordinalWithinScope);
       // The baselines this capture materializes are attributed to the run materializing them. The
       // thread's scope may already be a later run's: one queued meanwhile, or sent after Stop.
       const materializeBaseline = (ordinalWithinScope: number) =>
@@ -133,10 +145,10 @@ export const layer: Layer.Layer<
       // The thread starts in its first workspace's scope; a later workspace's scope starts at the
       // baseline of its first run there.
       const threadStartCheckpoint =
-        baselineOrdinalWithinScope === 0 || hasReadyCheckpoint(0) || scope.ordinalWithinParent !== 0
+        baselineOrdinalWithinScope === 0 || isPreserved(0) || scope.ordinalWithinParent !== 0
           ? null
           : yield* materializeBaseline(0);
-      const baselineCheckpoint = hasReadyCheckpoint(baselineOrdinalWithinScope)
+      const baselineCheckpoint = isPreserved(baselineOrdinalWithinScope)
         ? null
         : yield* materializeBaseline(baselineOrdinalWithinScope);
       const checkpoint = yield* checkpoints.capture({

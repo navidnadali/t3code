@@ -18,7 +18,10 @@ import {
   OrchestrationProjectShell as ProjectShellSchema,
   OrchestrationV2ThreadShell as ThreadShellSchema,
 } from "@t3tools/contracts";
+import { turnItemCanChangeUserWait } from "@t3tools/shared/agentAwareness";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+// @effect-diagnostics-next-line nodeBuiltinImport:off - a synchronous digest of a few project rows.
+import * as NodeCrypto from "node:crypto";
 import type * as Arr from "effect/Array";
 import type * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -32,6 +35,7 @@ import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
+import type * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import type { ActiveShellIndexEntry } from "./ProjectionStore.ts";
 
 export type ShellDelta = Extract<OrchestrationV2ShellStreamItem, { readonly sequence: number }>;
@@ -73,6 +77,107 @@ export function shellDeltaKey(item: ShellDelta): string {
   }
 }
 
+// Replaying each intervening event costs a shell refetch; past this gap a
+// single O(active-threads) snapshot is cheaper and bounded.
+const SHELL_RESUME_MAX_GAP = 1_000;
+// Row counts do not bound large tool payloads; sum stored JSON bytes in SQL and snapshot above budget.
+const SHELL_REPLAY_PAYLOAD_BUDGET_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Whether the events after a shell cursor can be replayed. The socket resume and the HTTP
+ * snapshot's `resumeFrom` ask the same question, so a client the route tells to resume is not
+ * refused by the socket.
+ */
+export const canResumeShellFrom = Effect.fnUntraced(function* (
+  events: Pick<
+    OrchestrationEventStore.OrchestrationEventStore["Service"],
+    "prunedThroughSequence" | "getReplayStats"
+  >,
+  afterSequence: number,
+  headSequence: number,
+) {
+  // A cursor at the head missed nothing, even where pruning has passed the head.
+  if (afterSequence === headSequence) return true;
+  const replayGap = headSequence - afterSequence;
+  if (replayGap < 0 || replayGap > SHELL_RESUME_MAX_GAP) return false;
+  if (afterSequence < (yield* events.prunedThroughSequence)) return false;
+  const stats = yield* events.getReplayStats({ afterSequence, throughSequence: headSequence });
+  if (stats.rawPayloadBytes > SHELL_REPLAY_PAYLOAD_BUDGET_BYTES) {
+    yield* Effect.logDebug("orchestration replay replaced by snapshot", {
+      afterSequence,
+      headSequence,
+      replayGap,
+      eventCount: stats.eventCount,
+      payloadBytes: stats.rawPayloadBytes,
+      payloadBudgetBytes: SHELL_REPLAY_PAYLOAD_BUDGET_BYTES,
+    });
+    return false;
+  }
+  return true;
+});
+
+/**
+ * Answers a client that asks for the shell with the cursor of the rows it holds: `resumable`
+ * when the socket can replay from that cursor, so the client keeps its rows, else the snapshot.
+ */
+export const loadShellUnlessResumable = Effect.fnUntraced(function* <A, E, R>(input: {
+  readonly events: Pick<
+    OrchestrationEventStore.OrchestrationEventStore["Service"],
+    "prunedThroughSequence" | "getReplayStats" | "latestApplicationSequence"
+  >;
+  readonly resumeFrom: number | undefined;
+  readonly loadSnapshot: Effect.Effect<A, E, R>;
+}) {
+  if (
+    input.resumeFrom !== undefined &&
+    (yield* canResumeShellFrom(
+      input.events,
+      input.resumeFrom,
+      yield* input.events.latestApplicationSequence,
+    ))
+  ) {
+    return { resumable: true as const };
+  }
+  return yield* input.loadSnapshot;
+});
+
+/**
+ * Names the repository identities a list of project shells carries. A client sends back the one
+ * its HTTP snapshot had, and a resume that computes the same one skips its marked snapshot.
+ */
+export function projectIdentitiesDigest(
+  projects: ReadonlyArray<Pick<OrchestrationProjectShell, "id" | "repositoryIdentity">>,
+): string {
+  const hash = NodeCrypto.createHash("sha256");
+  for (const project of projects) {
+    hash.update(JSON.stringify([project.id, project.repositoryIdentity ?? null]));
+  }
+  return hash.digest("base64url");
+}
+
+/**
+ * The resolved roots a resume sends. A client that names the current identities holds them
+ * already, but it keeps a cached identity over an absent one, so a root resolved to no identity
+ * still goes out.
+ */
+export function resumeIdentityRoots(input: {
+  readonly projects: ReadonlyArray<
+    Pick<OrchestrationProjectShell, "id" | "workspaceRoot" | "repositoryIdentity">
+  >;
+  readonly resolvedRepositoryIdentityRoots: ReadonlyArray<string>;
+  readonly knownProjectIdentities: string | undefined;
+}): ReadonlyArray<string> {
+  if (input.knownProjectIdentities !== projectIdentitiesDigest(input.projects)) {
+    return input.resolvedRepositoryIdentityRoots;
+  }
+  const withoutIdentity = new Set(
+    input.projects.flatMap((project) =>
+      project.repositoryIdentity == null ? [project.workspaceRoot] : [],
+    ),
+  );
+  return input.resolvedRepositoryIdentityRoots.filter((root) => withoutIdentity.has(root));
+}
+
 function buildActiveShellSnapshot(input: {
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
   readonly threads: OrchestrationV2ThreadShellSnapshot;
@@ -90,7 +195,7 @@ function buildActiveShellSnapshot(input: {
 type ShellTrimRow = Pick<
   OrchestrationV2ThreadShell,
   "id" | "projectId" | "lineage" | "settledOverride" | "settledAt"
->;
+> & { readonly hasRemoteTasks?: boolean };
 
 /**
  * What a subscriber's trims read across every active row. Computed from full shells or from the
@@ -99,6 +204,8 @@ type ShellTrimRow = Pick<
 interface ShellTrimFacts {
   readonly subagentParentIds: ReadonlySet<string>;
   readonly subagentThreadIds: Set<string>;
+  /** Only the store's index knows these; shells alone leave it empty. */
+  readonly remoteTaskParentIds: ReadonlySet<string>;
   /** Undefined when no thread is settled, so none is older. */
   readonly olderSettledBeforeMs: number | undefined;
   readonly olderSettledCounts: ReadonlyArray<OrchestrationV2OlderSettledCount>;
@@ -109,8 +216,10 @@ const NEWEST_SETTLED_KEPT = 25;
 function shellTrimFacts(rows: ReadonlyArray<ShellTrimRow>): ShellTrimFacts {
   const subagentParentIds = new Set<string>();
   const subagentThreadIds = new Set<string>();
+  const remoteTaskParentIds = new Set<string>();
   const settledTimes: Array<number> = [];
   for (const row of rows) {
+    if (row.hasRemoteTasks === true) remoteTaskParentIds.add(row.id);
     if (row.lineage.relationshipToParent === "subagent") {
       subagentThreadIds.add(row.id);
       if (row.lineage.parentThreadId) subagentParentIds.add(row.lineage.parentThreadId);
@@ -136,6 +245,7 @@ function shellTrimFacts(rows: ReadonlyArray<ShellTrimRow>): ShellTrimFacts {
   return {
     subagentParentIds,
     subagentThreadIds,
+    remoteTaskParentIds,
     olderSettledBeforeMs,
     olderSettledCounts: Array.from(counts, ([projectId, count]) => ({ projectId, count })),
   };
@@ -155,13 +265,14 @@ function hiddenChildAncestorIds(
 
 function omitIdleSubagentShellsWith(
   threads: ReadonlyArray<OrchestrationV2ThreadShell>,
-  facts: Pick<ShellTrimFacts, "subagentParentIds">,
+  facts: Pick<ShellTrimFacts, "subagentParentIds" | "remoteTaskParentIds">,
 ): ReadonlyArray<OrchestrationV2ThreadShell> {
   return threads.filter(
     (thread) =>
       thread.lineage.relationshipToParent !== "subagent" ||
       isLiveSubagentShell(thread) ||
-      facts.subagentParentIds.has(thread.id),
+      facts.subagentParentIds.has(thread.id) ||
+      facts.remoteTaskParentIds.has(thread.id),
   );
 }
 
@@ -171,7 +282,10 @@ function omitOlderSettledShellsWith(
     readonly snapshotSequence: number;
     readonly now: DateTime.Utc;
   },
-  facts: Pick<ShellTrimFacts, "olderSettledBeforeMs" | "olderSettledCounts">,
+  facts: Pick<
+    ShellTrimFacts,
+    "olderSettledBeforeMs" | "olderSettledCounts" | "remoteTaskParentIds"
+  >,
 ): {
   readonly threads: ReadonlyArray<OrchestrationV2ThreadShell>;
   readonly olderSettled: OrchestrationV2OlderSettledThreads;
@@ -185,7 +299,8 @@ function omitOlderSettledShellsWith(
       thread.pinnedAt != null ||
       (thread.snoozedUntil != null && DateTime.toEpochMillis(thread.snoozedUntil) > nowMs) ||
       isLiveSubagentShell(thread) ||
-      ancestorIds.has(thread.id),
+      ancestorIds.has(thread.id) ||
+      facts.remoteTaskParentIds.has(thread.id),
   );
   return {
     threads,
@@ -200,7 +315,8 @@ function omitOlderSettledShellsWith(
 /**
  * Idle subagent children have no sidebar row, so clients that opt in read them from their thread
  * family instead. A child stays while it is live or the parent of another child, so the request
- * and working walks over shell rows never meet a gap in a nested chain.
+ * and working walks over shell rows never meet a gap in a nested chain. It also stays as the
+ * parent of a task in a linked environment, whose clients nest that task under it.
  */
 export function omitIdleSubagentShells(
   threads: ReadonlyArray<OrchestrationV2ThreadShell>,
@@ -229,8 +345,8 @@ export function activeShellRowsForSubscriber(
 /**
  * Opted-in snapshots keep the 25 newest settled top-level threads (and ties) and count the rest per
  * project in `olderSettled`; clients page them with `getOlderSettledThreads`. Older rows stay while
- * pinned, snoozed, live, or above a kept subagent or side chat, so walks over shell rows still find
- * them.
+ * pinned, snoozed, live, above a kept subagent or side chat, or the parent of a task in a linked
+ * environment, so walks over shell rows and other environments' tasks still find them.
  */
 export function omitOlderSettledShells(input: {
   readonly threads: ReadonlyArray<OrchestrationV2ThreadShell>;
@@ -276,7 +392,10 @@ function shellSubscriberThreadIds(
   const subagents = index.filter(
     (entry) =>
       entry.lineage.relationshipToParent === "subagent" &&
-      (!options.omitIdleSubagents || entry.mayBeLive || facts.subagentParentIds.has(entry.id)),
+      (!options.omitIdleSubagents ||
+        entry.mayBeLive ||
+        entry.hasRemoteTasks ||
+        facts.subagentParentIds.has(entry.id)),
   );
   const ancestorIds = hiddenChildAncestorIds([
     ...subagents,
@@ -295,6 +414,7 @@ function shellSubscriberThreadIds(
           entry.pinnedAt != null ||
           entry.snoozedUntil != null ||
           entry.mayBeLive ||
+          entry.hasRemoteTasks ||
           ancestorIds.has(entry.id)
         ? [entry.id]
         : [],
@@ -303,16 +423,23 @@ function shellSubscriberThreadIds(
 
 /**
  * The snapshot a subscriber gets from a base holding every active shell (a resync's shared read),
- * trimmed as `loadSubscriberShellSnapshot` trims, and the subagent ids its stream drops.
+ * trimmed as `loadSubscriberShellSnapshot` trims, and the subagent ids its stream drops. Shells do
+ * not say which threads own a task in a linked environment, so the base brings them from the index.
  */
 export function trimSubscriberShellSnapshot(
   base: OrchestrationV2ShellSnapshot,
-  options: ShellSubscriberOptions & { readonly now: DateTime.Utc },
+  options: ShellSubscriberOptions & {
+    readonly now: DateTime.Utc;
+    readonly remoteTaskParentIds: ReadonlySet<string>;
+  },
 ): {
   readonly snapshot: OrchestrationV2ShellSnapshot;
   readonly subagentThreadIds: Set<string>;
 } {
-  const facts = shellTrimFacts(base.threads);
+  const facts = {
+    ...shellTrimFacts(base.threads),
+    remoteTaskParentIds: options.remoteTaskParentIds,
+  };
   return {
     snapshot: trimShellSnapshot(base, facts, options),
     subagentThreadIds: facts.subagentThreadIds,
@@ -373,11 +500,14 @@ export const loadShellSnapshotParts = Effect.fn("ShellStream.loadShellSnapshotPa
   E2,
   E3,
   E4,
+  E5 = never,
 >(input: {
   readonly sql: SqlClient.SqlClient;
   readonly readThreads: Effect.Effect<Effect.Effect<OrchestrationV2ThreadShellSnapshot, E2>, E1>;
   readonly listProjects: Effect.Effect<ReadonlyArray<OrchestrationProjectShell>, E3>;
   readonly latestSequence: Effect.Effect<number, E4>;
+  /** Read in the same transaction when given, for the trim facts shells do not carry. */
+  readonly listShellIndex?: Effect.Effect<ReadonlyArray<ActiveShellIndexEntry>, E5>;
 }) {
   const read = yield* input.sql
     .withTransaction(
@@ -385,6 +515,7 @@ export const loadShellSnapshotParts = Effect.fn("ShellStream.loadShellSnapshotPa
         decodeThreads: input.readThreads,
         projects: input.listProjects,
         snapshotSequence: input.latestSequence,
+        index: input.listShellIndex ?? Effect.undefined,
       }),
     )
     .pipe(NodeSqliteClient.readOnly);
@@ -392,6 +523,7 @@ export const loadShellSnapshotParts = Effect.fn("ShellStream.loadShellSnapshotPa
     projects: read.projects,
     threads: yield* read.decodeThreads,
     snapshotSequence: read.snapshotSequence,
+    index: read.index,
   };
 });
 
@@ -459,6 +591,9 @@ export function shouldPublishShellApplicationEvent(
   }
   if (event.type === "thread.deleted") {
     // Replay and the live tail overlap; keep known IDs so late events stay filtered.
+    return true;
+  }
+  if (event.type === "turn-item.updated" && turnItemCanChangeUserWait(event.payload)) {
     return true;
   }
   return !(

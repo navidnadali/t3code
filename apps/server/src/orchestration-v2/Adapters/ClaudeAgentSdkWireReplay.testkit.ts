@@ -186,6 +186,7 @@ const layerWireReplayQueryRunner = (
         open,
         forkSession: (forkInput) => replayed(() => replay.forkSession(forkInput)),
         subagentLaunchToolUseId: (lookup) => replayed(() => replay.subagentLaunchToolUseId(lookup)),
+        subagentModel: () => Effect.succeed(null),
         assertComplete: replayed(() => replay.assertComplete()),
       });
     }),

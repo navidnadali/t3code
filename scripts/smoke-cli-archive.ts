@@ -20,7 +20,11 @@ import * as NodeChildProcess from "node:child_process";
 import * as NetService from "@t3tools/shared/Net";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assertLinuxArm64PageCompatibility } from "./lib/linux-arm64-sea.ts";
-import { PROCESS_SPAWNER_EXECUTABLE } from "./lib/process-spawner-sea.ts";
+import {
+  CLI_ARCHIVE_MANIFEST,
+  CliArchiveManifest,
+  PROCESS_SPAWNER_EXECUTABLE,
+} from "./lib/process-spawner-sea.ts";
 import { windowsSystemTar } from "./lib/windows-tar.ts";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
@@ -32,6 +36,8 @@ export class CliArchiveSmokeError extends Schema.TaggedError<CliArchiveSmokeErro
     return `CLI archive smoke test failed while ${this.step}: ${this.detail}`;
   }
 }
+
+const decodeCliArchiveManifest = Schema.decodeEffect(Schema.fromJsonString(CliArchiveManifest));
 
 const collect = <E>(stream: Stream.Stream<Uint8Array, E>) =>
   stream.pipe(
@@ -149,11 +155,27 @@ const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
   const contentDir = path.join(scratch, root);
   const executable = path.join(contentDir, platform === "win32" ? "t3.exe" : "t3");
   const spawnerExecutable = path.join(contentDir, PROCESS_SPAWNER_EXECUTABLE);
+  // Without its spawner executable, t3 runs the spawner from its own bundle, at about four times the
+  // memory. build-exe builds it for a native non-Windows target only, and build-cli-archive records
+  // whether it staged one; a non-Windows archive without that record must carry one.
+  const manifestPath = path.join(contentDir, CLI_ARCHIVE_MANIFEST);
+  const withSpawner = (yield* fs.exists(manifestPath))
+    ? (yield* fs.readFileString(manifestPath).pipe(
+        Effect.flatMap(decodeCliArchiveManifest),
+        Effect.mapError(
+          (error) =>
+            new CliArchiveSmokeError({
+              step: `reading ${CLI_ARCHIVE_MANIFEST}`,
+              detail: error.message,
+            }),
+        ),
+      )).processSpawner
+    : platform !== "win32";
   const bundledLibatomic = path.join(contentDir, "lib/libatomic.so.1");
   for (const required of [
     executable,
     path.join(contentDir, "client/index.html"),
-    ...(platform === "win32" ? [] : [spawnerExecutable]),
+    ...(withSpawner ? [spawnerExecutable] : []),
     ...(platform === "linux" ? [bundledLibatomic, `${bundledLibatomic}.LICENSE`] : []),
   ]) {
     if (!(yield* fs.exists(required))) {
@@ -180,9 +202,8 @@ const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
     }
   }
 
-  // Without its spawner executable, t3 runs the spawner from its own bundle, at about four times the memory.
   if (platform !== "win32") {
-    for (const target of [executable, spawnerExecutable]) {
+    for (const target of withSpawner ? [executable, spawnerExecutable] : [executable]) {
       const mode = Number((yield* fs.stat(target)).mode) & 0o777;
       if (mode !== 0o755) {
         return yield* new CliArchiveSmokeError({
@@ -213,6 +234,8 @@ const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
         });
       }
     }
+  }
+  if (withSpawner) {
     const git = yield* spawner.string(ChildProcess.make("git", ["--version"]));
     const through = yield* runThroughSpawner(spawnerExecutable, "git", ["--version"]).pipe(
       Effect.timeout(Duration.seconds(30)),
@@ -307,14 +330,14 @@ const smokeCliArchive = Effect.fn("smokeCliArchive")(function* (input: {
   }
   // The server logs either warning when it cannot use the spawner executable beside it.
   const fallback = /No t3-process-spawner beside|falls back to the CLI entry/.exec(stdout + stderr);
-  if (platform !== "win32" && fallback !== null) {
+  if (withSpawner && fallback !== null) {
     return yield* new CliArchiveSmokeError({
       step: "serving from the extracted archive",
       detail: `the server did not use ${PROCESS_SPAWNER_EXECUTABLE}\n${stdout}${stderr}`,
     });
   }
   yield* Effect.log(
-    `[cli-smoke] ${root}: ${platform === "win32" ? "" : `${PROCESS_SPAWNER_EXECUTABLE} ran git, `}--version passed and serve answered on ${String(port)}.`,
+    `[cli-smoke] ${root}: ${withSpawner ? `${PROCESS_SPAWNER_EXECUTABLE} ran git, ` : ""}--version passed and serve answered on ${String(port)}.`,
   );
 });
 

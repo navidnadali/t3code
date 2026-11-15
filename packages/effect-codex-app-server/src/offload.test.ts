@@ -16,7 +16,7 @@ it("parses an offloaded line and builds its log entries as the protocol does in-
   assert.deepEqual(CodexOffload.decodeOffloadedLine(line, logEntry), {
     _tag: "Decoded",
     message: { method: "item/agentMessage/delta", params: delta },
-    logs: [{ stream: "native", payload: line }],
+    logs: [{ stream: "native", payload: line, stage: "decoded" }],
   });
   assert.deepEqual(stages, ["raw", "decoded"]);
   assert.deepEqual(CodexOffload.decodeOffloadedLine('{"id":3,"result":{"ok":true}}'), {

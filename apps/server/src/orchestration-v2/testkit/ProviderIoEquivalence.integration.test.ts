@@ -22,6 +22,7 @@ import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
 import * as EventNdjsonLogger from "../../provider/EventNdjsonLogger.ts";
+import * as ProviderInstallationGate from "../../provider/ProviderInstallationGate.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import {
   serializedRecordProblem,
@@ -107,6 +108,7 @@ const UUID_V4 = /[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]
 const ANY_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/giu;
 const API_ID = /\b(?:msg|toolu|srvtoolu|req)_[A-Za-z0-9]{8,}/gu;
 const TASK_ID = /\\?"(?:task_id|taskId|agent_id|agentId)\\?":\\?"([^"\\]+)\\?"/gu;
+const SUBAGENT_THREAD_ID = /thread:subagent:[0-9a-f]{16}/gu;
 const DURATION_MS = /(\\?"duration_ms\\?":)\d+/gu;
 
 // Writers interleave and race even in-thread (an interrupt's settle effect or the provider's own
@@ -254,8 +256,8 @@ const firstWrites = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) =>
 
 // Timestamps, per-run temporary directory names and random ids are the only run-specific values.
 // Temporary directories keep their prefix, and they and random ids (v4 UUIDs; with `freshIds` also
-// the ids a fake CLI mints) are renamed by first appearance across the channels, so where each one
-// recurs is still compared.
+// the ids a fake CLI mints, and subagent thread ids hashed from them) are renamed by first appearance
+// across the channels, so where each one recurs is still compared.
 const normalize = (
   raw: {
     readonly adapterEvents: ReadonlyArray<ReadonlyArray<unknown>>;
@@ -302,6 +304,7 @@ const normalize = (
     if (freshIds) for (const match of text.matchAll(TASK_ID)) name(match[1]!);
     for (const match of text.matchAll(freshIds ? ANY_UUID : UUID_V4)) name(match[0]);
     if (freshIds) for (const match of text.matchAll(API_ID)) name(match[0]);
+    if (freshIds) for (const match of text.matchAll(SUBAGENT_THREAD_ID)) name(match[0]);
   }
   const renames = [...ids].toSorted(([a], [b]) => b.length - a.length);
   const [adapterEvents, logLines, sinkWrites, firstWritten] = texts.map((text) =>
@@ -584,6 +587,8 @@ const claudeWireHarness = (services: Layer.Layer<ProviderIoServices>, input: Rep
             { name: "BENCH_SPEED", value: "0", sensitive: false },
             { name: "BENCH_STATE_DIR", value: stateDir, sensitive: false },
             { name: "BENCH_NODE", value: process.execPath, sensitive: false },
+            // A steered turn ends at the live steer, not when the unpaced replay gets there.
+            { name: "BENCH_HOLD_CUT_TURNS", value: "1", sensitive: false },
           ],
           config: yield* decodeClaudeSettings({ binaryPath, homePath: homeDir }),
         },
@@ -595,6 +600,7 @@ const claudeWireHarness = (services: Layer.Layer<ProviderIoServices>, input: Rep
           layerRunner,
           services,
           IdAllocator.layer,
+          ProviderInstallationGate.layer,
           NodeServices.layer,
           Layer.effect(
             ServerConfig.ServerConfig,

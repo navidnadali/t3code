@@ -3,7 +3,9 @@ import {
   CheckpointScopeId,
   CommandId,
   MessageId,
+  ModelSelection,
   NodeId,
+  NonNegativeInt,
   ProviderSessionId,
   RunAttemptId,
   ProviderApprovalDecision,
@@ -36,12 +38,19 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
+    processLossCount: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
     providerSessionId: ProviderSessionId,
     detail: Schema.optional(Schema.String),
     revokeMcpCredential: Schema.optional(Schema.Boolean),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider-session.apply-model-selection"),
+    providerSessionId: ProviderSessionId,
+    providerThreadId: ProviderThreadId,
+    modelSelection: ModelSelection,
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.start"),
@@ -59,11 +68,15 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     durableDelivery: Schema.optional(Schema.Literal(true)),
     deliveryIntent: Schema.optional(Schema.Literal("auto")),
     deliveryPhase: Schema.optional(Schema.Literals(["invoked", "accepted", "follow_up"])),
+    /** The provider declined the steer, so its `follow_up` is queued with the saved ordinal and model. */
+    steerDeclined: Schema.optional(Schema.Literal(true)),
     acceptDelegatedCompletion: Schema.optional(Schema.Boolean),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
     messageId: MessageId,
+    modelSelection: Schema.optional(ModelSelection),
+    steerFollowUpAfterRunOrdinal: Schema.optional(NonNegativeInt),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.restart"),
@@ -114,6 +127,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("attachment.cleanup"),
     attachmentIds: Schema.Array(Schema.String),
+    skipReferenced: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("thread-title.generate"),
@@ -143,6 +157,7 @@ export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
 
 export const PROCESS_BOUND_EFFECT_TYPES = [
+  "provider-session.apply-model-selection",
   "provider-turn.start",
   "provider-turn.interrupt",
   "provider-turn.steer",
@@ -216,6 +231,7 @@ export interface EffectOutboxV2Shape {
     effectId: string,
     leaseOwner: string | null,
     phase: "invoked" | "accepted" | "follow_up",
+    options?: { readonly steerDeclined?: boolean },
   ) => Effect.Effect<void, EffectOutboxError>;
   readonly get: (
     effectId: string,
@@ -243,13 +259,17 @@ export interface EffectOutboxV2Shape {
     readonly controlLane?: ControlLane;
     /** Effect types left in the outbox for now; an older one still blocks its thread's newer effects. */
     readonly excludeEffectTypes?: ReadonlyArray<string>;
+    readonly maxRunningTitleGenerations?: number;
   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
-  readonly nextClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
+  readonly nextClaimableAt: (input?: {
+    readonly maxRunningTitleGenerations?: number;
+  }) => Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly nextControlClaimableAt: (
     type: ControlLane,
   ) => Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly nextClaimableAtExcluding: (
     excludeEffectTypes: ReadonlyArray<string>,
+    input?: { readonly maxRunningTitleGenerations?: number },
   ) => Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly succeed: (input: {
     readonly effectId: string;
@@ -373,6 +393,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       excludeRestartContinuations = false,
       excludeEffectTypes: ReadonlyArray<string> = [],
       controlLane?: ControlLane,
+      maxRunningTitleGenerations?: number,
     ) =>
       sql`
         ${
@@ -427,6 +448,19 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               )
             )
         )
+        AND ${
+          maxRunningTitleGenerations === undefined
+            ? sql`1 = 1`
+            : sql`(
+                candidate.effect_type != 'thread-title.generate'
+                OR (
+                  SELECT COUNT(*)
+                  FROM orchestration_v2_effect_outbox AS running_title
+                  WHERE running_title.status = 'running'
+                    AND running_title.effect_type = 'thread-title.generate'
+                ) < ${maxRunningTitleGenerations}
+              )`
+        }
       `;
 
     const cancellationSignal = (effectId: string) => {
@@ -444,11 +478,21 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
 
     // Untraced: the workers ask on every idle poll, and the statement itself is kept out of traces.
     const nextClaimableAtFor = Effect.fnUntraced(
-      function* (excludeEffectTypes: ReadonlyArray<string>, controlLane?: ControlLane) {
+      function* (
+        excludeEffectTypes: ReadonlyArray<string>,
+        controlLane?: ControlLane,
+        maxRunningTitleGenerations?: number,
+      ) {
         const rows = yield* sql<{ readonly available_at: string | null }>`
           SELECT MIN(candidate.available_at) AS available_at
           FROM orchestration_v2_effect_outbox AS candidate
-          WHERE ${claimableCandidatePredicate(undefined, false, excludeEffectTypes, controlLane)}
+          WHERE ${claimableCandidatePredicate(
+            undefined,
+            false,
+            excludeEffectTypes,
+            controlLane,
+            maxRunningTitleGenerations,
+          )}
         `.pipe(NodeSqliteClient.readOnly, Effect.withTracerEnabled(false));
         const availableAt = rows[0]?.available_at;
         if (availableAt === undefined || availableAt === null) return Option.none();
@@ -473,10 +517,14 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
 
     const service: EffectOutboxV2Shape = {
       recordSteerDelivery: Effect.fn("EffectOutbox.recordSteerDelivery")(
-        function* (effectId, leaseOwner, phase) {
+        function* (effectId, leaseOwner, phase, options) {
+          const payload =
+            phase === "follow_up" && options?.steerDeclined === true
+              ? sql`json_set(payload_json, '$.deliveryPhase', ${phase}, '$.steerDeclined', json('true'))`
+              : sql`json_set(payload_json, '$.deliveryPhase', ${phase})`;
           const rows = yield* sql`
             UPDATE orchestration_v2_effect_outbox
-            SET payload_json = json_set(payload_json, '$.deliveryPhase', ${phase})
+            SET payload_json = ${payload}
             WHERE effect_id = ${effectId} AND effect_type = 'provider-turn.steer'
               AND status = 'running' AND lease_owner = ${leaseOwner}
               AND (json_extract(payload_json, '$.deliveryPhase') IS NULL
@@ -671,6 +719,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           excludeRestartContinuations = false,
           excludeEffectTypes = [],
           controlLane,
+          maxRunningTitleGenerations,
         }) {
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);
@@ -686,7 +735,13 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             WHERE effect_id = (
               SELECT candidate.effect_id
               FROM orchestration_v2_effect_outbox AS candidate
-              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations, excludeEffectTypes, controlLane)}
+              WHERE ${claimableCandidatePredicate(
+                nowIso,
+                excludeRestartContinuations,
+                excludeEffectTypes,
+                controlLane,
+                maxRunningTitleGenerations,
+              )}
                 AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
               ORDER BY candidate.available_at ASC, candidate.created_at ASC, candidate.effect_id ASC
               LIMIT 1
@@ -701,9 +756,11 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "claim", cause })),
       ),
-      nextClaimableAt: nextClaimableAtFor([]),
+      nextClaimableAt: (input) =>
+        nextClaimableAtFor([], undefined, input?.maxRunningTitleGenerations),
       nextControlClaimableAt: (type) => nextClaimableAtFor([], type),
-      nextClaimableAtExcluding: nextClaimableAtFor,
+      nextClaimableAtExcluding: (excludeEffectTypes, input) =>
+        nextClaimableAtFor(excludeEffectTypes, undefined, input?.maxRunningTitleGenerations),
       succeed: Effect.fn("EffectOutbox.succeed")(
         function* ({ effectId, workerId }) {
           const now = DateTime.formatIso(yield* DateTime.now);
@@ -801,6 +858,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         const cutoff = DateTime.formatIso(
           DateTime.subtractDuration(yield* DateTime.now, SETTLED_EFFECT_RETENTION),
         );
+        // Live continuations retain their preceding intent's cumulative crash budget.
         // Separate batch statements release the write lock between batches.
         const deleteBatch = sql<{ readonly effect_id: string }>`
           DELETE FROM orchestration_v2_effect_outbox
@@ -809,6 +867,16 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             FROM orchestration_v2_effect_outbox
             WHERE status IN ('succeeded', 'cancelled')
               AND completed_at < ${cutoff}
+              AND NOT (
+                effect_type = 'provider-runtime.continue'
+                AND EXISTS (
+                  SELECT 1 FROM orchestration_v2_projection_runs AS recovery_run
+                  WHERE recovery_run.thread_id = orchestration_v2_effect_outbox.thread_id
+                    AND recovery_run.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                    AND json_extract(recovery_run.payload_json, '$.restartContinuationOfRunId') =
+                      json_extract(orchestration_v2_effect_outbox.payload_json, '$.sourceRunId')
+                )
+              )
             LIMIT ${PRUNE_BATCH_SIZE}
           )
           RETURNING effect_id

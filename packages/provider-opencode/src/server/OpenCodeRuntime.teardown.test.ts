@@ -98,7 +98,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
         }).pipe(Effect.provide(runtime));
         assert.deepStrictEqual(
           { kills, strangerEnded: yield* strangerEnded },
-          { kills: ["SIGTERM", "SIGKILL"], strangerEnded: false },
+          { kills: ["SIGTERM"], strangerEnded: false },
         );
       }).pipe(Effect.scoped),
     );

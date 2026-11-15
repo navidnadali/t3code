@@ -53,6 +53,8 @@ export function readCredentials(
 }
 
 export interface CredentialCaller {
+  /** Its session ended (its credential was refused); it makes no more calls. */
+  readonly ended: boolean;
   readonly start: () => void;
   readonly stop: (closeSession: boolean) => Promise<void>;
 }
@@ -61,13 +63,16 @@ export interface CredentialCaller {
  * One caller per provider session, signed in with that session's credential. Sign-ins run in the
  * background: a newer credential for the same session supersedes any older one still signing in,
  * and the caller limit counts sign-ins in progress, so a rotation never leaves two callers running.
+ * A caller whose session ended frees its slot; its refused credential is not signed in again.
  */
 export class CredentialCallers<C extends CredentialCaller> {
   private readonly entries = new Map<
     string,
-    { generation: number; authorization: string; caller: C | null }
+    { generation: number; authorization: string; caller: C | null; signingIn: boolean }
   >();
   private readonly failed = new Set<string>();
+  /** Callers whose session ended, out of the limit but still reported. */
+  private readonly retired: Array<C> = [];
   /** Never reused, so a sign-in that outlives its entry can never pass for a newer one. */
   private attempts = 0;
   private closed = false;
@@ -80,6 +85,12 @@ export class CredentialCallers<C extends CredentialCaller> {
   }
 
   update(credentials: ReadonlyMap<string, McpCredential>): void {
+    for (const [name, entry] of this.entries) {
+      if (entry.signingIn || entry.caller?.ended !== true) continue;
+      this.retired.push(entry.caller);
+      this.failed.add(`${name}\0${entry.authorization}`);
+      this.entries.delete(name);
+    }
     for (const [name, credential] of credentials) {
       if (this.closed) return;
       const entry = this.entries.get(name);
@@ -91,6 +102,7 @@ export class CredentialCallers<C extends CredentialCaller> {
         generation,
         authorization: credential.authorization,
         caller: entry?.caller ?? null,
+        signingIn: true,
       });
       this.connect(name, credential).then(
         (caller) => {
@@ -101,24 +113,28 @@ export class CredentialCallers<C extends CredentialCaller> {
           }
           void current.caller?.stop(false);
           current.caller = caller;
+          current.signingIn = false;
           caller.start();
         },
         () => {
           this.failed.add(attempt);
           const current = this.entries.get(name);
-          if (current?.generation === generation && current.caller === null) {
-            this.entries.delete(name);
-          }
+          if (current?.generation !== generation) return;
+          if (current.caller === null) this.entries.delete(name);
+          else current.signingIn = false;
         },
       );
     }
   }
 
-  /** Callers running now, one per provider session. */
+  /** Callers signed in, one per provider session, those whose session ended included. */
   callers(): Array<C> {
-    return [...this.entries.values()].flatMap((entry) =>
-      entry.caller === null ? [] : [entry.caller],
-    );
+    return [
+      ...this.retired,
+      ...[...this.entries.values()].flatMap((entry) =>
+        entry.caller === null ? [] : [entry.caller],
+      ),
+    ];
   }
 
   async close(closeSessions: boolean): Promise<void> {

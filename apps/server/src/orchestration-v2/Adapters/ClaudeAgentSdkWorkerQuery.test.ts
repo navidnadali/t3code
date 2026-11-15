@@ -53,9 +53,11 @@ import {
   layerClaudeAgentSdkWorkerPool,
   startClaudeQueryInWorker,
 } from "./ClaudeAgentSdkWorkerQuery.ts";
-import type {
-  ClaudeAgentSdkWorkerEvent,
-  ClaudeAgentSdkWorkerRequest,
+import {
+  type ClaudeAgentSdkWorkerEvent,
+  type ClaudeAgentSdkWorkerRequest,
+  fromWorkerError,
+  toWorkerError,
 } from "../../provider/io/claudeAgentSdkProtocol.ts";
 
 const workers = vi.hoisted(() => ({
@@ -672,6 +674,96 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
+  it.effect.each([
+    {
+      exit: "exits with code 1",
+      code: 1,
+      signal: null,
+      fields: {
+        telemetryMessage: "Claude Code process exited with code 1",
+        errorClass: "process_exited_nonzero",
+        exitCode: 1,
+      },
+    },
+    {
+      exit: "is killed by a signal",
+      code: null,
+      signal: "SIGSEGV" as const,
+      fields: {
+        telemetryMessage: "Claude Code process terminated by signal SIGSEGV",
+        errorClass: "process_killed_by_signal",
+        signal: "SIGSEGV",
+      },
+    },
+  ])(
+    "fails a turn whose CLI $exit with the SDK's exit error and its fields, as in-thread",
+    ({ code, signal, fields }) =>
+      Effect.gen(function* () {
+        const run = (mode: Mode) =>
+          withRunner(mode, ({ runner }) =>
+            Effect.gen(function* () {
+              const cli = new FakeClaudeCli(streamThenWait);
+              const session = yield* runner.open(openInput(cli));
+              yield* session.offer(prompt("Stream until the CLI exits."));
+              const turn = yield* streamUntilDelta(session, "delta-15");
+              cli.exit(code, signal);
+              const error = yield* Fiber.join(turn).pipe(Effect.flip);
+              const cause = error.cause as Error;
+              return {
+                method: error.method,
+                name: cause.name,
+                message: cause.message,
+                fields: { ...cause } as Record<string, unknown>,
+              };
+            }),
+          );
+        const inThread = yield* run("thread");
+        const inWorker = yield* run("worker");
+
+        assert.deepStrictEqual(inThread.fields, fields);
+        assert.deepStrictEqual(inWorker, inThread);
+      }),
+  );
+
+  it.effect(
+    "fails a call the CLI exits before answering with the SDK's exit error, as in-thread",
+    () =>
+      Effect.gen(function* () {
+        const run = (mode: Mode) =>
+          withRunner(mode, ({ runner }) =>
+            Effect.gen(function* () {
+              const cli = new FakeClaudeCli({
+                control: (request) =>
+                  request.subtype === "set_model" ? new Promise(() => {}) : undefined,
+              });
+              const session = yield* runner.open(openInput(cli));
+              const call = yield* Effect.forkChild(
+                Effect.flip(session.setModel("claude-opus-4-1")),
+              );
+              yield* Effect.promise(() => cli.waitForControl("set_model"));
+              cli.exit(1, null);
+              const error = yield* Fiber.join(call);
+              const cause = error.cause as Error;
+              return {
+                method: error.method,
+                name: cause.name,
+                message: cause.message,
+                fields: { ...cause } as Record<string, unknown>,
+              };
+            }),
+          );
+        const inThread = yield* run("thread");
+        const inWorker = yield* run("worker");
+
+        assert.deepStrictEqual(inThread.fields, {
+          telemetryMessage: "Claude Code process exited with code 1",
+          errorClass: "process_exited_nonzero",
+          exitCode: 1,
+        });
+        assert.deepStrictEqual(inWorker, inThread);
+      }),
+  );
+
   const resultFrame = (uuid: string, text: string) => ({
     type: "result",
     subtype: "success",
@@ -750,35 +842,59 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       }),
   );
 
-  it.effect("stops the CLI when a query closes after its worker session failed", () =>
-    withRunner("worker", ({ runner }) =>
-      Effect.gen(function* () {
-        const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
-        const openedBefore = workers.opened.length;
-        const session = yield* runner.open(openInput(cli));
-        const messages = yield* Stream.runDrain(session.messages).pipe(
-          Effect.flip,
-          Effect.forkChild,
-        );
-        const [opened] = workers.opened.slice(openedBefore);
-        assert.isDefined(opened);
-        // What main hears when the stage throws on the worker.
-        opened.worker.emit("message", {
-          type: "fail",
-          session: opened.session,
-          error: new Error("injected stage failure"),
-        });
-        const error = yield* Fiber.join(messages);
-        assert.strictEqual(error.method, "fromAsyncIterable");
-        yield* session.close;
-        yield* Effect.promise(() => cli.stdinEnded);
-        yield* TestClock.adjust("2 seconds");
-        yield* Effect.promise(() => cli.waitForKill("SIGTERM"));
-        yield* TestClock.adjust("5 seconds");
-        yield* Effect.promise(() => cli.waitForKill("SIGKILL"));
-        assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGKILL"]);
-      }),
-    ),
+  it.effect.each([
+    { after: "with no close", close: false },
+    { after: "and then the query closes", close: true },
+  ])(
+    "stops the CLI and aborts main's callback when the worker session fails $after, as the SDK's cleanup does in-thread; the other sessions go on",
+    ({ close }) => {
+      const cli = new FakeClaudeCli({ exitOnStdinEnd: false, exitOnKill: false });
+      return withRunner(
+        "worker",
+        ({ runner }) =>
+          Effect.gen(function* () {
+            const called = Promise.withResolvers<void>();
+            const aborted: Array<boolean> = [];
+            const openedBefore = workers.opened.length;
+            const session = yield* runner.open(
+              openInput(cli, { canUseTool: answerOnAbort(called, aborted) }),
+            );
+            const [opened] = workers.opened.slice(openedBefore);
+            assert.isDefined(opened);
+            const healthy = new FakeClaudeCli({ onUser: playOnPrompt });
+            const healthySession = yield* runner.open(openInput(healthy));
+            void cli.request(permissionRequest("toolu-failed"));
+            yield* Effect.promise(() => called.promise);
+
+            // What main hears when the stage throws on the worker, which then drops the stage and
+            // with it the stdin end and kills of its SDK's cleanup.
+            opened.worker.emit("message", {
+              type: "fail",
+              session: opened.session,
+              error: new Error("injected stage failure"),
+            });
+            const abortedAtFailure = [...aborted];
+            const error = yield* Effect.flip(Stream.runDrain(session.messages));
+            assert.strictEqual(error.method, "fromAsyncIterable");
+            if (close) yield* session.close;
+            yield* TestClock.adjust("2 seconds");
+            assert.deepStrictEqual(cli.kills, ["SIGTERM"]);
+            yield* TestClock.adjust("5 seconds");
+            assert.deepStrictEqual(cli.kills, ["SIGTERM", "SIGKILL"]);
+            yield* Effect.promise(() => cli.stdinEnded);
+            assert.deepStrictEqual(abortedAtFailure, [true]);
+
+            yield* healthySession.offer(prompt("Run the tool."));
+            const messages = yield* takeTurn(healthySession);
+            assert.strictEqual(messages.at(-1)?.type, "result");
+            assert.deepStrictEqual(healthy.kills, []);
+          }).pipe(
+            // This CLI ignores signals; ending it keeps a failed assertion from hanging the pool's close.
+            Effect.ensuring(Effect.sync(() => cli.exit(null, "SIGKILL"))),
+          ),
+        { workers: 1 },
+      );
+    },
   );
 
   it.effect("stops the CLI when the worker session fails after the close was sent", () =>
@@ -1420,6 +1536,124 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
       ),
   );
 
+  // Deeper than main can read back from a structured clone (about 2,400 objects).
+  const DEEP = 3_000;
+  const nested = (leaf: string): Record<string, unknown> => {
+    let value: Record<string, unknown> = { leaf };
+    for (let level = 1; level < DEEP; level++) value = { nested: value };
+    return value;
+  };
+  // Chai compares recursively, which a deep value overflows; past 64 levels it compares JSON text.
+  const comparable = (value: unknown, depth = 0): unknown => {
+    if (typeof value !== "object" || value === null) return value;
+    if (depth === 64) return JSON.stringify(value);
+    return Array.isArray(value)
+      ? value.map((item) => comparable(item, depth + 1))
+      : Object.fromEntries(
+          Object.entries(value).map(([key, item]) => [key, comparable(item, depth + 1)]),
+        );
+  };
+
+  it.effect(
+    "delivers messages, callbacks and replies nested past a clone's depth as in-thread, and keeps the worker's other sessions",
+    () =>
+      Effect.gen(function* () {
+        const run = (mode: Mode) =>
+          withRunner(
+            mode,
+            ({ runner, recorded }) =>
+              Effect.gen(function* () {
+                const calls: Array<unknown> = [];
+                const deep = new FakeClaudeCli({
+                  control: (request) =>
+                    request.subtype === "mcp_call"
+                      ? { response: { content: [], structuredContent: nested("reply") } }
+                      : undefined,
+                  onUser: (_message, cli) => {
+                    cli.write({
+                      type: "assistant",
+                      message: {
+                        id: "msg-deep",
+                        type: "message",
+                        role: "assistant",
+                        model: "claude-sonnet-4-6",
+                        content: [
+                          {
+                            type: "tool_use",
+                            id: "toolu-deep",
+                            name: "mcp__fixture__deep",
+                            input: nested("message"),
+                          },
+                        ],
+                        stop_reason: "tool_use",
+                        stop_sequence: null,
+                        usage: { input_tokens: 1, output_tokens: 1 },
+                      },
+                      parent_tool_use_id: null,
+                      session_id: SESSION_ID,
+                      uuid: "assistant-deep",
+                    });
+                    cli.write(resultFrame("result-deep", "deep done"));
+                  },
+                });
+                const neighbour = new FakeClaudeCli({ onUser: playOnPrompt });
+                const deepSession = yield* runner.open(
+                  openInput(deep, {
+                    canUseTool: async (...args) => {
+                      recordCall(calls, args);
+                      return { behavior: "allow", updatedInput: args[1] };
+                    },
+                  }),
+                );
+                const neighbourSession = yield* runner.open(openInput(neighbour));
+
+                // A dead worker kills its sessions' CLIs, which then answer nothing.
+                const permission = yield* Effect.promise(() =>
+                  Promise.race([
+                    deep
+                      .request({ ...permissionRequest("toolu-deep"), input: nested("callback") })
+                      .then((response) => ({ response })),
+                    new Promise<{ readonly killed: true }>((resolve) =>
+                      deep.once("exit", () => resolve({ killed: true })),
+                    ),
+                  ]),
+                );
+                const reply = yield* deepSession.callMcpTool({
+                  tool: "mcp__fixture__deep",
+                  arguments: {},
+                });
+                // Ending a turn's messages closes its query.
+                yield* deepSession.offer(prompt("Answer deeply."));
+                const messages = yield* takeTurn(deepSession);
+                yield* neighbourSession.offer(prompt("Run the tool."));
+                const neighbourMessages = yield* takeTurn(neighbourSession);
+                yield* deepSession.close;
+                yield* neighbourSession.close;
+                return {
+                  messages,
+                  calls,
+                  permission,
+                  reply,
+                  neighbourMessages,
+                  frames: [normalizedFrames(deep.frames), normalizedFrames(neighbour.frames)],
+                  kills: [deep.kills, neighbour.kills],
+                  recorded,
+                };
+              }),
+            { workers: 1 },
+          );
+        const inThread = yield* run("thread");
+        const inWorker = yield* run("worker");
+
+        assert.deepStrictEqual(inWorker.recorded.opens, [true, true]);
+        assert.lengthOf(inThread.calls, 1);
+        const { recorded: _recorded, ...worker } = inWorker;
+        const { recorded: _unrecorded, ...thread } = inThread;
+        assert.deepStrictEqual(comparable(worker), comparable(thread));
+        assert.deepStrictEqual(inWorker.kills, [[], []]);
+      }),
+  );
+
   // Answers once its request is cancelled, recording whether its signal said so.
   const answerOnAbort =
     (called: PromiseWithResolvers<void>, aborted: Array<boolean>): CanUseTool =>
@@ -1792,6 +2026,82 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
+  it.effect.each([
+    { cli: "refuses a CLI that cannot block on a failed hook", supported: false },
+    { cli: "runs the turn on a CLI that can", supported: true },
+  ])("sends a matcher's onFailure and $cli, as in-thread", ({ supported }) =>
+    Effect.gen(function* () {
+      const run = (mode: Mode) =>
+        withRunner(mode, ({ runner }) =>
+          Effect.gen(function* () {
+            const cli = new FakeClaudeCli({
+              onUser: playOnPrompt,
+              control: (request) =>
+                request.subtype === "initialize"
+                  ? {
+                      response: {
+                        commands: [],
+                        agents: [],
+                        models: [],
+                        pid: 4242,
+                        hook_on_failure_supported: supported,
+                      },
+                    }
+                  : undefined,
+            });
+            const hooks: NonNullable<ClaudeQueryOptions["hooks"]> = {
+              PreToolUse: [
+                {
+                  matcher: "Bash",
+                  timeout: 5,
+                  onFailure: "block",
+                  hooks: [async () => ({ continue: true })],
+                },
+              ],
+            };
+            const session = yield* runner.open(openInput(cli, { hooks }));
+            yield* session.offer(prompt("Run the tool."));
+            const turn = yield* takeTurn(session).pipe(
+              Effect.match({
+                onFailure: (error) => ({
+                  method: error.method,
+                  message: (error.cause as Error).message,
+                }),
+                onSuccess: (messages) => messages.map((message) => message.type),
+              }),
+            );
+            const initialize = yield* Effect.promise(() => cli.waitForControl("initialize"));
+            return {
+              turn,
+              hooks: (initialize.request as { readonly hooks: unknown }).hooks,
+              frames: normalizedFrames(cli.frames),
+            };
+          }),
+        );
+      const inThread = yield* run("thread");
+      const inWorker = yield* run("worker");
+
+      assert.deepStrictEqual(inThread.hooks, {
+        PreToolUse: [
+          { matcher: "Bash", hookCallbackIds: ["hook_0"], timeout: 5, onFailure: "block" },
+        ],
+      });
+      if (supported) {
+        assert.strictEqual((inThread.turn as ReadonlyArray<string>).at(-1), "result");
+      } else {
+        assert.strictEqual(
+          (inThread.turn as { readonly method: string }).method,
+          "fromAsyncIterable",
+        );
+        assert.include(
+          (inThread.turn as { readonly message: string }).message,
+          'remove onFailure: "block" from your hooks',
+        );
+      }
+      assert.deepStrictEqual(inWorker, inThread);
+    }),
+  );
+
   it.effect("relays T3's SubagentStart hook to main and answers it as in-thread", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>
@@ -2089,6 +2399,42 @@ describe("startClaudeQueryInWorker callbacks", () => {
   );
 });
 
+describe("Claude Agent SDK errors across the worker boundary", () => {
+  it("restores an error's own fields after a structured clone and leaves other values alone", () => {
+    const error = Object.assign(new Error("Claude Code process exited with code 1"), {
+      name: "TelemetrySafeError",
+      telemetryMessage: "Claude Code process exited with code 1",
+      errorClass: "process_exited_nonzero",
+      exitCode: 1,
+      retry: () => {},
+    });
+    const restored = fromWorkerError(structuredClone(toWorkerError(error))) as Error;
+    assert.instanceOf(restored, Error);
+    assert.strictEqual(restored.message, error.message);
+    assert.strictEqual(restored.stack, error.stack);
+    assert.deepStrictEqual(
+      { ...restored },
+      {
+        name: "TelemetrySafeError",
+        telemetryMessage: "Claude Code process exited with code 1",
+        errorClass: "process_exited_nonzero",
+        exitCode: 1,
+      },
+    );
+    const plain = new TypeError("no fields");
+    const unreadable = Object.defineProperty(new Error("unreadable"), "field", {
+      enumerable: true,
+      get: () => {
+        throw new Error("unreadable field");
+      },
+    });
+    for (const value of [plain, unreadable, "text", { sdkError: "not an error" }]) {
+      assert.strictEqual(toWorkerError(value), value);
+      assert.strictEqual(fromWorkerError(value), value);
+    }
+  });
+});
+
 describe("claudeAgentSdkWorkerSetup", () => {
   const hook = () => Promise.resolve({});
   const base = { model: "claude-sonnet-4-6", pathToClaudeCodeExecutable: "claude" };
@@ -2107,7 +2453,10 @@ describe("claudeAgentSdkWorkerSetup", () => {
         stderr: vi.fn(),
         hooks: {
           SubagentStart: [{ hooks: [hook] }],
-          PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: preToolUseHooks }, { hooks: [] }],
+          PreToolUse: [
+            { matcher: "Bash", timeout: 5, onFailure: "block", hooks: preToolUseHooks },
+            { hooks: [] },
+          ],
         },
       },
       { "t3-code": { type: "http", url: "http://localhost:3773/mcp" } },
@@ -2117,7 +2466,7 @@ describe("claudeAgentSdkWorkerSetup", () => {
       callbacks: ["canUseTool", "onUserDialog"],
       hooks: {
         SubagentStart: [{ hooks: 1 }],
-        PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: 2 }, { hooks: 0 }],
+        PreToolUse: [{ matcher: "Bash", timeout: 5, onFailure: "block", hooks: 2 }, { hooks: 0 }],
       },
     });
     assert.deepStrictEqual(setup?.callbacks, {
@@ -2134,6 +2483,7 @@ describe("claudeAgentSdkWorkerSetup", () => {
       {
         matcher: { get: () => "Bash", enumerable: false },
         timeout: { value: 5, enumerable: false },
+        onFailure: { get: () => "block", enumerable: false },
         hooks: { value: [hook] },
       },
     ) as HookCallbackMatcher;
@@ -2143,7 +2493,7 @@ describe("claudeAgentSdkWorkerSetup", () => {
       {
         options: base,
         callbacks: [],
-        hooks: { PreToolUse: [{ matcher: "Bash", timeout: 5, hooks: 1 }] },
+        hooks: { PreToolUse: [{ matcher: "Bash", timeout: 5, onFailure: "block", hooks: 1 }] },
       },
     );
     assert.deepStrictEqual(
@@ -2153,6 +2503,18 @@ describe("claudeAgentSdkWorkerSetup", () => {
         callbacks: [],
         hooks: {},
       },
+    );
+  });
+
+  it("passes MCP servers in the query options to the worker, as in-thread", () => {
+    const mcpServers = { remote: { type: "http" as const, url: "http://localhost:3773/mcp" } };
+    assert.deepStrictEqual(
+      claudeAgentSdkWorkerSetup({ ...base, mcpServers }, undefined)?.stageOptions.options,
+      { ...base, mcpServers },
+    );
+    const sdkServer = { type: "sdk" as const, name: "local", instance: {} as never };
+    assert.isUndefined(
+      claudeAgentSdkWorkerSetup({ ...base, mcpServers: { local: sdkServer } }, undefined),
     );
   });
 
@@ -2167,6 +2529,10 @@ describe("claudeAgentSdkWorkerSetup", () => {
       [{ ...base, hooks: { SubagentStart: [null as never] } }, undefined],
       [
         { ...base, hooks: { SubagentStart: [{ hooks: [hook], matcher: new Map() as never }] } },
+        undefined,
+      ],
+      [
+        { ...base, hooks: { SubagentStart: [{ hooks: [hook], onFailure: new Map() as never }] } },
         undefined,
       ],
       [{ ...base, includeHookEvents: vi.fn() as never }, undefined],

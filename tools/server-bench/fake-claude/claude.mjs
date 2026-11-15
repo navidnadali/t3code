@@ -41,6 +41,12 @@ export function readConfig(env) {
     return value;
   };
   const count = (value) => Number.isSafeInteger(value) && value >= 1;
+  const flag = (name) => {
+    const raw = env[name]?.trim();
+    if (raw === undefined || raw === "" || raw === "0") return false;
+    if (raw === "1") return true;
+    throw new Error(`${name} must be 0 or 1, not ${JSON.stringify(raw)}.`);
+  };
   const fault = env.BENCH_FAULT?.trim() || undefined;
   if (fault !== undefined && !FAULTS.includes(fault)) {
     throw new Error(
@@ -73,6 +79,7 @@ export function readConfig(env) {
     statsDir: env.BENCH_STATS_DIR?.trim() || undefined,
     mcpCredentialsDir: env.BENCH_MCP_CREDENTIALS_DIR?.trim() || undefined,
     fault,
+    holdCutTurns: flag("BENCH_HOLD_CUT_TURNS"),
   };
 }
 
@@ -460,6 +467,8 @@ export function compileGroup(group) {
     loopSlots: idSlots.filter((slot) => inBody.has(slot) && !outsideBody.has(slot)),
     playSlots: idSlots.filter((slot) => !inBody.has(slot) || outsideBody.has(slot)),
     recordedModel: typeof init?.model === "string" ? init.model : "claude-sonnet-4-6",
+    // A steer or interrupt ended the recorded turn here.
+    cut: result.terminal_reason === "aborted_streaming",
   };
 }
 
@@ -539,6 +548,12 @@ const sleep = (ms, signal) =>
     };
     const timer = setTimeout(done, ms);
     signal.addEventListener("abort", done, { once: true });
+  });
+
+const abortedBy = (signal) =>
+  new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    signal.addEventListener("abort", resolve, { once: true });
   });
 
 function abortedResult(live, startedAt) {
@@ -798,10 +813,18 @@ async function runStream(flags, config) {
     }
     const groups = transcripts.get(assignment.transcript);
     const turn = played++ % groups.length;
+    const compiled = groups[turn];
+    // The frames recorded before the cut play whenever the live steer comes, then the turn
+    // waits there for it, so the replay ends where the recording did.
+    const holdCut = config.holdCutTurns && compiled.cut;
     const frames = {};
     let bytes = 0;
     let unpaced = 0;
-    for (const { frame, line, faultPoint } of turnLines(groups[turn], live, config.turnLoops)) {
+    for (const { frame, line, faultPoint } of turnLines(compiled, live, config.turnLoops)) {
+      if (holdCut && frame === compiled.suffix[0]) {
+        await abortedBy(controller.signal);
+        break;
+      }
       const wait = delayMs(frame.pace, config);
       if (wait > 0) {
         unpaced = 0;
@@ -810,7 +833,7 @@ async function runStream(flags, config) {
         unpaced = 0;
         await new Promise((resolve) => setImmediate(resolve));
       }
-      if (controller.signal.aborted) break;
+      if (!holdCut && controller.signal.aborted) break;
       if (faultPoint && faultPending) await injectFault(line);
       await write(line);
       frames[frame.stat] = (frames[frame.stat] ?? 0) + 1;

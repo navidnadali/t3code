@@ -8,10 +8,11 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 
 import { readBoundedFileAsync } from "./gitCheckpointRefs.ts";
-import type * as GitVcsDriver from "./GitVcsDriver.ts";
+import * as GitVcsDriver from "./GitVcsDriver.ts";
 
 export interface GitConfigEntry {
   readonly origin: string;
@@ -190,10 +191,9 @@ export const gitConfigEnvironmentSignature = (env: NodeJS.ProcessEnv): string | 
 export interface GitConfigDependency {
   readonly path: string;
   /**
-   * content: any change. identity: a directory's identity (a file's content), for the `.git` Git
-   * rewrites often. presence: whether it exists. absent: the snapshot holds only while it is missing,
-   * for the markers that would make Git find another repository on the way up. physical: the path
-   * with symbolic links resolved. entry: like content, for the path itself when it is a symbolic link.
+   * content: any change. identity: identity, mode and owners (the often rewritten `.git`). presence:
+   * existence, mode and owners. absent: holds while missing (markers that redirect discovery).
+   * physical: the resolved path. entry: content of the path itself when it is a symbolic link.
    */
   readonly kind: "content" | "identity" | "presence" | "absent" | "physical" | "entry";
 }
@@ -202,38 +202,51 @@ const dependencyKey = (dependency: GitConfigDependency) => `${dependency.kind}:$
 
 // Git replaces config files by rename, which changes the inode. An in-place edit of the same size can
 // go unseen when it lands within the filesystem's timestamp granularity (Linux stamps from a coarse
-// clock, ~4 ms) or behind NFS attribute caching. Ownership counts only on the read directory and the
-// found `.git`, so a chown elsewhere that trips safe.directory is not seen.
-const statFingerprint = (dependency: GitConfigDependency) =>
-  new Promise<string>((resolve) => {
+// clock, ~4 ms) or behind NFS attribute caching. Every kind counts the type, permission bits and
+// owners, which discovery and safe.directory read; an ACL-only change is not seen.
+const describeStats = (kind: GitConfigDependency["kind"], stats: NodeFS.BigIntStats) => {
+  const access = `${stats.mode}:${stats.uid}:${stats.gid}`;
+  if (kind === "presence" || kind === "absent") return access;
+  const identity = `${stats.dev}:${stats.ino}:${access}`;
+  return kind === "identity" && stats.isDirectory()
+    ? identity
+    : `${identity}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+};
+
+const statOf = (path: string, follow: boolean) =>
+  new Promise<NodeFS.BigIntStats | string>((resolve) => {
+    const done = (error: NodeJS.ErrnoException | null, stats: NodeFS.BigIntStats) =>
+      resolve(error ? `!${error.code ?? "error"}` : stats);
     try {
-      if (dependency.kind === "physical") {
-        NodeFS.realpath.native(dependency.path, (error, resolved) =>
-          resolve(error ? `!${error.code ?? "error"}` : resolved),
-        );
-        return;
-      }
-      const stat = dependency.kind === "entry" ? NodeFS.lstat : NodeFS.stat;
-      stat(dependency.path, { bigint: true }, (error, stats) => {
-        if (error) {
-          resolve(`!${error.code ?? "error"}`);
-          return;
-        }
-        if (dependency.kind === "presence" || dependency.kind === "absent") {
-          resolve(stats.isDirectory() ? "directory" : "file");
-          return;
-        }
-        const identity = `${stats.dev}:${stats.ino}:${stats.mode}:${stats.uid}`;
-        resolve(
-          dependency.kind === "identity" && stats.isDirectory()
-            ? identity
-            : `${identity}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`,
-        );
-      });
+      if (follow) NodeFS.stat(path, { bigint: true }, done);
+      else NodeFS.lstat(path, { bigint: true }, done);
     } catch {
       resolve("!invalid");
     }
   });
+
+const realPathOf = (path: string) =>
+  new Promise<string>((resolve) => {
+    try {
+      NodeFS.realpath.native(path, (error, resolved) =>
+        resolve(error ? `!${error.code ?? "error"}` : resolved),
+      );
+    } catch {
+      resolve("!invalid");
+    }
+  });
+
+// Git reads owners with lstat, so an identity that is a link counts as itself and as its target.
+const statFingerprint = async ({ path, kind }: GitConfigDependency) => {
+  if (kind === "physical") return realPathOf(path);
+  const describe = (stats: NodeFS.BigIntStats | string) =>
+    typeof stats === "string" ? stats : describeStats(kind, stats);
+  if (kind === "entry") return describe(await statOf(path, false));
+  if (kind !== "identity") return describe(await statOf(path, true));
+  const link = await statOf(path, false);
+  if (typeof link === "string" || !link.isSymbolicLink()) return describe(link);
+  return `${describe(link)}>${describe(await statOf(path, true))}`;
+};
 
 const fingerprintDependencies = (dependencies: ReadonlyArray<GitConfigDependency>) =>
   Effect.promise(() => Promise.all(dependencies.map(statFingerprint)));
@@ -296,7 +309,6 @@ interface CachedGitRefResult {
 }
 
 interface CachedGitConfigSnapshot {
-  readonly environment: string;
   readonly dependencies: ReadonlyArray<GitConfigDependency>;
   readonly fingerprint: string;
   // null: a value may depend on something the dependencies miss, so every read runs Git.
@@ -308,6 +320,10 @@ type RunGit = (
   cwd: string,
   args: ReadonlyArray<string>,
 ) => Effect.Effect<GitVcsDriver.ExecuteGitResult, GitCommandError | VcsError>;
+
+// Snapshots are per directory and config environment, so a read never sees another environment's
+// config. JSON escapes NUL and a path cannot hold one, so the key splits at its first NUL.
+const snapshotKey = (cwd: string, environment: string) => `${environment}\0${cwd}`;
 
 const CONFIG_SNAPSHOT_CACHE_CAPACITY = 2_048;
 const CONFIG_SNAPSHOT_RETRY_TTL = Duration.seconds(1);
@@ -385,9 +401,9 @@ const REPOSITORY_PATH_ARGS = [
 ] as const;
 
 /**
- * Per-directory snapshots of `git config --list`, reused while the files that chose and supplied
- * those values keep the same stat. Every dependency is stat'ed before the read that depends on it,
- * so a write during a load leaves the snapshot stale rather than wrong.
+ * Snapshots of `git config --list` per directory and config environment, reused while the files
+ * that chose and supplied those values keep the same stat. Every dependency is stat'ed before the
+ * read that depends on it, so a write during a load leaves the snapshot stale rather than wrong.
  */
 export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(function* (
   runGit: RunGit,
@@ -440,6 +456,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
   const readConfigState = Effect.fn("GitVcsDriver.configSnapshot.read")(function* (
     cwd: string,
     environment: string,
+    home: string | undefined,
   ) {
     const pathsResult = yield* runGit(
       "GitVcsDriver.configSnapshot.paths",
@@ -508,13 +525,12 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       ],
       { concurrency: "unbounded" },
     );
-    // A directory outside the work tree (GIT_WORK_TREE elsewhere) has no prefix to walk.
+    // A directory outside the work tree (core.worktree elsewhere) has no prefix to walk.
     if (locations === null || !insideTopLevel) return null;
 
-    // Discovery: the directory, what would make Git stop below the top level (a `.git`, or HEAD of a
-    // bare repository), the `.git` it found, and what keeps that a repository. The prefix comes from
-    // Git, cased as on disk like the top level, whatever case the directory was given in; the physical
-    // path keeps it, and the index path Git prints from it, current.
+    // Discovery inputs: the directory, any `.git` or bare HEAD below the top level, the found `.git`
+    // and what keeps it a repository, and the top level and git dir safe.directory checks. The
+    // prefix comes from Git, cased as on disk; the physical path keeps it and the index path current.
     const dependencies: GitConfigDependency[] = [
       { path: cwd, kind: "identity" },
       { path: cwd, kind: "physical" },
@@ -529,6 +545,8 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
     // The alternates decide which objects a ref may point to.
     dependencies.push(
       { path: path.join(toplevel, ".git"), kind: "identity" },
+      { path: toplevel, kind: "identity" },
+      { path: gitDir, kind: "identity" },
       { path: head, kind: "content" },
       // With core.preferSymlinkRefs HEAD is a link whose target names the branch.
       { path: path.join(gitDir, "HEAD"), kind: "entry" },
@@ -557,7 +575,7 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
       snapshotSupported = false;
     } else {
       const listed = gitConfigListDependencies(entries, {
-        home: (yield* HostProcess.Environment).HOME,
+        home,
         windows,
         isAbsolute: path.isAbsolute,
       });
@@ -595,14 +613,18 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
   });
 
   const load = Effect.fn("GitVcsDriver.configSnapshot.load")(
-    function* (cwd: string) {
-      const environment = gitConfigEnvironmentSignature(process.env);
-      if (environment === null) return null;
-      let dependencies = reloadDependencies.get(cwd) ?? [];
-      reloadDependencies.delete(cwd);
+    function* (key: string) {
+      const separator = key.indexOf("\0");
+      const environment = key.slice(0, separator);
+      const cwd = key.slice(separator + 1);
+      // Git runs in the environment of the read that started the load, which the key names.
+      const env = yield* HostProcess.Environment;
+      if (gitConfigEnvironmentSignature(env) !== environment) return null;
+      let dependencies = reloadDependencies.get(key) ?? [];
+      reloadDependencies.delete(key);
       for (let attempt = 0; attempt < CONFIG_SNAPSHOT_LOAD_ATTEMPTS; attempt++) {
         const fingerprints = yield* fingerprintDependencies(dependencies);
-        const state = yield* readConfigState(cwd, environment);
+        const state = yield* readConfigState(cwd, environment, env.HOME);
         if (state === null) return null;
         const fingerprintByKey = new Map(
           dependencies.map((dependency, index) => [
@@ -624,7 +646,6 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
               dependency.kind !== "absent" || fingerprint[index]!.startsWith("!"),
           );
           return {
-            environment,
             dependencies: unique,
             fingerprint: fingerprint.join("\n"),
             snapshot:
@@ -664,43 +685,57 @@ export const makeGitConfigSnapshots = Effect.fn("makeGitConfigSnapshots")(functi
   });
 
   const isCurrent = (cached: CachedGitConfigSnapshot) =>
-    cached.environment === gitConfigEnvironmentSignature(process.env)
-      ? fingerprintDependencies(cached.dependencies).pipe(
-          Effect.map((fingerprints) => fingerprints.join("\n") === cached.fingerprint),
-        )
-      : Effect.succeed(false);
+    fingerprintDependencies(cached.dependencies).pipe(
+      Effect.map((fingerprints) => fingerprints.join("\n") === cached.fingerprint),
+    );
 
   // A one-off read runs one command; a directory read again, such as on every refresh, is loaded.
-  const isReadAgain = (cwd: string) => {
-    if (readOnce.has(cwd)) return true;
+  const isReadAgain = (key: string) => {
+    if (readOnce.has(key)) return true;
     if (readOnce.size >= CONFIG_SNAPSHOT_CACHE_CAPACITY) {
       readOnce.delete(readOnce.values().next().value!);
     }
-    readOnce.add(cwd);
+    readOnce.add(key);
     return false;
   };
 
+  // The snapshot key for `cwd` in this read's environment; null when that environment has none.
+  const readKey = Effect.fnUntraced(function* (cwd: string) {
+    const environment = gitConfigEnvironmentSignature(yield* HostProcess.Environment);
+    return environment === null ? null : snapshotKey(cwd, environment);
+  });
+
   /**
-   * The current snapshot for `cwd`, or null when this read must run Git. Untraced: it runs on every
-   * config read, several per status refresh; loads keep their spans.
+   * The current snapshot for `cwd` in this read's environment, or null when this read must run Git.
+   * Untraced: it runs on every config read, several per status refresh; loads keep their spans.
    */
   const read = Effect.fnUntraced(function* (cwd: string) {
     if (!supported) return null;
-    if (!(yield* Cache.has(snapshots, cwd)) && !isReadAgain(cwd)) return null;
-    const cached = yield* Cache.get(snapshots, cwd);
+    const key = yield* readKey(cwd);
+    if (key === null) return null;
+    // Background work only reuses a current snapshot: a load in its small lane would hold up the
+    // reads that wait for it.
+    if (yield* GitVcsDriver.BackgroundGitWork) {
+      const cached = Option.getOrNull(yield* Cache.getOption(snapshots, key));
+      return cached !== null && (yield* isCurrent(cached)) ? cached.snapshot : null;
+    }
+    if (!(yield* Cache.has(snapshots, key)) && !isReadAgain(key)) return null;
+    const cached = yield* Cache.get(snapshots, key);
     if (cached === null) return null;
     if (yield* isCurrent(cached)) return cached.snapshot;
-    reloadDependencies.set(cwd, cached.dependencies);
-    yield* Cache.invalidateWhen(snapshots, cwd, (current) => current === cached);
+    reloadDependencies.set(key, cached.dependencies);
+    yield* Cache.invalidateWhen(snapshots, key, (current) => current === cached);
     // Whatever replaces the stale entry loaded after this read began, so it needs no check.
-    const reloaded = yield* Cache.get(snapshots, cwd);
-    reloadDependencies.delete(cwd);
+    const reloaded = yield* Cache.get(snapshots, key);
+    reloadDependencies.delete(key);
     return reloaded?.snapshot ?? null;
   });
 
   // Like read, but a directory without a snapshot stays without one (a non-repository polled for status).
   const peek = Effect.fnUntraced(function* (cwd: string) {
-    if (!supported || !(yield* Cache.has(snapshots, cwd))) return null;
+    if (!supported) return null;
+    const key = yield* readKey(cwd);
+    if (key === null || !(yield* Cache.has(snapshots, key))) return null;
     return yield* read(cwd);
   });
 

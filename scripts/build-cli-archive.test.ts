@@ -9,7 +9,11 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
-import { awaitCliNotarization, signMacArchiveContents } from "./build-cli-archive.ts";
+import {
+  awaitCliNotarization,
+  signMacArchiveContents,
+  stageProcessSpawner,
+} from "./build-cli-archive.ts";
 
 const signedEnv = {
   T3CODE_CLI_MAC_SIGN_IDENTITY: "Developer ID Application: Test (TEAM)",
@@ -230,6 +234,56 @@ it.layer(NodeServices.layer)("build-cli-archive notarization", (it) => {
       ).pipe(Effect.flip);
       assert.equal(error._tag, "CliArchiveNotarizationRejectedError");
       assert.isTrue(notarySubcommands(stub.calls)[0]?.includes("--wait"));
+    }).pipe(Effect.scoped),
+  );
+});
+
+it.layer(NodeServices.layer)("build-cli-archive process spawner", (it) => {
+  it.effect("stages t3-process-spawner for the host's own target only, and records which", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cli-spawner-" });
+      const builtSpawner = path.join(root, "dist-exe/t3-process-spawner");
+      yield* fs.makeDirectory(path.dirname(builtSpawner));
+      const stage = Effect.fn("test.stage")(function* (
+        name: string,
+        targetKey: string,
+        built: boolean,
+      ) {
+        const contentDir = path.join(root, name);
+        yield* fs.makeDirectory(contentDir);
+        if (built) yield* fs.writeFileString(builtSpawner, "spawner");
+        else yield* fs.remove(builtSpawner, { force: true });
+        const staged = yield* stageProcessSpawner({
+          builtSpawner,
+          contentDir,
+          targetKey,
+          hostKey: "darwin-arm64",
+        });
+        const spawner = path.join(contentDir, "t3-process-spawner");
+        return {
+          staged: Option.getOrUndefined(staged),
+          spawner: (yield* fs.exists(spawner)) ? yield* fs.readFileString(spawner) : undefined,
+          manifest: JSON.parse(yield* fs.readFileString(path.join(contentDir, "t3-archive.json"))),
+        };
+      });
+
+      assert.deepEqual(yield* stage("native", "darwin-arm64", true), {
+        staged: path.join(root, "native/t3-process-spawner"),
+        spawner: "spawner",
+        manifest: { processSpawner: true },
+      });
+      for (const [name, targetKey, built] of [
+        ["cross", "darwin-x64", true],
+        ["native-unbuilt", "darwin-arm64", false],
+      ] as const) {
+        assert.deepEqual(
+          yield* stage(name, targetKey, built),
+          { staged: undefined, spawner: undefined, manifest: { processSpawner: false } },
+          name,
+        );
+      }
     }).pipe(Effect.scoped),
   );
 });

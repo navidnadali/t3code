@@ -65,7 +65,10 @@ server does it, so the fixture keeps the source's scale and a boot writes nothin
    links and the branch cleared (the pull request sync and branch discovery read the host and `git`), snoozes
    removed, and a usage-limit failure marked handled with auto-resume off (`limitRecovery` set to its run and
    reset time, as a Stop leaves it), so the recovery worker never picks it.
-6. Run the server's event-store compaction (`ProjectionMaintenance.compactEventStore`), as a first boot would.
+6. Prune the event store through its head with the server's `ProjectionMaintenance.pruneEventStore`, as the
+   server has a day after upgrading: a first pass sets the prune mark, which is dated a day back so a second pass
+   prunes through it, and the mark the second pass leaves is deleted. A boot's first pass then only sets a new
+   mark and deletes nothing (see Booting a fixture).
    Then the server's own recovery queries must find nothing to resume, recover or deliver, and nothing else may
    be due on start (the list under Self-check), else the run fails here.
 7. Content pass (below): every string outside the allowlist becomes filler, BLOBs become zeros of their length.
@@ -73,8 +76,9 @@ server does it, so the fixture keeps the source's scale and a boot writes nothin
    in JavaScript and writes rows back, committing each batch, so its memory does not grow with the database (a
    user function in one UPDATE would hold the whole table: node:sqlite keeps every value it sees until the
    statement ends). It prints rows and MiB per table every 50,000 rows and at each table's end. Triggers are
-   dropped for the pass and restored, then the message search index is rebuilt from the filler, and the fork's
-   `orchestration_v2_projection_turn_item_counts` (kept, not blanked) is recounted from the turn items.
+   dropped for the pass and restored, then the message search index is rebuilt from the filler, and upstream
+   migration 85's `orchestration_v2_projection_turn_item_counts` (kept, not blanked) is recounted from the turn
+   items.
    Every v2 projection payload and thread event is decoded with the server's schemas before and after, row by
    row (flat memory on threads with millions of items); a row that decoded before and not after fails the run
    (nothing written).
@@ -82,7 +86,8 @@ server does it, so the fixture keeps the source's scale and a boot writes nothin
 9. Self-check, else delete the destination and fail (below).
 
 The report (`--report`) lists every table's rows in the source and the fixture. Every table but
-the ones in step 2 keeps its row count; events change by the step-5 updates less the compaction. Settings and `secrets/` live outside the database; copy only `statev2.sqlite`.
+the ones in step 2 keeps its row count; events change by the step-5 updates less the prune (step 6). Settings
+and `secrets/` live outside the database; copy only `statev2.sqlite`.
 
 ### Content blanking (default)
 
@@ -175,16 +180,20 @@ imports (`runnable`). Anything planted after sanitising, a token in an id or pro
 
 Boot it with its own `--base-dir` and `HOME`, never on the machine its data came from without one. With content
 blanked, project and worktree paths point nowhere. A first boot of a sanitised fixture writes no event: the
-start-up work (step 3), deliveries (4), settle sweep, pull request sync and timers (5) and compaction (6) are
-done, and the recovery queries find nothing. It may still run `git`: read-only repository identity probes per project. At the blanked
+start-up work (step 3), deliveries (4), settle sweep, pull request sync and timers (5) and prune (6) are
+done, and the recovery queries find nothing. The server's first prune pass, a minute after start, only sets the
+prune mark (a row in `orchestration_v2_projection_metadata`) and deletes nothing, however long ago the fixture
+was made; the next pass that can delete runs a day later. It may still run `git`: read-only repository
+identity probes per project. At the blanked
 paths they find no repository. For bench runs set, in `<base-dir>/userdata/settings.json`,
 `"enableProviderUpdateChecks": false` (no model manifest fetch), `"sidebarAutoSettleAfterDays": null` and
 `"sidebarAutoSettleOnMerge": false` (no settle sweep on threads the bench creates), and the environment variable
 `T3CODE_TELEMETRY_ENABLED=false`. The identity probes cannot be switched off.
 
 A fixture carries the migrations of the build that sanitised it. Booted by a newer build, its first boot runs
-the newer migrations: one made without the fork's own migrations gains the fork's turn item count table (fork
-migration 1 creates it, its triggers, and fills it from the turn items; no events). Sanitise with the build you
+the newer migrations: one made before upstream migration 85 gains its turn item count table (85 creates it and
+its triggers and fills it from the turn items; no events), and one made by a fork build before it has the fork's
+own count table, keyed by `run_id`, replaced by 85's the same way. Sanitise with the build you
 bench, or snapshot the fixture after that first boot.
 
 ## synth
@@ -193,7 +202,8 @@ Plans every row from the shape, then writes it through the server's `EventSink` 
 item positions, search index triggers) on a database created by the server's own `Sqlite.layerFromPath`, then
 compacts it with `VACUUM INTO`. It reports rows and bytes per table against the shape times `--scale`, and fails
 if any table differs from its own plan or the result is not clean (as `scan --keep-content`: generated text is
-not filler). "A boot writes nothing" holds for synth output as written and for sanitised copies (steps 3–6).
+not filler). "A boot writes nothing" but the prune mark holds for synth output as written and for sanitised
+copies (steps 3–6).
 
 - `--scale` multiplies projects, threads and every row count; each thread keeps the shape's turn-items-per-thread
   distribution (stratified draws), so long-history threads stay long at any scale.
@@ -207,8 +217,8 @@ not filler). "A boot writes nothing" holds for synth output as written and for s
 - Ids follow the server's `IdAllocator` (`derive.run`, `derive.providerTurn`, …) and Claude-style native ids
   (14 random base62 characters, redrawn while they spell a credential word, then an 8-digit counter), so index
   and payload sizes match. Text comes from a fixed word list: no data, nothing credential-shaped.
-- Events: one per entity, plus the shape's extra updates per event type (compactable types stay at first + latest,
-  so the store's compaction finds nothing to delete).
+- Events: one per entity, plus the shape's extra updates per event type (compactable types stay at first + latest;
+  a boot's first prune pass only sets the prune mark and deletes nothing).
 - Not written: tables the generator has no model for (pull request links, v1 sessions, …) show as `0 / target`.
 - The same shape, `--scale`, `--seed` and flags give the same bytes: the columns the server stamps with the
   wall clock (`created_at` in `effect_sql_migrations` and `t3_perf_fork_migrations`,

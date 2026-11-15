@@ -39,17 +39,23 @@ export const codexWireStage: ProviderIoStage<{ readonly maxLineBytes?: number },
           failure: CodexWire.decodeFailedLogPayload(decoded.failure),
         });
       };
+      const exceed = (emit: (output: CodexWireOutput) => void) => {
+        if (stopped) return;
+        stopped = true;
+        emit({ _tag: "Exceeded", maxLineBytes });
+      };
       return {
         push: (chunk, emit) => {
           if (stopped) return;
           const { lines, exceeded } = framer.push(chunk);
           for (const line of lines) handle(line, emit);
-          if (exceeded && !stopped) {
-            stopped = true;
-            emit({ _tag: "Exceeded", maxLineBytes });
-          }
+          if (exceeded) exceed(emit);
         },
-        end: (emit) => handle(framer.end(), emit),
+        end: (emit) => {
+          const { tail, exceeded } = framer.end();
+          if (exceeded) exceed(emit);
+          else handle(tail, emit);
+        },
       };
     },
   };

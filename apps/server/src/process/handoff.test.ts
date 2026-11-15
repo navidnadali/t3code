@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Fixtures connect raw sockets and kill processes by PID.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
+import * as NodeEvents from "node:events";
 import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -9,7 +10,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -17,6 +21,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
 import { HandoffProcess } from "./handoffProcess.ts";
@@ -341,6 +346,68 @@ describe("Node-style process with destroyed stdio", () => {
   );
 });
 
+// An SDK may give every process it starts the same abort signal: as Node's, a process that has
+// exited lets go of it, and so does one that never started.
+describe("Node-style process with a reused abort signal", () => {
+  it.live("leaves no listener on the signal once its processes have finished", () => {
+    const controller = new AbortController();
+    return Effect.gen(function* () {
+      const options = {
+        env: process.env,
+        signal: controller.signal,
+        stdio: ["ignore", "ignore", "ignore"] as ["ignore", "ignore", "ignore"],
+      };
+      // A host that answers a hand-off on the next tick (the process exits, or fails to start),
+      // or has no hand-off, so that the process starts on Node's spawner.
+      const host = (outcome: "exits" | "fails" | "unavailable") => ({
+        spawnHandoff: (
+          _command: string,
+          _args: ReadonlyArray<string>,
+          _options: Record<string, unknown>,
+          _request: { readonly fds: ReadonlyArray<number> },
+          callbacks: WorkerChildProcessSpawner.HandoffCallbacks,
+        ) => {
+          const child = {
+            pid: undefined as number | undefined,
+            sockets: new Map(),
+            exitListeners: new Set<(code: number | null, signal: null) => void>(),
+          };
+          if (outcome === "unavailable") callbacks.onUnavailable(new Error("no hand-off here"));
+          else {
+            process.nextTick(() => {
+              if (outcome === "fails") {
+                return callbacks.onError(
+                  Object.assign(new Error("spawn provider ENOENT"), { errno: -2, code: "ENOENT" }),
+                );
+              }
+              child.pid = 2 ** 30;
+              callbacks.onSpawn();
+              for (const listener of child.exitListeners) listener(0, null);
+            });
+          }
+          return child as never;
+        },
+        abandonHandoff: () => {},
+        killHandoff: () => {},
+        setHandoffReferenced: () => {},
+      });
+      const closed = (child: HandoffProcess) =>
+        new Promise<void>((resolve) => {
+          child.on("error", () => {});
+          child.once("close", () => resolve());
+        });
+      const closing = [
+        new HandoffProcess(host("exits"), "provider", [], options, () => {}),
+        new HandoffProcess(host("fails"), "provider", [], options, () => {}),
+        new HandoffProcess(host("unavailable"), process.execPath, ["-e", ""], options, () => {}),
+        new HandoffProcess(host("unavailable"), "/nonexistent/t3-provider", [], options, () => {}),
+      ].map(closed);
+      yield* Effect.promise(() => Promise.all(closing));
+      expect(NodeEvents.EventEmitter.getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    });
+  });
+});
+
 // A queued start has no deadline of its own: one covers the queue, and holds while it moves.
 describe("hand-off queue deadline", () => {
   it("stops a spawner whose queue stops moving, so its queued starts fall back", () => {
@@ -469,7 +536,354 @@ describe("hand-off queue deadline", () => {
   );
 });
 
+// Callers resume inside a stop's callbacks and may start commands at once, on the transport that
+// replaces the stopped one: that stop must leave them to it.
+describe("starts begun while a spawner stops", () => {
+  const playedHost = (options: { readonly openFails?: (opens: number) => boolean } = {}) => {
+    const transports: Array<{
+      readonly events: { readonly onMessage: (message: unknown) => void };
+      readonly stop: (cause: unknown) => void;
+      readonly posted: Array<{ readonly t: string; readonly id: number }>;
+      referenced: boolean;
+    }> = [];
+    const armed = new Set<object>();
+    let opens = 0;
+    const host = WorkerChildProcessSpawner.makeRemoteHost({
+      open: (events) => {
+        opens += 1;
+        if (options.openFails?.(opens)) throw new Error("cannot fork");
+        const transport = {
+          events,
+          stop: events.onStop,
+          posted: [] as Array<{ readonly t: string; readonly id: number }>,
+          referenced: false,
+        };
+        transports.push(transport);
+        return {
+          post: (message) => void transport.posted.push(message as { t: string; id: number }),
+          ref: () => void (transport.referenced = true),
+          unref: () => void (transport.referenced = false),
+          terminate: async () => {},
+        };
+      },
+      windowBytes: 65_536,
+      stoppedMessage: "stopped",
+      closedMessage: "closed",
+      restarts: 1,
+      startDeadline: () => {
+        const deadline = {};
+        armed.add(deadline);
+        return () => armed.delete(deadline);
+      },
+      handoffShim: () => ({ command: "shim", args: [] }),
+    });
+    const outcomes: Array<string> = [];
+    const cause = (error: Error) => (error.cause as Error).message;
+    const callbacks = (name: string) => ({
+      onSpawn: () => void outcomes.push(`${name} spawned`),
+      onError: (error: Error) => void outcomes.push(`${name} error: ${cause(error)}`),
+      onThrow: (error: Error) => void outcomes.push(`${name} threw: ${error.message}`),
+      onUnavailable: (error: Error) => void outcomes.push(`${name} falls back: ${cause(error)}`),
+    });
+    const startHandoff = (name: string) =>
+      host.spawnHandoff(
+        "provider",
+        [],
+        { stdio: ["ignore", "ignore", "ignore"] },
+        { fds: [0, 1, 2] },
+        callbacks(name),
+      );
+    return { host, transports, armed, outcomes, callbacks, startHandoff };
+  };
+
+  it("leaves a hand-off that a failed start's caller begins to the restarted transport", () => {
+    const { host, transports, armed, outcomes, callbacks, startHandoff } = playedHost();
+    let recovered: WorkerChildProcessSpawner.HandoffChild | undefined;
+    host.spawn(
+      "git",
+      [],
+      {},
+      {
+        ...callbacks("command"),
+        onError: (error) => {
+          callbacks("command").onError(error);
+          recovered = startHandoff("recovered");
+        },
+      },
+    );
+    startHandoff("waiting");
+    transports[0]!.stop(new Error("crashed"));
+    const id = recovered!.id;
+    expect({
+      outcomes,
+      posted: transports[1]?.posted.map(({ t, id }) => ({ t, id })),
+      deadlines: armed.size,
+      referenced: transports[1]?.referenced,
+    }).toEqual({
+      outcomes: ["command error: crashed", "waiting falls back: crashed"],
+      posted: [{ t: "spawn", id }],
+      deadlines: 1,
+      referenced: true,
+    });
+    // The restarted transport answers it; once it has ended, nothing holds that transport.
+    for (const message of [
+      { t: "spawn", id, pid: 2 ** 30, startTime: "1" },
+      { t: "exit", id, code: 0, signal: null },
+      { t: "close", id },
+    ]) {
+      transports[1]!.events.onMessage(message);
+    }
+    expect({ outcomes, deadlines: armed.size, referenced: transports[1]!.referenced }).toEqual({
+      outcomes: ["command error: crashed", "waiting falls back: crashed", "recovered spawned"],
+      deadlines: 0,
+      referenced: false,
+    });
+  });
+
+  it("leaves a transport its callbacks restart unreferenced once the stopped hand-offs let go", () => {
+    const { host, transports, callbacks, startHandoff } = playedHost();
+    // As a failed command's retry does before its preparation, which is asynchronous.
+    host.spawn("git", [], {}, { ...callbacks("command"), onError: () => void host.start() });
+    startHandoff("waiting");
+    transports[0]!.stop(new Error("crashed"));
+    expect({ restarted: transports.length, referenced: transports[1]?.referenced }).toEqual({
+      restarted: 2,
+      referenced: false,
+    });
+  });
+
+  it("fails each start once when its restart fails inside the stop", () => {
+    const { host, transports, outcomes, callbacks } = playedHost({
+      openFails: (opens) => opens === 2,
+    });
+    host.spawn(
+      "git",
+      [],
+      {},
+      {
+        ...callbacks("first"),
+        onError: (error) => {
+          callbacks("first").onError(error);
+          host.spawn("git", [], {}, callbacks("retry"));
+        },
+      },
+    );
+    host.spawn("git", [], {}, callbacks("second"));
+    transports[0]!.stop(new Error("crashed"));
+    expect(outcomes).toEqual([
+      "first error: crashed",
+      "retry error: cannot fork",
+      "second error: crashed",
+    ]);
+  });
+
+  it.live.skipIf(!linux)(
+    "hands off a provider that a failed start's caller begins, from the restarted spawner",
+    () => {
+      const { logs, layer: logLayer } = capturedLogs();
+      return Effect.gen(function* () {
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const source = spawnerProcessSource.replace(
+          'case "spawn":',
+          'case "spawn": if (message.args.includes("unanswered")) return;',
+        );
+        expect(source).not.toBe(spawnerProcessSource);
+        const startArmed = yield* Deferred.make<void>();
+        const before = new Set(spawnerProcessIds);
+        const { spawner, host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(
+          node,
+          {
+            source,
+            // Deadlines that never expire: the start reaching the spawner is all they say.
+            timers: {
+              schedule: (kind) => {
+                if (kind === "start") Deferred.doneUnsafe(startArmed, Effect.void);
+                return () => {};
+              },
+            },
+          },
+        );
+        const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        const [stopping] = [...spawnerProcessIds].filter((pid) => !before.has(pid));
+        // The start the spawner never answers fails when the spawner dies; its caller's recovery
+        // starts a provider at once, from inside that stop.
+        const recovery = yield* spawner
+          .exitCode(ChildProcess.make(process.execPath, ["-e", "", "unanswered"]))
+          .pipe(
+            Effect.as(undefined),
+            Effect.catch(() =>
+              Effect.sync(() =>
+                launcher.spawn(
+                  process.execPath,
+                  ["-e", "process.stdout.write(String(process.ppid))"],
+                  { env: process.env, stdio: ["ignore", "pipe", "ignore"] },
+                ),
+              ),
+            ),
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(startArmed);
+        process.kill(stopping!, "SIGKILL");
+        const provider = yield* Fiber.join(recovery);
+        const parent = yield* Effect.callback<number>((resume) => {
+          let text = "";
+          provider!.stdout!.on("data", (chunk: Buffer) => (text += chunk.toString()));
+          provider!.once("close", () => resume(Effect.succeed(Number(text))));
+        });
+        expect({
+          parent:
+            parent === process.pid
+              ? "server"
+              : spawnerProcessIds.has(parent) && parent !== stopping
+                ? "restarted spawner"
+                : parent,
+          fellBack: logs.filter(({ text }) => text.includes("hand-off failed")).length,
+        }).toEqual({ parent: "restarted spawner", fellBack: 0 });
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, logLayer)));
+    },
+  );
+});
+
+describe("handed-off command lookup", () => {
+  // execvp resolves `..` after following a symlink; collapsing `link/..` first finds another file.
+  it.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+    "runs the file execvp would, `..` after a symlink included",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const root = yield* fileSystem.realPath(yield* fileSystem.makeTempDirectoryScoped());
+        for (const file of ["tool", "target/tool"]) {
+          yield* fileSystem.makeDirectory(NodePath.dirname(`${root}/${file}`), {
+            recursive: true,
+          });
+          yield* fileSystem.writeFileString(`${root}/${file}`, `#!/bin/sh\nprintf ${file}\n`);
+          yield* fileSystem.chmod(`${root}/${file}`, 0o755);
+        }
+        yield* fileSystem.makeDirectory(`${root}/target/subdir`);
+        yield* fileSystem.symlink(`${root}/target/subdir`, `${root}/link`);
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node);
+        const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        const output = (child: NodeChildProcess.ChildProcess | HandoffProcess) =>
+          Effect.callback<string>((resume) => {
+            let text = "";
+            child.stdout!.on("data", (chunk: Buffer) => (text += chunk.toString()));
+            child.once("close", () => resume(Effect.succeed(text)));
+          });
+        const cases = [
+          { command: "link/../tool", cwd: root, env: { PATH: "/usr/bin:/bin" } },
+          { command: "tool", cwd: undefined, env: { PATH: `${root}/link/..` } },
+        ];
+        for (const { command, cwd, env } of cases) {
+          const native = yield* output(
+            NodeChildProcess.spawn(command, [], { cwd, env, stdio: ["ignore", "pipe", "ignore"] }),
+          );
+          expect(native, command).toBe("target/tool");
+          const handedOff = yield* output(
+            launcher.spawn(command, [], { cwd, env, stdio: ["ignore", "pipe", "ignore"] }),
+          );
+          expect(handedOff, command).toBe(native);
+        }
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
 describe("provider process hand-off", () => {
+  // As Node's spawner: input cut short by a failing source is the command's failure.
+  it.live.skipIf(!linux)("fails a handed-off command whose stdin source fails", () =>
+    Effect.gen(function* () {
+      const { spawner } = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+      const sourceFailure = PlatformError.badArgument({
+        module: "Test",
+        method: "stdin",
+        description: "the input source failed",
+      });
+      const exit = yield* spawner
+        .spawn(
+          node(
+            "process.stdout.write(String(process.ppid)); process.stdin.once('data', () => process.exit(0))",
+            {
+              stdin: Stream.make(new Uint8Array([1])).pipe(
+                Stream.concat(Stream.fail(sourceFailure)),
+              ),
+            },
+          ),
+        )
+        .pipe(
+          Effect.flatMap((handle) =>
+            Effect.all([text(handle.stdout), Effect.exit(handle.exitCode)], {
+              concurrency: "unbounded",
+            }),
+          ),
+          Effect.scoped,
+        );
+      expect(spawnerProcessIds.has(Number(exit[0]))).toBe(true);
+      expect(exit[1]).toEqual(Exit.fail(sourceFailure));
+    }).pipe(Effect.provide(launcherLayer())),
+  );
+
+  // Not handed off: Node's spawner starts it, and signals no group its exited child never led.
+  it.live.skipIf(!linux)("signals no process group for an exited non-detached command", () =>
+    Effect.gen(function* () {
+      const { spawner } = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+      const kill = yield* Effect.acquireRelease(
+        Effect.sync(() => vi.spyOn(process, "kill")),
+        (kill) => Effect.sync(() => kill.mockRestore()),
+      );
+      const [pid, parent] = yield* spawner
+        .spawn(
+          node(
+            "process.stdout.write(String(process.ppid)); process.stdin.once('data', () => process.exit(3))",
+            { detached: false },
+          ),
+        )
+        .pipe(
+          Effect.flatMap((handle) =>
+            Effect.all(
+              [
+                Effect.succeed(handle.pid),
+                text(handle.stdout),
+                Stream.run(Stream.make(new Uint8Array([1])), handle.stdin).pipe(
+                  Effect.andThen(Effect.exit(handle.exitCode)),
+                  Effect.ignore,
+                ),
+              ],
+              { concurrency: "unbounded" },
+            ),
+          ),
+          Effect.scoped,
+        );
+      // Exit listeners run after the exit's waiters: let them finish.
+      yield* Effect.yieldNow;
+      expect(Number(parent)).toBe(process.pid);
+      expect(kill.mock.calls.filter(([target]) => target === -pid)).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(launcherLayer())),
+  );
+
+  // Not handed off: Node's spawner refuses it, so its argument never runs as shell code.
+  it.live.skipIf(!linux)("refuses a shell command with separate arguments", () =>
+    Effect.gen(function* () {
+      const { spawner } = yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+      const shell = yield* spawner
+        .spawn(ChildProcess.make("printf", ["SAFE; printf INJECTED"], { shell: true }))
+        .pipe(
+          Effect.flatMap((handle) => text(handle.stdout)),
+          Effect.scoped,
+          Effect.exit,
+        );
+      expect(shell).toEqual(
+        Exit.fail(
+          PlatformError.badArgument({
+            module: "ChildProcess",
+            method: "spawn",
+            description:
+              "The shell option cannot be combined with arguments; pass the whole script as the command",
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(launcherLayer())),
+  );
+
   it.live.skipIf(!linux)(
     "hands off 64 concurrent processes without losing a line of their output",
     () =>

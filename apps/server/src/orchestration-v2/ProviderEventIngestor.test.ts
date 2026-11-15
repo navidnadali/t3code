@@ -33,8 +33,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Logger from "effect/Logger";
-import * as References from "effect/References";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlError from "effect/sql/SqlError";
 import * as Stream from "effect/Stream";
@@ -51,8 +50,10 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
+import { UsageLimitResetFallback } from "../usage/UsageLimitSources.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+import type { ServerProvider } from "@t3tools/contracts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
   makeProviderEventRoutingState,
@@ -169,6 +170,7 @@ const modelSelection = {
   model: "gpt-5.4",
 } satisfies ModelSelection;
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
+const isProviderEvent = Schema.is(ProviderAdapter.ProviderAdapterV2Event);
 
 function threadCreatedEvent(
   now: DateTime.Utc,
@@ -232,100 +234,120 @@ function threadCreatedEvent(
 
 const layer = it.layer(layerTest);
 
-it.effect("refreshes the failing instance snapshot after a committed usage_limit terminal", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const refreshed = yield* Deferred.make<void>();
-      const adapter = yield* ProviderAdapter.ProviderAdapterV2.pipe(
-        Effect.provide(
-          Layer.mock(ProviderAdapter.ProviderAdapterV2)({
-            instanceId: ProviderInstanceId.make("cursor-work"),
-            driver: ProviderDriverKind.make("cursor"),
-          }),
-        ),
-      );
-      const instance: ProviderInstance = {
-        instanceId: ProviderInstanceId.make("cursor-work"),
+it.effect("takes a hub's reset for an unreset usage_limit, then refreshes the snapshot", () =>
+  Effect.gen(function* () {
+    const refreshed = yield* Deferred.make<void>();
+    const adapter = yield* ProviderAdapter.ProviderAdapterV2.pipe(
+      Effect.provide(
+        Layer.mock(ProviderAdapter.ProviderAdapterV2)({
+          instanceId: ProviderInstanceId.make("cursor-work"),
+          driver: ProviderDriverKind.make("cursor"),
+        }),
+      ),
+    );
+    const instance: ProviderInstance = {
+      instanceId: ProviderInstanceId.make("cursor-work"),
+      driverKind: ProviderDriverKind.make("cursor"),
+      continuationIdentity: {
         driverKind: ProviderDriverKind.make("cursor"),
-        continuationIdentity: {
-          driverKind: ProviderDriverKind.make("cursor"),
-          continuationKey: "work",
-        },
-        enabled: true,
-        displayName: undefined,
-        orchestrationAdapter: adapter,
-        textGeneration: {
-          generateBranchName: () => Effect.die("unused"),
-          generateCommitMessage: () => Effect.die("unused"),
-          generatePrContent: () => Effect.die("unused"),
-          generateThreadTitle: () => Effect.die("unused"),
-          generateReviewGuide: () => Effect.die("unused"),
-          generateTranscriptionPostProcessing: () => Effect.die("unused"),
-        },
-        snapshot: {
-          refreshUsage: Deferred.succeed(refreshed, undefined).pipe(Effect.asVoid),
-          getSnapshot: Effect.die("unused"),
-          refresh: Effect.die("unused"),
-          resolveMaintenance: () => Effect.die("unused"),
-          applyUsageLimits: () => Effect.die("unused"),
-          streamChanges: Stream.empty,
-        },
-      };
-      const lookups: ProviderInstanceId[] = [];
-      const instances = Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
-        getInstance: (id) =>
-          Effect.sync(() => {
-            lookups.push(id);
-            return id === instance.instanceId ? instance : undefined;
-          }),
-      });
-      yield* Effect.gen(function* () {
-        const now = yield* DateTime.now;
-        const eventSink = yield* EventSink.EventSinkV2;
-        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
-        const idAllocator = yield* IdAllocator.IdAllocatorV2;
-        const threadEvent = yield* threadCreatedEvent(now);
-        yield* eventSink.write({ events: [threadEvent] });
-        const input = {
-          providerSessionId: yield* idAllocator.allocate.providerSession({
-            providerInstanceId: instance.instanceId,
-            threadId: threadEvent.threadId,
-          }),
+        continuationKey: "work",
+      },
+      enabled: true,
+      displayName: undefined,
+      orchestrationAdapter: adapter,
+      textGeneration: {
+        generateBranchName: () => Effect.die("unused"),
+        generateCommitMessage: () => Effect.die("unused"),
+        generatePrContent: () => Effect.die("unused"),
+        generateThreadTitle: () => Effect.die("unused"),
+        generateReviewGuide: () => Effect.die("unused"),
+        generateTranscriptionPostProcessing: () => Effect.die("unused"),
+      },
+      snapshot: {
+        refreshUsage: Deferred.succeed(refreshed, undefined).pipe(Effect.asVoid),
+        getSnapshot: Effect.succeed({
+          auth: { status: "authenticated", endpoint: "http://hub.test:8317" },
+        } as ServerProvider),
+        refresh: Effect.die("unused"),
+        resolveMaintenance: () => Effect.die("unused"),
+        applyUsageLimits: () => Effect.die("unused"),
+        streamChanges: Stream.empty,
+      },
+    };
+    const lookups: ProviderInstanceId[] = [];
+    const hubLookups: Array<[string, string, string | null]> = [];
+    const instances = Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+      getInstance: (id) =>
+        Effect.sync(() => {
+          lookups.push(id);
+          return id === instance.instanceId ? instance : undefined;
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      yield* eventSink.write({ events: [threadEvent] });
+      const input = {
+        providerSessionId: yield* idAllocator.allocate.providerSession({
           providerInstanceId: instance.instanceId,
           threadId: threadEvent.threadId,
-        };
-        for (const failureClass of ["validation_error", "usage_limit"] as const) {
-          const stored = yield* ingestor.ingestNormalized({
-            ...input,
-            event: {
-              type: "turn.terminal",
+        }),
+        providerInstanceId: instance.instanceId,
+        threadId: threadEvent.threadId,
+      };
+      for (const failureClass of ["validation_error", "usage_limit"] as const) {
+        const stored = yield* ingestor.ingestNormalized({
+          ...input,
+          event: {
+            type: "turn.terminal",
+            driver: instance.driverKind,
+            providerThreadId: idAllocator.derive.providerThread({
               driver: instance.driverKind,
-              providerThreadId: idAllocator.derive.providerThread({
-                driver: instance.driverKind,
-                nativeThreadId: "limited",
-              }),
-              providerTurnId: idAllocator.derive.providerTurn({
-                driver: instance.driverKind,
-                nativeTurnId: failureClass,
-              }),
-              runOrdinal: 1,
-              failureItemOrdinal: 1,
-              status: "failed",
-              failure: makeProviderFailure({
-                class: failureClass,
-                message: "Provider rejected turn.",
-              }),
-              threadDisposition: "reusable",
-            },
-          });
-          assert.equal(stored.length, 1);
-          if (failureClass === "validation_error") assert.deepEqual(lookups, []);
+              nativeThreadId: "limited",
+            }),
+            providerTurnId: idAllocator.derive.providerTurn({
+              driver: instance.driverKind,
+              nativeTurnId: failureClass,
+            }),
+            runOrdinal: 1,
+            failureItemOrdinal: 1,
+            status: "failed",
+            failure: makeProviderFailure({
+              class: failureClass,
+              message: "Provider rejected turn.",
+            }),
+            threadDisposition: "reusable",
+          },
+        });
+        assert.equal(stored.length, 1);
+        if (failureClass === "validation_error") assert.deepEqual(lookups, []);
+        else {
+          const event = stored[0]?.event;
+          assert.equal(
+            event?.type === "turn-item.updated" && event.payload.type === "error"
+              ? event.payload.failure.resetAt
+              : undefined,
+            "2026-11-13T18:00:00.000Z",
+          );
         }
-        assert.deepEqual(lookups, [instance.instanceId]);
-        yield* Deferred.await(refreshed);
-      }).pipe(Effect.provide(makeLayerTest(layerTestEventSink, instances)));
-    }),
-  ),
+      }
+      assert.deepEqual(lookups, [instance.instanceId, instance.instanceId]);
+      assert.deepEqual(hubLookups, [["cursor", "http://hub.test:8317", "gpt-5.4"]]);
+      yield* Deferred.await(refreshed);
+    }).pipe(
+      Effect.provide(makeLayerTest(layerTestEventSink, instances)),
+      Effect.provideService(UsageLimitResetFallback, {
+        resetAt: (driver, endpoint, model) =>
+          Effect.sync(() => {
+            hubLookups.push([driver, endpoint, model]);
+            return "2026-11-13T18:00:00.000Z";
+          }),
+      }),
+    );
+  }),
 );
 
 it.effect("records accepted billed turn usage once without billing the context window", () => {
@@ -425,6 +447,76 @@ it.effect("records accepted billed turn usage once without billing the context w
     });
   }).pipe(Effect.provide(layerTest.pipe(Layer.provide(layerAnalytics))));
 });
+
+it.effect(
+  "reports invalid provider questions as typed errors and still ingests valid questions",
+  () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const eventStore = yield* EventStore.EventStoreV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      yield* eventSink.write({ events: [threadEvent] });
+      const providerInstanceId = ProviderInstanceId.make("pi");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId,
+        threadId,
+      });
+      const question = { id: "input", header: "Enter a value", question: "", options: [] };
+      const item = {
+        id: TurnItemId.make(`${threadId}:question`),
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "waiting",
+        title: "Enter a value",
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        type: "user_input_request",
+        requestId: RuntimeRequestId.make(`${threadId}:question`),
+        questions: [question],
+      } satisfies OrchestrationV2TurnItem;
+      const event = {
+        type: "turn_item.updated",
+        driver: ProviderDriverKind.make("pi"),
+        turnItem: item,
+      } satisfies ProviderAdapter.ProviderAdapterV2Event;
+      const input = { providerSessionId, providerInstanceId, threadId, event };
+
+      assert.isFalse(isProviderEvent(event));
+      const error = yield* ingestor.ingestNormalized(input).pipe(Effect.flip);
+      assert.instanceOf(error, ProviderEventIngestor.ProviderEventNormalizeError);
+      assert.equal(
+        error.message,
+        `Failed to normalize provider event turn_item.updated for thread ${threadId}.`,
+      );
+      assert.instanceOf(error.cause, Schema.SchemaError);
+      assert.equal(yield* eventStore.latestSequence({ threadId }), 1);
+      assert.isEmpty((yield* projectionStore.getThreadProjection(threadId)).turnItems);
+
+      const validEvent = {
+        ...event,
+        turnItem: { ...item, questions: [{ ...question, question: "Enter a value" }] },
+      };
+      assert.isTrue(isProviderEvent(validEvent));
+      const stored = yield* ingestor.ingestNormalized({ ...input, event: validEvent });
+      assert.lengthOf(stored, 1);
+      assert.equal(stored[0]?.event.type, "turn-item.updated");
+      assert.deepEqual((yield* projectionStore.getThreadProjection(threadId)).turnItems, [
+        validEvent.turnItem,
+      ]);
+    }).pipe(Effect.provide(layerTest)),
+);
 
 layer("ProviderEventIngestorV2", (it) => {
   it.effect("normalizes provider events through the real event log and projection store", () =>
@@ -1311,280 +1403,275 @@ layer("ProviderEventIngestorV2", (it) => {
     "cancel-after-stop",
     "cancel-after-answer",
   ] as const)("preserves final request state during %s publication", (publication) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const eventSink = yield* EventSink.EventSinkV2;
-        const eventStore = yield* EventStore.EventStoreV2;
-        const projections = yield* ProjectionStore.ProjectionStoreV2;
-        const idAllocator = yield* IdAllocator.IdAllocatorV2;
-        const now = yield* DateTime.now;
-        const threadEvent = yield* threadCreatedEvent(now);
-        const threadId = threadEvent.threadId;
-        const providerSessionId = yield* idAllocator.allocate.providerSession({
-          providerInstanceId: modelSelection.instanceId,
+    Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const eventStore = yield* EventStore.EventStoreV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const now = yield* DateTime.now;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const providerThreadId = idAllocator.derive.providerThread({
+        driver: CODEX_DRIVER,
+        nativeThreadId: `${threadId}:race`,
+      });
+      const providerTurnId = idAllocator.derive.providerTurn({
+        driver: CODEX_DRIVER,
+        nativeTurnId: `${threadId}:race`,
+      });
+      const nodeId = NodeId.make(`${threadId}:question`);
+      const request: OrchestrationV2RuntimeRequest = {
+        id: RuntimeRequestId.make(`${threadId}:question`),
+        nodeId,
+        providerTurnId,
+        nativeRequestRef: null,
+        kind: "user_input",
+        status: "pending",
+        responseCapability: { type: "live", providerSessionId },
+        createdAt: now,
+        resolvedAt: null,
+      };
+      const node: OrchestrationV2ExecutionNode = {
+        id: nodeId,
+        threadId,
+        runId: null,
+        parentNodeId: null,
+        rootNodeId: nodeId,
+        kind: "user_input_request",
+        status: "waiting",
+        countsForRun: false,
+        providerThreadId,
+        providerTurnId,
+        nativeItemRef: null,
+        runtimeRequestId: request.id,
+        checkpointScopeId: null,
+        startedAt: now,
+        completedAt: null,
+      };
+      const item: OrchestrationV2TurnItem = {
+        id: TurnItemId.make(`${threadId}:question`),
+        threadId,
+        runId: null,
+        nodeId,
+        providerThreadId,
+        providerTurnId,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "waiting",
+        title: "Which option?",
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        type: "user_input_request",
+        requestId: request.id,
+        questions: [],
+      };
+      const seedEvents: Array<OrchestrationV2DomainEvent> = [threadEvent];
+      for (const payload of [
+        { type: "runtime-request.updated" as const, payload: request },
+        { type: "node.updated" as const, payload: node },
+        { type: "turn-item.updated" as const, payload: item },
+      ])
+        seedEvents.push({
+          id: yield* idAllocator.allocate.event({ threadId }),
           threadId,
+          occurredAt: now,
+          ...payload,
         });
-        const providerThreadId = idAllocator.derive.providerThread({
-          driver: CODEX_DRIVER,
-          nativeThreadId: `${threadId}:race`,
-        });
-        const providerTurnId = idAllocator.derive.providerTurn({
-          driver: CODEX_DRIVER,
-          nativeTurnId: `${threadId}:race`,
-        });
-        const nodeId = NodeId.make(`${threadId}:question`);
-        const request: OrchestrationV2RuntimeRequest = {
-          id: RuntimeRequestId.make(`${threadId}:question`),
-          nodeId,
-          providerTurnId,
-          nativeRequestRef: null,
-          kind: "user_input",
-          status: "pending",
-          responseCapability: { type: "live", providerSessionId },
-          createdAt: now,
-          resolvedAt: null,
-        };
-        const node: OrchestrationV2ExecutionNode = {
-          id: nodeId,
-          threadId,
-          runId: null,
-          parentNodeId: null,
-          rootNodeId: nodeId,
-          kind: "user_input_request",
-          status: "waiting",
-          countsForRun: false,
-          providerThreadId,
-          providerTurnId,
-          nativeItemRef: null,
-          runtimeRequestId: request.id,
-          checkpointScopeId: null,
-          startedAt: now,
-          completedAt: null,
-        };
-        const item: OrchestrationV2TurnItem = {
-          id: TurnItemId.make(`${threadId}:question`),
-          threadId,
-          runId: null,
-          nodeId,
-          providerThreadId,
-          providerTurnId,
-          nativeItemRef: null,
-          parentItemId: null,
-          ordinal: 1,
-          status: "waiting",
-          title: "Which option?",
-          startedAt: now,
-          completedAt: null,
-          updatedAt: now,
-          type: "user_input_request",
-          requestId: request.id,
-          questions: [],
-        };
-        const seedEvents: Array<OrchestrationV2DomainEvent> = [threadEvent];
-        for (const payload of [
-          { type: "runtime-request.updated" as const, payload: request },
-          { type: "node.updated" as const, payload: node },
-          { type: "turn-item.updated" as const, payload: item },
-        ])
-          seedEvents.push({
-            id: yield* idAllocator.allocate.event({ threadId }),
-            threadId,
-            occurredAt: now,
-            ...payload,
-          });
-        yield* eventSink.write({ events: seedEvents });
-        if (publication === "cancel-after-stop" || publication === "cancel-after-answer") {
-          const answered = publication === "cancel-after-answer";
-          const settledEvents: Array<OrchestrationV2DomainEvent> = [];
-          for (const payload of [
-            {
-              type: "runtime-request.updated" as const,
-              payload: {
-                ...request,
-                status: answered ? ("resolved" as const) : ("cancelled" as const),
-                ...(answered ? { answers: { decision: "Keep it" } } : {}),
-                resolvedAt: now,
-              },
-            },
-            {
-              type: "node.updated" as const,
-              payload: {
-                ...node,
-                status: answered ? ("completed" as const) : ("cancelled" as const),
-                completedAt: now,
-              },
-            },
-            ...(answered
-              ? [
-                  {
-                    type: "turn-item.updated" as const,
-                    payload: { ...item, status: "completed" as const, completedAt: now },
-                  },
-                ]
-              : []),
-          ])
-            settledEvents.push({
-              id: yield* idAllocator.allocate.event({ threadId }),
-              threadId,
-              occurredAt: now,
-              ...payload,
-            });
-          yield* eventSink.write({ events: settledEvents });
-          const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
-          const committed = yield* ingestor.ingestNormalized({
-            providerSessionId,
-            providerInstanceId: modelSelection.instanceId,
-            threadId,
-            event: {
-              type: "runtime_request.updated",
-              driver: CODEX_DRIVER,
-              runtimeRequest: { ...request, status: "cancelled", resolvedAt: now },
-              artifacts: {
-                node: { ...node, status: "cancelled", completedAt: now },
-                turnItem: { ...item, status: "cancelled", completedAt: now, updatedAt: now },
-              },
-            },
-          });
-          const final = yield* projections.getThreadProjection(threadId);
-          assert.equal(
-            final.runtimeRequests.find((entry) => entry.id === request.id)?.status,
-            answered ? "resolved" : "cancelled",
-          );
-          assert.equal(
-            final.nodes.find((entry) => entry.id === node.id)?.status,
-            answered ? "completed" : "cancelled",
-          );
-          assert.equal(
-            final.turnItems.find((entry) => entry.id === item.id)?.status,
-            answered ? "completed" : "cancelled",
-          );
-          assert.deepEqual(
-            committed.map((stored) => stored.event.type),
-            answered ? [] : ["turn-item.updated"],
-          );
-          if (answered)
-            assert.deepEqual(
-              final.runtimeRequests.find((entry) => entry.id === request.id)?.answers,
-              { decision: "Keep it" },
-            );
-          return;
-        }
-        const normalized = yield* Deferred.make<void>();
-        const releaseTerminalWrite = yield* Deferred.make<void>();
-        const gatedSink = EventSink.EventSinkV2.of({
-          ...eventSink,
-          write: (input) =>
-            publication === "terminal"
-              ? Deferred.succeed(normalized, undefined).pipe(
-                  Effect.andThen(Deferred.await(releaseTerminalWrite)),
-                  Effect.andThen(eventSink.write(input)),
-                )
-              : eventSink.write(input).pipe(
-                  Effect.tap(() => Deferred.succeed(normalized, undefined)),
-                  Effect.tap(() => Deferred.await(releaseTerminalWrite)),
-                ),
-        });
-        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2.pipe(
-          Effect.provide(Layer.fresh(ProviderEventIngestor.layer)),
-          Effect.provideService(EventSink.EventSinkV2, gatedSink),
-        );
-        const terminal = yield* ingestor
-          .ingestNormalized({
-            providerSessionId,
-            providerInstanceId: modelSelection.instanceId,
-            threadId,
-            event:
-              publication === "request-refresh"
-                ? {
-                    type: "runtime_request.updated",
-                    driver: CODEX_DRIVER,
-                    runtimeRequest: request,
-                    artifacts: { node, turnItem: { ...item, title: "Refreshed question" } },
-                  }
-                : {
-                    type: "provider_turn.updated",
-                    driver: CODEX_DRIVER,
-                    providerTurn: {
-                      id: providerTurnId,
-                      providerThreadId,
-                      nodeId,
-                      runAttemptId: null,
-                      nativeTurnRef: null,
-                      ordinal: 1,
-                      status: "completed",
-                      startedAt: now,
-                      completedAt: now,
-                    },
-                  },
-          })
-          .pipe(Effect.forkScoped);
-        yield* Deferred.await(normalized);
-        if (publication === "request-refresh") {
-          const visible = yield* projections.getThreadProjection(threadId);
-          assert.equal(
-            visible.turnItems.find((entry) => entry.id === item.id)?.title,
-            "Refreshed question",
-          );
-          assert.equal(
-            visible.runtimeRequests.find((entry) => entry.id === request.id)?.status,
-            "pending",
-          );
-        }
-        const answers = { decision: "Use the existing workspace" };
-        const responseEvents: Array<OrchestrationV2DomainEvent> = [];
+      yield* eventSink.write({ events: seedEvents });
+      if (publication === "cancel-after-stop" || publication === "cancel-after-answer") {
+        const answered = publication === "cancel-after-answer";
+        const settledEvents: Array<OrchestrationV2DomainEvent> = [];
         for (const payload of [
           {
             type: "runtime-request.updated" as const,
-            payload: { ...request, status: "resolved" as const, answers, resolvedAt: now },
+            payload: {
+              ...request,
+              status: answered ? ("resolved" as const) : ("cancelled" as const),
+              ...(answered ? { answers: { decision: "Keep it" } } : {}),
+              resolvedAt: now,
+            },
           },
           {
             type: "node.updated" as const,
-            payload: { ...node, status: "completed" as const, completedAt: now },
-          },
-          {
-            type: "turn-item.updated" as const,
             payload: {
-              ...item,
-              ...(publication === "request-refresh" ? { title: "Refreshed question" } : {}),
-              status: "completed" as const,
+              ...node,
+              status: answered ? ("completed" as const) : ("cancelled" as const),
               completedAt: now,
             },
           },
+          ...(answered
+            ? [
+                {
+                  type: "turn-item.updated" as const,
+                  payload: { ...item, status: "completed" as const, completedAt: now },
+                },
+              ]
+            : []),
         ])
-          responseEvents.push({
+          settledEvents.push({
             id: yield* idAllocator.allocate.event({ threadId }),
             threadId,
             occurredAt: now,
             ...payload,
           });
-        yield* eventSink.write({ events: responseEvents });
-        yield* Deferred.succeed(releaseTerminalWrite, undefined);
-        const committedTerminal = yield* Fiber.join(terminal);
-        assert.deepEqual(
-          committedTerminal.map((stored) => stored.event.type),
-          publication === "terminal"
-            ? ["provider-turn.updated"]
-            : ["node.updated", "turn-item.updated", "runtime-request.updated"],
-        );
-        const projection = yield* projections.getThreadProjection(threadId);
-        const answered = projection.runtimeRequests.find((entry) => entry.id === request.id)!;
-        assert.equal(answered.status, "resolved");
-        assert.deepEqual(answered.answers, answers);
-        assert.equal(projection.nodes.find((entry) => entry.id === nodeId)!.status, "completed");
+        yield* eventSink.write({ events: settledEvents });
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+        const committed = yield* ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          event: {
+            type: "runtime_request.updated",
+            driver: CODEX_DRIVER,
+            runtimeRequest: { ...request, status: "cancelled", resolvedAt: now },
+            artifacts: {
+              node: { ...node, status: "cancelled", completedAt: now },
+              turnItem: { ...item, status: "cancelled", completedAt: now, updatedAt: now },
+            },
+          },
+        });
+        const final = yield* projections.getThreadProjection(threadId);
         assert.equal(
-          projection.turnItems.find((entry) => entry.id === item.id)!.status,
-          "completed",
+          final.runtimeRequests.find((entry) => entry.id === request.id)?.status,
+          answered ? "resolved" : "cancelled",
         );
-        const history = yield* eventStore.read({ threadId }).pipe(Stream.runCollect);
-        assert.isFalse(
-          history.some(
-            (stored) =>
-              stored.event.type === "runtime-request.updated" &&
-              stored.event.payload.status === "cancelled",
-          ),
+        assert.equal(
+          final.nodes.find((entry) => entry.id === node.id)?.status,
+          answered ? "completed" : "cancelled",
         );
-      }),
-    ),
+        assert.equal(
+          final.turnItems.find((entry) => entry.id === item.id)?.status,
+          answered ? "completed" : "cancelled",
+        );
+        assert.deepEqual(
+          committed.map((stored) => stored.event.type),
+          answered ? [] : ["turn-item.updated"],
+        );
+        if (answered)
+          assert.deepEqual(
+            final.runtimeRequests.find((entry) => entry.id === request.id)?.answers,
+            { decision: "Keep it" },
+          );
+        return;
+      }
+      const normalized = yield* Deferred.make<void>();
+      const releaseTerminalWrite = yield* Deferred.make<void>();
+      const gatedSink = EventSink.EventSinkV2.of({
+        ...eventSink,
+        write: (input) =>
+          publication === "terminal"
+            ? Deferred.succeed(normalized, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseTerminalWrite)),
+                Effect.andThen(eventSink.write(input)),
+              )
+            : eventSink.write(input).pipe(
+                Effect.tap(() => Deferred.succeed(normalized, undefined)),
+                Effect.tap(() => Deferred.await(releaseTerminalWrite)),
+              ),
+      });
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2.pipe(
+        Effect.provide(Layer.fresh(ProviderEventIngestor.layer)),
+        Effect.provideService(EventSink.EventSinkV2, gatedSink),
+      );
+      const terminal = yield* ingestor
+        .ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          event:
+            publication === "request-refresh"
+              ? {
+                  type: "runtime_request.updated",
+                  driver: CODEX_DRIVER,
+                  runtimeRequest: request,
+                  artifacts: { node, turnItem: { ...item, title: "Refreshed question" } },
+                }
+              : {
+                  type: "provider_turn.updated",
+                  driver: CODEX_DRIVER,
+                  providerTurn: {
+                    id: providerTurnId,
+                    providerThreadId,
+                    nodeId,
+                    runAttemptId: null,
+                    nativeTurnRef: null,
+                    ordinal: 1,
+                    status: "completed",
+                    startedAt: now,
+                    completedAt: now,
+                  },
+                },
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(normalized);
+      if (publication === "request-refresh") {
+        const visible = yield* projections.getThreadProjection(threadId);
+        assert.equal(
+          visible.turnItems.find((entry) => entry.id === item.id)?.title,
+          "Refreshed question",
+        );
+        assert.equal(
+          visible.runtimeRequests.find((entry) => entry.id === request.id)?.status,
+          "pending",
+        );
+      }
+      const answers = { decision: "Use the existing workspace" };
+      const responseEvents: Array<OrchestrationV2DomainEvent> = [];
+      for (const payload of [
+        {
+          type: "runtime-request.updated" as const,
+          payload: { ...request, status: "resolved" as const, answers, resolvedAt: now },
+        },
+        {
+          type: "node.updated" as const,
+          payload: { ...node, status: "completed" as const, completedAt: now },
+        },
+        {
+          type: "turn-item.updated" as const,
+          payload: {
+            ...item,
+            ...(publication === "request-refresh" ? { title: "Refreshed question" } : {}),
+            status: "completed" as const,
+            completedAt: now,
+          },
+        },
+      ])
+        responseEvents.push({
+          id: yield* idAllocator.allocate.event({ threadId }),
+          threadId,
+          occurredAt: now,
+          ...payload,
+        });
+      yield* eventSink.write({ events: responseEvents });
+      yield* Deferred.succeed(releaseTerminalWrite, undefined);
+      const committedTerminal = yield* Fiber.join(terminal);
+      assert.deepEqual(
+        committedTerminal.map((stored) => stored.event.type),
+        publication === "terminal"
+          ? ["provider-turn.updated"]
+          : ["node.updated", "turn-item.updated", "runtime-request.updated"],
+      );
+      const projection = yield* projections.getThreadProjection(threadId);
+      const answered = projection.runtimeRequests.find((entry) => entry.id === request.id)!;
+      assert.equal(answered.status, "resolved");
+      assert.deepEqual(answered.answers, answers);
+      assert.equal(projection.nodes.find((entry) => entry.id === nodeId)!.status, "completed");
+      assert.equal(projection.turnItems.find((entry) => entry.id === item.id)!.status, "completed");
+      const history = yield* eventStore.read({ threadId }).pipe(Stream.runCollect);
+      assert.isFalse(
+        history.some(
+          (stored) =>
+            stored.event.type === "runtime-request.updated" &&
+            stored.event.payload.status === "cancelled",
+        ),
+      );
+    }),
   );
 
   it.effect("persists a failed provider terminal as one expected error item", () =>
@@ -1754,6 +1841,73 @@ layer("ProviderEventIngestorV2", (it) => {
     }),
   );
 
+  it.effect("keeps a steered message pending until the provider reports it read", () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId: threadEvent.threadId,
+      });
+      const runId = RunId.make("run:steer-read");
+      const messageId = MessageId.make("message:steer-read");
+      const steer: OrchestrationV2TurnItem = {
+        id: idAllocator.derive.userTurnItem({ messageId }),
+        threadId: threadEvent.threadId,
+        runId,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "user_message",
+        createdBy: "user",
+        creationSource: "web",
+        messageId,
+        inputIntent: "steer",
+        text: "Steer behind a command",
+        attachments: [],
+      };
+      yield* eventSink.write({ events: [threadEvent] });
+      const ingest = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+        ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId: threadEvent.threadId,
+          event,
+        });
+      const projected = projectionStore.getTurnItem({
+        threadId: threadEvent.threadId,
+        itemId: steer.id,
+      });
+      const steerUpdated = (status: "pending" | "completed") =>
+        ingest({
+          type: "steer.updated",
+          driver: CODEX_DRIVER,
+          threadId: threadEvent.threadId,
+          runId,
+          messageId,
+          status,
+        });
+
+      yield* ingest({ type: "turn_item.updated", driver: CODEX_DRIVER, turnItem: steer });
+      yield* steerUpdated("pending");
+      assert.deepInclude(yield* projected, { status: "pending", completedAt: null });
+      yield* steerUpdated("completed");
+      assert.equal((yield* projected)?.status, "completed");
+    }),
+  );
+
   it.effect("stores a bounded copy of a large file-change diff in both SQLite tables", () =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;
@@ -1908,15 +2062,18 @@ layer("ProviderEventIngestorV2", (it) => {
   );
 
   it.effect.each([
-    { parentMoved: false, failure: null },
-    { parentMoved: true, failure: null },
-    { parentMoved: false, failure: "write" },
-    { parentMoved: false, failure: "git" },
+    { parentMoved: false, failure: null, temporaryBranch: "t3/abcd1234" },
+    { parentMoved: true, failure: null, temporaryBranch: "t3/abcd1234" },
+    { parentMoved: false, failure: "write", temporaryBranch: "t3/abcd1234" },
+    { parentMoved: false, failure: "git", temporaryBranch: "t3/abcd1234" },
+    { parentMoved: false, failure: null, temporaryBranch: "my-prefix/abcd1234" },
   ])(
     "rechecks a pending native child's branch after the rename scan: %j",
-    ({ parentMoved, failure }) =>
+    ({ parentMoved, failure, temporaryBranch }) =>
       Effect.gen(function* () {
         const { worktreePath, command } = yield* makeSharedWorktree;
+        if (temporaryBranch !== "t3/abcd1234")
+          yield* command(worktreePath, ["branch", "-m", temporaryBranch]);
         const git = yield* GitVcsDriver.GitVcsDriver;
         const now = yield* DateTime.now;
         const eventSink = yield* EventSink.EventSinkV2;
@@ -1926,13 +2083,13 @@ layer("ProviderEventIngestorV2", (it) => {
         if (rootEvent.type !== "thread.created") throw new Error("Expected thread fixture");
         const parent = {
           ...rootEvent.payload,
-          branch: "t3/abcd1234",
+          branch: temporaryBranch,
           worktreePath,
         };
         yield* eventSink.write({ events: [{ ...rootEvent, payload: parent }] });
         const childId = ids.derive.threadFromProviderThread({
           driver: CODEX_DRIVER,
-          nativeThreadId: `child-created-during-rename:${parentMoved}:${failure}`,
+          nativeThreadId: `child-created-during-rename:${parentMoved}:${failure}:${temporaryBranch}`,
         });
         const beforeCommit = yield* Deferred.make<
           void,
@@ -2101,7 +2258,7 @@ layer("ProviderEventIngestorV2", (it) => {
         });
         assert.equal((yield* projections.getThread(childId)).branch, branch);
         assert.equal(stored.length, 1);
-        assert.equal(gitReads, scenario === "explicit" ? 0 : 1);
+        assert.equal(gitReads, 1);
       }),
   );
 
@@ -2477,244 +2634,3 @@ it.effect.each([
     assert.isEmpty(persisted);
   }).pipe(Effect.provide(layerFailingWrites(errors))),
 );
-
-const batchNode = (
-  threadId: OrchestrationV2ExecutionNode["threadId"],
-  name: string,
-  now: DateTime.Utc,
-): OrchestrationV2ExecutionNode => {
-  const id = NodeId.make(`${threadId}:${name}`);
-  return {
-    id,
-    threadId,
-    runId: null,
-    parentNodeId: null,
-    rootNodeId: id,
-    kind: "approval_request",
-    status: "waiting",
-    countsForRun: false,
-    providerThreadId: null,
-    providerTurnId: null,
-    nativeItemRef: null,
-    runtimeRequestId: null,
-    checkpointScopeId: null,
-    startedAt: now,
-    completedAt: null,
-  };
-};
-
-/**
- * Counts the ingestor's sink writes. The first batch fails (or dies, with `defect`) right after
- * normalizing `fail.node`; with `alone`, writing that node on its own fails too.
- */
-const ingestBatchOfNodes = (input: {
-  readonly nodes: (
-    threadId: OrchestrationV2ExecutionNode["threadId"],
-    now: DateTime.Utc,
-  ) => ReadonlyArray<OrchestrationV2ExecutionNode>;
-  readonly fail?: { readonly node: string; readonly alone: boolean; readonly defect?: boolean };
-}) =>
-  Effect.gen(function* () {
-    const writes = { single: 0, batched: 0 };
-    const sequencesAfterFailedBatch: Array<number> = [];
-    const includesFailingNode = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
-      events.some(
-        (event) =>
-          event.type === "node.updated" && event.payload.id.endsWith(`:${input.fail?.node}`),
-      );
-    const observedSink = Layer.effect(
-      EventSink.EventSinkV2,
-      Effect.gen(function* () {
-        const eventSink = yield* EventSink.EventSinkV2;
-        const eventStore = yield* EventStore.EventStoreV2;
-        let failBatch = input.fail !== undefined;
-        return EventSink.EventSinkV2.of({
-          ...eventSink,
-          write: (request) =>
-            Effect.suspend(() => {
-              writes.single++;
-              return input.fail?.alone === true && includesFailingNode(request.events)
-                ? Effect.fail(constraintFailure)
-                : eventSink.write(request);
-            }),
-          writeSteps: (request) =>
-            Effect.suspend(() => {
-              writes.batched++;
-              if (!failBatch) return eventSink.writeSteps(request);
-              failBatch = false;
-              return eventSink
-                .writeSteps({
-                  ...request,
-                  steps: request.steps.map((step) =>
-                    step.pipe(
-                      Effect.tap((events) =>
-                        !includesFailingNode(events)
-                          ? Effect.void
-                          : input.fail?.defect === true
-                            ? Effect.die("step defect")
-                            : Effect.fail(constraintFailure),
-                      ),
-                    ),
-                  ),
-                })
-                .pipe(
-                  Effect.tapError(() =>
-                    eventStore.latestSequence().pipe(
-                      Effect.map((sequence) => sequencesAfterFailedBatch.push(sequence)),
-                      Effect.orDie,
-                    ),
-                  ),
-                );
-            }),
-        });
-      }),
-    ).pipe(Layer.provide(Layer.mergeAll(layerTestEventSink, layerTestStores)));
-
-    return yield* Effect.gen(function* () {
-      const now = yield* DateTime.now;
-      const eventSink = yield* EventSink.EventSinkV2;
-      const eventStore = yield* EventStore.EventStoreV2;
-      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
-      const idAllocator = yield* IdAllocator.IdAllocatorV2;
-      const threadEvent = yield* threadCreatedEvent(now);
-      const threadId = threadEvent.threadId;
-      yield* eventSink.write({ events: [threadEvent] });
-      const providerSessionId = yield* idAllocator.allocate.providerSession({
-        providerInstanceId: modelSelection.instanceId,
-        threadId,
-      });
-      const logs: Array<ReadonlyArray<unknown>> = [];
-      const exit = yield* ingestor
-        .ingestNormalizedBatch({
-          events: input.nodes(threadId, now).map((node) => ({
-            providerSessionId,
-            providerInstanceId: modelSelection.instanceId,
-            threadId,
-            event: { type: "node.updated", driver: CODEX_DRIVER, node },
-          })),
-        })
-        .pipe(
-          Effect.exit,
-          Effect.provide(
-            Logger.layer(
-              [
-                Logger.make(({ logLevel, message }) => {
-                  logs.push([logLevel, ...(message as ReadonlyArray<unknown>)]);
-                }),
-              ],
-              { mergeWithExisting: false },
-            ),
-          ),
-          Effect.provideService(References.MinimumLogLevel, "Debug"),
-        );
-      const log = yield* eventStore.read({ afterSequence: 1 }).pipe(Stream.runCollect);
-      return {
-        exit,
-        writes,
-        sequencesAfterFailedBatch,
-        providerSessionId,
-        batchFailureLogs: logs.filter(
-          ([, message]) => message === "orchestration-v2.provider-event-batch-write-failed",
-        ),
-        logged: Array.from(log).map((stored) =>
-          stored.event.type === "node.updated"
-            ? `${stored.sequence}:${stored.event.payload.id.split(":").at(-1)}:${stored.event.payload.status}`
-            : `${stored.sequence}:${stored.event.type}`,
-        ),
-      };
-    }).pipe(Effect.provide(makeLayerTest(observedSink)));
-  });
-
-it.effect("writes a run of provider events in one transaction, each as it would be alone", () =>
-  Effect.gen(function* () {
-    const { exit, writes, logged } = yield* ingestBatchOfNodes({
-      nodes: (threadId, now) => {
-        const a = batchNode(threadId, "a", now);
-        return [
-          a,
-          { ...a },
-          batchNode(threadId, "b", now),
-          { ...a, status: "completed", completedAt: now },
-        ];
-      },
-    });
-    assert.isTrue(Exit.isSuccess(exit));
-    if (Exit.isSuccess(exit)) {
-      assert.deepEqual(
-        exit.value.map((stored) => stored.length),
-        [1, 0, 1, 1],
-      );
-    }
-    // The repeated node reads the first one inside the same transaction and is skipped.
-    assert.deepEqual(logged, ["2:a:waiting", "3:b:waiting", "4:a:completed"]);
-    assert.deepEqual(writes, { single: 0, batched: 1 });
-  }),
-);
-
-it.effect.each([false, true])(
-  "rolls back a batch that fails part-way and writes its events again one by one (defect: %s)",
-  (defect) =>
-    Effect.gen(function* () {
-      const {
-        exit,
-        writes,
-        logged,
-        sequencesAfterFailedBatch,
-        providerSessionId,
-        batchFailureLogs,
-      } = yield* ingestBatchOfNodes({
-        nodes: (threadId, now) => ["a", "b", "c"].map((name) => batchNode(threadId, name, now)),
-        fail: { node: "c", alone: false, defect },
-      });
-      assert.isTrue(Exit.isSuccess(exit));
-      assert.deepEqual(sequencesAfterFailedBatch, [1]);
-      assert.deepEqual(logged, ["2:a:waiting", "3:b:waiting", "4:c:waiting"]);
-      assert.deepEqual(writes, { single: 3, batched: 1 });
-      // The retry succeeded, so nothing else reports it: Warn names the cause's tag, never its values.
-      const [warning, debug, ...rest] = batchFailureLogs;
-      assert.deepEqual(warning, [
-        "Warn",
-        "orchestration-v2.provider-event-batch-write-failed",
-        { providerSessionId, eventCount: 3, errorTag: "EventSinkWriteError" },
-      ]);
-      assert.strictEqual(debug?.[0], "Debug");
-      assert.instanceOf(
-        (debug?.[2] as { readonly cause?: unknown } | undefined)?.cause,
-        EventSink.EventSinkWriteError,
-      );
-      assert.isEmpty(rest);
-    }),
-);
-
-it.effect("fails a batch at the event that fails alone, after writing the events before it", () =>
-  Effect.gen(function* () {
-    const { exit, writes, logged, sequencesAfterFailedBatch } = yield* ingestBatchOfNodes({
-      nodes: (threadId, now) => ["a", "b", "c"].map((name) => batchNode(threadId, name, now)),
-      fail: { node: "b", alone: true },
-    });
-    const failure = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
-    assert.instanceOf(failure, ProviderEventIngestor.ProviderEventPublishError);
-    assert.deepEqual(sequencesAfterFailedBatch, [1]);
-    assert.deepEqual(logged, ["2:a:waiting"]);
-    assert.deepEqual(writes, { single: 2, batched: 1 });
-  }),
-);
-
-it.each([
-  [undefined, 1],
-  ["", 1],
-  ["abc", 1],
-  ["-3", 1],
-  ["0", 1],
-  ["1", 1],
-  ["32", 32],
-  ["256", 256],
-  ["1000", 256],
-] as const)("reads T3CODE_PROVIDER_EVENT_BATCH_MAX=%s as %i events", (value, expected) => {
-  assert.equal(
-    ProviderEventIngestor.providerEventBatchLimitFromEnv({
-      T3CODE_PROVIDER_EVENT_BATCH_MAX: value,
-    }),
-    expected,
-  );
-});

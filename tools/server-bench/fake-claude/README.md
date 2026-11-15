@@ -29,6 +29,10 @@ bench instance; the fake answers `-p --json-schema` with a minimal schema-valid 
   echoes is the live prompt's, and every other recorded id is fresh on each play and each loop.
 - A prompt sent with `priority: "now"` or an `interrupt` ends the running turn with an
   `error_during_execution` result, as the CLI does.
+- With `BENCH_HOLD_CUT_TURNS=1`, a turn the recording's steer or interrupt cut off (its result's
+  `terminal_reason` is `aborted_streaming`) plays its frames up to that cut whenever the live one
+  arrives, then waits there for it, so the replay does not race it. Without the knob it plays the
+  recorded abort, which suits a bench that never steers.
 
 Not generated: the per-session MCP traffic a real agent sends to the server's `/mcp` (the load
 driver models it), permission prompts (run bench threads in full access), hook callbacks
@@ -52,6 +56,7 @@ the file, and files are not removed).
 | `BENCH_STATS_DIR`           | unset                                                            | Append one JSON line per played turn to `<dir>/fake-claude-<pid>.ndjson`.                                                                                                                                                                           |
 | `BENCH_MCP_CREDENTIALS_DIR` | unset                                                            | Write each session's T3 MCP URL and authorization to `<dir>/<session-id>.json` (see above).                                                                                                                                                         |
 | `BENCH_FAULT`               | unset                                                            | One malformed frame halfway through the first turn's body: `truncated-frame` (a cut-off JSON line, then the turn goes on), `truncated-frame-exit` (then exit status 1), `bad-shape` (a JSON assistant frame without a message).                     |
+| `BENCH_HOLD_CUT_TURNS`      | `0`                                                              | `1`: a recorded turn a steer or interrupt cut off waits at its cut for a live one (see above).                                                                                                                                                      |
 | `BENCH_NODE`                | `node` on `PATH`                                                 | The node binary the launcher runs.                                                                                                                                                                                                                  |
 
 At speed 1 a turn waits its recorded time to first token (capped at 3 s, 800 ms when unrecorded)

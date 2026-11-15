@@ -17,6 +17,7 @@ import {
   ProviderSessionId,
   ProviderThreadId,
   ThreadId,
+  VcsUnsupportedOperationError,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
@@ -32,7 +33,7 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
-import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import { withTurnStartReservation, withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
 import { resolveCodexRollbackTurnCount } from "./Adapters/CodexAdapterV2.ts";
 import * as CheckpointService from "./CheckpointService.ts";
@@ -175,8 +176,13 @@ it.effect.each([
   { order: "cleanup-first", restoreFiles: true },
   { order: "rollback-first", restoreFiles: true },
   { order: "cleanup-first", restoreFiles: false, unmanaged: true },
-])("locks rollback with %s", ({ order, restoreFiles, unmanaged = false }) =>
+  { order: "cleanup-first", restoreFiles: true, leavesFolder: true },
+  { order: "cleanup-first", restoreFiles: false, leavesFolder: true },
+  { order: "cleanup-first", restoreFiles: true, leavesFolder: true, shared: true },
+  { order: "cleanup-first", restoreFiles: true, leavesFolder: true, createFails: true },
+])("locks rollback with %s", (row) =>
   Effect.gen(function* () {
+    const { order, restoreFiles, unmanaged, leavesFolder, shared, createFails } = row;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const workspaceRoot = yield* fileSystem.realPath(
@@ -186,7 +192,7 @@ it.effect.each([
     const worktreePath = unmanaged
       ? path.join(workspaceRoot, "elsewhere", "feature")
       : path.join(worktreesDir, "repo", "feature");
-    yield* fileSystem.makeDirectory(worktreePath, { recursive: true });
+    yield* fileSystem.makeDirectory(path.join(worktreePath, ".git"), { recursive: true });
     const threadId = ThreadId.make("rollback-worktree");
     const projectId = ProjectId.make("rollback-worktree-project");
     const providerThreadId = ProviderThreadId.make("rollback-worktree-provider-thread");
@@ -248,14 +254,19 @@ it.effect.each([
                   path: worktreePath,
                 });
                 calls.push("create");
-                yield* fileSystem.makeDirectory(worktreePath).pipe(Effect.orDie);
+                if (createFails) return yield* Effect.die("the branch is gone");
+                yield* fileSystem
+                  .makeDirectory(path.join(worktreePath, ".git"), { recursive: true })
+                  .pipe(Effect.orDie);
                 return {} as never;
               }),
           }),
           Layer.mock(CheckpointService.CheckpointServiceV2)({
             restore: () =>
               Effect.gen(function* () {
-                assert.isTrue(yield* fileSystem.exists(worktreePath).pipe(Effect.orDie));
+                assert.isTrue(
+                  yield* fileSystem.exists(path.join(worktreePath, ".git")).pipe(Effect.orDie),
+                );
                 calls.push("files");
               }),
           }),
@@ -275,16 +286,31 @@ it.effect.each([
               Effect.succeed({
                 schemaVersion: 1,
                 snapshotSequence: 0,
-                threads: [],
+                threads: shared
+                  ? [
+                      {
+                        id: ThreadId.make("rollback-worktree-sharer"),
+                        projectId,
+                        worktreePath,
+                        deletedAt: null,
+                        lineage: {},
+                      },
+                    ]
+                  : [],
                 archivedThreads: [],
-              }),
+              } as never),
+            getCheckpointContext: () => Effect.succeed({ checkpointScopes: [], runs: [] } as never),
+            getThreadProviderContext: () => Effect.succeed({ providerSessions: [] } as never),
           }),
           Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
             open: (input) =>
               Effect.gen(function* () {
                 assert.equal(input.runtimePolicy.cwd, worktreePath);
                 if (!(yield* fileSystem.exists(worktreePath).pipe(Effect.orDie))) {
-                  return yield* new ProviderWorkspaceMissingError({ threadId, cwd: worktreePath });
+                  return yield* new ProviderWorkspaceMissingError({
+                    threadId,
+                    cwd: worktreePath,
+                  });
                 }
                 calls.push("session");
                 yield* Deferred.succeed(openEntered, undefined);
@@ -309,6 +335,11 @@ it.effect.each([
           cleanupEntered = true;
           if (order === "cleanup-first") yield* Deferred.await(release);
           yield* fileSystem.remove(worktreePath, { recursive: true, force: true });
+          // A failed `git worktree remove` can leave the folder without its checkout.
+          if (leavesFolder) {
+            yield* fileSystem.makeDirectory(worktreePath);
+            yield* fileSystem.writeFileString(path.join(worktreePath, "unsaved.txt"), "keep");
+          }
           calls.push("cleanup");
         }),
       );
@@ -328,10 +359,24 @@ it.effect.each([
       if (order === "rollback-first") assert.isFalse(cleanupEntered);
       yield* Deferred.succeed(release, undefined);
       if (cleanup !== undefined) yield* Fiber.join(cleanup);
-      if (unmanaged) {
+      if (unmanaged || shared) {
         const error = yield* Fiber.join(rollback).pipe(Effect.flip);
         assert.equal(error._tag, "CheckpointRollbackExecutionError");
         assert.deepEqual(calls, ["cleanup"]);
+        if (shared) {
+          assert.equal(error.reason, "shared-workspace");
+          assert.isTrue(yield* fileSystem.exists(path.join(worktreePath, "unsaved.txt")));
+        }
+        return;
+      }
+      if (createFails) {
+        yield* Fiber.join(rollback).pipe(Effect.exit);
+        assert.deepEqual(calls, ["cleanup", "prune", "create"]);
+        assert.equal(
+          yield* fileSystem.readFileString(path.join(worktreePath, "unsaved.txt")),
+          "keep",
+        );
+        assert.deepEqual(yield* fileSystem.readDirectory(path.dirname(worktreePath)), ["feature"]);
         return;
       }
       yield* Fiber.join(rollback);
@@ -339,19 +384,158 @@ it.effect.each([
       const rollbackCalls = restoreFiles
         ? ["session", "files", "projection"]
         : ["session", "projection"];
+      const recreates = !leavesFolder || restoreFiles;
       assert.deepEqual(
         calls,
         order === "cleanup-first"
-          ? ["cleanup", "prune", "create", ...rollbackCalls]
+          ? ["cleanup", ...(recreates ? ["prune", "create"] : []), ...rollbackCalls]
           : [...rollbackCalls, "cleanup"],
       );
+      if (!recreates) {
+        assert.isTrue(yield* fileSystem.exists(path.join(worktreePath, "unsaved.txt")));
+      }
     }).pipe(Effect.provide(testLayer));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.effect.each([{ restoreFiles: true }, { restoreFiles: false }])(
+  "holds turn starts inside the worktree during rollback with restoreFiles $restoreFiles",
+  ({ restoreFiles }) =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspaceRoot = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-rollback-reservation-" }),
+      );
+      const worktreesDir = path.join(workspaceRoot, "worktrees");
+      const worktreePath = path.join(worktreesDir, "repo", "feature");
+      yield* fileSystem.makeDirectory(path.join(worktreePath, ".git"), { recursive: true });
+      const threadId = ThreadId.make("rollback-reservation");
+      const providerThreadId = ProviderThreadId.make("rollback-reservation-provider-thread");
+      const providerInstanceId = ProviderInstanceId.make("rollback-reservation-provider");
+      const checkpointId = CheckpointId.make("rollback-reservation-checkpoint");
+      const scopeId = CheckpointScopeId.make("rollback-reservation-scope");
+      const release = Deferred.makeUnsafe<void>();
+      const openEntered = Deferred.makeUnsafe<void>();
+      const restoreEntered = Deferred.makeUnsafe<void>();
+      const releaseRestore = Deferred.makeUnsafe<void>();
+      const calls: string[] = [];
+      const projection = {
+        thread: {
+          id: threadId,
+          projectId: ProjectId.make("rollback-reservation-project"),
+          worktreePath,
+          branch: "feature/rollback-reservation",
+          activeProviderThreadId: providerThreadId,
+          modelSelection: { instanceId: providerInstanceId, model: "test-model" },
+        },
+        providerThread: {
+          id: providerThreadId,
+          providerSessionId: ProviderSessionId.make("rollback-reservation-session"),
+          providerInstanceId,
+        },
+        providerSession: undefined,
+        checkpoint: { id: checkpointId, scopeId, status: "ready", appRunOrdinal: 0 },
+        scope: { id: scopeId, cwd: worktreePath },
+        runsToRollback: [],
+        targetAttempt: undefined,
+        rolledBackAttemptIds: [],
+        staleCheckpoints: [],
+        otherRootScopes: [],
+        rootNodes: [],
+        providerTurns: [],
+      } as unknown as ProjectionStore.ProjectionCheckpointRollbackContext;
+      const testLayer = CheckpointRollbackService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ThreadCommandExecutor.layer,
+            NodeServices.layer,
+            Layer.mock(ServerConfig.ServerConfig)({ worktreesDir } as never),
+            ServerSettings.layerTest(),
+            Layer.mock(ProjectStore.ProjectStoreV2)({
+              get: () => Effect.succeedSome({ workspaceRoot } as never),
+            }),
+            Layer.mock(GitWorkflow.GitWorkflowService)({}),
+            Layer.mock(CheckpointService.CheckpointServiceV2)({
+              restore: () =>
+                Deferred.succeed(restoreEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseRestore)),
+                  Effect.andThen(Effect.sync(() => calls.push("files"))),
+                ),
+            }),
+            Layer.mock(EventSink.EventSinkV2)({ write: () => Effect.succeed([]) }),
+            IdAllocator.layer,
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getThread: () => Effect.succeed(projection.thread),
+              getCheckpointRollbackContext: () => Effect.succeed(projection),
+              getCheckpointWorkspaces: () => Effect.succeed([worktreePath]),
+              getShellSnapshot: () =>
+                Effect.succeed({
+                  schemaVersion: 1,
+                  snapshotSequence: 0,
+                  threads: [],
+                  archivedThreads: [],
+                }),
+            }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              open: () =>
+                Deferred.succeed(openEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as({} as never),
+                ),
+            }),
+            Layer.mock(RuntimePolicy.RuntimePolicyV2)({
+              resolve: () => Effect.succeed({ cwd: worktreePath } as never),
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* CheckpointRollbackService.CheckpointRollbackServiceV2;
+        const rollback = yield* service
+          .execute({ threadId, providerThreadId, checkpointId, scopeId, restoreFiles })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(openEntered);
+        // A synchronous realPath lets the forked start reach the reservation
+        // before the next assertion, so "not entered" means "waiting".
+        const startTurn = withTurnStartReservation(
+          FileSystem.makeNoop({ realPath: (target) => Effect.succeed(target) }),
+          path,
+          path.join(worktreePath, "packages", "app"),
+          Effect.sync(() => calls.push("turn start")),
+        ).pipe(Effect.forkChild({ startImmediately: true }));
+        const turnStart = yield* startTurn;
+        if (restoreFiles) {
+          assert.deepEqual(calls, []);
+          yield* Deferred.succeed(release, undefined);
+          // The reservation must still be held while files are being restored,
+          // not only while the provider rollback is in flight.
+          yield* Deferred.await(restoreEntered);
+          const duringRestore = yield* startTurn;
+          assert.deepEqual(calls, []);
+          yield* Deferred.succeed(releaseRestore, undefined);
+          yield* Fiber.join(duringRestore);
+        } else {
+          // Nothing is rewritten, so the turn start must not wait for the provider.
+          yield* Fiber.join(turnStart);
+          yield* Deferred.succeed(release, undefined);
+        }
+        yield* Fiber.join(rollback);
+        yield* Fiber.join(turnStart);
+        assert.deepEqual(
+          calls,
+          restoreFiles ? ["files", "turn start", "turn start"] : ["turn start"],
+        );
+      }).pipe(Effect.provide(testLayer));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 // With secondWorkspace, runs 5 and 6 ran in another workspace, which has its own root scope (and a
-// baseline taken at run 5's start).
-const seedRollbackHistory = (options: { readonly secondWorkspace?: string } = {}) =>
+// baseline taken at run 5's start). Refs are not dropped through withoutRepository, as the store
+// finds no repository there.
+const seedRollbackHistory = (
+  options: { readonly secondWorkspace?: string; readonly withoutRepository?: string } = {},
+) =>
   Effect.gen(function* () {
     const store = yield* ProjectionStore.ProjectionStoreV2;
     const now = yield* DateTime.now;
@@ -628,13 +812,25 @@ const seedRollbackHistory = (options: { readonly secondWorkspace?: string } = {}
                 restored.push(checkpoint.id);
               }),
             deleteStaleRefs: ({ scope, checkpoints }) =>
-              Effect.sync(() => {
-                deletedRefs.push(...checkpoints.map((checkpoint) => checkpoint.id));
-                deletions.push({
-                  cwd: scope.cwd,
-                  ids: checkpoints.map((checkpoint) => checkpoint.id).toSorted(),
-                });
-              }),
+              scope.cwd === options.withoutRepository
+                ? Effect.fail(
+                    new CheckpointService.CheckpointDeleteStaleRefsError({
+                      scopeId: scope.id,
+                      checkpointIds: checkpoints.map((checkpoint) => checkpoint.id),
+                      cause: new VcsUnsupportedOperationError({
+                        operation: "VcsDriverRegistry.resolve",
+                        kind: "unknown",
+                        detail: `No supported VCS repository was detected at ${scope.cwd}.`,
+                      }),
+                    }),
+                  )
+                : Effect.sync(() => {
+                    deletedRefs.push(...checkpoints.map((checkpoint) => checkpoint.id));
+                    deletions.push({
+                      cwd: scope.cwd,
+                      ids: checkpoints.map((checkpoint) => checkpoint.id).toSorted(),
+                    });
+                  }),
           }),
           Layer.mock(EventSink.EventSinkV2)({
             write: ({ events }) =>
@@ -791,9 +987,10 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
         }),
     );
 
-    // A workspace that no longer exists may share its repository (and refs) with one that does: its
-    // refs are dropped through the thread's other workspaces, and its checkpoints are still stale.
-    it.effect.each(["exists", "was removed"] as const)(
+    // A workspace that no longer exists, or whose folder outlived its checkout, may share its
+    // repository (and refs) with one that does: its refs are dropped through the thread's other
+    // workspaces, and its checkpoints are still stale.
+    it.effect.each(["exists", "was removed", "lost its checkout"] as const)(
       "marks stale the later checkpoints of every workspace scope and drops their refs (second workspace %s)",
       (secondWorkspace) =>
         Effect.gen(function* () {
@@ -803,8 +1000,11 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
             yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-rollback-workspace-b-" }),
             "worktree",
           );
-          if (secondWorkspace === "exists") yield* fileSystem.makeDirectory(directory);
-          const history = yield* seedRollbackHistory({ secondWorkspace: directory });
+          if (secondWorkspace !== "was removed") yield* fileSystem.makeDirectory(directory);
+          const history = yield* seedRollbackHistory({
+            secondWorkspace: directory,
+            ...(secondWorkspace === "lost its checkout" ? { withoutRepository: directory } : {}),
+          });
           const sql = yield* SqlClient.SqlClient;
           const { checkpointId } = history;
           const baselineB = CheckpointId.make("rollback-history-checkpoint-b-4");

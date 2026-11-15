@@ -1,3 +1,5 @@
+import type * as NodeWorkerThreads from "node:worker_threads";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -34,6 +36,8 @@ import * as Statement from "effect/sql/Statement";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 
+import { vi } from "vite-plus/test";
+
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -41,6 +45,30 @@ import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { encodeThreadHistoryCursor } from "./threadHistoryPaging.ts";
+
+// While on, reader workers open a file that does not exist, so they fail to start.
+const refuseReaders = vi.hoisted(() => ({ on: false }));
+
+vi.mock("node:worker_threads", async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeWorkerThreads>();
+  class Worker extends actual.Worker {
+    constructor(...[source, options]: ConstructorParameters<typeof actual.Worker>) {
+      super(
+        source,
+        refuseReaders.on && options?.workerData?.requireWal === true
+          ? {
+              ...options,
+              workerData: {
+                ...options.workerData,
+                filename: `${options.workerData.filename}-missing`,
+              },
+            }
+          : options,
+      );
+    }
+  }
+  return { ...actual, Worker };
+});
 
 const providerInstanceId = ProviderInstanceId.make("codex");
 const providerDriver = ProviderDriverKind.make("codex");
@@ -474,8 +502,9 @@ it.effect("keeps the results of the reads that hold reader transactions", () =>
         turnStart.subagentThreads,
         projection.subagents
           .filter((subagent) => !["interrupted", "failed", "cancelled"].includes(subagent.status))
-          .map(({ status, childThreadId, providerThreadId }) => ({
+          .map(({ status, origin, childThreadId, providerThreadId }) => ({
             status,
+            origin,
             childThreadId,
             providerThreadId,
           })),
@@ -594,7 +623,7 @@ const readCases: ReadonlyArray<ReadCase> = [
         "contextTransfers",
         "turnItems",
       ]),
-    statements: 6,
+    statements: 5,
     permit: true,
     corrupt: corruptRows.subagent,
     error: "ProjectionStoreReadError",
@@ -602,7 +631,7 @@ const readCases: ReadonlyArray<ReadCase> = [
   {
     name: "turn start context",
     read: (store, fixture) => store.getTurnStartContext(fixture.fork, fixture.forkRunId),
-    statements: 14,
+    statements: 15,
     permit: true,
     // Turn start no longer decodes task payloads; its run's items still decode after the read.
     corrupt: corruptRows.forkToolItem,
@@ -673,9 +702,13 @@ it.effect("reads a timeline page in as many statements whatever its length", () 
     "reader-scope-timeline-",
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
-      const fixture = yield* writeFixture("timeline", 20);
+      // A thread of its own for each page: a later page of the same thread reuses its index.
       const [short, long] = yield* Effect.forEach([1, 50], (limit) =>
-        traced(store.getTimelinePage(fixture.fork, { limit, view: "activity" })),
+        writeFixture(`timeline-${limit}`, 20).pipe(
+          Effect.flatMap((fixture) =>
+            traced(store.getTimelinePage(fixture.fork, { limit, view: "activity" })),
+          ),
+        ),
       );
       const lengths = [short!.exit, long!.exit].map((exit) =>
         Exit.isSuccess(exit) ? exit.value.items.length : -1,
@@ -998,17 +1031,19 @@ const withWriterStore = <A, E>(
         : SqlitePersistence.layerFromPath(path.join(directory, "statev2.sqlite"), {
             readerPoolSize: 4,
           });
-    // Readers refuse a database outside WAL, so every read falls back to the writer.
-    const run =
-      mode === "off"
-        ? body
-        : Effect.andThen(
-            Effect.flatMap(SqlClient.SqlClient, (sql) =>
-              sql.unsafe("PRAGMA journal_mode = DELETE"),
-            ),
-            body,
-          );
-    return yield* run.pipe(
+    // The readers cannot start, so every read falls back to the writer.
+    if (mode === "fallback") {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          refuseReaders.on = true;
+        }),
+        () =>
+          Effect.sync(() => {
+            refuseReaders.on = false;
+          }),
+      );
+    }
+    return yield* body.pipe(
       Effect.provide(
         EventSink.layer.pipe(
           Layer.provideMerge(Layer.merge(EventStore.layer, ProjectionStore.layer)),

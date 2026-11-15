@@ -11,6 +11,13 @@ import { injectLinuxArm64Sea } from "./linux-arm64-sea.ts";
 /** Beside `t3` in the archive; the server looks for the same name (its test pins them together). */
 export const PROCESS_SPAWNER_EXECUTABLE = "t3-process-spawner";
 
+/**
+ * Beside `t3` in a non-Windows archive, from build-cli-archive: whether it staged the spawner, which
+ * the archive's smoke check then requires.
+ */
+export const CLI_ARCHIVE_MANIFEST = "t3-archive.json";
+export const CliArchiveManifest = Schema.Struct({ processSpawner: Schema.Boolean });
+
 class ProcessSpawnerSeaError extends Schema.TaggedError<ProcessSpawnerSeaError>()(
   "ProcessSpawnerSeaError",
   { message: Schema.String },

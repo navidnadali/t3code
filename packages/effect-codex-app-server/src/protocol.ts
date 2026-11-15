@@ -70,8 +70,11 @@ export interface CodexAppServerLineOffload {
   readonly decode: (
     line: string,
   ) => Effect.Effect<CodexOffload.OffloadedLine, CodexError.CodexAppServerError>;
-  /** Appends an incoming log record serialized off-thread. */
-  readonly writeLog: (record: CodexOffload.SerializedLogRecord) => Effect.Effect<void>;
+  /** Appends an incoming log record serialized off-thread for `event`, in stdout order. */
+  readonly writeLog: (
+    record: CodexOffload.SerializedLogRecord,
+    event: CodexAppServerProtocolLogEvent,
+  ) => Effect.Effect<void>;
   /** Fails when the offload stops working (its worker died); that error then ends the protocol. */
   readonly failure: Effect.Effect<never, CodexError.CodexAppServerError>;
 }
@@ -453,9 +456,16 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     ) =>
       offloaded._tag === "InThread"
         ? handleLineInThread(line)
-        : Effect.forEach(offloaded.logs ?? [], offload.writeLog, { discard: true }).pipe(
-            Effect.andThen(routeMessage(offloaded.message)),
-          );
+        : Effect.forEach(
+            offloaded.logs ?? [],
+            ({ stage, ...record }) =>
+              offload.writeLog(record, {
+                direction: "incoming",
+                stage,
+                payload: stage === "raw" ? line : offloaded.message,
+              }),
+            { discard: true },
+          ).pipe(Effect.andThen(routeMessage(offloaded.message)));
     const handleLine = (line: string): Effect.Effect<void, CodexError.CodexAppServerError> => {
       if (line.trim().length === 0) {
         return Effect.void;
@@ -648,12 +658,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             Effect.succeed(normalizeIncomingError(error, "read-input-stream")),
           ),
         onSuccess: () =>
-          Effect.sync(() => {
-            const tail = framer.end();
+          Effect.suspend(() => {
+            const { tail, exceeded } = framer.end();
             // A dropped read's bytes end it; in-thread would log the last handled read's part.
-            return droppedAfterTermination ? "" : tail;
+            if (droppedAfterTermination) return Effect.void;
+            return exceeded ? Effect.fail(exceededError()) : handleLine(tail);
           }).pipe(
-            Effect.flatMap(handleLine),
             Effect.matchEffect({
               onFailure: (error) => handleTermination(() => Effect.succeed(error)),
               onSuccess: () =>

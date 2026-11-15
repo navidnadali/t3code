@@ -10,7 +10,8 @@ T3 Code has one server-side observability model:
 
 The local trace file is the persisted source of truth for normal local launches. Those launches do not
 write a separate server log file, but SSH-managed launches also persist the remote process's
-stdout/stderr at `~/.t3/ssh-launch/<state>/server.log`.
+stdout/stderr at `~/.t3/ssh-launch/<state>/server.log`. Each managed launch starts that file
+empty, so it holds only the latest launch's output.
 
 ## Where To Find Things
 
@@ -57,8 +58,9 @@ The `TraceRecord`, `EffectTraceRecord`, `OtlpTraceRecord`, and `SpanSummaryTrace
 live in `packages/shared/src/observability.ts`.
 
 SQL statement spans (named `sqlite`) and `sql.transaction` spans carry `db.connection` and
-`db.lock_wait_ms`. `db.connection` is `writer` for the main connection, which runs on the event loop,
-or `reader` for the read-only connection in a worker thread. `db.lock_wait_ms` is the part of the
+`db.lock_wait_ms`. `db.connection` is `writer` for the read-write connection or `reader` for a
+read-only one. For a database file both run in worker threads; an in-memory database has only a
+writer, on the event loop. `db.lock_wait_ms` is the part of the
 span spent waiting for that connection, behind other SQL. That wait does not block the event loop,
 so subtract it before you blame a slow span on the query. Statements inside a transaction use its
 connection and do not carry these attributes.
@@ -181,7 +183,10 @@ small spawner process, started once while the server is small, so the server doe
   health check, every 5 minutes by default) and text generation (thread titles, branch names, commit
   messages, pull request content and review guides, one or two per request);
 - document text extraction (one per document attachment);
-- Muse's checks and maintenance lookups (its SDK starts its sessions).
+- Muse's checks and maintenance lookups (its SDK starts its sessions);
+- Claude's history worker (resuming an interrupted turn, forking a session), keep-awake's sleep
+  inhibitor (`systemd-inhibit` or `caffeinate`, when runs start after a quiet minute) and source
+  control discovery's login-shell `PATH` refresh (at most one `$SHELL -ilc` per connection every 10 s).
 
 Output, exit codes, errors, timeouts and kills are the same.
 
@@ -193,7 +198,9 @@ session starts no longer holds the event loop for one fork each:
 - Claude sessions, through the Agent SDK's spawn hook: one per session start or restart (100 or 250 in
   a burst when as many sessions start);
 - the shared `codex app-server` of each Codex instance;
-- OpenCode's `opencode serve` servers and commands, and Pi's RPC sessions and checks.
+- OpenCode's `opencode serve` servers and commands, and Pi's RPC sessions and checks;
+- the CLI of Claude's capability probe: one per health check whose capabilities expired and one per
+  workspace a client shows, every 5 minutes.
 
 Each of these was run with its real CLI both ways and behaves the same: its stdio are sockets in both
 cases (no terminal, blocking mode), with the same end of input, 4 MiB written and 2 MiB read,
@@ -205,16 +212,16 @@ Everything else the server starts still forks it on Linux:
   that died would end its sessions); of Fx, Antigravity and Kiro, whose CLIs could not be run to
   verify them; and of ACP registry agents, which can be any agent the registry or a local command names
   (Gemini, verified, behaves);
-- the Claude capability probe the Agent SDK starts itself (2 at start-up, then on stale health
-  checks);
 - terminals: one `node-pty` process per terminal opened, which needs a pseudo-terminal in the server;
 - HTML render: one headless Chrome per `html_render` or `html_preview` call, which needs extra pipes
   (file descriptors 3 and 4) the spawner does not pass;
 - the preview browser and the Cursor and Muse SDKs, which spawn inside their libraries;
 - the login-shell `PATH` probe (once, synchronously, before the server builds its services), the
-  resource monitor and the spawner itself (once each at start-up), and the few commands whose output
-  is not piped or that need extra file descriptors (opening an editor or a folder, `xdg-mime`, and on
-  macOS `vm_stat` and `plutil`);
+  resource monitor, the `env -C` support check, `chattr` on btrfs and the spawner itself (once each
+  at start-up), and the few commands whose output is not piped or that need extra file descriptors
+  (opening an editor or a folder, `xdg-mime`, `wslpath`, and on macOS `ps`, `vm_stat` and `plutil`):
+  the spawner process starts only commands whose stdin, stdout and stderr are all pipes, and hands
+  any other command to Node's spawner;
 - commands other services still start on Node's spawner, each per user action, setting change or
   health check: `ssh -G` for device hosts, `tailscale`, `cloudflared` and the 1Password CLI.
 
@@ -353,7 +360,7 @@ You do not need any extra env vars. Just run the app normally and inspect `serve
 Examples:
 
 ```bash
-npx t3
+t3
 ```
 
 ```bash
@@ -388,7 +395,7 @@ Default Grafana login:
 
 For endpoint settings and startup precedence, see the
 [user telemetry guide](../user/telemetry.md#export-diagnostics-to-your-own-receiver).
-In a worktree, use `vp run dev` instead of `npx t3` to keep state isolated.
+In a worktree, use `vp run dev` instead of `t3` to keep state isolated.
 
 ```bash
 export T3CODE_OTLP_TRACES_URL=http://localhost:4318/v1/traces
@@ -409,7 +416,7 @@ export T3CODE_TRACE_TIMING_ENABLED=true
 CLI:
 
 ```bash
-npx t3
+t3
 ```
 
 Monorepo web/server dev:

@@ -944,6 +944,17 @@ effectIt.effect("stops only a job's own process group", () =>
     for (const pid of [20, 210, 500, 700, 710, 999]) {
       expect(PortScanner.stoppableProcessGroup(table, pid, serverPid, spawners)).toBeNull();
     }
+    // The tool shell is the command; its `npm run dev &` job only inherited the name.
+    const variables = new Map([
+      [200, new Map<string, string>()],
+      [300, new Map([["COMMAND", "a"]])],
+      [400, new Map([["COMMAND", "a"]])],
+    ]);
+    expect([...PortScanner.agentCommandsInGroup(variables, table.get(300)!)]).toEqual([
+      ["COMMAND", "a"],
+    ]);
+    expect(PortScanner.agentCommandsInGroup(variables, table.get(400)!).size).toBe(0);
+    expect(PortScanner.agentCommandsInGroup(variables, table.get(600)!).size).toBe(0);
   }),
 );
 
@@ -976,6 +987,8 @@ server.listen(0, "127.0.0.1", () => {
 });
 `;
 
+const AGENT_COMMAND_ENV = "T3CODE_TEST_AGENT_COMMAND";
+
 /**
  * A real HTML server with an agent's environment, started the way an agent's tool shell starts a
  * job: under a detached shell with job control, in a group of its own. Release kills only the pids
@@ -993,7 +1006,12 @@ const agentServer = () =>
       // dash ignores `set -m` without a terminal; bash, like agent tool shells, honors it.
       const child = NodeChildProcess.spawn(
         "bash",
-        ["-c", 'set -m; "$0" -e "$1" & wait', process.execPath, AGENT_SERVER_SCRIPT],
+        [
+          "-c",
+          `set -m; ${AGENT_COMMAND_ENV}=command-live "$0" -e "$1" & wait`,
+          process.execPath,
+          AGENT_SERVER_SCRIPT,
+        ],
         { detached: true, env, stdio: ["ignore", "pipe", "ignore"] },
       );
       const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
@@ -1031,6 +1049,12 @@ effectIt.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
         Effect.sync(release),
       );
       const job = yield* agentServer();
+      const stops: Array<readonly [string, boolean]> = [];
+      yield* scanner.watchAgentCommandStops({
+        variable: AGENT_COMMAND_ENV,
+        onStop: (command) => Effect.sync(() => stops.push([command, isRunning(job.pid)])),
+        onStopAbandoned: () => Effect.die("the signal reached the job"),
+      });
 
       expect(yield* scanner.scan()).toEqual(
         expect.arrayContaining([
@@ -1044,8 +1068,10 @@ effectIt.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
 
       const unlisted = yield* Effect.flip(scanner.stopServer({ pid: process.pid, port: job.port }));
       expect(unlisted.reason).toBe("not-found");
+      expect(stops).toEqual([]);
 
       yield* scanner.stopServer({ pid: job.pid, port: job.port });
+      expect(stops).toEqual([["command-live", true]]);
       // The shell waits on its job, so it exits once the job has.
       yield* Effect.promise(() => job.exited);
       expect(isRunning(job.pid)).toBe(false);

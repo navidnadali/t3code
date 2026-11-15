@@ -9,7 +9,10 @@ import { AcpTransportError } from "effect-acp/errors";
 import { CodexAppServerTransportError } from "effect-codex-app-server/errors";
 import type { AcpLineOffload } from "effect-acp/protocol";
 import type { SerializedLogRecord } from "effect-codex-app-server/offload";
-import type { CodexAppServerLineOffload } from "effect-codex-app-server/protocol";
+import type {
+  CodexAppServerLineOffload,
+  CodexAppServerProtocolLogEvent,
+} from "effect-codex-app-server/protocol";
 import { AcpLineOffloads } from "@t3tools/provider-acp/server/AcpSessionRuntime";
 
 import * as ServerConfig from "../../config.ts";
@@ -32,7 +35,11 @@ export interface CodexLineOffloadInput {
   /** Set when incoming protocol events go to the native log. */
   readonly log?: {
     readonly providerSessionId: string;
-    readonly writeSerialized: (record: SerializedLogRecord) => Effect.Effect<void>;
+    /** Appends a record built off-thread for `event`, in stdout order. */
+    readonly writeSerialized: (
+      record: SerializedLogRecord,
+      event: CodexAppServerProtocolLogEvent,
+    ) => Effect.Effect<void>;
   };
 }
 

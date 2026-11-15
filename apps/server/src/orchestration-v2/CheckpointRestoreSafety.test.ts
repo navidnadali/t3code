@@ -237,6 +237,60 @@ it.effect("lets rollback recreate a worktree storage cleanup removed", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+// Storage cleanup removed the worktree (and its repository folder); the checkpoint recorded its real
+// path. The thread reaches it through a symlinked folder: the same worktree, unless the link moved.
+it.effect.each([
+  { spelling: "at its real path", link: "none", placed: true },
+  { spelling: "through a symlinked folder", link: "worktrees", placed: true },
+  { spelling: "through a symlinked folder pointed elsewhere", link: "elsewhere", placed: false },
+] as const)("places a removed worktree reached $spelling: $placed", ({ link, placed }) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const parent = yield* fileSystem.realPath(
+      yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-v2-restore-removed-link-" }),
+    );
+    const worktrees = path.join(parent, "worktrees");
+    const elsewhere = path.join(parent, "elsewhere");
+    yield* fileSystem.makeDirectory(worktrees);
+    yield* fileSystem.makeDirectory(elsewhere);
+    const linked = path.join(parent, "link");
+    if (link !== "none") yield* fileSystem.symlink(path.join(parent, link), linked);
+    const recorded = path.join(worktrees, "repo", "feature");
+    const thread = {
+      id: ThreadId.make("restore-removed-link"),
+      worktreePath: link === "none" ? recorded : path.join(linked, "repo", "feature"),
+    };
+    const place = yield* checkpointRestorePlace(
+      thread,
+      CheckpointId.make("restore-removed-link-checkpoint"),
+      {
+        fileSystem,
+        path,
+        projections: { getCheckpointWorkspaces: () => Effect.succeed([recorded]) },
+      },
+    );
+    if (!placed) {
+      assert.deepEqual(place, { refusal: anotherWorktreeRestoreMessage(recorded) });
+      return;
+    }
+    assert.deepEqual(place, { refusal: null, workspace: recorded });
+    const isolated = yield* isCheckpointRestoreIsolated(
+      thread,
+      { cwd: recorded },
+      {
+        fileSystem,
+        path,
+        projections: {
+          getShellSnapshot: () => Effect.succeed({ threads: [], archivedThreads: [] }),
+        } as never,
+        projects: {} as never,
+      },
+    );
+    assert.isTrue(isolated);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect.each([
   { sideChat: "answering questions", running: false, toolItems: 0, isolated: true },
   { sideChat: "running", running: true, toolItems: 0, isolated: false },

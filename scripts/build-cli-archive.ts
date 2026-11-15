@@ -28,7 +28,11 @@ import {
   STAGE_INSTALL_ARGS,
 } from "./build-desktop-artifact.ts";
 import { assertLinuxArm64PageCompatibility } from "./lib/linux-arm64-sea.ts";
-import { PROCESS_SPAWNER_EXECUTABLE } from "./lib/process-spawner-sea.ts";
+import {
+  CLI_ARCHIVE_MANIFEST,
+  CliArchiveManifest,
+  PROCESS_SPAWNER_EXECUTABLE,
+} from "./lib/process-spawner-sea.ts";
 import { selectCliRuntimeExternalDependencies } from "./lib/cli-external-packages.ts";
 import { signWithJsign } from "./lib/windows-jsign.ts";
 import { windowsSystemTar } from "./lib/windows-tar.ts";
@@ -47,6 +51,7 @@ const WorkspaceConfig = Schema.Struct({
 });
 const decodeWorkspaceConfig = Schema.decodeEffect(fromYaml(WorkspaceConfig));
 const encodeJsonString = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const encodeCliArchiveManifest = Schema.encodeEffect(Schema.fromJsonString(CliArchiveManifest));
 const StageWorkspaceConfig = Schema.Struct({
   supportedArchitectures: Schema.Struct({
     os: Schema.Array(Schema.String),
@@ -604,6 +609,34 @@ const signWindowsExecutable = Effect.fn("signWindowsExecutable")(function* (
   yield* Effect.log("[cli-archive] Signed t3.exe (Azure Trusted Signing).");
 });
 
+/**
+ * Stages the spawner, built for the host only; without it t3 starts its spawner from its own, much
+ * larger bundle. The archive records whether it has one, so the smoke check requires it exactly then.
+ */
+export const stageProcessSpawner = Effect.fn("stageProcessSpawner")(function* (input: {
+  readonly builtSpawner: string;
+  readonly contentDir: string;
+  readonly targetKey: string;
+  readonly hostKey: string;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const staged = input.targetKey === input.hostKey && (yield* fs.exists(input.builtSpawner));
+  const spawnerPath = path.join(input.contentDir, PROCESS_SPAWNER_EXECUTABLE);
+  if (staged) {
+    yield* fs.copyFile(input.builtSpawner, spawnerPath);
+  } else {
+    yield* Effect.logWarning(
+      `[cli-archive] No ${PROCESS_SPAWNER_EXECUTABLE} for ${input.targetKey}; t3 starts its spawner from its own bundle.`,
+    );
+  }
+  yield* fs.writeFileString(
+    path.join(input.contentDir, CLI_ARCHIVE_MANIFEST),
+    `${yield* encodeCliArchiveManifest({ processSpawner: staged })}\n`,
+  );
+  return staged ? Option.some(spawnerPath) : Option.none<string>();
+});
+
 const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
   readonly platform: BuildPlatform;
   readonly arch: BuildArch;
@@ -654,17 +687,15 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
 
   yield* Effect.log(`[cli-archive] Staging ${stem}...`);
   yield* fs.copyFile(builtExecutable, path.join(contentDir, executableName));
-  // Built for the host only; without it t3 starts its spawner from its own, much larger bundle.
-  const builtSpawner = path.join(serverDir, "dist-exe", PROCESS_SPAWNER_EXECUTABLE);
   const otherExecutablePaths: Array<string> = [];
-  if (input.platform !== "win" && targetKey === hostKey && (yield* fs.exists(builtSpawner))) {
-    const spawnerPath = path.join(contentDir, PROCESS_SPAWNER_EXECUTABLE);
-    yield* fs.copyFile(builtSpawner, spawnerPath);
-    otherExecutablePaths.push(spawnerPath);
-  } else if (input.platform !== "win") {
-    yield* Effect.logWarning(
-      `[cli-archive] No ${PROCESS_SPAWNER_EXECUTABLE} for ${targetKey}; t3 starts its spawner from its own bundle.`,
-    );
+  if (input.platform !== "win") {
+    const spawnerPath = yield* stageProcessSpawner({
+      builtSpawner: path.join(serverDir, "dist-exe", PROCESS_SPAWNER_EXECUTABLE),
+      contentDir,
+      targetKey,
+      hostKey,
+    });
+    if (Option.isSome(spawnerPath)) otherExecutablePaths.push(spawnerPath.value);
   }
   yield* stageWebClient(webClient, path.join(contentDir, "client"));
   yield* fs.copy(resourceMonitorDir, path.join(contentDir, "resource-monitor"));

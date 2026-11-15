@@ -1,7 +1,6 @@
 import { ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
-import { driftedTurnItemCountThreads } from "./turnItemCounts.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -12,7 +11,6 @@ export interface ProjectionIntegrityVerification {
   readonly projectionSequence: number;
   readonly unreadableThreadIds: ReadonlyArray<ThreadId>;
   readonly missingThreadIds: ReadonlyArray<ThreadId>;
-  readonly turnItemCountDriftThreadIds: ReadonlyArray<ThreadId>;
   readonly unexpectedThreadIds: ReadonlyArray<ThreadId>;
 }
 
@@ -42,9 +40,6 @@ export const verifyProjectionIntegrity = Effect.gen(function* () {
   const expectedSet = new Set(expectedIds);
   const missingThreadIds = expectedIds.filter((threadId) => !actualSet.has(threadId));
   const unexpectedThreadIds = actualIds.filter((threadId) => !expectedSet.has(threadId));
-  const turnItemCountDriftThreadIds = (yield* driftedTurnItemCountThreads(sql)).map((row) =>
-    ThreadId.make(row.thread_id),
-  );
   const unreadableThreadIds = yield* projectionStore.getUnreadableThreadIds();
   const metadata = yield* sql<ProjectionMetadataRow>`
         SELECT schema_version, last_sequence
@@ -62,12 +57,10 @@ export const verifyProjectionIntegrity = Effect.gen(function* () {
       projectionSequence === expectedSequence &&
       missingThreadIds.length === 0 &&
       unexpectedThreadIds.length === 0 &&
-      turnItemCountDriftThreadIds.length === 0 &&
       unreadableThreadIds.length === 0,
     schemaVersion,
     expectedSequence,
     projectionSequence,
-    turnItemCountDriftThreadIds,
     unreadableThreadIds,
     missingThreadIds,
     unexpectedThreadIds,

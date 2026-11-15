@@ -39,6 +39,7 @@ import * as NodeStream from "node:stream";
 
 import * as ProcessRunner from "../processRunner.ts";
 import { HandoffProcess, type ProviderSpawnOptions } from "./handoffProcess.ts";
+import * as NonBlockingSpawner from "./NonBlockingSpawner.ts";
 import { isPidReused, isSameProcess } from "./processIdentity.ts";
 import { answerDeadlines, type SpawnerTimers } from "./spawnerDeadlines.ts";
 import { registerAdoptedProcess, registerSpawnerProcess } from "./spawnerProcesses.ts";
@@ -239,6 +240,8 @@ interface SpawnCallbacks {
 interface Entry {
   readonly child: RemoteChild;
   readonly callbacks: SpawnCallbacks;
+  /** The transport it was sent to: only that transport's stop ends it. */
+  readonly generation: object | undefined;
   spawned: boolean;
   /** Its caller stopped waiting for the start: the child is killed as soon as its PID is known. */
   abandoned: boolean;
@@ -279,6 +282,7 @@ export interface HandoffCallbacks {
 interface HandoffEntry {
   readonly child: HandoffChild;
   readonly callbacks: HandoffCallbacks;
+  readonly generation: object | undefined;
   readonly fds: ReadonlyArray<number>;
   spawned: boolean;
   settled: boolean;
@@ -389,19 +393,25 @@ export const makeRemoteHost = (options: {
     transport?.post(message, transfer);
   };
 
-  // A child keeps the event loop alive as Node's handles do: until close, or until its
-  // output ends once unreferenced; and while a stdin write or kill awaits its answer.
-  const updateHold = (entry: Entry) => {
-    const { child } = entry;
-    const holds =
-      entry.stdinCallbacks.size > 0 ||
-      entry.killCallbacks.size > 0 ||
-      (!child.closed && (child.referenced || !(child.ended[0] && child.ended[1])));
+  // The transport keeps the event loop alive while any child holds it.
+  const setHold = (entry: Entry | HandoffEntry, holds: boolean) => {
     if (holds === entry.holdsLoop) return;
     entry.holdsLoop = holds;
     holding += holds ? 1 : -1;
     if (holding === 0) transport?.unref();
     else if (holding === 1 && holds) transport?.ref();
+  };
+
+  // A child keeps the event loop alive as Node's handles do: until close, or until its
+  // output ends once unreferenced; and while a stdin write or kill awaits its answer.
+  const updateHold = (entry: Entry) => {
+    const { child } = entry;
+    setHold(
+      entry,
+      entry.stdinCallbacks.size > 0 ||
+        entry.killCallbacks.size > 0 ||
+        (!child.closed && (child.referenced || !(child.ended[0] && child.ended[1]))),
+    );
   };
 
   const completeExit = (entry: Entry, code: number | null, signal: NodeJS.Signals | null) => {
@@ -424,8 +434,12 @@ export const makeRemoteHost = (options: {
 
   const stop = (cause: unknown) => {
     const stopped = transport;
-    // Callers resume inside the callbacks below and may start commands on a restarted transport.
-    const stoppedEntries = [...entries.values()];
+    const stoppedGeneration = generation;
+    // Callers resume inside the callbacks below and may start commands on a restarted transport,
+    // or stop it: this stop ends only what was sent to its own.
+    const stoppedEntries = [...entries.values()].filter(
+      (entry) => entry.generation === stoppedGeneration,
+    );
     transport = undefined;
     generation = undefined;
     failure = cause;
@@ -494,19 +508,19 @@ export const makeRemoteHost = (options: {
     }
     // Hand-off: a running child's stdio are the server's, so it keeps running; one not yet
     // running never ran (the caller starts it another way), unless its start was reported.
-    const stoppedHandoffs = [...handoffs.values()];
-    handoffs.clear();
-    queuedHandoffs.clear();
-    cancelQueueDeadline?.();
-    cancelQueueDeadline = undefined;
+    const stoppedHandoffs = [...handoffs.values()].filter(
+      (entry) => entry.generation === stoppedGeneration,
+    );
+    for (const entry of stoppedHandoffs) {
+      handoffs.delete(entry.child.id);
+      leaveQueue(entry, false);
+    }
     const running: Array<HandoffChild> = [];
     for (const entry of stoppedHandoffs) {
       const { child } = entry;
       entry.cancelStartDeadline?.();
-      if (entry.holdsLoop) {
-        entry.holdsLoop = false;
-        holding -= 1;
-      }
+      // A transport restarted by the callbacks above was referenced while these held.
+      setHold(entry, false);
       const killCallbacks = [...entry.killCallbacks.values()];
       entry.killCallbacks.clear();
       if (!entry.settled) {
@@ -540,15 +554,12 @@ export const makeRemoteHost = (options: {
 
   const updateHandoffHold = (entry: HandoffEntry) => {
     const { child } = entry;
-    const holds =
+    setHold(
+      entry,
       entry.killCallbacks.size > 0 ||
-      !entry.settled ||
-      (entry.spawned && child.referenced && !Deferred.isDoneUnsafe(child.exitSignal));
-    if (holds === entry.holdsLoop) return;
-    entry.holdsLoop = holds;
-    holding += holds ? 1 : -1;
-    if (holding === 0) transport?.unref();
-    else if (holding === 1 && holds) transport?.ref();
+        !entry.settled ||
+        (entry.spawned && child.referenced && !Deferred.isDoneUnsafe(child.exitSignal)),
+    );
   };
 
   const destroySockets = (child: HandoffChild) => {
@@ -921,6 +932,7 @@ export const makeRemoteHost = (options: {
     const entry: Entry = {
       child,
       callbacks,
+      generation,
       spawned: false,
       abandoned: false,
       cancelStartDeadline: undefined,
@@ -985,6 +997,7 @@ export const makeRemoteHost = (options: {
     const entry: HandoffEntry = {
       child,
       callbacks,
+      generation,
       fds: request.fds,
       spawned: false,
       settled: false,
@@ -1505,6 +1518,17 @@ const runsOnWorker = (command: ChildProcess.Command): command is ChildProcess.St
   );
 };
 
+// Upstream's hung-mount guard (bounded cwd and executable checks, then `env -C`): neither the
+// server's thread pool nor the shared spawner waits on a mount that hangs.
+// A command with a NUL is refused as given, before any preparation.
+const prepareForSpawner = Effect.map(
+  NonBlockingSpawner.makePrepare,
+  (prepared) => (command: ChildProcess.StandardCommand) =>
+    prepared === undefined || findNulCharacter(command) !== undefined
+      ? Effect.succeed(command)
+      : prepared.prepareStandard(command),
+);
+
 /** What a handle needs of a started child, wherever its stdio are. */
 interface ChildView {
   readonly pid: number | undefined;
@@ -1568,9 +1592,14 @@ const makeChildHandles = Effect.fnUntraced(function* () {
     };
   };
 
-  const isProcessAlive = (child: ChildView): boolean => {
+  // A non-detached leader shares its spawner's group, so once it has exited it has none of its own.
+  const ownsProcessGroup = (command: ChildProcess.StandardCommand, child: ChildView): boolean =>
+    command.options.detached !== false || !Deferred.isDoneUnsafe(child.exitSignal);
+
+  const isProcessAlive = (command: ChildProcess.StandardCommand, child: ChildView): boolean => {
     if (child.killedOnStop) return false;
     if (!Deferred.isDoneUnsafe(child.exitSignal)) return true;
+    if (!ownsProcessGroup(command, child)) return false;
     try {
       signalProcessGroup(child.pid!, 0);
       return true;
@@ -1616,7 +1645,11 @@ const makeChildHandles = Effect.fnUntraced(function* () {
       });
     });
 
-  const awaitProcessExit = (child: ChildView, timeoutMillis: number): Effect.Effect<void> =>
+  const awaitProcessExit = (
+    command: ChildProcess.StandardCommand,
+    child: ChildView,
+    timeoutMillis: number,
+  ): Effect.Effect<void> =>
     Effect.callback<void>((resume) => {
       const deadline = Date.now() + timeoutMillis;
       let timer: NodeJS.Timeout | undefined;
@@ -1626,7 +1659,7 @@ const makeChildHandles = Effect.fnUntraced(function* () {
       };
       const poll = () => {
         clearTimeout(timer);
-        if (Date.now() >= deadline || !isProcessAlive(child)) {
+        if (Date.now() >= deadline || !isProcessAlive(command, child)) {
           stop();
           resume(Effect.void);
           return;
@@ -1645,17 +1678,19 @@ const makeChildHandles = Effect.fnUntraced(function* () {
     killOptions: ChildProcess.KillOptions | undefined,
   ) {
     const signalGroup = (signal: NodeJS.Signals) =>
-      killProcessGroup(command, child, signal).pipe(
-        Effect.catch(() => killProcess(command, backend, child, signal)),
-      );
+      ownsProcessGroup(command, child)
+        ? killProcessGroup(command, child, signal).pipe(
+            Effect.catch(() => killProcess(command, backend, child, signal)),
+          )
+        : killProcess(command, backend, child, signal);
     yield* signalGroup(killOptions?.killSignal ?? "SIGTERM");
     if (Predicate.isUndefined(killOptions?.forceKillAfter)) {
-      yield* awaitProcessExit(child, processGroupGraceMillis);
+      yield* awaitProcessExit(command, child, processGroupGraceMillis);
     } else {
-      yield* awaitProcessExit(child, Duration.toMillis(killOptions.forceKillAfter));
-      if (isProcessAlive(child)) {
+      yield* awaitProcessExit(command, child, Duration.toMillis(killOptions.forceKillAfter));
+      if (isProcessAlive(command, child)) {
         yield* signalGroup("SIGKILL");
-        yield* awaitProcessExit(child, processGroupGraceMillis);
+        yield* awaitProcessExit(command, child, processGroupGraceMillis);
       }
     }
     yield* Deferred.await(child.exitSignal);
@@ -1665,6 +1700,18 @@ const makeChildHandles = Effect.fnUntraced(function* () {
     command: ChildProcess.StandardCommand,
     backend: ChildBackend<C, E>,
   ) {
+    if (
+      command.options.shell !== undefined &&
+      command.options.shell !== false &&
+      command.args.length > 0
+    ) {
+      return yield* PlatformError.badArgument({
+        module: "ChildProcess",
+        method: "spawn",
+        description:
+          "The shell option cannot be combined with arguments; pass the whole script as the command",
+      });
+    }
     const nulCharacter = findNulCharacter(command);
     if (nulCharacter !== undefined) {
       return yield* PlatformError.badArgument({
@@ -1712,15 +1759,18 @@ const makeChildHandles = Effect.fnUntraced(function* () {
       (child) => finalize(child).pipe(Effect.ensuring(Effect.sync(() => backend.release?.(child)))),
     );
 
-    child.exitListeners.add((code) => {
-      if (code !== 0 && Predicate.isNotNull(code) && child.groupIsOwn?.() !== false) {
-        try {
-          signalProcessGroup(child.pid!, command.options.killSignal ?? "SIGTERM");
-        } catch {
-          // Best-effort cleanup, as NodeChildProcessSpawner does.
+    // A non-detached child leaves no process group of its own to clean up.
+    if (command.options.detached !== false) {
+      child.exitListeners.add((code) => {
+        if (code !== 0 && Predicate.isNotNull(code) && child.groupIsOwn?.() !== false) {
+          try {
+            signalProcessGroup(child.pid!, command.options.killSignal ?? "SIGTERM");
+          } catch {
+            // Best-effort cleanup, as NodeChildProcessSpawner does.
+          }
         }
-      }
-    });
+      });
+    }
     const reref = Effect.sync(() => {
       if (!isReferenced) {
         backend.setReferenced(child, true);
@@ -1743,8 +1793,16 @@ const makeChildHandles = Effect.fnUntraced(function* () {
         endOnDone: stdinConfig.endOnDone,
         encoding: stdinConfig.encoding,
       });
+    // As Node's spawner: a failed input source truncated the child's input, so its failure is the
+    // command's, ahead of the exit status and without waiting for the exit.
+    const inputFailure = Deferred.makeUnsafe<never, PlatformError.PlatformError>();
     if (Stream.isStream(stdinConfig.stream)) {
-      yield* Effect.forkScoped(Stream.run(stdinConfig.stream, stdinSink));
+      yield* Effect.forkScoped(
+        Stream.run(
+          Stream.tapError(stdinConfig.stream, (error) => Deferred.fail(inputFailure, error)),
+          stdinSink,
+        ),
+      );
     }
     const stdout = PlatformNodeStream.fromReadable<Uint8Array, PlatformError.PlatformError>({
       evaluate: () => child.stdout,
@@ -1754,16 +1812,20 @@ const makeChildHandles = Effect.fnUntraced(function* () {
       evaluate: () => child.stderr,
       onError: (error) => toPlatformError("fromReadable(stderr)", toError(error), command),
     });
-    const exitCode = Effect.flatMap(Deferred.await(child.exitSignal), ([code, signal]) => {
-      if (Predicate.isNotNull(code)) return Effect.succeed(ExitCode(code));
-      // Neither code nor signal: a handed-off process that ended after its spawner died.
-      const error = new globalThis.Error(
-        signal === null
-          ? "Process exited; its exit status is unknown (its process spawner had stopped)"
-          : `Process interrupted due to receipt of signal: '${signal}'`,
-      );
-      return Effect.fail(toPlatformError("exitCode", error, command));
-    });
+    const exitCode = Effect.flatMap(
+      Effect.raceFirst(Deferred.await(child.exitSignal), Deferred.await(inputFailure)),
+      ([code, signal]) => {
+        if (Deferred.isDoneUnsafe(inputFailure)) return Deferred.await(inputFailure);
+        if (Predicate.isNotNull(code)) return Effect.succeed(ExitCode(code));
+        // Neither code nor signal: a handed-off process that ended after its spawner died.
+        const error = new globalThis.Error(
+          signal === null
+            ? "Process exited; its exit status is unknown (its process spawner had stopped)"
+            : `Process interrupted due to receipt of signal: '${signal}'`,
+        );
+        return Effect.fail(toPlatformError("exitCode", error, command));
+      },
+    );
 
     return makeHandle({
       pid: ProcessId(child.pid!),
@@ -1792,6 +1854,7 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
   ) => Effect.Effect<ChildProcessHandle, PlatformError.PlatformError, Scope.Scope>,
 ) {
   const { platform, spawnWith } = yield* makeChildHandles();
+  const prepare = yield* prepareForSpawner;
   const relayed: ChildBackend<RemoteChild, never> = {
     start: (command, spawnOptions) =>
       Effect.callback<RemoteChild, PlatformError.PlatformError>((resume) => {
@@ -1812,7 +1875,7 @@ const makeRemoteSpawner = Effect.fnUntraced(function* (
         return yield* fallback.spawn(command);
       }
       if (!host.start()) return yield* unavailable(command);
-      return yield* spawnWith(command, relayed);
+      return yield* spawnWith(yield* prepare(command), relayed);
     }),
   );
 });
@@ -2106,6 +2169,7 @@ const makeHandoffSpawner = Effect.fnUntraced(function* (
   warn: (reason: Error) => Effect.Effect<void>,
 ) {
   const { platform, spawnWith } = yield* makeChildHandles();
+  const prepare = yield* prepareForSpawner;
   const handedOff: ChildBackend<HandoffView, HandoffUnavailableError> = {
     start: (command, spawnOptions) =>
       Effect.callback<HandoffView, PlatformError.PlatformError | HandoffUnavailableError>(
@@ -2140,7 +2204,8 @@ const makeHandoffSpawner = Effect.fnUntraced(function* (
       ) {
         return yield* node.spawn(command);
       }
-      return yield* spawnWith(command, handedOff).pipe(
+      return yield* prepare(command).pipe(
+        Effect.flatMap((prepared) => spawnWith(prepared, handedOff)),
         Effect.catchTags({
           HandoffUnavailableError: (error) =>
             warn(error.cause).pipe(Effect.andThen(node.spawn(command))),
@@ -2188,14 +2253,25 @@ const providerSpawnerChoices = new Map<string, "handoff" | "direct">([
 
 const directLauncher = (node: ChildProcessSpawner["Service"]) =>
   ProviderProcessLauncher.of({
-    spawn: (command, args, options) =>
-      NodeChildProcess.spawn(command, [...args], {
+    spawn: (command, args, options) => {
+      const child = NodeChildProcess.spawn(command, [...args], {
         cwd: options.cwd,
         env: options.env,
         signal: options.signal,
         stdio: [...options.stdio],
         detached: true,
-      }),
+      });
+      // Nothing has been written to its stdin yet: the caller has not had the child.
+      if (options.beforeStdin !== undefined && child.pid !== undefined) {
+        try {
+          options.beforeStdin({ pid: child.pid });
+        } catch (cause) {
+          child.kill("SIGKILL");
+          throw cause;
+        }
+      }
+      return child;
+    },
     spawner: node,
   });
 

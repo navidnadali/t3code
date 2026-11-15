@@ -2,6 +2,23 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.9-perf.7 (2026-11-15)
+
+Upstream 0.1.9, Node 26.13.1 and a round of correctness fixes
+
+Upstream base: e82050b8b97c.
+
+Upstream T3 Code 0.1.9; Node 26.13.1.
+
+- Migrations: the fork's migration chain follows upstream migration 85; upstream's message-ordinal index migration is a no-op on a database that already has the fork's.
+- Database: reader transactions are not folded into one BEGIN/COMMIT.
+- Worker path parity with in-thread provider sessions: hook matchers (onFailure included), MCP servers in the query options and SDK error fields reach the worker; a failed worker session stops its Claude CLI.
+- Spawner process: shell commands refuse separate arguments, no process-group signal for an exited child, a failing stdin source fails the command, upstream's hung-mount guard applies, commands are found as execvp finds them, and a stopped spawner's cleanup ends only what was sent to it.
+- Checkpoints: baselines and checkpoints are taken at the scope's real path; a refused workspace lookup records an error checkpoint and completes the run; a later workspace's full-thread diff starts at its own first baseline.
+- Steering: follow-ups of an archived or deleted thread are dropped; Stop and steer delivery fixes.
+- Claude descendant processes share one poll (upstream #34505); pull request sync backs off; Codex and ACP output offload match in-thread behaviour; Codex's line framer flushes its decoder at end of input.
+- Bench parameters in tools/server-bench set to chosen defaults.
+
 ## v0.1.7-perf.6 (2026-11-09)
 
 Durable inter-agent steering and in-order delivery

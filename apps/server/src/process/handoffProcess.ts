@@ -18,6 +18,11 @@ export interface ProviderSpawnOptions {
   readonly stdio: readonly ["pipe" | "ignore", "pipe" | "ignore", "pipe" | "ignore"];
   /** Piped descriptors the server only holds open (a watch pipe): never read, not in `stdio`. */
   readonly held?: ReadonlyArray<0 | 1 | 2>;
+  /**
+   * Runs once the process exists, before anything written to its stdin reaches it, with the start
+   * time its spawner read when handed off. Throwing kills it; the error is then the process's.
+   */
+  readonly beforeStdin?: (process: { readonly pid: number; readonly startTime?: string }) => void;
 }
 
 /** What a hand-off process needs of the spawner host. */
@@ -74,6 +79,9 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
   readonly #openOutputs = new Set<NodeStream.PassThrough>();
   readonly #held: Array<NodeNet.Socket> = [];
   #host: HandoffHost | undefined;
+  readonly #beforeStdin: ProviderSpawnOptions["beforeStdin"];
+  /** Once it has exited (as Node's) or failed to start, its abort signal no longer holds it. */
+  #forgetSignal: (() => void) | undefined;
 
   constructor(
     host: HandoffHost,
@@ -83,6 +91,7 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     fallback: (reason: Error) => void,
   ) {
     super();
+    this.#beforeStdin = options.beforeStdin;
     const held = new Set<number>(options.held ?? []);
     this.stdio = options.stdio.map((mode, fd) =>
       mode !== "pipe" || held.has(fd)
@@ -110,7 +119,12 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
       queueMicrotask(() => this.#cancel());
       return;
     }
-    options.signal?.addEventListener("abort", () => this.#abort(), { once: true });
+    const signal = options.signal;
+    if (signal !== undefined) {
+      const onAbort = () => this.#abort();
+      signal.addEventListener("abort", onAbort, { once: true });
+      this.#forgetSignal = () => signal.removeEventListener("abort", onAbort);
+    }
     this.#host = host;
     this.#child = host.spawnHandoff(
       command,
@@ -154,12 +168,26 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     return this.stdio[2] ?? null;
   }
 
+  /** The `beforeStdin` hook's failure, if it threw; stdin is then never connected. */
+  #runBeforeStdin(pid: number | undefined, startTime?: string): Error | undefined {
+    if (this.#beforeStdin === undefined || pid === undefined) return undefined;
+    try {
+      this.#beforeStdin({ pid, ...(startTime === undefined ? {} : { startTime }) });
+      return undefined;
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
   #joinHandedOff(host: HandoffHost) {
     const child = this.#child!;
     this.pid = child.pid;
+    const refused = this.#runBeforeStdin(child.pid, child.startTime);
     for (const [fd, socket] of child.sockets) {
       const stream = this.stdio[fd];
-      if (stream === undefined || stream === null) {
+      if (fd === 0 && refused !== undefined) {
+        socket.destroy();
+      } else if (stream === undefined || stream === null) {
         // Held for the child (a watch descriptor): never read or written here.
         socket.unref();
         socket.on("error", () => {});
@@ -170,7 +198,12 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     }
     child.exitListeners.add((code, signal) => this.#exit(code, signal));
     this.emit("spawn");
-    if (this.#pendingKill !== undefined) host.killHandoff(child, this.#pendingKill, () => {});
+    if (refused !== undefined) {
+      this.emit("error", refused);
+      host.killHandoff(child, "SIGKILL", () => {});
+    } else if (this.#pendingKill !== undefined) {
+      host.killHandoff(child, this.#pendingKill, () => {});
+    }
   }
 
   #startDirect(command: string, args: ReadonlyArray<string>, options: ProviderSpawnOptions) {
@@ -188,15 +221,20 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
     }
     this.#direct = child;
     this.pid = child.pid;
+    const refused = this.#runBeforeStdin(child.pid);
     for (const [fd, stream] of this.stdio.entries()) {
       const pipe = child.stdio[fd];
       if (stream === null || pipe === null || pipe === undefined) continue;
-      this.#connect(fd, stream, pipe);
+      if (fd === 0 && refused !== undefined) pipe.destroy();
+      else this.#connect(fd, stream, pipe);
     }
     child.on("spawn", () => this.emit("spawn"));
     child.on("error", (error) => this.#fail(error));
     child.on("exit", (code, signal) => this.#exit(code, signal));
-    if (this.#pendingKill !== undefined) child.kill(this.#pendingKill);
+    if (refused !== undefined) {
+      child.kill("SIGKILL");
+      process.nextTick(() => this.emit("error", refused));
+    } else if (this.#pendingKill !== undefined) child.kill(this.#pendingKill);
   }
 
   /**
@@ -235,6 +273,7 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
       // As Node's: a process that never started closes with no exit, its exit code the negative
       // errno of why it could not start (-2 for ENOENT, -13 for EACCES).
       this.#exited = true;
+      this.#forgetSignal?.();
       const errno = (error as NodeJS.ErrnoException).errno;
       if (typeof errno === "number" && errno < 0) this.exitCode = errno;
       for (const stream of this.stdio) stream?.destroy();
@@ -246,6 +285,7 @@ export class HandoffProcess extends NodeEvents.EventEmitter {
   #exit(code: number | null, signal: NodeJS.Signals | null) {
     if (this.#exited) return;
     this.#exited = true;
+    this.#forgetSignal?.();
     this.exitCode = code;
     this.signalCode = signal;
     // As Node's: stdin closes when the process exits.

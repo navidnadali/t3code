@@ -23,11 +23,11 @@ import * as ProjectionStore from "../../../apps/server/src/orchestration-v2/Proj
 import * as ProviderRuntimeRecovery from "../../../apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as LegacyV1ThreadImporter from "../../../apps/server/src/orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import { rebuildMessageSearch } from "../../../apps/server/src/orchestration-v2/messageSearchIndex.ts";
-import { recountTurnItems } from "../../../apps/server/src/orchestration-v2/turnItemCounts.ts";
 import {
   migrationRunLabels,
   runMigrationChains,
 } from "../../../apps/server/src/persistence/Migrations.ts";
+import { EVENT_LOG_PRUNE_MARK } from "../../../apps/server/src/persistence/OrchestrationEventStore.ts";
 import * as ServerSettings from "../../../apps/server/src/serverSettings.ts";
 import { assertSafeDestination } from "./guards.ts";
 
@@ -239,14 +239,31 @@ export const rebuildSearch = Effect.gen(function* () {
 });
 
 /**
- * Fork migration 1's recount of the turn item counts (clear, then refill from the items), when the
- * database has the table: the content pass runs with its triggers dropped.
+ * Upstream migration 85's backfill of the turn item counts (clear, then refill from the items), when
+ * the database has the table: the content pass runs with its triggers dropped.
  */
 export const recountTurnItemCounts = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const table = yield* sql<{ name: string }>`
     SELECT name FROM sqlite_schema WHERE name = 'orchestration_v2_projection_turn_item_counts'`;
-  if (table.length > 0) yield* recountTurnItems(sql);
+  if (table.length === 0) return;
+  // One transaction: an interrupt between clear and refill would leave every shell at zero items.
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`DELETE FROM orchestration_v2_projection_turn_item_counts`;
+      // Group in the (thread_id, run_id) index's order, then fold NULL runs into ''.
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_key, item_count)
+        SELECT thread_id, COALESCE(run_id, ''), SUM(item_count)
+        FROM (
+          SELECT thread_id, run_id, COUNT(*) AS item_count
+          FROM orchestration_v2_projection_turn_items
+          GROUP BY thread_id, run_id
+        )
+        GROUP BY thread_id, COALESCE(run_id, '')
+      `;
+    }),
+  );
 });
 
 /** v1 threads the legacy importer would turn into v2 threads on start (no v2 `thread.created`). */
@@ -362,10 +379,30 @@ export const runnableWork = Effect.gen(function* () {
 
 export const isRunnable = (work: RunnableWork) => Object.values(work).some((count) => count > 0);
 
-/** Run the server's retention maintenance on the isolated fixture. */
+/**
+ * The server's event-store prune, through the fixture's head: the first pass sets the prune mark at
+ * the head (the source's mark goes first; one under a day old would stay), dated a day back so the
+ * second prunes through it, as a day after upgrading. The mark the second pass leaves goes too, so
+ * a boot's first pass only sets a new one and deletes nothing.
+ */
 export const compactEvents = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
   const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
-  return yield* maintenance.pruneEventStore();
+  yield* sql`
+    DELETE FROM orchestration_v2_projection_metadata WHERE projection_name = ${EVENT_LOG_PRUNE_MARK}`;
+  const marked = yield* maintenance.pruneEventStore();
+  const dayBack = DateTime.subtract(yield* DateTime.now, { days: 1 });
+  yield* sql`
+    UPDATE orchestration_v2_projection_metadata SET updated_at = ${DateTime.formatIso(dayBack)}
+    WHERE projection_name = ${EVENT_LOG_PRUNE_MARK}`;
+  const pruned = yield* maintenance.pruneEventStore();
+  yield* sql`
+    DELETE FROM orchestration_v2_projection_metadata WHERE projection_name = ${EVENT_LOG_PRUNE_MARK}`;
+  return {
+    deletedEventCount: marked.deletedEventCount + pruned.deletedEventCount,
+    deletedReceiptCount: marked.deletedReceiptCount + pruned.deletedReceiptCount,
+    reclaimableBytes: pruned.reclaimableBytes,
+  };
 });
 
 export const withMaintenance = (filename: string) =>

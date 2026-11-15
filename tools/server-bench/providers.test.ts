@@ -130,7 +130,10 @@ describe("bench provider settings", () => {
     const settings = withBenchInstances(
       {
         theme: "dark",
-        providerInstances: { codex: { driver: "codex", config: { binaryPath: "/usr/bin/codex" } } },
+        providerInstances: {
+          codex: { driver: "codex", config: { binaryPath: "/usr/bin/codex" } },
+          kiro: { driver: "kiro", enabled: true },
+        },
       },
       {
         benchDir: "/bench",
@@ -153,6 +156,7 @@ describe("bench provider settings", () => {
       enabled: false,
     });
     expect(instances.claudeAgent).toEqual({ driver: "claudeAgent", enabled: false });
+    expect(instances.kiro).toEqual({ driver: "kiro", enabled: false });
     expect(instances.codexBench).toMatchObject({
       driver: "codex",
       config: { binaryPath: "/bench/fake-codex/codex", homePath: "/codex-home" },

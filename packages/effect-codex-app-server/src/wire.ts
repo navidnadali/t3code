@@ -18,10 +18,16 @@ export interface FramedLines {
   readonly exceeded: boolean;
 }
 
+export interface FramedTail {
+  /** The unterminated tail, without CR stripping; empty once the line passed the byte limit. */
+  readonly tail: string;
+  readonly exceeded: boolean;
+}
+
 export interface LineFramer {
   readonly push: (chunk: Uint8Array) => FramedLines;
-  /** The unterminated tail at end of input, without CR stripping. */
-  readonly end: () => string;
+  /** At end of input, as upstream's `Stream.decodeText`: a cut UTF-8 sequence ends the tail as U+FFFD. */
+  readonly end: () => FramedTail;
 }
 
 export function makeLineFramer(maxLineBytes: number = MAX_INCOMING_MESSAGE_BYTES): LineFramer {
@@ -29,36 +35,38 @@ export function makeLineFramer(maxLineBytes: number = MAX_INCOMING_MESSAGE_BYTES
   const remainder: Array<string> = [];
   let remainderBytes = 0;
   let exceeded = false;
-  return {
-    push: (bytes) => {
-      if (exceeded) return { lines: [], exceeded };
-      const chunk = decoder.decode(bytes, { stream: true });
-      const lines: Array<string> = [];
-      let start = 0;
-      while (start < chunk.length) {
-        const newline = chunk.indexOf("\n", start);
-        const fragment = chunk.slice(start, newline === -1 ? chunk.length : newline);
-        // The streaming decoder holds back split UTF-8 sequences, so fragment byte sums are exact.
-        remainderBytes += Buffer.byteLength(fragment, "utf8");
-        if (remainderBytes > maxLineBytes) {
-          remainder.length = 0;
-          exceeded = true;
-          break;
-        }
-        remainder.push(fragment);
-        if (newline === -1) break;
-        lines.push(remainder.join("").replace(/\r$/, ""));
+  const frame = (chunk: string): FramedLines => {
+    const lines: Array<string> = [];
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf("\n", start);
+      const fragment = chunk.slice(start, newline === -1 ? chunk.length : newline);
+      // The streaming decoder holds back split UTF-8 sequences, so fragment byte sums are exact.
+      remainderBytes += Buffer.byteLength(fragment, "utf8");
+      if (remainderBytes > maxLineBytes) {
         remainder.length = 0;
-        remainderBytes = 0;
-        start = newline + 1;
+        exceeded = true;
+        break;
       }
-      return { lines, exceeded };
-    },
-    end: () => {
-      const line = remainder.join("");
+      remainder.push(fragment);
+      if (newline === -1) break;
+      lines.push(remainder.join("").replace(/\r$/, ""));
       remainder.length = 0;
       remainderBytes = 0;
-      return line;
+      start = newline + 1;
+    }
+    return { lines, exceeded };
+  };
+  return {
+    push: (bytes) =>
+      exceeded ? { lines: [], exceeded } : frame(decoder.decode(bytes, { stream: true })),
+    end: () => {
+      // The flush holds no LF, only the U+FFFD of a sequence cut at EOF; it counts toward the limit.
+      if (!exceeded) frame(decoder.decode());
+      const tail = remainder.join("");
+      remainder.length = 0;
+      remainderBytes = 0;
+      return { tail, exceeded };
     },
   };
 }

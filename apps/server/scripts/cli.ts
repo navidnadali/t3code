@@ -16,8 +16,10 @@ import {
   buildProcessSpawnerSea,
   PROCESS_SPAWNER_EXECUTABLE,
 } from "../../../scripts/lib/process-spawner-sea.ts";
-import { spawnerProcessSource } from "../src/process/spawnerSources.ts";
+import { resolveBuildVersion } from "../../../scripts/lib/tagged-source-version.ts";
+import { spawnerProcessSourceFor } from "../src/process/spawnerSources.ts";
 import rootPackageJson from "../../../package.json" with { type: "json" };
+import serverPackageJson from "../package.json" with { type: "json" };
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import {
@@ -142,6 +144,8 @@ const buildExeCmd = Command.make(
         !target &&
         (yield* HostProcess.Platform) === "linux" &&
         (yield* HostProcess.Architecture) === "arm64";
+      // One version for the bundles and the spawner beside them, whose handshake must match.
+      const buildVersion = resolveBuildVersion(repoRoot, serverPackageJson.version);
       const spawnCommand = yield* resolveSpawnCommand("vp", ["pack"]);
       const cliAssetDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cli-asset-" });
       const pack = (packMode: "bundle" | "bootstrap" | "1") =>
@@ -150,6 +154,7 @@ const buildExeCmd = Command.make(
             cwd: serverDir,
             env: {
               ...process.env,
+              APP_VERSION: buildVersion,
               T3CODE_PACK_EXE: packMode,
               T3CODE_CLI_ASSET_DIR: cliAssetDir,
               T3CODE_PACK_EXE_TARGET: target ?? "",
@@ -195,7 +200,7 @@ const buildExeCmd = Command.make(
       // Keep subprocess forks off the main server.
       if (target === undefined && (yield* HostProcess.Platform) !== "win32") {
         yield* buildProcessSpawnerSea({
-          source: spawnerProcessSource,
+          source: spawnerProcessSourceFor(buildVersion),
           outputPath: path.join(outDir, PROCESS_SPAWNER_EXECUTABLE),
           nodeVersion: rootPackageJson.engines.node,
           verbose: config.verbose,

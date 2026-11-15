@@ -20,13 +20,14 @@ import * as Scope from "effect/Scope";
 import * as Result from "effect/Result";
 import * as Scheduler from "effect/Scheduler";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 import { describe, expect } from "vite-plus/test";
 
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as EffectAcpErrors from "effect-acp/errors";
-import type * as EffectAcpProtocol from "effect-acp/protocol";
+import * as EffectAcpProtocol from "effect-acp/protocol";
 
 import * as ProviderIoOffloads from "../io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "../io/ProviderIoWorkerPool.ts";
@@ -1584,6 +1585,75 @@ describe("AcpSessionRuntime", () => {
         );
         expect(run.offloadedLines > 0).toBe(workers > 0);
       }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect.each(
+    (["interrupt", "wait-for-prompt"] as const).flatMap((cancelBehavior) =>
+      (["protocol-log", "submit"] as const).map((holdIn) => ({ cancelBehavior, holdIn })),
+    ),
+  )(
+    "never sends a prompt held in its $holdIn past its cancel's wait ($cancelBehavior)",
+    ({ cancelBehavior, holdIn }) =>
+      Effect.gen(function* () {
+        const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "acp-runtime-"));
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true })),
+        );
+        const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+        const promptHeld = yield* Deferred.make<void>();
+        const promptReleased = yield* Deferred.make<void>();
+        const hold = Deferred.succeed(promptHeld, undefined).pipe(
+          Effect.andThen(Deferred.await(promptReleased)),
+        );
+        const runtime = yield* AcpSessionRuntime.make({
+          ...mockRuntimeOptions,
+          spawn: { ...mockRuntimeOptions.spawn, env: { T3_ACP_REQUEST_LOG_PATH: requestLogPath } },
+          cancelBehavior,
+          interruptPromptOnCancel: false,
+          protocolLogging: {
+            logOutgoing: holdIn === "protocol-log",
+            logger: (event) => (isOutgoingPrompt(event) ? hold : Effect.void),
+          },
+        });
+        yield* runtime.getEvents().pipe(
+          Stream.runForEach((event) =>
+            event._tag === "EventStreamBarrier"
+              ? Deferred.succeed(event.acknowledge, undefined)
+              : Effect.void,
+          ),
+          Effect.forkChild,
+        );
+        yield* runtime.start();
+        // Like a turn's claim, the submit cannot be interrupted once it has begun.
+        const prompt = yield* runtime
+          .prompt({ prompt: [{ type: "text", text: "first" }] })
+          .pipe(
+            holdIn === "submit"
+              ? Effect.provideService(EffectAcpProtocol.AcpOutgoingSubmit, (enqueue) =>
+                  hold.pipe(Effect.andThen(Effect.sync(enqueue)), Effect.uninterruptible),
+                )
+              : (effect) => effect,
+            Effect.forkChild,
+          );
+        yield* Deferred.await(promptHeld);
+        const cancel = yield* runtime.cancel.pipe(Effect.forkChild({ startImmediately: true }));
+        yield* runtime.request("_test/environment", {});
+        // The cancel stops waiting for the prompt and goes out; only then is the prompt released.
+        yield* TestClock.adjust("15 seconds");
+        yield* Deferred.succeed(promptReleased, undefined);
+        const promptExit = yield* Fiber.await(prompt);
+        yield* Fiber.join(cancel);
+        // A round trip: whatever was queued before it reaches the agent first.
+        yield* runtime.request("_test/environment", {});
+
+        const received = NodeFS.readFileSync(requestLogPath, "utf8")
+          .split("\n")
+          .filter((line) => line.length > 0)
+          .map((line) => (JSON.parse(line) as { readonly method?: string }).method)
+          .filter((method) => method === "session/prompt" || method === "session/cancel");
+        expect(received).toEqual(["session/cancel"]);
+        expect(promptExit).toEqual(Exit.succeed({ stopReason: "cancelled" }));
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect.each([0, 2])(

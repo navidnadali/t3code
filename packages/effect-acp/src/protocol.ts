@@ -112,8 +112,9 @@ type OffloadOutcome = Exit.Exit<AcpOffload.OffloadedLine, AcpError.AcpError>;
 
 const noOffloadedLines: Iterator<OffloadOutcome> = [][Symbol.iterator]();
 
+// A blank line stays on main, whose parser skips it.
 const isOffloaded = (offload: AcpLineOffload, line: string) =>
-  line.length >= offload.minChars && !AcpWire.isBatchLine(line);
+  line.length >= offload.minChars && !AcpWire.isBatchLine(line) && line.trim() !== "";
 
 export interface AcpPatchedProtocolOptions {
   readonly stdio: AcpStdio;
@@ -220,6 +221,9 @@ const decodeSessionUpdate = (payload: unknown) =>
 const decodeElicitationComplete = (payload: unknown) =>
   Effect.fromResult(AcpWire.decodeElicitationComplete(payload));
 const parserFactory = RpcSerialization.ndJsonRpc();
+// Unread raw notifications are best-effort. The newest is always kept; older
+// ones are dropped once the backlog passes either limit. The length limit counts
+// JSON line characters (UTF-16 code units), not bytes or heap size.
 const MAX_BUFFERED_RAW_NOTIFICATIONS = 32;
 const MAX_BUFFERED_RAW_NOTIFICATION_JSON_LENGTH = 16 * 1024 * 1024;
 const encodeJsonRpcNotification = Schema.encodeUnknownExit(
@@ -263,9 +267,8 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
   const rawNotifications = yield* Queue.unbounded<AcpBufferedRawNotification, Cause.Done<void>>();
-  // JSON length of the notifications offered since the queue was last empty.
-  // `incoming` takes the whole backlog on every pull, so an empty queue holds
-  // nothing, and a read can only make this an overestimate.
+  // JSON length of the notifications still in the queue. `incoming` takes one
+  // at a time, so a slow reader holds at most one outside this budget.
   let rawNotificationsJsonLength = 0;
   // Raw readers finish with the connection: termination ends the queue, and so
   // does closing the scope, which interrupts the reader before it terminates.
@@ -471,7 +474,6 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   // so readers never see more than the limits allow.
   const bufferRawNotification = (notification: AcpIncomingNotification, lineLength: number) =>
     Effect.sync(() => {
-      if (Queue.sizeUnsafe(rawNotifications) === 0) rawNotificationsJsonLength = 0;
       if (!Queue.offerUnsafe(rawNotifications, { notification, lineLength })) return;
       rawNotificationsJsonLength += lineLength;
       while (
@@ -805,11 +807,13 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     ).pipe(
       Effect.flatMap(decode),
       Effect.tap((messages) =>
-        timing === undefined
-          ? logIncomingDecoded(messages.map(({ message }) => message))
-          : timeSync(timing, "logShape", () =>
-              logIncomingDecoded(messages.map(({ message }) => message)),
-            ),
+        !options.logIncoming
+          ? Effect.void
+          : timing === undefined
+            ? logIncomingDecoded(messages.map(({ message }) => message))
+            : timeSync(timing, "logShape", () =>
+                logIncomingDecoded(messages.map(({ message }) => message)),
+              ),
       ),
       Effect.tapErrorTag("AcpProtocolParseError", (error) =>
         logProtocol({
@@ -1232,8 +1236,15 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     clientProtocol,
     serverProtocol,
     get incoming() {
-      return Stream.fromQueue(rawNotifications).pipe(
-        Stream.map(({ notification }) => notification),
+      return Stream.fromPull(
+        Effect.succeed(
+          Queue.take(rawNotifications).pipe(
+            Effect.map(({ notification, lineLength }) => {
+              rawNotificationsJsonLength -= lineLength;
+              return [notification] as const;
+            }),
+          ),
+        ),
       );
     },
     request: sendRequest,

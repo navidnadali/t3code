@@ -14,7 +14,9 @@ const frameChunks = (framer: CodexWire.LineFramer, chunks: ReadonlyArray<Uint8Ar
     assert.isFalse(framed.exceeded);
     lines.push(...framed.lines);
   }
-  return { lines, tail: framer.end() };
+  const end = framer.end();
+  assert.isFalse(end.exceeded);
+  return { lines, tail: end.tail };
 };
 
 it("frames lines identically however the bytes are chunked", () => {
@@ -43,7 +45,25 @@ it("holds back a split UTF-8 sequence until its last byte arrives", () => {
 
   assert.deepEqual(framer.push(bytes.subarray(0, 3)), { lines: [], exceeded: false });
   assert.deepEqual(framer.push(bytes.subarray(3)), { lines: ["🙂"], exceeded: false });
-  assert.equal(framer.end(), "");
+  assert.deepEqual(framer.end(), { tail: "", exceeded: false });
+});
+
+it("ends the tail with U+FFFD for a UTF-8 sequence cut at EOF, counting its bytes", () => {
+  for (const cut of [[0xc3], [0xe2, 0x82], [0xf0, 0x9f, 0x99]]) {
+    const framer = CodexWire.makeLineFramer(5);
+    assert.deepEqual(framer.push(Uint8Array.from([0x61, 0x0a, 0x62, 0x63, ...cut])), {
+      lines: ["a"],
+      exceeded: false,
+    });
+    assert.deepEqual(framer.end(), { tail: "bc\uFFFD", exceeded: false }, `cut ${cut}`);
+  }
+
+  const framer = CodexWire.makeLineFramer(4);
+  assert.deepEqual(framer.push(Uint8Array.from([0x62, 0x63, 0xc3])), {
+    lines: [],
+    exceeded: false,
+  });
+  assert.deepEqual(framer.end(), { tail: "", exceeded: true });
 });
 
 it("limits a line by its UTF-8 bytes, excluding the LF, and stays exceeded", () => {
@@ -58,7 +78,7 @@ it("limits a line by its UTF-8 bytes, excluding the LF, and stays exceeded", () 
     exceeded: true,
   });
   assert.deepEqual(framer.push(encoder.encode("a\n")), { lines: [], exceeded: true });
-  assert.equal(framer.end(), "");
+  assert.deepEqual(framer.end(), { tail: "", exceeded: true });
 });
 
 it("accepts an unterminated line of exactly 128 MiB and rejects one more byte", () => {

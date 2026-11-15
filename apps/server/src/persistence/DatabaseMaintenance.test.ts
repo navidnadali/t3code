@@ -137,7 +137,7 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         yield* fs.writeFileString(dbPath, "not a database");
         const failure = yield* Effect.flip(maintenance.inspect(dbPath));
         assert.equal(failure._tag, "DatabaseInspectError");
-      }).pipe(Effect.scoped),
+      }),
     );
 
     it.effect("reports and deletes only the database from before 0.1.0", () =>
@@ -207,10 +207,81 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
         }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath, readonly: true })));
         assert.isNull((yield* maintenance.inspect(dbPath)).legacyDatabaseBytes);
-      }).pipe(Effect.scoped),
+      }),
     );
 
-    it.effect("reports the compaction's outcome when the VACUUM after it fails", () =>
+    it.effect("runs a repair requested from Settings once and keeps its failure for Settings", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-requested-reclaim-" });
+        const dbPath = path.join(baseDir, "userdata", "statev2.sqlite");
+        const files = DatabaseMaintenance.reclaimFiles(path, dbPath);
+        yield* Effect.void.pipe(Effect.provide(Sqlite.layerFromPath(dbPath)));
+        const autoVacuum = Effect.flatMap(
+          SqlClient.SqlClient,
+          (sql) => sql<{ readonly auto_vacuum: number }>`PRAGMA auto_vacuum`,
+        ).pipe(
+          Effect.map((rows) => rows[0]?.auto_vacuum),
+          Effect.provide(NodeSqliteClient.layer({ filename: dbPath, readonly: true })),
+        );
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA auto_vacuum = NONE`;
+          yield* sql`VACUUM`;
+          yield* sql`CREATE TABLE retained_data (value TEXT)`;
+          yield* sql`INSERT INTO retained_data VALUES ('keep')`;
+        }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
+
+        // Every server exit runs this; without a request it must leave the database alone.
+        yield* DatabaseMaintenance.runRequestedReclaim(dbPath);
+        assert.equal(yield* autoVacuum, 0);
+
+        yield* fs.writeFileString(files.request, "");
+        yield* fs.writeFileString(files.failure, "an earlier failure");
+        yield* DatabaseMaintenance.runRequestedReclaim(dbPath);
+        assert.isFalse(yield* fs.exists(files.request));
+        assert.isFalse(yield* fs.exists(files.failure));
+        assert.equal(yield* autoVacuum, 2);
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
+        }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath, readonly: true })));
+
+        const brokenPath = path.join(baseDir, "broken", "statev2.sqlite");
+        const broken = DatabaseMaintenance.reclaimFiles(path, brokenPath);
+        yield* fs.makeDirectory(path.dirname(brokenPath));
+        yield* fs.writeFileString(brokenPath, "not a database");
+        yield* fs.writeFileString(broken.request, "");
+        yield* DatabaseMaintenance.runRequestedReclaim(brokenPath);
+        assert.isFalse(
+          yield* fs.exists(broken.request),
+          "a failed repair must not rerun on every exit",
+        );
+        assert.equal(
+          yield* fs.readFileString(broken.failure),
+          new DatabaseMaintenance.DatabaseCompactError({ path: brokenPath, cause: null }).message,
+        );
+      }),
+    );
+
+    it.effect("refuses a repair whose copies would not fit on disk", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dbPath = path.join(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-reclaim-space-" }),
+          "statev2.sqlite",
+        );
+        assert.isNull(yield* DatabaseMaintenance.reclaimSpaceShortfall(dbPath, 1024));
+        const huge = 2 ** 60;
+        const shortfall = yield* DatabaseMaintenance.reclaimSpaceShortfall(dbPath, huge);
+        assert.isAtLeast(shortfall?.neededBytes ?? 0, huge);
+        assert.isBelow(shortfall?.freeBytes ?? Infinity, huge);
+      }),
+    );
+
+    it.effect("keeps the VACUUM's own error when the VACUUM after pruning fails", () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
@@ -250,12 +321,6 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         );
         const error = yield* maintenance.compact(dbPath).pipe(Effect.flip);
         assert.equal(error._tag, "DatabaseCompactError");
-        const compaction = error._tag === "DatabaseCompactError" ? error.compaction : undefined;
-        assert.deepEqual(compaction, {
-          deletedEventCount: 0,
-          deletedReceiptCount: 0,
-          repairedItemCountThreads: 0,
-        });
         // The VACUUM's own error is kept underneath, however many layers wrap it.
         const messages: Array<string> = [];
         for (
@@ -331,21 +396,10 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           yield* sql`CREATE TABLE discarded_data (value BLOB)`;
           yield* sql`INSERT INTO discarded_data VALUES (zeroblob(4194304))`;
           yield* sql`DROP TABLE discarded_data`;
-
           // An index that drifted from its rows, as a renumbering VACUUM would leave it.
           yield* sql`
             INSERT INTO orchestration_v2_message_search (orchestration_v2_message_search)
             VALUES ('delete-all')
-          `;
-
-          // Item counts that drifted from their items: one too high, one with no items at all.
-          yield* sql`
-            UPDATE orchestration_v2_projection_turn_item_counts SET item_count = 3
-            WHERE thread_id = 'thread-1'
-          `;
-          yield* sql`
-            INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_id, item_count)
-            VALUES ('thread-2', 'run-2', 4)
           `;
           yield* sql`PRAGMA wal_checkpoint(TRUNCATE)`;
           yield* sql`INSERT INTO orchestration_v2_legacy_imports (
@@ -370,31 +424,28 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
         const clock = yield* Clock.Clock;
         const pauses: number[] = [];
         let activeNanos = 0n;
-        const result = yield* maintenance.compact(dbPath).pipe(
-          Effect.provideService(Clock.Clock, {
-            ...clock,
-            // Exceed the background budget whenever the compactor checks elapsed time.
-            monotonicTimeNanos: Effect.sync(() => (activeNanos += 30_000_000n)),
-            sleep: (duration) =>
-              Effect.sync(() => {
-                pauses.push(Duration.toMillis(duration));
-              }),
-          }),
-        );
+        const steps: string[] = [];
+        const result = yield* maintenance
+          .compact(dbPath, (step) => Effect.sync(() => steps.push(step)))
+          .pipe(
+            Effect.provideService(Clock.Clock, {
+              ...clock,
+              // Exceed the background budget whenever the compactor checks elapsed time.
+              monotonicTimeNanos: Effect.sync(() => (activeNanos += 30_000_000n)),
+              sleep: (duration) =>
+                Effect.sync(() => {
+                  pauses.push(Duration.toMillis(duration));
+                }),
+            }),
+          );
         assert.deepEqual(pauses, [], "offline doctor must not throttle compaction");
+        assert.deepEqual(steps, ["prune-events", "vacuum", "rebuild-search", "checkpoint"]);
         assert.equal(result.deletedReceiptCount, 51);
-        assert.equal(result.repairedItemCountThreads, 2);
         assert.isBelow(result.afterBytes, result.beforeBytes - 3 * 1024 * 1024);
         yield* Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           assert.deepEqual(yield* sql`PRAGMA auto_vacuum`, [{ auto_vacuum: 2 }]);
           assert.deepEqual(yield* sql`SELECT value FROM retained_data`, [{ value: "keep" }]);
-          assert.deepEqual(
-            yield* sql`
-              SELECT thread_id, run_id, item_count FROM orchestration_v2_projection_turn_item_counts
-            `,
-            [{ thread_id: "thread-1", run_id: "", item_count: 1 }],
-          );
           assert.deepEqual(
             yield* sql`
               SELECT messages.message_id AS "messageId"
@@ -406,7 +457,7 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
             [{ messageId: "message-1" }],
           );
         }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath, readonly: true })));
-      }).pipe(Effect.scoped),
+      }),
     );
   },
 );

@@ -2,25 +2,27 @@ import * as NodeSqlite from "node:sqlite";
 import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
+import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as Result from "effect/Result";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
+import * as Result from "effect/Result";
 import * as Scheduler from "effect/Scheduler";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as SqlError from "effect/sql/SqlError";
 import * as Statement from "effect/sql/Statement";
-import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import type * as Tracer from "effect/Tracer";
 import { vi } from "vite-plus/test";
 
@@ -32,35 +34,13 @@ const workerParams = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, Arra
 const workerMessages = vi.hoisted(
   () => new WeakMap<NodeWorkerThreads.Worker, Array<Record<string, unknown>>>(),
 );
-const workerReplies = vi.hoisted(
-  () => new WeakMap<NodeWorkerThreads.Worker, Array<Record<string, unknown>>>(),
-);
-// Holds every COMMIT sent to a worker until released, and answers the next one with an error.
-const commitHold = vi.hoisted(() => ({
-  on: false,
-  held: [] as Array<() => void>,
-  failNext: false,
-}));
-// Holds the reply to any request whose SQL mentions "hold-reply" until released, and tells a waiter.
-const replyHold = vi.hoisted(() => ({
-  ids: new Set<number>(),
-  held: [] as Array<() => void>,
-  waiters: [] as Array<() => void>,
-}));
-// Whether a worker keeps the process alive, as the client last told it, and that state at each reply.
-const workerRefd = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, boolean>());
-const refdAtReply = vi.hoisted(() => new Map<number, boolean>());
-// Whether a reply was awaited: the client lets go of the worker while handling the last awaited one.
-const awaitedAtReply = vi.hoisted(() => new Map<number, boolean>());
-const unrefDuring = vi.hoisted(() => ({ emit: false }));
-// The worker's reference state at the moment each ending (ROLLBACK) was posted, by request id.
-const refdAtEnding = vi.hoisted(() => new Map<number, boolean>());
-// Makes every reader announce itself without a statement authorizer.
-const readyRewrite = vi.hoisted(() => ({ unguarded: false }));
-// Resolves a waiter when a request whose SQL mentions its needle is posted to a worker.
-const postWaiters = vi.hoisted(() => [] as Array<{ needle: string; resolve: () => void }>);
+// Whether each worker was last referenced or unreferenced; Node's Worker has no hasRef().
+const workerRefs = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, boolean>());
+// Workers that behave as exited: a post to one is dropped without an error, and reported here.
+const stoppedWorkers = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, () => void>());
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
+const checkpointWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
@@ -77,10 +57,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
       workerExits.set(this, new Promise((resolve) => this.once("exit", () => resolve())));
       workerParams.set(this, []);
       workerMessages.set(this, []);
-      workerReplies.set(this, []);
-      this.on("message", (reply) => {
-        if (typeof reply === "object" && reply !== null) workerReplies.get(this)!.push(reply);
-      });
+      if (args[1]?.workerData?.frames !== undefined) checkpointWorkers.push(this);
     }
     override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
       const [request] = args;
@@ -88,66 +65,18 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         workerMessages.get(this)!.push(request as Record<string, unknown>);
         if ("params" in request)
           workerParams.get(this)!.push(...(request.params as ReadonlyArray<unknown>));
-        if ("sql" in request && String(request.sql).includes("hold-reply"))
-          replyHold.ids.add(request.id as number);
-        if ("sql" in request && /^\s*ROLLBACK/i.test(String(request.sql)))
-          refdAtEnding.set(request.id as number, workerRefd.get(this) ?? true);
-        for (const waiter of postWaiters.splice(0)) {
-          if ("sql" in request && String(request.sql).includes(waiter.needle)) waiter.resolve();
-          else postWaiters.push(waiter);
-        }
-        if ("sql" in request && /^\s*COMMIT\b/i.test(String(request.sql)) && commitHold.on) {
-          if (commitHold.failNext) {
-            commitHold.failNext = false;
-            this.emit("message", {
-              id: request.id,
-              error: { operation: "execute", message: "commit answered with an error" },
-            });
-          }
-          commitHold.held.push(() => super.postMessage(...args));
-          return;
-        }
       }
+      const dropped = stoppedWorkers.get(this);
+      if (dropped !== undefined) return dropped();
       super.postMessage(...args);
     }
     override ref() {
-      workerRefd.set(this, true);
-      return super.ref();
+      workerRefs.set(this, true);
+      super.ref();
     }
     override unref() {
-      workerRefd.set(this, false);
-      unrefDuring.emit = true;
-      return super.unref();
-    }
-    override emit(event: string | symbol, ...args: Array<any>): boolean {
-      const reply = args[0];
-      if (
-        event === "message" &&
-        typeof reply === "object" &&
-        reply !== null &&
-        typeof reply.id === "number" &&
-        !replyHold.ids.has(reply.id)
-      ) {
-        refdAtReply.set(reply.id, workerRefd.get(this) ?? true);
-        unrefDuring.emit = false;
-        const delivered = super.emit(event, ...args);
-        awaitedAtReply.set(reply.id, unrefDuring.emit);
-        return delivered;
-      }
-      if (event === "message" && readyRewrite.unguarded && reply?.type === "ready")
-        return super.emit(event, { ...reply, guarded: false });
-      if (
-        event === "message" &&
-        typeof reply === "object" &&
-        reply !== null &&
-        replyHold.ids.has(reply.id)
-      ) {
-        replyHold.ids.delete(reply.id);
-        replyHold.held.push(() => super.emit(event, ...args));
-        for (const waiter of replyHold.waiters.splice(0)) waiter();
-        return true;
-      }
-      return super.emit(event, ...args);
+      workerRefs.set(this, false);
+      super.unref();
     }
     override terminate() {
       // A "ready" already queued when termination starts reaches the parent before "exit".
@@ -162,7 +91,7 @@ const withReaderClient = <A, E>(
   use: (sql: SqlClient.SqlClient) => Effect.Effect<A, E, SqlClient.SqlClient>,
   config: Pick<
     SqliteClient.SqliteClientConfig,
-    "readerPoolSize" | "cacheSizeMb" | "readerCacheSizeMb" | "mmapSizeMb"
+    "readerPoolSize" | "cacheSizeMb" | "readerCacheSizeMb" | "mmapSizeMb" | "writerWorker"
   > = {},
 ) =>
   Effect.gen(function* () {
@@ -288,6 +217,91 @@ const makeTempDatabase = Effect.gen(function* () {
   return { filename, other };
 });
 
+it.effect.each([false, true])("batches worker results without losing rows (reader=%s)", (reader) =>
+  Effect.gen(function* () {
+    const { filename } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const route = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        reader ? effect.pipe(SqliteClient.readOnly) : effect;
+      yield* route(sql`SELECT 1`);
+      const worker = startedWorkers
+        .filter((candidate) => !checkpointWorkers.includes(candidate))
+        .at(-1)!;
+      const batches: Array<ReadonlyArray<unknown>> = [];
+      const record = (reply: { rows?: ReadonlyArray<unknown> }) => {
+        if (Array.isArray(reply.rows) && reply.rows.length > 0) batches.push(reply.rows);
+      };
+      worker.prependListener("message", record);
+      yield* Effect.gen(function* () {
+        const text = "x".repeat(16 * 1024);
+        const query = sql<{ n: number; text: string }>`
+          WITH RECURSIVE sequence(n) AS (
+            SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 300
+          ) SELECT n, ${text} AS text FROM sequence
+        `;
+        const rows = yield* reader ? route(query.values) : query;
+        assert.equal(rows.length, 300);
+        for (const [index, row] of rows.entries()) {
+          assert.deepEqual(row, reader ? [index + 1, text] : { n: index + 1, text });
+        }
+        assert.isAbove(batches.length, 1);
+        for (const batch of batches) {
+          assert.isAtMost(batch.length, 16_384);
+          assert.isAtMost(batch.length * text.length * 2, 8 * 1024 * 1024);
+        }
+        batches.length = 0;
+        const narrow = sql<{ n: number }>`
+          WITH RECURSIVE sequence(n) AS (
+            SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 10000
+          ) SELECT n FROM sequence
+        `;
+        const narrowRows = yield* reader ? route(narrow.values) : narrow;
+        assert.equal(narrowRows.length, 10_000);
+        assert.deepEqual(narrowRows.at(-1), reader ? [10_000] : { n: 10_000 });
+        assert.equal(batches.length, 1);
+      }).pipe(Effect.ensuring(Effect.sync(() => worker.off("message", record))));
+    }).pipe(
+      Effect.provide(SqliteClient.layer({ filename, writerWorker: true, readerWorker: true })),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reuses a worker query after an iterator constraint failure", () =>
+  Effect.gen(function* () {
+    const { filename } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+      const insert = (name: string) =>
+        sql<{ name: string }>`INSERT INTO unique_entries VALUES (${name}) RETURNING name`;
+      yield* insert("first");
+      const error = yield* insert("first").pipe(Effect.flip);
+      assert.equal(error.reason._tag, "UniqueViolation");
+      assert.deepEqual(yield* insert("second"), [{ name: "second" }]);
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("commits on the worker writer after a returning write timed out on a lock", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`PRAGMA busy_timeout = 0`;
+      yield* Effect.sync(() => other.exec("BEGIN IMMEDIATE"));
+      const error = yield* sql`UPDATE counters SET value = 1 WHERE id = 1 RETURNING value`.pipe(
+        Effect.flip,
+      );
+      assert.equal(error.reason._tag, "LockTimeoutError");
+      yield* Effect.sync(() => other.exec("COMMIT"));
+
+      yield* sql.withTransaction(sql`UPDATE counters SET value = 2 WHERE id = 1`);
+      assert.deepEqual(yield* sql`SELECT value FROM counters WHERE id = 1`.values, [[2]]);
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("keeps another connection from committing between a transaction's read and write", () =>
   Effect.gen(function* () {
     const { filename, other } = yield* makeTempDatabase;
@@ -338,22 +352,17 @@ it.effect("waits for another process's lock while the database opens", () =>
     yield* Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       assert.deepEqual(yield* sql`SELECT COUNT(*) FROM entries`.values, [[0]]);
-    }).pipe(Effect.provide(SqliteClient.layer({ filename, checkpointWorker: true })));
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 // A page cache size makes the writer read the schema, which needs the lock the open waits for.
 it.effect.each([
-  { checkpoint: "its checkpoint worker", checkpointWorker: true, unsupported: false },
-  { checkpoint: "no checkpoint worker", checkpointWorker: false, unsupported: false },
-  {
-    checkpoint: "a Node SQLite without the worker's APIs",
-    checkpointWorker: true,
-    unsupported: true,
-  },
+  { writer: "the writer worker", writerWorker: true },
+  { writer: "the main-thread writer", writerWorker: false },
 ])(
-  "waits for another process's lock while the database opens with a page cache size and $checkpoint",
-  ({ checkpointWorker, unsupported }) =>
+  "waits for another process's lock while the database opens with a page cache size and $writer",
+  ({ writerWorker }) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -362,16 +371,6 @@ it.effect.each([
       const seed = new NodeSqlite.DatabaseSync(filename);
       seed.exec("PRAGMA journal_mode = WAL; CREATE TABLE entries(name TEXT NOT NULL)");
       seed.close();
-      if (unsupported) {
-        const prototype = NodeSqlite.DatabaseSync.prototype;
-        const descriptor = Object.getOwnPropertyDescriptor(prototype, "setAuthorizer")!;
-        yield* Effect.acquireRelease(
-          Effect.sync(() => {
-            Reflect.deleteProperty(prototype, "setAuthorizer");
-          }),
-          () => Effect.sync(() => Object.defineProperty(prototype, "setAuthorizer", descriptor)),
-        );
-      }
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const holder = yield* spawner.spawn(
         ChildProcess.make(process.execPath, [
@@ -389,10 +388,8 @@ it.effect.each([
         assert.deepEqual(yield* sql`SELECT COUNT(*) FROM entries`.values, [[0]]);
         assert.deepEqual(yield* sql`PRAGMA cache_size`.values, [[-1024]]);
         // The wait covers the tuning only; the caller's wait is what it was before.
-        assert.deepEqual(yield* sql`PRAGMA busy_timeout`.values, [
-          [checkpointWorker && !unsupported ? 5000 : 0],
-        ]);
-      }).pipe(Effect.provide(SqliteClient.layer({ filename, checkpointWorker, cacheSizeMb: 1 })));
+        assert.deepEqual(yield* sql`PRAGMA busy_timeout`.values, [[writerWorker ? 5000 : 0]]);
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker, cacheSizeMb: 1 })));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
@@ -412,6 +409,52 @@ it.effect("reports a transaction blocked by another writer as a lock timeout", (
       assert.deepEqual(yield* read, [[0]]);
     }).pipe(Effect.provide(SqliteClient.layer({ filename })));
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("lets the event loop run while a write waits for another connection's lock", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`PRAGMA busy_timeout = 5000`;
+      yield* Effect.sync(() => other.exec("BEGIN IMMEDIATE"));
+      const write = yield* Effect.forkChild(
+        sql`UPDATE counters SET value = value + 1 WHERE id = 1`,
+        { startImmediately: true },
+      );
+      // A writer on the event loop sleeps in SQLite's busy handler here, so this commit
+      // cannot run until that write has already timed out.
+      yield* eventLoopTurn;
+      yield* Effect.sync(() => other.exec("UPDATE counters SET value = 10 WHERE id = 1; COMMIT"));
+      yield* Fiber.join(write);
+      assert.deepEqual(yield* sql`SELECT value FROM counters WHERE id = 1`.values, [[11]]);
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("finishes a write already sent to the writer before its caller is interrupted", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`PRAGMA busy_timeout = 5000`;
+      yield* Effect.sync(() => other.exec("BEGIN IMMEDIATE"));
+      const write = yield* Effect.forkChild(
+        sql`UPDATE counters SET value = value + 1 WHERE id = 1`,
+        { startImmediately: true },
+      );
+      yield* eventLoopTurn;
+      const interrupted = yield* Effect.forkChild(Fiber.interrupt(write), {
+        startImmediately: true,
+      });
+      yield* eventLoopTurn;
+      // The write is waiting in the worker for the lock, so the interrupt has to wait too.
+      assert.isUndefined(interrupted.pollUnsafe());
+      yield* Effect.sync(() => other.exec("COMMIT"));
+      yield* Fiber.join(interrupted);
+      assert.deepEqual(yield* sql`SELECT value FROM counters WHERE id = 1`.values, [[1]]);
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.effect("lets the writer commit while a read-only transaction is open", () =>
@@ -463,32 +506,79 @@ it.effect("serves another read while a read-only transaction is open", () =>
   ),
 );
 
-// oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary that lets the worker's queued messages land, not a wait for time
-const eventLoopTurn = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
-// Registers now, waits later: the posting of the next request whose SQL mentions the needle.
-const posting = (needle: string) => {
-  const promise = new Promise<void>((resolve) => postWaiters.push({ needle, resolve }));
-  return Effect.promise(() => promise);
-};
-// Replies a worker has given to the requests whose SQL mentions the needle.
-const repliesTo = (worker: NodeWorkerThreads.Worker, needle: string) => {
-  const ids = new Set(
-    workerMessages
-      .get(worker)!
-      .filter((message) => String(message.sql ?? "").includes(needle))
-      .map((message) => message.id),
-  );
-  return workerReplies.get(worker)!.filter((reply) => ids.has(reply.id)).length;
-};
-// A read that keeps a worker busy for a while (a recursive count), tagged in its rows.
-const longRead = (tag: string, rows: number) =>
-  `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ${rows}) SELECT count(*) AS n, '${tag}' AS tag FROM c`;
-// The failure an effect ends with (a success fails the test), typed as its error.
-const failureOf = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  Effect.map(Effect.exit(effect), (exit) => {
-    if (Exit.isSuccess(exit)) return assert.fail("expected a failure");
-    return Cause.squash(exit.cause) as E;
-  });
+it.effect("gives a queued read the first reader that frees up", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const holders = yield* Effect.forEach([0, 1, 2, 3], () =>
+        Effect.gen(function* () {
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const fiber = yield* sql
+            .withTransaction(
+              countEntries(sql).pipe(
+                Effect.andThen(Deferred.succeed(held, undefined)),
+                Effect.andThen(Deferred.await(release)),
+              ),
+            )
+            .pipe(SqliteClient.readOnly, Effect.forkChild);
+          yield* Deferred.await(held);
+          return { fiber, release };
+        }),
+      );
+      const cancelled = yield* Effect.uninterruptibleMask((restore) =>
+        SqliteClient.readOnly(restore(sql.withTransaction(countEntries(sql)))),
+      ).pipe((effect) => Effect.forkChild(effect, { startImmediately: true }));
+      yield* Fiber.interrupt(cancelled);
+      const cancelledRead = yield* Effect.uninterruptibleMask((restore) =>
+        SqliteClient.readOnly(restore(countEntries(sql))),
+      ).pipe((effect) => Effect.forkChild(effect, { startImmediately: true }));
+      yield* Fiber.interrupt(cancelledRead);
+      const queuedSpan = yield* Deferred.make<Tracer.Span>();
+      const observeQueued: Statement.Transformer = (statement, _sql, _fiber, span) =>
+        Deferred.succeed(queuedSpan, span).pipe(Effect.as(statement));
+      const queued = yield* countEntries(sql).pipe(
+        Effect.provideService(Statement.CurrentTransformer, observeQueued),
+        Effect.provideService(Statement.SpanPropagationEnabled, true),
+        SqliteClient.readOnly,
+        (effect) => Effect.forkChild(effect, { startImmediately: true }),
+      );
+      // Masked read-only work keeps its cancellation pending and still runs once a reader frees up.
+      let maskedRan = 0;
+      const maskedRuns = yield* Effect.forEach(
+        [
+          Effect.scoped(
+            Effect.flatMap(sql.reserve, (connection) =>
+              connection.executeUnprepared("SELECT 1", [], undefined),
+            ),
+          ).pipe(Effect.asVoid),
+          sql.withTransaction(countEntries(sql)).pipe(Effect.asVoid),
+        ],
+        (effect) =>
+          effect.pipe(
+            Effect.andThen(Effect.sync(() => maskedRan++)),
+            Effect.uninterruptible,
+            SqliteClient.readOnly,
+            (masked) => Effect.forkChild(masked, { startImmediately: true }),
+          ),
+      );
+      const interrupting = yield* Effect.forEach(maskedRuns, (fiber) =>
+        Effect.forkChild(Fiber.interrupt(fiber), { startImmediately: true }),
+      );
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.succeed(holders[1]!.release, undefined);
+      yield* Fiber.join(holders[1]!.fiber);
+      // Pinned to the first reader it saw, this read would wait for that reader's transaction.
+      assert.equal(yield* Fiber.join(queued), 1);
+      assert.equal((yield* Deferred.await(queuedSpan)).attributes.get("db.lock_wait_ms"), 1000);
+      for (const { fiber, release } of [holders[0]!, holders[2]!, holders[3]!]) {
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(fiber);
+      }
+      yield* Effect.forEach(interrupting, Fiber.join);
+      assert.equal(maskedRan, 2);
+    }),
+  ),
+);
 
 const holdReader = (sql: SqlClient.SqlClient, name: string) =>
   Effect.gen(function* () {
@@ -508,30 +598,6 @@ const holdReader = (sql: SqlClient.SqlClient, name: string) =>
 
 const workerThatRan = (since: number, name: string) =>
   startedWorkers.slice(since).findIndex((worker) => workerParams.get(worker)?.includes(name));
-
-it.effect("runs a waiting read on the first reader that frees up", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const startedBefore = startedWorkers.length;
-      const [first, second, ...rest] = yield* Effect.forEach(["a", "b", "c", "d"], (name) =>
-        holdReader(sql, name),
-      );
-      const waiting = yield* sql`SELECT ${"waiting"} AS name`.pipe(
-        SqliteClient.readOnly,
-        (effect) => Effect.forkChild(effect, { startImmediately: true }),
-      );
-      yield* second!;
-      // Wake-ups run on setImmediate, so one turn lets the waiting read claim the freed slot first.
-      yield* eventLoopTurn;
-      yield* first!;
-      yield* Effect.all(rest);
-      assert.deepEqual(yield* Fiber.join(waiting), [{ name: "waiting" }]);
-
-      assert.equal(startedWorkers.length - startedBefore, 4);
-      assert.equal(workerThatRan(startedBefore, "waiting"), workerThatRan(startedBefore, "b"));
-    }),
-  ),
-);
 
 it.effect.each([
   { setting: "1", size: 1, workers: 1 },
@@ -574,7 +640,6 @@ const assertPermits = (expected: number) =>
     assert.deepEqual([Option.isSome(all), Option.isSome(more)], [true, false]);
   });
 
-// A large read that runs as far as it can at once, then pauses in its transaction until released.
 // A read of the given class that runs as far as it can at once, then pauses in its transaction
 // until released; `started` records the order in which reads reached their statement.
 const holdClassReader = (
@@ -668,13 +733,14 @@ it.effect("lets a page read pass history reads still waiting for a reader", () =
         // The holders start in either order; the page read must be third, before any history read.
         assert.deepEqual(started.slice(0, 2).toSorted(), ["holder-1", "holder-2"]);
         assert.deepEqual(started.slice(2), ["page"]);
-        // Each history read takes a reader as one frees; the first is running before the second
-        // reader frees, since a COMMIT is no longer awaited and the two would otherwise race.
         yield* page.release;
+        // Each history read takes a reader as one frees.
         yield* histories[0]!.running;
         yield* holders[1]!.release;
-        yield* histories[1]!.running;
-        for (const history of histories) yield* history.release;
+        for (const history of histories) {
+          yield* history.running;
+          yield* history.release;
+        }
         assert.deepEqual(started.slice(3), ["history-1", "history-2"]);
       }),
     { readerPoolSize: 2 },
@@ -936,14 +1002,13 @@ it.effect("rejects a write in a read-only transaction", () =>
   ),
 );
 
-it.effect("keeps the reader read-only even if a statement tries to turn query_only off", () =>
+it.effect("keeps the reader read-only even if a statement turns query_only off", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {
       const error = yield* sql
         .withTransaction(
           Effect.gen(function* () {
-            // Refused by the reader's authorizer; the open keeps the database read-only anyway.
-            yield* sql`PRAGMA query_only = OFF`.pipe(Effect.ignore);
+            yield* sql`PRAGMA query_only = OFF`;
             yield* sql`INSERT INTO entries VALUES ('blocked')`;
           }),
         )
@@ -997,22 +1062,25 @@ const pageCacheAndMap = (sql: SqlClient.SqlClient) =>
     return { cacheSize: cache?.cache_size, mmapSize: mmap?.mmap_size };
   });
 
+const configuredTuning = {
+  config: { cacheSizeMb: 64, readerCacheSizeMb: 8, mmapSizeMb: 16 },
+  writer: { cacheSize: -64 * 1024, mmapSize: 16 * 1024 * 1024 },
+  reader: { cacheSize: -8 * 1024, mmapSize: 16 * 1024 * 1024 },
+};
+const defaultTuning = {
+  config: {},
+  writer: { cacheSize: -2000, mmapSize: 0 },
+  reader: { cacheSize: -2000, mmapSize: 0 },
+};
+
 it.effect.each([
-  {
-    tuning: "configured",
-    config: { cacheSizeMb: 64, readerCacheSizeMb: 8, mmapSizeMb: 16 },
-    writer: { cacheSize: -64 * 1024, mmapSize: 16 * 1024 * 1024 },
-    reader: { cacheSize: -8 * 1024, mmapSize: 16 * 1024 * 1024 },
-  },
-  {
-    tuning: "default",
-    config: {},
-    writer: { cacheSize: -2000, mmapSize: 0 },
-    reader: { cacheSize: -2000, mmapSize: 0 },
-  },
+  { tuning: "configured", writerWorker: true, ...configuredTuning },
+  { tuning: "configured", writerWorker: false, ...configuredTuning },
+  { tuning: "default", writerWorker: true, ...defaultTuning },
+  { tuning: "default", writerWorker: false, ...defaultTuning },
 ])(
-  "gives the writer and every reader, restarted ones too, the $tuning page cache and memory map",
-  ({ config, writer, reader }) =>
+  "gives the writer and every reader, restarted ones too, the $tuning page cache and memory map (writer worker: $writerWorker)",
+  ({ config, writerWorker, writer, reader }) =>
     withReaderClient(
       (sql) =>
         Effect.gen(function* () {
@@ -1052,7 +1120,7 @@ it.effect.each([
           );
           assert.equal(startedWorkers.length, startedBefore + 5);
         }),
-      config,
+      { ...config, writerWorker },
     ),
 );
 
@@ -1180,7 +1248,7 @@ const withWorkers = <A, E, R>(
       }),
   );
 
-const unavailableWarning = "SQLite reader worker unavailable; reads use the main connection";
+const unavailableWarning = "SQLite reader worker unavailable; reads use the writer";
 
 const notWal = "database uses journal_mode delete, not wal";
 
@@ -1203,7 +1271,7 @@ it.effect.each([
     failure: "a startup timeout",
     workers: { silent: true },
     startup: Duration.seconds(10),
-    reason: "worker did not open the database within 10000 ms",
+    reason: "Database reader did not open the database within 10000 ms",
   },
 ])(
   "reads on the writer after $failure until a retry starts the reader again",
@@ -1211,6 +1279,7 @@ it.effect.each([
     withLogLines((lines) =>
       withReaderClient((sql) =>
         Effect.gen(function* () {
+          assert.deepEqual(yield* readerPoolAvailable, [1]);
           // The failed read's own metric attributes must not label the pool's gauge.
           const failed = yield* withWorkers(
             workers,
@@ -1265,6 +1334,31 @@ it.effect("backs off a reader that never starts without logging each retry", () 
 );
 
 it.effect.each([
+  { phase: "the retry waits", beforeClose: Duration.zero, retries: 0 },
+  { phase: "a retried reader starts", beforeClose: Duration.seconds(1), retries: 1 },
+])("stops retrying the reader when the client closes while $phase", ({ beforeClose, retries }) =>
+  withWorkers(
+    { silent: true },
+    Effect.gen(function* () {
+      const startedAtClose = yield* withReaderClient((sql) =>
+        Effect.gen(function* () {
+          const read = yield* Effect.forkChild(readConnection(sql), { startImmediately: true });
+          yield* TestClock.adjust("10 seconds");
+          assert.deepEqual(yield* Fiber.join(read), { count: 1, connection: ["writer"] });
+
+          const startedBefore = startedWorkers.length;
+          yield* TestClock.adjust(beforeClose);
+          assert.equal(startedWorkers.length - startedBefore, retries);
+          return startedWorkers.length;
+        }),
+      );
+      yield* TestClock.adjust("10 minutes");
+      assert.equal(startedWorkers.length, startedAtClose);
+    }),
+  ),
+);
+
+it.effect.each([
   {
     when: "the database is not in WAL mode",
     journalMode: "DELETE",
@@ -1281,7 +1375,7 @@ it.effect.each([
       ["Warn", unavailableWarning, { reason: "Database reader failed: reader start failed" }],
       [
         "Info",
-        "SQLite reader worker retries stopped permanently; reads use the main connection",
+        "SQLite reader worker retries stopped permanently; reads use the writer",
         { reason: notWal },
       ],
     ],
@@ -1312,6 +1406,24 @@ it.effect.each([
     ).pipe(Effect.provideService(Metric.MetricRegistry, new Map())),
 );
 
+it.effect("fails with a typed SqlError when the database file is not SQLite", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-notadb-" });
+    const filename = path.join(directory, "state.sqlite");
+    yield* fs.writeFileString(filename, "not a db\n");
+
+    const exit = yield* Layer.build(SqliteClient.layer({ filename, writerWorker: true })).pipe(
+      Effect.exit,
+    );
+
+    assert.isTrue(Exit.isFailure(exit));
+    if (Exit.isFailure(exit)) assert.isTrue(SqlError.isSqlError(Cause.squash(exit.cause)));
+    if (Exit.isFailure(exit)) assert.isFalse(Cause.hasDies(exit.cause));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("finishes masked database cleanup after its caller is interrupted", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -1337,6 +1449,9 @@ it.effect("finishes masked database cleanup after its caller is interrupted", ()
     ]);
   }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:" }))),
 );
+
+// oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a zero-delay macrotask boundary that lets the worker's queued messages land, not a wait for time
+const eventLoopTurn = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
 
 it.effect.each([
   { reservation: false, masked: false },
@@ -1442,1127 +1557,216 @@ it.effect.each([
     ),
 );
 
-// Messages a worker received: the statement's first word, with "begin+" for a folded BEGIN.
-const messageShapes = (worker: NodeWorkerThreads.Worker) =>
-  workerMessages
-    .get(worker)!
-    .map(
-      (message) =>
-        `${message.begin === true ? "begin+" : ""}${String(message.sql).trim().split(/\s+/)[0]}`,
-    );
-
-it.effect(
-  "sends a read transaction's BEGIN with its first statement and nothing for an empty one",
-  () =>
-    withReaderClient((sql) =>
-      Effect.gen(function* () {
-        const before = startedWorkers.length;
-        yield* sql.withTransaction(Effect.void).pipe(SqliteClient.readOnly);
-        const counts = yield* sql
-          .withTransaction(Effect.all([countEntries(sql), countEntries(sql)]))
-          .pipe(SqliteClient.readOnly);
-        assert.deepEqual(counts, [1, 1]);
-        // The COMMIT leaves for the worker on the next turn, after the transaction already ended.
-        yield* eventLoopTurn;
-        const worker = startedWorkers[before]!;
-        assert.deepEqual(messageShapes(worker), ["begin+SELECT", "SELECT", "COMMIT"]);
-        // A read after the transaction starts no transaction of its own.
-        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
-        yield* eventLoopTurn;
-        assert.deepEqual(messageShapes(worker).slice(3), ["SELECT"]);
-      }),
-    ),
-);
-
-it.effect("finishes a read transaction without waiting for COMMIT and ignores its error", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const before = startedWorkers.length;
-      commitHold.on = true;
-      commitHold.failNext = true;
-      try {
-        const count = yield* sql
-          .withTransaction(countEntries(sql))
-          .pipe(SqliteClient.readOnly, Effect.exit);
-        // Completed before the COMMIT even left for the worker; held back there, its error reply
-        // is ignored.
-        assert.deepEqual(count, Exit.succeed(1));
-        // The COMMIT leaves at once, still unanswered when the transaction has ended.
-        assert.lengthOf(commitHold.held, 1);
-        assert.deepEqual(messageShapes(startedWorkers[before]!), ["begin+SELECT", "COMMIT"]);
-      } finally {
-        commitHold.on = false;
-        for (const release of commitHold.held.splice(0)) release();
-      }
-      // The worker is in sync again once the COMMIT reaches it.
-      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
-    }),
-  ),
-);
-
-it.effect(
-  "answers a duplicate BEGIN and a COMMIT with no transaction with SQLite's error, bookkeeping intact",
-  () =>
-    withReaderClient((sql) =>
-      Effect.gen(function* () {
-        const before = startedWorkers.length;
-        const duplicate = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              assert.equal(yield* countEntries(sql), 1);
-              return yield* sql.unsafe("BEGIN").pipe(Effect.flip);
-            }),
-          )
-          .pipe(SqliteClient.readOnly);
-        assert.include(String(duplicate.reason.cause), "within a transaction");
-        // The reader is still usable: the next read transaction starts and ends as always.
-        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-        yield* eventLoopTurn;
-        assert.deepEqual(messageShapes(startedWorkers[before]!), [
-          "begin+SELECT",
-          "BEGIN",
-          "COMMIT",
-          "begin+SELECT",
-          "COMMIT",
-        ]);
-        // A COMMIT with no transaction to end is answered, not dropped.
-        const stray = yield* sql.unsafe("COMMIT").pipe(SqliteClient.readOnly, Effect.flip);
-        assert.include(String(stray.reason.cause), "no transaction is active");
-      }),
-    ),
-);
-
-it.effect(
-  "keeps a read transaction through a nested rollback and answers a missing savepoint with SQLite's error",
-  () =>
-    withReaderClient((sql) =>
-      Effect.gen(function* () {
-        const before = startedWorkers.length;
-        const outer = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              assert.equal(yield* countEntries(sql), 1);
-              // A failed nested transaction rolls back to its savepoint; the outer one goes on.
-              const nested = yield* sql.withTransaction(Effect.fail("nested")).pipe(Effect.exit);
-              assert.isTrue(Exit.isFailure(nested));
-              const duplicate = yield* sql.unsafe("BEGIN").pipe(Effect.flip);
-              assert.include(String(duplicate.reason.cause), "within a transaction");
-              for (const form of [
-                "ROLLBACK TO SAVEPOINT missing",
-                "ROLLBACK TRANSACTION TO SAVEPOINT missing",
-                "ROLLBACK/*to the savepoint*/TO SAVEPOINT missing",
-                "-- a comment first\nROLLBACK TO missing",
-              ]) {
-                const missing = yield* sql.unsafe(form).pipe(Effect.flip);
-                assert.include(String(missing.reason.cause), "no such savepoint", form);
-              }
-              return yield* countEntries(sql);
-            }),
-          )
-          .pipe(SqliteClient.readOnly);
-        assert.equal(outer, 1);
-        // The reader is still usable, and only the two transactions carried a BEGIN.
-        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-        yield* eventLoopTurn;
-        const shapes = messageShapes(startedWorkers[before]!);
-        assert.deepEqual(
-          shapes.filter((shape) => shape.startsWith("begin+")),
-          ["begin+SELECT", "begin+SELECT"],
-          shapes.join(" "),
-        );
-        assert.include(shapes, "ROLLBACK", shapes.join(" "));
-      }),
-    ),
-);
-
-it.effect("forwards statements that merely start with a transaction keyword to SQLite", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      // SQLite's whitespace is narrower than JavaScript's: a no-break space or a vertical tab is
-      // part of the token, not a separator.
-      for (const form of [
-        "BEGIN2",
-        "COMMIT2",
-        "BEGIN 1",
-        "ROLLBACK x",
-        "END 2",
-        "BEGIN\u00a0",
-        "BEGIN\v",
-      ]) {
-        const error = yield* sql.unsafe(form).pipe(SqliteClient.readOnly, Effect.flip);
-        assert.match(
-          String(error.reason.cause),
-          /syntax error|unrecognized token/,
-          JSON.stringify(form),
-        );
-      }
-      // Inside a transaction too, and the reader stays usable afterwards.
-      const inside = yield* sql
-        .withTransaction(sql.unsafe("BEGIN2").pipe(Effect.flip))
-        .pipe(SqliteClient.readOnly);
-      assert.include(String(inside.reason.cause), "syntax error");
-      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-    }),
-  ),
-);
-
-it.effect("leaves a transaction control with bindings or a raw result to SQLite", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const before = startedWorkers.length;
-      // A BEGIN with a binding is SQLite's error, not a folded BEGIN.
-      const bound = yield* sql.unsafe("BEGIN", [1]).pipe(SqliteClient.readOnly, Effect.flip);
-      assert.include(String(bound.reason.cause), "column index out of range");
-      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-      // Raw controls keep the run() result, as before.
-      const raw = yield* sql
-        .withTransaction(
-          Effect.gen(function* () {
-            const begun = yield* failureOf(sql.unsafe("BEGIN").raw);
-            assert.include(String(begun.reason.cause), "within a transaction");
-            assert.equal(yield* countEntries(sql), 1);
-            return yield* failureOf(sql.unsafe("RELEASE SAVEPOINT missing").raw);
-          }),
-        )
-        .pipe(SqliteClient.readOnly);
-      assert.include(String(raw.reason.cause), "no such savepoint");
-      const committed = yield* Effect.gen(function* () {
-        yield* sql.unsafe("BEGIN").raw;
-        assert.equal(yield* countEntries(sql), 1);
-        return yield* sql.unsafe("COMMIT").raw;
-      }).pipe(SqliteClient.readOnly);
-      assert.deepEqual(committed, { changes: 0, lastInsertRowid: 0 });
-      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-      yield* eventLoopTurn;
-      // The raw BEGIN inside the transaction was its first statement, so it carried the folded one.
-      const shapes = messageShapes(startedWorkers[before]!);
-      assert.deepEqual(
-        shapes.filter((shape) => shape.startsWith("begin+")),
-        ["begin+SELECT", "begin+BEGIN", "begin+SELECT"],
-        shapes.join(" "),
-      );
-    }),
-  ),
-);
-
-it.effect("keeps its transaction bookkeeping in step with controls the worker ran itself", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      // A transaction opened raw survives a managed one that cannot start inside it.
-      const manual = yield* Effect.gen(function* () {
-        yield* sql.unsafe("BEGIN").raw;
-        assert.equal(yield* countEntries(sql), 1);
-        const managed = yield* sql.withTransaction(countEntries(sql)).pipe(Effect.flip);
-        assert.include(String(managed.reason.cause), "within a transaction");
-        assert.equal(yield* countEntries(sql), 1);
-        return yield* sql.unsafe("COMMIT").raw;
-      }).pipe(SqliteClient.readOnly);
-      assert.deepEqual(manual, { changes: 0, lastInsertRowid: 0 });
-      // A raw COMMIT inside a managed transaction leaves its COMMIT with nothing to end.
-      const mixed = yield* failureOf(
-        sql
-          .withTransaction(
-            Effect.gen(function* () {
-              assert.equal(yield* countEntries(sql), 1);
-              return yield* sql.unsafe("COMMIT").raw;
-            }),
-          )
-          .pipe(SqliteClient.readOnly),
-      );
-      assert.include(String(mixed.reason.cause), "no transaction is active");
-      // A top-level savepoint is a transaction too: the managed one fails, the savepoint survives.
-      const savepoint = yield* Effect.gen(function* () {
-        yield* sql.unsafe("SAVEPOINT outer");
-        const managed = yield* sql.withTransaction(countEntries(sql)).pipe(Effect.flip);
-        assert.include(String(managed.reason.cause), "within a transaction");
-        return yield* sql.unsafe("RELEASE SAVEPOINT outer");
-      }).pipe(SqliteClient.readOnly);
-      assert.deepEqual(savepoint, []);
-      // And the reader is as usable as ever.
-      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-    }),
-  ),
-);
-
-it.effect("ignores a reply that arrives after a newer transaction transition", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
-      // A standalone read whose fiber gives up on it while the worker's reply is held back.
-      const abandoned = yield* Effect.forkChild(
-        sql`SELECT COUNT(*) AS count /* hold-reply */ FROM entries`.pipe(SqliteClient.readOnly),
-        { startImmediately: true },
-      );
-      yield* Effect.promise(() => new Promise<void>((resolve) => replyHold.waiters.push(resolve)));
-      yield* Fiber.interrupt(abandoned);
-      const count = yield* sql
-        .withTransaction(
-          Effect.gen(function* () {
-            // This read carries the folded BEGIN; the stale reply lands after it.
-            assert.equal(yield* countEntries(sql), 1);
-            for (const release of replyHold.held.splice(0)) release();
-            const duplicate = yield* sql.unsafe("BEGIN").pipe(Effect.flip);
-            assert.include(String(duplicate.reason.cause), "within a transaction");
-            return yield* countEntries(sql);
-          }),
-        )
-        .pipe(SqliteClient.readOnly);
-      assert.equal(count, 1);
-      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-    }),
-  ),
-);
-
-it.effect(
-  "forwards a BEGIN while an earlier statement on the same reader is still outstanding",
-  () =>
-    withReaderClient((sql) =>
-      Effect.gen(function* () {
-        const [savepoint, begin] = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              // Ends the managed transaction before it began, leaving the reserved reader idle.
-              yield* sql.unsafe("ROLLBACK");
-              return yield* Effect.all(
-                [
-                  sql.unsafe("SAVEPOINT outer").pipe(Effect.exit),
-                  sql.unsafe("BEGIN").pipe(Effect.exit),
-                ],
-                { concurrency: "unbounded" },
-              );
-            }),
-          )
-          .pipe(SqliteClient.readOnly);
-        assert.isTrue(Exit.isSuccess(savepoint));
-        // The BEGIN reached SQLite behind the savepoint, which had opened a transaction.
-        assert.isTrue(Exit.isFailure(begin), "BEGIN behind a savepoint");
-        // The managed COMMIT ended the savepoint's transaction: the reader is free again.
-        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-      }),
-    ),
-);
-
-it.effect(
-  "keeps an interrupted read transaction's reader until the worker has answered what it abandoned",
-  () =>
-    withReaderClient(
-      (sql) =>
-        Effect.gen(function* () {
-          const before = startedWorkers.length;
-          yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
-          const worker = startedWorkers[before]!;
-          // Abandoned as the first statement (its reply still pending, so the ending is an
-          // ordinary awaited statement) and as a later one (the ending itself is awaited).
-          for (const [tag, body] of [
-            ["long-1", (read: string) => sql.unsafe(read)],
-            ["long-2", (read: string) => Effect.andThen(countEntries(sql), sql.unsafe(read))],
-          ] as const) {
-            const arrived = posting(tag);
-            const long = yield* sql
-              .withTransaction(body(longRead(tag, 1_500_000)))
-              .pipe(SqliteClient.readOnly, (effect) =>
-                Effect.forkChild(effect, { startImmediately: true }),
-              );
-            yield* arrived;
-            yield* Fiber.interrupt(long);
-            // The interruption completed only once the worker had answered the abandoned read,
-            // so the reader it frees is idle, as it was before the ending stopped being awaited.
-            assert.equal(repliesTo(worker, tag), 1, tag);
-          }
-          assert.deepEqual(yield* sql`SELECT ${"short-1"} AS tag`.pipe(SqliteClient.readOnly), [
-            { tag: "short-1" },
-          ]);
-        }),
-      { readerPoolSize: 1 },
-    ),
-);
-
-it.effect("leaves no abandoned statement unanswered behind a run of interrupted transactions", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const before = startedWorkers.length;
-        yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
-        const worker = startedWorkers[before]!;
-        for (let i = 0; i < 5; i++) {
-          const arrived = posting(`pile-${i}`);
-          const fiber = yield* sql
-            .withTransaction(sql.unsafe(longRead(`pile-${i}`, 500_000)))
-            .pipe(SqliteClient.readOnly, (effect) =>
-              Effect.forkChild(effect, { startImmediately: true }),
-            );
-          yield* arrived;
-          yield* Fiber.interrupt(fiber);
-        }
-        const unanswered = [0, 1, 2, 3, 4].filter((i) => repliesTo(worker, `pile-${i}`) === 0);
-        assert.deepEqual(unanswered, [], "abandoned reads still queued on the worker");
-        assert.deepEqual(yield* sql`SELECT ${"after"} AS tag`.pipe(SqliteClient.readOnly), [
-          { tag: "after" },
-        ]);
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect(
-  "answers a duplicate BEGIN issued beside a transaction's first statement with SQLite's error",
-  () =>
-    withReaderClient(
-      (sql) =>
-        Effect.gen(function* () {
-          const [count, duplicate] = yield* sql
-            .withTransaction(
-              Effect.all([countEntries(sql), failureOf(sql.unsafe("BEGIN"))], {
-                concurrency: "unbounded",
-              }),
-            )
-            .pipe(SqliteClient.readOnly);
-          assert.equal(count, 1);
-          assert.include(String(duplicate.reason.cause), "within a transaction");
-          assert.equal(
-            yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly),
-            1,
-          );
-        }),
-      { readerPoolSize: 1 },
-    ),
-);
-
-it.effect("ends a transaction the worker reopened raw while a plain BEGIN was folded", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const plain = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              assert.equal(yield* countEntries(sql), 1);
-              yield* sql.unsafe("COMMIT").raw;
-              const raw = yield* Effect.forkChild(sql.unsafe("BEGIN").raw, {
-                startImmediately: true,
-              });
-              const plain = yield* sql.unsafe("BEGIN").pipe(Effect.exit);
-              yield* Fiber.join(raw);
-              return plain;
-            }),
-          )
-          .pipe(SqliteClient.readOnly);
-        // The plain BEGIN reached SQLite behind the raw one; the managed COMMIT ended that one.
-        assert.isTrue(Exit.isFailure(plain), "plain BEGIN behind a raw one");
-        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect("folds and ends a transaction whose controls carry comments", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const before = startedWorkers.length;
-        yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
-        const count = yield* Effect.gen(function* () {
-          yield* sql.unsafe("/* deferred */ BEGIN");
-          const count = yield* countEntries(sql);
-          yield* sql.unsafe("COMMIT -- done");
-          return count;
-        }).pipe(SqliteClient.readOnly);
-        assert.equal(count, 1);
-        yield* eventLoopTurn;
-        assert.deepEqual(messageShapes(startedWorkers[before]!).slice(2), [
-          "begin+SELECT",
-          "COMMIT",
-        ]);
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect("reports the connection's transaction state on every reply", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const before = startedWorkers.length;
-        yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              assert.equal(yield* countEntries(sql), 1);
-              yield* sql`SELECT name FROM missing_table /* inside-error */`.pipe(Effect.exit);
-              yield* sql`SELECT name FROM entries /* inside-rows */`;
-            }),
-          )
-          .pipe(SqliteClient.readOnly);
-        yield* sql`SELECT name FROM entries /* outside-rows */`.pipe(SqliteClient.readOnly);
-        const worker = startedWorkers[before]!;
-        const stateOf = (needle: string) => {
-          const ids = new Set(
-            workerMessages
-              .get(worker)!
-              .filter((message) => String(message.sql ?? "").includes(needle))
-              .map((message) => message.id),
-          );
-          return workerReplies
-            .get(worker)!
-            .filter((reply) => ids.has(reply.id))
-            .map((reply) => reply.inTransaction);
-        };
-        assert.deepEqual(stateOf("inside-error"), [true]);
-        assert.deepEqual(stateOf("inside-rows"), [true]);
-        assert.deepEqual(stateOf("outside-rows"), [false]);
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect("ignores a reply older than the ending that freed the reader", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const before = startedWorkers.length;
-        yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              assert.equal(yield* countEntries(sql), 1);
-              // A sibling abandoned by its fiber, its reply (in-transaction) held back.
-              const abandoned = yield* Effect.forkChild(
-                sql`SELECT name /* hold-reply */ FROM entries`,
-                { startImmediately: true },
-              );
-              yield* Effect.promise(
-                () => new Promise<void>((resolve) => replyHold.waiters.push(resolve)),
-              );
-              yield* Fiber.interrupt(abandoned);
-            }),
-          )
-          .pipe(SqliteClient.readOnly);
-        // The ending was awaited behind the abandoned read; its stale reply lands afterwards.
-        for (const release of replyHold.held.splice(0)) release();
-        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-        yield* eventLoopTurn;
-        const shapes = messageShapes(startedWorkers[before]!);
-        assert.deepEqual(shapes.slice(-2), ["begin+SELECT", "COMMIT"], shapes.join(" "));
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect("refuses a write on a reader, temporary tables included", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const error = yield* sql
-        .unsafe("CREATE TEMP TABLE scratch(x)")
-        .pipe(SqliteClient.readOnly, Effect.flip);
-      assert.match(String(error.reason.cause), /readonly|query_only|read-only|not authorized/i);
-      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
-    }),
-  ),
-);
-
-it.effect("keeps a reader from turning its writes back on", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const pragma = yield* sql
-          .unsafe("PRAGMA query_only = OFF")
-          .pipe(SqliteClient.readOnly, Effect.exit);
-        const write = yield* sql
-          .unsafe("CREATE TEMP TABLE scratch(x)")
-          .pipe(SqliteClient.readOnly, Effect.flip);
-        assert.match(String(write.reason.cause), /readonly|query_only|read-only|not authorized/i);
-        assert.isTrue(Exit.isFailure(pragma), "query_only stays on");
-        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect("refuses what the read-only open does not, whatever the spelling or the database", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        const pragma = yield* sql
-          .unsafe("PRAGMA QUERY_ONLY = OFF")
-          .pipe(SqliteClient.readOnly, Effect.exit);
-        assert.isTrue(Exit.isFailure(pragma), "query_only stays on, whatever the spelling");
-        const write = yield* sql
-          .unsafe("CREATE TEMP TABLE scratch(x)")
-          .pipe(SqliteClient.readOnly, Effect.flip);
-        assert.match(String(write.reason.cause), /readonly|query_only|read-only|not authorized/i);
-        const attach = yield* sql
-          .unsafe("ATTACH DATABASE 'file:extra?mode=memory' AS extra")
-          .pipe(SqliteClient.readOnly, Effect.flip);
-        assert.include(String(attach.reason.cause), "not authorized");
-        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect("awaits a read transaction's ending on a reader without an authorizer", () =>
-  Effect.gen(function* () {
-    readyRewrite.unguarded = true;
-    commitHold.on = true;
-    try {
-      yield* withReaderClient((sql) =>
-        Effect.gen(function* () {
-          const committing = posting("COMMIT");
-          const fiber = yield* sql
-            .withTransaction(countEntries(sql))
-            .pipe(SqliteClient.readOnly, (effect) =>
-              Effect.forkChild(effect, { startImmediately: true }),
-            );
-          yield* committing;
-          yield* eventLoopTurn;
-          // Without an authorizer a write could have happened, so the ending's answer is waited for.
-          assert.isUndefined(fiber.pollUnsafe(), "ended before the COMMIT was answered");
-          commitHold.on = false;
-          for (const release of commitHold.held.splice(0)) release();
-          assert.equal(yield* Fiber.join(fiber), 1);
-          assert.equal(
-            yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly),
-            1,
-          );
-        }),
-      );
-    } finally {
-      readyRewrite.unguarded = false;
-      commitHold.on = false;
-      for (const release of commitHold.held.splice(0)) release();
-    }
-  }),
-);
-
-it.effect("sets up an awaited ending correctly whatever happens before it runs", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        // Several yield budgets, so that the gap before the ending's callback falls at a turn
-        // boundary under at least one alignment.
-        for (const happening of ["the abandoned reply arrives", "the worker stops"] as const) {
-          for (const budget of [3, 4, 5, 6, 7]) {
-            const turns = Effect.provideService(Scheduler.MaxOpsBeforeYield, budget);
-            for (let yields = 0; yields < 24; yields++) {
-              yield* sql.withTransaction(sql`SELECT 1 AS warm`).pipe(SqliteClient.readOnly);
-              const worker = startedWorkers.at(-1)!;
-              const held = new Promise<void>((resolve) => replyHold.waiters.push(resolve));
-              // The transaction abandons a read whose reply is held, then ends: with a one-step
-              // budget every step of its ending, including the gap before its callback, is a turn.
-              const transaction = yield* sql
-                .withTransaction(
-                  Effect.gen(function* () {
-                    const abandoned = yield* Effect.forkChild(
-                      sql`SELECT name /* hold-reply */ FROM entries`,
-                      { startImmediately: true },
-                    );
-                    yield* Effect.promise(() => held);
-                    yield* Fiber.interrupt(abandoned);
-                  }),
-                )
-                .pipe(SqliteClient.readOnly, turns, (effect) =>
-                  Effect.forkChild(effect, { startImmediately: true }),
-                );
-              yield* Effect.promise(() => held);
-              for (let i = 0; i < yields; i++) yield* Effect.yieldNow;
-              if (happening === "the abandoned reply arrives")
-                for (const release of replyHold.held.splice(0)) release();
-              else worker.emit("exit", 1);
-              // The transaction ends either way, and never hangs.
-              yield* Fiber.join(transaction).pipe(Effect.exit);
-              for (const release of replyHold.held.splice(0)) release();
-              if (happening === "the abandoned reply arrives") {
-                // An ending left as the only pending request keeps the worker referenced.
-                const ending = workerMessages
-                  .get(worker)!
-                  .findLast((message) => /^\s*COMMIT/i.test(String(message.sql ?? "")));
-                if (ending !== undefined && awaitedAtReply.get(ending.id as number))
-                  assert.isTrue(
-                    refdAtReply.get(ending.id as number),
-                    `after ${yields} yields: the worker was let go of before its ending was answered`,
-                  );
-              } else {
-                yield* Effect.promise(() => worker.terminate());
-              }
-            }
-          }
-        }
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect(
-  "answers an awaited ending with SQLite's error when a control it waited behind ended first",
-  () =>
-    withReaderClient(
-      (sql) =>
-        Effect.gen(function* () {
-          const outer = yield* sql
-            .withTransaction(
-              Effect.gen(function* () {
-                assert.equal(yield* countEntries(sql), 1);
-                // The raw COMMIT is still outstanding when the plain one leaves, so that one waits
-                // for its answer: SQLite's, not a guess.
-                const [raw, plain] = yield* Effect.all(
-                  [
-                    sql.unsafe("COMMIT").raw.pipe(Effect.exit),
-                    sql.unsafe("COMMIT").pipe(Effect.exit),
-                  ],
-                  { concurrency: "unbounded" },
-                );
-                assert.isTrue(Exit.isSuccess(raw));
-                assert.isTrue(Exit.isFailure(plain), "the second COMMIT had nothing to end");
-                if (Exit.isFailure(plain))
-                  assert.include(
-                    String(
-                      (Cause.squash(plain.cause) as { reason: { cause: unknown } }).reason.cause,
-                    ),
-                    "no transaction is active",
-                  );
-              }),
-            )
-            .pipe(SqliteClient.readOnly, Effect.exit);
-          // The managed COMMIT has nothing to end either, as on the earlier reader protocol.
-          assert.isTrue(Exit.isFailure(outer));
-          assert.equal(
-            yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly),
-            1,
-          );
-        }),
-      { readerPoolSize: 1 },
-    ),
-);
-
-it.effect("answers an awaited ending behind an outstanding raw COMMIT with SQLite's error", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        // The raw COMMIT's reply is held back, so the managed COMMIT behind it takes the awaited
-        // path for certain; SQLite answers that one with "no transaction is active".
-        const exit = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              assert.equal(yield* countEntries(sql), 1);
-              yield* Effect.forkChild(sql.unsafe("COMMIT /* hold-reply */").raw, {
-                startImmediately: true,
-              });
-            }),
-          )
-          .pipe(SqliteClient.readOnly, Effect.exit);
-        for (const release of replyHold.held.splice(0)) release();
-        assert.isTrue(Exit.isFailure(exit), "the managed COMMIT had nothing to end");
-        if (Exit.isFailure(exit))
-          assert.include(
-            String((Cause.squash(exit.cause) as { reason: { cause: unknown } }).reason.cause),
-            "no transaction is active",
-          );
-        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect(
-  "keeps its bookkeeping and the worker through a reply landing before an awaited ending runs",
-  () =>
-    withReaderClient(
-      (sql) =>
-        Effect.gen(function* () {
-          const before = startedWorkers.length;
-          yield* countEntries(sql).pipe(SqliteClient.readOnly);
-          const worker = startedWorkers[before]!;
-          // A scheduler of the test's own releases the held reply at the k-th turn; with a yield
-          // budget of three, one of those turns is the gap before the awaited ending's callback.
-          let releaseAt = -1;
-          let turns = 0;
-          const hooked = new Scheduler.MixedScheduler("async", (task) => {
-            const timer = setImmediate(() => {
-              if (releaseAt >= 0 && turns++ === releaseAt)
-                for (const release of replyHold.held.splice(0)) release();
-              task();
-            });
-            return () => clearImmediate(timer);
-          });
-          for (let k = 0; k < 24; k++) {
-            releaseAt = -1;
-            turns = 0;
-            const seen = workerMessages.get(worker)!.length;
-            const held = new Promise<void>((resolve) => replyHold.waiters.push(resolve));
-            const fiber = yield* sql
-              .withTransaction(
-                Effect.gen(function* () {
-                  yield* countEntries(sql);
-                  yield* sql`SELECT 1 AS x /* hold-reply */`;
-                }),
-              )
-              .pipe(
-                SqliteClient.readOnly,
-                Effect.provideService(Scheduler.MaxOpsBeforeYield, 3),
-                Effect.provideService(Scheduler.Scheduler, hooked),
-                (effect) => Effect.forkChild(effect, { startImmediately: true }),
-              );
-            yield* Effect.promise(() => held);
-            releaseAt = k;
-            yield* Fiber.interrupt(fiber);
-            for (const release of replyHold.held.splice(0)) release();
-            assert.equal(
-              yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly),
-              1,
-            );
-            yield* eventLoopTurn;
-            const messages = workerMessages.get(worker)!.slice(seen);
-            const ending = messages.findIndex((message) =>
-              /^\s*ROLLBACK/i.test(String(message.sql)),
-            );
-            assert.notEqual(ending, -1, `k=${k}: no ending`);
-            // The next transaction still folds its BEGIN: the ending left no restored flag behind.
-            const shapes = messageShapes(worker).slice(seen);
-            assert.equal(shapes[ending + 1], "begin+SELECT", `k=${k}: ${shapes.join(" ")}`);
-            // And while the ending was awaited, the worker stayed referenced.
-            const endingId = messages[ending]!.id as number;
-            if (awaitedAtReply.get(endingId))
-              assert.isTrue(
-                refdAtEnding.get(endingId),
-                `k=${k}: the worker was let go of while its ending was awaited`,
-              );
-          }
-        }),
-      { readerPoolSize: 1 },
-    ),
-);
-
-it.effect("reads the temporary schema's metadata on a reader", () =>
-  withReaderClient(
-    (sql) =>
-      Effect.gen(function* () {
-        assert.deepEqual(
-          yield* sql.unsafe("PRAGMA temp.table_info(entries)").pipe(SqliteClient.readOnly),
-          [],
-        );
-        assert.lengthOf(yield* sql.unsafe("PRAGMA temp.page_count").pipe(SqliteClient.readOnly), 1);
-        const pragma = yield* sql
-          .unsafe("PRAGMA temp.query_only = OFF")
-          .pipe(SqliteClient.readOnly, Effect.flip);
-        assert.include(String(pragma.reason.cause), "not authorized");
-      }),
-    { readerPoolSize: 1 },
-  ),
-);
-
-it.effect("lets a process exit cleanly after a one-shot read transaction", () =>
+it.effect("keeps writes moving while an outside reader pins the WAL, then trims the WAL", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-exit-" });
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-pinned-wal-" });
     const filename = path.join(directory, "state.sqlite");
-    const seed = new NodeSqlite.DatabaseSync(filename);
-    seed.exec("PRAGMA journal_mode = WAL; CREATE TABLE entries(name TEXT NOT NULL)");
-    seed.close();
-    // The reply that answers the read resumes the fiber, whose scope then terminates the worker;
-    // a worker let go of after that leaves nothing to keep the process alive (exit code 13). The
-    // script lives beside the client so that its bare imports resolve.
-    const script = path.join(import.meta.dirname, `.exit-probe-${process.pid}.mjs`);
-    yield* Effect.acquireRelease(
-      fs.writeFileString(
-        script,
-        `import * as Effect from "effect/Effect";
-import * as SqlClient from "effect/sql/SqlClient";
-import * as SqliteClient from "./nodeSqliteClient.ts";
-await Effect.runPromise(
-  Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    yield* sql.withTransaction(sql\`SELECT COUNT(*) AS count FROM entries\`).pipe(SqliteClient.readOnly);
-  }).pipe(
-    Effect.provide(SqliteClient.layer({ filename: process.argv[2], readerWorker: true })),
-    Effect.scoped,
-  ),
-);
-console.log("done");
-`,
-      ),
-      () => fs.remove(script).pipe(Effect.ignore),
+    // Stands in for `sqlite3 statev2.sqlite` or a backup script reading the database.
+    const outside = yield* Effect.acquireRelease(
+      Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+      (db) =>
+        Effect.sync(() => {
+          if (db.isTransaction) db.exec("COMMIT");
+          db.close();
+        }),
     );
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const child = yield* spawner.spawn(
-      ChildProcess.make(process.execPath, ["--no-warnings", script, filename]),
+    outside.exec("PRAGMA journal_mode = WAL; CREATE TABLE blobs(data BLOB NOT NULL)");
+    const walSize = fs.stat(`${filename}-wal`).pipe(
+      Effect.map((info) => Number(info.size)),
+      Effect.orDie,
     );
-    const decoder = new TextDecoder();
-    const output = yield* Stream.runFold(
-      child.stdout,
-      () => "",
-      (text, chunk) => text + decoder.decode(chunk),
-    );
-    const errors = yield* Stream.runFold(
-      child.stderr,
-      () => "",
-      (text, chunk) => text + decoder.decode(chunk),
-    );
-    const exitCode = yield* child.exitCode;
-    assert.equal(exitCode, 0, `exit ${exitCode}: ${errors}`);
-    assert.include(output, "done");
+    const limit = 8 * 1024 * 1024;
+    const payload = new Uint8Array(1024 * 1024).fill(7);
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql.unsafe(`PRAGMA journal_size_limit = ${limit}`);
+      yield* sql`INSERT INTO blobs VALUES (${payload})`;
+      outside.exec("BEGIN");
+      outside.prepare("SELECT COUNT(*) FROM blobs").get();
+      for (let write = 0; write < 24; write++) yield* sql`INSERT INTO blobs VALUES (${payload})`;
+      assert.isAbove(yield* walSize, limit);
+      outside.exec("COMMIT");
+      const checkpointer = checkpointWorkers.at(-1)!;
+      const caughtUp = Effect.callback<void>((resume) => {
+        const onMessage = (message: { type?: unknown; log?: unknown; checkpointed?: unknown }) => {
+          if (
+            message?.type === "checked" &&
+            typeof message.log === "number" &&
+            message.log > 0 &&
+            message.log === message.checkpointed
+          ) {
+            resume(Effect.void);
+          }
+        };
+        checkpointer.on("message", onMessage);
+        checkpointer.ref();
+        return Effect.sync(() => {
+          checkpointer.off("message", onMessage);
+          checkpointer.unref();
+        });
+      });
+      // The worker checkpoints the released frames; the next write restarts the WAL at the limit.
+      yield* Effect.all([caughtUp, sql`DELETE FROM blobs WHERE rowid = 1`], { concurrency: 2 });
+      yield* sql`DELETE FROM blobs WHERE rowid = 2`;
+      assert.isAtMost(yield* walSize, limit);
+      assert.deepEqual(yield* sql`SELECT COUNT(*) FROM blobs`.values, [[23]]);
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
+
+// The first word of each statement a worker received, in order.
+const statementsSent = (worker: NodeWorkerThreads.Worker) =>
+  workerMessages.get(worker)!.map((message) => String(message.sql).trim().split(/\s+/)[0]);
 
 it.effect("posts statements issued together at once, in order, and answers each on its own", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {
       const before = startedWorkers.length;
-      const results = yield* sql
+      const [concurrency, results] = yield* sql
         .withTransaction(
-          Effect.all(
-            [
-              countEntries(sql),
-              sql`SELECT name FROM missing_table`,
-              sql<{ name: string }>`SELECT name FROM entries`,
-            ],
-            { concurrency: "unbounded", mode: "result" },
-          ),
+          Effect.gen(function* () {
+            const concurrency = yield* SqliteClient.readConcurrency;
+            const results = yield* Effect.all(
+              [
+                countEntries(sql),
+                sql`SELECT name FROM missing_table`,
+                sql<{ name: string }>`SELECT name FROM entries`,
+              ],
+              { concurrency, mode: "result" },
+            );
+            return [concurrency, results] as const;
+          }),
         )
         .pipe(SqliteClient.readOnly);
+      assert.equal(concurrency, "unbounded");
       assert.deepEqual(results[0], Result.succeed(1));
       assert.isTrue(Result.isFailure(results[1]));
       assert.deepEqual(results[2], Result.succeed([{ name: "first" }]));
-      yield* eventLoopTurn;
-      // One message per statement, in order, the BEGIN with the first.
-      assert.deepEqual(messageShapes(startedWorkers[before]!), [
-        "begin+SELECT",
+      // One message per statement, in order.
+      assert.deepEqual(statementsSent(startedWorkers[before]!), [
+        "BEGIN",
+        "SELECT",
         "SELECT",
         "SELECT",
         "COMMIT",
       ]);
+      // On the writer the statements run in turn.
+      assert.isUndefined(yield* sql.withTransaction(SqliteClient.readConcurrency));
     }),
   ),
 );
 
-// A yield budget of three makes a fiber yield after every step (two cannot progress at all: the
-// resumption and the yield check use the budget up), so whatever the transaction's fiber does after
-// k of its own yields lands at every point of that statement's path, including between the request
-// effect being built and its callback running.
-const oneStepTurns = Effect.provideService(Scheduler.MaxOpsBeforeYield, 3);
-
-it.effect(
-  "keeps a read transaction's BEGIN on the first statement that leaves, whichever fiber yields",
-  () =>
-    withReaderClient((sql) =>
-      Effect.gen(function* () {
-        const before = startedWorkers.length;
-        let seen = 0;
-        for (let yields = 0; yields < 32; yields++) {
-          yield* sql
-            .withTransaction(
-              Effect.gen(function* () {
-                const first = yield* Effect.forkChild(countEntries(sql).pipe(oneStepTurns), {
-                  startImmediately: true,
-                });
-                for (let i = 0; i < yields; i++) yield* Effect.yieldNow;
-                const second = yield* Effect.forkChild(countEntries(sql), {
-                  startImmediately: true,
-                });
-                assert.deepEqual([yield* Fiber.join(second), yield* Fiber.join(first)], [1, 1]);
-              }),
-            )
-            .pipe(SqliteClient.readOnly);
-          yield* eventLoopTurn;
-          const shapes = messageShapes(startedWorkers[before]!).slice(seen);
-          seen += shapes.length;
-          assert.deepEqual(shapes, ["begin+SELECT", "SELECT", "COMMIT"], `after ${yields} yields`);
-        }
-      }),
-    ),
-);
-
-it.effect("never lets an interrupted statement take a read transaction's BEGIN with it", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const before = startedWorkers.length;
-      let seen = 0;
-      for (let yields = 0; yields < 32; yields++) {
-        const count = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              const first = yield* Effect.forkChild(countEntries(sql).pipe(oneStepTurns), {
-                startImmediately: true,
-              });
-              for (let i = 0; i < yields; i++) yield* Effect.yieldNow;
-              yield* Fiber.interrupt(first);
-              return yield* countEntries(sql);
-            }),
-          )
-          .pipe(SqliteClient.readOnly);
-        assert.equal(count, 1);
-        yield* eventLoopTurn;
-        const shapes = messageShapes(startedWorkers[before]!).slice(seen);
-        seen += shapes.length;
-        // The interrupted statement left before the interruption or not at all; either way the
-        // BEGIN is on the first message.
-        assert.deepInclude(
-          [
-            ["begin+SELECT", "SELECT", "COMMIT"],
-            ["begin+SELECT", "COMMIT"],
-          ],
-          shapes,
-          `after ${yields} yields: ${shapes.join(" ")}`,
-        );
-      }
-    }),
-  ),
-);
+// Yields at every step and calls `stop` as the n-th yield is scheduled, so a sweep of n lands the
+// stop between every two steps of a statement's path.
+const stoppingAtYield = (n: number, stop: () => void): Scheduler.Scheduler => {
+  const scheduler = new Scheduler.MixedScheduler();
+  let yields = 0;
+  return {
+    executionMode: scheduler.executionMode,
+    shouldYield: () => true,
+    makeDispatcher: () => {
+      const dispatcher = scheduler.makeDispatcher();
+      return {
+        scheduleTask: (task, priority) => {
+          if (++yields === n) stop();
+          dispatcher.scheduleTask(task, priority);
+        },
+        flush: () => dispatcher.flush(),
+      };
+    },
+  };
+};
 
 it.effect("fails a statement whose worker stopped before it left instead of waiting forever", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      for (let yields = 0; yields < 64; yields++) {
-        // Warm a reader, then stop it after the statement's fiber has taken k steps towards it.
-        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
-        const worker = startedWorkers.at(-1)!;
-        const first = yield* Effect.forkChild(
-          countEntries(sql).pipe(SqliteClient.readOnly, oneStepTurns),
-          { startImmediately: true },
-        );
-        for (let i = 0; i < yields; i++) yield* Effect.yieldNow;
-        // The stop lands at this very step of the statement's path (a termination's exit would
-        // arrive turns later, and a second exit would rescue a statement the first one lost).
-        worker.emit("exit", 1);
-        // Failed with the stopped reader or answered by a fresh one; a statement posted to nobody
-        // would never settle here.
-        const exit = yield* Fiber.join(first).pipe(Effect.exit);
-        yield* Effect.promise(() => worker.terminate());
-        if (Exit.isFailure(exit)) {
-          const error = Cause.squash(exit.cause) as { reason: { cause: unknown } };
-          assert.include(String(error.reason.cause), "Database reader exited");
-        } else {
-          assert.equal(exit.value, 1);
+  withLogLines((lines) =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        let posted = false;
+        for (let n = 1; n <= 2000; n++) {
+          assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+          const worker = startedWorkers.at(-1)!;
+          const sent = workerMessages.get(worker)!.length;
+          const dropped = yield* Deferred.make<void>();
+          let stopped = false;
+          const stop = () => {
+            stopped = true;
+            posted = workerMessages.get(worker)!.length > sent;
+            // From now on the worker drops what is posted to it, as an exited one does.
+            stoppedWorkers.set(worker, () => Deferred.doneUnsafe(dropped, Exit.void));
+            worker.emit("exit", 1);
+          };
+          const first = yield* Effect.forkChild(
+            countEntries(sql).pipe(
+              SqliteClient.readOnly,
+              Effect.provideService(Scheduler.Scheduler, stoppingAtYield(n, stop)),
+            ),
+            { startImmediately: true },
+          );
+          const outcome = yield* Effect.raceFirst(
+            Effect.exit(Fiber.join(first)),
+            Effect.as(Deferred.await(dropped), "dropped" as const),
+          );
+          if (outcome === "dropped") {
+            assert.fail(`a statement was posted to a stopped reader at yield ${n}`);
+          }
+          // Failed with the stopped reader, or answered by a fresh reader or the writer.
+          if (Exit.isFailure(outcome)) {
+            const error = Cause.squash(outcome.cause);
+            assert(SqlError.isSqlError(error));
+            assert.include(String(error.reason.cause), "Database reader exited");
+          } else {
+            assert.equal(outcome.value, 1);
+          }
+          assert.isTrue(stopped, `the statement finished before its fiber's yield ${n}`);
+          yield* Effect.promise(() => worker.terminate());
+          // A stop while the reader was starting turns the pool off until a retry starts it again.
+          if ((yield* Queue.clear(lines)).length > 0) {
+            yield* TestClock.adjust("1 second");
+            assert.equal((yield* Queue.take(lines))[0], "Info");
+          }
+          if (posted) break;
         }
-      }
-    }),
+        assert.isTrue(posted);
+      }),
+    ),
   ),
 );
 
-it.effect("answers reader statements with column names and row arrays", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const before = startedWorkers.length;
-      const rows = yield* sql<{
-        name: string;
-        one: number;
-      }>`SELECT name, 1 AS one FROM entries`.pipe(SqliteClient.readOnly);
-      assert.deepEqual(rows, [{ name: "first", one: 1 }]);
-      const values = yield* sql`SELECT name, 1 AS one FROM entries`.values.pipe(
-        SqliteClient.readOnly,
-      );
-      assert.deepEqual(values, [["first", 1]]);
-      const replies = workerReplies
-        .get(startedWorkers[before]!)!
-        .filter((reply) => "rows" in reply);
-      assert.lengthOf(replies, 2);
-      // Both replies carry row arrays; only the object read needs the column names.
-      assert.deepEqual(replies[0]!.columns, ["name", "one"]);
-      assert.isUndefined(replies[1]!.columns);
-      for (const reply of replies) assert.deepEqual(reply.rows, [["first", 1]]);
-    }),
-  ),
-);
-
-it.effect("fails a reader statement with an uncloneable binding and still answers the others", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const [bad, good] = yield* sql
-        .withTransaction(
-          Effect.all(
-            [
-              sql.unsafe("SELECT ? AS value", [() => 1]).pipe(Effect.exit),
-              countEntries(sql).pipe(Effect.exit),
-            ],
-            { concurrency: "unbounded" },
-          ),
-        )
-        .pipe(SqliteClient.readOnly);
-      assert.isTrue(Exit.isFailure(bad!));
-      assert.deepEqual(good, Exit.succeed(1));
-      // The worker is still in step afterwards.
-      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
-    }),
-  ),
-);
-
-it.effect("names the columns of a cached reader statement after a schema change", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const before = yield* sql`SELECT * FROM entries`.pipe(SqliteClient.readOnly);
-      assert.deepEqual(before, [{ name: "first" }]);
-      yield* sql`ALTER TABLE entries ADD COLUMN extra TEXT`;
-      const after = yield* sql`SELECT * FROM entries`.pipe(SqliteClient.readOnly);
-      assert.deepEqual(after, [{ name: "first", extra: null }]);
-    }),
-  ),
-);
-
-it.effect("keeps a reader column named __proto__", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const rows = yield* sql`SELECT 7 AS [__proto__], 9 AS ordinary`.pipe(SqliteClient.readOnly);
-      assert.deepEqual(Object.entries(rows[0]!), [
-        ["__proto__", 7],
-        ["ordinary", 9],
-      ]);
-    }),
-  ),
-);
-
-it.effect("keeps a read transaction when its first statement cannot be sent", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const snapshotTaken = yield* Deferred.make<void>();
-      const writer = yield* Effect.forkChild(
-        Deferred.await(snapshotTaken).pipe(
-          Effect.andThen(sql`INSERT INTO entries VALUES ('second')`),
-        ),
-      );
-      const counts = yield* sql
-        .withTransaction(
-          Effect.gen(function* () {
-            const unsent = yield* sql.unsafe("SELECT ? AS value", [() => 1]).pipe(Effect.exit);
-            assert.isTrue(Exit.isFailure(unsent));
-            const before = yield* countEntries(sql);
-            yield* Deferred.succeed(snapshotTaken, undefined);
-            yield* Fiber.join(writer);
-            const after = yield* countEntries(sql);
-            return { before, after };
-          }),
-        )
-        .pipe(SqliteClient.readOnly);
-      // Both reads ran inside the transaction's snapshot, which the lost BEGIN would not give.
-      assert.deepEqual(counts, { before: 1, after: 1 });
-      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 2);
-    }),
-  ),
-);
-
-it.effect("keeps a read transaction for the siblings of a statement that cannot be sent", () =>
-  withReaderClient((sql) =>
-    Effect.gen(function* () {
-      const snapshotTaken = yield* Deferred.make<void>();
-      const writer = yield* Effect.forkChild(
-        Deferred.await(snapshotTaken).pipe(
-          Effect.andThen(sql`INSERT INTO entries VALUES ('second')`),
-        ),
-      );
-      const counts = yield* sql
-        .withTransaction(
-          Effect.gen(function* () {
-            const [unsent, before] = yield* Effect.all(
-              [sql.unsafe("SELECT ? AS value", [() => 1]).pipe(Effect.exit), countEntries(sql)],
-              { concurrency: "unbounded" },
-            );
-            assert.isTrue(Exit.isFailure(unsent));
-            yield* Deferred.succeed(snapshotTaken, undefined);
-            yield* Fiber.join(writer);
-            const after = yield* countEntries(sql);
-            return { before, after };
-          }),
-        )
-        .pipe(SqliteClient.readOnly);
-      // The sibling took the transaction's snapshot, so the later read sees the same rows.
-      assert.deepEqual(counts, { before: 1, after: 1 });
-      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 2);
-    }),
-  ),
+it.effect.each([
+  { role: "reader", writerWorker: false },
+  { role: "writer", writerWorker: true },
+] as const)(
+  "fails a $role statement with an uncloneable binding on its own and lets go of the worker",
+  ({ role, writerWorker }) =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const on = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            role === "reader" ? SqliteClient.readOnly(effect) : effect;
+          const [bad, good] = yield* sql
+            .withTransaction(
+              Effect.all(
+                [
+                  sql.unsafe("SELECT ? AS value", [() => 1]).pipe(Effect.exit),
+                  countEntries(sql).pipe(Effect.exit),
+                ],
+                { concurrency: "unbounded" },
+              ),
+            )
+            .pipe(on);
+          assert(Exit.isFailure(bad));
+          assert.isFalse(Cause.hasDies(bad.cause));
+          assert.isTrue(SqlError.isSqlError(Cause.squash(bad.cause)));
+          assert.deepEqual(good, Exit.succeed(1));
+          // The worker is still in step afterwards.
+          assert.equal(yield* countEntries(sql).pipe(on), 1);
+          const worker = startedWorkers.findLast((candidate) =>
+            workerMessages.get(candidate)?.some((message) => message.sql === "SELECT ? AS value"),
+          )!;
+          assert.isFalse(workerRefs.get(worker));
+        }),
+      { writerWorker },
+    ),
 );

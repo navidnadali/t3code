@@ -60,6 +60,7 @@ export const NON_SERVER_COMMANDS: ReadonlySet<string> = new Set([
   "doctor",
   "environment",
   "help",
+  "install",
   "pair",
   "policy",
   "project",

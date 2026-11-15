@@ -60,6 +60,7 @@ const BUILT_IN_DRIVERS = [
   "fx",
   "opencode",
   "antigravity",
+  "kiro",
   "pi",
   "muse",
 ] as const;

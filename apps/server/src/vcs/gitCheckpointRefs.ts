@@ -1,4 +1,3 @@
-import * as HostProcess from "@t3tools/shared/HostProcess";
 // @effect-diagnostics nodeBuiltinImport:off - reads loose refs, packed-refs and loose objects as the files Git writes; Effect's FileSystem has no inflate and its stat lacks the inode.
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
@@ -470,34 +469,26 @@ export const makeCheckpointRefMemory = (): CheckpointRefMemory => {
   // Parsed packed-refs per common directory (insertion order = age), bounded in files and entries.
   const packed = new Map<string, PackedRefs>();
   let packedEntries = 0;
-  // The store a ref was resolved against, taken where Git looks and resolved now (a retargeted
-  // link is another store); a store with alternates borrows through links that can change, so
-  // it has no key and Git answers.
+  // The store a ref was resolved against: `<common dir>/objects`, which Git uses since VcsProcess
+  // clears inherited object selectors, resolved now (a retargeted link is another store). A store
+  // with alternates borrows through links that can change, so it has no key and Git answers.
   const refKey = (repository: CheckpointRepository, ref: string) =>
-    HostProcess.Environment.pipe(
-      Effect.flatMap((environment) =>
-        Effect.promise(async () => {
-          if ((environment.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? "") !== "") return null;
-          const configured = environment.GIT_OBJECT_DIRECTORY;
-          // Git reads a relative one from each command's own directory.
-          if (configured !== undefined && !NodePath.isAbsolute(configured)) return null;
-          const store = await new Promise<string | null>((resolve) => {
-            try {
-              NodeFS.realpath.native(
-                configured ?? NodePath.join(repository.commonDir, "objects"),
-                (error, resolved) => resolve(error ? null : resolved),
-              );
-            } catch {
-              resolve(null);
-            }
-          });
-          if (store === null) return null;
-          const alternates = await statFingerprint(NodePath.join(store, "info", "alternates"));
-          if (alternates !== "!ENOENT") return null;
-          return `${repository.commonDir}\0${store}\0${ref}`;
-        }),
-      ),
-    );
+    Effect.promise(async () => {
+      const store = await new Promise<string | null>((resolve) => {
+        try {
+          NodeFS.realpath.native(
+            NodePath.join(repository.commonDir, "objects"),
+            (error, resolved) => resolve(error ? null : resolved),
+          );
+        } catch {
+          resolve(null);
+        }
+      });
+      if (store === null) return null;
+      const alternates = await statFingerprint(NodePath.join(store, "info", "alternates"));
+      if (alternates !== "!ENOENT") return null;
+      return `${repository.commonDir}\0${store}\0${ref}`;
+    });
 
   const packedRefs = Effect.fnUntraced(function* (commonDir: string) {
     const current = yield* readPackedRefs(commonDir, packed.get(commonDir));

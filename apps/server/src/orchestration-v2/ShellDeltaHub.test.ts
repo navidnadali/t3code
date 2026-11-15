@@ -66,6 +66,7 @@ const layerHub = (input: {
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
           listActiveSubagentThreadIds: () => Effect.sync(() => [...(input.subagents?.() ?? [])]),
+          listActiveShellIndex: () => Effect.succeed([]),
           readShellSnapshot: () =>
             (input.readGate ?? Effect.void).pipe(
               Effect.map(() =>
@@ -1019,6 +1020,49 @@ it.effect(
         assert.deepEqual(sequences(yield* Fiber.join(items)), [2]);
       }).pipe(Effect.provide(layerHub({ reads, subagents: () => active })));
     }).pipe(Effect.scoped),
+);
+
+it.effect("a subagent's user-wait item updates reach the shell, known at start or not", () =>
+  Effect.gen(function* () {
+    const reads: Array<number> = [];
+    const known = ThreadId.make("thread:known-child");
+    const discovered = ThreadId.make("thread:discovered-child");
+    let active: ReadonlyArray<ThreadId> = [known];
+    const publishItem = (id: ThreadId, sequence: number, itemType: string) =>
+      Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+        yield* store.publishCommitted([
+          {
+            sequence,
+            event: { type: "turn-item.updated", threadId: id, payload: { type: itemType } },
+          } as unknown as ApplicationStoredEvent,
+        ]);
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      });
+    yield* Effect.gen(function* () {
+      const hub = yield* ShellDeltaHub.ShellDeltaHub;
+      const subscription = yield* hub.subscribe();
+      const items = yield* Effect.forkScoped(
+        subscription.stream(0).pipe(
+          Stream.takeUntil((item) => item.kind !== "resync" && item.sequence === 6),
+          Stream.runCollect,
+        ),
+      );
+      yield* TestClock.adjust(0);
+      active = [known, discovered];
+      yield* publishItem(known, 1, "secret_request");
+      yield* publishItem(discovered, 2, "link_request");
+      yield* publishItem(known, 3, "user_message");
+      yield* publishItem(discovered, 4, "secret_request");
+      yield* publishItem(discovered, 5, "command_execution");
+      yield* publish(known, 6);
+      assert.deepEqual(sequences(yield* Fiber.join(items)), [1, 2, 3, 4, 6]);
+    }).pipe(
+      Effect.provide(
+        layerHub({ reads, title: () => `read ${reads.length}`, subagents: () => active }),
+      ),
+    );
+  }).pipe(Effect.scoped),
 );
 
 const projectShell = (id: ProjectId, title: string) =>

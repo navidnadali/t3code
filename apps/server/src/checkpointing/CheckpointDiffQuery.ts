@@ -1,4 +1,5 @@
 import {
+  CHECKPOINT_DIFF_TRUNCATED_MARKER,
   OrchestrationGetTurnDiffResult,
   type OrchestrationGetFullThreadDiffInput,
   type OrchestrationGetFullThreadDiffResult,
@@ -28,7 +29,6 @@ import { isGitImport, parseTurnDiffFilesFromNumstat, type TurnDiffFileSummary } 
 
 // Windows limits a command line to 32,767 characters. Leave room for the rest of git's arguments.
 const MAX_PATHSPEC_CHARS = 24_000;
-const DIFF_TRUNCATED_MARKER = "\n\n[truncated]";
 
 function batchFilePaths(files: ReadonlyArray<TurnDiffFileSummary>) {
   const batches: string[][] = [];
@@ -176,12 +176,24 @@ export const make = Effect.gen(function* () {
           : undefined;
 
       // A range stays in the turn's scope: a thread has one per workspace it ran in, and a diff
-      // between two worktrees would show their branches' differences as the turn's changes.
+      // between two worktrees would show their branches' differences as the turn's changes. A scope
+      // starts at its earliest checkpoint a rewind kept: the thread start, or for a later workspace
+      // the baseline of its first run there.
+      const scopeStart = () => {
+        const earliest = projection.checkpoints.reduce(
+          (start, checkpoint) =>
+            checkpoint.scopeId === toScope.id && checkpoint.status !== "stale"
+              ? Math.min(start, checkpoint.ordinalWithinScope)
+              : start,
+          toCheckpoint.ordinalWithinScope,
+        );
+        return earliest < toCheckpoint.ordinalWithinScope ? earliest : 0;
+      };
       const fromCheckpointRef =
         input.fromTurnCount === 0
           ? yield* checkpointRefForScopeOrdinal({
               scopeId: toScope.id,
-              ordinalWithinScope: 0,
+              ordinalWithinScope: scopeStart(),
             }).pipe(Effect.provideService(Digest.Digest, digest))
           : (
               parentCheckpoint ??
@@ -243,10 +255,11 @@ export const make = Effect.gen(function* () {
             new TextDecoder().decode(
               Buffer.from(diff).subarray(
                 0,
-                CHECKPOINT_DIFF_MAX_OUTPUT_BYTES - Buffer.byteLength(DIFF_TRUNCATED_MARKER),
+                CHECKPOINT_DIFF_MAX_OUTPUT_BYTES -
+                  Buffer.byteLength(CHECKPOINT_DIFF_TRUNCATED_MARKER),
               ),
               { stream: true },
-            ) + DIFF_TRUNCATED_MARKER;
+            ) + CHECKPOINT_DIFF_TRUNCATED_MARKER;
           break;
         }
         remainingBytes -= patchBytes;

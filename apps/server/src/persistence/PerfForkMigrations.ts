@@ -1,3 +1,4 @@
+import { DATABASE_MIGRATION_PROGRESS_MESSAGE } from "@t3tools/shared/databaseMigrationLog";
 import * as Effect from "effect/Effect";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -17,19 +18,16 @@ const TURN_ITEM_COUNTS = "orchestration_v2_projection_turn_item_counts";
 
 type PerfForkObject = readonly [type: "table" | "trigger" | "index", name: string, table: string];
 
+const TURN_ITEM_COUNT_TRIGGERS = [
+  "orchestration_v2_turn_item_counts_insert",
+  "orchestration_v2_turn_item_counts_update",
+  "orchestration_v2_turn_item_counts_delete",
+] as const;
+
 // [id, name, migration, the objects it leaves in place]
 const perfForkMigrationEntries = [
-  [
-    1,
-    "ProjectionTurnItemCounts",
-    Migration0001,
-    [
-      ["table", TURN_ITEM_COUNTS, TURN_ITEM_COUNTS],
-      ["trigger", "orchestration_v2_turn_item_counts_insert", TURN_ITEMS],
-      ["trigger", "orchestration_v2_turn_item_counts_update", TURN_ITEMS],
-      ["trigger", "orchestration_v2_turn_item_counts_delete", TURN_ITEMS],
-    ],
-  ],
+  // Upstream's migration 85 owns the turn-item counts now; see replacePerfForkTurnItemCounts.
+  [1, "ProjectionTurnItemCounts", Migration0001, []],
   [
     2,
     "TurnItemMessageOrdinalIndex",
@@ -53,6 +51,22 @@ const RC1_LEDGER_ROWS = [
 export const isRc1PerfForkMigration = (row: { readonly id: number; readonly name: string }) =>
   RC1_LEDGER_ROWS.some(([id, name]) => row.id === id && row.name === name);
 
+// Untraced helpers below run inside their caller's span.
+const rc1LedgerRows = Effect.fnUntraced(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const upstreamLedger = yield* sql`
+    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'
+  `;
+  if (upstreamLedger.length === 0) return [];
+  const rows = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+    SELECT migration_id, name FROM effect_sql_migrations
+    WHERE migration_id IN ${sql.in(RC1_LEDGER_ROWS.map(([id]) => id))}
+  `;
+  return RC1_LEDGER_ROWS.filter(([id, name]) =>
+    rows.some((row) => row.migration_id === id && row.name === name),
+  );
+});
+
 // Effect's own DDL for a migrations table, so a moved database's schema matches a fresh one.
 const createLedger = (sql: SqlClient.SqlClient) =>
   sql`CREATE TABLE IF NOT EXISTS ${sql(PERF_FORK_MIGRATIONS_TABLE)} (
@@ -70,17 +84,7 @@ export const moveRc1PerfForkMigrations = Effect.fn("moveRc1PerfForkMigrations")(
   const sql = yield* SqlClient.SqlClient;
   yield* sql.withTransaction(
     Effect.gen(function* () {
-      const upstreamLedger = yield* sql`
-        SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'
-      `;
-      if (upstreamLedger.length === 0) return;
-      const rows = yield* sql<{ readonly migration_id: number; readonly name: string }>`
-        SELECT migration_id, name FROM effect_sql_migrations
-        WHERE migration_id IN ${sql.in(RC1_LEDGER_ROWS.map(([id]) => id))}
-      `;
-      const found = RC1_LEDGER_ROWS.filter(([id, name]) =>
-        rows.some((row) => row.migration_id === id && row.name === name),
-      );
+      const found = yield* rc1LedgerRows();
       if (found.length === 0) return;
       yield* createLedger(sql);
       const recorded = new Set(
@@ -105,11 +109,46 @@ export const moveRc1PerfForkMigrations = Effect.fn("moveRc1PerfForkMigrations")(
   );
 });
 
+/** Upstream's migration that creates the turn-item count table and triggers fork migration 1 made. */
+export const UPSTREAM_TURN_ITEM_COUNTS_MIGRATION_ID = 85;
+
+/**
+ * Runs upstream's count migration in one transaction with dropping the count table and triggers
+ * fork migration 1 left (keyed by run_id): it creates them under the same names without IF NOT
+ * EXISTS and backfills its own. Checked under the write lock, so another start's table stays.
+ */
+export const replacePerfForkTurnItemCounts = Effect.fn("replacePerfForkTurnItemCounts")(function* <
+  A,
+  E,
+  R,
+>(upstreamMigration: Effect.Effect<A, E, R>) {
+  const sql = yield* SqlClient.SqlClient;
+  return yield* sql.withTransaction(
+    Effect.gen(function* () {
+      const columns = yield* sql<{ readonly name: string }>`
+        SELECT name FROM pragma_table_info(${TURN_ITEM_COUNTS})
+      `;
+      if (columns.some((column) => column.name === "run_id")) {
+        for (const trigger of TURN_ITEM_COUNT_TRIGGERS) {
+          yield* sql.unsafe(`DROP TRIGGER IF EXISTS main."${trigger}"`);
+        }
+        yield* sql.unsafe(`DROP TABLE main."${TURN_ITEM_COUNTS}"`);
+        yield* Effect.log(
+          "Replacing the performance fork's turn-item counts with upstream's migration",
+        ).pipe(
+          Effect.annotateLogs({
+            migration: perfForkMigrationLabel([1, "ProjectionTurnItemCounts"]),
+          }),
+        );
+      }
+      return yield* upstreamMigration;
+    }),
+  );
+});
+
 // Objects not in place on their table, and those of them that sit on another table: a rebuild
 // that keeps the old table aside takes the triggers and indexes with it, under the same names.
-const inspectObjects = Effect.fn("inspectPerfForkObjects")(function* (
-  objects: ReadonlyArray<PerfForkObject>,
-) {
+const findObjects = Effect.fnUntraced(function* (objects: ReadonlyArray<PerfForkObject>) {
   const sql = yield* SqlClient.SqlClient;
   const rows = yield* sql<{
     readonly type: string;
@@ -129,15 +168,69 @@ const inspectObjects = Effect.fn("inspectPerfForkObjects")(function* (
   return { missing, misplaced };
 });
 
+const inspectObjects = Effect.fn("inspectPerfForkObjects")(function* (
+  objects: ReadonlyArray<PerfForkObject>,
+) {
+  return yield* findObjects(objects);
+});
+
+const chainEntries = (throughId: number | undefined) =>
+  perfForkMigrationEntries.filter(([id]) => throughId === undefined || id <= throughId);
+
+const isRecorded = (
+  recorded: ReadonlyArray<{ readonly migration_id: number; readonly name: string }>,
+  id: number,
+  name: string,
+) => recorded.some((row) => row.migration_id === id && row.name === name);
+
+// The recorded rows, and the migrations above the highest recorded id, which the migrator runs.
+const unrecordedEntries = Effect.fnUntraced(function* (throughId: number | undefined) {
+  const sql = yield* SqlClient.SqlClient;
+  const ledger = yield* sql`
+    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ${PERF_FORK_MIGRATIONS_TABLE}
+  `;
+  const recorded =
+    ledger.length === 0
+      ? []
+      : yield* sql<{ readonly migration_id: number; readonly name: string }>`
+          SELECT migration_id, name FROM ${sql(PERF_FORK_MIGRATIONS_TABLE)}
+        `;
+  const latest = Math.max(0, ...recorded.map((row) => row.migration_id));
+  return { recorded, unrecorded: chainEntries(throughId).filter(([id]) => id > latest) };
+});
+
+/**
+ * Whether a start's fork chain writes anything: release candidate 1's rows to move, migrations to
+ * run, or a recorded migration's objects to restore. A few small reads, cheap on every start.
+ */
+export const hasPendingPerfForkMigrations = Effect.fn("hasPendingPerfForkMigrations")(function* (
+  throughId?: number,
+) {
+  if ((yield* rc1LedgerRows()).length > 0) return true;
+  const { recorded, unrecorded } = yield* unrecordedEntries(throughId);
+  if (unrecorded.length > 0) return true;
+  for (const [id, name, , objects] of chainEntries(throughId)) {
+    if (objects.length === 0 || !isRecorded(recorded, id, name)) continue;
+    if ((yield* findObjects(objects)).missing.length > 0) return true;
+  }
+  return false;
+});
+
 const run = Migrator.make({});
 
 export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function* (
   throughId?: number,
 ) {
-  const entries = perfForkMigrationEntries.filter(
-    ([id]) => throughId === undefined || id <= throughId,
-  );
+  const entries = chainEntries(throughId);
   if (entries.length === 0) return [];
+  const { unrecorded } = yield* unrecordedEntries(throughId);
+  if (unrecorded.length > 0) {
+    yield* Effect.log(DATABASE_MIGRATION_PROGRESS_MESSAGE).pipe(
+      Effect.annotateLogs({
+        migration: unrecorded.map(([id, name]) => perfForkMigrationLabel([id, name])).join(", "),
+      }),
+    );
+  }
   const executed = yield* run({
     loader: Migrator.fromRecord(
       Object.fromEntries(entries.map(([id, name, migration]) => [`${id}_${name}`, migration])),
@@ -158,7 +251,8 @@ export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function
   // moves them to the old table it keeps), and the migrator never runs a recorded migration
   // again: run one whose objects are not in place again.
   for (const [id, name, migration, objects] of entries) {
-    if (!recorded.some((row) => row.migration_id === id && row.name === name)) continue;
+    if (objects.length === 0) continue;
+    if (!isRecorded(recorded, id, name)) continue;
     const found = yield* inspectObjects(objects);
     if (found.missing.length === 0) continue;
     const label = perfForkMigrationLabel([id, name]);
@@ -176,6 +270,9 @@ export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function
               migration: label,
               missing: now.missing.map(([, object]) => object),
             }),
+          );
+          yield* Effect.log(DATABASE_MIGRATION_PROGRESS_MESSAGE).pipe(
+            Effect.annotateLogs({ migration: label }),
           );
           for (const [type, object] of now.misplaced) {
             yield* sql.unsafe(`DROP ${type === "trigger" ? "TRIGGER" : "INDEX"} main."${object}"`);

@@ -4,6 +4,7 @@ import type {
   OrchestrationV2ThreadShell,
   ProjectId,
 } from "@t3tools/contracts";
+import { turnItemCanChangeUserWait } from "@t3tools/shared/agentAwareness";
 import type * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -58,6 +59,8 @@ export interface ShellResyncBase {
   readonly snapshotSequence: number;
   readonly threads: ReadonlyArray<OrchestrationV2ThreadShell>;
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
+  /** Threads owning a task in a linked environment, from the store's index (shells do not say). */
+  readonly remoteTaskParentIds: ReadonlySet<string>;
 }
 
 /**
@@ -151,10 +154,12 @@ interface PendingShellEvent {
   readonly transcriptOnly: boolean;
 }
 
+// A subagent's user-wait items change its parent's "Input needed", so they are never transcript-only.
 const isTranscriptEvent = (stored: ApplicationStoredEvent) =>
   !("aggregateKind" in stored) &&
   (stored.event.type === "node.updated" ||
-    stored.event.type === "turn-item.updated" ||
+    (stored.event.type === "turn-item.updated" &&
+      !turnItemCanChangeUserWait(stored.event.payload)) ||
     stored.event.type === "provider-turn.updated" ||
     stored.event.type === "message.updated");
 
@@ -325,12 +330,16 @@ const make = Effect.gen(function* () {
           readThreads: threadManagement.readShellSnapshot({ location: "active" }),
           listProjects: projects.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
+          listShellIndex: threadManagement.listActiveShellIndex(),
         }).pipe(
-          Effect.map(({ projects, threads, snapshotSequence }): ShellResyncBase => ({
+          Effect.map(({ projects, threads, snapshotSequence, index }): ShellResyncBase => ({
             schemaVersion: threads.schemaVersion,
             snapshotSequence,
             threads: threads.threads,
             projects,
+            remoteTaskParentIds: new Set(
+              index?.flatMap((entry) => (entry.hasRemoteTasks ? [entry.id] : [])),
+            ),
           })),
           Effect.mapError(
             (cause) =>

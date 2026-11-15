@@ -31,6 +31,8 @@ async function loadCliMain(): Promise<typeof import("./binMain.ts")> {
   }
 }
 
+function ignoreOutputError(): void {}
+
 if (
   isEntrypoint({
     moduleUrl: import.meta.url,
@@ -39,15 +41,31 @@ if (
   })
 ) {
   const youngGeneration = applyYoungGenerationDefault();
-  // The launcher owns shutdown until its child exits, so it bypasses the Effect CLI runtime.
-  // The service unit passes no arguments; flags and help go through the full CLI.
-  if (process.argv[2] === "__node-flags") {
+  if (process.argv[2] === "__process-spawner") {
+    const { runProcessSpawner } = await import("./process/spawnerSources.ts");
+    runProcessSpawner();
+  } else if (process.argv[2] === "__node-flags") {
     printNodeFlags(youngGeneration);
-  } else if (process.argv[2] === "__service-launcher" && process.argv.length === 3) {
-    const { runServiceLauncherCli } = await import("./cli/serviceLauncher.ts");
-    await runServiceLauncherCli();
   } else {
-    const { runCliCommand } = await loadCliMain();
-    await runCliCommand(youngGeneration);
+    // Logs go to stdout and stderr, which may be a closed desktop launcher pipe or a log file on
+    // a full disk. Node emits a failed write as an unhandled stream error that crashes the process
+    // and skips shutdown, so drop the line instead.
+    process.stdout.on("error", ignoreOutputError);
+    process.stderr.on("error", ignoreOutputError);
+
+    // The launcher owns shutdown until its child exits, so it bypasses the Effect CLI runtime.
+    // A service unit passes nothing, or on Windows the launcher's own flags; help and anything
+    // else go through the full CLI.
+    const launcher =
+      process.argv[2] === "__service-launcher"
+        ? await import("./cli/serviceLauncher.ts")
+        : undefined;
+    const launcherOptions = launcher?.parseServiceLauncherArgs(process.argv.slice(3));
+    if (launcher !== undefined && launcherOptions !== undefined) {
+      await launcher.runServiceLauncherCli(launcherOptions);
+    } else {
+      const { runCliCommand } = await loadCliMain();
+      await runCliCommand(youngGeneration);
+    }
   }
 }

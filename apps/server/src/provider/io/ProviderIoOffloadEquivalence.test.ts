@@ -165,7 +165,6 @@ const runCodex = (
       logOutgoing: true,
       logger: makeCodexAppServerProtocolLogger({
         nativeEventLogger: native,
-        threadId,
         providerSessionId: providerSessionId as never,
       })!,
       ...(lineOffload === undefined ? {} : { lineOffload }),

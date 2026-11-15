@@ -23,7 +23,7 @@ import * as Queue from "effect/Queue";
 import * as Redacted from "effect/Redacted";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
-import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
+import { type ChildProcessHandle, ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
 import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
@@ -31,7 +31,14 @@ import * as ProcessRunner from "../processRunner.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { spawnerProcessIds } from "./spawnerProcesses.ts";
+import * as NonBlockingSpawner from "./NonBlockingSpawner.ts";
 import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
+
+// What the server's callers get from its ambient spawner: upstream's NonBlockingSpawner over
+// Node's (on Linux a start runs through `env`, which its command line in an error shows).
+const serverPlatform = NonBlockingSpawner.layer.pipe(
+  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+);
 
 // Windows keeps the main-thread spawner, so the worker cases run elsewhere.
 const workerPlatform = HostProcess.Platform.defaultValue() !== "win32";
@@ -228,6 +235,8 @@ const manualTimers = Effect.gen(function* () {
     timers,
     fireHandshake: Effect.flatMap(Queue.take(handshake), (fire) => Effect.sync(fire)),
     fireStart: Effect.flatMap(Queue.take(start), (fire) => Effect.sync(fire)),
+    // A start has reached the spawner: its answer deadline is armed (and left unfired).
+    startArmed: Effect.asVoid(Queue.take(start)),
   };
 });
 
@@ -287,10 +296,7 @@ describe("WorkerChildProcessSpawner", () => {
           expect((yield* collect(remoteSpawner, commands[9]!)).stdout).toHaveLength(
             3 * 1024 * 1024,
           );
-        }).pipe(
-          Effect.scoped,
-          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-        ),
+        }).pipe(Effect.scoped, Effect.provide(serverPlatform)),
     );
 
     it.live.skipIf(!workerPlatform)(
@@ -364,6 +370,122 @@ describe("WorkerChildProcessSpawner", () => {
         ),
     );
 
+    // Input cut short by a failing source is the command's failure, whatever the child does then.
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: fails the command whose stdin source fails, like the Node spawner`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          const sourceFailure = PlatformError.badArgument({
+            module: "Test",
+            method: "stdin",
+            description: "the input source failed",
+          });
+          // Exits 0 once the first chunk arrives, after the source failed.
+          const command = node("process.stdin.once('data', () => process.exit(0))", {
+            stdin: Stream.make(new Uint8Array([1])).pipe(Stream.concat(Stream.fail(sourceFailure))),
+          });
+          const exit = (spawner: ChildProcessSpawner["Service"]) =>
+            spawner.spawn(command).pipe(
+              Effect.flatMap((handle) => Effect.exit(handle.exitCode)),
+              Effect.scoped,
+            );
+          const expected = yield* exit(nodeSpawner);
+          expect(expected).toEqual(Exit.fail(sourceFailure));
+          expect(yield* exit(remoteSpawner)).toEqual(expected);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+    );
+
+    // A non-detached child leads no group: once it has exited, its PID's group may be another's.
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: signals no process group for an exited non-detached child, like the Node spawner`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          const kill = yield* Effect.acquireRelease(
+            Effect.sync(() => vi.spyOn(process, "kill")),
+            (kill) => Effect.sync(() => kill.mockRestore()),
+          );
+          const run = (
+            spawner: ChildProcessSpawner["Service"],
+            script: string,
+            use: (handle: ChildProcessHandle) => Effect.Effect<unknown>,
+          ) =>
+            Effect.gen(function* () {
+              const handle = yield* spawner.spawn(node(script, { detached: false }));
+              yield* use(handle);
+              return handle.pid;
+            }).pipe(Effect.scoped);
+          const cases: ReadonlyArray<
+            readonly [string, (handle: ChildProcessHandle) => Effect.Effect<unknown>]
+          > = [
+            // Exits non-zero once it has input, so after its handle exists: its exit cleanup and
+            // its release.
+            [
+              "process.stdin.once('data', () => process.exit(3))",
+              (handle) =>
+                Stream.run(Stream.make(new Uint8Array([1])), handle.stdin).pipe(
+                  Effect.andThen(Effect.exit(handle.exitCode)),
+                  Effect.ignore,
+                ),
+            ],
+            // Killed while it runs: polled until it has exited, then released.
+            ["setInterval(() => {}, 1000)", (handle) => Effect.exit(handle.kill())],
+          ];
+          const pids = [];
+          for (const spawner of [nodeSpawner, remoteSpawner]) {
+            for (const [script, use] of cases) pids.push(yield* run(spawner, script, use));
+          }
+          // Exit listeners run after the exit's waiters: let the last ones finish.
+          yield* Effect.yieldNow;
+          // Every signal sent to each child's PID as a group, from its start to its release.
+          const groupSignals = pids.map((pid) =>
+            kill.mock.calls.filter(([target]) => target === -pid).map(([, signal]) => signal),
+          );
+          expect(groupSignals).toEqual([[], ["SIGTERM"], [], ["SIGTERM"]]);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+    );
+
+    // The shell joins its words into one script, so a separate argument would run as shell code.
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: refuses a shell command with separate arguments, like the Node spawner`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          const command = ChildProcess.make("printf", ["SAFE; printf INJECTED"], { shell: true });
+          const run = (spawner: ChildProcessSpawner["Service"]) =>
+            spawner.spawn(command).pipe(
+              Effect.flatMap((handle) => Stream.mkString(Stream.decodeText(handle.stdout))),
+              Effect.scoped,
+              Effect.exit,
+            );
+          const expected = yield* run(nodeSpawner);
+          expect(expected).toEqual(
+            Exit.fail(
+              PlatformError.badArgument({
+                module: "ChildProcess",
+                method: "spawn",
+                description:
+                  "The shell option cannot be combined with arguments; pass the whole script as the command",
+              }),
+            ),
+          );
+          expect(yield* run(remoteSpawner)).toEqual(expected);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+    );
+
     it.live.skipIf(!workerPlatform)(
       `${remote.name}: kills a running child, escalating to SIGKILL after forceKillAfter`,
       () =>
@@ -388,10 +510,7 @@ describe("WorkerChildProcessSpawner", () => {
             expect(result).toEqual(yield* killed(nodeSpawner, ignoreSigterm));
             expect(result.exit.causeMessage).toContain(ignoreSigterm ? "SIGKILL" : "SIGTERM");
           }
-        }).pipe(
-          Effect.scoped,
-          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-        ),
+        }).pipe(Effect.scoped, Effect.provide(serverPlatform)),
     );
   }
 
@@ -453,8 +572,13 @@ describe("WorkerChildProcessSpawner", () => {
                 ? true
                 : realKill(pid, signal),
             );
-            yield* handle.kill();
+            const killed = yield* Effect.exit(handle.kill());
             expect(kill).not.toHaveBeenCalledWith(-handle.pid, 0);
+            // Without a group of its own, an exited child is not there to kill, as on Node's spawner.
+            expect(Exit.isSuccess(killed)).toBe(detached);
+            if (!detached) {
+              expect(kill.mock.calls.filter(([pid]) => pid === -handle.pid)).toEqual([]);
+            }
           }).pipe(Effect.scoped, Effect.ensuring(Effect.sync(() => kill.mockRestore())));
         }
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
@@ -941,13 +1065,14 @@ describe("WorkerChildProcessSpawner", () => {
       const { layer, waitFor } = capturedLogs();
       return Effect.gen(function* () {
         const { calls, spawner } = yield* recordingSpawner;
-        const { timers, fireHandshake } = yield* manualTimers;
+        const { timers, fireHandshake, startArmed } = yield* manualTimers;
         // A process that never says anything.
         const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(spawner, {
           source: "setInterval(() => {}, 1 << 30)",
           timers,
         });
         const pending = yield* Effect.forkScoped(spawnError(remoteSpawner, node("1")));
+        yield* startArmed;
         yield* fireHandshake;
         expect(yield* Fiber.join(pending)).toMatchObject({
           method: "spawn",

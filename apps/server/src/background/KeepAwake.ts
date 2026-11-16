@@ -2,7 +2,6 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as ChildProcess from "effect/process/ChildProcess";
-import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -11,6 +10,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Settings from "../serverSettings.ts";
 
@@ -101,7 +101,8 @@ export const layer = Layer.effectDiscard(
     const settings = yield* Settings.ServerSettingsService;
     const events = yield* OrchestrationEventStore.OrchestrationEventStore;
     const sql = yield* SqlClient.SqlClient;
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    // The server's command spawner where it has one: holds start as runs start, never forking it.
+    const spawner = yield* WorkerChildProcessSpawner.commandSpawner;
 
     const hasActiveRun = sql<{ readonly active: number }>`
       SELECT EXISTS (
@@ -155,12 +156,11 @@ export const layer = Layer.effectDiscard(
 
     const holdOnce = spawner
       .spawn(
+        // Piped with an empty input: the server's spawner process starts only piped commands.
         ChildProcess.make(command.command, command.args, {
           detached: false,
           shell: false,
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
+          stdin: Stream.empty,
         }),
       )
       .pipe(
@@ -169,6 +169,14 @@ export const layer = Layer.effectDiscard(
         ),
         Effect.tap(() =>
           Effect.addFinalizer(() => Effect.logInfo("keep-awake released sleep inhibitor")),
+        ),
+        // Drained aside, so the hold ends with the inhibitor even if a child keeps its output.
+        Effect.tap((child) =>
+          Effect.forkScoped(
+            Effect.all([Stream.runDrain(child.stdout), Stream.runDrain(child.stderr)], {
+              concurrency: 2,
+            }),
+          ),
         ),
         Effect.flatMap((child) => child.exitCode),
         Effect.flatMap((exitCode) =>

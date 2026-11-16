@@ -21,12 +21,19 @@ interface Growth {
   readonly growthBytes: number;
 }
 
+export interface HeapAttributionOptions {
+  readonly heapUsed?: () => number;
+  /** Spans that are neither measured nor named as suspects. */
+  readonly skip?: (spanName: string) => boolean;
+}
+
 /**
  * Heap growth is approximate: it includes other fibers' allocations and GC, so it names
  * suspects, not culprits. A spike lists what was open or just grew.
  */
-export const make = (tracer: Tracer.Tracer, heapUsed: () => number = readHeapUsed) =>
+export const make = (tracer: Tracer.Tracer, attributionOptions: HeapAttributionOptions = {}) =>
   Effect.sync(() => {
+    const { heapUsed = readHeapUsed, skip } = attributionOptions;
     const open = new Map<
       Tracer.Span,
       { readonly name: string; readonly startHeap: number; readonly startTick: number }
@@ -40,6 +47,7 @@ export const make = (tracer: Tracer.Tracer, heapUsed: () => number = readHeapUse
       ...(tracer.context === undefined ? {} : { context: tracer.context }),
       span(options) {
         const span = tracer.span(options);
+        if (skip?.(options.name)) return span;
         const startHeap = heapUsed();
         open.set(span, { name: options.name, startHeap, startTick: tick });
         const end = span.end.bind(span);

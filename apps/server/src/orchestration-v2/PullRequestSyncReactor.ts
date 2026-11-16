@@ -40,10 +40,20 @@ import { isTerminalRunStatus } from "./ThreadManagementService.ts";
 
 const SLOW_SYNC_INTERVAL_MS = 15 * 60 * 1_000;
 // Every server polls every open linked pull request, and most of them sit untouched for days.
-// One nobody has updated for QUIET_AFTER_MS is read on the quiet cadence instead of each sweep;
-// requested refreshes, watches and a host CLI's merge command still read it at once.
+// One nobody has updated for QUIET_AFTER_MS is read again after a sixth of how long it had been
+// quiet when last read, within the bounds below; requested refreshes, watches and a host CLI's
+// merge command still read it at once.
 export const QUIET_AFTER_MS = 30 * 60 * 1_000;
 export const QUIET_SYNC_INTERVAL_MS = 5 * 60 * 1_000;
+const QUIET_SYNC_MAX_INTERVAL_MS = 60 * 60 * 1_000;
+const QUIET_SYNC_BACKOFF_DIVISOR = 6;
+
+/** How long after a read a pull request quiet for `quietForMs` at that read is due again. */
+export const quietSyncIntervalMs = (quietForMs: number) =>
+  Math.min(
+    QUIET_SYNC_MAX_INTERVAL_MS,
+    Math.max(QUIET_SYNC_INTERVAL_MS, quietForMs / QUIET_SYNC_BACKOFF_DIVISOR),
+  );
 // A pull request closed this long ago is rarely reopened, so the sweep stops reading it, as it
 // does merged ones. A reader that sees it open, or a requested refresh, still reads it at once.
 const CLOSED_FINAL_AFTER_MS = 24 * 60 * 60 * 1_000;
@@ -237,14 +247,17 @@ function snapshotFieldsOf(summary: PullRequestSummary): SnapshotFields {
   };
 }
 
-// GitHub briefly returns unknown after base pushes; other hosts may mean a lasting condition.
+// GitHub briefly returns unknown after base pushes, as GitLab does while it checks (unchecked,
+// checking, preparing); other hosts may mean a lasting condition.
+const RECHECKING_PROVIDERS: ReadonlySet<string> = new Set(["github", "gitlab"]);
+
 function withKnownMergeability(
   previous: ThreadPullRequestSnapshot | null,
   fields: SnapshotFields,
   provider: PullRequestSummary["provider"],
 ): SnapshotFields {
   if (
-    provider !== "github" ||
+    !RECHECKING_PROVIDERS.has(provider) ||
     fields.state !== "open" ||
     fields.mergeability !== "unknown" ||
     previous?.updatedAt !== fields.updatedAt
@@ -389,11 +402,12 @@ export const make = Effect.gen(function* () {
     if (active.every(isFinal)) return false;
     const open = active.filter((entry) => entry.link.snapshot?.state === "open");
     if (open.length > 0) {
-      const quiet = open.every((entry) => {
-        const updatedAt = entry.link.snapshot?.updatedAt;
-        return updatedAt != null && nowMs - Date.parse(updatedAt) >= QUIET_AFTER_MS;
-      });
-      return !quiet || sinceLastMs >= QUIET_SYNC_INTERVAL_MS;
+      // NaN, from a missing or unparsable updatedAt, counts as recently updated.
+      const updatedAtMs = Math.max(
+        ...open.map((entry) => Date.parse(entry.link.snapshot?.updatedAt ?? "")),
+      );
+      if (!(nowMs - updatedAtMs >= QUIET_AFTER_MS)) return true;
+      return last === undefined || sinceLastMs >= quietSyncIntervalMs(last - updatedAtMs);
     }
     return sinceLastMs >= SLOW_SYNC_INTERVAL_MS;
   };
@@ -594,8 +608,9 @@ export const make = Effect.gen(function* () {
           }
         }
       }
-      // The host answered, so the cadence clock ticks even if a dispatch below is rejected.
-      lastSyncedAt.set(key, nowMs);
+      // The host answered, so the cadence clock ticks even if a dispatch below is rejected. It
+      // counts from the answer: a read that queued for the host is due no sooner for the wait.
+      lastSyncedAt.set(key, yield* Clock.currentTimeMillis);
       requested.delete(key);
       yield* Effect.forEach(
         entries,

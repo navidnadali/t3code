@@ -309,7 +309,19 @@ it.effect("keeps the anchor a retained stream head borrows from", () =>
     const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
     const now = yield* DateTime.now;
     const threadId = ThreadId.make("thread:prune-head");
-    yield* sink.write({ events: [threadCreated(makeThread(threadId, now), now)] });
+    const thread = makeThread(threadId, now);
+    yield* sink.write({
+      events: [
+        threadCreated(thread, now),
+        ...[1, 2].map((revision) => ({
+          id: EventId.make(`event:prune-head:metadata:${revision}`),
+          type: "thread.metadata-updated" as const,
+          threadId,
+          occurredAt: now,
+          payload: { ...thread, title: `Title ${revision}` },
+        })),
+      ],
+    });
     yield* sink.write({ events: subagentEvents(threadId, now, 0) });
     // The stream's newest row borrows prompt A, so it is kept below the boundary.
     yield* sink.write({ events: subagentEvents(threadId, now, 0, "repeat") });

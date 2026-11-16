@@ -1,0 +1,4 @@
+#!/bin/sh
+# A native-looking launcher, as fake-claude/claude: provider instances run it like an agent binary.
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+exec "${BENCH_NODE:-node}" "$dir/acp-agent.mjs" "$@"

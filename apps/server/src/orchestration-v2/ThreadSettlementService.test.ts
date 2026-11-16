@@ -23,6 +23,7 @@ import {
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
+import * as Clock from "effect/Clock";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -1752,7 +1753,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
       }),
   );
 
-  it.effect("reads a quiet open branch pull request every 5 minutes", () =>
+  it.effect("reads an open branch pull request quiet for half an hour every 5 minutes", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(Date.parse(NOW));
       const fixture = yield* makeHarness({
@@ -1773,7 +1774,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
             makePullRequestSummary({
               ...input,
               state: "open",
-              updatedAt: DateTime.formatIso(DateTime.makeUnsafe(Date.parse(NOW) - 2 * DAY_MS)),
+              updatedAt: DateTime.formatIso(DateTime.makeUnsafe(Date.parse(NOW) - 30 * 60_000)),
             }),
           ),
       });
@@ -1806,6 +1807,56 @@ describe("ThreadSettlementServiceV2 worker", () => {
         }
       }).pipe(Effect.provide(fixture.layer));
     }),
+  );
+
+  it.effect.each([
+    { quiet: "six hours", quietForMinutes: 6 * 60, next: 60 },
+    { quiet: "two hours", quietForMinutes: 2 * 60, next: 20 },
+  ])(
+    "reads an open branch pull request quiet for $quiet again $next minutes later",
+    ({ quietForMinutes, next }) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const reads: Array<number> = [];
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("active-branch", {
+              branch: "feature",
+              latestUserMessageAt: DateTime.makeUnsafe("2026-08-27T00:00:00.000Z"),
+              branchPullRequest: {
+                projectId: PROJECT_ID,
+                repository: "owner/repository",
+                number: 42,
+                url: "https://example.test/owner/repository/pull/42",
+              },
+            }),
+          ]),
+          pullRequestSummary: (input) =>
+            Clock.currentTimeMillis.pipe(
+              Effect.map((nowMs) => {
+                reads.push((nowMs - Date.parse(NOW)) / 60_000);
+                return makePullRequestSummary({
+                  ...input,
+                  state: "open",
+                  updatedAt: DateTime.formatIso(
+                    DateTime.makeUnsafe(Date.parse(NOW) - quietForMinutes * 60_000),
+                  ),
+                });
+              }),
+            ),
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
+          for (let minute = 1; minute <= next; minute++) {
+            yield* TestClock.adjust("1 minute");
+            yield* Queue.take(fixture.snapshotReads);
+            yield* reactor.drain;
+          }
+          assert.deepStrictEqual(reads, [0, next]);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
   );
 
   it.effect.each([

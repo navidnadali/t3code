@@ -6,6 +6,14 @@ import {
   DATABASE_MIGRATIONS_FINISHED_MESSAGE,
   DATABASE_MIGRATIONS_STARTED_MESSAGE,
 } from "@t3tools/shared/databaseMigrationLog";
+import {
+  hasPendingPerfForkMigrations,
+  moveRc1PerfForkMigrations,
+  perfForkMigrationLabel,
+  replacePerfForkTurnItemCounts,
+  runPerfForkMigrations,
+  UPSTREAM_TURN_ITEM_COUNTS_MIGRATION_ID,
+} from "./PerfForkMigrations.ts";
 import { reconcileV2PreviewMigration } from "./reconcileV2PreviewMigration.ts";
 
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -255,7 +263,8 @@ const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function*
 
 const latestMigrationId = Math.max(...migrationEntries.map(([id]) => id));
 
-// Mirrors the Migrator, which runs only ids above the highest recorded, plus the V2-preview reconciliation.
+// Mirrors the Migrator, which runs only ids above the highest recorded, plus the V2-preview
+// reconciliation and the fork's chain, which runs after upstream's.
 export const hasPendingMigrations = Effect.fn("hasPendingMigrations")(function* () {
   const sql = yield* SqlClient.SqlClient;
   const tables = yield* sql`
@@ -269,20 +278,30 @@ export const hasPendingMigrations = Effect.fn("hasPendingMigrations")(function* 
     FROM effect_sql_migrations
   `;
   const row = rows[0];
-  return (row?.latestId ?? 0) < latestMigrationId || (row?.previewRows ?? 0) > 0;
+  return (
+    (row?.latestId ?? 0) < latestMigrationId ||
+    (row?.previewRows ?? 0) > 0 ||
+    (yield* hasPendingPerfForkMigrations())
+  );
 });
 
 const run = Migrator.make({});
 
 export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
+  readonly toPerfForkMigrationInclusive?: number | undefined;
 }
 
-export const runMigrations = Effect.fn("runMigrations")(function* ({
+/** Both chains' runs; `runMigrations` returns upstream's alone, as its callers expect. */
+export const runMigrationChains = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
+  toPerfForkMigrationInclusive,
 }: RunMigrationsOptions = {}) {
   // The desktop waits past its readiness budget until the finished line follows this one.
-  if (yield* hasPendingMigrations()) yield* Effect.log(DATABASE_MIGRATIONS_STARTED_MESSAGE);
+  const started = yield* hasPendingMigrations();
+  if (started) yield* Effect.log(DATABASE_MIGRATIONS_STARTED_MESSAGE);
+  // Before upstream's chain reads its ledger: release candidate 1 recorded the fork's there.
+  yield* moveRc1PerfForkMigrations();
   const includesV2 =
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
   const previewMigrations = includesV2 ? yield* reconcileV2PreviewMigration() : [];
@@ -316,12 +335,13 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
         }),
       );
     }
-    executedMigrations.push(...(yield* run({ loader: makeMigrationLoader(id) })));
+    const migration = run({ loader: makeMigrationLoader(id) });
+    executedMigrations.push(
+      ...(yield* id === UPSTREAM_TURN_ITEM_COUNTS_MIGRATION_ID
+        ? replacePerfForkTurnItemCounts(migration)
+        : migration),
+    );
   }
-  const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
-  yield* migrations.length === 0
-    ? Effect.logDebug("Database schema is current")
-    : Effect.log(DATABASE_MIGRATIONS_FINISHED_MESSAGE).pipe(Effect.annotateLogs({ migrations }));
 
   const recorded = yield* sql<{
     readonly migration_id: number;
@@ -342,5 +362,26 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
       "Database migration history diverges from this build; recorded migration ids are skipped, not reconciled by name.",
     ).pipe(Effect.annotateLogs({ divergent }));
   }
-  return executedMigrations;
+  const perfFork =
+    toMigrationInclusive === undefined || toMigrationInclusive >= latestMigrationId
+      ? yield* runPerfForkMigrations(toPerfForkMigrationInclusive)
+      : [];
+  // After the fork's chain too: its index builds and restores can take minutes.
+  const migrations = migrationRunLabels({ upstream: executedMigrations, perfFork });
+  yield* started || migrations.length > 0
+    ? Effect.log(DATABASE_MIGRATIONS_FINISHED_MESSAGE).pipe(Effect.annotateLogs({ migrations }))
+    : Effect.logDebug("Database schema is current");
+  return { upstream: executedMigrations, perfFork };
 });
+
+export const runMigrations = (options?: RunMigrationsOptions) =>
+  runMigrationChains(options).pipe(Effect.map(({ upstream }) => upstream));
+
+/** Every migration a start ran, upstream's then the fork's, as reports list them. */
+export const migrationRunLabels = (runs: {
+  readonly upstream: ReadonlyArray<readonly [number, string]>;
+  readonly perfFork: ReadonlyArray<readonly [number, string]>;
+}) => [
+  ...runs.upstream.map(([id, name]) => `${id}_${name}`),
+  ...runs.perfFork.map(perfForkMigrationLabel),
+];

@@ -1,6 +1,11 @@
 import packageJson from "../../package.json" with { type: "json" };
 import { BUILD_MIGRATION_HEAD, recordedMigrations } from "../persistence/databaseMigrationHead.ts";
 import { skippedV2Migrations } from "../persistence/Migrations.ts";
+import {
+  PERF_FORK_MIGRATION_HEAD,
+  PERF_FORK_MIGRATIONS_TABLE,
+  perfForkMigrationLabel,
+} from "../persistence/PerfForkMigrations.ts";
 import { reconciledV2PreviewHistory } from "../persistence/reconcileV2PreviewMigration.ts";
 import {
   isSupportedLauncherProtocol,
@@ -44,16 +49,22 @@ export function runServicePreflight(input: {
   }
 
   const recorded = recordedMigrations(input.databasePath);
-  if (recorded === null) {
+  const recordedFork = recordedMigrations(input.databasePath, PERF_FORK_MIGRATIONS_TABLE);
+  if (recorded === null || recordedFork === null) {
     return {
       status: "blocked",
       version,
       reason: `Could not read this database to confirm t3@${version} supports it.`,
     };
   }
-  const newer = recorded
-    .filter(({ id }) => id > BUILD_MIGRATION_HEAD)
-    .map(({ id, name }) => `${id}_${name}`);
+  const newer = [
+    ...recorded
+      .filter(({ id }) => id > BUILD_MIGRATION_HEAD)
+      .map(({ id, name }) => `${id}_${name}`),
+    ...recordedFork
+      .filter(({ id }) => id > PERF_FORK_MIGRATION_HEAD)
+      .map(({ id, name }) => perfForkMigrationLabel([id, name])),
+  ];
   if (newer.length > 0) {
     return {
       status: "blocked",

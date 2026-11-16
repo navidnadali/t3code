@@ -5,6 +5,7 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -15,6 +16,7 @@ import { makeClaudeTextGeneration } from "../../textGeneration/ClaudeTextGenerat
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as ServerConfig from "../../config.ts";
+import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
@@ -102,7 +104,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     enabled,
     config,
   }) {
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const spawner = yield* WorkerChildProcessSpawner.commandSpawner;
+    // Workspace scans run in the caller's context, so they take the launcher captured here.
+    const launcher = yield* Effect.serviceOption(WorkerChildProcessSpawner.ProviderProcessLauncher);
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     // The server cwd is $HOME in packaged desktop builds, and `claude`
@@ -419,6 +423,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           ),
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),
+          (scan) =>
+            Option.isSome(launcher)
+              ? Effect.provideService(
+                  scan,
+                  WorkerChildProcessSpawner.ProviderProcessLauncher,
+                  launcher.value,
+                )
+              : scan,
         ),
       orchestrationAdapter,
       textGeneration,

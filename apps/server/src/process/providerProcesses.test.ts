@@ -56,6 +56,53 @@ const ownedProcess = Effect.gen(function* () {
 });
 
 describe.runIf(HostProcess.Platform.defaultValue() === "linux")("ProviderProcesses", () => {
+  // A handed-off CLI's parent is the spawner process, which read its start time before it ran.
+  it.live("records a provider another process started only by the start time it reported", () =>
+    Effect.gen(function* () {
+      // A grandchild, as a handed-off CLI is the server's.
+      const shell = NodeChildProcess.spawn("/bin/sh", ["-c", "sleep 600 & echo $!; wait"], {
+        stdio: ["ignore", "pipe", "ignore"],
+        detached: true,
+      });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          try {
+            process.kill(-shell.pid!, "SIGKILL");
+          } catch {}
+        }),
+      );
+      const pid = yield* Effect.callback<number>((resume) => {
+        shell.stdout!.once("data", (data: Buffer) => resume(Effect.succeed(Number(String(data)))));
+      });
+      const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const startTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!;
+      const context = yield* Layer.build(ProviderProcesses.layer);
+      const { register } = Context.get(context, ProviderProcesses.ProviderProcesses);
+      assert(register !== undefined);
+      expect(() => register(pid)).toThrow("Cannot identify spawned provider");
+      expect(() => register(pid, `${startTime}0`)).toThrow("Cannot identify spawned provider");
+      const forget = register(pid, startTime);
+      const directory = NodePath.join(
+        (yield* ServerConfig.ServerConfig).stateDir,
+        "provider-processes",
+      );
+      const recorded = NodeFS.readdirSync(directory).flatMap((file) => {
+        const record = JSON.parse(NodeFS.readFileSync(NodePath.join(directory, file), "utf8"));
+        return record.processes as ReadonlyArray<{ readonly pid: number }>;
+      });
+      expect(recorded.map((entry) => entry.pid)).toEqual([pid]);
+      forget();
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(HostProcess.Platform, "linux"),
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-spawner-ownership-" }).pipe(
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.live("reaps only recorded CLIs of dead servers before startup completes", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;

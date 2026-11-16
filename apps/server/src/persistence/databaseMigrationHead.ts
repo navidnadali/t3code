@@ -3,13 +3,16 @@ import * as NodeFS from "node:fs";
 import * as NodeSqlite from "node:sqlite";
 
 import { migrationManifest } from "./Migrations.ts";
+import { isRc1PerfForkMigration } from "./PerfForkMigrations.ts";
 
 export const BUILD_MIGRATION_HEAD = Math.max(...migrationManifest.map(([id]) => id));
 
-/** Migrations the database records, read-only. A missing or new database records none; one that
- * exists but cannot be read is null, since its history is unknown. */
+/** Migrations the database records in `table`, read-only. A missing or new database records none;
+ * one that exists but cannot be read is null, since its history is unknown. Startup moves the
+ * fork's release candidate 1 rows out of upstream's ledger, so they are left out. */
 export function recordedMigrations(
   databasePath: string,
+  table = "effect_sql_migrations",
 ): ReadonlyArray<{ readonly id: number; readonly name: string }> | null {
   let db: NodeSqlite.DatabaseSync;
   try {
@@ -19,15 +22,14 @@ export function recordedMigrations(
   }
   try {
     const hasTable = db
-      .prepare(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'",
-      )
-      .get();
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table);
     if (hasTable === undefined) return [];
     return db
-      .prepare("SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id")
+      .prepare(`SELECT migration_id, name FROM "${table}" ORDER BY migration_id`)
       .all()
-      .map((row) => ({ id: Number(row.migration_id), name: String(row.name) }));
+      .map((row) => ({ id: Number(row.migration_id), name: String(row.name) }))
+      .filter((row) => !isRc1PerfForkMigration(row));
   } catch {
     return null;
   } finally {

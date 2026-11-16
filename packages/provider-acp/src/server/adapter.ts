@@ -66,7 +66,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
-import type * as EffectAcpProtocol from "effect-acp/protocol";
+import * as EffectAcpProtocol from "effect-acp/protocol";
 import type * as EffectAcpSchema from "effect-acp/compat";
 
 import { formatReadToolLabel, formatSearchToolLabel } from "@t3tools/shared/toolActivity";
@@ -74,6 +74,7 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { makeAcpMcpOverAcpBridge, type AcpMcpOverAcpBridge } from "./mcpOverAcpBridge.ts";
 import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import { ProviderIoStageDriver } from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import {
   applyAcpAgentTerminalUpdate,
@@ -5920,15 +5921,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             node,
           });
           yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver,
+            turnItem,
+          });
+          // Publish the actionable request only after its timeline item.
+          yield* emitProviderEvent({
             type: "runtime_request.updated",
             driver,
             threadId: context.input.threadId,
             runtimeRequest,
-          });
-          yield* emitProviderEvent({
-            type: "turn_item.updated",
-            driver,
-            turnItem,
           });
           return {
             context,
@@ -6045,15 +6047,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             node,
           });
           yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver,
+            turnItem,
+          });
+          // Publish the actionable request only after its timeline item.
+          yield* emitProviderEvent({
             type: "runtime_request.updated",
             driver,
             threadId: context.input.threadId,
             runtimeRequest,
-          });
-          yield* emitProviderEvent({
-            type: "turn_item.updated",
-            driver,
-            turnItem,
           });
           return {
             answers,
@@ -7173,6 +7176,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
               Effect.provideService(AgentScope, agentScope),
               Effect.provideService(AgentScopeThreadId, threadId ?? undefined),
+              Effect.provideService(ProviderIoStageDriver, driver),
             );
         });
 
@@ -7254,6 +7258,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
                 Effect.provideService(AgentScope, agentScope),
                 Effect.provideService(AgentScopeThreadId, threadId ?? undefined),
+                Effect.provideService(ProviderIoStageDriver, driver),
               );
             yield* replacementRuntime.handleSessionUpdate((notification) =>
               Effect.suspend(() => handleCandidateSessionUpdate(notification)),
@@ -8706,9 +8711,26 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   )
                 : Deferred.succeed(context.promptDispatched, undefined).pipe(
                     Effect.andThen(compactSession.compact(runtime, requestedSessionId)),
-                    Effect.as({ stopReason: "end_turn" } satisfies EffectAcpSchema.PromptResponse),
+                    Effect.as<EffectAcpSchema.PromptResponse>({ stopReason: "end_turn" }),
                   )
             ).pipe(
+              Effect.provideService(
+                EffectAcpProtocol.AcpOutgoingSubmit,
+                turnInput.submit === undefined
+                  ? undefined
+                  : (enqueue) =>
+                      turnInput.submit!(enqueue).pipe(
+                        Effect.mapError(
+                          (cause) =>
+                            new EffectAcpErrors.AcpRequestError({
+                              code: -32800,
+                              operation: "enqueue-request",
+                              method: "session/prompt",
+                              errorMessage: cause.message,
+                            }),
+                        ),
+                      ),
+              ),
               // Settle the wire before the completion callback's permit so a settled-soft
               // Stop sees the native return. Capture usage only before finalize: a late
               // response must not flip a settled turn.
@@ -9152,9 +9174,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 context.finalized ||
                 context.providerTurnId !== turnInput.providerTurnId
               ) {
-                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                  driver,
-                  detail: `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver: driver,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                  deliveryNotSent: true,
+                  cause: `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
                 });
               }
               // An agent that drops an early cancel drops an early steer too.
@@ -9164,11 +9189,32 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   Effect.timeoutOption(startHold.bound),
                 );
               }
-              const steerId = yield* steering.send(
-                runtime,
-                context.nativeThreadId,
-                turnInput.message.text,
-              );
+              if (turnInput.beforeSubmit !== undefined) yield* turnInput.beforeSubmit;
+              if (
+                context.finalized ||
+                context.interrupted ||
+                pendingStopCloseTurn === context ||
+                (yield* Ref.get(activeTurn)) !== context
+              )
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                  deliveryNotSent: true,
+                  cause: "The turn ended during steering preparation.",
+                });
+              const steerId = yield* steering
+                .send(runtime, context.nativeThreadId, turnInput.message.text)
+                .pipe(
+                  Effect.provideService(
+                    EffectAcpProtocol.AcpOutgoingGuard,
+                    () =>
+                      !context.finalized &&
+                      !context.interrupted &&
+                      pendingStopCloseTurn !== context &&
+                      Ref.getUnsafe(activeTurn) === context,
+                  ),
+                );
               const injected = steerInjection(steerId);
               // The agent reads a steer at its next step. One that lands after the last
               // step is dropped, and the turn settles right after; the orchestrator then
@@ -9179,21 +9225,30 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               ).pipe(Effect.timeoutOption(STEER_DELIVERY_BOUND));
               steerInjections.delete(steerId);
               if (Option.contains(outcome, "settled") && !(yield* Deferred.isDone(injected))) {
-                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                  driver,
-                  detail: `Provider turn ${turnInput.providerTurnId} ended before it read the steering message.`,
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver: driver,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                  deliveryNotSent: true,
+                  cause: `Provider turn ${turnInput.providerTurnId} ended before it read the steering message.`,
                 });
               }
             },
             (effect, turnInput) =>
               effect.pipe(
                 Effect.mapError((cause) =>
-                  cause._tag === "ProviderAdapterSteerRunUnsupportedError"
+                  ProviderAdapter.isProviderAdapterSteerRunUnsupportedError(cause) ||
+                  ProviderAdapter.isProviderAdapterSteerRunError(cause)
                     ? cause
                     : new ProviderAdapter.ProviderAdapterSteerRunError({
                         driver,
                         providerThreadId: turnInput.providerThread.id,
                         providerTurnId: turnInput.providerTurnId,
+                        ...(cause._tag === "AcpRequestError" &&
+                        cause.operation === "enqueue-request" &&
+                        cause.code === -32800
+                          ? { deliveryNotSent: true }
+                          : {}),
                         cause,
                       }),
                 ),

@@ -23,32 +23,42 @@ import {
   WsRpcGroup,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
+  ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationProjectShell,
+  OrchestrationV2RpcSchemas,
+  type OrchestrationV2ShellStreamItem,
   type AuthAccessStreamEvent,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2StoredEvent,
-  type OrchestrationV2ThreadShell,
-  type OrchestrationProjectShell,
+  type OrchestrationV2ThreadProjection,
+  OrchestrationV2ThreadShell,
+  type OrchestrationV2ThreadStreamItem,
+  type RepositoryIdentity,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerProvider,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
-import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
+import { RpcGroup, RpcMessage, RpcServer, type Rpc } from "effect/rpc";
 import * as RpcTest from "effect/rpc/RpcTest";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
@@ -68,6 +78,7 @@ import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as NativeChildWorkQuery from "./orchestration-v2/NativeChildWorkQuery.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
+import * as CommandReceiptStore from "./orchestration-v2/CommandReceiptStore.ts";
 import * as CodexInstallation from "./provider/CodexInstallation.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
@@ -144,22 +155,32 @@ import { USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 
+import { LIVE_STREAM_MAX_ITEMS } from "./orchestration-v2/LiveStreamBudget.ts";
 import * as EventStore from "./orchestration-v2/EventStore.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
+import * as ShellDeltaHub from "./orchestration-v2/ShellDeltaHub.ts";
+import {
+  projectIdentitiesDigest,
+  UNCHANGED_THREAD_SHELL_RESEND_MS,
+} from "./orchestration-v2/ShellStream.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as EventSink from "./orchestration-v2/EventSink.ts";
 import * as LegacyV1ThreadImporter from "./orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
-import { projectIdentitiesDigest } from "./orchestration-v2/ShellStream.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
 import {
+  encodeShellStreamItem,
+  encodeThreadStreamItem,
   layerWsRpc,
+  ServerWsStreamRpcGroup,
+  subscribeShellRpcHandler,
+  subscribeThreadRpcHandler,
   resolveOpenDiscoveryForConfig,
   subscribeOrchestrationV2Shell,
   subscribeOrchestrationV2Thread,
@@ -348,6 +369,7 @@ const resumeSkipsUnknownTypes = (scope: "thread" | "shell") =>
           }).pipe(Effect.flatMap(consume));
     });
     const items = yield* subscription.pipe(
+      Effect.provide(ShellDeltaHub.layer),
       Effect.provideService(ThreadManagement.ThreadManagementService, {
         ensureLegacyTranscript: () => Effect.void,
         getShellSnapshot: () => Effect.die("shell resume must not load a full snapshot"),
@@ -365,13 +387,17 @@ const resumeSkipsUnknownTypes = (scope: "thread" | "shell") =>
       } as unknown as ThreadManagement.ThreadManagementService["Service"]),
       Effect.provideService(ProjectStore.ProjectStoreV2, {
         listShells: () => Effect.succeed([]),
-      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
-      Effect.provideService(ProjectService.ProjectService, {
         getShell: () => Effect.succeedSome(project),
-      } as unknown as ProjectService.ProjectService["Service"]),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
       Effect.provideService(ProjectEnrichment.ProjectEnrichmentService, {
         subscribeChanges: PubSub.subscribe(updates),
-      } as ProjectEnrichment.ProjectEnrichmentService["Service"]),
+        getAvailable: () =>
+          Effect.succeed({
+            repositoryIdentity: null,
+            faviconPath: null,
+            repositoryIdentityResolved: true,
+          }),
+      } as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"]),
     );
     assert.deepEqual(
       items.map((item) => item.kind),
@@ -462,128 +488,101 @@ it.effect("coalesces streaming replay before synchronization and the live tail",
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
-it.effect("shell groups read distinct threads once and keep each event's own sequence", () =>
+it.effect("shares each live event item across subscribers and dedupes bodies per subscriber", () =>
   Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    const now = "2026-10-27T00:00:00.000Z";
-    const insert = (aggregateKind: "thread" | "project", streamId: string, version: number) =>
-      sql<{ sequence: number }>`
-      INSERT INTO orchestration_events (
-        event_id, aggregate_kind, stream_id, stream_version, event_type,
-        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
-      ) VALUES (
-        ${`shell-group:${streamId}:${version}`}, ${aggregateKind}, ${streamId}, ${version},
-        ${aggregateKind === "thread" ? "provider-session.detached" : "project.meta-updated"},
-        ${now}, 'server', ${JSON.stringify(
-          aggregateKind === "thread"
-            ? { providerSessionId: "session:shell-group", detachedAt: now }
-            : { projectId: streamId, updatedAt: now },
-        )}, '{}', 2
-      ) RETURNING sequence
-    `.pipe(Effect.map(([row]) => row!.sequence));
-    const shell = (id: string, archivedAt: string | null = null) =>
-      ({ id: ThreadId.make(id), archivedAt }) as unknown as OrchestrationV2ThreadShell;
-    const project = {
-      id: ProjectId.make("project:group"),
-    } as unknown as OrchestrationProjectShell;
-
-    const after = yield* insert("project", "project:before", 0);
-    yield* insert("thread", "thread:active", 0);
-    const archived = yield* insert("thread", "thread:archived", 0);
-    const projectUpdated = yield* insert("project", project.id, 0);
-    const active = yield* insert("thread", "thread:active", 1);
-    const missing = yield* insert("thread", "thread:missing", 0);
-
-    const shellReads: Array<ReadonlyArray<string> | undefined> = [];
-    let batchFails = false;
-    const collect = (afterSequence: number) =>
-      subscribeOrchestrationV2Shell({ afterSequence, requestCompletionMarker: true }).pipe(
-        Effect.flatMap((stream) =>
-          stream.pipe(
-            Stream.takeUntil((item) => item.kind === "synchronized"),
-            Stream.runCollect,
-          ),
-        ),
+    const threadId = ThreadId.make("thread:shared-live");
+    const messageId = MessageId.make("message:shared-live");
+    const at = DateTime.makeUnsafe("2026-10-31T00:00:00.000Z");
+    const owner = { threadId, runId: null, nodeId: null, createdAt: at, updatedAt: at };
+    // DateTime memoizes its formatted parts, so only the plain records are frozen.
+    const freeze = <A>(value: A): A => {
+      if (typeof value === "object" && value !== null && !DateTime.isDateTime(value)) {
+        for (const child of Object.values(value)) freeze(child);
+        Object.freeze(value);
+      }
+      return value;
+    };
+    const live: ReadonlyArray<OrchestrationV2StoredEvent> = freeze([
+      {
+        sequence: 1,
+        commandId: null,
+        event: {
+          id: EventId.make("event:shared-live:message"),
+          type: "message.updated",
+          threadId,
+          occurredAt: at,
+          payload: {
+            ...owner,
+            id: messageId,
+            role: "assistant",
+            text: "Done",
+            attachments: [],
+            streaming: false,
+            createdBy: "agent",
+            creationSource: "provider",
+          },
+        },
+      },
+      {
+        sequence: 2,
+        commandId: null,
+        event: {
+          id: EventId.make("event:shared-live:reply"),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: at,
+          payload: {
+            ...owner,
+            id: TurnItemId.make("item:shared-live:reply"),
+            type: "assistant_message",
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            title: null,
+            status: "completed",
+            messageId,
+            text: "Done",
+            streaming: false,
+            startedAt: at,
+            completedAt: at,
+          },
+        },
+      },
+    ] as ReadonlyArray<OrchestrationV2StoredEvent>);
+    const stringify = yield* Effect.acquireRelease(
+      Effect.sync(() => vi.spyOn(JSON, "stringify")),
+      (spy) => Effect.sync(() => spy.mockRestore()),
+    );
+    // The EventSink hands every subscriber the same projected objects.
+    const subscribe = (acceptDedupedBodies: boolean) =>
+      subscribeOrchestrationV2Thread({ threadId, afterSequence: 0, acceptDedupedBodies }).pipe(
+        Effect.flatMap(Stream.runCollect),
+        Effect.map((items) => Array.from(items)),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
-          listActiveSubagentThreadIds: () => Effect.succeed([]),
-          getShellSnapshot: (options?: { readonly threadIds?: ReadonlyArray<string> }) =>
-            Effect.suspend(() => {
-              shellReads.push(options?.threadIds);
-              return batchFails
-                ? Effect.fail("batch failed")
-                : Effect.succeed({
-                    schemaVersion: 1,
-                    snapshotSequence: Number.MAX_SAFE_INTEGER,
-                    threads: [shell("thread:active")],
-                    archivedThreads: [shell("thread:archived", now)],
-                  });
-            }),
-          getThreadShell: (threadId: string) =>
-            Effect.sync(() => {
-              shellReads.push([`scalar:${threadId}`]);
-              return threadId === "thread:missing"
-                ? null
-                : shell(threadId, threadId === "thread:archived" ? now : null);
-            }),
+          ensureLegacyTranscript: () => Effect.void,
+          streamStoredEventsFrom: () => Stream.fromIterable(live),
         } as unknown as ThreadManagement.ThreadManagementService["Service"]),
-        Effect.provideService(ProjectStore.ProjectStoreV2, {
-          listShells: () => Effect.succeed([]),
-        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
-        Effect.provideService(ProjectService.ProjectService, {
-          getShell: () => Effect.succeedSome(project),
-        } as unknown as ProjectService.ProjectService["Service"]),
-        Effect.provideServiceEffect(
-          ProjectEnrichment.ProjectEnrichmentService,
-          PubSub.unbounded().pipe(
-            Effect.map(
-              (changes) =>
-                ({
-                  subscribeChanges: PubSub.subscribe(changes),
-                }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
-            ),
-          ),
-        ),
       );
+    const [deduped, first, second] = yield* Effect.forEach([true, false, false], subscribe);
 
-    const collectSummary = (afterSequence: number) =>
-      collect(afterSequence).pipe(
-        Effect.map((items) =>
-          items.flatMap((item): ReadonlyArray<ReadonlyArray<string | number>> =>
-            item.kind === "thread.updated"
-              ? [[item.kind, item.sequence, item.thread.id]]
-              : item.kind === "thread.removed"
-                ? [[item.kind, item.sequence, item.threadId]]
-                : item.kind === "project.updated"
-                  ? [[item.kind, item.sequence, item.project.id]]
-                  : [],
-          ),
-        ),
-      );
-    const expectedGroup = [
-      ["thread.removed", archived, "thread:archived"],
-      ["project.updated", projectUpdated, project.id],
-      ["thread.updated", active, "thread:active"],
-      ["thread.removed", missing, "thread:missing"],
-    ];
-
-    assert.deepEqual(yield* collectSummary(after), expectedGroup);
-    assert.deepEqual(shellReads, [["thread:archived", "thread:active", "thread:missing"]]);
-
-    shellReads.length = 0;
-    assert.deepEqual(yield* collectSummary(active), [
-      ["thread.removed", missing, "thread:missing"],
-    ]);
-    assert.deepEqual(shellReads, [["scalar:thread:missing"]]);
-
-    shellReads.length = 0;
-    batchFails = true;
-    assert.deepEqual(yield* collectSummary(after), expectedGroup);
-    assert.deepEqual(shellReads, [
-      ["thread:archived", "thread:active", "thread:missing"],
-      ["scalar:thread:archived"],
-      ["scalar:thread:active"],
-      ["scalar:thread:missing"],
-    ]);
+    assert.lengthOf(first!, live.length);
+    first!.forEach((item, index) => {
+      assert.strictEqual(item, second![index]);
+      assert.strictEqual(item.kind === "event" && item.event, live[index]!.event);
+    });
+    assert.strictEqual(deduped![0], first![0]);
+    const reply = deduped![1];
+    assert.deepInclude(reply?.kind === "event" ? reply.event.payload : undefined, {
+      text: "",
+      textOmitted: true,
+    });
+    // The live buffer sizes each shared item once, not once per subscriber.
+    assert.lengthOf(
+      stringify.mock.calls.filter(([value]) => value?.kind === "event"),
+      live.length,
+    );
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
@@ -726,7 +725,9 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
       subscribeOrchestrationV2Shell(input).pipe(
         Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
         Effect.map(([item]) => (item?.kind === "snapshot" ? item.snapshot : null)),
+        Effect.provide(ShellDeltaHub.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
+          listActiveSubagentThreadIds: () => Effect.succeed([]),
           listActiveShellIndex: () =>
             Effect.succeed(
               threads.map((thread) => ({
@@ -751,10 +752,8 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
         } as unknown as ThreadManagement.ThreadManagementService["Service"]),
         Effect.provideService(ProjectStore.ProjectStoreV2, {
           listShells: () => Effect.succeed([]),
-        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
-        Effect.provideService(ProjectService.ProjectService, {
           getShell: () => Effect.succeedNone,
-        } as unknown as ProjectService.ProjectService["Service"]),
+        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
         Effect.provideServiceEffect(
           ProjectEnrichment.ProjectEnrichmentService,
           PubSub.unbounded().pipe(
@@ -793,8 +792,1923 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
+it.effect("shell subscribers share one thread shell read per event", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shared-shell-read");
+    const now = "2026-10-31T00:00:00.000Z";
+    const [event] = yield* sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        'shared-shell-read:0', 'thread', ${threadId}, 0, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:shared", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+    const reads: Array<ThreadId> = [];
+    const shell = { id: threadId, archivedAt: null } as unknown as OrchestrationV2ThreadShell;
+    const subscriber = subscribeOrchestrationV2Shell({
+      afterSequence: 0,
+      requestCompletionMarker: true,
+    }).pipe(
+      Effect.flatMap((stream) =>
+        stream.pipe(
+          Stream.takeUntil((item) => item.kind === "synchronized"),
+          Stream.runCollect,
+        ),
+      ),
+    );
+
+    const [first, second] = yield* Effect.all([subscriber, subscriber], {
+      concurrency: "unbounded",
+    }).pipe(
+      Effect.provide(
+        ShellDeltaHub.layer.pipe(
+          Layer.provideMerge(
+            ThreadManagement.layer.pipe(
+              Layer.provide(
+                Layer.mock(Orchestrator.OrchestratorV2)({
+                  listActiveSubagentThreadIds: () => Effect.succeed([]),
+                  getThreadShell: (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
+                }),
+              ),
+              Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+              Layer.provide(ServerSettings.layerTest()),
+              Layer.provide(CommandReceiptStore.layer),
+            ),
+          ),
+        ),
+      ),
+      Effect.provideService(ProjectStore.ProjectStoreV2, {
+        listShells: () => Effect.succeed([]),
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+      Effect.provideServiceEffect(
+        ProjectEnrichment.ProjectEnrichmentService,
+        PubSub.unbounded().pipe(
+          Effect.map(
+            (changes) =>
+              ({
+                subscribeChanges: PubSub.subscribe(changes),
+              }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+          ),
+        ),
+      ),
+    );
+
+    for (const items of [first, second]) {
+      assert.deepEqual(
+        items.flatMap((item) =>
+          item.kind === "thread.updated" ? [[item.sequence, item.thread.id]] : [],
+        ),
+        [[event!.sequence, threadId]],
+      );
+    }
+    assert.deepEqual(reads, [threadId]);
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// The shell delta hub over mocked shell reads; `onStart` runs when the hub subscribes to committed events.
+const layerShellSubscribers = (input: {
+  readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
+  readonly getProjectRow?: ProjectStore.ProjectStoreV2["Service"]["getShell"];
+  readonly listShells?: ProjectStore.ProjectStoreV2["Service"]["listShells"];
+  readonly getAvailable?: ProjectEnrichment.ProjectEnrichmentService["Service"]["getAvailable"];
+  readonly enrichmentChanges?: PubSub.PubSub<ProjectEnrichment.ProjectEnrichmentChange>;
+  readonly onStart?: () => void;
+}) =>
+  ShellDeltaHub.layer.pipe(
+    Layer.provide(
+      Layer.effect(
+        OrchestrationEventStore.OrchestrationEventStore,
+        Effect.gen(function* () {
+          const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+          return {
+            ...store,
+            subscribeCommitted: Effect.tap(store.subscribeCommitted, () =>
+              Effect.sync(() => input.onStart?.()),
+            ),
+          };
+        }),
+      ),
+    ),
+    Layer.provideMerge(
+      ThreadManagement.layer.pipe(
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            listActiveSubagentThreadIds: () => Effect.succeed([]),
+            getThreadShell: input.getThreadShell,
+          }),
+        ),
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(CommandReceiptStore.layer),
+      ),
+    ),
+    Layer.provideMerge(
+      Layer.succeed(ProjectStore.ProjectStoreV2, {
+        listShells: input.listShells ?? (() => Effect.succeed([])),
+        getShell: input.getProjectRow ?? (() => Effect.succeedNone),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+    ),
+    Layer.provideMerge(
+      Layer.effect(
+        ProjectEnrichment.ProjectEnrichmentService,
+        (input.enrichmentChanges === undefined
+          ? PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>()
+          : Effect.succeed(input.enrichmentChanges)
+        ).pipe(
+          Effect.map(
+            (changes) =>
+              ({
+                subscribeChanges: PubSub.subscribe(changes),
+                getAvailable:
+                  input.getAvailable ??
+                  (() =>
+                    Effect.succeed({
+                      repositoryIdentity: null,
+                      faviconPath: null,
+                      repositoryIdentityResolved: true,
+                    })),
+              }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+          ),
+        ),
+      ),
+    ),
+  );
+
+const insertShellEvent = (sql: SqlClient.SqlClient, threadId: ThreadId, version: number) => {
+  const now = "2026-10-31T00:00:00.000Z";
+  return sql<{ sequence: number }>`
+    INSERT INTO orchestration_events (
+      event_id, aggregate_kind, stream_id, stream_version, event_type,
+      occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+    ) VALUES (
+      ${`${threadId}:${version}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+      ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:hub", detachedAt: now })},
+      '{}', 2
+    ) RETURNING sequence
+  `.pipe(Effect.map(([row]) => row!.sequence));
+};
+
+// Commits and publishes one event, then lets the hub's batch window pass.
+const publishShellEvent = (sql: SqlClient.SqlClient, threadId: ThreadId, version: number) =>
+  Effect.gen(function* () {
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const sequence = yield* insertShellEvent(sql, threadId, version);
+    const events = yield* store
+      .readApplicationEvents({ afterSequence: sequence - 1, throughSequence: sequence })
+      .pipe(Stream.runCollect);
+    yield* store.publishCommitted(events);
+    yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+    return sequence;
+  });
+
+// A shell subscriber resumed at `afterSequence`, drained into a queue once synchronized.
+const openShellSubscriber = (afterSequence: number) =>
+  Effect.gen(function* () {
+    const stream = yield* subscribeOrchestrationV2Shell({
+      afterSequence,
+      requestCompletionMarker: true,
+    });
+    const items = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
+    const exit = yield* Deferred.make<Exit.Exit<void, unknown>>();
+    yield* stream.pipe(
+      Stream.runForEach((item) => Queue.offer(items, item)),
+      Effect.exit,
+      Effect.flatMap((result) => Deferred.succeed(exit, result)),
+      Effect.forkScoped,
+    );
+    while ((yield* Queue.take(items)).kind !== "synchronized") {
+      // drain the replay
+    }
+    return { items, exit };
+  });
+
+const threadUpdate = (item: OrchestrationV2ShellStreamItem) =>
+  item.kind === "thread.updated" ? [item.sequence, item.thread.id] : item.kind;
+
+it.effect("live shell deltas are projected once and shared by every shell subscriber", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shell-hub:shared");
+    const seeded = yield* insertShellEvent(sql, threadId, 0);
+    const reads: Array<ThreadId> = [];
+    const shell = { id: threadId, archivedAt: null } as unknown as OrchestrationV2ThreadShell;
+    yield* Effect.gen(function* () {
+      const first = yield* openShellSubscriber(seeded);
+      const second = yield* openShellSubscriber(seeded);
+      const live = yield* publishShellEvent(sql, threadId, 1);
+      const a = yield* Queue.take(first.items);
+      const b = yield* Queue.take(second.items);
+      assert.strictEqual(a, b);
+      assert.deepEqual(threadUpdate(a), [live, threadId]);
+      assert.deepEqual(reads, [threadId]);
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: (id) => Effect.sync(() => reads.push(id)).pipe(Effect.as(shell)),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("a shared unchanged shell is skipped per subscriber from its own first item", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shell-hub:unchanged");
+    const seeded = yield* insertShellEvent(sql, threadId, 0);
+    let reads = 0;
+    const shell = { id: threadId, archivedAt: null } as unknown as OrchestrationV2ThreadShell;
+    yield* Effect.gen(function* () {
+      const first = yield* openShellSubscriber(seeded);
+      const live1 = yield* publishShellEvent(sql, threadId, 1);
+      assert.deepEqual(threadUpdate(yield* Queue.take(first.items)), [live1, threadId]);
+      // Joins after the hub already sent this shell once: its snapshot predates nothing it is told.
+      const second = yield* openShellSubscriber(live1);
+      const live2 = yield* publishShellEvent(sql, threadId, 2);
+      assert.deepEqual(threadUpdate(yield* Queue.take(second.items)), [live2, threadId]);
+      assert.equal(yield* Queue.size(first.items), 0);
+      yield* TestClock.adjust(UNCHANGED_THREAD_SHELL_RESEND_MS);
+      const live3 = yield* publishShellEvent(sql, threadId, 3);
+      assert.deepEqual(threadUpdate(yield* Queue.take(first.items)), [live3, threadId]);
+      assert.deepEqual(threadUpdate(yield* Queue.take(second.items)), [live3, threadId]);
+      assert.equal(reads, 3);
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: () => Effect.sync(() => ++reads).pipe(Effect.as(shell)),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("the shell delta hub runs only while a shell subscriber exists", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shell-hub:lifecycle");
+    const seeded = yield* insertShellEvent(sql, threadId, 0);
+    let starts = 0;
+    yield* Effect.gen(function* () {
+      const first = yield* Scope.make();
+      const second = yield* Scope.make();
+      yield* openShellSubscriber(seeded).pipe(Scope.provide(first));
+      yield* openShellSubscriber(seeded).pipe(Scope.provide(second));
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 1);
+      yield* Scope.close(first, Exit.void);
+      yield* openShellSubscriber(seeded).pipe(Scope.provide(second));
+      assert.equal(starts, 1);
+      yield* Scope.close(second, Exit.void);
+      const third = yield* Scope.make();
+      yield* openShellSubscriber(seeded).pipe(Scope.provide(third));
+      yield* TestClock.adjust(0);
+      assert.equal(starts, 2);
+      yield* Scope.close(third, Exit.void);
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: () => Effect.succeed(null),
+          onStart: () => {
+            starts += 1;
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("a failed shared shell read ends every shell subscriber's stream", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:shell-hub:failure");
+    const seeded = yield* insertShellEvent(sql, threadId, 0);
+    yield* Effect.gen(function* () {
+      const first = yield* openShellSubscriber(seeded);
+      const second = yield* openShellSubscriber(seeded);
+      yield* publishShellEvent(sql, threadId, 1);
+      for (const subscriber of [first, second]) {
+        const exit = yield* Deferred.await(subscriber.exit);
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          const error = Cause.squash(exit.cause) as { readonly _tag?: string };
+          assert.equal(error._tag, "OrchestrationV2GetShellSnapshotError");
+        }
+        assert.equal(yield* Queue.size(subscriber.items), 0);
+      }
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: (id) =>
+            Effect.fail(
+              new Orchestrator.OrchestratorProjectionError({
+                threadId: id,
+                cause: new Error("reader gone"),
+              }),
+            ),
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live(
+  "a shell subscriber outlives a live burst larger than its buffer while its shell reads wait",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-01T00:00:00.000Z";
+      const threadIds = Array.from({ length: 3 }, (_, index) =>
+        ThreadId.make(`thread:live-burst-${index}`),
+      );
+      const [row] = yield* sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        'live-burst:0', 'thread', ${threadIds[0]!}, 0, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:live-burst", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+      const [stored] = yield* store
+        .readApplicationEvents({ afterSequence: row!.sequence - 1, throughSequence: row!.sequence })
+        .pipe(Stream.runCollect);
+      if (stored === undefined || !("event" in stored))
+        return yield* Effect.die("Expected a thread event");
+      // More events than the live buffer holds, spread over three threads whose shell reads
+      // wait until every event has been retained: the stream must stay up and end with the
+      // newest shell of each thread.
+      const burst = 3 * LIVE_STREAM_MAX_ITEMS + 3;
+      const lastSequence = row!.sequence + burst;
+      const events = Array.from({ length: burst }, (_, index) => ({
+        ...stored,
+        sequence: row!.sequence + index + 1,
+        event: { ...stored.event, threadId: threadIds[index % threadIds.length]! },
+      }));
+      // Shell reads wait until the whole burst is published; a buffer that gives up logs it.
+      const burstPublished = yield* Deferred.make<void>();
+      const overflows = overflowCounter();
+      const shell = (threadId: ThreadId, sequence: number) =>
+        ({
+          id: threadId,
+          projectId: "project",
+          archivedAt: null,
+          title: `Shell at ${sequence}`,
+          status: "completed",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          pendingBackgroundTasks: [],
+          settledOverride: null,
+          settledAt: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        }) as unknown as OrchestrationV2ThreadShell;
+      const threadManagement = {
+        listActiveShellIndex: () => Effect.succeed([]),
+        readShellSnapshot: () =>
+          Effect.succeed(
+            Effect.succeed({
+              schemaVersion: 1,
+              snapshotSequence: 0,
+              threads: [],
+              archivedThreads: [],
+            }),
+          ),
+        listActiveSubagentThreadIds: () => Effect.succeed([]),
+        getThreadShellReadForEvent: (input: {
+          readonly threadId: ThreadId;
+          readonly sequence: number;
+        }) =>
+          Deferred.await(burstPublished).pipe(
+            Effect.as({
+              shell: shell(input.threadId, input.sequence),
+              readOrdinal: input.sequence,
+            }),
+          ),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"];
+      const projectService = {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"];
+      const hub = yield* buildShellHub({ store, threadManagement, projectService });
+      const items = yield* subscribeOrchestrationV2Shell({ requestCompletionMarker: true }).pipe(
+        Effect.flatMap((stream) =>
+          stream.pipe(
+            // The hub subscription exists before the snapshot: publish once the client is live.
+            Stream.tap((item) =>
+              item.kind === "synchronized"
+                ? store
+                    .publishCommitted(events)
+                    .pipe(Effect.andThen(Deferred.succeed(burstPublished, undefined)))
+                : Effect.void,
+            ),
+            Stream.takeUntil(
+              (item) => item.kind === "thread.updated" && item.sequence === lastSequence,
+            ),
+            Stream.runCollect,
+          ),
+        ),
+        Effect.provide(hub),
+        Effect.provide(Logger.layer([overflows.logger], { mergeWithExisting: true })),
+        Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
+        Effect.provideService(ProjectStore.ProjectStoreV2, {
+          listShells: () => Effect.succeed([]),
+        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+        Effect.provideService(ProjectService.ProjectService, projectService),
+        Effect.provideServiceEffect(
+          ProjectEnrichment.ProjectEnrichmentService,
+          PubSub.unbounded().pipe(
+            Effect.map(
+              (changes) =>
+                ({
+                  subscribeChanges: PubSub.subscribe(changes),
+                }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+            ),
+          ),
+        ),
+      );
+      const updates = items.flatMap((item) =>
+        item.kind === "thread.updated" ? [[item.thread.id, item.sequence] as const] : [],
+      );
+      const newestByThread = new Map(updates);
+      assert.deepEqual(
+        threadIds.map((threadId) => newestByThread.get(threadId)),
+        [lastSequence - 2, lastSequence - 1, lastSequence],
+      );
+      // Coalesced before the shell reads, not one shell per event; the buffer never filled.
+      assert.isBelow(updates.length, 3 * 4);
+      assert.equal(overflows.count, 0);
+      assert.isTrue(
+        updates.every(([, sequence], index) => index === 0 || sequence > updates[index - 1]![1]),
+      );
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+/** The shell delta hub over a test's mocked reads, built in the test's scope so it outlives the subscribe effect. */
+const buildShellHub = (input: {
+  readonly store: OrchestrationEventStore.OrchestrationEventStore["Service"];
+  readonly threadManagement: ThreadManagement.ThreadManagementService["Service"];
+  readonly projectService: ProjectService.ProjectService["Service"];
+  readonly projectStore?: ProjectStore.ProjectStoreV2["Service"];
+}) =>
+  Layer.build(
+    ShellDeltaHub.layer.pipe(
+      Layer.provide(Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, input.store)),
+      Layer.provide(
+        Layer.succeed(ThreadManagement.ThreadManagementService, input.threadManagement),
+      ),
+      Layer.provide(Layer.succeed(ProjectService.ProjectService, input.projectService)),
+      Layer.provide(
+        Layer.succeed(
+          ProjectStore.ProjectStoreV2,
+          input.projectStore ??
+            ({
+              listShells: () => Effect.succeed([]),
+            } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+        ),
+      ),
+    ),
+  );
+
+/** Folds shell items like the client: a snapshot replaces, deltas apply when newer than the cursor. */
+function makeShellFold() {
+  const threads = new Map<string, string>();
+  let cursor = 0;
+  let dropped = 0;
+  let snapshots = 0;
+  const waiters: Array<{ readonly target: number; readonly done: Deferred.Deferred<void> }> = [];
+  const apply = (item: OrchestrationV2ShellStreamItem) => {
+    if (item.kind === "synchronized") return;
+    if (item.kind === "snapshot-required") {
+      throw new Error("This shell fold requires inline snapshots.");
+    }
+    if (item.kind === "snapshot") {
+      if (item.resolvedRepositoryIdentityRoots !== undefined) return;
+      snapshots += 1;
+      threads.clear();
+      for (const thread of item.snapshot.threads) threads.set(thread.id, thread.title);
+      cursor = item.snapshot.snapshotSequence;
+    } else {
+      if (item.sequence <= cursor) {
+        dropped += 1;
+        return;
+      }
+      cursor = item.sequence;
+      if (item.kind === "thread.updated") threads.set(item.thread.id, item.thread.title);
+      if (item.kind === "thread.removed") threads.delete(item.threadId);
+    }
+    for (let index = waiters.length - 1; index >= 0; index--) {
+      if (cursor >= waiters[index]!.target) {
+        Deferred.doneUnsafe(waiters[index]!.done, Effect.void);
+        waiters.splice(index, 1);
+      }
+    }
+  };
+  const reach = (target: number) =>
+    Effect.suspend(() => {
+      if (cursor >= target) return Effect.void;
+      const done = Deferred.makeUnsafe<void>();
+      waiters.push({ target, done });
+      return Deferred.await(done);
+    });
+  return {
+    apply,
+    reach,
+    get state() {
+      return { threads, cursor, dropped, snapshots };
+    },
+  };
+}
+
+/** Completes once the budget has logged its n-th overflow. */
+function overflowCounter() {
+  const state = { count: 0, waiters: [] as Array<Deferred.Deferred<void>> };
+  const logger = Logger.make(({ message }) => {
+    if (/live event buffer is full|live buffer reset for a resync/.test(String(message))) {
+      state.count += 1;
+      for (const waiter of state.waiters.splice(0)) Deferred.doneUnsafe(waiter, Effect.void);
+    }
+  });
+  const reach = (count: number): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      if (state.count >= count) return Effect.void;
+      const done = Deferred.makeUnsafe<void>();
+      state.waiters.push(done);
+      return Deferred.await(done).pipe(Effect.andThen(reach(count)));
+    });
+  return {
+    logger,
+    reach,
+    get count() {
+      return state.count;
+    },
+  };
+}
+
+it.live(
+  "a shell subscriber resyncs after every overflow: one snapshot each, folded state = store",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-01T00:00:00.000Z";
+      // The store's state: every committed thread at its newest title.
+      const threads = new Map<string, string>();
+      const versions = new Map<string, number>();
+      let eventCounter = 0;
+      // Real rows first, so the catch-up after a resync snapshot reads them; then publish.
+      const commit = (threadIds: ReadonlyArray<string>) =>
+        Effect.gen(function* () {
+          let first: number | undefined;
+          let last = 0;
+          for (const threadId of threadIds) {
+            const version = (versions.get(threadId) ?? -1) + 1;
+            versions.set(threadId, version);
+            const [inserted] = yield* sql<{ sequence: number }>`
+              INSERT INTO orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type,
+                occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+              ) VALUES (
+                ${`shell-storm:${eventCounter++}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+                ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:storm", detachedAt: now })},
+                '{}', 2
+              ) RETURNING sequence
+            `;
+            first ??= inserted!.sequence;
+            last = inserted!.sequence;
+            threads.set(threadId, `${threadId}@${inserted!.sequence}`);
+          }
+          if (first === undefined) return 0;
+          const stored = yield* store
+            .readApplicationEvents({ afterSequence: first - 1, throughSequence: last })
+            .pipe(Stream.runCollect);
+          yield* store.publishCommitted(Array.from(stored));
+          return last;
+        });
+      yield* commit(["thread:sentinel"]);
+      const shell = (threadId: string) =>
+        ({
+          id: threadId,
+          projectId: "project",
+          archivedAt: null,
+          title: threads.get(threadId),
+          status: "completed",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          pendingBackgroundTasks: [],
+          settledOverride: null,
+          settledAt: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        }) as unknown as OrchestrationV2ThreadShell;
+      const overflows = overflowCounter();
+      let snapshotLoads = 0;
+      // Committed while the resync base is being read: after its sequence, so they arrive live
+      // through the subscription the hub emptied before that read.
+      const raceThreads: Array<string> = [];
+      const fold = makeShellFold();
+      const threadManagement = {
+        listActiveShellIndex: () => Effect.succeed([]),
+        readShellSnapshot: () =>
+          Effect.sync(() => {
+            snapshotLoads += 1;
+            const rows = Array.from(threads.keys(), shell);
+            const loads = snapshotLoads;
+            return Effect.gen(function* () {
+              if (loads > 1 && raceThreads.length > 0) yield* commit(raceThreads.splice(0));
+              return { schemaVersion: 1, snapshotSequence: 0, threads: rows, archivedThreads: [] };
+            }).pipe(Effect.orDie);
+          }),
+        listActiveSubagentThreadIds: () => Effect.succeed([]),
+        getThreadShellReadForEvent: (input: {
+          readonly threadId: string;
+          readonly sequence: number;
+        }) =>
+          Effect.sync(() => ({
+            shell: (() => shell(input.threadId))(),
+            readOrdinal: input.sequence,
+          })),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"];
+      const projectService = {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"];
+      const hub = yield* buildShellHub({ store, threadManagement, projectService });
+      const stream = yield* subscribeOrchestrationV2Shell({ requestCompletionMarker: true }).pipe(
+        Effect.provide(hub),
+        Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
+        Effect.provideService(ProjectStore.ProjectStoreV2, {
+          listShells: () => Effect.succeed([]),
+        } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+        Effect.provideService(ProjectService.ProjectService, projectService),
+        Effect.provideServiceEffect(
+          ProjectEnrichment.ProjectEnrichmentService,
+          PubSub.unbounded().pipe(
+            Effect.map(
+              (changes) =>
+                ({
+                  subscribeChanges: PubSub.subscribe(changes),
+                }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+            ),
+          ),
+        ),
+        Effect.provide(Logger.layer([overflows.logger], { mergeWithExisting: true })),
+      );
+      const pull = yield* Stream.toPull(
+        stream.pipe(Stream.provide(Logger.layer([overflows.logger], { mergeWithExisting: true }))),
+      );
+      const pullOnce = pull.pipe(Effect.map((items) => items.forEach(fold.apply)));
+      while (fold.state.snapshots === 0) yield* pullOnce;
+      let consumer: Fiber.Fiber<unknown, unknown> | undefined;
+      const startConsumer = pullOnce.pipe(
+        Effect.forever,
+        Effect.forkScoped,
+        Effect.tap((fiber) => Effect.sync(() => void (consumer = fiber))),
+      );
+      yield* startConsumer;
+      let distinct = 0;
+      const rounds = 3;
+      for (let round = 0; round < rounds; round++) {
+        const first = yield* commit(["thread:sentinel"]);
+        yield* fold.reach(first);
+        // The client stops pulling while more distinct threads than its buffer holds change.
+        yield* Fiber.interrupt(consumer!);
+        const loadsBefore = snapshotLoads;
+        const burst = Array.from(
+          { length: LIVE_STREAM_MAX_ITEMS + 300 },
+          () => `thread:d${distinct++}`,
+        );
+        const touched = Array.from(threads.keys()).slice(0, 25);
+        yield* commit(burst.concat(touched));
+        raceThreads.push(...touched.slice(0, 10), `thread:race${round}`);
+        yield* overflows.reach(round + 1);
+        // Nothing pulled, so nothing loaded: a stalled client costs no snapshot.
+        assert.equal(snapshotLoads, loadsBefore);
+        yield* startConsumer;
+        const after = yield* commit(["thread:sentinel"]);
+        yield* fold.reach(after);
+        assert.equal(snapshotLoads, loadsBefore + 1, `one snapshot per overflow (round ${round})`);
+      }
+      const last = yield* commit(["thread:sentinel"]);
+      yield* fold.reach(last);
+      assert.equal(fold.state.dropped, 0);
+      assert.equal(fold.state.snapshots, 1 + rounds);
+      assert.deepEqual(
+        Array.from(fold.state.threads.entries()).sort(([a], [b]) => a.localeCompare(b)),
+        Array.from(threads.entries()).sort(([a], [b]) => a.localeCompare(b)),
+      );
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live(
+  "a project first seen in a resync snapshot keeps the identity a refresh resolved while the snapshot loaded",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-01T00:00:00.000Z";
+      let eventCounter = 0;
+      const versions = new Map<string, number>();
+      const commit = (threadIds: ReadonlyArray<string>) =>
+        Effect.gen(function* () {
+          let first: number | undefined;
+          let last = 0;
+          for (const threadId of threadIds) {
+            const version = (versions.get(threadId) ?? -1) + 1;
+            versions.set(threadId, version);
+            const [inserted] = yield* sql<{ sequence: number }>`
+              INSERT INTO orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type,
+                occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+              ) VALUES (
+                ${`enrich-race:${eventCounter++}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+                ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:enrich", detachedAt: now })},
+                '{}', 2
+              ) RETURNING sequence
+            `;
+            first ??= inserted!.sequence;
+            last = inserted!.sequence;
+          }
+          const stored = yield* store
+            .readApplicationEvents({ afterSequence: first! - 1, throughSequence: last })
+            .pipe(Stream.runCollect);
+          yield* store.publishCommitted(Array.from(stored));
+          return last;
+        });
+      const shell = (threadId: string) =>
+        ({
+          id: threadId,
+          projectId: "project:p0",
+          archivedAt: null,
+          title: `${threadId}@${versions.get(threadId)}`,
+          status: "completed",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          pendingBackgroundTasks: [],
+          settledOverride: null,
+          settledAt: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        }) as unknown as OrchestrationV2ThreadShell;
+      const workspaceRoot = "/tmp/enrich-race";
+      const identity = { canonicalKey: "github.com/t3/enrich-race", locator: { kind: "github" } };
+      // A project created after the subscription started: the client first sees it in the
+      // resync snapshot.
+      const newProject = {
+        id: ProjectId.make("project:new"),
+        title: "New",
+        workspaceRoot,
+        repositoryIdentity: null,
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as OrchestrationProjectShell;
+      let projects: ReadonlyArray<OrchestrationProjectShell> = [];
+      let resolved = false;
+      const changes = yield* PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>();
+      const refreshSeen = yield* Deferred.make<void>();
+      let gated = false;
+      const enrichment = {
+        subscribeChanges: PubSub.subscribe(changes),
+        // The resync's first read of the new root: its identity resolves and its refresh goes
+        // out (and reaches the client) while this read still reports the root unresolved.
+        getAvailable: (root: string) =>
+          Effect.gen(function* () {
+            if (root === workspaceRoot && !gated) {
+              gated = true;
+              resolved = true;
+              yield* PubSub.publish(changes, {
+                workspaceRoot,
+                enrichment: {
+                  repositoryIdentity: identity,
+                  faviconPath: null,
+                  repositoryIdentityResolved: true,
+                },
+                repositoryIdentityResolved: true,
+              } as unknown as ProjectEnrichment.ProjectEnrichmentChange);
+              yield* Deferred.await(refreshSeen);
+              return {
+                repositoryIdentity: null,
+                faviconPath: null,
+                repositoryIdentityResolved: false,
+              };
+            }
+            return {
+              repositoryIdentity: root === workspaceRoot && resolved ? identity : null,
+              faviconPath: null,
+              repositoryIdentityResolved: root === workspaceRoot && resolved,
+            };
+          }),
+      } as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"];
+      const overflows = overflowCounter();
+      const threadManagement = {
+        listActiveShellIndex: () => Effect.succeed([]),
+        readShellSnapshot: () =>
+          Effect.succeed(
+            Effect.succeed({
+              schemaVersion: 1,
+              snapshotSequence: 0,
+              threads: [],
+              archivedThreads: [],
+            }),
+          ),
+        listActiveSubagentThreadIds: () => Effect.succeed([]),
+        getThreadShellReadForEvent: (input: {
+          readonly threadId: string;
+          readonly sequence: number;
+        }) =>
+          Effect.sync(() => ({
+            shell: (() => shell(input.threadId))(),
+            readOrdinal: input.sequence,
+          })),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"];
+      const projectService = {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"];
+      const projectStore = {
+        listShells: () => Effect.sync(() => projects),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"];
+      const hub = yield* buildShellHub({ store, threadManagement, projectService, projectStore });
+      const stream = yield* subscribeOrchestrationV2Shell({ requestCompletionMarker: true }).pipe(
+        Effect.provide(hub),
+        Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
+        Effect.provideService(ProjectStore.ProjectStoreV2, projectStore),
+        Effect.provideService(ProjectService.ProjectService, projectService),
+        Effect.provideService(ProjectEnrichment.ProjectEnrichmentService, enrichment),
+        Effect.provide(Logger.layer([overflows.logger], { mergeWithExisting: true })),
+      );
+      const pull = yield* Stream.toPull(
+        stream.pipe(Stream.provide(Logger.layer([overflows.logger], { mergeWithExisting: true }))),
+      );
+      // The client: authoritative snapshots replace the projects; refreshes update known ones.
+      const known = new Map<string, unknown>();
+      const resynced = yield* Deferred.make<void>();
+      let snapshots = 0;
+      let refreshesForNew = 0;
+      const apply = (item: OrchestrationV2ShellStreamItem) => {
+        if (item.kind !== "snapshot") return;
+        if (item.resolvedRepositoryIdentityRoots === undefined) {
+          snapshots += 1;
+          known.clear();
+          for (const project of item.snapshot.projects)
+            known.set(project.id, project.repositoryIdentity);
+          if (snapshots === 2) Deferred.doneUnsafe(resynced, Effect.void);
+          return;
+        }
+        for (const project of item.snapshot.projects) {
+          if (project.id === newProject.id) {
+            refreshesForNew += 1;
+            Deferred.doneUnsafe(refreshSeen, Effect.void);
+          }
+          if (known.has(project.id)) known.set(project.id, project.repositoryIdentity);
+        }
+      };
+      const fold = makeShellFold();
+      // Project state first: the fold's waiters may resume the test on the same item.
+      const applyAll = (items: ReadonlyArray<OrchestrationV2ShellStreamItem>) => {
+        for (const item of items) {
+          apply(item);
+          fold.apply(item);
+        }
+      };
+      const consumer = yield* pull.pipe(Effect.map(applyAll), Effect.forever, Effect.forkScoped);
+      yield* fold.reach(yield* commit(["thread:seed"]));
+      // Nothing pulls while the burst overflows the buffer; the project appears meanwhile.
+      yield* Fiber.interrupt(consumer);
+      projects = [newProject];
+      yield* commit(
+        Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:d${index}`),
+      );
+      yield* overflows.reach(1);
+      yield* pull.pipe(Effect.map(applyAll), Effect.forever, Effect.forkScoped);
+      yield* Deferred.await(resynced);
+      // A live item committed after the resync snapshot follows whatever the resync sent after it.
+      yield* fold.reach(yield* commit(["thread:seed"]));
+      assert.equal(snapshots, 2);
+      assert.isAtLeast(refreshesForNew, 1);
+      assert.deepEqual(known.get(newProject.id), identity);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// A linked environment's clients nest its task under its parent; only the store's index knows
+// those parents, and a resync must keep them as the opening snapshot did.
+it.live("a trimmed shell resync keeps the parents of tasks in linked environments", () =>
+  Effect.gen(function* () {
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const now = "2026-11-01T00:00:00.000Z";
+    let eventCounter = 0;
+    const versions = new Map<string, number>();
+    const commit = (threadIds: ReadonlyArray<string>) =>
+      Effect.gen(function* () {
+        let first: number | undefined;
+        let last = 0;
+        for (const threadId of threadIds) {
+          const version = (versions.get(threadId) ?? -1) + 1;
+          versions.set(threadId, version);
+          const [inserted] = yield* sql<{ sequence: number }>`
+            INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type,
+              occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+            ) VALUES (
+              ${`remote-resync:${eventCounter++}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+              ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:remote", detachedAt: now })},
+              '{}', 2
+            ) RETURNING sequence
+          `;
+          first ??= inserted!.sequence;
+          last = inserted!.sequence;
+        }
+        const stored = yield* store
+          .readApplicationEvents({ afterSequence: first! - 1, throughSequence: last })
+          .pipe(Stream.runCollect);
+        yield* store.publishCommitted(Array.from(stored));
+        return last;
+      });
+    const shell = (id: string, parent: string | null, settledDaysAgo: number | null = null) =>
+      ({
+        id: ThreadId.make(id),
+        projectId: "project",
+        archivedAt: null,
+        title: id,
+        status: "completed",
+        activityRunStatus: null,
+        pendingRuntimeRequest: null,
+        pendingBackgroundTasks: [],
+        settledOverride: settledDaysAgo === null ? null : "settled",
+        settledAt:
+          settledDaysAgo === null ? null : DateTime.makeUnsafe(-settledDaysAgo * 86_400_000),
+        lineage: {
+          parentThreadId: parent === null ? null : ThreadId.make(parent),
+          relationshipToParent: parent === null ? null : "subagent",
+          rootThreadId: ThreadId.make(parent ?? id),
+        },
+      }) as unknown as OrchestrationV2ThreadShell;
+    const threads = [
+      shell("parent", null),
+      shell("idle", "parent"),
+      ...Array.from({ length: 25 }, (_, index) => shell(`recent-${index}`, null, 1)),
+      shell("old", null, 30),
+      shell("remote-settled-parent", null, 40),
+      shell("remote-idle-parent", "parent"),
+    ];
+    const overflows = overflowCounter();
+    const threadManagement = {
+      listActiveShellIndex: () =>
+        Effect.succeed(
+          threads.map((thread) => ({
+            ...thread,
+            pinnedAt: null,
+            snoozedUntil: null,
+            mayBeLive: false,
+            hasRemoteTasks: thread.id.startsWith("remote-"),
+          })),
+        ),
+      readShellSnapshot: (options?: { readonly threadIds?: ReadonlyArray<string> }) =>
+        Effect.succeed(
+          Effect.succeed({
+            schemaVersion: 1,
+            snapshotSequence: 0,
+            threads: threads.filter((thread) => options?.threadIds?.includes(thread.id) ?? true),
+            archivedThreads: [],
+          }),
+        ),
+      listActiveSubagentThreadIds: () => Effect.succeed([]),
+      getThreadShellReadForEvent: (input: {
+        readonly threadId: string;
+        readonly sequence: number;
+      }) =>
+        Effect.sync(() => ({ shell: shell(input.threadId, null), readOrdinal: input.sequence })),
+    } as unknown as ThreadManagement.ThreadManagementService["Service"];
+    const projectService = {
+      getShell: () => Effect.succeedNone,
+    } as unknown as ProjectService.ProjectService["Service"];
+    const hub = yield* buildShellHub({ store, threadManagement, projectService });
+    const stream = yield* subscribeOrchestrationV2Shell({
+      requestCompletionMarker: true,
+      omitIdleSubagents: true,
+      omitOlderSettled: true,
+    }).pipe(
+      Effect.provide(hub),
+      Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
+      Effect.provideService(ProjectStore.ProjectStoreV2, {
+        listShells: () => Effect.succeed([]),
+      } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+      Effect.provideService(ProjectService.ProjectService, projectService),
+      Effect.provideServiceEffect(
+        ProjectEnrichment.ProjectEnrichmentService,
+        PubSub.unbounded().pipe(
+          Effect.map(
+            (changes) =>
+              ({
+                subscribeChanges: PubSub.subscribe(changes),
+              }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+          ),
+        ),
+      ),
+      Effect.provide(Logger.layer([overflows.logger], { mergeWithExisting: true })),
+    );
+    const pull = yield* Stream.toPull(
+      stream.pipe(Stream.provide(Logger.layer([overflows.logger], { mergeWithExisting: true }))),
+    );
+    const snapshots: Array<ReadonlyArray<string>> = [];
+    const fold = makeShellFold();
+    const applyAll = (items: ReadonlyArray<OrchestrationV2ShellStreamItem>) => {
+      for (const item of items) {
+        if (item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined) {
+          snapshots.push(item.snapshot.threads.map((thread) => thread.id));
+        }
+        fold.apply(item);
+      }
+    };
+    const consumer = yield* pull.pipe(Effect.map(applyAll), Effect.forever, Effect.forkScoped);
+    yield* fold.reach(yield* commit(["thread:seed"]));
+    // Nothing pulls while more distinct threads than the buffer holds change.
+    yield* Fiber.interrupt(consumer);
+    yield* commit(
+      Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:d${index}`),
+    );
+    yield* overflows.reach(1);
+    yield* pull.pipe(Effect.map(applyAll), Effect.forever, Effect.forkScoped);
+    yield* fold.reach(yield* commit(["thread:seed"]));
+    const kept = [
+      "parent",
+      ...threads.slice(2, 27).map((thread) => thread.id),
+      "remote-settled-parent",
+      "remote-idle-parent",
+    ];
+    assert.deepEqual(snapshots, [kept, kept]);
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live.each([20, 100, 250])(
+  "one large batch resets %d shell subscribers at once (half of them stalled), who share one base read",
+  (subscribers) =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-01T00:00:00.000Z";
+      const threads = new Map<string, string>();
+      const versions = new Map<string, number>();
+      let eventCounter = 0;
+      const commit = (threadIds: ReadonlyArray<string>) =>
+        Effect.gen(function* () {
+          let first: number | undefined;
+          let last = 0;
+          for (const threadId of threadIds) {
+            const version = (versions.get(threadId) ?? -1) + 1;
+            versions.set(threadId, version);
+            const [inserted] = yield* sql<{ sequence: number }>`
+              INSERT INTO orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type,
+                occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+              ) VALUES (
+                ${`herd:${subscribers}:${eventCounter++}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+                ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:herd", detachedAt: now })},
+                '{}', 2
+              ) RETURNING sequence
+            `;
+            first ??= inserted!.sequence;
+            last = inserted!.sequence;
+            threads.set(threadId, `${threadId}@${inserted!.sequence}`);
+          }
+          const stored = yield* store
+            .readApplicationEvents({ afterSequence: first! - 1, throughSequence: last })
+            .pipe(Stream.runCollect);
+          yield* store.publishCommitted(Array.from(stored));
+          return last;
+        });
+      yield* commit(["thread:sentinel"]);
+      const shell = (threadId: string) =>
+        ({
+          id: threadId,
+          projectId: "project",
+          archivedAt: null,
+          title: threads.get(threadId),
+          status: "completed",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          pendingBackgroundTasks: [],
+          settledOverride: null,
+          settledAt: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        }) as unknown as OrchestrationV2ThreadShell;
+      let snapshotReads = 0;
+      const threadManagement = {
+        listActiveShellIndex: () => Effect.succeed([]),
+        readShellSnapshot: () =>
+          Effect.sync(() => {
+            snapshotReads += 1;
+            return Effect.succeed({
+              schemaVersion: 1,
+              snapshotSequence: 0,
+              threads: Array.from(threads.keys(), shell),
+              archivedThreads: [],
+            });
+          }),
+        listActiveSubagentThreadIds: () => Effect.succeed([]),
+        getThreadShellReadForEvent: (input: {
+          readonly threadId: string;
+          readonly sequence: number;
+        }) =>
+          Effect.sync(() => ({
+            shell: (() => shell(input.threadId))(),
+            readOrdinal: input.sequence,
+          })),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"];
+      const projectService = {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"];
+      const overflows = overflowCounter();
+      const logging = Logger.layer([overflows.logger], { mergeWithExisting: true });
+      const hub = yield* buildShellHub({ store, threadManagement, projectService });
+      const folds: Array<ReturnType<typeof makeShellFold>> = [];
+      // A subscriber that pulls by hand: its consumer is interrupted while it stalls.
+      const pullInto = (
+        stream: Effect.Success<ReturnType<typeof subscribeOrchestrationV2Shell>>,
+        fold: ReturnType<typeof makeShellFold>,
+      ) =>
+        Stream.toPull(stream.pipe(Stream.provide(logging))).pipe(
+          Effect.map((pull) =>
+            pull.pipe(
+              Effect.map((items) => {
+                for (const item of items) fold.apply(item);
+              }),
+            ),
+          ),
+        );
+      const stalled: Array<{
+        readonly pull: Effect.Success<ReturnType<typeof pullInto>>;
+        consumer: Fiber.Fiber<unknown, unknown>;
+      }> = [];
+      // Project rows a subscriber reads itself (its initial snapshot); a resync has them in the base.
+      let projectListReads = 0;
+      for (let index = 0; index < subscribers; index++) {
+        const fold = makeShellFold();
+        folds.push(fold);
+        const stream = yield* subscribeOrchestrationV2Shell({ requestCompletionMarker: true }).pipe(
+          Effect.provide(hub),
+          Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
+          Effect.provideService(ProjectStore.ProjectStoreV2, {
+            listShells: () =>
+              Effect.sync(() => {
+                projectListReads += 1;
+                return [];
+              }),
+          } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+          Effect.provideService(ProjectService.ProjectService, projectService),
+          Effect.provideServiceEffect(
+            ProjectEnrichment.ProjectEnrichmentService,
+            PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>().pipe(
+              Effect.map(
+                (changes) =>
+                  ({
+                    subscribeChanges: PubSub.subscribe(changes),
+                  }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+              ),
+            ),
+          ),
+          Effect.provide(logging),
+        );
+        if (index % 2 === 0) {
+          yield* stream.pipe(
+            Stream.provide(logging),
+            Stream.runForEach((item) => Effect.sync(() => fold.apply(item))),
+            Effect.forkScoped,
+          );
+        } else {
+          const pull = yield* pullInto(stream, fold);
+          stalled.push({ pull, consumer: yield* pull.pipe(Effect.forever, Effect.forkScoped) });
+        }
+      }
+      const ready = yield* commit(["thread:sentinel"]);
+      yield* Effect.forEach(folds, (fold) => fold.reach(ready), { discard: true });
+      // Half the subscribers stop pulling; one batch with more distinct threads than a buffer
+      // holds empties every buffer at once, and the pulling half resyncs.
+      for (const entry of stalled) yield* Fiber.interrupt(entry.consumer);
+      const readsBefore = snapshotReads;
+      const projectListReadsBefore = projectListReads;
+      yield* commit(
+        Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:bulk${index}`),
+      );
+      const pulled = yield* commit(["thread:sentinel"]);
+      yield* Effect.forEach(
+        folds.filter((_, index) => index % 2 === 0),
+        (fold) => fold.reach(pulled),
+        { discard: true },
+      );
+      const readsForPulling = snapshotReads - readsBefore;
+      // More changes before the stalled half pulls again: their resync shares the wave's base.
+      yield* commit(Array.from({ length: 50 }, (_, index) => `thread:late${index}`));
+      for (const entry of stalled) {
+        entry.consumer = yield* entry.pull.pipe(Effect.forever, Effect.forkScoped);
+      }
+      const after = yield* commit(["thread:sentinel"]);
+      yield* Effect.forEach(folds, (fold) => fold.reach(after), { discard: true });
+      const baseReads = snapshotReads - readsBefore;
+      yield* Effect.log(
+        `shell resync herd: subscribers=${subscribers} resets=${overflows.count} baseReads=${baseReads} (pulling half: ${readsForPulling})`,
+      );
+      const truth = Array.from(threads.entries()).sort(([a], [b]) => a.localeCompare(b));
+      for (const fold of folds) {
+        assert.equal(fold.state.dropped, 0);
+        assert.equal(fold.state.snapshots, 2);
+        assert.deepEqual(
+          Array.from(fold.state.threads.entries()).sort(([a], [b]) => a.localeCompare(b)),
+          truth,
+        );
+      }
+      // The resets of one batch share one base read, however the resets and pulls interleave,
+      // and a subscriber that pulls late finds the base its reset is covered by.
+      assert.equal(readsForPulling, 1);
+      assert.equal(baseReads, 1);
+      assert.equal(overflows.count, subscribers);
+      // The resync's project rows, and the identities re-sent after its snapshot, come from the
+      // base: no subscriber lists the projects again.
+      assert.equal(projectListReads, projectListReadsBefore);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live(
+  "a subscriber cancelled mid-read leaves the wave's read to the others; a restarted hub reads anew",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-01T00:00:00.000Z";
+      const threads = new Map<string, string>();
+      const versions = new Map<string, number>();
+      let eventCounter = 0;
+      const commit = (threadIds: ReadonlyArray<string>) =>
+        Effect.gen(function* () {
+          let first: number | undefined;
+          let last = 0;
+          for (const threadId of threadIds) {
+            const version = (versions.get(threadId) ?? -1) + 1;
+            versions.set(threadId, version);
+            const [inserted] = yield* sql<{ sequence: number }>`
+              INSERT INTO orchestration_events (
+                event_id, aggregate_kind, stream_id, stream_version, event_type,
+                occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+              ) VALUES (
+                ${`cancel:${eventCounter++}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+                ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:cancel", detachedAt: now })},
+                '{}', 2
+              ) RETURNING sequence
+            `;
+            first ??= inserted!.sequence;
+            last = inserted!.sequence;
+            threads.set(threadId, `${threadId}@${inserted!.sequence}`);
+          }
+          const stored = yield* store
+            .readApplicationEvents({ afterSequence: first! - 1, throughSequence: last })
+            .pipe(Stream.runCollect);
+          yield* store.publishCommitted(Array.from(stored));
+          return last;
+        });
+      yield* commit(["thread:sentinel"]);
+      const shell = (threadId: string) =>
+        ({
+          id: threadId,
+          projectId: "project",
+          archivedAt: null,
+          title: threads.get(threadId),
+          status: "completed",
+          activityRunStatus: null,
+          pendingRuntimeRequest: null,
+          pendingBackgroundTasks: [],
+          settledOverride: null,
+          settledAt: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        }) as unknown as OrchestrationV2ThreadShell;
+      let snapshotReads = 0;
+      let hubStarts = 0;
+      // A gated base read signals when it starts and completes when the gate opens.
+      let gate:
+        | { readonly started: Deferred.Deferred<void>; readonly open: Deferred.Deferred<void> }
+        | undefined;
+      const threadManagement = {
+        listActiveShellIndex: () => Effect.succeed([]),
+        readShellSnapshot: () =>
+          Effect.suspend(() => {
+            snapshotReads += 1;
+            const rows = Array.from(threads.keys(), shell);
+            const held = gate;
+            return (
+              held === undefined
+                ? Effect.void
+                : Deferred.succeed(held.started, undefined).pipe(
+                    Effect.andThen(Deferred.await(held.open)),
+                  )
+            ).pipe(
+              Effect.map(() =>
+                Effect.succeed({
+                  schemaVersion: 1,
+                  snapshotSequence: 0,
+                  threads: rows,
+                  archivedThreads: [],
+                }),
+              ),
+            );
+          }),
+        listActiveSubagentThreadIds: () =>
+          Effect.sync(() => {
+            hubStarts += 1;
+            return [];
+          }),
+        getThreadShellReadForEvent: (input: {
+          readonly threadId: string;
+          readonly sequence: number;
+        }) =>
+          Effect.sync(() => ({
+            shell: (() => shell(input.threadId))(),
+            readOrdinal: input.sequence,
+          })),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"];
+      const projectService = {
+        getShell: () => Effect.succeedNone,
+      } as unknown as ProjectService.ProjectService["Service"];
+      const hub = yield* buildShellHub({ store, threadManagement, projectService });
+      const subscriber = (scope: Scope.Scope) =>
+        Effect.gen(function* () {
+          const fold = makeShellFold();
+          const stream = yield* subscribeOrchestrationV2Shell({
+            requestCompletionMarker: true,
+          }).pipe(
+            Effect.provide(hub),
+            Effect.provideService(ThreadManagement.ThreadManagementService, threadManagement),
+            Effect.provideService(ProjectStore.ProjectStoreV2, {
+              listShells: () => Effect.succeed([]),
+            } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+            Effect.provideService(ProjectService.ProjectService, projectService),
+            Effect.provideServiceEffect(
+              ProjectEnrichment.ProjectEnrichmentService,
+              PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>().pipe(
+                Effect.map(
+                  (changes) =>
+                    ({
+                      subscribeChanges: PubSub.subscribe(changes),
+                    }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+                ),
+              ),
+            ),
+            Scope.provide(scope),
+          );
+          const pull = (yield* Stream.toPull(stream).pipe(Scope.provide(scope))).pipe(
+            Effect.map((items) => {
+              for (const item of items) fold.apply(item);
+            }),
+          );
+          const consume = pull.pipe(Effect.forever, Effect.forkIn(scope));
+          return { fold, consume, consumer: yield* consume };
+        });
+      const truth = () => Array.from(threads.entries()).sort(([a], [b]) => a.localeCompare(b));
+      const folded = (fold: ReturnType<typeof makeShellFold>) =>
+        Array.from(fold.state.threads.entries()).sort(([a], [b]) => a.localeCompare(b));
+      const scopeA = yield* Scope.make();
+      const scopeB = yield* Scope.make();
+      const a = yield* subscriber(scopeA);
+      const b = yield* subscriber(scopeB);
+      const ready = yield* commit(["thread:sentinel"]);
+      yield* a.fold.reach(ready);
+      yield* b.fold.reach(ready);
+      yield* Fiber.interrupt(a.consumer);
+      yield* Fiber.interrupt(b.consumer);
+      // One batch resets both. A pulls first and starts the wave's read, held by the gate; A is
+      // cancelled while it waits. B's resync waits on that same read, which the hub keeps running.
+      yield* commit(
+        Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:x${index}`),
+      );
+      const held = { started: yield* Deferred.make<void>(), open: yield* Deferred.make<void>() };
+      gate = held;
+      const readsBefore = snapshotReads;
+      yield* a.consume;
+      yield* Deferred.await(held.started);
+      yield* Scope.close(scopeA, Exit.void);
+      yield* b.consume;
+      gate = undefined;
+      yield* Deferred.succeed(held.open, undefined);
+      const afterB = yield* commit(["thread:sentinel"]);
+      yield* b.fold.reach(afterB);
+      assert.equal(snapshotReads - readsBefore, 1);
+      assert.equal(b.fold.state.snapshots, 2);
+      assert.deepEqual(folded(b.fold), truth());
+      // The last subscriber leaves and the hub stops. A new one restarts it; its own wave reads.
+      yield* Scope.close(scopeB, Exit.void);
+      const startsBefore = hubStarts;
+      const scopeC = yield* Scope.make();
+      const c = yield* subscriber(scopeC);
+      yield* c.fold.reach(yield* commit(["thread:sentinel"]));
+      assert.isAbove(hubStarts, startsBefore);
+      yield* Fiber.interrupt(c.consumer);
+      const readsC = snapshotReads;
+      yield* commit(
+        Array.from({ length: LIVE_STREAM_MAX_ITEMS + 300 }, (_, index) => `thread:y${index}`),
+      );
+      yield* c.consume;
+      yield* c.fold.reach(yield* commit(["thread:sentinel"]));
+      assert.equal(snapshotReads - readsC, 1);
+      assert.equal(c.fold.state.snapshots, 2);
+      assert.equal(c.fold.state.dropped, 0);
+      assert.deepEqual(folded(c.fold), truth());
+      yield* Scope.close(scopeC, Exit.void);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.live(
+  "a thread subscriber resyncs after every overflow: a stalled client loads no snapshot, repeats fold correctly",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-01T00:00:00.000Z";
+      const threadId = ThreadId.make("thread:thread-resync");
+      const [row] = yield* sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        'thread-resync:0', 'thread', ${threadId}, 0, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:thread-resync", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+      const [stored] = yield* store
+        .readApplicationEvents({ afterSequence: row!.sequence - 1, throughSequence: row!.sequence })
+        .pipe(Stream.runCollect);
+      if (stored === undefined || !("event" in stored))
+        return yield* Effect.die("Expected a thread event");
+      let sequence = row!.sequence;
+      let newestPublished = sequence;
+      const nextEvents = (count: number) =>
+        Array.from({ length: count }, () => ({ ...stored, sequence: ++sequence }));
+      const overflows = overflowCounter();
+      // Each live tail reads the high-water mark right after subscribing: publish queued events there.
+      let queued: Array<OrchestrationV2StoredEvent> = [];
+      const publishOnLiveSubscription: Statement.Transformer = (statement) => {
+        const [query] = statement.compile();
+        if (!query.includes("FROM orchestration_events") || !query.includes("MAX(sequence)")) {
+          return Effect.succeed(statement);
+        }
+        const batch = queued;
+        queued = [];
+        if (batch.length === 0) return Effect.succeed(statement);
+        newestPublished = batch.at(-1)!.sequence;
+        return store.publishCommitted(batch).pipe(Effect.as(statement));
+      };
+      const publish = (batch: ReadonlyArray<OrchestrationV2StoredEvent>) =>
+        Effect.suspend(() => {
+          newestPublished = batch.at(-1)!.sequence;
+          return store.publishCommitted(batch);
+        });
+      let snapshotLoads = 0;
+      const projection = (title: string) =>
+        ({
+          thread: {
+            id: threadId,
+            projectId: ProjectId.make("project"),
+            title,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            deletedAt: null,
+          },
+          runs: [],
+          attempts: [],
+          nodes: [],
+          subagents: [],
+          providerSessions: [],
+          providerThreads: [],
+          providerTurns: [],
+          runtimeRequests: [],
+          messages: [],
+          plans: [],
+          turnItems: [],
+          checkpointScopes: [],
+          checkpoints: [],
+          contextHandoffs: [],
+          contextTransfers: [],
+          visibleTurnItems: [],
+          updatedAt: now,
+        }) as unknown as OrchestrationV2ThreadProjection;
+      const stream = yield* subscribeOrchestrationV2Thread({
+        threadId,
+        requestCompletionMarker: true,
+      }).pipe(
+        Effect.provideService(ThreadManagement.ThreadManagementService, {
+          ensureLegacyTranscript: () => Effect.void,
+          // The projection the store holds reflects every event published so far.
+          getThreadSnapshot: () =>
+            Effect.sync(() => {
+              snapshotLoads += 1;
+              return {
+                snapshotSequence: newestPublished,
+                projection: projection(`Events through ${newestPublished}`),
+              };
+            }),
+          streamStoredEventsFrom: (input: { readonly afterSequence?: number }) =>
+            store
+              .streamApplicationEvents({ afterSequence: input.afterSequence ?? 0 })
+              .pipe(
+                Stream.filter((event): event is OrchestrationV2StoredEvent => "event" in event),
+              ),
+        } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+      );
+      const pull = yield* Stream.toPull(
+        stream.pipe(
+          Stream.provideService(Statement.CurrentTransformer, publishOnLiveSubscription),
+          Stream.provide(Logger.layer([overflows.logger], { mergeWithExisting: true })),
+        ),
+      );
+      let cursor = 0;
+      let title = "";
+      let snapshots = 0;
+      let dropped = 0;
+      const apply = (items: ReadonlyArray<OrchestrationV2ThreadStreamItem>) => {
+        for (const item of items) {
+          if (item.kind === "snapshot") {
+            snapshots += 1;
+            cursor = item.snapshotSequence;
+            title = item.projection.thread.title;
+          } else if (item.kind === "event") {
+            if (item.sequence <= cursor) dropped += 1;
+            else cursor = item.sequence;
+          }
+        }
+      };
+      for (let items = yield* pull; ; items = yield* pull) {
+        apply(items);
+        if (items.some((item) => item.kind === "snapshot")) break;
+      }
+      const rounds = 3;
+      for (let round = 0; round < rounds; round++) {
+        // One event for the live tail that starts with this pull (initial, or after a resync).
+        const marker = nextEvents(1);
+        queued = marker;
+        if (round > 0) {
+          // The pull after a stall surfaces the overflow and loads exactly one snapshot.
+          const loadsBefore = snapshotLoads;
+          let gotSnapshot = false;
+          while (!gotSnapshot) {
+            const items = yield* pull;
+            apply(items);
+            gotSnapshot = items.some((item) => item.kind === "snapshot");
+          }
+          assert.equal(snapshotLoads, loadsBefore + 1);
+        }
+        while (cursor < marker[0]!.sequence) apply(yield* pull);
+        // The client stalls: nothing pulls while more events than the buffer holds arrive.
+        const loadsBefore = snapshotLoads;
+        yield* publish(nextEvents(LIVE_STREAM_MAX_ITEMS + 200));
+        yield* overflows.reach(round + 1);
+        assert.equal(
+          snapshotLoads,
+          loadsBefore,
+          `a stalled client loaded a snapshot (round ${round})`,
+        );
+      }
+      const marker = nextEvents(1);
+      queued = marker;
+      while (cursor < marker[0]!.sequence) apply(yield* pull);
+      assert.equal(dropped, 0);
+      assert.equal(snapshots, 1 + rounds);
+      assert.equal(snapshotLoads, 1 + rounds);
+      assert.equal(overflows.count, rounds);
+      assert.equal(title, `Events through ${marker[0]!.sequence - 1}`);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+const decodeThreadShellJson = Schema.decodeSync(Schema.toCodecJson(OrchestrationV2ThreadShell));
+const encodeShellChunk = Schema.encodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeShell.output)),
+);
+const encodeThreadChunk = Schema.encodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeThread.output)),
+);
+
+const sampleThreadShell = decodeThreadShellJson({
+  createdBy: "user",
+  creationSource: "web",
+  id: "4fce7cfc-16ef-42bb-bca2-000000000046",
+  projectId: "d2e0512a-ce5d-42b9-b72d-000000000001",
+  title: "Synthetic thread 63",
+  providerInstanceId: "claudeAgent",
+  modelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-4-6" },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+  linkedPullRequest: null,
+  pullRequests: [],
+  branchPullRequest: null,
+  lineage: {
+    parentThreadId: null,
+    relationshipToParent: null,
+    rootThreadId: "4fce7cfc-16ef-42bb-bca2-000000000046",
+  },
+  forkedFrom: null,
+  activeProviderThreadId: null,
+  latestRunId: "run:thread:4fce7cfc-16ef-42bb-bca2-000000000046:ordinal:4",
+  latestRunRequestedAt: "2025-11-09T01:43:58.436Z",
+  latestRunStartedAt: "2025-11-09T01:43:59.436Z",
+  latestRunCompletedAt: "2025-11-09T01:44:33.436Z",
+  latestRunStopRequested: false,
+  activeRunId: null,
+  activityRunStartedAt: null,
+  activityRunStatus: null,
+  blockedOnThreadWait: false,
+  status: "completed",
+  lastError: null,
+  usageLimitResetAt: null,
+  pendingRuntimeRequest: null,
+  pendingGuestMessageCount: 0,
+  latestVisibleMessage: null,
+  latestUserMessageAt: "2025-11-09T01:43:58.436Z",
+  hasActionableProposedPlan: false,
+  pendingBackgroundTasks: [],
+  providerInstanceHistory: ["claudeAgent"],
+  itemCount: 25,
+  visibleItemCount: 25,
+  createdAt: "2025-11-09T01:09:02.473Z",
+  updatedAt: "2025-11-09T01:45:33.436Z",
+  archivedAt: null,
+  settledOverride: "settled",
+  settledAt: "2025-11-09T01:45:33.436Z",
+  lastVisitedAt: "2025-11-09T01:45:33.436Z",
+  deletedAt: null,
+});
+
+it("encodes a shared stream item once, as the RPC JSON codec encodes a chunk", () => {
+  const shell = sampleThreadShell;
+  const shellItems: Array<OrchestrationV2ShellStreamItem> = [
+    { kind: "thread.updated", sequence: 7, location: "active", thread: shell },
+    { kind: "thread.removed", sequence: 8, location: "archive", threadId: shell.id },
+    { kind: "synchronized" },
+  ];
+  assert.deepStrictEqual<unknown>(
+    shellItems.map(encodeShellStreamItem),
+    encodeShellChunk(shellItems),
+  );
+  assert.strictEqual(encodeShellStreamItem(shellItems[0]!), encodeShellStreamItem(shellItems[0]!));
+  const synchronized = { kind: "synchronized" as const };
+  assert.deepStrictEqual<unknown>(
+    [encodeThreadStreamItem(synchronized)],
+    encodeThreadChunk([synchronized]),
+  );
+});
+
+// Review E1: each encoder keeps its own cache, so an object that reaches both streams is never
+// served with the other stream's encoding.
+it("an item encoded for the shell stream is not served to the thread stream from the cache", () => {
+  const item: OrchestrationV2ShellStreamItem = {
+    kind: "thread.removed",
+    sequence: 9,
+    location: "archive",
+    threadId: ThreadId.make("4fce7cfc-16ef-42bb-bca2-000000000047"),
+  };
+  assert.deepStrictEqual<unknown>([encodeShellStreamItem(item)], encodeShellChunk([item]));
+  // Not a thread stream item: the thread encoder must reject it, not return the shell encoding.
+  assert.throws(() => encodeThreadStreamItem(item as never));
+});
+
+// Review E2: the two stream RPCs served through the server's real definitions by RpcServer with
+// the JSON codec (pass-through items), decoded with the client contract's chunk codec, and
+// byte-identical to the same handlers served through the contract definitions.
+const decodeProjectShellJson = Schema.decodeSync(Schema.toCodecJson(OrchestrationProjectShell));
+type WsRpc = RpcGroup.Rpcs<typeof WsRpcGroup>;
+const contractRpc = <Tag extends WsRpc["_tag"]>(tag: Tag) =>
+  WsRpcGroup.requests.get(tag) as Extract<WsRpc, { readonly _tag: Tag }>;
+const ContractStreamRpcGroup = RpcGroup.make(
+  contractRpc(ORCHESTRATION_V2_WS_METHODS.subscribeShell),
+  contractRpc(ORCHESTRATION_V2_WS_METHODS.subscribeThread),
+);
+const decodeShellChunk = Schema.decodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeShell.output)),
+);
+const decodeThreadChunk = Schema.decodeUnknownSync(
+  Schema.toCodecJson(Schema.NonEmptyArray(OrchestrationV2RpcSchemas.subscribeThread.output)),
+);
+
+// RpcServer over an in-memory protocol with the JSON codec: the frames it sends are collected,
+// each chunk acknowledged as the websocket client would.
+const serveStreamRequest = <Rpcs extends Rpc.Any, R>(
+  group: RpcGroup.RpcGroup<Rpcs>,
+  handlers: Layer.Layer<Rpc.ToHandler<Rpcs>, never, R>,
+  request: { readonly tag: string; readonly payload: unknown },
+) =>
+  Effect.gen(function* () {
+    const frames = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
+    const disconnects = yield* Queue.unbounded<number>();
+    let write:
+      | ((clientId: number, data: RpcMessage.FromClientEncoded) => Effect.Effect<void>)
+      | undefined;
+    const protocol = yield* RpcServer.Protocol.make((toServer) =>
+      Effect.sync(() => {
+        write = toServer;
+        return {
+          disconnects,
+          send: (_clientId: number, response: RpcMessage.FromServerEncoded) =>
+            Effect.asVoid(Queue.offer(frames, response)),
+          end: () => Effect.void,
+          clientIds: Effect.succeed(new Set([0])),
+          initialMessage: Effect.succeedNone,
+          supportsAck: true,
+          supportsTransferables: false,
+          supportsSpanPropagation: false,
+          supportsNotifications: false,
+          codecFor: Schema.toCodecJson,
+        };
+      }),
+    );
+    yield* RpcServer.make(group, WS_RPC_SERVER_OPTIONS).pipe(
+      Effect.provideService(RpcServer.Protocol, protocol),
+      Effect.provide(Layer.merge(handlers, RpcAuthorization.layer([AuthOrchestrationReadScope]))),
+      Effect.forkScoped,
+    );
+    const toServer = (data: RpcMessage.FromClientEncoded) =>
+      write === undefined ? Effect.die("the protocol has not started") : write(0, data);
+    yield* toServer({
+      _tag: "Request",
+      id: "1",
+      tag: request.tag,
+      payload: request.payload,
+      headers: [],
+    });
+    // Chunk frames as JSON strings, until the completion marker (the live tail never ends).
+    const chunks: Array<string> = [];
+    while (true) {
+      const frame = yield* Queue.take(frames);
+      if (frame._tag === "Exit" || frame._tag === "Defect") {
+        return yield* Effect.die(
+          `stream ended before the completion marker: ${JSON.stringify(frame)}`,
+        );
+      }
+      if (frame._tag !== "Chunk") continue;
+      chunks.push(JSON.stringify(frame.values));
+      yield* toServer({ _tag: "Ack", requestId: frame.requestId });
+      if (frame.values.some((value) => (value as { kind?: string }).kind === "synchronized")) {
+        return chunks;
+      }
+    }
+  });
+
+it.live(
+  "the server's stream RPC definitions send what the contract definitions send, and the contract client decodes them",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const now = "2026-10-31T00:00:00.000Z";
+      const threadId = ThreadId.make("thread:stream-rpc");
+      const projectId = ProjectId.make("project:stream-rpc");
+      const identity = {
+        canonicalKey: "github.com/x/y",
+        locator: {
+          source: "git-remote",
+          remoteName: "origin",
+          remoteUrl: "https://github.com/x/y.git",
+        },
+      } as const;
+      const projectRow = decodeProjectShellJson({
+        id: projectId,
+        title: "Stream RPC",
+        workspaceRoot: "/tmp/stream-rpc",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      });
+      // Events the resumes replay: a project update and a thread update.
+      yield* sql`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          'stream-rpc:project:1', 'project', ${projectId}, 1, 'project.meta-updated',
+          ${now}, 'server', ${JSON.stringify({ projectId, title: "Stream RPC", updatedAt: now })}, '{}', 2
+        )
+      `;
+      yield* insertShellEvent(sql, threadId, 0);
+      const layerStreamServices = ShellDeltaHub.layer.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(
+            Layer.succeed(ThreadManagement.ThreadManagementService, {
+              ensureLegacyTranscript: () => Effect.void,
+              getShellSnapshot: () => Effect.die("a resume must not load a full snapshot"),
+              listActiveSubagentThreadIds: () => Effect.succeed([]),
+              getThreadShellReadForEvent: (input: {
+                readonly threadId: ThreadId;
+                readonly sequence: number;
+              }) =>
+                Effect.succeed({
+                  shell: { ...sampleThreadShell, id: input.threadId },
+                  readOrdinal: input.sequence,
+                }),
+              streamStoredEventsFrom: (input?: { readonly afterSequence?: number }) =>
+                store
+                  .streamApplicationEvents({ afterSequence: input?.afterSequence ?? 0 })
+                  .pipe(
+                    Stream.filter((event): event is OrchestrationV2StoredEvent => "event" in event),
+                  ),
+            } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+            Layer.succeed(ProjectStore.ProjectStoreV2, {
+              listShells: () => Effect.succeed([projectRow]),
+              getShell: () => Effect.succeedSome(projectRow),
+            } as unknown as ProjectStore.ProjectStoreV2["Service"]),
+            Layer.effect(
+              ProjectEnrichment.ProjectEnrichmentService,
+              PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>().pipe(
+                Effect.map(
+                  (changes) =>
+                    ({
+                      subscribeChanges: PubSub.subscribe(changes),
+                      // The identity is attached as each subscriber sends the project item.
+                      getAvailable: () =>
+                        Effect.succeed({
+                          repositoryIdentity: identity,
+                          faviconPath: null,
+                          repositoryIdentityResolved: true,
+                        }),
+                    }) as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"],
+                ),
+              ),
+            ),
+            Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, store),
+          ),
+        ),
+      );
+      const serverHandlers = ServerWsStreamRpcGroup.toLayer({
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: subscribeShellRpcHandler,
+        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: subscribeThreadRpcHandler,
+      }).pipe(Layer.provide(layerStreamServices));
+      const contractHandlers = ContractStreamRpcGroup.toLayer({
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input) =>
+          Stream.unwrap(subscribeOrchestrationV2Shell(input)),
+        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
+          Stream.unwrap(subscribeOrchestrationV2Thread(input)),
+      }).pipe(Layer.provide(layerStreamServices));
+      const shellRequest = {
+        tag: ORCHESTRATION_V2_WS_METHODS.subscribeShell,
+        payload: { afterSequence: 0, requestCompletionMarker: true },
+      };
+      const threadRequest = {
+        tag: ORCHESTRATION_V2_WS_METHODS.subscribeThread,
+        payload: { threadId, afterSequence: 0, requestCompletionMarker: true },
+      };
+
+      const shellChunks = yield* serveStreamRequest(
+        ServerWsStreamRpcGroup,
+        serverHandlers,
+        shellRequest,
+      );
+      const shellItems = shellChunks.flatMap((chunk) => decodeShellChunk(JSON.parse(chunk)));
+      assert.deepEqual(
+        shellItems.map((item) => item.kind),
+        ["snapshot", "project.updated", "thread.updated", "synchronized"],
+      );
+      const projectItem = shellItems.find((item) => item.kind === "project.updated");
+      assert.equal(
+        projectItem?.kind === "project.updated"
+          ? projectItem.project.repositoryIdentity?.canonicalKey
+          : undefined,
+        identity.canonicalKey,
+      );
+      const threadItem = shellItems.find((item) => item.kind === "thread.updated");
+      assert.deepEqual(threadItem?.kind === "thread.updated" ? threadItem.thread : undefined, {
+        ...sampleThreadShell,
+        id: threadId,
+      });
+      assert.deepEqual(
+        shellChunks,
+        yield* serveStreamRequest(ContractStreamRpcGroup, contractHandlers, shellRequest),
+      );
+
+      const threadChunks = yield* serveStreamRequest(
+        ServerWsStreamRpcGroup,
+        serverHandlers,
+        threadRequest,
+      );
+      const threadItems = threadChunks.flatMap((chunk) => decodeThreadChunk(JSON.parse(chunk)));
+      assert.deepEqual(
+        threadItems.map((item) => item.kind),
+        ["event", "synchronized"],
+      );
+      // The event's timestamps travel as the contract encodes them.
+      assert.include(threadChunks.join("\n"), `"occurredAt":"${now}"`);
+      assert.deepEqual(
+        threadChunks,
+        yield* serveStreamRequest(ContractStreamRpcGroup, contractHandlers, threadRequest),
+      );
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
+  Layer.mock(ShellDeltaHub.ShellDeltaHub)({
+    inspect: () => ({ subscribers: 0, baseRetained: false }),
+  }),
   Layer.mock(DocumentText.DocumentText)({}),
   Layer.mock(ServerSecretStore.ServerSecretStore)({}),
   Layer.mock(SecretCheck.SecretCheck)({}),
@@ -2002,6 +3916,7 @@ it.effect.each([
         return items;
       });
       const exit = yield* subscription.pipe(
+        Effect.provide(ShellDeltaHub.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getThreadSnapshot: () => Effect.die("snapshot"),
@@ -2073,6 +3988,7 @@ it.effect.each(["thread", "shell"] as const)(
         return stream;
       }).pipe(
         Effect.provideService(Statement.CurrentTransformer, gateReplayRead),
+        Effect.provide(ShellDeltaHub.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getThreadSnapshot: () => Effect.die("snapshot"),
@@ -2106,6 +4022,183 @@ it.effect.each(["thread", "shell"] as const)(
       const exit = yield* Fiber.join(fiber);
       assert.deepEqual(Exit.isFailure(exit) ? Cause.squash(exit.cause) : exit, "snapshot");
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// The snapshot a prune race falls back to continues live like any other: an overflow resyncs it.
+it.live("a thread resume that pruning sent to a snapshot resyncs after a later overflow", () =>
+  Effect.gen(function* () {
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const now = "2026-10-13T00:00:00.000Z";
+    const threadId = ThreadId.make("thread:prune-race-overflow");
+    const insert = (version: number) => sql<{ sequence: number }>`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type,
+        occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        ${`prune-race-overflow:${version}`}, 'thread', ${threadId}, ${version}, 'provider-session.detached',
+        ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:race", detachedAt: now })},
+        '{}', 2
+      ) RETURNING sequence
+    `;
+    const [first] = yield* insert(0);
+    const [second] = yield* insert(1);
+    const [third] = yield* insert(2);
+    const [stored] = yield* store
+      .readApplicationEvents({
+        afterSequence: third!.sequence - 1,
+        throughSequence: third!.sequence,
+      })
+      .pipe(Stream.runCollect);
+    if (stored === undefined || !("event" in stored)) {
+      return yield* Effect.die("Expected a thread event");
+    }
+    let sequence = third!.sequence;
+    let newestPublished = sequence;
+    const nextEvents = (count: number) =>
+      Array.from({ length: count }, () => ({ ...stored, sequence: ++sequence }));
+    const publish = (batch: ReadonlyArray<OrchestrationV2StoredEvent>) =>
+      Effect.suspend(() => {
+        newestPublished = batch.at(-1)!.sequence;
+        return store.publishCommitted(batch);
+      });
+    const overflows = overflowCounter();
+    const readStarted = yield* Deferred.make<void>();
+    const releaseRead = yield* Deferred.make<void>();
+    let gated = false;
+    // A live tail reads the high-water mark right after subscribing: queued events go out there.
+    let queued: Array<OrchestrationV2StoredEvent> = [];
+    const transformer: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      // The paged replay read (readAgentEvents), not the stats or high-water queries.
+      if (!gated && /^\s*SELECT\s+sequence,\s+event_id,/.test(query)) {
+        gated = true;
+        return Deferred.succeed(readStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseRead)),
+          Effect.as(statement),
+        );
+      }
+      if (
+        queued.length > 0 &&
+        query.includes("FROM orchestration_events") &&
+        query.includes("MAX(sequence)")
+      ) {
+        const batch = queued;
+        queued = [];
+        return publish(batch).pipe(Effect.as(statement));
+      }
+      return Effect.succeed(statement);
+    };
+    let snapshotLoads = 0;
+    const fiber = yield* subscribeOrchestrationV2Thread({
+      threadId,
+      afterSequence: first!.sequence,
+    }).pipe(
+      Effect.provideService(Statement.CurrentTransformer, transformer),
+      Effect.provideService(ThreadManagement.ThreadManagementService, {
+        ensureLegacyTranscript: () => Effect.void,
+        getThreadSnapshot: () =>
+          Effect.sync(() => {
+            snapshotLoads += 1;
+            return {
+              snapshotSequence: newestPublished,
+              projection: {
+                thread: {
+                  id: threadId,
+                  projectId: ProjectId.make("project"),
+                  title: `Events through ${newestPublished}`,
+                  lineage: {
+                    parentThreadId: null,
+                    relationshipToParent: null,
+                    rootThreadId: threadId,
+                  },
+                  createdAt: now,
+                  updatedAt: now,
+                  archivedAt: null,
+                  deletedAt: null,
+                },
+                runs: [],
+                attempts: [],
+                nodes: [],
+                subagents: [],
+                providerSessions: [],
+                providerThreads: [],
+                providerTurns: [],
+                runtimeRequests: [],
+                messages: [],
+                plans: [],
+                turnItems: [],
+                checkpointScopes: [],
+                checkpoints: [],
+                contextHandoffs: [],
+                contextTransfers: [],
+                visibleTurnItems: [],
+                updatedAt: now,
+              } as unknown as OrchestrationV2ThreadProjection,
+            };
+          }),
+        streamStoredEventsFrom: (input: { readonly afterSequence?: number }) =>
+          store
+            .streamApplicationEvents({ afterSequence: input.afterSequence ?? 0 })
+            .pipe(Stream.filter((event): event is OrchestrationV2StoredEvent => "event" in event)),
+      } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(readStarted);
+    // A pass publishes its boundary, then deletes the rows it covers.
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_metadata (
+        projection_name, schema_version, last_sequence, updated_at
+      ) VALUES (${OrchestrationEventStore.EVENT_LOG_PRUNED_THROUGH}, 2, ${second!.sequence}, ${now})
+    `;
+    yield* sql`DELETE FROM orchestration_events WHERE sequence = ${second!.sequence}`;
+    yield* Deferred.succeed(releaseRead, undefined);
+    const pull = yield* Stream.toPull(
+      (yield* Fiber.join(fiber)).pipe(
+        Stream.provideService(Statement.CurrentTransformer, transformer),
+        Stream.provide(Logger.layer([overflows.logger], { mergeWithExisting: true })),
+      ),
+    );
+    let cursor = 0;
+    let snapshots = 0;
+    let dropped = 0;
+    const apply = (items: ReadonlyArray<OrchestrationV2ThreadStreamItem>) => {
+      for (const item of items) {
+        if (item.kind === "snapshot") {
+          snapshots += 1;
+          cursor = item.snapshotSequence;
+        } else if (item.kind === "event") {
+          if (item.sequence <= cursor) dropped += 1;
+          else cursor = item.sequence;
+        }
+      }
+    };
+    const pullThroughSnapshot = Effect.gen(function* () {
+      for (let items = yield* pull; ; items = yield* pull) {
+        apply(items);
+        if (items.some((item) => item.kind === "snapshot")) return "snapshot";
+      }
+    });
+    // One event for each live tail, published as it subscribes (after its snapshot).
+    const marker = nextEvents(1);
+    queued = marker;
+    assert.equal(yield* pullThroughSnapshot, "snapshot");
+    while (cursor < marker[0]!.sequence) apply(yield* pull);
+    // The client stalls: nothing pulls while more events than the buffer holds arrive.
+    yield* publish(nextEvents(LIVE_STREAM_MAX_ITEMS + 200));
+    yield* overflows.reach(1);
+    const after = nextEvents(1);
+    queued = after;
+    const resynced = yield* Effect.exit(pullThroughSnapshot);
+    assert.deepEqual(
+      Exit.isFailure(resynced) ? Cause.squash(resynced.cause) : resynced.value,
+      "snapshot",
+    );
+    while (cursor < after[0]!.sequence) apply(yield* pull);
+    assert.equal(snapshotLoads, 2);
+    assert.equal(snapshots, 2);
+    assert.equal(dropped, 0);
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
 // A cursor at the high-water missed nothing, even below the boundary; resuming must not resend
@@ -2193,6 +4286,7 @@ it.effect.each([
         );
       });
       const exit = yield* subscription.pipe(
+        Effect.provide(ShellDeltaHub.layer),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getThreadSnapshot: () => Effect.die("snapshot"),
@@ -2457,4 +4551,646 @@ it.effect("ACP session RPCs list a thread missing its history and repair it on i
       ),
     ),
   ),
+);
+
+// Reviewer scenario (F2): the resume replay reads a thread after the hub's held delta for it was read.
+it.effect("a resumed shell subscriber never receives a shell older than one its replay sent", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const threadId = ThreadId.make("thread:resume-order");
+    let title = "c1";
+    let version = 0;
+    let published = 0;
+    const insert = (id: ThreadId) =>
+      sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          ${`resume-order:${++version}`}, 'thread', ${id}, ${version}, 'provider-session.detached',
+          '2026-10-31T00:00:00.000Z', 'server',
+          ${JSON.stringify({ providerSessionId: "session:order", detachedAt: "2026-10-31T00:00:00.000Z" })},
+          '{}', 2
+        ) RETURNING sequence
+      `.pipe(Effect.asVoid);
+    const publishAll = Effect.gen(function* () {
+      const events = yield* store
+        .readApplicationEvents({ afterSequence: published, throughSequence: version })
+        .pipe(Stream.runCollect);
+      published = version;
+      yield* store.publishCommitted(events);
+    });
+    const settle = Effect.gen(function* () {
+      for (let round = 0; round < 4; round++) {
+        for (let step = 0; step < 200; step++) yield* Effect.yieldNow;
+        yield* TestClock.adjust(0);
+      }
+    });
+    // The replay's reads of these threads wait, so the replay outlives the 5 s shared-read TTL.
+    const replayGate = yield* Deferred.make<void>();
+    const seen: Array<string> = [];
+    for (let index = 0; index < 8; index++)
+      yield* insert(ThreadId.make(`thread:resume-slow-${index}`));
+    yield* insert(threadId);
+    published = version;
+    yield* Effect.gen(function* () {
+      const stream = yield* subscribeOrchestrationV2Shell({
+        afterSequence: 0,
+        requestCompletionMarker: true,
+      });
+      yield* stream.pipe(
+        Stream.runForEach((item) =>
+          Effect.sync(() => {
+            seen.push(
+              item.kind === "thread.updated"
+                ? `${item.sequence}:${(item.thread as { title: string }).title}`
+                : item.kind,
+            );
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settle;
+      title = "c2";
+      yield* insert(threadId);
+      yield* publishAll;
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settle;
+      yield* TestClock.adjust(ThreadManagement.SHARED_SHELL_READ_TTL_MS + 1_000);
+      yield* settle;
+      title = "c3";
+      yield* insert(threadId);
+      yield* publishAll;
+      yield* Deferred.succeed(replayGate, undefined);
+      yield* settle;
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settle;
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settle;
+    }).pipe(
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: (id) =>
+            Effect.gen(function* () {
+              if (id.startsWith("thread:resume-slow-")) {
+                yield* Deferred.await(replayGate);
+                return {
+                  id,
+                  archivedAt: null,
+                  title: "slow",
+                } as unknown as OrchestrationV2ThreadShell;
+              }
+              return { id, archivedAt: null, title } as unknown as OrchestrationV2ThreadShell;
+            }),
+        }),
+      ),
+    );
+    const titles = seen
+      .filter((item) => item.includes(":") && !item.endsWith(":slow"))
+      .map((item) => item.split(":")[1]!);
+    const order = ["c1", "c2", "c3"];
+    for (let index = 1; index < titles.length; index++) {
+      assert.isTrue(
+        order.indexOf(titles[index]!) >= order.indexOf(titles[index - 1]!),
+        `shell went backwards: ${seen.join(" ")}`,
+      );
+    }
+    assert.include(titles, "c3");
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// Shell subscribers over gated reads: the shell read of a gated thread waits until released.
+const withGatedShellReads = <A, E, R>(
+  input: {
+    readonly gates: ReadonlyMap<string, Deferred.Deferred<void>>;
+    readonly title: (id: string) => string;
+  },
+  run: Effect.Effect<A, E, R>,
+) =>
+  run.pipe(
+    Effect.provide(
+      layerShellSubscribers({
+        getThreadShell: (id) =>
+          Effect.gen(function* () {
+            const gate = input.gates.get(id);
+            if (gate !== undefined) yield* Deferred.await(gate);
+            return {
+              id,
+              archivedAt: null,
+              title: input.title(id),
+            } as unknown as OrchestrationV2ThreadShell;
+          }),
+      }),
+    ),
+  );
+
+const settleHub = Effect.gen(function* () {
+  for (let round = 0; round < 4; round++) {
+    for (let step = 0; step < 200; step++) yield* Effect.yieldNow;
+    yield* TestClock.adjust(0);
+  }
+});
+
+const subscribeInto = (afterSequence: number, seen: Array<string>) =>
+  Effect.gen(function* () {
+    const stream = yield* subscribeOrchestrationV2Shell({
+      afterSequence,
+      requestCompletionMarker: true,
+    });
+    yield* stream.pipe(
+      Stream.runForEach((item) =>
+        Effect.sync(() => {
+          seen.push(
+            item.kind === "thread.updated"
+              ? `${item.thread.id}@${item.sequence}:${(item.thread as { title: string }).title}`
+              : item.kind === "project.updated"
+                ? `project.updated@${item.sequence}:${item.project.title}`
+                : item.kind,
+          );
+        }),
+      ),
+      Effect.forkScoped,
+    );
+  });
+
+// the replay read A before the hub did, then waited on B; the hub's newer A must survive.
+it.effect(
+  "a hub delta read after the replay's read of its thread is delivered even if the replay finished later",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const a = ThreadId.make("thread:order-a");
+      const b = ThreadId.make("thread:order-b");
+      let titleA = "a1";
+      const gateB = yield* Deferred.make<void>();
+      const seen: Array<string> = [];
+      yield* insertShellEvent(sql, a, 0);
+      yield* insertShellEvent(sql, b, 0);
+      yield* withGatedShellReads(
+        {
+          gates: new Map([[b, gateB]]),
+          title: (id) => (id === a ? titleA : "b"),
+        },
+        Effect.gen(function* () {
+          yield* subscribeInto(0, seen);
+          yield* settleHub;
+          // The replay has read A (a1) and waits on B; the hub now reads A anew.
+          titleA = "a2";
+          yield* publishShellEvent(sql, a, 1);
+          yield* settleHub;
+          yield* Deferred.succeed(gateB, undefined);
+          yield* settleHub;
+          yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+          yield* settleHub;
+        }).pipe(Effect.scoped),
+      );
+      const afterSync = seen.slice(seen.indexOf("synchronized") + 1);
+      assert.include(seen.join(" "), `${a}@`, seen.join(" "));
+      assert.isTrue(
+        afterSync.some((item) => item.endsWith(":a2")),
+        `newer A lost: ${seen.join(" ")}`,
+      );
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// a hub batch that read A before the replay did (the shared read then expired) and publishes
+// after the live tail opened must not deliver the older A.
+it.effect(
+  "a hub batch published after the live tail opened cannot deliver a shell older than the replay's",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const a = ThreadId.make("thread:late-a");
+      const c = ThreadId.make("thread:late-c");
+      const slow = Array.from({ length: 9 }, (_, index) =>
+        ThreadId.make(`thread:late-slow-${index}`),
+      );
+      let titleA = "a1";
+      const gateC = yield* Deferred.make<void>();
+      const gateSlow = yield* Deferred.make<void>();
+      const keeper: Array<string> = [];
+      const seen: Array<string> = [];
+      yield* withGatedShellReads(
+        {
+          gates: new Map([[c, gateC], ...slow.map((id) => [id, gateSlow] as const)]),
+          title: (id) => (id === a ? titleA : id === c ? "c" : "slow"),
+        },
+        Effect.gen(function* () {
+          yield* subscribeInto(0, keeper);
+          yield* settleHub;
+          // The resuming subscriber's replay has nine gated threads ahead of A, so its read of A comes late.
+          for (const [index, id] of slow.entries()) yield* insertShellEvent(sql, id, index);
+          const last = yield* insertShellEvent(sql, a, 0);
+          yield* subscribeInto(0, seen);
+          yield* settleHub;
+          // Meanwhile one hub batch reads A (a1) and then waits on C, so it publishes late.
+          const cSeq = yield* insertShellEvent(sql, c, 1);
+          const aSeq = yield* insertShellEvent(sql, a, 1);
+          const events = yield* store
+            .readApplicationEvents({ afterSequence: cSeq - 1, throughSequence: aSeq })
+            .pipe(Stream.runCollect);
+          yield* store.publishCommitted(events);
+          yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+          yield* settleHub;
+          // The shared read of A expires before the replay gets to A, which then reads a2.
+          yield* TestClock.adjust(ThreadManagement.SHARED_SHELL_READ_TTL_MS + 1_000);
+          titleA = "a2";
+          yield* Deferred.succeed(gateSlow, undefined);
+          yield* settleHub;
+          assert.include(seen, "synchronized", seen.join(" "));
+          yield* Deferred.succeed(gateC, undefined);
+          yield* settleHub;
+          yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+          yield* settleHub;
+          assert.isAbove(aSeq, last);
+        }).pipe(Effect.scoped),
+      );
+      // The late batch did publish: the keeper got C and the older A.
+      assert.include(keeper.join(" "), `${c}@`, `keeper: ${keeper.join(" ")}`);
+      const titlesA = seen
+        .filter((item) => item.startsWith(`${a}@`))
+        .map((item) => item.slice(item.lastIndexOf(":") + 1));
+      assert.deepEqual(titlesA, ["a2"], `older A delivered after the newer one: ${seen.join(" ")}`);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// Reviewer scenario (F2b): two project updates land while the resume replay is still reading that project.
+it.effect(
+  "a resumed shell subscriber never receives a project shell older than one its replay sent",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const threadId = ThreadId.make("thread:project-order");
+      const projectId = ProjectId.make("project:order");
+      const now = "2026-10-31T00:00:00.000Z";
+      let title = "c1";
+      let version = 0;
+      let published = 0;
+      const insertProject = () =>
+        sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          ${`project-order:${++version}`}, 'project', ${projectId}, ${version}, 'project.meta-updated',
+          ${now}, 'server', ${JSON.stringify({ projectId, title, updatedAt: now })}, '{}', 2
+        ) RETURNING sequence
+      `.pipe(Effect.map(([row]) => row!.sequence));
+      const publishAll = Effect.gen(function* () {
+        const events = yield* store
+          .readApplicationEvents({ afterSequence: published, throughSequence: 1_000 })
+          .pipe(Stream.runCollect);
+        published = events.at(-1)?.sequence ?? published;
+        yield* store.publishCommitted(events);
+      });
+      // The replay's reads of the thread and of the project wait until released.
+      const replayGate = yield* Deferred.make<void>();
+      let threadReads = 0;
+      let projectReads = 0;
+      const seen: Array<string> = [];
+      yield* insertShellEvent(sql, threadId, 0);
+      published = yield* insertProject();
+      yield* Effect.gen(function* () {
+        yield* subscribeInto(0, seen);
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        title = "c2";
+        yield* insertProject();
+        yield* publishAll;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        title = "c3";
+        yield* insertProject();
+        yield* publishAll;
+        yield* Deferred.succeed(replayGate, undefined);
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          layerShellSubscribers({
+            getThreadShell: (id) =>
+              Effect.gen(function* () {
+                if (threadReads++ === 0) yield* Deferred.await(replayGate);
+                return {
+                  id,
+                  archivedAt: null,
+                  title: "t",
+                } as unknown as OrchestrationV2ThreadShell;
+              }),
+            getProjectRow: () =>
+              Effect.gen(function* () {
+                if (projectReads++ === 0) yield* Deferred.await(replayGate);
+                return Option.some({
+                  id: projectId,
+                  title,
+                  workspaceRoot: "/tmp/project-order",
+                  defaultModelSelection: null,
+                  scripts: [],
+                  createdAt: now,
+                  updatedAt: now,
+                } as unknown as OrchestrationProjectShell);
+              }),
+          }),
+        ),
+      );
+      const titles = seen
+        .filter((item) => item.startsWith("project.updated"))
+        .map((item) => item.slice(item.lastIndexOf(":") + 1));
+      const order = ["c1", "c2", "c3"];
+      for (let index = 1; index < titles.length; index++) {
+        assert.isTrue(
+          order.indexOf(titles[index]!) >= order.indexOf(titles[index - 1]!),
+          `project went backwards: ${seen.join(" ")}`,
+        );
+      }
+      assert.include(titles, "c3", seen.join(" "));
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// Review R1: a project's repository identity changes without a project event. A shared project
+// read must add it per caller, or a resume replay that joins the hub's read sends an identity
+// older than the one the client's own initial items carried, until the next project event.
+it.effect(
+  "a resumed shell subscriber never receives a repository identity older than its initial items sent",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const projectId = ProjectId.make("project:identity");
+      const now = "2026-10-31T00:00:00.000Z";
+      const identity = {
+        canonicalKey: "github.com/x/y",
+        displayName: "x/y",
+      } as unknown as RepositoryIdentity;
+      let resolved = false;
+      const row = {
+        id: projectId,
+        title: "p",
+        workspaceRoot: "/tmp/project-identity",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as OrchestrationProjectShell;
+      const enrichment = () => ({
+        repositoryIdentity: resolved ? identity : null,
+        faviconPath: null,
+        repositoryIdentityResolved: resolved,
+      });
+      const [inserted] = yield* sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          'project-identity:1', 'project', ${projectId}, 1, 'project.meta-updated',
+          ${now}, 'server', ${JSON.stringify({ projectId, title: "p", updatedAt: now })}, '{}', 2
+        ) RETURNING sequence
+      `;
+      const sequence = inserted!.sequence;
+      const seen: Array<string> = [];
+      yield* Effect.gen(function* () {
+        // A live watcher keeps the hub running; the hub reads the project while its identity is unresolved.
+        yield* subscribeInto(0, []);
+        yield* settleHub;
+        const events = yield* store
+          .readApplicationEvents({ afterSequence: 0, throughSequence: sequence })
+          .pipe(Stream.runCollect);
+        yield* store.publishCommitted(events);
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        // The workspace's repository identity resolves, well inside the shared-read TTL.
+        yield* TestClock.adjust(1_000);
+        resolved = true;
+        // A client resumes from before the event; its replay joins the hub's read of the project.
+        const stream = yield* subscribeOrchestrationV2Shell({
+          afterSequence: 0,
+          requestCompletionMarker: true,
+        });
+        yield* stream.pipe(
+          Stream.runForEach((item) =>
+            Effect.sync(() => {
+              seen.push(
+                item.kind === "project.updated"
+                  ? `project.updated@${item.sequence}:${item.project.repositoryIdentity === null ? "unresolved" : "resolved"}`
+                  : item.kind,
+              );
+            }),
+          ),
+          Effect.forkScoped,
+        );
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          layerShellSubscribers({
+            getThreadShell: () => Effect.die("no thread is read"),
+            getProjectRow: () => Effect.succeedSome(row),
+            getAvailable: () => Effect.sync(enrichment),
+          }),
+        ),
+      );
+      assert.deepEqual(
+        seen.filter((item) => item.startsWith("project.updated")),
+        [`project.updated@${sequence}:resolved`],
+        seen.join(" "),
+      );
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// a hub batch that waits on another aggregate must not deliver a project row with a
+// repository identity older than the refresh this subscriber already sent (no project event in
+// the replay, so no read ordinal guards the delta).
+it.effect(
+  "a delayed hub batch never sends a repository identity older than a refresh the subscriber already sent",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+      const threadId = ThreadId.make("thread:identity-order");
+      const projectId = ProjectId.make("project:identity-order");
+      const now = "2026-10-31T00:00:00.000Z";
+      const identityA = { canonicalKey: "repo:a" } as unknown as RepositoryIdentity;
+      const identityB = { canonicalKey: "repo:b" } as unknown as RepositoryIdentity;
+      let identity = identityA;
+      const row = {
+        id: projectId,
+        title: "p",
+        workspaceRoot: "/tmp/identity-order",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      } as unknown as OrchestrationProjectShell;
+      const changes = yield* PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>();
+      const threadGate = yield* Deferred.make<void>();
+      let threadReads = 0;
+      const keyOf = (project: OrchestrationProjectShell) =>
+        project.repositoryIdentity?.canonicalKey ?? "none";
+      const seen: Array<string> = [];
+      const highWater = yield* insertShellEvent(sql, threadId, 0);
+      yield* Effect.gen(function* () {
+        // Resume at the high water: an empty replay, so no project read orders the live tail.
+        const stream = yield* subscribeOrchestrationV2Shell({
+          afterSequence: highWater,
+          requestCompletionMarker: true,
+        });
+        yield* stream.pipe(
+          Stream.runForEach((item) =>
+            Effect.sync(() => {
+              seen.push(
+                item.kind === "project.updated"
+                  ? `project.updated@${item.sequence}:${keyOf(item.project)}`
+                  : item.kind === "snapshot"
+                    ? `snapshot:${item.snapshot.projects.map(keyOf).join(",")}`
+                    : item.kind,
+              );
+            }),
+          ),
+          Effect.forkScoped,
+        );
+        yield* settleHub;
+        // A project event and a thread event share one hub batch; the thread's read waits.
+        const [projectRow] = yield* sql<{ sequence: number }>`
+          INSERT INTO orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type,
+            occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+          ) VALUES (
+            'identity-order:1', 'project', ${projectId}, 1, 'project.meta-updated',
+            ${now}, 'server', ${JSON.stringify({ projectId, title: "p", updatedAt: now })}, '{}', 2
+          ) RETURNING sequence
+        `;
+        const projectSequence = projectRow!.sequence;
+        yield* insertShellEvent(sql, threadId, 1);
+        const events = yield* store
+          .readApplicationEvents({ afterSequence: highWater, throughSequence: highWater + 2 })
+          .pipe(Stream.runCollect);
+        yield* store.publishCommitted(events);
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        // The identity changes while the batch waits; the subscriber gets the refresh first.
+        identity = identityB;
+        yield* PubSub.publish(changes, {
+          workspaceRoot: row.workspaceRoot,
+          enrichment: {
+            repositoryIdentity: identityB,
+            faviconPath: null,
+            repositoryIdentityResolved: true,
+          },
+          repositoryIdentityResolved: true,
+        });
+        yield* TestClock.adjust(25);
+        yield* settleHub;
+        yield* Deferred.succeed(threadGate, undefined);
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+        yield* settleHub;
+        assert.isTrue(
+          seen.some((item) => item.startsWith(`project.updated@${projectSequence}:`)),
+          `the delayed delta was not delivered: ${seen.join(" ")}`,
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          layerShellSubscribers({
+            getThreadShell: (id) =>
+              Effect.gen(function* () {
+                if (threadReads++ === 0) yield* Deferred.await(threadGate);
+                return {
+                  id,
+                  archivedAt: null,
+                  title: "t",
+                } as unknown as OrchestrationV2ThreadShell;
+              }),
+            getProjectRow: () => Effect.succeedSome(row),
+            listShells: () => Effect.succeed([row]),
+            getAvailable: () =>
+              Effect.sync(() => ({
+                repositoryIdentity: identity,
+                faviconPath: null,
+                repositoryIdentityResolved: true,
+              })),
+            enrichmentChanges: changes,
+          }),
+        ),
+      );
+      const firstB = seen.findIndex((item) => item.includes("repo:b"));
+      assert.isAtLeast(firstB, 0, seen.join(" "));
+      const stale = seen.slice(firstB + 1).filter((item) => item.includes("repo:a"));
+      assert.deepEqual(stale, [], `identity went back after the refresh: ${seen.join(" ")}`);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+// the live tail keeps the hub's batch boundaries; the RPC server waits for a client
+// acknowledgement per chunk, so one chunk per delta would make a burst one round trip per delta.
+it.effect("live thread deltas of one hub batch reach the subscriber in one chunk", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+    const threads = ["thread:chunk-a", "thread:chunk-b", "thread:chunk-c"].map((id) =>
+      ThreadId.make(id),
+    );
+    const highWater = yield* insertShellEvent(sql, threads[0]!, 0);
+    const chunks: Array<Array<string>> = [];
+    yield* Effect.gen(function* () {
+      const stream = yield* subscribeOrchestrationV2Shell({
+        afterSequence: highWater,
+        requestCompletionMarker: true,
+      });
+      yield* stream.pipe(
+        Stream.runForEachArray((items) =>
+          Effect.sync(() => {
+            chunks.push(
+              items.map((item) =>
+                item.kind === "thread.updated" ? `${item.thread.id}@${item.sequence}` : item.kind,
+              ),
+            );
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* settleHub;
+      // Three threads change inside one batch window.
+      for (const [index, threadId] of threads.entries()) {
+        yield* insertShellEvent(sql, threadId, index === 0 ? 1 : 0);
+      }
+      const events = yield* store
+        .readApplicationEvents({ afterSequence: highWater, throughSequence: highWater + 3 })
+        .pipe(Stream.runCollect);
+      yield* store.publishCommitted(events);
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settleHub;
+      yield* TestClock.adjust(ShellDeltaHub.SHELL_DELTA_BATCH_WINDOW);
+      yield* settleHub;
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerShellSubscribers({
+          getThreadShell: (id) =>
+            Effect.succeed({
+              id,
+              archivedAt: null,
+              title: "t",
+            } as unknown as OrchestrationV2ThreadShell),
+        }),
+      ),
+    );
+    const live = chunks.filter((chunk) => chunk.some((item) => item.includes("@")));
+    assert.deepEqual(
+      live,
+      [threads.map((threadId, index) => `${threadId}@${highWater + 1 + index}`)],
+      JSON.stringify(chunks),
+    );
+  }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );

@@ -9,7 +9,7 @@ import * as HeapAttribution from "./HeapAttribution.ts";
 
 const MB = 1024 * 1024;
 
-it.effect("names the span that grew the heap in a spike, not an older open or ended one", () =>
+it.effect("names the span that grew the heap in a spike, not an older, ended or skipped one", () =>
   Effect.gen(function* () {
     const ended: Array<Tracer.NativeSpan> = [];
     const inner = Tracer.make({
@@ -24,7 +24,10 @@ it.effect("names the span that grew the heap in a spike, not an older open or en
       },
     });
     let heap = 300 * MB;
-    const attribution = yield* HeapAttribution.make(inner, () => heap);
+    const attribution = yield* HeapAttribution.make(inner, {
+      heapUsed: () => heap,
+      skip: (name) => name === "sqlite",
+    });
     yield* attribution.run;
     // The sampler's baseline: heap before the spans allocate.
     yield* TestClock.adjust("1 second");
@@ -50,6 +53,7 @@ it.effect("names the span that grew the heap in a spike, not an older open or en
     }
     const small = open("ProjectionStore.getThreadShell");
     const big = open("ProjectionStore.getThreadProjection");
+    const query = open("sqlite");
     heap += 2 * MB;
     small.end(1n, undefined as never);
     heap += 198 * MB;
@@ -61,9 +65,11 @@ it.effect("names the span that grew the heap in a spike, not an older open or en
       "ProjectionStore.getThreadProjection +200 MB",
     ]);
     big.end(2n, undefined as never);
+    query.end(2n, undefined as never);
     subscription.end(3n, undefined as never);
     assert.equal(big.attributes.get("memory.heap_growth_bytes"), 200 * MB);
     assert.isUndefined(small.attributes.get("memory.heap_growth_bytes"));
+    assert.isUndefined(query.attributes.get("memory.heap_growth_bytes"));
     assert.equal(old.attributes.get("memory.heap_growth_bytes"), 160 * MB);
   }),
 );

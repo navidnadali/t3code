@@ -128,10 +128,13 @@ const findExecutable = Effect.fnUntraced(function* (
   return yield* spawnFailure(command, denied ? "EACCES" : "ENOENT");
 });
 
-const make = Effect.gen(function* () {
-  const native = yield* ChildProcessSpawner.ChildProcessSpawner;
-  if ((yield* HostProcess.Platform) !== "linux") return native;
-  if (!(yield* Effect.promise(supportsEnvChdir))) return native;
+/**
+ * On Linux with GNU `env`, rewrites a command, after bounded checks of its cwd and executable, so
+ * that spawning it waits on neither; undefined elsewhere. The server's own spawners use it too.
+ */
+export const makePrepare = Effect.gen(function* () {
+  if ((yield* HostProcess.Platform) !== "linux") return undefined;
+  if (!(yield* Effect.promise(supportsEnvChdir))) return undefined;
   const path = yield* Path.Path;
 
   // Runs inside the NonBlockingSpawner.spawn span.
@@ -163,6 +166,14 @@ const make = Effect.gen(function* () {
       : Effect.map(Effect.all([prepare(command.left), prepare(command.right)]), ([left, right]) =>
           ChildProcess.pipeTo(left, right, command.options),
         );
+  return { prepare, prepareStandard };
+});
+
+const make = Effect.gen(function* () {
+  const native = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const prepared = yield* makePrepare;
+  if (prepared === undefined) return native;
+  const { prepare } = prepared;
 
   return ChildProcessSpawner.make(
     Effect.fn("NonBlockingSpawner.spawn")(function* (command) {

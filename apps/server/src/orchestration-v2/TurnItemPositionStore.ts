@@ -38,6 +38,9 @@ export class TurnItemPositionStoreV2 extends Context.Service<
   TurnItemPositionStoreV2Shape
 >()("t3/orchestration-v2/TurnItemPositionStore/TurnItemPositionStoreV2") {}
 
+/** Each run's turn items take ordinals in a band of their own; runless items use band 0. */
+export const TURN_ITEM_ORDINALS_PER_RUN = 1_000_000;
+
 export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlClient> = Layer.effect(
   TurnItemPositionStoreV2,
   Effect.gen(function* () {
@@ -70,8 +73,8 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
                 LIMIT 1
               `;
           const runOrdinal = suppliedRunOrdinal ?? runRows[0]?.ordinal ?? null;
-          const lowerBound = runOrdinal === null ? 0 : runOrdinal * 1_000_000;
-          const upperBound = runOrdinal === null ? 999_999 : lowerBound + 999_999;
+          const lowerBound = runOrdinal === null ? 0 : runOrdinal * TURN_ITEM_ORDINALS_PER_RUN;
+          const upperBound = lowerBound + TURN_ITEM_ORDINALS_PER_RUN - 1;
           const current = existing[0]?.ordinal;
           if (current !== undefined) {
             // A steer that missed its turn starts the next run; it moves into that run's range.

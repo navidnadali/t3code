@@ -10,6 +10,8 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
+import * as ConfigProvider from "effect/ConfigProvider";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Deferred from "effect/Deferred";
@@ -17,7 +19,9 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
@@ -26,7 +30,16 @@ import { AgentScope } from "@t3tools/shared/AgentScope";
 import { ProviderEventLoggers } from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
+import * as ServerConfig from "../../config.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
+import { HandoffProcess, type HandoffHost } from "../../process/handoffProcess.ts";
+import * as ProviderProcesses from "../../process/providerProcesses.ts";
+import { spawnerProcessIds } from "../../process/spawnerProcesses.ts";
+import * as WorkerChildProcessSpawner from "../../process/workerChildProcessSpawner.ts";
+import {
+  commandsLeaveTheServer,
+  withServerCommandSpawner,
+} from "../../testUtils/serverCommandSpawner.ts";
 import {
   ClaudeAgentSdkQueryRunner,
   type ClaudeAgentSdkQueryOpenInput,
@@ -230,6 +243,79 @@ const resumedMcpQueryInput = {
     },
   },
 } satisfies ClaudeAgentSdkQueryOpenInput;
+
+// the history worker runs from the server's command spawner, so a fork or a resume never
+// forks the server itself.
+const historyWorkerRoute = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const executable = yield* HostProcess.ExecutablePath;
+    const { ambientCommands, serverCommands } = yield* withServerCommandSpawner(effect);
+    return {
+      ambient: ambientCommands.includes(executable),
+      server: serverCommands.includes(executable),
+    };
+  });
+
+it.effect.skipIf(!commandsLeaveTheServer)("forks a session from the server's command spawner", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const configDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-claude-fork-spawner-",
+      });
+      yield* writeClaudeSession(configDir);
+      const route = yield* historyWorkerRoute(
+        Effect.gen(function* () {
+          const runner = yield* ClaudeAgentSdkQueryRunner;
+          yield* runner.forkSession({
+            sessionId: FORK_SESSION_ID,
+            options: { dir: "/repo" },
+            environment: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
+            threadId: ThreadId.make("thread-fork-spawner"),
+            providerSessionId: ProviderSessionId.make("session-fork-spawner"),
+          });
+        }).pipe(Effect.provide(forkRunnerLayer)),
+      );
+      assert.deepStrictEqual(route, { ambient: false, server: true });
+    }),
+  ).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
+
+it.effect.skipIf(!commandsLeaveTheServer)(
+  "reads a resumed session's messages from the server's command spawner",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const configDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-resume-spawner-",
+        });
+        yield* writeClaudeSession(configDir);
+        const querySpy = vi
+          .spyOn(ClaudeSdk, "query")
+          .mockImplementation(() => ({ close: vi.fn() }) as unknown as ClaudeSdk.Query);
+        yield* Effect.addFinalizer(() => Effect.sync(() => querySpy.mockRestore()));
+        const route = yield* historyWorkerRoute(
+          Effect.gen(function* () {
+            const runner = yield* ClaudeAgentSdkQueryRunner;
+            const { mcpServers: _mcpServers, ...options } = resumedMcpQueryInput.options;
+            const session = yield* runner.open({
+              ...resumedMcpQueryInput,
+              resume: true,
+              options: {
+                ...options,
+                cwd: "/repo",
+                env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
+              },
+            });
+            yield* session.close;
+          }).pipe(Effect.provide(forkRunnerLayer)),
+        );
+        assert.equal(querySpy.mock.calls.length, 1);
+        assert.deepStrictEqual(route, { ambient: false, server: true });
+      }),
+    ).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
 
 it.effect("reopens a stalled MCP registration before delivering the resumed prompt", () =>
   Effect.gen(function* () {
@@ -545,6 +631,59 @@ it.effect.each([
   }).pipe(Effect.provide(realQueryRunner)),
 );
 
+// Answers every `ps` with `table()` at once, so the clock alone decides when the CLIs are polled.
+const processTableSpawner = (table: () => string, onRead: () => void = () => {}) =>
+  Layer.succeed(
+    ChildProcessSpawner.ChildProcessSpawner,
+    ChildProcessSpawner.make((command) =>
+      Effect.sync(() => {
+        if (command._tag === "StandardCommand" && command.command === "ps") onRead();
+        return ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(1),
+          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          isRunning: Effect.succeed(false),
+          kill: () => Effect.void,
+          unref: Effect.succeed(Effect.void),
+          stdin: Sink.drain,
+          stdout: Stream.encodeText(Stream.make(table())),
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+        });
+      }),
+    ),
+  );
+
+// Counts the CLIs started, so a test knows each one is being tracked.
+const countedAgents = (count: number) => {
+  let started = 0;
+  const allStarted = Deferred.makeUnsafe<void>();
+  const layer = Layer.mock(PortScanner.PortDiscovery)({
+    trackAgent: () => {
+      if (++started === count) Deferred.doneUnsafe(allStarted, Effect.void);
+      return () => {};
+    },
+  });
+  return { layer, allStarted: Deferred.await(allStarted) };
+};
+
+const openNumberedFakeCli = (cli: string, index: number) =>
+  Effect.gen(function* () {
+    const runner = yield* ClaudeAgentSdkQueryRunner;
+    return yield* runner.open({
+      threadId: ThreadId.make(`thread-fake-cli-${index}`),
+      providerSessionId: ProviderSessionId.make(`session-fake-cli-${index}`),
+      options: {
+        sessionId: `native-session-fake-cli-${index}`,
+        model: "claude-sonnet-4-6",
+        tools: [],
+        permissionMode: "default",
+        pathToClaudeCodeExecutable: cli,
+      },
+    });
+  });
+
 function fakeClaudeCli(script: string): string {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-claude-cli-"));
   const cli = NodePath.join(dir, "claude");
@@ -680,6 +819,132 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     }),
   );
 
+  const fakeTableRunner = (
+    spawner: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>,
+    agents: Layer.Layer<PortScanner.PortDiscovery>,
+  ) =>
+    layerQueryRunner.pipe(
+      Layer.provide(agents),
+      Layer.provide(
+        Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
+      ),
+      Layer.provide(spawner),
+      Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+    );
+
+  // One `ps` per poll serves every CLI: per CLI, a host with hundreds of sessions forks hundreds a second.
+  it.effect("reads the process table once per poll however many CLIs run", () => {
+    let tableReads = 0;
+    const agents = countedAgents(3);
+    return Effect.gen(function* () {
+      const sessions = yield* Effect.forEach([0, 1, 2], (index) => {
+        const cli = fakeClaudeCli("cat > /dev/null");
+        return Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(NodePath.dirname(cli), { recursive: true, force: true })),
+        ).pipe(Effect.andThen(openNumberedFakeCli(cli, index)));
+      });
+      yield* agents.allStarted;
+      yield* TestClock.adjust("1 second");
+      const before = tableReads;
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual(tableReads - before, 1);
+      yield* Effect.forEach(sessions, (session) => session.close);
+    }).pipe(
+      Effect.provide(
+        fakeTableRunner(
+          processTableSpawner(
+            () => "",
+            () => tableReads++,
+          ),
+          agents.layer,
+        ),
+      ),
+    );
+  });
+
+  // The shared table names each CLI's own job, which only that CLI's exit stops.
+  it.effect("stops the job each CLI moved out of its group, found by one shared poll", () => {
+    const rows: Array<string> = [];
+    const agents = countedAgents(2);
+    return Effect.gen(function* () {
+      const dirs = [0, 1].map(() =>
+        NodePath.dirname(
+          fakeClaudeCli(
+            ['dir=$(dirname "$0")', 'echo $$ > "$dir/pid"', 'read -r _ < "$dir/go"'].join("\n"),
+          ),
+        ),
+      );
+      for (const dir of dirs) {
+        NodeChildProcess.execFileSync("mkfifo", [
+          NodePath.join(dir, "pid"),
+          NodePath.join(dir, "go"),
+        ]);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
+        );
+      }
+      const sessions = yield* Effect.forEach(dirs, (dir, index) =>
+        openNumberedFakeCli(NodePath.join(dir, "claude"), index),
+      );
+      yield* agents.allStarted;
+      const jobs = yield* Effect.forEach(dirs, (dir) =>
+        Effect.gen(function* () {
+          const cliPid = (yield* Effect.promise(() =>
+            NodeFS.promises.readFile(NodePath.join(dir, "pid"), "utf8"),
+          )).trim();
+          // Its own group, so the CLI's group kill misses it.
+          const job = NodeChildProcess.spawn("sleep", ["600"], { detached: true, stdio: "ignore" });
+          yield* Effect.addFinalizer(() => Effect.sync(() => job.kill("SIGKILL")));
+          rows.push(`${job.pid} ${cliPid} ${job.pid} Sat Nov 14 22:00:00 2026`);
+          return job;
+        }),
+      );
+      yield* TestClock.adjust("1 second");
+      const stopped = jobs.map((job) => new Promise((resolve) => job.once("exit", resolve)));
+      for (const dir of dirs) {
+        yield* Effect.promise(() => NodeFS.promises.writeFile(NodePath.join(dir, "go"), "\n"));
+      }
+      yield* Effect.promise(() => Promise.all(stopped));
+      yield* Effect.forEach(sessions, (session) => session.close);
+    }).pipe(
+      Effect.provide(
+        fakeTableRunner(
+          processTableSpawner(() => rows.join("\n")),
+          agents.layer,
+        ),
+      ),
+    );
+  });
+
+  // the server's command spawner runs `ps`, so polling never forks the server itself.
+  it.effect("reads the process table through the server's command spawner", () =>
+    Effect.gen(function* () {
+      const cli = fakeClaudeCli("cat > /dev/null");
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(NodePath.dirname(cli), { recursive: true, force: true })),
+      );
+      const { ambientCommands, serverCommands } = yield* withServerCommandSpawner(
+        Effect.gen(function* () {
+          const session = yield* openFakeCli(cli);
+          yield* session.close;
+        }).pipe(
+          Effect.provide(
+            layerQueryRunner.pipe(
+              Layer.provide(PortScanner.layerTest),
+              Layer.provide(
+                Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
+              ),
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(
+        { ambient: ambientCommands.includes("ps"), server: serverCommands.includes("ps") },
+        { ambient: false, server: true },
+      );
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
   const rootRefusal =
     "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons";
 
@@ -713,39 +978,214 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     }).pipe(Effect.provide(realQueryRunner)),
   );
 
+  // The provider launcher (hand-off on Linux, or Node's spawner when it is off) carries the
+  // CLI's stderr as Node's own spawn does, so the refusal reads the same however it started.
+  it.live("reports the CLI's root refusal the same whichever launcher starts the CLI", () => {
+    const launcherRunner = (knobs: Record<string, string>) =>
+      layerQueryRunner.pipe(
+        Layer.provide(PortScanner.layerTest),
+        Layer.provide(
+          Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
+        ),
+        Layer.provide(
+          WorkerChildProcessSpawner.layerProviderLauncher.pipe(
+            Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-refusal-" })),
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(knobs))),
+          ),
+        ),
+        Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+      );
+    const message = <E>(runner: Layer.Layer<ClaudeAgentSdkQueryRunner, E>) =>
+      startupFailureMessage(rootRefusal).pipe(Effect.scoped, Effect.provide(runner));
+    return Effect.gen(function* () {
+      const nodeSpawner = yield* message(realQueryRunner);
+      assert.include(nodeSpawner, rootRefusal);
+      const handedOff = yield* message(launcherRunner({}));
+      const launcherDirect = yield* message(
+        launcherRunner({ [WorkerChildProcessSpawner.PROVIDER_SPAWNER_ENV]: "direct" }),
+      );
+      assert.deepStrictEqual(
+        { handedOff, launcherDirect },
+        { handedOff: nodeSpawner, launcherDirect: nodeSpawner },
+      );
+    });
+  });
+
   // The CLI keeps running its turn after its pipes close, so a server that
   // crashed would leave it working next to the session it resumes.
-  it.effect("stops the CLI when the server that started it goes away", () =>
+  it.effect.each([
+    { launcher: "none" },
+    ...(HostProcess.Platform.defaultValue() === "linux" ? [{ launcher: "provider" }] : []),
+  ] as const)(
+    "stops the CLI when the server that started it goes away ($launcher launcher)",
+    ({ launcher }) =>
+      Effect.gen(function* () {
+        const cli = fakeClaudeCli(['dir=$(dirname "$0")', 'sleep 600 > "$dir/alive"'].join("\n"));
+        const dir = NodePath.dirname(cli);
+        NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "alive")]);
+        const providerLauncher =
+          launcher === "none"
+            ? undefined
+            : yield* WorkerChildProcessSpawner.ProviderProcessLauncher;
+        const child = spawnClaudeProcessGroup(
+          {
+            command: cli,
+            args: [],
+            cwd: dir,
+            env: process.env,
+            // @effect-diagnostics-next-line abortControllerInEffect:off - This crash fixture closes pipes itself; aborting on test teardown raises an unrelated process error.
+            signal: new AbortController().signal,
+          },
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          providerLauncher,
+        ) as NodeChildProcess.ChildProcess & { readonly held?: ReadonlyArray<NodeStream.Duplex> };
+        // Its descriptors are the server's once it has started (a handed-off CLI can open its
+        // fifo before the spawner's answer reaches the server).
+        const started = new Promise<void>((resolve) => child.once("spawn", () => resolve()));
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            try {
+              signalProcessGroup(child.pid ?? 0, "SIGKILL");
+            } catch {}
+            NodeFS.rmSync(dir, { recursive: true, force: true });
+          }),
+        );
+        const alive = NodeFS.createReadStream(NodePath.join(dir, "alive"));
+        const turnStarted = new Promise<void>((resolve) => alive.once("open", () => resolve()));
+        const turnStopped = new Promise<void>((resolve) => alive.once("close", () => resolve()));
+        alive.resume();
+        yield* Effect.promise(() => Promise.all([started, turnStarted]));
+
+        // A dying server's descriptors close; the kernel would do this for it.
+        for (const pipe of [...child.stdio, ...(child.held ?? [])]) pipe?.destroy();
+        yield* Effect.promise(() => turnStopped);
+      }).pipe(
+        Effect.provide(
+          WorkerChildProcessSpawner.layerProviderLauncher.pipe(
+            Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-handoff-" })),
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))),
+            Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+          ),
+        ),
+      ),
+  );
+
+  // Linux: a handed-off CLI is known by its PID and /proc start time. Its exit can be learned late
+  // (its spawner died), when its PID may name another process: that one's group is not signalled.
+  it.live.each(
+    HostProcess.Platform.defaultValue() === "linux"
+      ? ([
+          { pid: "still names the CLI", reused: false },
+          { pid: "names another process", reused: true },
+        ] as const)
+      : [],
+  )("kills the group of an exited, handed-off CLI only while its PID $pid", ({ reused }) =>
     Effect.gen(function* () {
-      const cli = fakeClaudeCli(['dir=$(dirname "$0")', 'sleep 600 > "$dir/alive"'].join("\n"));
-      const dir = NodePath.dirname(cli);
-      NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "alive")]);
-      const child = spawnClaudeProcessGroup({
-        command: cli,
-        args: [],
-        cwd: dir,
-        env: process.env,
-        // @effect-diagnostics-next-line abortControllerInEffect:off - This crash fixture closes pipes itself; aborting on test teardown raises an unrelated process error.
-        signal: new AbortController().signal,
-      }) as NodeChildProcess.ChildProcess;
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          try {
-            signalProcessGroup(child.pid ?? 0, "SIGKILL");
-          } catch {}
-          NodeFS.rmSync(dir, { recursive: true, force: true });
+      // Leads its own group, as the CLI's group would, or as a process that took its PID might.
+      const leader = NodeChildProcess.spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+      yield* Effect.promise(() => new Promise((resolve) => leader.once("spawn", resolve)));
+      yield* Effect.addFinalizer(() => Effect.sync(() => leader.kill("SIGKILL")));
+      const pid = leader.pid!;
+      const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const startTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!;
+      const exitListeners = new Set<(code: number | null, signal: NodeJS.Signals | null) => void>();
+      // A spawner host that hands off nothing: it names the leader as the CLI it started.
+      const host: HandoffHost = {
+        spawnHandoff: (_command, _args, _options, _request, callbacks) => {
+          queueMicrotask(() => callbacks.onSpawn());
+          return {
+            id: 1,
+            pid,
+            startTime: reused ? `${startTime}0` : startTime,
+            sockets: new Map(),
+            exitSignal: Deferred.makeUnsafe(),
+            exitListeners,
+            orphaned: true,
+            referenced: true,
+            released: false,
+          };
+        },
+        abandonHandoff: () => {},
+        killHandoff: (_child, _signal, callback) => callback({ _tag: "Sent", killed: false }),
+        setHandoffReferenced: () => {},
+      };
+      const child = spawnClaudeProcessGroup(
+        {
+          command: "claude",
+          args: [],
+          cwd: process.cwd(),
+          env: process.env,
+          // @effect-diagnostics-next-line abortControllerInEffect:off - The SDK's spawn options carry one; nothing aborts here.
+          signal: new AbortController().signal,
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        WorkerChildProcessSpawner.ProviderProcessLauncher.of({
+          spawn: (command, args, options) =>
+            new HandoffProcess(host, command, args, options, () => {}),
+          spawner: undefined as never,
         }),
       );
-      const alive = NodeFS.createReadStream(NodePath.join(dir, "alive"));
-      const turnStarted = new Promise<void>((resolve) => alive.once("open", () => resolve()));
-      const turnStopped = new Promise<void>((resolve) => alive.once("close", () => resolve()));
-      alive.resume();
-      yield* Effect.promise(() => turnStarted);
+      yield* Effect.promise(
+        () => new Promise((resolve) => (child as unknown as HandoffProcess).once("spawn", resolve)),
+      );
+      // Its exit as the server reports one it learned by watching: no status.
+      for (const listener of exitListeners) listener(null, null);
+      const killed = yield* Effect.callback<boolean>((resume) => {
+        if (leader.exitCode !== null || leader.signalCode !== null) {
+          return resume(Effect.succeed(true));
+        }
+        leader.once("exit", () => resume(Effect.succeed(true)));
+      }).pipe(Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.succeed(false) }));
+      assert.strictEqual(killed, !reused);
+    }).pipe(Effect.scoped),
+  );
 
-      // A dying server's descriptors close; the kernel would do this for it.
-      for (const pipe of child.stdio) pipe?.destroy();
-      yield* Effect.promise(() => turnStopped);
-    }),
+  // Linux: a provider handed off by the spawner process identifies by /proc start time.
+  it.live.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
+    "starts the CLI from the server's provider launcher, not from the server",
+    () => {
+      const runner = layerQueryRunner.pipe(
+        Layer.provide(PortScanner.layerTest),
+        Layer.provide(
+          Layer.succeed(ProviderEventLoggers, { native: undefined, canonical: undefined }),
+        ),
+        Layer.provide(
+          WorkerChildProcessSpawner.layerProviderLauncher.pipe(
+            Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-handoff-" })),
+            Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))),
+          ),
+        ),
+        Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+      );
+      return Effect.gen(function* () {
+        const cli = fakeClaudeCli(
+          ['dir=$(dirname "$0")', 'printf "%s" "$PPID" > "$dir/parent"', "cat > /dev/null"].join(
+            "\n",
+          ),
+        );
+        const dir = NodePath.dirname(cli);
+        NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "parent")]);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
+        );
+        const parentRead = new Promise<string>((resolve) => {
+          let parent = "";
+          NodeFS.createReadStream(NodePath.join(dir, "parent"), "utf8")
+            .on("data", (chunk) => (parent += chunk))
+            .once("end", () => resolve(parent));
+        });
+        const session = yield* openFakeCli(cli);
+        const parent = Number(yield* Effect.promise(() => parentRead));
+        assert.isTrue(spawnerProcessIds.has(parent), `parent ${parent} is not a spawner`);
+        yield* session.close;
+      }).pipe(Effect.scoped, Effect.provide(runner));
+    },
   );
 
   // A native cwd makes libuv wait for chdir, which a hung mount stalls with the whole server.
@@ -780,45 +1220,137 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     }),
   );
 
-  // A restarted server reaps recorded CLIs, so a CLI must never run before its record exists.
-  it.effect("records the CLI before it runs and forgets it once it exits", () =>
-    Effect.gen(function* () {
-      const cli = fakeClaudeCli(
-        ['dir=$(dirname "$0")', 'printf \'%s %s\' "$$" "$(cat "$dir/record")" > "$dir/seen"'].join(
-          "\n",
+  // A restarted server reaps recorded CLIs, so a CLI must never run before its record exists,
+  // however it starts: Node's spawner, the provider launcher's, or hand-off from the spawner.
+  it.effect.each(["none", "direct", "handoff"] as const)(
+    "records the CLI before it runs and forgets it once it exits (%s launcher)",
+    (launcherKind) =>
+      Effect.gen(function* () {
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const providerLauncher =
+          launcherKind === "none"
+            ? undefined
+            : launcherKind === "direct"
+              ? yield* WorkerChildProcessSpawner.ProviderProcessLauncher.pipe(
+                  Effect.provide(
+                    WorkerChildProcessSpawner.layerProviderLauncher.pipe(
+                      Layer.provide(
+                        ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-record-" }),
+                      ),
+                      Layer.provide(
+                        ConfigProvider.layer(
+                          ConfigProvider.fromUnknown({
+                            [WorkerChildProcessSpawner.PROVIDER_SPAWNER_ENV]: "direct",
+                          }),
+                        ),
+                      ),
+                    ),
+                  ),
+                )
+              : yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node).pipe(
+                  Effect.flatMap(({ host }) =>
+                    WorkerChildProcessSpawner.makeProviderLauncher(node, host!),
+                  ),
+                );
+        const cli = fakeClaudeCli(
+          [
+            'dir=$(dirname "$0")',
+            'printf \'%s %s\' "$$" "$(cat "$dir/record")" > "$dir/seen"',
+          ].join("\n"),
+        );
+        const dir = NodePath.dirname(cli);
+        NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "seen")]);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
+        );
+        const forgotten = yield* Deferred.make<void>();
+        let registered = 0;
+        spawnClaudeProcessGroup(
+          {
+            command: cli,
+            args: [],
+            cwd: dir,
+            env: process.env,
+            // @effect-diagnostics-next-line abortControllerInEffect:off - The CLI exits on its own.
+            signal: new AbortController().signal,
+          },
+          undefined,
+          undefined,
+          undefined,
+          (pid) => {
+            registered = pid;
+            NodeFS.writeFileSync(NodePath.join(dir, "record"), String(pid));
+            return () => Deferred.doneUnsafe(forgotten, Effect.void);
+          },
+          providerLauncher,
+        );
+        const seen = yield* Effect.promise(() =>
+          NodeFS.promises.readFile(NodePath.join(dir, "seen"), "utf8"),
+        );
+        assert.equal(seen, `${registered} ${registered}`);
+        assert.notEqual(registered, 0);
+        yield* Deferred.await(forgotten);
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  // Linux: a handed-off CLI is the spawner's child; the server records it by the spawner's start time.
+  it.live.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
+    "records a handed-off CLI in the server's own provider record until it exits",
+    () =>
+      Effect.gen(function* () {
+        const cli = fakeClaudeCli("cat > /dev/null");
+        const dir = NodePath.dirname(cli);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
+        );
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const { host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(node);
+        const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        const { register } = Context.get(
+          yield* Layer.build(ProviderProcesses.layer),
+          ProviderProcesses.ProviderProcesses,
+        );
+        const directory = NodePath.join(
+          (yield* ServerConfig.ServerConfig).stateDir,
+          "provider-processes",
+        );
+        const recorded = () =>
+          NodeFS.readdirSync(directory).flatMap((file) =>
+            (
+              JSON.parse(NodeFS.readFileSync(NodePath.join(directory, file), "utf8")) as {
+                readonly processes: ReadonlyArray<{ readonly pid: number }>;
+              }
+            ).processes.map((entry) => entry.pid),
+          );
+        const child = spawnClaudeProcessGroup(
+          {
+            command: cli,
+            args: [],
+            cwd: dir,
+            env: process.env,
+            // @effect-diagnostics-next-line abortControllerInEffect:off - The CLI exits once its stdin ends.
+            signal: new AbortController().signal,
+          },
+          undefined,
+          undefined,
+          undefined,
+          register,
+          launcher,
+        ) as unknown as HandoffProcess;
+        yield* Effect.promise(() => new Promise((resolve) => child.once("spawn", resolve)));
+        assert.deepStrictEqual(recorded(), [child.pid]);
+        const exited = new Promise((resolve) => child.once("exit", resolve));
+        child.stdin!.end();
+        yield* Effect.promise(() => exited);
+        assert.deepStrictEqual(recorded(), []);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-recorded-" }).pipe(
+            Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+          ),
         ),
-      );
-      const dir = NodePath.dirname(cli);
-      NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "seen")]);
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
-      );
-      const forgotten = yield* Deferred.make<void>();
-      let registered = 0;
-      spawnClaudeProcessGroup(
-        {
-          command: cli,
-          args: [],
-          cwd: dir,
-          env: process.env,
-          // @effect-diagnostics-next-line abortControllerInEffect:off - The CLI exits on its own.
-          signal: new AbortController().signal,
-        },
-        undefined,
-        undefined,
-        undefined,
-        (pid) => {
-          registered = pid;
-          NodeFS.writeFileSync(NodePath.join(dir, "record"), String(pid));
-          return () => Deferred.doneUnsafe(forgotten, Effect.void);
-        },
-      );
-      const seen = yield* Effect.promise(() =>
-        NodeFS.promises.readFile(NodePath.join(dir, "seen"), "utf8"),
-      );
-      assert.equal(seen, `${registered} ${registered}`);
-      yield* Deferred.await(forgotten);
-    }),
+      ),
   );
 
   it.effect("marks the CLI's jobs with its thread and counts it as an agent until it exits", () => {

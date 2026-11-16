@@ -1,4 +1,5 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointId,
@@ -18,13 +19,16 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
-import { VcsProcessTimeoutError } from "@t3tools/contracts";
+import { VcsProcessSpawnError, VcsProcessTimeoutError } from "@t3tools/contracts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as CheckpointCaptureService from "./CheckpointCaptureService.ts";
 import * as EventSink from "./EventSink.ts";
@@ -268,6 +272,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
         const layerCapture = CheckpointCaptureService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              NodeServices.layer,
               IdAllocator.layer,
               refLookupFails
                 ? CheckpointService.layer.pipe(
@@ -275,6 +280,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
                       Layer.mergeAll(
                         IdAllocator.layer,
                         NodeCrypto.layer,
+                        NodeServices.layer,
                         Layer.mock(CheckpointStore.CheckpointStore)({
                           listAuthoredPaths: () => Effect.succeed(null),
                           isGitRepository: () => Effect.succeed(true),
@@ -447,6 +453,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               materializeBaselineCheckpoint: () => Effect.die("a discarded run has no baseline"),
@@ -551,6 +558,8 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
             completedAt: stoppedAt,
             checkpointId: null,
             contextHandoffId: null,
+            // The workspace it ran in; the next run's scope names another.
+            workspaceCwd: "/repo",
           },
         });
         yield* projectionStore.apply({
@@ -624,27 +633,31 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
             kind: "root_run",
             ordinalWithinParent: 0,
             advancesAppRunCount: true,
-            cwd: "/repo",
+            cwd: "/repo-next",
             createdAt: rescopedAt,
           },
         });
 
         const committed = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
+        const workspaces = new Set<string>();
+        const inWorkspace = (cwd: string) => Effect.sync(() => workspaces.add(cwd));
         const layerCapture = CheckpointCaptureService.layer.pipe(
           Layer.provide(
             Layer.mergeAll(
+              NodeServices.layer,
               IdAllocator.layer,
               CheckpointService.layer.pipe(
                 Layer.provide(
                   Layer.mergeAll(
                     IdAllocator.layer,
                     NodeCrypto.layer,
+                    NodeServices.layer,
                     Layer.mock(CheckpointStore.CheckpointStore)({
-                      isGitRepository: () => Effect.succeed(true),
-                      hasCheckpointRef: () => Effect.succeed(true),
-                      captureCheckpoint: () => Effect.void,
-                      diffCheckpoints: () => Effect.succeed(""),
-                      listAuthoredPaths: () => Effect.succeed(null),
+                      isGitRepository: (cwd) => inWorkspace(cwd).pipe(Effect.as(true)),
+                      hasCheckpointRef: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as(true)),
+                      captureCheckpoint: ({ cwd }) => inWorkspace(cwd).pipe(Effect.asVoid),
+                      diffCheckpoints: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as("")),
+                      listAuthoredPaths: ({ cwd }) => inWorkspace(cwd).pipe(Effect.as(null)),
                     }),
                   ),
                 ),
@@ -672,6 +685,8 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
           assert.equal(baseline.payload.nodeId, lateRootNodeId);
           assert.deepEqual(baseline.payload.capturedAt, requestedAt);
         }
+        // Its checkpoint and baselines are taken in its own workspace, not the thread's latest.
+        assert.deepEqual([...workspaces], ["/repo"]);
       }),
   );
 
@@ -869,6 +884,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               materializeBaselineCheckpoint: () =>
@@ -932,6 +948,234 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
         scopeId: cancelledScopeId,
       });
       assert.deepEqual(afterRewind.preservedCheckpointOrdinals, [0]);
+    }),
+  );
+
+  // The workspace cannot be resolved (a path component lost search permission); git cannot run
+  // there either. The run still completes, with an error checkpoint, instead of staying waiting.
+  it.effect.each([
+    { recorded: "a recorded workspace", workspaceCwd: "/repo-locked/run" },
+    { recorded: "no recorded workspace", workspaceCwd: undefined },
+  ])("completes a run whose workspace lookup is denied, with $recorded", ({ workspaceCwd }) =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const name = workspaceCwd === undefined ? "legacy" : "recorded";
+      const deniedThreadId = ThreadId.make(`thread:checkpoint-capture-denied-${name}`);
+      const deniedRunId = RunId.make(`run:checkpoint-capture-denied-${name}`);
+      const deniedScopeId = CheckpointScopeId.make(`scope:checkpoint-capture-denied-${name}`);
+      const deniedRootNodeId = NodeId.make(`node:checkpoint-capture-denied-${name}-root`);
+      const deniedProviderThreadId = ProviderThreadId.make(
+        `provider-thread:checkpoint-capture-denied-${name}`,
+      );
+      const events: ReadonlyArray<OrchestrationV2DomainEvent> = [
+        {
+          id: EventId.make(`event:checkpoint-capture-denied-${name}:thread`),
+          type: "thread.created",
+          threadId: deniedThreadId,
+          occurredAt: now,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: deniedThreadId,
+            projectId,
+            title: "Checkpoint capture in a workspace whose lookup is denied",
+            providerInstanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: {
+              parentThreadId: null,
+              relationshipToParent: null,
+              rootThreadId: deniedThreadId,
+            },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        },
+        {
+          id: EventId.make(`event:checkpoint-capture-denied-${name}:provider-thread`),
+          type: "provider-thread.updated",
+          threadId: deniedThreadId,
+          nodeId: deniedRootNodeId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: deniedProviderThreadId,
+            driver,
+            providerInstanceId,
+            providerSessionId: null,
+            appThreadId: deniedThreadId,
+            ownerNodeId: deniedRootNodeId,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            status: "idle",
+            firstRunOrdinal: 1,
+            lastRunOrdinal: 1,
+            handoffIds: [],
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        {
+          id: EventId.make(`event:checkpoint-capture-denied-${name}:scope`),
+          type: "checkpoint-scope.created",
+          threadId: deniedThreadId,
+          runId: deniedRunId,
+          nodeId: deniedRootNodeId,
+          occurredAt: now,
+          // Created before scopes kept their real path, so the capture looks the workspace up.
+          payload: {
+            id: deniedScopeId,
+            threadId: deniedThreadId,
+            runId: deniedRunId,
+            nodeId: deniedRootNodeId,
+            parentScopeId: null,
+            providerThreadId: deniedProviderThreadId,
+            kind: "root_run",
+            ordinalWithinParent: 0,
+            advancesAppRunCount: true,
+            cwd: "/repo-locked/scope",
+            createdAt: now,
+          },
+        },
+        {
+          id: EventId.make(`event:checkpoint-capture-denied-${name}:run`),
+          type: "run.updated",
+          threadId: deniedThreadId,
+          runId: deniedRunId,
+          nodeId: deniedRootNodeId,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: deniedRunId,
+            threadId: deniedThreadId,
+            ordinal: 1,
+            providerInstanceId,
+            modelSelection,
+            providerThreadId: deniedProviderThreadId,
+            userMessageId: MessageId.make(`message:checkpoint-capture-denied-${name}`),
+            rootNodeId: deniedRootNodeId,
+            activeAttemptId: null,
+            status: "waiting",
+            requestedAt: now,
+            startedAt: now,
+            completedAt: null,
+            checkpointId: null,
+            contextHandoffId: null,
+            ...(workspaceCwd === undefined ? {} : { workspaceCwd }),
+          },
+        },
+        {
+          id: EventId.make(`event:checkpoint-capture-denied-${name}:node`),
+          type: "node.updated",
+          threadId: deniedThreadId,
+          runId: deniedRunId,
+          nodeId: deniedRootNodeId,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: deniedRootNodeId,
+            threadId: deniedThreadId,
+            runId: deniedRunId,
+            parentNodeId: null,
+            rootNodeId: deniedRootNodeId,
+            kind: "root_turn",
+            status: "waiting",
+            countsForRun: true,
+            providerThreadId: deniedProviderThreadId,
+            providerTurnId: null,
+            nativeItemRef: null,
+            runtimeRequestId: null,
+            checkpointScopeId: deniedScopeId,
+            startedAt: now,
+            completedAt: null,
+          },
+        },
+      ];
+      yield* Effect.forEach(events, (event) => projectionStore.apply(event));
+
+      const lookedUp: Array<string> = [];
+      const denied = (method: string, path: string) =>
+        PlatformError.systemError({
+          _tag: "PermissionDenied",
+          module: "FileSystem",
+          method,
+          pathOrDescriptor: path,
+        });
+      const layerCapture = CheckpointCaptureService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Path.layer,
+            FileSystem.layerNoop({
+              realPath: (path) =>
+                Effect.sync(() => lookedUp.push(path)).pipe(
+                  Effect.andThen(Effect.fail(denied("realPath", path))),
+                ),
+            }),
+            IdAllocator.layer,
+            CheckpointService.layer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  IdAllocator.layer,
+                  NodeCrypto.layer,
+                  NodeServices.layer,
+                  Layer.mock(CheckpointStore.CheckpointStore)({
+                    isGitRepository: (cwd) =>
+                      Effect.fail(
+                        new VcsProcessSpawnError({
+                          operation: "test.isGitRepository",
+                          command: "git",
+                          cwd,
+                          cause: denied("chdir", cwd),
+                        }),
+                      ),
+                  }),
+                ),
+              ),
+            ),
+            Layer.mock(EventSink.EventSinkV2)({
+              commitCommand: (input) =>
+                Effect.forEach(input.events, (event) => projectionStore.apply(event)).pipe(
+                  Effect.as({ committed: true } as never),
+                  Effect.orDie,
+                ),
+            }),
+          ),
+        ),
+      );
+
+      yield* CheckpointCaptureService.CheckpointCaptureServiceV2.use((service) =>
+        service.execute({ threadId: deniedThreadId, runId: deniedRunId, scopeId: deniedScopeId }),
+      ).pipe(Effect.provide(layerCapture));
+
+      assert.deepEqual(lookedUp, [workspaceCwd ?? "/repo-locked/scope"]);
+      const projected = yield* projectionStore.getCheckpointCaptureContext(deniedThreadId, {
+        runId: deniedRunId,
+        scopeId: deniedScopeId,
+      });
+      assert.equal(projected.run?.status, "completed");
+      assert.equal(projected.rootNode?.status, "completed");
+      assert.equal(projected.run?.workspaceCwd, workspaceCwd);
+      const context = yield* projectionStore.getCheckpointContext(deniedThreadId);
+      assert.deepEqual(
+        context.checkpoints.map((checkpoint) => [checkpoint.ordinalWithinScope, checkpoint.status]),
+        [
+          [0, "error"],
+          [1, "error"],
+        ],
+      );
     }),
   );
 
@@ -1078,12 +1322,14 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       const layerCapture = CheckpointCaptureService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            NodeServices.layer,
             IdAllocator.layer,
             CheckpointService.layer.pipe(
               Layer.provide(
                 Layer.mergeAll(
                   IdAllocator.layer,
                   NodeCrypto.layer,
+                  NodeServices.layer,
                   Layer.mock(CheckpointStore.CheckpointStore)({
                     isGitRepository: gitUnavailable,
                     captureCheckpoint: gitUnavailable,

@@ -41,6 +41,10 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
     providerTurnId: ProviderTurnId,
     turnCompleted: Schema.optional(Schema.Boolean),
     steerDeclined: Schema.optional(Schema.Boolean),
+    /** No adapter call was made, so automatic input can safely be queued. */
+    steerNotInvoked: Schema.optional(Schema.Boolean),
+    /** The invoked adapter confirmed it never offered this input. */
+    steerNotDelivered: Schema.optional(Schema.Literal(true)),
     /** The provider never confirmed the stop; Force stop is the way out. */
     unresponsive: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
@@ -71,6 +75,7 @@ export interface ProviderTurnControlServiceV2Shape {
     readonly providerTurnId: ProviderTurnId;
     readonly messageId: MessageId;
     readonly modelSelection?: ModelSelection;
+    readonly beforeInvoke?: Effect.Effect<void, unknown>;
   }) => Effect.Effect<void, ProviderTurnControlError>;
   /** Best effort: a turn that ended or moved sessions picks the selection up when it next starts. */
   readonly applyModelSelection: (input: {
@@ -138,6 +143,7 @@ export const layer: Layer.Layer<
           threadId: input.threadId,
           operation: input.operation,
           providerTurnId: input.providerTurnId,
+          steerNotInvoked: input.operation === "steer",
           cause: "The recorded provider execution target is no longer valid.",
         });
       }
@@ -159,6 +165,7 @@ export const layer: Layer.Layer<
             operation: "steer",
             providerTurnId: input.providerTurnId,
             turnCompleted: providerTurn.status === "completed",
+            steerNotInvoked: true,
             cause: "The provider turn ended before the steering message was delivered.",
           });
         }
@@ -197,6 +204,7 @@ export const layer: Layer.Layer<
           threadId: input.threadId,
           operation: input.operation,
           providerTurnId: input.providerTurnId,
+          steerNotInvoked: input.operation === "steer",
           cause: `Provider session ${input.providerSessionId} is not active.`,
         });
       }
@@ -419,11 +427,28 @@ export const layer: Layer.Layer<
               threadId: input.threadId,
               operation: "steer",
               providerTurnId: input.providerTurnId,
+              steerNotInvoked: message !== undefined && run === undefined,
               cause: "The persisted steering message or target run is missing.",
             });
           }
           yield* loaded.session.value
             .steerTurn({
+              ...(input.beforeInvoke === undefined
+                ? {}
+                : {
+                    beforeSubmit: input.beforeInvoke.pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new ProviderAdapter.ProviderAdapterSteerRunError({
+                            driver: loaded.providerThread.driver,
+                            providerThreadId: input.providerThreadId,
+                            providerTurnId: input.providerTurnId,
+                            deliveryNotSent: true,
+                            cause,
+                          }),
+                      ),
+                    ),
+                  }),
               threadId: input.threadId,
               runId: run.id,
               providerThread: loaded.providerThread,
@@ -464,6 +489,19 @@ export const layer: Layer.Layer<
               Effect.catch((cause) =>
                 Effect.gen(function* () {
                   if (isProviderTurnControlError(cause)) return yield* cause;
+                  // Preserve confirmed non-delivery even if the subsequent projection read fails.
+                  if (
+                    (ProviderAdapter.isProviderAdapterSteerRunError(cause) &&
+                      cause.deliveryNotSent === true) ||
+                    ProviderAdapter.isProviderAdapterSteerRunUnsupportedError(cause)
+                  )
+                    return yield* new ProviderTurnControlError({
+                      threadId: input.threadId,
+                      operation: "steer",
+                      providerTurnId: input.providerTurnId,
+                      steerNotDelivered: true,
+                      cause,
+                    });
                   const current = yield* projections.getProviderControlContext(
                     input.threadId,
                     input,

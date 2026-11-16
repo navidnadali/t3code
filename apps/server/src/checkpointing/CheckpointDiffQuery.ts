@@ -175,22 +175,32 @@ export const make = Effect.gen(function* () {
             )
           : undefined;
 
-      const firstScope =
-        input.fromTurnCount === 0
-          ? projection.checkpointScopes.find((scope) => scope.kind === "root_run")
-          : undefined;
+      // A range stays in the turn's scope: a thread has one per workspace it ran in, and a diff
+      // between two worktrees would show their branches' differences as the turn's changes. A scope
+      // starts at its earliest checkpoint a rewind kept: the thread start, or for a later workspace
+      // the baseline of its first run there.
+      const scopeStart = () => {
+        const earliest = projection.checkpoints.reduce(
+          (start, checkpoint) =>
+            checkpoint.scopeId === toScope.id && checkpoint.status !== "stale"
+              ? Math.min(start, checkpoint.ordinalWithinScope)
+              : start,
+          toCheckpoint.ordinalWithinScope,
+        );
+        return earliest < toCheckpoint.ordinalWithinScope ? earliest : 0;
+      };
       const fromCheckpointRef =
         input.fromTurnCount === 0
-          ? firstScope === undefined
-            ? undefined
-            : yield* checkpointRefForScopeOrdinal({
-                scopeId: firstScope.id,
-                ordinalWithinScope: 0,
-              }).pipe(Effect.provideService(Digest.Digest, digest))
+          ? yield* checkpointRefForScopeOrdinal({
+              scopeId: toScope.id,
+              ordinalWithinScope: scopeStart(),
+            }).pipe(Effect.provideService(Digest.Digest, digest))
           : (
               parentCheckpoint ??
               readyCheckpoints.find(
-                (checkpoint) => checkpoint.appRunOrdinal === input.fromTurnCount,
+                (checkpoint) =>
+                  checkpoint.appRunOrdinal === input.fromTurnCount &&
+                  checkpoint.scopeId === toCheckpoint.scopeId,
               )
             )?.ref;
       if (fromCheckpointRef === undefined) {
@@ -202,8 +212,10 @@ export const make = Effect.gen(function* () {
         });
       }
 
+      // Diffed where the run worked; its scope keeps the spelling its workspace was first reached by.
       const comparison = {
-        cwd: toScope.cwd,
+        cwd:
+          projection.runs.find((run) => run.id === toCheckpoint.runId)?.workspaceCwd ?? toScope.cwd,
         fromCheckpointRef,
         toCheckpointRef: toCheckpoint.ref,
         fallbackFromToHead: false,

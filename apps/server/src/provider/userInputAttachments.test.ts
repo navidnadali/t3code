@@ -1,5 +1,4 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -10,10 +9,13 @@ import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as PlatformError from "effect/PlatformError";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as TestClock from "effect/testing/TestClock";
-import { vi } from "vite-plus/test";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ServerConfig from "../config.ts";
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
+import { withServerCommandSpawner } from "../testUtils/serverCommandSpawner.ts";
 import * as DocumentText from "./DocumentText.ts";
 import { extractDocumentText } from "./documentTextWorker.ts";
 import * as Cleanup from "../orchestration-v2/ResourceCleanupService.ts";
@@ -24,12 +26,35 @@ import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts
 import * as NodeZlib from "node:zlib";
 import { appendUserInputAttachmentPaths } from "./userInputAttachments.ts";
 
-vi.mock("node:child_process", { spy: true });
-
 const layer = Layer.merge(
   ServerConfig.layerTest(process.cwd(), { prefix: "t3-answer-paths-" }),
   DocumentText.layer,
 ).pipe(Layer.provideMerge(NodeServices.layer));
+// DocumentText runs its extractor on the server's CommandSpawner, not execFile. `body` sees every
+// spawn there; `rewrite` can fail a spawn or change its command before the server's spawner runs it.
+const withExtractorSpawns = <A, E, R>(
+  body: (spawns: ReadonlyArray<ChildProcess.StandardCommand>) => Effect.Effect<A, E, R>,
+  rewrite: (
+    command: ChildProcess.StandardCommand,
+    spawn: number,
+  ) => Effect.Effect<ChildProcess.StandardCommand, PlatformError.PlatformError> = Effect.succeed,
+) =>
+  withServerCommandSpawner(
+    Effect.gen(function* () {
+      const server = yield* WorkerChildProcessSpawner.CommandSpawner;
+      const spawns: Array<ChildProcess.StandardCommand> = [];
+      return yield* body(spawns).pipe(
+        Effect.provideService(
+          WorkerChildProcessSpawner.CommandSpawner,
+          ChildProcessSpawner.make((command) =>
+            command._tag === "StandardCommand"
+              ? rewrite(command, spawns.push(command)).pipe(Effect.flatMap(server.spawn))
+              : server.spawn(command),
+          ),
+        ),
+      );
+    }),
+  ).pipe(Effect.map(({ result }) => result));
 const attachment = {
   type: "file" as const,
   id: "thread-1-00000000-0000-4000-8000-0000000000aa-txt",
@@ -198,55 +223,55 @@ describe("question answer paths", () => {
   );
 
   it.effect.each(["spawn", "read"])("retries after a transient %s failure expires", (failure) =>
-    Effect.acquireUseRelease(
-      Effect.promise(async () => {
-        const { execFile } = await vi.importActual<typeof NodeChildProcess>("node:child_process");
-        const worker = vi.spyOn(NodeChildProcess, "execFile");
-        worker.mockImplementationOnce(((
-          file: string,
-          args: readonly string[],
-          options: NodeChildProcess.ExecFileOptionsWithStringEncoding,
-          callback: (
-            error: NodeChildProcess.ExecFileException | null,
-            stdout: string,
-            stderr: string,
-          ) => void,
-        ) => {
-          if (failure === "spawn") {
-            throw Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" });
-          }
-          const preload = `import fs from 'node:fs/promises';
-            import { syncBuiltinESMExports } from 'node:module';
-            fs.readFile = async () => { throw Object.assign(new Error('read EAGAIN'), { code: 'EAGAIN' }); };
-            syncBuiltinESMExports();`;
-          return execFile(
-            file,
-            ["--import", `data:text/javascript,${encodeURIComponent(preload)}`, ...args],
-            options,
-            callback,
-          );
-        }) as typeof NodeChildProcess.execFile);
-        return worker;
-      }),
-      (worker) =>
-        Effect.gen(function* () {
-          const config = yield* ServerConfig.ServerConfig;
-          const path = NodePath.join(config.attachmentsDir, "retry.rtf");
-          NodeFS.writeFileSync(path, String.raw`{\rtf1 Available}`);
-          const documents = yield* DocumentText.DocumentText;
-          expect(yield* documents.ensure(path)).toBeUndefined();
-          expect(yield* documents.ensure(path)).toBeUndefined();
-          expect(worker).toHaveBeenCalledTimes(1);
-          expect(NodeFS.existsSync(path + ".txt")).toBe(false);
-          yield* TestClock.adjust("1 second");
-          expect(yield* documents.ensure(path)).toBe(path + ".txt");
-          expect(NodeFS.readFileSync(path + ".txt", "utf8")).toBe("Available");
-          expect(worker).toHaveBeenCalledTimes(2);
-          expect(yield* documents.ensure(path)).toBe(path + ".txt");
-          expect(worker).toHaveBeenCalledTimes(2);
-        }).pipe(Effect.provide(layer)),
-      (worker) => Effect.sync(() => worker.mockRestore()),
-    ),
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const path = NodePath.join(config.attachmentsDir, "retry.rtf");
+      NodeFS.writeFileSync(path, String.raw`{\rtf1 Available}`);
+      const preload = `import fs from 'node:fs/promises';
+        import { syncBuiltinESMExports } from 'node:module';
+        fs.readFile = async () => { throw Object.assign(new Error('read EAGAIN'), { code: 'EAGAIN' }); };
+        syncBuiltinESMExports();`;
+      yield* withExtractorSpawns(
+        (spawns) =>
+          Effect.gen(function* () {
+            const documents = yield* DocumentText.DocumentText;
+            expect(yield* documents.ensure(path)).toBeUndefined();
+            expect(yield* documents.ensure(path)).toBeUndefined();
+            expect(spawns).toHaveLength(1);
+            expect(NodeFS.existsSync(path + ".txt")).toBe(false);
+            yield* TestClock.adjust("1 second");
+            expect(yield* documents.ensure(path)).toBe(path + ".txt");
+            expect(NodeFS.readFileSync(path + ".txt", "utf8")).toBe("Available");
+            expect(spawns).toHaveLength(2);
+            expect(yield* documents.ensure(path)).toBe(path + ".txt");
+            expect(spawns).toHaveLength(2);
+          }).pipe(Effect.provide(Layer.fresh(DocumentText.layer))),
+        (command, spawn) =>
+          spawn > 1
+            ? Effect.succeed(command)
+            : failure === "spawn"
+              ? Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "Unknown",
+                    module: "ChildProcess",
+                    method: "spawn",
+                    syscall: "spawn",
+                    description: "EAGAIN",
+                  }),
+                )
+              : Effect.succeed(
+                  ChildProcess.make(
+                    command.command,
+                    [
+                      "--import",
+                      `data:text/javascript,${encodeURIComponent(preload)}`,
+                      ...command.args,
+                    ],
+                    command.options,
+                  ),
+                ),
+      );
+    }).pipe(Effect.provide(layer)),
   );
 
   it.effect.each([
@@ -255,23 +280,22 @@ describe("question answer paths", () => {
     ["rtf", String.raw`{\rtf1}`],
     ["rtf", String.raw`{\rtf1\ansi\ansicpg99999 Unsupported}`],
   ] as const)("caches unchanged document rejections: %s %s", ([extension, source]) =>
-    Effect.acquireUseRelease(
-      Effect.sync(() => vi.spyOn(NodeChildProcess, "execFile")),
-      (worker) =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const path = NodePath.join(config.attachmentsDir, `invalid.${extension}`);
+      NodeFS.writeFileSync(path, source);
+      yield* withExtractorSpawns((spawns) =>
         Effect.gen(function* () {
-          const config = yield* ServerConfig.ServerConfig;
-          const path = NodePath.join(config.attachmentsDir, `invalid.${extension}`);
-          NodeFS.writeFileSync(path, source);
           const documents = yield* DocumentText.DocumentText;
           for (const seconds of [0, 1, 60]) {
             yield* TestClock.adjust(`${seconds} seconds`);
             expect(yield* documents.ensure(path)).toBeUndefined();
-            expect(worker).toHaveBeenCalledTimes(1);
+            expect(spawns).toHaveLength(1);
             expect(NodeFS.existsSync(path + ".txt")).toBe(false);
           }
-        }).pipe(Effect.provide(layer)),
-      (worker) => Effect.sync(() => worker.mockRestore()),
-    ),
+        }).pipe(Effect.provide(Layer.fresh(DocumentText.layer))),
+      );
+    }).pipe(Effect.provide(layer)),
   );
 
   it.effect.each([
@@ -320,38 +344,15 @@ describe("question answer paths", () => {
   );
 
   it.effect.each([false, true])("limits the child heap for standalone=%s", (standalone) =>
-    Effect.acquireUseRelease(
-      Effect.promise(async () => {
-        const { execFile } = await vi.importActual<typeof NodeChildProcess>("node:child_process");
-        const probe = vi.spyOn(NodeChildProcess, "execFile");
-        probe.mockImplementation(((
-          file: string,
-          _args: readonly string[],
-          options: NodeChildProcess.ExecFileOptionsWithStringEncoding,
-          callback: (
-            error: NodeChildProcess.ExecFileException | null,
-            stdout: string,
-            stderr: string,
-          ) => void,
-        ) =>
-          execFile(
-            file,
-            [
-              "-e",
-              'process.stdout.write(String(require("node:v8").getHeapStatistics().heap_size_limit))',
-            ],
-            options,
-            callback,
-          )) as typeof NodeChildProcess.execFile);
-        return probe;
-      }),
-      () =>
-        Effect.gen(function* () {
-          const config = yield* ServerConfig.ServerConfig;
-          const path = NodePath.join(config.attachmentsDir, "heap.rtf");
-          NodeFS.writeFileSync(path, String.raw`{\rtf1 hello}`);
-          const extracted = yield* Effect.gen(function* () {
-            return yield* (yield* DocumentText.DocumentText).ensure(path);
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const path = NodePath.join(config.attachmentsDir, "heap.rtf");
+      NodeFS.writeFileSync(path, String.raw`{\rtf1 hello}`);
+      const { extracted, spawns } = yield* withExtractorSpawns(
+        (spawns) =>
+          Effect.gen(function* () {
+            const extracted = yield* (yield* DocumentText.DocumentText).ensure(path);
+            return { extracted, spawns };
           }).pipe(
             Effect.provide(Layer.fresh(DocumentText.layer)),
             Effect.provideService(HostProcess.IsExecutable, standalone),
@@ -359,15 +360,43 @@ describe("question answer paths", () => {
               ...process.env,
               NODE_OPTIONS: "--max-old-space-size=1024",
             }),
-          );
-          expect(extracted).toBe(path + ".txt");
-          const heapLimit = Number(NodeFS.readFileSync(path + ".txt", "utf8"));
-          expect(heapLimit).toBeGreaterThan(192 * 1024 * 1024);
-          // Newer V8 versions reserve up to 192 MiB for the young generation as well.
-          expect(heapLimit).toBeLessThanOrEqual(384 * 1024 * 1024);
-        }).pipe(Effect.provide(layer)),
-      (probe) => Effect.sync(() => probe.mockRestore()),
-    ),
+          ),
+        (command) =>
+          Effect.succeed(
+            ChildProcess.make(
+              command.command,
+              [
+                "-e",
+                'process.stdout.write(String(require("node:v8").getHeapStatistics().heap_size_limit))',
+              ],
+              command.options,
+            ),
+          ),
+      );
+      expect(
+        spawns.map(({ command, args, options }) => ({
+          command,
+          args,
+          nodeOptions: options.env?.NODE_OPTIONS,
+        })),
+      ).toEqual([
+        {
+          command: process.execPath,
+          args: [
+            ...(standalone ? [] : [NodePath.join(import.meta.dirname, "..", "bin.ts")]),
+            "__document-text",
+            path,
+            ".rtf",
+          ],
+          nodeOptions: "--max-old-space-size=1024 --max-old-space-size=192",
+        },
+      ]);
+      expect(extracted).toBe(path + ".txt");
+      const heapLimit = Number(NodeFS.readFileSync(path + ".txt", "utf8"));
+      expect(heapLimit).toBeGreaterThan(192 * 1024 * 1024);
+      // Newer V8 versions reserve up to 192 MiB for the young generation as well.
+      expect(heapLimit).toBeLessThanOrEqual(384 * 1024 * 1024);
+    }).pipe(Effect.provide(layer)),
   );
 
   it.effect("extracts notebook cells and outputs once and keeps both readable paths", () =>

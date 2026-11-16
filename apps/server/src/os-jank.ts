@@ -163,15 +163,18 @@ const readLoginShellOutput = Effect.fn("readLoginShellOutput")(
         shell,
         ["-ilc", buildEnvironmentCaptureCommand(shell, LOGIN_SHELL_ENV_NAMES)],
         {
-          stdin: "ignore",
+          // Piped with an empty input: the server's spawner process starts only piped commands.
+          stdin: Stream.empty,
           stdout: "pipe",
-          stderr: "ignore",
+          stderr: "pipe",
           // A profile that traps SIGTERM would otherwise hold the scope open
           // past the timeout while cleanup waits for the exit.
           forceKillAfter: "1 second",
         },
       ),
     );
+    // Drained aside: a job the profile starts in the background can keep stderr open.
+    yield* Effect.forkScoped(Stream.runDrain(child.stderr));
     const [stdout, exitCode] = yield* Effect.all(
       [Stream.mkString(Stream.decodeText(child.stdout)), child.exitCode],
       { concurrency: 2 },

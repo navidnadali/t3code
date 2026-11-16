@@ -54,6 +54,7 @@ import * as Hex from "effect/encoding/Hex";
 import * as Exit from "effect/Exit";
 import * as P from "effect/Predicate";
 import * as FileSystem from "effect/FileSystem";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
@@ -266,6 +267,7 @@ interface ActiveTurn {
       }
     | undefined;
   interrupted: boolean;
+  stopGeneration: number;
   unsent: boolean;
   readonly steers: Set<string>;
   readonly settledInbox: Set<string>;
@@ -662,6 +664,7 @@ const ACTIVE_CHECK_TIMEOUT = "5 seconds";
 const CLEAR_PROMPT_REJECTIONS: ReadonlySet<string> = new Set([
   "InvalidRequestError",
   "ConflictError",
+  "SessionNotFoundError",
   "UnauthorizedError",
   "CommandNotFoundError",
   "SkillNotFoundError",
@@ -1555,6 +1558,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       todoPlanId: undefined,
       retry: undefined,
       interrupted: false,
+      stopGeneration: 0,
       unsent: false,
       steers: new Set(),
       settledInbox: new Set(),
@@ -2355,6 +2359,35 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       if (window === undefined) {
         yield* Effect.forkIn(readModels(directoryOf(turn.input.runtimePolicy.cwd)), sessionScope);
       }
+    });
+
+    // A typed missing-session reply proves the input was not admitted.
+    const forgetMissingSession = Effect.fn("OpenCode2Adapter.forgetMissingSession")(function* (
+      state: ThreadState,
+    ) {
+      if (threads.get(state.sessionId) !== state) return;
+      yield* finishTurn(
+        state,
+        {
+          status: "failed",
+          failure: makeProviderFailure({
+            message:
+              "The OpenCode session no longer exists. The next message will use a new session.",
+            class: "provider_error",
+          }),
+        },
+        "broken",
+      );
+      // A terminal event can precede the 404; the manager must still forget its loaded binding.
+      if (state.providerThread.status !== "error") {
+        state.providerThread = {
+          ...state.providerThread,
+          status: "error",
+          updatedAt: yield* DateTime.now,
+        };
+        yield* emitProviderThread(state);
+      }
+      if (threads.get(state.sessionId) === state) threads.delete(state.sessionId);
     });
 
     // OpenCode waits forever on unanswered requests; stop that run and keep its end from settling the next.
@@ -4524,6 +4557,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       turn: ActiveTurn,
     ) {
       const sessionID = Session.ID.make(sessionId);
+      const nativeFetch = yield* FetchHttpClient.Fetch;
+      const withSubmission =
+        turnInput.submit === undefined
+          ? nativeFetch
+          : yield* ProviderAdapter.startSubmissionFetch(turnInput.submit, nativeFetch);
       const sending = () => {
         if (state.active !== turn || turn.interrupted) return false;
         turn.unsent = false;
@@ -4545,7 +4583,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       }
       if (bare && text === "/compact") {
         if (!sending()) return;
-        return yield* client.session.compact({ sessionID, id }).pipe(Effect.asVoid);
+        return yield* client.session
+          .compact({ sessionID, id })
+          .pipe(Effect.provideService(FetchHttpClient.Fetch, withSubmission), Effect.asVoid);
       }
       const location = { directory: turnInput.runtimePolicy.cwd ?? host.paths.cwd };
       const command = bare ? commandOf(text) : undefined;
@@ -4563,6 +4603,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           if (goalCommand?.type === "pause" || goalCommand?.type === "clear") {
             // OpenCode rejects pausing or clearing a missing goal; Codex treats that as a no-op.
             yield* client.session.command({ sessionID, ...command }).pipe(
+              Effect.provideService(FetchHttpClient.Fetch, withSubmission),
               Effect.catchIf(
                 (error) =>
                   error._tag === "CommandExecutionError" && error.message === "No goal is set.",
@@ -4571,7 +4612,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             );
             return yield* finishControl;
           }
-          return yield* client.session.command({ sessionID, ...command }).pipe(Effect.asVoid);
+          return yield* client.session
+            .command({ sessionID, ...command })
+            .pipe(Effect.provideService(FetchHttpClient.Fetch, withSubmission), Effect.asVoid);
         }
       }
       const mentions = skillMentions(text);
@@ -4589,7 +4632,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             ? {}
             : { skills: skills.map((id) => ({ id: Skill.ID.make(id) })) }),
         })
-        .pipe(Effect.asVoid);
+        .pipe(Effect.provideService(FetchHttpClient.Fetch, withSubmission), Effect.asVoid);
     });
 
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
@@ -4853,19 +4896,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           yield* submit(sessionId, turnInput, state, turn).pipe(
             // Forget externally deleted sessions so the next turn recreates them with handoff.
             Effect.catchTags({
-              SessionNotFoundError: () =>
-                finishTurn(
-                  state,
-                  {
-                    status: "failed",
-                    failure: makeProviderFailure({
-                      message:
-                        "The OpenCode session no longer exists. Send the message again to continue in a new session.",
-                      class: "provider_error",
-                    }),
-                  },
-                  "broken",
-                ).pipe(Effect.andThen(Effect.sync(() => threads.delete(sessionId)))),
+              SessionNotFoundError: () => forgetMissingSession(state),
             }),
             Effect.tapError((cause) =>
               state.active === turn
@@ -4906,11 +4937,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             turn.providerTurn.id !== steerInput.providerTurnId ||
             turn.interrupted
           ) {
-            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
               driver: OPENCODE_PROVIDER,
-              detail: `OpenCode turn ${steerInput.providerTurnId} is not active`,
+              providerThreadId: steerInput.providerThread.id,
+              providerTurnId: steerInput.providerTurnId,
+              deliveryNotSent: true,
+              cause: `OpenCode turn ${steerInput.providerTurnId} is not active`,
             });
           }
+          const stopGeneration = turn.stopGeneration;
           const inboxID = steerPromptId(sessionId, steerInput.message.messageId);
           if (turn.settledInbox.has(inboxID)) return;
           turn.steers.add(inboxID);
@@ -4935,7 +4970,21 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               ),
             ),
           );
-          if (state.active !== turn || turn.interrupted) {
+          if (steerInput.beforeSubmit !== undefined)
+            yield* steerInput.beforeSubmit.pipe(
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit)
+                  ? lock.withPermit(
+                      Effect.gen(function* () {
+                        turn.steers.delete(inboxID);
+                        state.strandedSteers.delete(inboxID);
+                        if (state.active === turn) yield* endIfSettled(state, turn);
+                      }),
+                    )
+                  : Effect.void,
+              ),
+            );
+          if (state.active !== turn || turn.interrupted || turn.stopGeneration !== stopGeneration) {
             yield* lock.withPermit(
               Effect.gen(function* () {
                 turn.steers.delete(inboxID);
@@ -4949,9 +4998,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 }
               }),
             );
-            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
               driver: OPENCODE_PROVIDER,
-              detail: `OpenCode turn ${steerInput.providerTurnId} is not active`,
+              providerThreadId: steerInput.providerThread.id,
+              providerTurnId: steerInput.providerTurnId,
+              deliveryNotSent: true,
+              cause: `OpenCode turn ${steerInput.providerTurnId} is not active`,
             });
           }
           yield* client.session
@@ -4967,10 +5019,27 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 lock.withPermit(
                   Effect.gen(function* () {
                     turn.steers.delete(inboxID);
-                    if (!CLEAR_PROMPT_REJECTIONS.has(cause._tag)) state.strandedSteers.add(inboxID);
-                    if (state.active === turn) yield* endIfSettled(state, turn);
+                    if (CLEAR_PROMPT_REJECTIONS.has(cause._tag))
+                      state.strandedSteers.delete(inboxID);
+                    else state.strandedSteers.add(inboxID);
+                    if (cause._tag === "SessionNotFoundError") yield* forgetMissingSession(state);
+                    else if (state.active === turn) yield* endIfSettled(state, turn);
                   }),
                 ),
+              ),
+              Effect.mapError((cause) =>
+                CLEAR_PROMPT_REJECTIONS.has(cause._tag)
+                  ? new ProviderAdapter.ProviderAdapterSteerRunError({
+                      driver: OPENCODE_PROVIDER,
+                      providerThreadId: steerInput.providerThread.id,
+                      providerTurnId: steerInput.providerTurnId,
+                      deliveryNotSent: true,
+                      ...(cause._tag === "SessionNotFoundError"
+                        ? { threadDisposition: "broken" as const }
+                        : {}),
+                      cause,
+                    })
+                  : cause,
               ),
             );
         },
@@ -4994,6 +5063,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const state = threads.get(sessionId);
           if (state === undefined) return;
           const turn = state.active;
+          // A failed Stop still invalidates input already being prepared.
+          if (turn?.providerTurn.id === interruptInput.providerTurnId) turn.stopGeneration += 1;
           // User Stop must end background children and their report execution; steering leaves them running.
           if (interruptInput.requestRuntimeRestart === true) yield* stopBackground(state);
           if (turn === undefined || turn.providerTurn.id !== interruptInput.providerTurnId) {

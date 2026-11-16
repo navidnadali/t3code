@@ -4,8 +4,9 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as OpenCodeServerLedger from "./OpenCodeServerLedger.ts";
 import { assert, describe, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { OpencodeClient, ToolPart } from "@opencode-ai/sdk/v2";
+import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2";
 import { toolOutputImages } from "@t3tools/shared/toolOutput";
 import {
   CheckpointId,
@@ -30,6 +31,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
+import * as Result from "effect/Result";
 import * as Queue from "effect/Queue";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -161,6 +163,7 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
     readonly exitCode?: Effect.Effect<number>;
     readonly options?: ReadonlyArray<ProviderOptionSelection>;
     readonly interactionMode?: ProviderAdapter.ProviderAdapterV2RuntimePolicy["interactionMode"];
+    readonly nativeEventLogger?: ProviderEventLoggers.EventNdjsonLogger;
   } = {},
 ) {
   const instanceId = ProviderInstanceId.make(`opencode-${suffix}`);
@@ -178,6 +181,9 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
     instanceId,
     settings: OPEN_CODE_TEST_SETTINGS,
     environment: {},
+    ...(turnSettings.nativeEventLogger
+      ? { nativeEventLogger: turnSettings.nativeEventLogger }
+      : {}),
   }).pipe(
     Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, {
       connectToOpenCodeServer: () =>
@@ -568,6 +574,79 @@ describe("OpenCodeAdapterV2", () => {
       assert.isTrue(Exit.isFailure(yield* Fiber.join(firstSteer)));
       assert.isTrue(Exit.isFailure(yield* Fiber.join(secondSteer)));
       assert.deepEqual(calls, ["catalog", "catalog-aborted", "abort"]);
+    }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
+  );
+
+  it.effect("ends a turn that Stop reached before its prompt was sent", () =>
+    Effect.gen(function* () {
+      const sessionId = "catalog-stop";
+      const nativeEvents = asyncEventStream();
+      const catalogStarted = promiseGate<void>();
+      const calls: string[] = [];
+      const harness = yield* makeOpenCodeRuntimeHarness(
+        sessionId,
+        sessionId,
+        {
+          event: {
+            subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
+              options.signal?.addEventListener("abort", () => nativeEvents.close(), { once: true });
+              return { stream: nativeEvents.stream };
+            },
+          },
+          provider: {
+            list: async (_input: unknown, { signal }: { signal: AbortSignal }) => {
+              catalogStarted.resolve();
+              await new Promise<void>((_resolve, reject) => {
+                signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+              });
+              return { data: { all: [] } };
+            },
+          },
+          session: {
+            create: async () => ({ data: { id: sessionId, time: { created: 1, updated: 1 } } }),
+            get: async () => ({ data: { id: sessionId, time: { created: 1, updated: 1 } } }),
+            messages: async () => ({ data: [] }),
+            children: async () => ({ data: [] }),
+            promptAsync: async (_input: unknown, { signal }: { signal: AbortSignal }) => {
+              signal.throwIfAborted();
+              calls.push("prompt");
+              return { data: true };
+            },
+            abort: async () => {
+              calls.push("abort");
+              return { data: true };
+            },
+          },
+        },
+        {},
+        { model: "opencode/big-pickle", options: [{ id: "variant", value: "medium" }] },
+      );
+      const terminals = yield* harness.runtime.events.pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      const start = yield* harness.startTurn().pipe(Effect.forkScoped);
+      yield* Effect.promise(() => catalogStarted.promise);
+      const announced = (yield* harness.runtime.readThreadSnapshot({
+        providerThread: harness.providerThread,
+      })).providerTurns.at(-1)!;
+      assert.equal(announced.status, "running");
+
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: announced.id,
+        requestRuntimeRestart: true,
+      });
+      yield* Fiber.join(start);
+      assert.deepEqual(calls, ["abort"]);
+      const after = yield* harness.runtime.readThreadSnapshot({
+        providerThread: harness.providerThread,
+      });
+      assert.equal(after.providerTurns.at(-1)?.status, "interrupted");
+      const [terminal] = yield* Fiber.join(terminals);
+      assert.deepInclude(terminal, { providerTurnId: announced.id, status: "interrupted" });
     }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
   );
 
@@ -3601,57 +3680,88 @@ describe("OpenCodeAdapterV2", () => {
     }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
   );
 
-  it.effect("steers with the turn's agent, reasoning variant and system instructions", () =>
-    Effect.gen(function* () {
-      const nativeEvents = asyncEventStream();
-      const promptInputs: Array<{ agent?: string; variant?: string; system?: string }> = [];
-      const harness = yield* makeOpenCodeRuntimeHarness(
-        "steer-agent",
-        "root",
-        {
-          event: { subscribe: async () => ({ stream: nativeEvents.stream }) },
-          session: {
-            create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
-            get: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
-            messages: async () => ({ data: [] }),
-            promptAsync: async (input: { agent?: string; variant?: string; system?: string }) => {
+  it.effect.each(["mock", "sdk", "sdk-error"])(
+    "steers with the turn's options through %s",
+    (transport) =>
+      Effect.gen(function* () {
+        const nativeEvents = asyncEventStream();
+        const promptInputs: Array<{ agent?: string; variant?: string; system?: string }> = [];
+        const sdk = createOpencodeClient({ baseUrl: "http://test.invalid", throwOnError: true });
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            vi.spyOn(globalThis, "fetch").mockImplementation(async (request) => {
+              assert.instanceOf(request, Request);
+              const input = await (request as Request).json();
               promptInputs.push(input);
-              return { data: true };
+              if (transport === "sdk-error") throw new Error("Transport failed after submission");
+              return Response.json(true);
+            }),
+          ),
+          (spy) => Effect.sync(() => spy.mockRestore()),
+        );
+        const harness = yield* makeOpenCodeRuntimeHarness(
+          "steer-agent",
+          "root",
+          {
+            event: { subscribe: async () => ({ stream: nativeEvents.stream }) },
+            session: {
+              create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+              get: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+              messages: async () => ({ data: [] }),
+              promptAsync: async (
+                input: { agent?: string; variant?: string; system?: string },
+                options: { signal: AbortSignal },
+              ) => {
+                if (transport !== "mock" && promptInputs.length > 0)
+                  return sdk.session.promptAsync(
+                    input as Parameters<typeof sdk.session.promptAsync>[0],
+                    options,
+                  );
+                promptInputs.push(input);
+                return { data: true };
+              },
+              abort: async () => ({ data: true }),
+              children: async () => ({ data: [] }),
             },
-            abort: async () => ({ data: true }),
-            children: async () => ({ data: [] }),
           },
-        },
-        {},
-        { options: [{ id: "variant", value: "high" }], interactionMode: "plan" },
-      );
-      yield* harness.startTurn();
-      const snapshot = yield* harness.runtime.readThreadSnapshot({
-        providerThread: harness.providerThread,
-      });
-      yield* harness.runtime.steerTurn({
-        threadId: harness.threadId,
-        runId: harness.runId,
-        providerThread: harness.providerThread,
-        providerTurnId: snapshot.providerTurns.at(-1)!.id,
-        message: {
-          messageId: MessageId.make("message-opencode-steer-agent"),
-          text: "also cover the README",
-          attachments: [],
-          createdBy: "user",
-          creationSource: "web",
-        },
-      });
+          {},
+          { options: [{ id: "variant", value: "high" }], interactionMode: "plan" },
+        );
+        yield* harness.startTurn();
+        const snapshot = yield* harness.runtime.readThreadSnapshot({
+          providerThread: harness.providerThread,
+        });
+        const steering = harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: harness.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: snapshot.providerTurns.at(-1)!.id,
+          message: {
+            messageId: MessageId.make("message-opencode-steer-agent"),
+            text: "also cover the README",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+          },
+        });
 
-      const [start, steer] = promptInputs;
-      assert.equal(start?.agent, "plan");
-      assert.equal(start?.variant, "high");
-      assert.include(start?.system ?? "", "OpenCode");
-      assert.deepEqual(
-        { agent: steer?.agent, variant: steer?.variant, system: steer?.system },
-        { agent: start?.agent, variant: start?.variant, system: start?.system },
-      );
-    }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
+        if (transport === "sdk-error") {
+          const error = yield* steering.pipe(Effect.flip);
+          assert.isTrue(ProviderAdapter.isProviderAdapterSteerRunError(error));
+          assert.isNotTrue(
+            ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+          );
+        } else yield* steering;
+        assert.equal(promptInputs.length, 2);
+        const [start, steer] = promptInputs;
+        assert.equal(start?.agent, "plan");
+        assert.equal(start?.variant, "high");
+        assert.include(start?.system ?? "", "OpenCode");
+        assert.deepEqual(
+          { agent: steer?.agent, variant: steer?.variant, system: steer?.system },
+          { agent: start?.agent, variant: start?.variant, system: start?.system },
+        );
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
   );
 
   it.effect("keeps a newly admitted prompt alive across stale idle and delayed busy evidence", () =>
@@ -3669,6 +3779,26 @@ describe("OpenCodeAdapterV2", () => {
       let promptCalls = 0;
       let statusCalls = 0;
       const promptInputs: Array<{ readonly messageID?: string }> = [];
+      const sdk = createOpencodeClient({ baseUrl: "http://test.invalid", throwOnError: true });
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi.spyOn(globalThis, "fetch").mockImplementation(async (request) => {
+            assert.instanceOf(request, Request);
+            if (promptCalls === 2) {
+              steerPromptStarted.resolve();
+              await steerPrompt.promise;
+            } else {
+              stopPromptStarted.resolve();
+              const signal = (request as Request).signal;
+              await new Promise<void>((_resolve, reject) =>
+                signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+              );
+            }
+            return Response.json(true);
+          }),
+        ),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
       const client = {
         event: {
           subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
@@ -3692,18 +3822,12 @@ describe("OpenCodeAdapterV2", () => {
             if (promptCalls === 1) {
               promptStarted.resolve();
               await prompt.promise;
-            } else if (promptCalls === 2) {
-              steerPromptStarted.resolve();
-              await steerPrompt.promise;
-            } else {
-              stopPromptStarted.resolve();
-              await new Promise<void>((_resolve, reject) =>
-                options?.signal?.addEventListener("abort", () => reject(options.signal!.reason), {
-                  once: true,
-                }),
-              );
+              return { data: true };
             }
-            return { data: true };
+            return sdk.session.promptAsync(
+              input as Parameters<typeof sdk.session.promptAsync>[0],
+              options,
+            );
           },
           status: async () => ({
             data: (() => {
@@ -3971,12 +4095,58 @@ describe("OpenCodeAdapterV2", () => {
     }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
   );
 
-  it.effect("rejects steering when stop wins the extracted-text lookup", () =>
+  it.effect.each([
+    { phase: "extraction", command: false },
+    { phase: "submission", command: false },
+    { phase: "logging", command: false },
+    { phase: "logging", command: true },
+    { phase: "logging-timeout", command: false },
+    { phase: "logging-timeout", command: true },
+    { phase: "fork", command: true },
+    { phase: "sdk", command: false },
+    { phase: "sdk", command: true },
+    { phase: "sdk-timeout", command: false },
+    { phase: "sdk-timeout", command: true },
+    { phase: "sdk-validation", command: false },
+    { phase: "sdk-validation", command: true },
+    { phase: "sdk-rejection", command: false },
+    { phase: "sdk-rejection", command: true },
+    { phase: "sdk-failed-stop", command: false },
+    { phase: "sdk-failed-stop", command: true },
+    { phase: "extraction-failed-stop", command: false },
+  ])("preserves unsent steering during $phase with command=$command", ({ phase, command }) =>
     Effect.gen(function* () {
       const events = asyncEventStream();
       const lookup = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
+      const queuedStop = yield* Deferred.make<void, ProviderAdapter.ProviderAdapterV2Error>();
+      const scope = yield* Effect.scope;
       let prompts = 0;
+      let steering = false;
+      let initialMessageId = "";
+      let abortFailed = false;
+      const nativePreparation = promiseGate<void>();
+      const nativeFetch: typeof fetch = async (request) => {
+        assert.instanceOf(request, Request);
+        (request as Request).signal.throwIfAborted();
+        prompts++;
+        return Response.json(true);
+      };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => vi.spyOn(globalThis, "fetch").mockImplementation(nativeFetch)),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      const sdk = createOpencodeClient({
+        baseUrl: "http://test.invalid",
+        throwOnError: true,
+        requestValidator: async () => {
+          Deferred.doneUnsafe(lookup, Effect.void);
+          await nativePreparation.promise;
+          if (phase === "sdk-validation" || phase === "sdk-rejection")
+            throw new DOMException("Cancelled before fetch", "AbortError");
+        },
+        fetch: nativeFetch,
+      });
       const harness = yield* makeOpenCodeRuntimeHarness(
         "extraction-stop",
         "root",
@@ -3987,43 +4157,125 @@ describe("OpenCodeAdapterV2", () => {
               return { stream: events.stream };
             },
           },
+          command: { list: async () => ({ data: [{ name: "review" }] }) },
           session: {
             create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
             get: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
-            promptAsync: async () => {
+            promptAsync: async (input: unknown, options: { signal: AbortSignal }) => {
+              if (phase.startsWith("sdk") && steering)
+                return sdk.session.promptAsync(
+                  input as Parameters<typeof sdk.session.promptAsync>[0],
+                  options,
+                );
+              options.signal.throwIfAborted();
+              if (!steering) initialMessageId = (input as { messageID: string }).messageID;
+              prompts++;
+              return { data: true };
+            },
+            command: async (input: unknown, options: { signal: AbortSignal }) => {
+              if (phase.startsWith("sdk"))
+                return sdk.session.command(
+                  input as Parameters<typeof sdk.session.command>[0],
+                  options,
+                );
+              options.signal.throwIfAborted();
               prompts++;
               return { data: true };
             },
             status: async () => ({ data: { root: { type: "busy" } } }),
             messages: async () => ({ data: [] }),
             children: async () => ({ data: [] }),
-            abort: async () => ({ data: true }),
+            abort: async () => {
+              if (phase.endsWith("failed-stop") && !abortFailed) {
+                abortFailed = true;
+                throw new Error("Native abort failed");
+              }
+              return { data: true };
+            },
           },
           mcp: { add: async () => ({ data: true }) },
         },
         {
           resolveAttachmentPath: () => "/workspace/report.docx",
           resolveExtractedTextPath: () =>
-            Deferred.succeed(lookup, undefined).pipe(
-              Effect.andThen(Deferred.await(release)),
-              Effect.as("/workspace/report.docx.txt"),
-            ),
+            !phase.startsWith("extraction")
+              ? Effect.succeed("/workspace/report.docx.txt")
+              : Deferred.succeed(lookup, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as("/workspace/report.docx.txt"),
+                ),
+        },
+        {
+          nativeEventLogger: {
+            filePath: "/tmp/opencode-steer-stop.ndjson",
+            write: (event) => {
+              const record = (
+                event as { event: { payload: { direction?: string; method?: string } } }
+              ).event.payload;
+              return phase.startsWith("logging") &&
+                steering &&
+                record.direction === "outgoing" &&
+                record.method === (command ? "session.command" : "session.promptAsync")
+                ? Deferred.succeed(lookup, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void;
+            },
+            close: () => Effect.void,
+          },
         },
       );
       yield* harness.startTurn();
+      yield* Effect.promise(() =>
+        events.push({
+          type: "message.updated",
+          properties: {
+            sessionID: "root",
+            info: {
+              id: initialMessageId,
+              sessionID: "root",
+              role: "user",
+              time: { created: DateTime.toEpochMillis(harness.now) },
+            },
+          },
+        }),
+      );
       const snapshot = yield* harness.runtime.readThreadSnapshot({
         providerThread: harness.providerThread,
       });
       const turn = snapshot.providerTurns.at(-1)!;
+      let submitCalls = 0;
+      steering = true;
       const steer = yield* harness.runtime
         .steerTurn({
+          beforeSubmit: Effect.sync(() => {
+            submitCalls += 1;
+          }).pipe(
+            Effect.andThen(
+              phase === "fork"
+                ? Deferred.complete(
+                    queuedStop,
+                    harness.runtime.interruptTurn({
+                      providerThread: harness.providerThread,
+                      providerTurnId: turn.id,
+                    }),
+                  ).pipe(
+                    Effect.forkIn(scope),
+                    Effect.andThen(Deferred.succeed(lookup, undefined)),
+                    Effect.asVoid,
+                  )
+                : phase === "submission"
+                  ? Deferred.succeed(lookup, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    )
+                  : Effect.void,
+            ),
+          ),
           threadId: harness.threadId,
           runId: harness.runId,
           providerThread: harness.providerThread,
           providerTurnId: turn.id,
           message: {
             messageId: MessageId.make("steer-extraction-stop"),
-            text: "read this",
+            text: command ? "/review" : "read this",
             createdBy: "user",
             creationSource: "web",
             attachments: [
@@ -4037,14 +4289,33 @@ describe("OpenCodeAdapterV2", () => {
             ],
           },
         })
-        .pipe(Effect.exit, Effect.forkScoped);
+        .pipe(Effect.result, Effect.forkScoped);
       yield* Deferred.await(lookup);
-      yield* harness.runtime.interruptTurn({
-        providerThread: harness.providerThread,
-        providerTurnId: turn.id,
-      });
+      const stopping =
+        phase === "sdk-rejection"
+          ? Effect.void
+          : phase === "fork"
+            ? Deferred.await(queuedStop)
+            : harness.runtime.interruptTurn({
+                providerThread: harness.providerThread,
+                providerTurnId: turn.id,
+              });
+      const stop = yield* stopping.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }));
+      const stopResult = yield* Fiber.join(stop);
+      assert.equal(Exit.isFailure(stopResult), phase.endsWith("failed-stop"));
+      if (phase.endsWith("timeout")) yield* TestClock.adjust("10 seconds");
+      nativePreparation.resolve();
       yield* Deferred.succeed(release, undefined);
-      assert.isTrue(Exit.isFailure(yield* Fiber.join(steer)));
+      const outcome = yield* Fiber.join(steer);
+      assert.isTrue(Result.isFailure(outcome));
+      const error = Result.isFailure(outcome) ? outcome.failure : undefined;
+      assert.isTrue(
+        ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+      );
+      assert.equal(
+        submitCalls,
+        phase === "submission" || phase === "fork" || phase.startsWith("sdk") ? 1 : 0,
+      );
       assert.equal(prompts, 1);
       yield* Effect.promise(() =>
         events.push({
@@ -4055,7 +4326,10 @@ describe("OpenCodeAdapterV2", () => {
       const stopped = yield* harness.runtime.readThreadSnapshot({
         providerThread: harness.providerThread,
       });
-      assert.equal(stopped.providerTurns.at(-1)?.status, "interrupted");
+      assert.equal(
+        stopped.providerTurns.at(-1)?.status,
+        phase === "sdk-rejection" || phase.endsWith("failed-stop") ? "completed" : "interrupted",
+      );
     }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
   );
 
@@ -4077,6 +4351,23 @@ describe("OpenCodeAdapterV2", () => {
       const statusRead = promiseGate<void>();
       const statusRechecked = promiseGate<void>();
       let statusCalls = 0;
+      // The adapter admits a steer when the SDK hands it to the transport, so the steer goes
+      // through the installed SDK and this fetch.
+      const sdk = createOpencodeClient({ baseUrl: "http://test.invalid", throwOnError: true });
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+            if (idleTiming === "during") await nativeEvents.push(idle);
+            if (idleTiming === "after-refused-connection") {
+              throw new TypeError("fetch failed", {
+                cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+              });
+            }
+            return new Response("steer rejected", { status: 503 });
+          }),
+        ),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
       const harness = yield* makeOpenCodeRuntimeHarness(`steer-rejected-${idleTiming}`, sessionId, {
         event: { subscribe: async () => ({ stream: nativeEvents.stream }) },
         session: {
@@ -4107,17 +4398,14 @@ describe("OpenCodeAdapterV2", () => {
               },
             };
           },
-          promptAsync: async (input: { messageID: string }) => {
+          promptAsync: async (input: { messageID: string }, options: { signal: AbortSignal }) => {
             promptIds.push(input.messageID);
             if (promptIds.length === 1) return { data: true };
-            if (idleTiming === "during") await nativeEvents.push(idle);
-            if (idleTiming === "after-refused-connection") {
-              throw new TypeError("fetch failed", {
-                cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
-              });
-            }
             // The SDK wraps an HTTP error reply in an Error with its status on `cause`.
-            throw new Error("steer rejected", { cause: { body: "steer rejected", status: 503 } });
+            return sdk.session.promptAsync(
+              input as Parameters<typeof sdk.session.promptAsync>[0],
+              options,
+            );
           },
           abort: async () => ({ data: true }),
           children: async () => ({ data: [] }),

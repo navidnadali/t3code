@@ -58,6 +58,11 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
+import * as ProjectEnrichment from "../project/ProjectEnrichmentService.ts";
+import * as ProjectService from "../project/ProjectService.ts";
+import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import * as VcsStatusBroadcaster from "../vcs/VcsStatusBroadcaster.ts";
+import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -1336,6 +1341,60 @@ it.effect("prompts the provider only after a forked baseline capture finishes", 
     }).pipe(Effect.provide(layerTest));
 
     assert.deepEqual(yield* Ref.get(order), ["baseline", "prompt"]);
+  }),
+);
+
+// A run's baseline is taken where its checkpoint will be: its scope's real path, fixed when the run
+// was scoped there, not a spelling (a symlink) that may point elsewhere by its turn start.
+it.effect.each([
+  { name: "a scope with its real path", realCwd: "/repo-real", expected: "/repo-real" },
+  { name: "a scope created before it kept one", realCwd: undefined, expected: "/repo-link" },
+])("takes a run's baseline at its workspace's real path: $name", ({ realCwd, expected }) =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:run-execution-baseline-workspace");
+    const checkpointScope = {
+      id: CheckpointScopeId.make("checkpoint-scope:run-execution-baseline-workspace"),
+      cwd: "/repo-first-spelling",
+      ...(realCwd === undefined ? {} : { realCwd }),
+    } as OrchestrationV2CheckpointScope;
+    const run = {
+      id: RunId.make("run:run-execution-baseline-workspace"),
+      threadId,
+      ordinal: 2,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      workspaceCwd: "/repo-link",
+    } as OrchestrationV2Run;
+    const workspaces = yield* Ref.make<ReadonlyArray<string>>([]);
+    const layerTest = RunExecutionService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          McpAppModelContext.layerEmpty,
+          PreviewAgentActivity.layer,
+          Layer.mock(CheckpointService.CheckpointServiceV2)({
+            captureBaseline: ({ scope }) =>
+              Ref.update(workspaces, (current) => [...current, scope.cwd]),
+          }),
+          layerTurnItemPositionsTest,
+          mockEventSink({}),
+          IdAllocator.layer,
+          ThreadCommandExecutor.layer,
+          Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+            ingestNormalized: () => Effect.succeed([]),
+          }),
+          ServerSettings.layerTest(),
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      yield* yield* runExecution.forkBaseline({
+        appThread: rootAppThread(threadId),
+        run,
+        checkpointScope,
+      });
+    }).pipe(Effect.provide(layerTest));
+    assert.deepEqual(yield* Ref.get(workspaces), [expected]);
   }),
 );
 
@@ -3449,6 +3508,109 @@ it.effect.each([
   }),
 );
 
+// EventSink owns commit batching; this layer must preserve event order and terminal delivery.
+it.effect.each([
+  { count: 21, text: 0 },
+  { count: 41, text: 10_000 },
+])(
+  "ingests a provider backlog exactly once and in order ($count events, $text bytes each)",
+  ({ count, text }) =>
+    Effect.gen(function* () {
+      const key = `backlog-${count}-${text}`;
+      const ids = backgroundScenarioIds(key);
+      const providerEvents = yield* Queue.unbounded<
+        ProviderAdapter.ProviderAdapterV2Event,
+        Cause.Done
+      >();
+      // A background command starts, updates and ends among them: only the changes it makes to
+      // the run's tracking are written on their own.
+      const command = TurnItemId.make(`turn-item:${key}:command`);
+      const commandUpdates = new Map([
+        [5, backgroundTurnItemEvent(ids, "command_execution", "running", 5, command)],
+        [10, backgroundTurnItemEvent(ids, "command_execution", "running", 5, command)],
+        [15, backgroundTurnItemEvent(ids, "command_execution", "completed", 5, command)],
+      ]);
+      const items = Array.from(
+        { length: count },
+        (_, index): ProviderAdapter.ProviderAdapterV2Event =>
+          commandUpdates.get(index) ??
+          ({
+            type: "turn_item.updated",
+            driver,
+            turnItem: {
+              id: TurnItemId.make(`turn-item:${key}:${index}`),
+              threadId: ids.threadId,
+              runId: ids.runId,
+              providerTurnId: ids.rootProviderTurnId,
+              ordinal: index + 1,
+              type: "assistant_message",
+              status: "completed",
+              streaming: false,
+              text: "x".repeat(text),
+            },
+          } as ProviderAdapter.ProviderAdapterV2Event),
+      );
+      const terminal = rootTerminalEvent(ids, "completed");
+      const writes: Array<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>> = [];
+      const writing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      // The first write holds the writer until everything else has queued behind it.
+      const write = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+        Effect.gen(function* () {
+          writes.push(events);
+          if (writes.length === 1) {
+            yield* Deferred.succeed(writing, undefined);
+            yield* Deferred.await(release);
+          }
+        });
+      yield* Queue.offer(providerEvents, items[0]!);
+      yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () => Stream.fromQueue(providerEvents),
+        ingestNormalized: (input) => write([input.event]).pipe(Effect.as([])),
+        afterStart: () =>
+          Deferred.await(writing).pipe(
+            Effect.andThen(Queue.offerAll(providerEvents, [...items.slice(1), terminal])),
+            Effect.andThen(Deferred.succeed(release, undefined)),
+          ),
+      });
+      assert.deepEqual(writes.flat(), [...items, terminal]);
+    }),
+);
+
+it.effect("closes a child whose completion failed to write", () =>
+  Effect.gen(function* () {
+    const key = "child-close-failed";
+    const ids = backgroundScenarioIds(key);
+    const node = (status: "running" | "completed") =>
+      ({
+        type: "node.updated",
+        driver,
+        node: { ...makeRunOwnedSubagentNodeFixture({ ids, status: "running" }), status },
+      }) as const;
+    const { finalEvents } = yield* captureRootRunTermination({
+      key,
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () => Stream.make(node("running"), node("completed")),
+      ingestNormalized: (input) =>
+        input.event.type === "node.updated" && input.event.node.status === "completed"
+          ? Effect.fail(
+              new ProviderEventIngestor.ProviderEventPublishError({
+                providerSessionId: ProviderSessionId.make(`session:${key}`),
+                eventCount: 1,
+              }),
+            )
+          : Effect.succeed([]),
+    });
+    const closed = finalEvents.find(
+      (event) => event.type === "node.updated" && event.payload.id === ids.subagentNodeId,
+    );
+    assert.isDefined(closed);
+    assert.notEqual(closed?.type === "node.updated" ? closed.payload.status : undefined, "running");
+  }),
+);
+
 it.effect("fails the run when its event stream ends without a root terminal", () =>
   Effect.gen(function* () {
     const { observed, finalEvents } = yield* captureRootRunTermination({
@@ -3513,6 +3675,43 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
   }),
 );
 
+it.effect("completes a run while its after-turn pull request refresh waits on the forge", () =>
+  Effect.gen(function* () {
+    const refreshStarted = yield* Deferred.make<void>();
+    const capture = yield* captureRootRunTermination({
+      key: "pull-request-refresh:forge-waits",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) => Stream.make(rootTerminalEvent(ids, "completed")),
+      // The server's observer, whose pull request refresh never gets its forge answer.
+      observer: RunFinalizationService.layerObserver.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(WorkspaceEntries.WorkspaceEntries)({}),
+            Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(ProjectEnrichment.ProjectEnrichmentService)({}),
+            Layer.mock(PullRequestService.PullRequestService)({
+              refreshAfterTurn: () =>
+                Deferred.succeed(refreshStarted, undefined).pipe(Effect.andThen(Effect.never)),
+            }),
+          ),
+        ),
+      ),
+      // The run's ingestion ends, and its refresh was requested and is still waiting.
+      afterStart: (closed) =>
+        Deferred.await(closed).pipe(Effect.andThen(Deferred.await(refreshStarted))),
+    }).pipe(Effect.timeoutOption("1 minute"), Effect.forkChild({ startImmediately: true }));
+    yield* TestClock.adjust("1 minute");
+    const result = yield* Fiber.join(capture);
+    assert.isTrue(
+      Option.isSome(result),
+      "the run's finalization waited for the after-turn pull request refresh",
+    );
+    if (Option.isSome(result)) assert.deepEqual(result.value.observed, ["run:waiting"]);
+  }),
+);
+
 function captureRootRunTermination(input: {
   readonly key: string;
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
@@ -3536,6 +3735,8 @@ function captureRootRunTermination(input: {
     error: RunExecutionService.RunExecutionServiceV2Error,
   ) => Effect.Effect<void>;
   readonly refreshAfterTurn?: Effect.Effect<void>;
+  // Replaces the recording observer, e.g. with the server's own (a reference: no requirement).
+  readonly observer?: Layer.Layer<never>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
@@ -3624,13 +3825,14 @@ function captureRootRunTermination(input: {
             ingestNormalized: input.ingestNormalized ?? (() => Effect.succeed([])),
           }),
           ServerSettings.layerTest(),
-          Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
-            refresh: () => Effect.void,
-            refreshAfterTurn: () =>
-              Ref.update(observed, (current) => [...current, "pull-requests-refreshed"]).pipe(
-                Effect.andThen(input.refreshAfterTurn ?? Effect.void),
-              ),
-          }),
+          input.observer ??
+            Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
+              refresh: () => Effect.void,
+              refreshAfterTurn: () =>
+                Ref.update(observed, (current) => [...current, "pull-requests-refreshed"]).pipe(
+                  Effect.andThen(input.refreshAfterTurn ?? Effect.void),
+                ),
+            }),
         ),
       ),
       Layer.provideMerge(PreviewAgentActivity.layer),

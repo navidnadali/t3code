@@ -131,6 +131,40 @@ queries read item counts from a per-thread, per-run table that turn-item trigger
 use a partial index for nonterminal background items, including idle items. Latest user-message
 reads use an index ordered by update time.
 
+Upstream's migration 85 creates that table, `orchestration_v2_projection_turn_item_counts`, and its
+three triggers. The fork's migration 1 created them earlier under the same names, keyed by
+`run_id`; a start drops those in the same transaction as it runs migration 85, and migration 1 now
+does nothing but stays recorded in `t3_perf_fork_migrations` (see
+[Leaving the performance fork's schema](../operations/perf-fork-schema-exit.md)). The triggers write
+to that table: dropping the table while they remain makes every turn-item insert fail, so drop the
+three triggers first.
+
+A projection read that orders messages by their first user or assistant turn item groups those
+items by `$.messageId` through a partial index on that expression (the fork's migration 2), so it
+does not parse every message item's payload; the index's expression and `WHERE` must stay identical
+to the query's. That migration scans the turn-item table once on first start, and leaves out a
+message item whose payload is not valid JSON. Each message-item write re-parses the old and new
+payload for the index, so its cost grows with the payload. An upstream build starts with the index
+in place, which writes keep current;
+`DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx` removes it. An upstream
+migration that rebuilds the turn-item table (create, copy, drop, rename) drops the index with it,
+or leaves it on an old table it keeps aside. After upstream's migrations, every start runs a
+recorded fork migration whose objects are not on their table again, checking again under the write
+lock so that concurrent starts run it once; migration 2 must stay safe to re-run.
+Finalizing a delegated task reads from the parent only that child's tasks and the transfers it
+sent, through the child and source indexes, and the node, card, runs and delivery message it
+changes, by id. A message dispatch does not read the command projection: the store's
+`getMessageDispatchRecords` returns only the rows dispatch decides on (the live runs, the runs whose
+state it derives from the whole history, and their attempts, turns, nodes, provider threads and
+messages), and a run's model switch walks the runs back from the latest. A dispatch change that
+reads more of the projection must add those rows there, or send that path to the whole command
+read in `readMessageDispatchProjection`. `MessageDispatchReads.test.ts` fails when a dispatch read
+returns more rows on a longer history. A turn start reads its tasks' status and threads as columns,
+not their payloads, and only the transfers its handoffs name, any into its run, and a run fork's own
+fork transfer. The open-task filter selects row ids through the settled index, which covers it: the
+delivery state column sits past each task's payload, so reading it from the table reads every
+prompt and result.
+
 Command palette results keep live VCS and linked pull-request queries leased to the visible
 viewport, including a small overscan region. Cached badges remain available while leases are
 released. Local Git status reads skip divergence calculations; callers that need ahead/behind

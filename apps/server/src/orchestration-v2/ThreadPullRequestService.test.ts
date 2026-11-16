@@ -104,7 +104,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const activation = yield* Deferred.make<void>();
       const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
       const turnLookup = yield* Deferred.make<void>();
-      const lookups: Array<{ readonly refresh: boolean }> = [];
+      const lookups: Array<{ readonly refresh: boolean | "shared" }> = [];
       const dependencies = Layer.mergeAll(
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.fromQueue(domainEvents),
@@ -292,7 +292,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const turnEndQueued = yield* Deferred.make<void>();
       const lookupStarted = yield* Deferred.make<void>();
       const followUpQueued = yield* Deferred.make<void>();
-      const lookups: Array<{ readonly branch: string; readonly refresh: boolean }> = [];
+      const lookups: Array<{ readonly branch: string; readonly refresh: boolean | "shared" }> = [];
       const dependencies = Layer.mergeAll(
         Layer.mock(Orchestrator.OrchestratorV2)({
           // The batch arrives while the worker is busy with the startup sweep.
@@ -382,9 +382,9 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       expect(lookups).toEqual([
         { branch: thread.branch, refresh: false },
         { branch: otherThread.branch, refresh: false },
-        { branch: thread.branch, refresh: true },
-        { branch: otherThread.branch, refresh: true },
-        { branch: thread.branch, refresh: true },
+        { branch: thread.branch, refresh: "shared" },
+        { branch: otherThread.branch, refresh: "shared" },
+        { branch: thread.branch, refresh: "shared" },
       ]);
     }),
   );
@@ -542,9 +542,10 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
       const sweeps = yield* Queue.unbounded<void>();
       const childLookup = yield* Deferred.make<void>();
-      const lookups: Array<{ readonly branch: string; readonly refresh: boolean }> = [];
+      const lookups: Array<{ readonly branch: string; readonly refresh: boolean | "shared" }> = [];
       const dependencies = Layer.mergeAll(
         Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadShell: (threadId) => Effect.succeed(threadId === parent.id ? parent : child),
           streamDomainEvents: Stream.fromQueue(domainEvents),
           getPullRequestSnapshot: ({ threadId }) =>
             threadId !== undefined
@@ -632,7 +633,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
 
         expect(sweepLookups).toEqual([parent.branch, parent.branch]);
         expect(lookups.slice(sweepLookups.length)).toEqual([
-          { branch: child.branch, refresh: true },
+          { branch: child.branch, refresh: "shared" },
         ]);
       }).pipe(Effect.provide(dependencies));
     }),

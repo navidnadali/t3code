@@ -37,7 +37,8 @@ const readRecord = (recordPath: string) => {
 };
 
 export const ProviderProcesses = Context.Reference<{
-  readonly register?: (pid: number) => () => void;
+  /** `startTime`: the /proc start time the spawner read for a process it started for the server. */
+  readonly register?: (pid: number, startTime?: string) => () => void;
   readonly hasOtherLiveOwner: boolean;
 }>("t3/process/ProviderProcesses", { defaultValue: () => ({ hasOtherLiveOwner: false }) });
 
@@ -125,9 +126,14 @@ const make = Effect.gen(function* () {
 
   return {
     hasOtherLiveOwner,
-    register: (pid: number) => {
+    register: (pid: number, startTime?: string) => {
       const provider = identity(pid);
-      if (provider === undefined || provider.ppid !== process.pid) {
+      // The server's own child, or the one its spawner process started and identified.
+      const owned =
+        startTime === undefined
+          ? provider?.ppid === process.pid
+          : provider?.startTime === `${boot}:${startTime}`;
+      if (provider === undefined || !owned) {
         throw new Error("Cannot identify spawned provider");
       }
       // A rename keeps startup from seeing a partial write. The child is gated

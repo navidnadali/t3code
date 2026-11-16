@@ -53,6 +53,7 @@ import * as OrchestrationEventStore from "../src/persistence/OrchestrationEventS
 import * as EventStore from "../src/orchestration-v2/EventStore.ts";
 import * as EventSink from "../src/orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../src/orchestration-v2/ProjectionStore.ts";
+import * as ShellDeltaHub from "../src/orchestration-v2/ShellDeltaHub.ts";
 import * as ThreadManagementService from "../src/orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "../src/orchestration-v2/ProjectStore.ts";
 import * as ProjectService from "../src/project/ProjectService.ts";
@@ -157,6 +158,8 @@ const layerPersistence = EventSink.layer.pipe(
   Layer.provideMerge(OrchestrationEventStore.layer),
   Layer.provideMerge(SqlitePersistence.layerMemory),
 );
+// As in the server, every shared shell read gets a later ordinal than the one before it.
+let shellReadOrdinal = 0;
 const layerManagement = Layer.unwrap(
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -171,6 +174,13 @@ const layerManagement = Layer.unwrap(
           .getThreadHistoryPage(id, cursor, throughEntryId, conversationOnly)
           .pipe(Effect.orDie),
       getThreadShell: (id) => projections.getThreadShell(id).pipe(Effect.orDie),
+      getThreadShellForEvent: (input) =>
+        projections.getThreadShell(input.threadId).pipe(Effect.orDie),
+      getThreadShellReadForEvent: (input) =>
+        projections.getThreadShell(input.threadId).pipe(
+          Effect.map((shell) => ({ shell, readOrdinal: ++shellReadOrdinal })),
+          Effect.orDie,
+        ),
       getShellSnapshot: (options) => projections.getShellSnapshot(options).pipe(Effect.orDie),
       listActiveShellIndex: () => projections.listActiveShellIndex().pipe(Effect.orDie),
       listActiveSubagentThreadIds: () =>
@@ -196,7 +206,8 @@ const layerEnrichment = Layer.unwrap(
     });
   }),
 );
-const layerServices = layerManagement.pipe(
+const layerServices = ShellDeltaHub.layer.pipe(
+  Layer.provideMerge(layerManagement),
   Layer.provideMerge(
     Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
       getEnvironmentId: Effect.succeed(EnvironmentId.make("transfer-test")),
@@ -486,10 +497,24 @@ it.live("reports V2 thread HTTP and WebSocket transfer budgets", () =>
               return { kinds: items.map((item) => item.kind), items, totals };
             });
 
+          // A shell client that resumes with a replay of this thread still gets its next live update.
+          const lateShell = yield* openMeasuredWsClient({ url, cookie: "" });
+          const lsq = yield* subscribe(lateShell, {
+            shell: true,
+            afterSequence: last.sequence - 1,
+          });
+          assert.equal(yield* synchronized(lsq), "replay");
           // A phone that comes back after one ordinary turn replays it, without tool bodies.
           const shortTurn = yield* sink.write({
             events: turnEvents(provider, TRANSFER_HISTORY_TURN_COUNT + 1, false),
           });
+          const nextShell = yield* projection.getThreadShell(THREAD_ID);
+          yield* collectUntil(
+            lsq,
+            (item) =>
+              item.kind === "thread.updated" && NodeUtil.isDeepStrictEqual(item.thread, nextShell),
+          );
+          yield* lateShell.close;
           const shortTurnResume = yield* open({ thread: THREAD_ID, afterSequence: last.sequence });
           assert.notInclude(shortTurnResume.kinds, "snapshot");
           // The byte cap below also passes when the resume skips the turn.

@@ -267,6 +267,36 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
   return layerWithRegistry(scenario, layerRegistry, options);
 }
 
+interface LayerWithRegistryOptions {
+  readonly databaseLayer?: Layer.Layer<
+    SqlClient.SqlClient,
+    MigrationError | PlatformError.PlatformError | SqlError
+  >;
+  readonly runEffectWorker?: boolean;
+  readonly runContinuationWorker?: boolean;
+  readonly recoverOnStartup?: boolean;
+  readonly continueThreadsAfterServerUpdate?: boolean;
+  /** Lets a test hold a projection read open to order concurrent dispatches. */
+  readonly wrapProjectionStore?: (
+    store: ProjectionStore.ProjectionStoreV2Shape,
+  ) => ProjectionStore.ProjectionStoreV2Shape;
+  readonly managedPolicy?: ManagedPolicyDocument;
+}
+
+type ReplayRuntime =
+  | Orchestrator.OrchestratorV2
+  | EffectOutbox.EffectOutboxV2
+  | EffectWorker.OrchestrationEffectWorkerV2
+  | EventSink.EventSinkV2
+  | ProviderSessionManager.ProviderSessionManagerV2
+  | CommandOutputRecorder.CommandOutputRecorder
+  | ThreadCommandExecutor.ThreadCommandExecutor;
+
+type ReplayRuntimeInternals =
+  | EffectWorker.OrchestrationEffectExecutorV2
+  | ProjectionStore.ProjectionStoreV2
+  | ThreadManagementService.ThreadManagementService;
+
 export function layerWithRegistry<Error>(
   scenario: Pick<OrchestratorV2ProviderReplayScenario, "name" | "runtimePolicyOverride">,
   registryLayer: Layer.Layer<
@@ -274,29 +304,41 @@ export function layerWithRegistry<Error>(
     Error,
     McpProviderSessions.McpProviderSessions
   >,
-  options: {
-    readonly databaseLayer?: Layer.Layer<
-      SqlClient.SqlClient,
-      MigrationError | PlatformError.PlatformError | SqlError
-    >;
-    readonly runEffectWorker?: boolean;
-    readonly runContinuationWorker?: boolean;
-    readonly recoverOnStartup?: boolean;
-    readonly continueThreadsAfterServerUpdate?: boolean;
-    /** Lets a test hold a projection read open to order concurrent dispatches. */
-    readonly wrapProjectionStore?: (
-      store: ProjectionStore.ProjectionStoreV2Shape,
-    ) => ProjectionStore.ProjectionStoreV2Shape;
-    readonly managedPolicy?: ManagedPolicyDocument;
-  } = {},
+  options: LayerWithRegistryOptions = {},
+): Layer.Layer<ReplayRuntime, Error | MigrationError | PlatformError.PlatformError | SqlError> {
+  return makeReplayRuntime(scenario, registryLayer, options, false);
+}
+
+/**
+ * Also exposes the effect executor and the projection store and thread management it runs on.
+ * Callers that build their own ThreadManagementService must not merge it before this layer.
+ */
+export function layerWithRegistryInternals<Error>(
+  scenario: Pick<OrchestratorV2ProviderReplayScenario, "name" | "runtimePolicyOverride">,
+  registryLayer: Layer.Layer<
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    Error,
+    McpProviderSessions.McpProviderSessions
+  >,
+  options: LayerWithRegistryOptions = {},
 ): Layer.Layer<
-  | Orchestrator.OrchestratorV2
-  | EffectOutbox.EffectOutboxV2
-  | EffectWorker.OrchestrationEffectWorkerV2
-  | EventSink.EventSinkV2
-  | ProviderSessionManager.ProviderSessionManagerV2
-  | CommandOutputRecorder.CommandOutputRecorder
-  | ThreadCommandExecutor.ThreadCommandExecutor,
+  ReplayRuntime | ReplayRuntimeInternals,
+  Error | MigrationError | PlatformError.PlatformError | SqlError
+> {
+  return makeReplayRuntime(scenario, registryLayer, options, true);
+}
+
+function makeReplayRuntime<Error>(
+  scenario: Pick<OrchestratorV2ProviderReplayScenario, "name" | "runtimePolicyOverride">,
+  registryLayer: Layer.Layer<
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    Error,
+    McpProviderSessions.McpProviderSessions
+  >,
+  options: LayerWithRegistryOptions,
+  exposeInternals: boolean,
+): Layer.Layer<
+  ReplayRuntime | ReplayRuntimeInternals,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
   const layerServerConfig = Layer.effect(
@@ -384,7 +426,7 @@ export function layerWithRegistry<Error>(
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
   const layerCheckpointServiceProvided = CheckpointService.layer.pipe(
-    Layer.provide(Layer.mergeAll(layerCheckpointStore, IdAllocator.layer)),
+    Layer.provide(Layer.mergeAll(layerCheckpointStore, IdAllocator.layer, NodeServices.layer)),
   );
   const layerContextHandoffServiceProvided = ContextHandoffService.layer.pipe(
     Layer.provide(IdAllocator.layer),
@@ -449,6 +491,7 @@ export function layerWithRegistry<Error>(
         layerRuntime,
         layerServerConfig,
         layerServerSettings,
+        layerCheckpointServiceProvided,
       ),
     ),
   );
@@ -568,6 +611,9 @@ export function layerWithRegistry<Error>(
     layerContinuationWorkerProvided,
     layerCommandOutputHubProvided,
     ThreadCommandExecutor.layer,
+    exposeInternals
+      ? Layer.mergeAll(layerEffectExecutorProvided, layerThreadManagementProvided, layerStores)
+      : Layer.empty,
   ).pipe(
     Layer.provide(ProviderTurnStartServiceTestkit.layer),
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),

@@ -61,6 +61,7 @@ import {
   OrchestrationV2DispatchCommandError,
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2GetThreadProjectionError,
+  OrchestrationV2RpcSchemas,
   OrchestrationV2ThreadLaunchError,
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
@@ -107,7 +108,7 @@ import {
   HttpServerRespondable,
   HttpServerResponse,
 } from "effect/http";
-import { RpcGroup, RpcSerialization, RpcServer } from "effect/rpc";
+import { RpcGroup, RpcSchema, RpcSerialization, RpcServer } from "effect/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as NativeChildWorkQuery from "./orchestration-v2/NativeChildWorkQuery.ts";
@@ -125,15 +126,15 @@ import * as DocumentText from "./provider/DocumentText.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
+import * as ShellDeltaHub from "./orchestration-v2/ShellDeltaHub.ts";
 import {
-  bufferShellLiveStream,
-  coalesceShellApplicationEvents,
   composeShellStreamWithEnrichment,
   dedupeShellEnrichment,
   loadOlderSettledThreadsPage,
   loadShellSnapshotParts,
+  projectShellDeltas,
+  shellDeltaAggregate,
   shellStreamItemFromEnrichmentRefresh,
-  shellStreamItemFromThreadShell,
   shellStreamItemsFromInitialSnapshot,
   loadSubscriberShellSnapshot,
   canResumeShellFrom,
@@ -141,10 +142,12 @@ import {
   shellStreamItemsFromResumeSnapshot,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
-  toShellApplicationEvent,
+  trimSubscriberShellSnapshot,
   type ShellApplicationEvent,
+  type ShellDelta,
 } from "./orchestration-v2/ShellStream.ts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
+import { resyncOnLiveOverflow } from "./orchestration-v2/LiveStreamBudget.ts";
 import {
   coalesceLiveUpdatedEvents,
   coalesceThreadLiveStream,
@@ -706,8 +709,54 @@ function projectFileFailureContext(
 
 const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
+// Shell and thread stream items are shared across clients (the shell delta hub, projected
+// events); each object is encoded once with the JSON codec RpcServer would apply, and the
+// server-side definitions of those two streams pass the encoded items through unchanged.
+// Each encoder has its own cache: an object that reached both streams is encoded per schema.
+const encodeStreamItemOnce = <A extends object>(encode: (item: A) => unknown) => {
+  const encoded = new WeakMap<A, unknown>();
+  return (item: A): unknown => {
+    const cached = encoded.get(item);
+    if (cached !== undefined) return cached;
+    const value = encode(item);
+    encoded.set(item, value);
+    return value;
+  };
+};
+export const encodeShellStreamItem = encodeStreamItemOnce(
+  Schema.encodeSync(Schema.toCodecJson(OrchestrationV2RpcSchemas.subscribeShell.output)),
+);
+export const encodeThreadStreamItem = encodeStreamItemOnce(
+  Schema.encodeSync(Schema.toCodecJson(OrchestrationV2RpcSchemas.subscribeThread.output)),
+);
+// `toCodecJson` would turn `Schema.Unknown` into a walk over every field of every item per
+// client; the items are already the contract codec's output, so they pass through untouched.
+const EncodedStreamItem = Schema.declare((_: unknown): _ is unknown => true, {
+  toCodecJson: () => undefined,
+});
+type WsRpc = RpcGroup.Rpcs<typeof WsRpcGroup>;
+const wsRpc = <Tag extends WsRpc["_tag"]>(tag: Tag) =>
+  WsRpcGroup.requests.get(tag) as Extract<WsRpc, { readonly _tag: Tag }>;
+const subscribeShellRpc = wsRpc(ORCHESTRATION_V2_WS_METHODS.subscribeShell);
+const subscribeThreadRpc = wsRpc(ORCHESTRATION_V2_WS_METHODS.subscribeThread);
+type EncodedStreamWsRpc = typeof subscribeShellRpc | typeof subscribeThreadRpc;
+/** The two stream RPCs as the server defines them: encoded items pass through. Exported for RpcServer-level tests. */
+export const ServerWsStreamRpcGroup = RpcGroup.make(
+  subscribeShellRpc.setSuccess(
+    RpcSchema.Stream(EncodedStreamItem, subscribeShellRpc.successSchema.error),
+  ),
+  subscribeThreadRpc.setSuccess(
+    RpcSchema.Stream(EncodedStreamItem, subscribeThreadRpc.successSchema.error),
+  ),
+);
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
-const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
+const ServerWsRpcGroup = RpcGroup.make(
+  ...Array.from(WsRpcGroup.requests.values()).filter(
+    (rpc): rpc is Exclude<WsRpc, EncodedStreamWsRpc> =>
+      rpc !== subscribeShellRpc && rpc !== subscribeThreadRpc,
+  ),
+  ...Array.from(ServerWsStreamRpcGroup.requests.values()),
+).middleware(RpcInstrumentation);
 
 // RpcGroup.toLayer derives each handler's requirements by scanning every RPC in
 // the group, so its type cost grows with handlers × RPCs. Near 200 methods that
@@ -976,48 +1025,70 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         ? Stream.make({ kind: "synchronized" as const })
         : Stream.empty;
 
-    const snapshotThenLive = Effect.fn("ws.orchestrationV2.threadSnapshotThenLive")(function* () {
-      const useBoundedSnapshot = shouldUseBoundedThreadSnapshot(input);
-      const snapshot = yield* (
-        useBoundedSnapshot
-          ? threadManagement.getThreadSnapshotWindow(input.threadId, {
-              rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
-              deferWork: input.acceptDeferredWork === true,
-              userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+    const snapshotThenLive = Effect.fn("ws.orchestrationV2.threadSnapshotThenLive")(
+      function* (options?: { readonly resync?: boolean }) {
+        const useBoundedSnapshot = shouldUseBoundedThreadSnapshot(input);
+        const snapshot = yield* (
+          useBoundedSnapshot
+            ? threadManagement.getThreadSnapshotWindow(input.threadId, {
+                rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
+                deferWork: input.acceptDeferredWork === true,
+                userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+              })
+            : threadManagement.getThreadSnapshot(input.threadId)
+        ).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestrationV2GetThreadProjectionError({
+                threadId: input.threadId,
+                message: `Failed to load orchestration V2 thread ${input.threadId}`,
+                cause,
+              }),
+          ),
+        );
+        const { snapshotSequence } = snapshot;
+        const snapshotItem = useBoundedSnapshot
+          ? buildBoundedThreadStreamSnapshot({
+              ...snapshot,
+              compactTurnItems: input.acceptCompactTurnItems === true,
+              dedupeBodies,
+              compactIds: input.acceptCompactIds === true,
             })
-          : threadManagement.getThreadSnapshot(input.threadId)
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestrationV2GetThreadProjectionError({
+          : (() => {
+              const projection = projectThreadProjectionForWire(snapshot.projection);
+              return {
+                kind: "snapshot" as const,
+                snapshotSequence,
+                projection: dedupeBodies ? dedupeSnapshotBodies(projection) : projection,
+              };
+            })();
+        if (options?.resync === true) {
+          yield* Effect.logWarning(
+            "orchestration thread stream resynchronized after a live buffer overflow",
+            {
               threadId: input.threadId,
-              message: `Failed to load orchestration V2 thread ${input.threadId}`,
-              cause,
-            }),
-        ),
-      );
-      const { snapshotSequence } = snapshot;
-      const snapshotItem = useBoundedSnapshot
-        ? buildBoundedThreadStreamSnapshot({
-            ...snapshot,
-            compactTurnItems: input.acceptCompactTurnItems === true,
-            dedupeBodies,
-            compactIds: input.acceptCompactIds === true,
-          })
-        : (() => {
-            const projection = projectThreadProjectionForWire(snapshot.projection);
-            return {
-              kind: "snapshot" as const,
               snapshotSequence,
-              projection: dedupeBodies ? dedupeSnapshotBodies(projection) : projection,
-            };
-          })();
-      return rpcInitialItems([snapshotItem]).pipe(
-        Stream.concat(completionMarker),
-        Stream.concat(eventStreamFrom(snapshotSequence)),
-        withLiveDedupe,
-      );
-    });
+            },
+          );
+        }
+        return rpcInitialItems([snapshotItem]).pipe(
+          Stream.concat(options?.resync === true ? Stream.empty : completionMarker),
+          Stream.concat(eventStreamFrom(snapshotSequence)),
+          withLiveDedupe,
+        );
+      },
+    );
+
+    // A subscriber that falls more than its live buffer behind gets a fresh snapshot and
+    // continues live from it, with a fresh body deduper for the records it now holds. The
+    // snapshot is loaded when the client next pulls, so a client that never acknowledges
+    // never costs one.
+    const resyncOnOverflow = (
+      segment: Stream.Stream<
+        OrchestrationV2ThreadStreamItem,
+        OrchestrationV2GetThreadProjectionError
+      >,
+    ) => resyncOnLiveOverflow(segment, () => snapshotThenLive({ resync: true }));
 
     // Subscribe before reading persisted events to retain concurrent publishes; clients dedupe overlap by sequence.
     if (input.afterSequence !== undefined) {
@@ -1046,7 +1117,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         input.afterSequence > highWater ||
         (input.afterSequence < highWater && input.afterSequence < prunedThrough)
       ) {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
       const stats = yield* applicationEvents
         .getAgentReplayStats({
@@ -1070,7 +1141,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         stats.eventCount > THREAD_RESUME_MAX_REPLAY_EVENTS ||
         !isThreadReplayRawPayloadSafe(stats.rawPayloadBytes)
       ) {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
       if (stats.hasCreateEvent) {
         const shell = yield* threadManagement.getThreadShell(input.threadId).pipe(
@@ -1084,7 +1155,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
           ),
         );
         // Retained creation events may describe deleted threads; replace replay only if a snapshot exists.
-        if (shell !== null) return yield* snapshotThenLive();
+        if (shell !== null) return resyncOnOverflow(yield* snapshotThenLive());
       }
       const replayed = yield* loadReplayThrough(input.afterSequence, highWater);
       // Pruning publishes its boundary before deleting, so a pass during the read shows up here.
@@ -1102,7 +1173,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
             ),
           ))
       ) {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
       const replay = coalesceLiveUpdatedEvents(replayed);
       const plan = decideThreadResume({
@@ -1112,16 +1183,18 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         replayEncodedBytes: threadReplayEncodedBytes(replay),
       });
       if (plan.mode === "snapshot") {
-        return yield* snapshotThenLive();
+        return resyncOnOverflow(yield* snapshotThenLive());
       }
-      return rpcInitialItems(replay).pipe(
-        Stream.concat(completionMarker),
-        Stream.concat(eventStreamFrom(highWater)),
-        withLiveDedupe,
+      return resyncOnOverflow(
+        rpcInitialItems(replay).pipe(
+          Stream.concat(completionMarker),
+          Stream.concat(eventStreamFrom(highWater)),
+          withLiveDedupe,
+        ),
       );
     }
 
-    return yield* snapshotThenLive();
+    return resyncOnOverflow(yield* snapshotThenLive());
   },
 );
 
@@ -1138,16 +1211,19 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
     const projects = yield* ProjectStore.ProjectStoreV2;
-    const projectService = yield* ProjectService.ProjectService;
     const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
     let subagentThreadIds = new Set<string>();
     const filterSubagentTranscript = (stored: ApplicationStoredEvent) =>
       shouldPublishShellApplicationEvent(stored, subagentThreadIds);
 
     const enrichmentChanges = yield* projectEnrichment.subscribeChanges;
+    // Subscribe before the snapshot or high-water read: the hub projects every later event once for all subscribers.
+    const hub = yield* ShellDeltaHub.ShellDeltaHub;
+    const shellDeltas = yield* hub.subscribe();
+    // Given `rows` (a resync base's), the projects are not listed again; only their enrichment is.
     const loadProjectMetadataSnapshot = Effect.fn("ws.orchestrationV2.loadProjectMetadataSnapshot")(
-      function* (snapshotSequence: number) {
-        const enriched = yield* enrichProjectShells(yield* projects.listShells());
+      function* (snapshotSequence: number, rows?: ReadonlyArray<OrchestrationProjectShell>) {
+        const enriched = yield* enrichProjectShells(rows ?? (yield* projects.listShells()));
         return {
           snapshot: {
             schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
@@ -1176,7 +1252,6 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           omitOlderSettled: input.omitOlderSettled === true,
         },
       });
-      subagentThreadIds = forSubscriber.subagentThreadIds;
       const enriched = yield* enrichProjectShells(forSubscriber.snapshot.projects);
       return {
         snapshot: {
@@ -1186,87 +1261,134 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
       };
     });
-    const projectItem = Effect.fn("ws.orchestrationV2.projectShellItem")(function* (
-      stored: Extract<ShellApplicationEvent, { readonly aggregateKind: "project" }>,
-    ) {
-      if (stored.type === "project.deleted") {
-        return {
-          kind: "project.removed" as const,
-          sequence: stored.sequence,
-          projectId: stored.aggregateId,
-        };
-      }
-      const project = yield* projectService.getShell(stored.aggregateId);
-      return Option.match(project, {
-        onNone: () => ({
-          kind: "project.removed" as const,
-          sequence: stored.sequence,
-          projectId: stored.aggregateId,
-        }),
-        onSome: (value) => ({
-          kind: "project.updated" as const,
-          sequence: stored.sequence,
-          project: value,
-        }),
-      });
-    });
+    // The hub and the replay carry the project's store row; the repository identity is added
+    // when the item is sent, so a delta delayed by its batch never carries an identity older than
+    // a refresh this subscriber already sent. Chunks stay whole: the RPC server waits for a
+    // client acknowledgement per chunk.
+    const withRepositoryIdentityItem = (item: ShellDelta): Effect.Effect<ShellDelta> =>
+      item.kind === "project.updated"
+        ? Effect.map(
+            projectEnrichment.getAvailable(item.project.workspaceRoot),
+            (enrichment): ShellDelta => ({
+              ...item,
+              project: { ...item.project, repositoryIdentity: enrichment.repositoryIdentity },
+            }),
+          )
+        : Effect.succeed(item);
+    const withRepositoryIdentityItems = (
+      items: ReadonlyArray<ShellDelta>,
+    ): Effect.Effect<ReadonlyArray<ShellDelta>> =>
+      items.some((item) => item.kind === "project.updated")
+        ? Effect.forEach(items, withRepositoryIdentityItem)
+        : Effect.succeed(items);
+    const withRepositoryIdentity = <E, R>(
+      stream: Stream.Stream<ShellDelta, E, R>,
+    ): Stream.Stream<ShellDelta, E, R> =>
+      Stream.mapArrayEffect(stream, (items) =>
+        items.some((item) => item.kind === "project.updated")
+          ? Effect.forEach(items, withRepositoryIdentityItem)
+          : Effect.succeed(items),
+      );
 
+    // Replay only; the live tail comes projected from the hub.
     const projectShellItems = Effect.fn("ws.orchestrationV2.projectShellItems")(function* (
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
-      const coalesced = coalesceShellApplicationEvents(events);
-      const threadIds = coalesced.flatMap((stored) =>
-        "aggregateKind" in stored ? [] : [stored.event.threadId],
-      );
-      // A failed batch can't name its thread, so the scalar reads below report which one is bad.
-      const batch =
-        threadIds.length > 1
-          ? yield* threadManagement
-              .getShellSnapshot({ threadIds })
-              .pipe(Effect.orElseSucceed(() => null))
-          : null;
-      const batchedShells =
-        batch === null
-          ? null
-          : new Map(
-              [...batch.threads, ...batch.archivedThreads].map(
-                (shell) => [shell.id, shell] as const,
-              ),
-            );
-      return yield* Effect.forEach(
-        coalesced,
-        (stored) =>
-          Effect.gen(function* () {
-            if ("aggregateKind" in stored) {
-              return yield* projectItem(stored);
-            }
-            const threadId = stored.event.threadId;
-            const shell =
-              batchedShells === null
-                ? yield* threadManagement.getThreadShell(threadId)
-                : (batchedShells.get(threadId) ?? null);
-            return shellStreamItemFromThreadShell({ stored, shell });
-          }),
-        { concurrency: 8 },
-      );
+      return yield* projectShellDeltas(events, {
+        threadShell: threadManagement.getThreadShellReadForEvent,
+        projectShell: hub.readProjectShellForEvent,
+      });
     });
 
+    // The replay's read ordinal per aggregate, so the live tail drops hub deltas read earlier.
+    const replayReads = new Map<string, number>();
     const toShellStream = <E, R>(stream: Stream.Stream<ShellApplicationEvent, E, R>) =>
       stream.pipe(
         Stream.groupedWithin(512, Duration.millis(50)),
         Stream.mapEffect((events) => projectShellItems(Array.from(events))),
         Stream.flatMap(Stream.fromIterable),
+        Stream.map(({ item, readOrdinal }) => {
+          const aggregate = shellDeltaAggregate(item);
+          replayReads.set(aggregate, Math.max(replayReads.get(aggregate) ?? 0, readOrdinal));
+          return item;
+        }),
         skipUnchangedThreadShells,
+        withRepositoryIdentity,
       );
 
-    const liveFrom = (afterSequence: number) =>
-      bufferShellLiveStream(
-        toShellStream(
-          applicationEvents.streamProjectedApplicationEvents({
-            afterSequence,
-            project: toShellApplicationEvent,
-            filter: filterSubagentTranscript,
+    // The hub emptied this subscriber's buffer and read one base for every subscriber it emptied
+    // at the same time; the subscriber's own trims and the base's project rows, with their
+    // identities, make its snapshot here.
+    const resyncSnapshot = Effect.fn("ws.orchestrationV2.resyncShellSnapshot")(
+      function* (base: ShellDeltaHub.ShellResyncBase) {
+        const enriched = yield* enrichProjectShells(base.projects);
+        const trimmed = trimSubscriberShellSnapshot(
+          {
+            schemaVersion: base.schemaVersion,
+            snapshotSequence: base.snapshotSequence,
+            projects: enriched.projects,
+            threads: base.threads,
+            archivedThreads: [],
+          },
+          {
+            omitIdleSubagents: input.omitIdleSubagents === true,
+            omitOlderSettled: input.omitOlderSettled === true,
+            now: yield* DateTime.now,
+            remoteTaskParentIds: base.remoteTaskParentIds,
+          },
+        );
+        yield* Effect.logWarning(
+          "orchestration shell stream resynchronized after a live buffer overflow",
+          { snapshotSequence: base.snapshotSequence },
+        );
+        return shellStreamItemsFromInitialSnapshot({
+          snapshot: trimmed.snapshot,
+          resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
+        });
+      },
+      Effect.provideService(ProjectEnrichmentService.ProjectEnrichmentService, projectEnrichment),
+    );
+    // Enrichment keeps flowing during a resync, so a refresh can reach the client before the
+    // snapshot that introduces its project: the resolved identities are re-sent after it, read
+    // once the snapshot has been taken.
+    const resyncResend = (base: ShellDeltaHub.ShellResyncBase) =>
+      loadProjectMetadataSnapshot(base.snapshotSequence, base.projects).pipe(
+        Effect.provideService(ProjectEnrichmentService.ProjectEnrichmentService, projectEnrichment),
+        Effect.map((loaded) =>
+          shellStreamItemsFromResumeSnapshot({
+            snapshot: loaded.snapshot,
+            resolvedRepositoryIdentityRoots: loaded.resolvedRepositoryIdentityRoots,
           }),
+        ),
+      );
+    // Every chunk the hub sends stays one chunk here (the RPC server waits for a client
+    // acknowledgement per chunk): a batch of deltas gets its repository identities; a `resync`,
+    // which the hub sends alone, becomes the snapshot chunk and then the re-sent identities.
+    const liveFrom = (afterSequence: number) =>
+      shellDeltas.stream(afterSequence, replayReads).pipe(
+        Stream.chunks,
+        Stream.flatMap(
+          (
+            chunk,
+          ): Stream.Stream<
+            OrchestrationV2ShellStreamItem,
+            | Effect.Error<ReturnType<typeof resyncSnapshot>>
+            | Effect.Error<ReturnType<typeof resyncResend>>
+          > => {
+            const first = chunk[0];
+            if (first.kind === "resync") {
+              return Stream.unwrap(
+                Effect.map(resyncSnapshot(first.base), (items) =>
+                  Stream.concat(
+                    Stream.fromArray(items),
+                    Stream.unwrap(Effect.map(resyncResend(first.base), Stream.fromArray)),
+                  ),
+                ),
+              );
+            }
+            const deltas = chunk.flatMap((item) => (item.kind === "resync" ? [] : [item]));
+            return Stream.unwrap(Effect.map(withRepositoryIdentityItems(deltas), Stream.fromArray));
+          },
         ),
       );
 
@@ -1415,6 +1537,19 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     );
   },
 );
+
+/** The stream handlers as `layerWsRpc` registers them: each item encoded once, shared across clients. */
+export const subscribeShellRpcHandler = (
+  input: Parameters<typeof subscribeOrchestrationV2Shell>[0],
+) => Stream.unwrap(subscribeOrchestrationV2Shell(input)).pipe(Stream.map(encodeShellStreamItem));
+export const subscribeThreadRpcHandler = (
+  input: Parameters<typeof subscribeOrchestrationV2Thread>[0],
+) =>
+  Stream.unwrap(
+    Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
+      Effect.andThen(subscribeOrchestrationV2Thread(input)),
+    ),
+  ).pipe(Stream.map(encodeThreadStreamItem));
 
 export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
@@ -2266,14 +2401,8 @@ export const layerWsRpc = (
                 ),
             ),
           ),
-        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input) =>
-          Stream.unwrap(subscribeOrchestrationV2Shell(input)),
-        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
-          Stream.unwrap(
-            Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-              Effect.andThen(subscribeOrchestrationV2Thread(input)),
-            ),
-          ),
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: subscribeShellRpcHandler,
+        [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: subscribeThreadRpcHandler,
         [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: (input) =>
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(

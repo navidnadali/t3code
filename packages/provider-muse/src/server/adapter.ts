@@ -379,44 +379,58 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         Schema.decodeUnknownEffect(schema)(data).pipe(
           Effect.mapError((cause) => protocolError("Invalid Muse protocol response", cause)),
         );
-      const request = (
-        method: string,
-        params: Record<string, unknown>,
-        command = true,
-        commandId?: string,
-      ) =>
-        Effect.tryPromise({
-          try: () =>
-            command
-              ? host.connection.command(
-                  method,
-                  { ...(nativeSessionId ? { sessionId: nativeSessionId } : {}), ...params },
-                  {
-                    ...(method === "turn/start" ? {} : { maxAttempts: 1 }),
-                    ...(commandId ? { commandId } : {}),
-                  },
-                )
-              : host.connection.request(method, {
-                  ...(nativeSessionId ? { sessionId: nativeSessionId } : {}),
-                  ...params,
-                }),
-          catch: (cause) =>
-            protocolError(
-              cause instanceof Error && cause.message
-                ? `Muse ${method} failed: ${cause.message}`
-                : `Muse ${method} failed`,
-              cause,
-            ),
-        }).pipe(
-          Effect.timeout(options.requestTimeoutMs ?? 30_000),
-          Effect.catchTags({
-            // The enclosing operation owns the span for this inline handler.
-            TimeoutError: Effect.fnUntraced(function* (cause) {
-              yield* eventPermit.withPermits(1)(failHost(cause));
-              return yield* protocolError(`Muse ${method} timed out; its host was closed`, cause);
+      const request = Effect.fn("MuseAdapter.request")(
+        (
+          method: string,
+          params: Record<string, unknown>,
+          command = true,
+          commandId?: string,
+          submit?: ProviderAdapter.ProviderAdapterV2TurnInput["submit"],
+        ) =>
+          Effect.gen(function* () {
+            const invoke = () =>
+              command
+                ? host.connection.command(
+                    method,
+                    { ...(nativeSessionId ? { sessionId: nativeSessionId } : {}), ...params },
+                    {
+                      ...(method === "turn/start" ? {} : { maxAttempts: 1 }),
+                      ...(commandId ? { commandId } : {}),
+                    },
+                  )
+                : host.connection.request(method, {
+                    ...(nativeSessionId ? { sessionId: nativeSessionId } : {}),
+                    ...params,
+                  });
+            let response: ReturnType<typeof invoke>;
+            if (submit === undefined) response = invoke();
+            else
+              yield* submit(() => {
+                response = invoke();
+              }).pipe(
+                Effect.mapError((cause) => protocolError("Muse submission was stopped", cause)),
+              );
+            return yield* Effect.tryPromise({
+              try: () => response,
+              catch: (cause) =>
+                protocolError(
+                  cause instanceof Error && cause.message
+                    ? `Muse ${method} failed: ${cause.message}`
+                    : `Muse ${method} failed`,
+                  cause,
+                ),
+            });
+          }).pipe(
+            Effect.timeout(options.requestTimeoutMs ?? 30_000),
+            Effect.catchTags({
+              // The enclosing operation owns the span for this inline handler.
+              TimeoutError: Effect.fnUntraced(function* (cause) {
+                yield* eventPermit.withPermits(1)(failHost(cause));
+                return yield* protocolError(`Muse ${method} timed out; its host was closed`, cause);
+              }),
             }),
-          }),
-        );
+          ),
+      );
       const updateSession = Effect.fnUntraced(function* (
         status: OrchestrationV2ProviderSession["status"],
         lastError: string | null = null,
@@ -1015,9 +1029,8 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           driver: MUSE_PROVIDER,
           threadId: input.threadId,
           runtimeRequest: entry.request,
+          artifacts: { node: entry.node, turnItem: entry.item },
         });
-        yield* emit({ type: "node.updated", driver: MUSE_PROVIDER, node: entry.node });
-        yield* emit({ type: "turn_item.updated", driver: MUSE_PROVIDER, turnItem: entry.item });
       });
       const finish = Effect.fnUntraced(function* (
         turn: ActiveTurn,
@@ -1173,9 +1186,8 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           driver: MUSE_PROVIDER,
           threadId: entry.node.threadId,
           runtimeRequest: entry.request,
+          artifacts: { node: entry.node, turnItem: entry.item },
         });
-        yield* emit({ type: "node.updated", driver: MUSE_PROVIDER, node: entry.node });
-        yield* emit({ type: "turn_item.updated", driver: MUSE_PROVIDER, turnItem: entry.item });
         yield* updateSession("waiting");
       });
       /**
@@ -2165,7 +2177,13 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         yield* Effect.gen(function* () {
           if (compact) {
             // The turn's terminal reports a declined compaction; only a broken host fails the command.
-            const declined = yield* request("session/compact", {}, true, nativeId).pipe(
+            const declined = yield* request(
+              "session/compact",
+              {},
+              true,
+              nativeId,
+              turnInput.submit,
+            ).pipe(
               Effect.flatMap((value) => decode(MuseCompactResult, value)),
               Effect.map((result) =>
                 result.status === "accepted"
@@ -2201,6 +2219,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
               },
               true,
               nativeId,
+              turnInput.submit,
             ).pipe(Effect.flatMap((value) => decode(MuseTurnStartResult, value)));
             if (result.turnId !== nativeId) {
               yield* eventPermit.withPermits(1)(
@@ -2331,8 +2350,23 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
               !validateThread(args.providerThread) ||
               turn.compact
             )
-              return yield* protocolError("This Muse turn cannot be steered");
+              return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                driver: MUSE_PROVIDER,
+                providerThreadId: args.providerThread.id,
+                providerTurnId: args.providerTurnId,
+                deliveryNotSent: true,
+                cause: "This Muse turn cannot be steered",
+              });
             const parts = yield* prompt(args.message);
+            if (args.beforeSubmit !== undefined) yield* args.beforeSubmit;
+            if (active !== turn)
+              return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                driver: MUSE_PROVIDER,
+                providerThreadId: args.providerThread.id,
+                providerTurnId: args.providerTurnId,
+                deliveryNotSent: true,
+                cause: "The turn ended during steering preparation.",
+              });
             const result = yield* request("turn/steer", {
               expectedTurnId: turn.nativeId,
               input: parts,
@@ -2343,14 +2377,15 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           (effect, args) =>
             effect.pipe(
               commands.withPermits(1),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterSteerRunError({
-                    driver: MUSE_PROVIDER,
-                    providerThreadId: args.providerThread.id,
-                    providerTurnId: args.providerTurnId,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                ProviderAdapter.isProviderAdapterSteerRunError(cause)
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterSteerRunError({
+                      driver: MUSE_PROVIDER,
+                      providerThreadId: args.providerThread.id,
+                      providerTurnId: args.providerTurnId,
+                      cause,
+                    }),
               ),
             ),
         ),

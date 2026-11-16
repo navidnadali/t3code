@@ -12,6 +12,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
 import { refreshPathFromLoginShell } from "../os-jank.ts";
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import {
   detailFromCause,
@@ -76,7 +77,8 @@ export const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
   const process = yield* VcsProcess.VcsProcess;
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  // The server's command spawner where it has one, so the shell never forks the server.
+  const spawner = yield* WorkerChildProcessSpawner.commandSpawner;
   // Discovery re-reads the login shell so a tool installed since launch
   // resolves here and in every later spawn. Thread views, the palette and
   // mobile also run discovery, so one interactive shell serves a short window.

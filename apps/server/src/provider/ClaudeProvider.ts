@@ -59,6 +59,7 @@ import {
   readClaudeSettingsEnv,
 } from "./Drivers/ClaudeSkills.ts";
 import type { ProviderWorkspaceSnapshot } from "@t3tools/provider-core/server/driver";
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
 import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
 import {
   type ClaudeScopedLimitNames,
@@ -243,22 +244,42 @@ const CLAUDE_CAPABILITIES_PROBE_SETTING_SOURCES = [
  * that stops answering freezes the server. `env` enters the cwd and finds the CLI in the child.
  * A shell would not do: dash drops the exported Bash functions a launcher may call.
  */
-export function spawnClaudeProbeThroughEnv({
-  command,
-  args,
-  cwd,
-  env,
-  signal,
-}: ClaudeSpawnOptions) {
-  const launch = envTrampoline(command, args, cwd) ?? { command, args, cwd };
-  return NodeChildProcess.spawn(launch.command, launch.args, {
-    ...("cwd" in launch ? { cwd: launch.cwd } : {}),
-    env,
-    signal,
-    // The probe ignores stderr.
-    stdio: ["pipe", "pipe", "ignore"],
-  });
+export function spawnClaudeProbeThroughEnv(options: ClaudeSpawnOptions) {
+  const { command, args, spawnOptions } = claudeProbeLaunch(options, true);
+  return NodeChildProcess.spawn(command, args, { ...spawnOptions, stdio: [...spawnOptions.stdio] });
 }
+
+function claudeProbeLaunch(
+  { command, args, cwd, env, signal }: ClaudeSpawnOptions,
+  throughEnv: boolean,
+) {
+  const launch = (throughEnv ? envTrampoline(command, args, cwd) : undefined) ?? {
+    command,
+    args,
+    cwd,
+  };
+  return {
+    command: launch.command,
+    args: launch.args,
+    spawnOptions: {
+      ...("cwd" in launch ? { cwd: launch.cwd } : {}),
+      env,
+      signal,
+      // The probe ignores stderr.
+      stdio: ["pipe", "pipe", "ignore"] as const,
+    },
+  };
+}
+
+/** The probe's CLI from the server's provider launcher, which hands it off on Linux. */
+const spawnClaudeProbeFrom =
+  (launcher: WorkerChildProcessSpawner.ProviderProcessLauncher["Service"], throughEnv: boolean) =>
+  (options: ClaudeSpawnOptions) => {
+    const { command, args, spawnOptions } = claudeProbeLaunch(options, throughEnv);
+    return launcher.spawn(command, args, spawnOptions) as ReturnType<
+      typeof spawnClaudeProbeThroughEnv
+    >;
+  };
 
 /** Windows runs CreateProcess on the calling thread, so the probe launches from a launcher thread. */
 function spawnClaudeProbeOffThread({ command, args, cwd, env, signal }: ClaudeSpawnOptions) {
@@ -275,12 +296,18 @@ export function buildClaudeCapabilitiesProbeQueryOptions(input: {
   readonly cwd: string | undefined;
   readonly managedMcpConfig: boolean;
   readonly spawnVia: "env" | "launcher-thread" | undefined;
+  readonly launcher?: WorkerChildProcessSpawner.ProviderProcessLauncher["Service"] | undefined;
 }): ClaudeQueryOptions {
+  const spawnClaudeCodeProcess =
+    input.launcher !== undefined
+      ? spawnClaudeProbeFrom(input.launcher, input.spawnVia === "env")
+      : input.spawnVia === "env"
+        ? spawnClaudeProbeThroughEnv
+        : input.spawnVia === "launcher-thread"
+          ? spawnClaudeProbeOffThread
+          : undefined;
   return {
-    ...(input.spawnVia === "env" ? { spawnClaudeCodeProcess: spawnClaudeProbeThroughEnv } : {}),
-    ...(input.spawnVia === "launcher-thread"
-      ? { spawnClaudeCodeProcess: spawnClaudeProbeOffThread }
-      : {}),
+    ...(spawnClaudeCodeProcess === undefined ? {} : { spawnClaudeCodeProcess }),
     persistSession: false,
     pathToClaudeCodeExecutable: input.executablePath,
     abortController: input.abortController,
@@ -517,6 +544,13 @@ const probeClaudeCapabilities = (
         : platform === "linux" && (yield* Effect.promise(supportsEnvChdir))
           ? "env"
           : undefined;
+    // Health checks and workspace scans start one each; elsewhere a spawn costs no page tables.
+    const launcher =
+      platform === "linux"
+        ? Option.getOrUndefined(
+            yield* Effect.serviceOption(WorkerChildProcessSpawner.ProviderProcessLauncher),
+          )
+        : undefined;
     return yield* Effect.tryPromise({
       try: async () => {
         const q = claudeQuery({
@@ -531,6 +565,7 @@ const probeClaudeCapabilities = (
             cwd,
             managedMcpConfig,
             spawnVia,
+            launcher,
           }),
         });
         const init = await q.initializationResult();

@@ -45,6 +45,20 @@ import {
   PATCH_RENDER_PREFIX_ARGS,
   splitNullSeparatedGitStdoutPaths,
 } from "./GitVcsDriverCore.ts";
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
+import {
+  type CheckpointRepository,
+  type CommitFacts,
+  isObjectId,
+  isSymbolicLink,
+  makeCheckpointRefMemory,
+  readTextFile,
+} from "./gitCheckpointRefs.ts";
+import {
+  type GitConfigSnapshot,
+  gitConfigBool,
+  makeGitConfigSnapshots,
+} from "./gitConfigSnapshot.ts";
 import * as CheckoutCloner from "./CheckoutCloner.ts";
 import * as VcsDriver from "./VcsDriver.ts";
 import * as VcsProcess from "./VcsProcess.ts";
@@ -674,6 +688,28 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         : {}),
     });
 
+  const configSnapshots = yield* makeGitConfigSnapshots((operation, cwd, args) =>
+    execute({ operation, cwd, args, allowNonZeroExit: true }),
+  );
+  const refMemory = makeCheckpointRefMemory();
+
+  // Where the directory's repository keeps refs and objects, while refs are files (so a loose ref
+  // or packed-refs can be read in place of `git rev-parse`). Untraced: it runs several times a turn.
+  const checkpointRepository = Effect.fnUntraced(function* (cwd: string) {
+    const snapshot = yield* configSnapshots.read(cwd);
+    return snapshot === null || snapshot.commonDir === null
+      ? null
+      : { commonDir: snapshot.commonDir, objectsDir: snapshot.objectsDir };
+  });
+
+  const rememberedCommitFacts = Effect.fnUntraced(function* (
+    repository: CheckpointRepository,
+    revision: string,
+  ) {
+    const oid = isObjectId(revision) ? revision : yield* refMemory.resolveRef(repository, revision);
+    return typeof oid === "string" ? yield* refMemory.commitFacts(repository, oid) : null;
+  });
+
   const detectRepository: VcsDriver.VcsDriver["Service"]["detectRepository"] = Effect.fn(
     "detectRepository",
   )(function* (cwd) {
@@ -879,35 +915,41 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       ...(env !== undefined ? { env } : {}),
     }).pipe(Effect.map((result) => result.exitCode === 0));
 
-  const resolveCheckpointCommit = (cwd: string, checkpointRef: string) =>
-    execute({
+  // A ref this driver wrote or resolved before is read from the ref store; Git answers the rest.
+  const resolveCheckpointCommit = Effect.fnUntraced(function* (cwd: string, checkpointRef: string) {
+    const repository = yield* checkpointRepository(cwd);
+    if (repository !== null) {
+      const remembered = yield* refMemory.resolveRef(repository, checkpointRef);
+      if (remembered !== undefined) return remembered;
+    }
+    const result = yield* execute({
       operation: "GitVcsDriver.checkpoints.resolveCheckpointCommit",
       cwd,
       args: ["rev-parse", "--verify", "--quiet", `${checkpointRef}^{commit}`],
       env: { LC_ALL: "C" },
       allowNonZeroExit: true,
-    }).pipe(
-      Effect.flatMap((result) => {
-        // --quiet reports an absent ref as exit 1 with no error; an unreadable object also exits 1
-        // but reports an error line.
-        if (result.exitCode === 1 && !hasStderrLine(result.stderr, ["error:", "fatal:"])) {
-          return Effect.succeed(null);
-        }
-        if (result.exitCode !== 0) {
-          return Effect.fail(
-            new VcsProcessExitError({
-              operation: "GitVcsDriver.checkpoints.resolveCheckpointCommit",
-              command: "git rev-parse",
-              cwd,
-              exitCode: result.exitCode,
-              detail: result.stderr.trim() || "git rev-parse failed",
-            }),
-          );
-        }
-        const commit = result.stdout.trim();
-        return Effect.succeed(commit.length > 0 ? commit : null);
-      }),
-    );
+    });
+    const commit = result.exitCode === 0 ? result.stdout.trim() : "";
+    if (repository !== null) {
+      if (commit.length > 0) yield* refMemory.rememberRef(repository, checkpointRef, commit);
+      else yield* refMemory.forgetRef(repository, checkpointRef);
+    }
+    // --quiet reports an absent ref as exit 1 with no error; an unreadable object also exits 1
+    // but reports an error line.
+    if (result.exitCode === 1 && !hasStderrLine(result.stderr, ["error:", "fatal:"])) {
+      return null;
+    }
+    if (result.exitCode !== 0) {
+      return yield* new VcsProcessExitError({
+        operation: "GitVcsDriver.checkpoints.resolveCheckpointCommit",
+        command: "git rev-parse",
+        cwd,
+        exitCode: result.exitCode,
+        detail: result.stderr.trim() || "git rev-parse failed",
+      });
+    }
+    return commit.length > 0 ? commit : null;
+  });
 
   // Git reports relative paths from the physical cwd, which can differ from a symlink.
   const resolveGitCommonDir = Effect.fn("GitVcsDriver.resolveGitCommonDir")(function* (
@@ -924,10 +966,53 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     return path.resolve(physicalCwd, gitCommonDir);
   });
 
+  // The commit HEAD resolves to, or false when it does not: Git answers once per state of HEAD's
+  // content (a snapshot dependency) and of the ref it names; null when HEAD is neither symbolic nor
+  // an object id, or Git failed.
+  const headResolves = Effect.fnUntraced(function* (cwd: string, snapshot: GitConfigSnapshot) {
+    // With core.preferSymlinkRefs HEAD is a link to the branch file; Git reads its target as a name.
+    if ((yield* isSymbolicLink(path.join(snapshot.gitDir, "HEAD"))) !== false) return null;
+    const content = yield* readTextFile(snapshot.headPath);
+    if (content === null) return null;
+    const names = content.startsWith("ref:")
+      ? [content.slice("ref:".length).trim()]
+      : isObjectId(content.trim())
+        ? []
+        : null;
+    if (names === null) return null;
+    const result = yield* configSnapshots.runWithRefs(
+      snapshot,
+      ["rev-parse", "--verify", "--quiet", "HEAD"],
+      () => names,
+      execute({
+        operation: VcsProcess.CHECKPOINT_CAPTURE_OPERATION,
+        cwd,
+        args: ["rev-parse", "--verify", "--quiet", "HEAD"],
+        allowNonZeroExit: true,
+      }),
+    );
+    const head = result.stdout.trim();
+    if (result.exitCode === 0) return isObjectId(head) ? head : null;
+    return result.exitCode === 1 ? false : null;
+  });
+
   // --verify prints HEAD after the paths; --quiet leaves only paths for an unborn HEAD.
   const resolveCaptureRepository = Effect.fn("GitVcsDriver.resolveCaptureRepository")(function* (
     cwd: string,
+    snapshot: GitConfigSnapshot | null,
   ) {
+    if (snapshot !== null) {
+      const head = yield* headResolves(cwd, snapshot);
+      if (head !== null) {
+        return {
+          gitCommonDir: snapshot.gitCommonDir,
+          indexPath: snapshot.absoluteIndexPath,
+          prefix: snapshot.prefixSegments.map((segment) => `${segment}/`).join(""),
+          headExists: head !== false,
+          head: head === false ? undefined : head,
+        };
+      }
+    }
     const result = yield* execute({
       operation: VcsProcess.CHECKPOINT_CAPTURE_OPERATION,
       cwd,
@@ -992,6 +1077,98 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
   // core.longpaths is disabled in the user's Git configuration.
   const longPaths = hostPlatform === "win32" ? ["-c", "core.longpaths=true"] : [];
 
+  // The file core.excludesFile names, or Git's default for it; null when it cannot be named here.
+  const excludesFile = (value: string | null | undefined) => {
+    if (value === undefined) {
+      const xdgConfigHome = process.env.XDG_CONFIG_HOME;
+      if (xdgConfigHome) return path.join(xdgConfigHome, "git", "ignore");
+      return process.env.HOME ? path.join(process.env.HOME, ".config", "git", "ignore") : null;
+    }
+    if (value === null || value.length === 0) return null;
+    if (path.isAbsolute(value)) return value;
+    if (value.startsWith("~/") && process.env.HOME) return `${process.env.HOME}${value.slice(1)}`;
+    return null;
+  };
+
+  // Everything `git check-ignore` reads for the directory itself besides config: the exclude files
+  // and .gitignore from the top level down to the directory.
+  const workspaceIgnoreFiles = (snapshot: GitConfigSnapshot) => {
+    if (hostPlatform === "win32") return null;
+    const excludes = excludesFile(snapshot.values.get("core.excludesfile"));
+    if (excludes === null) return null;
+    const files = [excludes, snapshot.infoExcludePath];
+    for (let depth = 0; depth <= snapshot.prefixSegments.length; depth++) {
+      files.push(
+        path.join(snapshot.toplevel, ...snapshot.prefixSegments.slice(0, depth), ".gitignore"),
+      );
+    }
+    return files;
+  };
+
+  // The working-tree root is never ignored. Probe a subdirectory without the trailing slash Git
+  // adds to ".", which a blank or whitespace-only ignore line matches as an empty pattern.
+  const isWorkspaceIgnored = Effect.fnUntraced(function* (
+    cwd: string,
+    prefix: string,
+    snapshot: GitConfigSnapshot | null,
+  ) {
+    if (prefix === "") return false;
+    const probe = filterIgnoredPaths(cwd, [`../${prefix.slice(0, -1).split("/").at(-1)}`]).pipe(
+      Effect.map((kept) => kept.length === 0),
+    );
+    const files = snapshot === null ? null : workspaceIgnoreFiles(snapshot);
+    if (snapshot === null || files === null) return yield* probe;
+    return yield* configSnapshots.runWithFiles(snapshot, "workspace-ignored", files, probe);
+  });
+
+  // `%ct %P` of two checkpoint commits, from the commit objects when both refs are remembered.
+  const checkpointHeadLines = Effect.fnUntraced(function* (
+    operation: string,
+    cwd: string,
+    fromCheckpointRef: string,
+    toCheckpointRef: string,
+  ) {
+    const repository = yield* checkpointRepository(cwd);
+    if (repository !== null) {
+      const [fromFacts, toFacts] = yield* Effect.all([
+        rememberedCommitFacts(repository, fromCheckpointRef),
+        rememberedCommitFacts(repository, toCheckpointRef),
+      ]);
+      if (fromFacts !== null && toFacts !== null) {
+        return [fromFacts, toFacts].map(
+          (facts) => `${facts.committerTime} ${facts.parents.join(" ")}`,
+        );
+      }
+    }
+    const stateBefore =
+      repository === null ? null : yield* refMemory.historyState(repository.commonDir);
+    const heads = yield* execute({
+      operation,
+      cwd,
+      args: [
+        "log",
+        "--no-walk=unsorted",
+        "--format=%H %T %P %ct",
+        `${fromCheckpointRef}^{commit}`,
+        `${toCheckpointRef}^{commit}`,
+      ],
+    });
+    const reported: Array<readonly [string, CommitFacts]> = [];
+    const lines = heads.stdout
+      .trimEnd()
+      .split("\n")
+      .map((line) => {
+        const [hash = "", tree = "", ...rest] = line.split(" ");
+        const committerTime = rest.pop() ?? "";
+        const parents = rest.filter((parent) => parent.length > 0);
+        if (isObjectId(hash) && isObjectId(tree) && /^\d+$/.test(committerTime)) {
+          reported.push([hash, { tree, parents, committerTime }]);
+        }
+        return `${committerTime} ${parents.join(" ")}`;
+      });
+    if (repository !== null) yield* refMemory.rememberCommits(repository, reported, stateBefore);
+    return lines;
+  });
   // Newest first: the commit each HEAD move landed on, when, and Git's reason for it.
   const readHeadMoves = (cwd: string) =>
     execute({
@@ -1026,8 +1203,27 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
 
   // A checkpoint taken after a branch switch has a second parent: the checkpoint before it with
   // the switch applied, which is where that turn started. Other ranges start at `from` itself.
-  const resolveTurnStart = (input: VcsDriver.VcsListAuthoredPathsInput) =>
-    execute({
+  const resolveTurnStart = Effect.fnUntraced(function* (
+    input: VcsDriver.VcsListAuthoredPathsInput,
+  ) {
+    const repository = yield* checkpointRepository(input.cwd);
+    if (repository !== null) {
+      const toFacts = yield* rememberedCommitFacts(repository, input.toCheckpointRef);
+      if (toFacts !== null && toFacts.parents.length < 2) return input.fromCheckpointRef;
+      const start = toFacts?.parents[1];
+      if (start !== undefined) {
+        const [fromCommit, startFacts] = yield* Effect.all([
+          isObjectId(input.fromCheckpointRef)
+            ? Effect.succeed(input.fromCheckpointRef)
+            : refMemory.resolveRef(repository, input.fromCheckpointRef),
+          rememberedCommitFacts(repository, start),
+        ]);
+        if (typeof fromCommit === "string" && startFacts !== null) {
+          return startFacts.parents[1] === fromCommit ? start : input.fromCheckpointRef;
+        }
+      }
+    }
+    const result = yield* execute({
       operation: "GitVcsDriver.checkpoints.resolveTurnStart",
       cwd: input.cwd,
       args: [
@@ -1040,15 +1236,13 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         `${input.toCheckpointRef}^2`,
       ],
       allowNonZeroExit: true,
-    }).pipe(
-      Effect.map((result): string => {
-        const [fromLine = "", startLine = ""] = result.stdout.trimEnd().split("\n");
-        const [start = "", , startedFrom] = startLine.split(" ");
-        return result.exitCode === 0 && startedFrom === fromLine.split(" ")[0]
-          ? start
-          : input.fromCheckpointRef;
-      }),
-    );
+    });
+    const [fromLine = "", startLine = ""] = result.stdout.trimEnd().split("\n");
+    const [start = "", , startedFrom] = startLine.split(" ");
+    return result.exitCode === 0 && startedFrom === fromLine.split(" ")[0]
+      ? start
+      : input.fromCheckpointRef;
+  });
 
   const checkpoints: VcsDriver.VcsCheckpointOps = {
     captureCheckpoint: Effect.fn("GitVcsDriver.checkpoints.captureCheckpoint")(function* (input) {
@@ -1064,8 +1258,10 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         "-c",
         "splitIndex.sharedIndexExpire=never",
       ];
+      const snapshot = yield* configSnapshots.read(input.cwd);
       const { gitCommonDir, indexPath, prefix, headExists, head } = yield* resolveCaptureRepository(
         input.cwd,
+        snapshot,
       );
       // Read before the snapshot and pinned to the same HEAD: a switch that lands while files are
       // being staged then belongs to the next checkpoint instead of being applied to this one.
@@ -1128,13 +1324,17 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       );
 
       yield* Effect.gen(function* () {
-        const sparseConfig = yield* execute({
-          operation,
-          cwd: input.cwd,
-          args: ["config", "--bool", "core.sparseCheckout"],
-          allowNonZeroExit: true,
-        });
-        let sparseCheckout = sparseConfig.stdout.trim() === "true";
+        let sparseCheckout =
+          snapshot === null ? null : gitConfigBool(snapshot.valueLists, "core.sparseCheckout");
+        if (sparseCheckout === null) {
+          const sparseConfig = yield* execute({
+            operation,
+            cwd: input.cwd,
+            args: ["config", "--bool", "core.sparseCheckout"],
+            allowNonZeroExit: true,
+          });
+          sparseCheckout = sparseConfig.stdout.trim() === "true";
+        }
         if (sparseCheckout) {
           const help = yield* execute({
             operation,
@@ -1301,12 +1501,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           }
         }
 
-        // The working-tree root is never ignored. Probe a subdirectory without the trailing slash
-        // Git adds to ".", which a blank or whitespace-only ignore line matches as an empty pattern.
-        const workspaceIgnored =
-          prefix !== "" &&
-          (yield* filterIgnoredPaths(input.cwd, [`../${prefix.slice(0, -1).split("/").at(-1)}`]))
-            .length === 0;
+        const workspaceIgnored = yield* isWorkspaceIgnored(input.cwd, prefix, snapshot);
         if (workspaceIgnored) {
           // HEAD omits staged-only paths. Seed just this workspace's additions, keeping
           // unrelated staged changes and the scratch index's sparse flags untouched.
@@ -1708,6 +1903,13 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           cwd: input.cwd,
           args: [...durableWrite, "update-ref", input.checkpointRef, commitOid],
         });
+        if (snapshot !== null && snapshot.commonDir !== null) {
+          yield* refMemory.rememberRef(
+            { commonDir: snapshot.commonDir, objectsDir: snapshot.objectsDir },
+            input.checkpointRef,
+            commitOid,
+          );
+        }
       }).pipe(Effect.ensuring(cleanupTempIndex));
     }, Effect.scoped),
 
@@ -1951,6 +2153,16 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         }
       }
 
+      // Two commits with one tree diff to nothing, whatever the format, whitespace or paths.
+      const repository = yield* checkpointRepository(input.cwd);
+      if (repository !== null) {
+        const [fromFacts, toFacts] = yield* Effect.all([
+          rememberedCommitFacts(repository, fromRevision),
+          rememberedCommitFacts(repository, input.toCheckpointRef),
+        ]);
+        if (fromFacts !== null && toFacts !== null && fromFacts.tree === toFacts.tree) return "";
+      }
+
       const result = yield* execute({
         operation,
         cwd: input.cwd,
@@ -1996,18 +2208,12 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     listAuthoredPaths: Effect.fn("GitVcsDriver.checkpoints.listAuthoredPaths")(function* (input) {
       const operation = "GitVcsDriver.checkpoints.listAuthoredPaths";
       const turnStart = yield* resolveTurnStart(input);
-      const heads = yield* execute({
+      const [fromLine = "", toLine = ""] = yield* checkpointHeadLines(
         operation,
-        cwd: input.cwd,
-        args: [
-          "log",
-          "--no-walk=unsorted",
-          "--format=%ct %P",
-          `${turnStart}^{commit}`,
-          `${input.toCheckpointRef}^{commit}`,
-        ],
-      });
-      const [fromLine = "", toLine = ""] = heads.stdout.trimEnd().split("\n");
+        input.cwd,
+        turnStart,
+        input.toCheckpointRef,
+      );
       const [capturedAt = "", startHead = ""] = fromLine.split(" ");
       const [, endHead = ""] = toLine.split(" ");
       if (startHead === "" || endHead === "" || startHead === endHead) {
@@ -2111,6 +2317,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
 
     deleteCheckpointRefs: Effect.fn("GitVcsDriver.checkpoints.deleteCheckpointRefs")(
       function* (input) {
+        const repository = yield* checkpointRepository(input.cwd);
         yield* Effect.forEach(
           input.checkpointRefs,
           (checkpointRef) =>
@@ -2119,7 +2326,11 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
               cwd: input.cwd,
               args: ["update-ref", "-d", checkpointRef],
               allowNonZeroExit: true,
-            }),
+            }).pipe(
+              Effect.tap(() =>
+                repository === null ? Effect.void : refMemory.forgetRef(repository, checkpointRef),
+              ),
+            ),
           { discard: true },
         );
       },
@@ -2149,4 +2360,6 @@ export const make = Effect.gen(function* () {
 });
 
 export const layerVcs = Layer.effect(VcsDriver.VcsDriver, makeVcsDriver);
-export const layer = Layer.effect(GitVcsDriver, make).pipe(Layer.provide(CheckoutCloner.layer));
+export const layer = Layer.effect(GitVcsDriver, make).pipe(
+  Layer.provide(Layer.merge(WorkerChildProcessSpawner.layerFromConfig, CheckoutCloner.layer)),
+);

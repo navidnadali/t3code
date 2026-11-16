@@ -100,8 +100,13 @@ const makeLayerSetup = <E, R>(migrate: Effect.Effect<unknown, E, R>) =>
 
 const layerSetup = makeLayerSetup(runMigrations());
 
+type SqliteTuning = Pick<
+  NodeSqliteClient.SqliteClientConfig,
+  "readerPoolSize" | "cacheSizeMb" | "readerCacheSizeMb" | "mmapSizeMb"
+>;
+
 const makeLayerFromPath = <E, R>(makeSetup: (dbPath: string) => Layer.Layer<never, E, R>) =>
-  Effect.fn("makeSqlitePersistenceLive")(function* (dbPath: string) {
+  Effect.fn("makeSqlitePersistenceLive")(function* (dbPath: string, tuning?: SqliteTuning) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });
@@ -113,6 +118,7 @@ const makeLayerFromPath = <E, R>(makeSetup: (dbPath: string) => Layer.Layer<neve
         readerWorker: true,
         // A slow disk then delays writes instead of freezing every client.
         writerWorker: true,
+        ...tuning,
         spanAttributes: {
           "db.name": path.basename(dbPath),
           "service.name": "t3code-server",
@@ -140,13 +146,18 @@ export const layerMemory = Layer.provideMerge(
 );
 
 const makeLayerConfig = <E, R>(
-  fromPath: (dbPath: string) => Layer.Layer<SqlClient.SqlClient, E, R>,
+  fromPath: (dbPath: string, tuning: SqliteTuning) => Layer.Layer<SqlClient.SqlClient, E, R>,
 ) =>
   Layer.unwrap(
     Effect.gen(function* () {
-      const { dbPath } = yield* ServerConfig.ServerConfig;
-      yield* initializeV2Database(dbPath);
-      return fromPath(dbPath);
+      const config = yield* ServerConfig.ServerConfig;
+      yield* initializeV2Database(config.dbPath);
+      return fromPath(config.dbPath, {
+        readerPoolSize: config.sqliteReaderPoolSize,
+        cacheSizeMb: config.sqliteCacheSizeMb,
+        readerCacheSizeMb: config.sqliteReaderCacheSizeMb,
+        mmapSizeMb: config.sqliteMmapSizeMb,
+      });
     }),
   );
 

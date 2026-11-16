@@ -936,9 +936,16 @@ export const layer: Layer.Layer<
     ) {
       // Side chats share the parent's worktree; a snapshot would capture the parent's edits.
       if (input.appThread.lineage.sideChat === true) return;
+      // Where the run's checkpoint is taken (CheckpointCaptureService): its scope's real path.
       yield* checkpointService
         .captureBaseline({
-          scope: input.checkpointScope,
+          scope: {
+            ...input.checkpointScope,
+            cwd:
+              input.run.workspaceCwd === undefined
+                ? input.checkpointScope.cwd
+                : (input.checkpointScope.realCwd ?? input.run.workspaceCwd),
+          },
           ordinalWithinScope: Math.max(0, input.run.ordinal - 1),
         })
         .pipe(
@@ -960,6 +967,7 @@ export const layer: Layer.Layer<
           Effect.map(Fiber.join),
         ),
       startRootRun: Effect.fn("RunExecutionService.startRootRun")(function* (input) {
+        let activeAttempt = input.attempt;
         const rootTurnOrigin: ProviderUsageAnalytics.ProviderTurnOrigin = {
           createdBy: input.message.createdBy,
           creationSource: input.message.creationSource,
@@ -1029,7 +1037,7 @@ export const layer: Layer.Layer<
                 rootNode: input.rootNode,
                 checkpointScope: input.checkpointScope,
                 providerThread: input.providerThread,
-                attempt: input.attempt,
+                attempt: activeAttempt,
                 terminal: makeFailedTerminalEvent(
                   makeProviderFailure({
                     cause: Cause.squash(cause),
@@ -1159,7 +1167,7 @@ export const layer: Layer.Layer<
               rootNode: input.rootNode,
               checkpointScope: input.checkpointScope,
               providerThread,
-              attempt: input.attempt,
+              attempt: activeAttempt,
               ...(input.shouldFinalizeRun === undefined
                 ? {}
                 : {
@@ -1840,7 +1848,7 @@ export const layer: Layer.Layer<
                     rootNode: input.rootNode,
                     checkpointScope: input.checkpointScope,
                     providerThread,
-                    attempt: input.attempt,
+                    attempt: activeAttempt,
                     writeIfRunCurrent: {
                       activeAttemptId: input.attempt.id,
                       expectedStatus: "running",
@@ -1927,6 +1935,54 @@ export const layer: Layer.Layer<
           key: `mcp_app_${entry.itemId.replace(/[^\w.-]/g, "_")}`,
           text: entry.text,
         }));
+        // Provider preparation may await context, files, setup RPCs, and protocol logging.
+        // Only its final synchronous transport enqueue can consume the original input.
+        const submit: NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["submit"]> = (
+          enqueue,
+        ) =>
+          threadCommands
+            .withLock(
+              input.run.threadId,
+              Effect.gen(function* () {
+                const invokedAttempt = { ...activeAttempt, providerStartState: "invoked" as const };
+                const claimed = yield* eventSink.writeIfRunCurrent({
+                  threadId: input.run.threadId,
+                  runId: input.run.id,
+                  activeAttemptId: input.attemptId,
+                  expectedStatus: "running",
+                  events: [
+                    {
+                      id: yield* idAllocator.allocate.event({ threadId: input.run.threadId }),
+                      type: "run-attempt.updated",
+                      threadId: input.run.threadId,
+                      runId: input.run.id,
+                      nodeId: input.rootNode.id,
+                      providerInstanceId: input.run.providerInstanceId,
+                      occurredAt: yield* DateTime.now,
+                      payload: invokedAttempt,
+                    },
+                  ],
+                });
+                if (!claimed.committed)
+                  return yield* Effect.fail("The restart was stopped before submission.");
+                activeAttempt = invokedAttempt;
+                enqueue();
+              }),
+            )
+            .pipe(
+              // Cancellation cannot split a committed claim from its synchronous native enqueue.
+              Effect.uninterruptible,
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterTurnStartError({
+                    driver: input.session.driver,
+                    threadId: input.run.threadId,
+                    providerThreadId: input.providerThread.id,
+                    runId: input.run.id,
+                    cause,
+                  }),
+              ),
+            );
         const turnInput = {
           appThread: input.appThread,
           threadId: input.run.threadId,
@@ -1948,13 +2004,11 @@ export const layer: Layer.Layer<
           modelSelection: input.modelSelection,
           runtimePolicy: input.runtimePolicy,
           ...(appContext.length === 0 ? {} : { appContext }),
+          ...(activeAttempt.providerStartState === "pending" ? { submit } : {}),
         };
-        // Check after the context read: ingestion can settle the run while
-        // it awaits. A failed ownership read fails the start below.
-        const shouldStart =
-          input.shouldStartProviderTurn === undefined
-            ? Exit.succeed(true)
-            : yield* Effect.exit(input.shouldStartProviderTurn());
+        const shouldStart = yield* Effect.exit(
+          input.shouldStartProviderTurn?.() ?? Effect.succeed(true),
+        );
         if (Exit.isSuccess(shouldStart) && !shouldStart.value) {
           yield* Fiber.interrupt(providerEventFiber);
           return;
@@ -2020,7 +2074,7 @@ export const layer: Layer.Layer<
                           rootNode: input.rootNode,
                           checkpointScope: input.checkpointScope,
                           providerThread,
-                          attempt: input.attempt,
+                          attempt: activeAttempt,
                           writeIfRunCurrent: {
                             activeAttemptId: input.attempt.id,
                             expectedStatus: "running",

@@ -1,0 +1,209 @@
+import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
+import type * as RpcMessage from "effect/rpc/RpcMessage";
+import * as RpcSerialization from "effect/rpc/RpcSerialization";
+
+import * as AcpSchema from "./schema.ts";
+import * as AcpSchemaV1 from "./_generated/schema-v1.gen.ts";
+import * as AcpError from "./errors.ts";
+import type { AcpStageTiming } from "./protocol.ts";
+
+export type WireMessage = RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded;
+
+export const decodeSessionUpdate = Schema.decodeUnknownResult(
+  Schema.Union([
+    // Claude ACP v2 reports prompt failures on idle; alpha.3 omits that field.
+    Schema.Struct({
+      ...AcpSchema.UpdateSessionNotification.fields,
+      update: Schema.Struct({
+        sessionUpdate: Schema.Literal("state_update"),
+        state: Schema.Literal("idle"),
+        stopReason: Schema.optionalKey(Schema.NullOr(AcpSchema.StopReason)),
+        usage: Schema.optionalKey(Schema.NullOr(AcpSchema.Usage)),
+        error: Schema.optionalKey(Schema.NullOr(AcpSchema.Error)),
+        _meta: AcpSchema.UpdateSessionNotification.fields._meta,
+      }),
+    }),
+    AcpSchema.UpdateSessionNotification,
+    AcpSchemaV1.SessionNotification,
+  ]),
+);
+export const decodeElicitationComplete = Schema.decodeUnknownResult(
+  AcpSchema.CompleteElicitationNotification,
+);
+/** Splits stdout into complete lines; `makeStrictNdJsonRpcParser` frames with it too. */
+export const makeLineSplitter = () => {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const split = (bytes: Uint8Array | string): ReadonlyArray<string> => {
+    const chunk = typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
+    const lastNewline = chunk.lastIndexOf("\n");
+    // Splitting the whole buffer per chunk is quadratic for multi-megabyte lines.
+    if (lastNewline === -1) {
+      buffer += chunk;
+      return [];
+    }
+    const lines = (buffer + chunk.slice(0, lastNewline)).split("\n");
+    buffer = chunk.slice(lastNewline + 1);
+    return lines;
+  };
+  return Object.assign(split, {
+    end: () => {
+      const line = buffer + decoder.decode();
+      buffer = "";
+      return line;
+    },
+  });
+};
+
+// ndJsonRpc skips lines that are not JSON. A malformed agent line has to end the
+// session, so frames are split here and each nonblank one goes through the strict codec.
+export interface FramedWireMessage {
+  readonly message: WireMessage;
+  readonly lineLength: number;
+}
+export const makeStrictNdJsonRpcParser = (timing?: AcpStageTiming) => {
+  const codec = RpcSerialization.jsonRpc().makeUnsafe();
+  const split = makeLineSplitter();
+  const decodeLine = (line: string): ReadonlyArray<FramedWireMessage> => {
+    const startedAt = timing?.now() ?? 0;
+    const messages = codec.decode(line) as ReadonlyArray<WireMessage>;
+    timing?.record("json", timing.now() - startedAt, Buffer.byteLength(line, "utf8"));
+    return messages.map((message) => ({
+      message: normalizeAcpJsonRpcError(message),
+      lineLength: line.length,
+    }));
+  };
+  const decodeWithLengths = (bytes: Uint8Array | string): ReadonlyArray<FramedWireMessage> => {
+    const startedAt = timing?.now() ?? 0;
+    const lines = split(bytes);
+    timing?.record(
+      "framing",
+      timing.now() - startedAt,
+      typeof bytes === "string" ? Buffer.byteLength(bytes, "utf8") : bytes.byteLength,
+    );
+    return lines.flatMap((line) => (line.trim() === "" ? [] : decodeLine(line)));
+  };
+  return {
+    decode: (bytes: Uint8Array | string) => decodeWithLengths(bytes).map(({ message }) => message),
+    decodeWithLengths,
+    endWithLengths: () => {
+      const line = split.end();
+      try {
+        return line.trim() === "" ? [] : decodeLine(line);
+      } catch {
+        return [];
+      }
+    },
+    encode: (response: Parameters<typeof codec.encode>[0]) => {
+      const encoded = codec.encode(response);
+      if (encoded === undefined) return undefined;
+      const json = typeof encoded === "string" ? encoded : new TextDecoder().decode(encoded);
+      if (!json.includes('"_tag":"Cause"')) return `${json}\n`;
+      return `${JSON.stringify(normalizeOutgoingFrame(JSON.parse(json)))}\n`;
+    },
+  };
+};
+export type StrictNdJsonRpcParser = ReturnType<typeof makeStrictNdJsonRpcParser>;
+const isCauseResponse = Schema.is(
+  Schema.Struct({
+    error: Schema.TaggedStruct("Cause", { data: Schema.Array(Schema.Unknown) }),
+  }),
+);
+const isProtocolFailure = Schema.is(Schema.TaggedStruct("Fail", { error: AcpSchema.Error }));
+const isInterruptReason = Schema.is(Schema.TaggedStruct("Interrupt", {}));
+
+// Normalize only Effect's error envelope after the codec has completed batch tracking.
+function normalizeOutgoingFrame(frame: unknown): unknown {
+  if (Array.isArray(frame)) return frame.map(normalizeOutgoingFrame);
+  if (!isCauseResponse(frame)) return frame;
+  const reasons = frame.error.data.filter((reason) => !isInterruptReason(reason));
+  const [failure] = reasons;
+  const error =
+    reasons.length === 1 && isProtocolFailure(failure)
+      ? failure.error
+      : AcpError.AcpRequestError.internalError().toProtocolError();
+  return {
+    ...frame,
+    error: {
+      code: error.code,
+      message: error.message,
+      ...(error.data === undefined ? {} : { data: error.data }),
+    },
+  };
+}
+
+/** A malformed line fails the whole chunk, so none of its messages are routed. */
+export const decodeWireChunk = (
+  parser: StrictNdJsonRpcParser,
+  data: Uint8Array | string,
+): Result.Result<ReadonlyArray<WireMessage>, AcpError.AcpProtocolParseError> =>
+  Result.try({
+    try: () => (parser.decode(data) as ReadonlyArray<WireMessage>).map(normalizeAcpJsonRpcError),
+    catch: (cause) =>
+      new AcpError.AcpProtocolParseError({
+        operation: "decode-wire-message",
+        cause,
+      }),
+  });
+
+export const decodeFramedWireChunk = (
+  parser: StrictNdJsonRpcParser,
+  data: Uint8Array | string,
+): Result.Result<ReadonlyArray<FramedWireMessage>, AcpError.AcpProtocolParseError> =>
+  Result.try({
+    try: () => parser.decodeWithLengths(data),
+    catch: (cause) =>
+      new AcpError.AcpProtocolParseError({ operation: "decode-wire-message", cause }),
+  });
+
+export const decodeFailureDiagnostics = (error: AcpError.AcpProtocolParseError) => ({
+  operation: error.operation,
+  ...(error.method === undefined ? {} : { method: error.method }),
+  ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
+  ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
+  ...(error.issueKinds === undefined ? {} : { issueKinds: error.issueKinds }),
+  ...(error.maximumPathDepth === undefined ? {} : { maximumPathDepth: error.maximumPathDepth }),
+  ...(error.issueSummary === undefined ? {} : { issueSummary: error.issueSummary }),
+});
+
+export const isProtocolError = Schema.is(AcpSchema.Error);
+
+/**
+ * Effect RPC's JSON-RPC codec treats a standard JSON-RPC error object as a
+ * defect unless it carries Effect's private `_tag: "Cause"` envelope.
+ */
+function normalizeAcpJsonRpcError(message: WireMessage): WireMessage {
+  if (message._tag !== "Exit" || message.exit._tag !== "Failure") return message;
+  const [failure] = message.exit.cause;
+  if (
+    message.exit.cause.length !== 1 ||
+    failure?._tag !== "Die" ||
+    !isProtocolError(failure.defect)
+  ) {
+    return message;
+  }
+  return {
+    ...message,
+    exit: {
+      _tag: "Failure",
+      cause: [{ _tag: "Fail", error: failure.defect }],
+    },
+  };
+}
+
+/** A JSON-RPC batch: its request ids are state the encoder of the responses must hold. */
+export const isBatchLine = (line: string) => /^[ \t\r]*\[/.test(line);
+
+/** Finishes the messages of a line `makeOffloadedLineDecoder` decoded, as `decodeWireChunk` does. */
+export const normalizeOffloadedMessages = (
+  messages: ReadonlyArray<WireMessage>,
+): Result.Result<ReadonlyArray<WireMessage>, AcpError.AcpProtocolParseError> =>
+  Result.try({
+    try: () => messages.map(normalizeAcpJsonRpcError),
+    catch: (cause) =>
+      new AcpError.AcpProtocolParseError({
+        operation: "decode-wire-message",
+        cause,
+      }),
+  });

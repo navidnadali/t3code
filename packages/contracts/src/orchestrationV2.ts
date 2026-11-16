@@ -478,6 +478,8 @@ export const OrchestrationV2AppThread = Schema.Struct({
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
+  /** Advances when Resume supersedes earlier Stop holds, including in-flight steering. */
+  queueReleaseGeneration: Schema.optional(NonNegativeInt),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
@@ -758,6 +760,8 @@ export const OrchestrationV2Run = Schema.Struct({
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
   /** Starts a new provider conversation; earlier runs stay visible but never reach the provider. */
   freshContext: Schema.optional(Schema.Boolean),
+  /** The workspace the run started in; its checkpoints are taken there. Absent on older runs. */
+  workspaceCwd: Schema.optional(TrimmedNonEmptyString),
 });
 export type OrchestrationV2Run = typeof OrchestrationV2Run.Type;
 
@@ -771,6 +775,8 @@ export const OrchestrationV2RunAttempt = Schema.Struct({
   id: RunAttemptId,
   // Provider-thread rows can be reused after recovery; retain the native input destination.
   nativeThreadId: Schema.optional(Schema.String),
+  // Running can include preparation; only pending starts are safe to queue again after Stop.
+  providerStartState: Schema.optional(Schema.Literals(["pending", "invoked"])),
   runId: RunId,
   attemptOrdinal: PositiveInt,
   rootNodeId: NodeId,
@@ -978,6 +984,8 @@ export const OrchestrationV2CheckpointScope = Schema.Struct({
   ordinalWithinParent: NonNegativeInt,
   advancesAppRunCount: Schema.Boolean,
   cwd: TrimmedNonEmptyString,
+  /** The workspace by real path when the scope was created: its identity; cwd keeps the spelling. */
+  realCwd: Schema.optional(TrimmedNonEmptyString),
   createdAt: Schema.DateTimeUtc,
 });
 export type OrchestrationV2CheckpointScope = typeof OrchestrationV2CheckpointScope.Type;
@@ -1825,6 +1833,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("run_interrupt_request"),
     message: Schema.String,
+    holdQueue: Schema.optionalKey(Schema.Boolean),
+    queueHoldGeneration: Schema.optionalKey(NonNegativeInt),
     /** Set when the provider did not confirm the stop in time; clients then offer Force stop. */
     unresponsiveAt: Schema.optionalKey(Schema.DateTimeUtc),
   }),
@@ -2707,6 +2717,8 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("run_interrupt_request"),
     message: Schema.String,
+    holdQueue: Schema.optionalKey(Schema.Boolean),
+    queueHoldGeneration: Schema.optionalKey(NonNegativeInt),
     unresponsiveAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
   }),
   Schema.Struct({
@@ -3368,6 +3380,7 @@ export const OrchestrationV2Command = Schema.Union([
     restartContinuationOfRunId: Schema.optional(RunId),
     usageLimitContinuationOfRunId: Schema.optional(RunId),
     manualContinuationOfRunId: Schema.optional(RunId),
+    /** Requeues an accepted steer that could not be delivered; preserves Stop and queue holds. */
     steerFollowUpOfRunId: Schema.optional(RunId),
     steerFollowUpAfterRunOrdinal: Schema.optional(NonNegativeInt),
     usageLimitRecoveryRequestId: Schema.optional(CommandId),

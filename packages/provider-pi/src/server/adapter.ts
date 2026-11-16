@@ -62,6 +62,7 @@ import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/sel
 import {
   findReportedPiModel,
   makePiRpcConnection,
+  PiRpcError,
   resolvePiModelSlug,
   piRecordField as recordField,
   piRecordNumber as recordNumber,
@@ -364,6 +365,7 @@ interface ActivePiTurn {
   readonly toolStartedAt: Map<string, DateTime.Utc>;
   readonly commandOutputBytes: Map<string, number>;
   interrupted: boolean;
+  stopGeneration: number;
   nativeAborted: boolean;
   sawAgentActivity: boolean;
   adoptedWake: boolean;
@@ -417,9 +419,14 @@ function piApprovalRequestKind(title: string): "command" | "file-change" {
 const PI_COMPACTING_PROMPT_REJECTION = "Cannot submit a prompt while compaction is in progress";
 
 interface PiPromptSend {
+  readonly submit?: ProviderAdapter.ProviderAdapterV2TurnInput["submit"];
   readonly providerTurnId: OrchestrationV2ProviderTurn["id"];
   readonly kind: "turn_start" | "steer";
   readonly record: PiRpcRecord;
+  readonly acknowledgement?: Deferred.Deferred<
+    PiRpcRecord,
+    ProviderAdapter.ProviderAdapterProtocolError
+  >;
   readonly messageId?: MessageId;
 }
 
@@ -635,13 +642,20 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       // after it; they precede every prompt held since.
       let rejectedHeldCount = 0;
 
+      const nativeSubmission = (submit: ProviderAdapter.ProviderAdapterV2TurnInput["submit"]) =>
+        submit === undefined
+          ? undefined
+          : (enqueue: () => void) =>
+              submit(enqueue).pipe(
+                Effect.mapError((cause) => new PiRpcError({ operation: "submit", cause })),
+              );
       const sendPrompt = Effect.fnUntraced(function* (prompt: PiPromptSend) {
         if (nativeCompacting) {
           heldPrompts.push(prompt);
           return;
         }
         const id = `t3-prompt-${nextPromptId++}`;
-        yield* connection.send({ ...prompt.record, id });
+        yield* connection.send({ ...prompt.record, id }, nativeSubmission(prompt.submit));
         pendingPromptResponsesDrained ??= yield* Deferred.make<
           void,
           ProviderAdapter.ProviderAdapterProtocolError
@@ -1556,20 +1570,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           driver: PI_PROVIDER,
           threadId: pending.node.threadId,
           runtimeRequest: pending.runtimeRequest,
-        });
-        yield* emit({
-          type: "node.updated",
-          driver: PI_PROVIDER,
-          node: { ...pending.node, status: "cancelled", completedAt: resolvedAt },
-        });
-        yield* emit({
-          type: "turn_item.updated",
-          driver: PI_PROVIDER,
-          turnItem: {
-            ...pending.turnItem,
-            status: "cancelled",
-            completedAt: resolvedAt,
-            updatedAt: resolvedAt,
+          artifacts: {
+            node: { ...pending.node, status: "cancelled", completedAt: resolvedAt },
+            turnItem: {
+              ...pending.turnItem,
+              status: "cancelled",
+              completedAt: resolvedAt,
+              updatedAt: resolvedAt,
+            },
           },
         });
       });
@@ -1777,9 +1785,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           driver: PI_PROVIDER,
           threadId,
           runtimeRequest,
+          artifacts: { node, turnItem },
         });
-        yield* emit({ type: "node.updated", driver: PI_PROVIDER, node });
-        yield* emit({ type: "turn_item.updated", driver: PI_PROVIDER, turnItem });
         if (expiresAt !== null) {
           const now = yield* DateTime.now;
           pending.expirationFiber = yield* Effect.sleep(
@@ -2441,11 +2448,16 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             }
             const responseTurn =
               pendingPrompt?.providerTurnId === turn?.providerTurn.id ? turn : null;
+            if (pendingPrompt?.acknowledgement !== undefined)
+              yield* Deferred.succeed(pendingPrompt.acknowledgement, event);
             if (
               event["success"] === false &&
               nativeCompacting &&
               recordString(event, "error")?.startsWith(PI_COMPACTING_PROMPT_REJECTION) === true &&
               pendingPrompt !== undefined &&
+              // The durable worker owns a refused tracked prompt. Never retain
+              // another in-memory copy that could be released after Stop.
+              pendingPrompt.acknowledgement === undefined &&
               responseTurn !== null
             ) {
               heldPrompts.splice(rejectedHeldCount++, 0, pendingPrompt);
@@ -2635,6 +2647,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           sessionEventPermit.withPermits(1)(
             Effect.gen(function* () {
               runtimeRetired = true;
+              for (const prompt of pendingPromptResponses.splice(0)) {
+                if (prompt.acknowledgement !== undefined) {
+                  yield* Deferred.fail(
+                    prompt.acknowledgement,
+                    protocolError("Pi closed before acknowledging the steer"),
+                  );
+                }
+              }
               const state = threadState;
               closed = true;
               if (pendingPromptResponsesDrained !== null)
@@ -3144,6 +3164,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               toolStartedAt: new Map(),
               commandOutputBytes: new Map(),
               interrupted: false,
+              stopGeneration: 0,
               nativeAborted: false,
               sawAgentActivity: false,
               adoptedWake: false,
@@ -3185,7 +3206,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 state.activeTurn = activeTurn;
                 activeTurn.adoptedWake = wake !== null && !continuation;
                 if (compactCommand !== null) {
-                  yield* connection.send(compactRpcRecord(compactCommand));
+                  yield* connection.send(
+                    compactRpcRecord(compactCommand),
+                    nativeSubmission(turnInput.submit),
+                  );
                   pendingCompactResponses.push({
                     providerTurnId: providerTurn.id,
                     kind: "turn_start",
@@ -3194,6 +3218,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                   yield* sendPrompt({
                     providerTurnId: providerTurn.id,
                     kind: "turn_start",
+                    ...(turnInput.submit === undefined ? {} : { submit: turnInput.submit }),
                     record: {
                       type: "prompt",
                       message: payload.message,
@@ -3264,8 +3289,15 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           function* (steerInput: ProviderAdapter.ProviderAdapterV2SteerInput) {
             const turn = threadState?.activeTurn ?? null;
             if (turn === null || turn.providerTurn.id !== steerInput.providerTurnId) {
-              return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
+              return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                driver: PI_PROVIDER,
+                providerThreadId: steerInput.providerThread.id,
+                providerTurnId: steerInput.providerTurnId,
+                deliveryNotSent: true,
+                cause: `Pi turn ${steerInput.providerTurnId} is not active`,
+              });
             }
+            const stopGeneration = turn.stopGeneration;
             const compactCommand = parsePiCompactCommand(steerInput.message.text);
             const payload =
               compactCommand === null
@@ -3274,12 +3306,48 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                     steerInput.message.attachments,
                   )
                 : null;
-            // prompt with steer atomically queues or starts; fire-and-forget under the permit avoids dialog deadlocks.
+            const acknowledgement =
+              compactCommand === null && steerInput.beforeSubmit !== undefined
+                ? yield* Deferred.make<PiRpcRecord, ProviderAdapter.ProviderAdapterProtocolError>()
+                : undefined;
+            // Submit under the permit, then await the prompt ACK outside it so
+            // the pump can deliver extension dialogs and native responses.
             // /compact uses its RPC, which aborts the agent first.
             yield* sessionEventPermit.withPermits(1)(
               Effect.gen(function* () {
                 if (threadState?.activeTurn !== turn) {
-                  return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
+                  return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                    driver: PI_PROVIDER,
+                    providerThreadId: steerInput.providerThread.id,
+                    providerTurnId: steerInput.providerTurnId,
+                    deliveryNotSent: true,
+                    cause: `Pi turn ${steerInput.providerTurnId} is not active`,
+                  });
+                }
+                // Tracked steers must stay in the durable queue while compaction would
+                // otherwise buffer them in memory until a possibly interrupted turn.
+                if (
+                  nativeCompacting &&
+                  compactCommand === null &&
+                  steerInput.beforeSubmit !== undefined
+                ) {
+                  return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                    driver: PI_PROVIDER,
+                    providerThreadId: steerInput.providerThread.id,
+                    providerTurnId: steerInput.providerTurnId,
+                    deliveryNotSent: true,
+                    cause: "Pi is compacting; preserve the steer in the durable queue",
+                  });
+                }
+                if (steerInput.beforeSubmit !== undefined) yield* steerInput.beforeSubmit;
+                if (turn.interrupted || stopRequested || turn.stopGeneration !== stopGeneration) {
+                  return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                    driver: PI_PROVIDER,
+                    providerThreadId: steerInput.providerThread.id,
+                    providerTurnId: steerInput.providerTurnId,
+                    deliveryNotSent: true,
+                    cause: "Pi was stopped before the steer was submitted",
+                  });
                 }
                 if (compactCommand !== null) {
                   turn.manualCompactInFlight = true;
@@ -3293,6 +3361,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                     providerTurnId: turn.providerTurn.id,
                     kind: "steer",
                     messageId: steerInput.message.messageId,
+                    ...(acknowledgement === undefined ? {} : { acknowledgement }),
                     record: {
                       type: "prompt",
                       message: payload.message,
@@ -3304,17 +3373,38 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 turn.settleProbeGeneration += 1;
               }),
             );
+            if (acknowledgement !== undefined) {
+              const response = yield* Deferred.await(acknowledgement).pipe(
+                Effect.timeoutOrElse({
+                  duration: Duration.millis(PI_REQUEST_TIMEOUT_MS),
+                  orElse: () => Effect.fail(protocolError("Pi did not acknowledge the steer")),
+                }),
+              );
+              if (response["success"] !== true) {
+                const error = recordString(response, "error");
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver: PI_PROVIDER,
+                  providerThreadId: steerInput.providerThread.id,
+                  providerTurnId: steerInput.providerTurnId,
+                  ...(error?.startsWith(PI_COMPACTING_PROMPT_REJECTION) === true
+                    ? { deliveryNotSent: true }
+                    : {}),
+                  cause: error ?? "Pi did not accept the steer",
+                });
+              }
+            }
           },
           (effect, steerInput) =>
             effect.pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterSteerRunError({
-                    driver: PI_PROVIDER,
-                    providerThreadId: steerInput.providerThread.id,
-                    providerTurnId: steerInput.providerTurnId,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                ProviderAdapter.isProviderAdapterSteerRunError(cause)
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterSteerRunError({
+                      driver: PI_PROVIDER,
+                      providerThreadId: steerInput.providerThread.id,
+                      providerTurnId: steerInput.providerTurnId,
+                      cause,
+                    }),
               ),
             ),
         ),
@@ -3329,6 +3419,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
               return yield* protocolError(`Pi turn ${interruptInput.providerTurnId} is not active`);
             }
+            turn.stopGeneration += 1;
             turn.interrupted = true;
             if (
               interruptInput.requestRuntimeRestart === true ||
@@ -3413,20 +3504,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               driver: PI_PROVIDER,
               threadId: pending.node.threadId,
               runtimeRequest: pending.runtimeRequest,
-            });
-            yield* emit({
-              type: "node.updated",
-              driver: PI_PROVIDER,
-              node: { ...pending.node, status: "completed", completedAt: resolvedAt },
-            });
-            yield* emit({
-              type: "turn_item.updated",
-              driver: PI_PROVIDER,
-              turnItem: {
-                ...pending.turnItem,
-                status: "completed",
-                completedAt: resolvedAt,
-                updatedAt: resolvedAt,
+              artifacts: {
+                node: { ...pending.node, status: "completed", completedAt: resolvedAt },
+                turnItem: {
+                  ...pending.turnItem,
+                  status: "completed",
+                  completedAt: resolvedAt,
+                  updatedAt: resolvedAt,
+                },
               },
             });
           },

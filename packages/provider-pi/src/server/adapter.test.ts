@@ -33,6 +33,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
@@ -173,6 +174,7 @@ interface FakePi {
     type: "switch_session" | "new_session" | "fork" | "prompt" | "abort",
   ) => void;
   readonly deferNextModelSelection: () => void;
+  readonly deferNextPrompt: () => void;
   readonly queueModels: (models: ReadonlyArray<unknown>) => void;
   readonly vetoNextNewSession: () => void;
   readonly allRequests: () => ReadonlyArray<PiRpcRecord>;
@@ -237,6 +239,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
   let isStreaming: boolean | null = null;
   let isCompacting = false;
   let clearQueue: Parameters<FakePi["setClearQueue"]>[0] = { steering: [], followUp: [] };
+  const pendingPromptReplies: Array<unknown> = [];
   let stdinBuffer = "";
   let thinkingLevel = "high";
   const promptThinkingLevels: Array<string> = [];
@@ -249,6 +252,13 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
 
   const emit = (record: PiRpcRecord, chunkBytes?: number) =>
     Effect.gen(function* () {
+      if (record["type"] === "response" && record["command"] === "prompt") {
+        const index = record["id"] === undefined ? 0 : pendingPromptReplies.indexOf(record["id"]);
+        if (index >= 0 && index < pendingPromptReplies.length) {
+          const [id] = pendingPromptReplies.splice(index, 1);
+          record = { ...record, id };
+        }
+      }
       const bytes = new TextEncoder().encode(`${encodeJsonLine(record)}\n`);
       const size = chunkBytes ?? bytes.byteLength;
       for (let offset = 0; offset < bytes.byteLength; offset += size) {
@@ -358,6 +368,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         stdinBuffer = stdinBuffer.slice(newline + 1);
         if (line.length === 0) continue;
         const record = decodeJsonLine(line) as PiRpcRecord;
+        if (record["type"] === "prompt") pendingPromptReplies.push(record["id"]);
         if (
           record["type"] === "prompt" &&
           !String(record["message"]).startsWith(serviceTierCommand)
@@ -457,6 +468,9 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
     },
     deferNextLifecycle: (type) => {
       deferredLifecycle = type;
+    },
+    deferNextPrompt: () => {
+      deferredLifecycle = "prompt";
     },
     deferNextModelSelection: () => {
       deferredLifecycle = "set_model";
@@ -648,6 +662,11 @@ describe("PiAdapterV2", () => {
           observed.push(event);
           return event.type === "runtime_request.updated";
         });
+        const pending = observed.at(-1);
+        assert.isTrue(pending?.type === "runtime_request.updated");
+        if (pending?.type !== "runtime_request.updated") return;
+        assert.strictEqual(pending.artifacts?.node.id, pending.runtimeRequest.nodeId);
+        assert.strictEqual(pending.artifacts?.turnItem.nodeId, pending.runtimeRequest.nodeId);
         assert.deepInclude(runtime.providerSession, {
           extensionStatuses: [{ key: "watch", text: "Watching 4 files" }],
         });
@@ -1910,15 +1929,15 @@ describe("PiAdapterV2", () => {
           if (
             event.type === "runtime_request.updated" &&
             event.runtimeRequest.id === dialog.runtimeRequest.id
-          )
+          ) {
             requestCancelled = event.runtimeRequest.status === "cancelled";
-          if (event.type === "node.updated" && event.node.id === dialog.runtimeRequest.nodeId)
-            nodeCancelled = event.node.status === "cancelled";
-          if (
-            event.type === "turn_item.updated" &&
-            event.turnItem.nodeId === dialog.runtimeRequest.nodeId
-          )
-            itemCancelled = event.turnItem.status === "cancelled";
+            nodeCancelled =
+              event.artifacts?.node.id === dialog.runtimeRequest.nodeId &&
+              event.artifacts.node.status === "cancelled";
+            itemCancelled =
+              event.artifacts?.turnItem.nodeId === dialog.runtimeRequest.nodeId &&
+              event.artifacts.turnItem.status === "cancelled";
+          }
           return (
             event.type === "provider_session.updated" &&
             event.providerSession.status ===
@@ -4426,12 +4445,16 @@ describe("PiAdapterV2", () => {
         });
         const event = yield* takeEvent(
           (event) =>
-            event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+            event.type === "runtime_request.updated" &&
+            event.artifacts?.turnItem.type === "user_input_request",
         );
-        if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request") {
+        if (
+          event.type !== "runtime_request.updated" ||
+          event.artifacts?.turnItem.type !== "user_input_request"
+        ) {
           return assert.fail("expected a user input request");
         }
-        const question = decodeUserInputQuestions(event.turnItem.questions)[0]!;
+        const question = decodeUserInputQuestions(event.artifacts.turnItem.questions)[0]!;
         assert.equal(question.header, title.trim() ? title : "Question");
         assert.equal(question.question, "Your name");
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
@@ -4455,12 +4478,16 @@ describe("PiAdapterV2", () => {
       });
       const event = yield* takeEvent(
         (event) =>
-          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+          event.type === "runtime_request.updated" &&
+          event.artifacts?.turnItem.type === "user_input_request",
       );
-      if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request") {
+      if (
+        event.type !== "runtime_request.updated" ||
+        event.artifacts?.turnItem.type !== "user_input_request"
+      ) {
         return assert.fail("expected a user input request");
       }
-      const questions = decodeUserInputQuestions(event.turnItem.questions);
+      const questions = decodeUserInputQuestions(event.artifacts.turnItem.questions);
       assert.deepEqual(
         questions[0]?.options.map((option) => [option.label, option.value]),
         [
@@ -4471,7 +4498,7 @@ describe("PiAdapterV2", () => {
       assert.equal(questions[0]?.header, "Question");
       assert.equal(questions[0]?.question, "Pick a tag");
       yield* runtime.respondToRuntimeRequest({
-        requestId: event.turnItem.requestId,
+        requestId: event.artifacts.turnItem.requestId,
         answers: { "ui-select": "" },
       });
       const response = yield* fake.takeRequest("extension_ui_response");
@@ -4502,16 +4529,20 @@ describe("PiAdapterV2", () => {
         });
         const event = yield* takeEvent(
           (event) =>
-            event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+            event.type === "runtime_request.updated" &&
+            event.artifacts?.turnItem.type === "user_input_request",
         );
-        if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request") {
+        if (
+          event.type !== "runtime_request.updated" ||
+          event.artifacts?.turnItem.type !== "user_input_request"
+        ) {
           return assert.fail("expected a user input request");
         }
-        const question = decodeUserInputQuestions(event.turnItem.questions)[0]!;
+        const question = decodeUserInputQuestions(event.artifacts.turnItem.questions)[0]!;
         assert.equal(question.header, "Question");
         assert.equal(question.question, title.trim() ? title : "Question");
         yield* runtime.respondToRuntimeRequest({
-          requestId: event.turnItem.requestId,
+          requestId: event.artifacts.turnItem.requestId,
           answers: { "ui-input": "SQLite" },
         });
         const response = yield* fake.takeRequest("extension_ui_response");
@@ -4539,17 +4570,21 @@ describe("PiAdapterV2", () => {
       });
       const event = yield* takeEvent(
         (event) =>
-          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
+          event.type === "runtime_request.updated" &&
+          event.artifacts?.turnItem.type === "user_input_request",
       );
-      if (event.type !== "turn_item.updated" || event.turnItem.type !== "user_input_request")
+      if (
+        event.type !== "runtime_request.updated" ||
+        event.artifacts?.turnItem.type !== "user_input_request"
+      )
         return;
-      assert.equal(event.turnItem.questions[0]?.initialAnswer, prefill);
-      assert.deepEqual(event.turnItem.questions[0]?.options, []);
-      assert.equal(event.turnItem.questions[0]?.header, "Question");
-      assert.equal(event.turnItem.questions[0]?.question, "Commit message");
+      assert.equal(event.artifacts.turnItem.questions[0]?.initialAnswer, prefill);
+      assert.deepEqual(event.artifacts.turnItem.questions[0]?.options, []);
+      assert.equal(event.artifacts.turnItem.questions[0]?.header, "Question");
+      assert.equal(event.artifacts.turnItem.questions[0]?.question, "Commit message");
       const edited = "  fix(server): edited commit message\n\n";
       yield* runtime.respondToRuntimeRequest({
-        requestId: event.turnItem.requestId,
+        requestId: event.artifacts.turnItem.requestId,
         answers: { "ui-editor": edited },
       });
       const response = yield* fake.takeRequest("extension_ui_response");
@@ -4564,14 +4599,19 @@ describe("PiAdapterV2", () => {
       });
       const cleared = yield* takeEvent(
         (event) =>
-          event.type === "turn_item.updated" &&
-          event.turnItem.type === "user_input_request" &&
-          event.turnItem.questions.some((question) => question.id === "ui-editor-cleared"),
+          event.type === "runtime_request.updated" &&
+          event.artifacts?.turnItem.type === "user_input_request" &&
+          event.artifacts.turnItem.questions.some(
+            (question) => question.id === "ui-editor-cleared",
+          ),
       );
-      if (cleared.type !== "turn_item.updated" || cleared.turnItem.type !== "user_input_request")
+      if (
+        cleared.type !== "runtime_request.updated" ||
+        cleared.artifacts?.turnItem.type !== "user_input_request"
+      )
         return;
       yield* runtime.respondToRuntimeRequest({
-        requestId: cleared.turnItem.requestId,
+        requestId: cleared.artifacts.turnItem.requestId,
         answers: { "ui-editor-cleared": "" },
       });
       const emptyResponse = yield* fake.takeRequest("extension_ui_response");
@@ -4599,12 +4639,13 @@ describe("PiAdapterV2", () => {
         yield* fake.emit({ type: "extension_ui_request", id, method: "confirm", title });
         const item = yield* takeEvent(
           (event) =>
-            event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
+            event.type === "runtime_request.updated" &&
+            event.artifacts?.turnItem.type === "approval_request",
         );
         assert.isTrue(
-          item.type === "turn_item.updated" &&
-            item.turnItem.type === "approval_request" &&
-            item.turnItem.requestKind === requestKind,
+          item.type === "runtime_request.updated" &&
+            item.artifacts?.turnItem.type === "approval_request" &&
+            item.artifacts.turnItem.requestKind === requestKind,
           `${title} should be ${requestKind}`,
         );
       }
@@ -5750,77 +5791,299 @@ describe("PiAdapterV2", () => {
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
-  it.effect("delivers a steer sent during in-turn compaction once it ends", () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakePi;
-      const { runtime, takeEvent } = yield* openRuntime(fake);
-      const providerThread = yield* runtime.ensureThread({
-        threadId: THREAD_ID,
-        modelSelection: modelSelection("default"),
-        runtimePolicy,
-      });
-      yield* startTurn(runtime, providerThread);
-      yield* fake.takeRequest("prompt");
-      const running = yield* takeEvent(
-        (event) =>
-          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
-      );
-      const providerTurnId =
-        running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
-      assert.isDefined(providerTurnId);
-      yield* fake.emit({ type: "agent_start" });
-      fake.queueState({ isStreaming: false, isCompacting: true, pendingMessageCount: 0 });
-      yield* fake.emit({ type: "agent_settled" });
-      yield* fake.takeRequest("get_state");
-      fake.setCompacting(true);
-      yield* fake.emit({ type: "compaction_start", reason: "manual" });
-      yield* takeEvent(
-        (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
-      );
+  it.effect.each(["accepted", "rejected", "closed", "timeout", "stopped", "failed-stop"] as const)(
+    "waits for a tracked steer acknowledgement without blocking dialogs, outcome=%s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        fake.deferNextPrompt();
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "response", command: "prompt", success: true });
+        yield* fake.emit({ type: "agent_start" });
+        const running = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        );
+        if (running.type !== "provider_turn.updated") throw new Error("Expected running turn");
+        if (outcome === "stopped" || outcome === "failed-stop") fake.setStreaming(false);
+        fake.deferNextPrompt();
+        const pending = yield* runtime
+          .steerTurn({
+            threadId: THREAD_ID,
+            runId: RunId.make("run:thread-pi-test:1"),
+            providerThread,
+            providerTurnId: running.providerTurn.id,
+            beforeSubmit:
+              outcome === "failed-stop"
+                ? Effect.gen(function* () {
+                    fake.deferNextLifecycle("abort");
+                    const stopping = yield* runtime
+                      .interruptTurn({ providerThread, providerTurnId: running.providerTurn.id })
+                      .pipe(Effect.exit, Effect.forkScoped);
+                    const abort = yield* fake.takeRequest("abort");
+                    yield* fake.emit({
+                      type: "response",
+                      id: abort["id"],
+                      command: "abort",
+                      success: false,
+                      error: "Stop failed",
+                    });
+                    assert.isTrue(Exit.isFailure(yield* Fiber.join(stopping)));
+                  }).pipe(Effect.scoped)
+                : outcome === "stopped"
+                  ? runtime
+                      .interruptTurn({ providerThread, providerTurnId: running.providerTurn.id })
+                      .pipe(Effect.orDie)
+                  : Effect.void,
+            message: {
+              messageId: "message:tracked-ack" as never,
+              text: "Tracked steer",
+              attachments: [],
+              createdBy: "user",
+              creationSource: "web",
+            },
+          })
+          .pipe(Effect.forkScoped);
+        if (outcome === "stopped" || outcome === "failed-stop") {
+          const error = yield* Fiber.join(pending).pipe(Effect.flip);
+          assert.isTrue(
+            ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+          );
+          assert.equal(
+            fake.allRequests().filter((request) => request["type"] === "prompt").length,
+            1,
+          );
+          return;
+        }
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "steer-dialog",
+          method: "confirm",
+          title: "Accept input?",
+        });
+        const dialog = yield* takeEvent((event) => event.type === "runtime_request.updated");
+        assert.isUndefined(
+          pending.pollUnsafe(),
+          "A transport write is not a native acknowledgement",
+        );
+        if (dialog.type !== "runtime_request.updated") throw new Error("Expected dialog");
+        yield* runtime.respondToRuntimeRequest({
+          requestId: dialog.runtimeRequest.id,
+          decision: "accept",
+        });
+        yield* fake.takeRequest("extension_ui_response");
+        if (outcome === "closed") yield* fake.closeStdout;
+        else if (outcome === "timeout") yield* TestClock.adjust("15 seconds");
+        else
+          yield* fake.emit({
+            type: "response",
+            command: "prompt",
+            success: outcome === "accepted",
+            error: "Extension failed after handling input",
+          });
+        if (outcome === "accepted") yield* Fiber.join(pending);
+        else {
+          const error = yield* Fiber.join(pending).pipe(Effect.flip);
+          assert.isTrue(ProviderAdapter.isProviderAdapterSteerRunError(error));
+          assert.isFalse(
+            ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+            "An uncertain outcome must not be replayed",
+          );
+        }
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
 
-      yield* runtime.steerTurn({
-        threadId: THREAD_ID,
-        runId: RunId.make("run:thread-pi-test:1"),
-        providerThread,
-        providerTurnId: providerTurnId!,
-        message: {
-          messageId: "message:thread-pi-test:steer-during-compaction" as never,
-          text: "Steer during compaction",
-          attachments: [],
-          createdBy: "user",
-          creationSource: "web",
-        },
-      });
-      fake.setCompacting(false);
-      const compactionEnded = fake.allRequests().length;
-      yield* fake.emit({
-        type: "compaction_end",
-        reason: "manual",
-        result: { summary: "smaller", tokensBefore: 10_000, estimatedTokensAfter: 2_000 },
-        aborted: false,
-        willRetry: false,
-      });
-      const delivered = yield* fake.takeRequest("prompt");
-      assert.equal(delivered["message"], "Steer during compaction");
-      yield* fake.emit({ type: "agent_start" });
-      fake.queueState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
-      yield* fake.emit({ type: "agent_settled" });
-      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
-      assert.equal(
-        fake
-          .allRequests()
-          .slice(compactionEnded)
-          .filter(
-            (request) =>
-              request["type"] === "prompt" && request["message"] === "Steer during compaction",
-          ).length,
-        1,
-      );
-      assert.isTrue(
-        terminal.type === "turn.terminal" && terminal.status === "completed",
-        `turn ended ${terminal.type === "turn.terminal" ? terminal.status : terminal.type}`,
-      );
-    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  it.effect.each([
+    { tracked: false, race: false, lateStartAck: false },
+    { tracked: true, race: false, lateStartAck: false },
+    { tracked: true, race: true, lateStartAck: false },
+    { tracked: true, race: true, lateStartAck: true },
+  ])(
+    "preserves a steer during in-turn compaction, tracked=$tracked, race=$race, lateStartAck=$lateStartAck",
+    ({ tracked, race, lateStartAck }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        const initialPrompt = yield* fake.takeRequest("prompt");
+        if (!lateStartAck)
+          yield* fake.emit({
+            type: "response",
+            id: initialPrompt["id"],
+            command: "prompt",
+            success: true,
+          });
+        const running = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        );
+        const providerTurnId =
+          running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
+        assert.isDefined(providerTurnId);
+        yield* fake.emit({ type: "agent_start" });
+        if (!race) {
+          fake.queueState({ isStreaming: false, isCompacting: true, pendingMessageCount: 0 });
+          yield* fake.emit({ type: "agent_settled" });
+          yield* fake.takeRequest("get_state");
+          fake.setCompacting(true);
+          yield* fake.emit({ type: "compaction_start", reason: "manual" });
+          yield* takeEvent(
+            (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
+          );
+        }
+
+        const steering: ProviderAdapter.ProviderAdapterV2SteerInput = {
+          threadId: THREAD_ID,
+          runId: RunId.make("run:thread-pi-test:1"),
+          providerThread,
+          providerTurnId: providerTurnId!,
+          message: {
+            messageId: "message:thread-pi-test:steer-during-compaction" as never,
+            text: "Steer during compaction",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+          },
+        };
+        if (tracked) {
+          if (race) fake.deferNextPrompt();
+          let submitted = 0;
+          const pending = yield* runtime
+            .steerTurn({
+              ...steering,
+              beforeSubmit: Effect.gen(function* () {
+                submitted += 1;
+                if (race) {
+                  fake.setCompacting(true);
+                  yield* fake.emit({ type: "compaction_start", reason: "manual" });
+                }
+              }),
+            })
+            .pipe(Effect.flip, Effect.forkScoped);
+          if (race) {
+            const steerPrompt = yield* fake.takeRequest("prompt");
+            yield* fake.emit({
+              type: "response",
+              id: steerPrompt["id"],
+              command: "prompt",
+              success: false,
+              error: "Cannot submit a prompt while compaction is in progress",
+            });
+          }
+          if (lateStartAck)
+            yield* fake.emit({
+              type: "response",
+              id: initialPrompt["id"],
+              command: "prompt",
+              success: true,
+            });
+          const refused = yield* Fiber.join(pending);
+          assert.isTrue(
+            ProviderAdapter.isProviderAdapterSteerRunError(refused) &&
+              refused.deliveryNotSent === true,
+          );
+          assert.equal(submitted, race ? 1 : 0);
+          yield* runtime.interruptTurn({ providerThread, providerTurnId: providerTurnId! });
+          fake.setCompacting(false);
+          yield* fake.emit({
+            type: "compaction_end",
+            reason: "manual",
+            result: null,
+            aborted: true,
+          });
+          yield* fake.closeStdout;
+          const stopped = yield* takeEvent((event) => event.type === "turn.terminal");
+          assert.isTrue(stopped.type === "turn.terminal" && stopped.status === "interrupted");
+          assert.equal(
+            fake.allRequests().filter((request) => request["message"] === steering.message.text)
+              .length,
+            race ? 1 : 0,
+          );
+
+          // The durable worker retains the refused input until Resume starts a fresh runtime.
+          const resumedFake = yield* makeFakePi;
+          const resumed = yield* openRuntime(resumedFake);
+          const resumedThread = yield* resumed.runtime.ensureThread({
+            threadId: THREAD_ID,
+            modelSelection: modelSelection("default"),
+            runtimePolicy,
+          });
+          const resumedRun = RunId.make(`run:${THREAD_ID}:2`);
+          yield* resumed.runtime.startTurn({
+            appThread: yield* makeAppThread("default"),
+            threadId: THREAD_ID,
+            runId: resumedRun,
+            runOrdinal: 2,
+            providerTurnOrdinal: 2,
+            attemptId: RunAttemptId.make(`run-attempt:${resumedRun}:1`),
+            rootNodeId: NodeId.make(`node:${resumedRun}:root`),
+            providerThread: resumedThread,
+            message: steering.message,
+            modelSelection: modelSelection("default"),
+            runtimePolicy,
+          });
+          const delivered = yield* resumedFake.takeRequest("prompt");
+          assert.equal(delivered["message"], steering.message.text);
+          yield* resumedFake.emit({ type: "agent_start" });
+          yield* resumedFake.emit({ type: "agent_settled" });
+          const completed = yield* resumed.takeEvent((event) => event.type === "turn.terminal");
+          assert.isTrue(completed.type === "turn.terminal" && completed.status === "completed");
+          assert.equal(
+            resumedFake.allRequests().filter((request) => request["type"] === "prompt").length,
+            1,
+          );
+          return;
+        }
+        yield* runtime.steerTurn(steering);
+        fake.setCompacting(false);
+        const compactionEnded = fake.allRequests().length;
+        yield* fake.emit({
+          type: "compaction_end",
+          reason: "manual",
+          result: { summary: "smaller", tokensBefore: 10_000, estimatedTokensAfter: 2_000 },
+          aborted: false,
+          willRetry: false,
+        });
+        const delivered = yield* fake.takeRequest("prompt");
+        assert.equal(delivered["message"], "Steer during compaction");
+        yield* fake.emit({ type: "agent_start" });
+        fake.queueState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+        yield* fake.emit({ type: "agent_settled" });
+        const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.equal(
+          fake
+            .allRequests()
+            .slice(compactionEnded)
+            .filter(
+              (request) =>
+                request["type"] === "prompt" && request["message"] === "Steer during compaction",
+            ).length,
+          1,
+        );
+        assert.isTrue(
+          terminal.type === "turn.terminal" && terminal.status === "completed",
+          `turn ended ${terminal.type === "turn.terminal" ? terminal.status : terminal.type}`,
+        );
+        const count = fake.allRequests().length;
+        const late = yield* runtime.steerTurn(steering).pipe(Effect.flip);
+        assert.isTrue(
+          ProviderAdapter.isProviderAdapterSteerRunError(late) && late.deliveryNotSent === true,
+        );
+        assert.equal(fake.allRequests().length, count);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   it.effect("keeps working after a settle probe fails before detached compaction", () =>
@@ -5899,6 +6162,111 @@ describe("PiAdapterV2", () => {
       const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
       assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "interrupted");
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([false, true])(
+    "ignores a stale idle snapshot and settles a refused steer, rejected=%s",
+    (rejected) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        fake.deferNextPrompt();
+        yield* startTurn(runtime, providerThread);
+        const initialPrompt = yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "response",
+          id: initialPrompt["id"],
+          command: "prompt",
+          success: true,
+        });
+        const running = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        );
+        assert.equal(running.type, "provider_turn.updated");
+        const providerTurnId =
+          running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
+        assert.isDefined(providerTurnId);
+        yield* fake.emit({ type: "agent_start" });
+
+        fake.deferNextState();
+        yield* fake.emit({ type: "agent_settled" });
+        yield* fake.takeRequest("get_state");
+        if (rejected) fake.deferNextPrompt();
+        const steering = yield* runtime
+          .steerTurn({
+            ...(rejected ? { beforeSubmit: Effect.void } : {}),
+            threadId: THREAD_ID,
+            runId: RunId.make("run:thread-pi-test:1"),
+            providerThread,
+            providerTurnId: providerTurnId!,
+            message: {
+              messageId: "message:thread-pi-test:late-steer" as never,
+              text: "Continue after settlement",
+              attachments: [],
+              createdBy: "user",
+              creationSource: "web",
+            },
+          })
+          .pipe(Effect.forkScoped);
+        const steerPrompt = yield* fake.takeRequest("prompt");
+        yield* fake.resolveDeferredState({
+          isStreaming: false,
+          isCompacting: false,
+          pendingMessageCount: 0,
+        });
+
+        if (rejected) {
+          yield* fake.emit({
+            type: "response",
+            id: steerPrompt["id"],
+            command: "prompt",
+            success: false,
+            error: "Model unavailable",
+          });
+          yield* Fiber.join(steering).pipe(Effect.flip);
+          const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+          assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+          return;
+        }
+        yield* Fiber.join(steering);
+        yield* fake.emit({ type: "agent_start" });
+        yield* fake.emit({ type: "message_start", message: { role: "assistant" } });
+        yield* fake.emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Recovered" },
+        });
+        yield* fake.emit({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Recovered" }],
+            stopReason: "stop",
+          },
+        });
+        const assistantItem = yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "assistant_message" &&
+            event.turnItem.streaming === false,
+        );
+        assert.isTrue(
+          assistantItem.type === "turn_item.updated" &&
+            assistantItem.turnItem.type === "assistant_message" &&
+            assistantItem.turnItem.text === "Recovered",
+        );
+
+        fake.queueState({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* fake.takeRequest("get_state");
+        const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   it.effect.each([

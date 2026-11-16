@@ -1,11 +1,14 @@
+// @effect-diagnostics nodeBuiltinImport:off - Vite config runs before any Effect runtime.
 import "vite-plus/test/config";
-// @effect-diagnostics-next-line nodeBuiltinImport:off -- tsdown needs the asset path when it reads this config.
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import { defineConfig, mergeConfig } from "vite-plus";
+import { seaBuildOptions } from "@t3tools/shared/youngGenerationEnv";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
-import { resolveTaggedSourceVersion } from "../../scripts/lib/tagged-source-version.ts";
+import { providerIoWorkerBundle } from "../../scripts/lib/provider-io-worker-bundle.ts";
+import { resolveBuildVersion } from "../../scripts/lib/tagged-source-version.ts";
 import rootPackageJson from "../../package.json" with { type: "json" };
 import packageJson from "./package.json" with { type: "json" };
 import { WeightedShardSequencer } from "./src/testUtils/weightedShardSequencer.ts";
@@ -21,9 +24,10 @@ export { shouldBundleCliDependency };
 const repoEnv = loadRepoEnv();
 const serverManifestPath = NodePath.join(import.meta.dirname, "package.json");
 // The desktop packager passes APP_VERSION; it can equal the manifest at a commit tagged otherwise.
-const buildVersion =
-  process.env.APP_VERSION?.trim() ||
-  resolveTaggedSourceVersion(NodePath.join(import.meta.dirname, "../.."), packageJson.version);
+const buildVersion = resolveBuildVersion(
+  NodePath.join(import.meta.dirname, "../.."),
+  packageJson.version,
+);
 const cliBuildChannel = /^[^-+]+-(?:nightly|preview)\./.test(buildVersion) ? "nightly" : "latest";
 // Official release workflows set the telemetry channel; local builds and forks use "dev".
 const TELEMETRY_CHANNELS = ["stable", "nightly", "preview", "dev"];
@@ -43,6 +47,7 @@ const packBootstrap = packMode === "1" || packMode === "bootstrap";
 const packExecutable = packBootstrap || packMode === "bundle";
 const cliAssetDir = process.env.T3CODE_CLI_ASSET_DIR ?? "";
 if (packExecutable && !cliAssetDir) throw new Error("Build the executable with build:exe.");
+const packExecutableOutDir = process.env.T3CODE_PACK_EXE_OUT_DIR?.trim() || "dist-exe";
 // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
 // No linux-arm64: --build-sea output cannot load on 16/64 KiB page kernels, so it builds natively.
 const SEA_TARGETS = {
@@ -64,6 +69,7 @@ if (packExecutableTarget && !Object.hasOwn(SEA_TARGETS, packExecutableTarget)) {
     `T3CODE_PACK_EXE_TARGET must be one of ${Object.keys(SEA_TARGETS).join(", ")}, got "${packExecutableTarget}".`,
   );
 }
+const packSeaOptions = seaBuildOptions();
 const packExecutableTargets = packExecutableTarget
   ? [
       {
@@ -72,6 +78,8 @@ const packExecutableTargets = packExecutableTarget
       },
     ]
   : undefined;
+
+const providerIoDir = NodeURL.fileURLToPath(new URL("./src/provider/io/", import.meta.url));
 
 // The root config's `projects` route repo-root runs to package configs,
 // including this one. Inheriting them would make this config a container.
@@ -104,6 +112,14 @@ export default mergeConfig(
             };
           },
         },
+        ...(packBootstrap
+          ? []
+          : [
+              providerIoWorkerBundle({
+                entry: NodePath.join(providerIoDir, "providerIoWorker.ts"),
+                placeholder: NodePath.join(providerIoDir, "embeddedProviderIoWorker.ts"),
+              }),
+            ]),
       ],
       // SEA embeds one entry; expose the history worker as a hidden subcommand.
       entry: packBootstrap
@@ -111,7 +127,7 @@ export default mergeConfig(
         : packExecutable
           ? ["src/binMain.ts"]
           : ["src/bin.ts", "src/claude-history-worker.ts"],
-      outDir: packBootstrap ? "dist-exe" : packExecutable ? cliAssetDir : "dist",
+      outDir: packBootstrap ? packExecutableOutDir : packExecutable ? cliAssetDir : "dist",
       sourcemap: !packExecutable,
       clean: true,
       // SEA can only resolve built-ins; keep dynamic imports inside each emitted module.
@@ -120,13 +136,13 @@ export default mergeConfig(
         ? {
             exe: {
               fileName: "t3",
-              outDir: "dist-exe",
+              outDir: packExecutableOutDir,
               ...(packExecutableTargets ? { targets: packExecutableTargets } : {}),
               // Node SEA useCodeCache breaks import(), which the server needs.
               seaConfig: {
                 useCodeCache: false,
-                // The bootstrap loads the embedded CLI with require(esm).
-                execArgv: ["--require-module"],
+                execArgv: [...packSeaOptions.execArgv, "--require-module"],
+                execArgvExtension: packSeaOptions.execArgvExtension,
                 assets: { "binMain.mjs": NodePath.join(cliAssetDir, "binMain.mjs") },
               },
             },

@@ -14,6 +14,9 @@ import * as NodeOS from "node:os";
 import * as SqlClient from "effect/sql/SqlClient";
 import { isSqlError } from "effect/sql/SqlError";
 
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as EventStore from "../orchestration-v2/EventStore.ts";
+import { verifyProjectionIntegrity } from "../orchestration-v2/ProjectionIntegrity.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import { rebuildMessageSearch } from "../orchestration-v2/messageSearchIndex.ts";
 
@@ -49,6 +52,19 @@ export class DatabaseInspectError extends Schema.TaggedError<DatabaseInspectErro
 ) {
   override get message() {
     return "Could not read the database. Check that this user can open it.";
+  }
+}
+
+class DatabaseProjectionsInvalidError extends Schema.TaggedError<DatabaseProjectionsInvalidError>()(
+  "DatabaseProjectionsInvalidError",
+  {
+    path: Schema.String,
+    missingThreadIds: Schema.Array(Schema.String),
+    unreadableThreadIds: Schema.Array(Schema.String),
+  },
+) {
+  override get message() {
+    return "Database projections are missing, unreadable, or behind their events. History was not pruned; restore or repair the projections before compacting.";
   }
 }
 
@@ -198,6 +214,15 @@ const make = Effect.gen(function* () {
         yield* lockExclusively(databasePath);
         const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
         yield* onStep("prune-events");
+        const verified = yield* verifyProjectionIntegrity.pipe(
+          Effect.provide(Layer.merge(ProjectionStore.layer, EventStore.layer)),
+        );
+        if (!verified.valid)
+          return yield* new DatabaseProjectionsInvalidError({
+            path: databasePath,
+            missingThreadIds: verified.missingThreadIds,
+            unreadableThreadIds: verified.unreadableThreadIds,
+          });
         const summary = yield* maintenance.pruneEventStore();
         yield* onStep("vacuum");
         // VACUUM is required to enable incremental auto_vacuum on existing databases.

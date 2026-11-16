@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import type {
   ApplicationStoredEvent,
+  OrchestrationProjectShell,
   OrchestrationV2ShellSnapshot,
   OrchestrationV2ShellStreamItem,
   OrchestrationV2ThreadShell,
@@ -11,6 +12,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -18,16 +20,18 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   activeShellRowsForSubscriber,
-  bufferShellLiveStream,
   composeShellStreamWithEnrichment,
   dedupeShellEnrichment,
   omitIdleSubagentShells,
   omitOlderSettledShells,
+  projectShellDeltas,
+  shellDeltaKey,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemsFromInitialSnapshot,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
 } from "./ShellStream.ts";
+import { bufferLatestLiveStream } from "./LiveStreamBudget.ts";
 
 const emptyShellSnapshot = {
   schemaVersion: 1,
@@ -129,8 +133,9 @@ it.effect("coalesces a slow shell subscriber by identity and location in sequenc
       { kind: "thread.removed", sequence: 11, location: "archive", threadId: shell.id },
     ] satisfies Array<Extract<OrchestrationV2ShellStreamItem, { readonly sequence: number }>>;
     const pull = yield* Stream.toPull(
-      bufferShellLiveStream(
+      bufferLatestLiveStream(
         Stream.fromQueue(input).pipe(Stream.ensuring(Deferred.succeed(drained, undefined))),
+        shellDeltaKey,
         { maxItems: 6, maxSerializedBytes: 1_500 },
       ),
     );
@@ -429,13 +434,14 @@ describe("composeShellStreamWithEnrichment", () => {
       const pull = yield* Stream.toPull(
         composeShellStreamWithEnrichment({
           initial: Stream.empty,
-          tail: bufferShellLiveStream(
+          tail: bufferLatestLiveStream(
             Stream.concat(
               Stream.succeed(initial),
               Stream.fromEffect(Deferred.await(update)).pipe(
                 Stream.map(() => ({ ...initial, sequence: 2 })),
               ),
             ).pipe(Stream.ensuring(Deferred.succeed(closed, undefined))),
+            shellDeltaKey,
             { maxItems: 1 },
           ),
           enrichment: Stream.empty,
@@ -692,6 +698,58 @@ describe("skipUnchangedThreadShells", () => {
         updated(3, shell("a")),
       ]);
       expect(sent).toEqual([1, 2, 3]);
+    }),
+  );
+});
+
+describe("projectShellDeltas", () => {
+  it.effect("reads each thread and project once per burst and keeps each item's own sequence", () =>
+    Effect.gen(function* () {
+      const threadReads: Array<string> = [];
+      const projectReads: Array<string> = [];
+      const thread = (threadId: string, sequence: number) => ({
+        sequence,
+        event: { threadId: ThreadId.make(threadId) },
+      });
+      const project = (projectId: string, sequence: number) => ({
+        aggregateKind: "project" as const,
+        aggregateId: ProjectId.make(projectId),
+        type: "project.meta-updated" as const,
+        sequence,
+      });
+      const deltas = yield* projectShellDeltas(
+        [
+          thread("thread-a", 1),
+          thread("thread-b", 2),
+          project("project-p", 3),
+          thread("thread-a", 4),
+          project("project-p", 5),
+        ],
+        {
+          threadShell: ({ threadId, sequence }) =>
+            Effect.sync(() => {
+              threadReads.push(`${threadId}@${sequence}`);
+              return { shell: shellFixture({ id: threadId }), readOrdinal: sequence };
+            }),
+          projectShell: ({ projectId, sequence }) =>
+            Effect.sync(() => {
+              projectReads.push(`${projectId}@${sequence}`);
+              return {
+                project: Option.some({ id: projectId } as OrchestrationProjectShell),
+                readOrdinal: sequence,
+              };
+            }),
+        },
+      );
+      expect(threadReads).toEqual(["thread-b@2", "thread-a@4"]);
+      expect(projectReads).toEqual(["project-p@5"]);
+      expect(
+        deltas.map(({ item, readOrdinal }) => [item.kind, item.sequence, readOrdinal]),
+      ).toEqual([
+        ["thread.updated", 2, 2],
+        ["thread.updated", 4, 4],
+        ["project.updated", 5, 5],
+      ]);
     }),
   );
 });

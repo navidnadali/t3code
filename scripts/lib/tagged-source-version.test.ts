@@ -5,7 +5,11 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
 
-import { releasePackageFiles, resolveTaggedSourceVersion } from "./tagged-source-version.ts";
+import {
+  releasePackageFiles,
+  resolveBuildVersion,
+  resolveTaggedSourceVersion,
+} from "./tagged-source-version.ts";
 
 function makeRoot() {
   const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "tagged-source-version-"));
@@ -56,4 +60,15 @@ it("reports the single stable tag on HEAD unless a release manifest was edited",
 it("keeps the manifest version in a source archive without Git metadata", () => {
   using repo = makeRoot();
   expect(resolveTaggedSourceVersion(repo.root, "0.1.5")).toBe("0.1.5");
+});
+
+it("stamps a build with the packager's APP_VERSION before any tag", () => {
+  using repo = makeRoot();
+  for (const relativePath of releasePackageFiles) repo.writeManifest(relativePath, "0.1.9");
+  repo.git("init", "--quiet");
+  repo.git("add", ".");
+  repo.git("commit", "--quiet", "--no-gpg-sign", "-m", "source");
+  repo.git("tag", "--no-sign", "-a", "v0.1.10", "-m", "release");
+  expect(resolveBuildVersion(repo.root, "0.1.9", " 0.1.9-perf.7 ")).toBe("0.1.9-perf.7");
+  expect(resolveBuildVersion(repo.root, "0.1.9", " ")).toBe("0.1.10");
 });

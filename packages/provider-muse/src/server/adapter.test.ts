@@ -784,10 +784,12 @@ describe("MuseAdapterV2", () => {
         },
       });
       yield* fake.emit("approval/requested", approval(nativeId));
-      yield* harness.takeEvent(
+      const pending = yield* harness.takeEvent(
         "runtime_request.updated",
         (event) => event.runtimeRequest.status === "pending",
       );
+      assert.strictEqual(pending.artifacts?.node.id, pending.runtimeRequest.nodeId);
+      assert.strictEqual(pending.artifacts?.turnItem.nodeId, pending.runtimeRequest.nodeId);
       yield* fake.emit("turn/completed", {
         turnId: nativeId,
         terminal: "failed",
@@ -1088,6 +1090,8 @@ describe("MuseAdapterV2", () => {
         (event) => event.runtimeRequest.status === "pending",
       );
       assert.strictEqual(refreshed.runtimeRequest.id, first.runtimeRequest.id);
+      assert.strictEqual(refreshed.artifacts?.node.runtimeRequestId, refreshed.runtimeRequest.id);
+      assert.strictEqual(refreshed.artifacts?.turnItem.nodeId, refreshed.runtimeRequest.nodeId);
       yield* harness.runtime.respondToRuntimeRequest({
         requestId: first.runtimeRequest.id,
         decision: "accept",
@@ -1231,10 +1235,8 @@ describe("MuseAdapterV2", () => {
         assert.strictEqual(resolved.runtimeRequest.status, "resolved");
         assert.strictEqual(resolved.runtimeRequest.decision, "accept");
         assert.isNull(resolved.runtimeRequest.providerTurnId);
-        const node = yield* harness.takeEvent("node.updated");
-        const item = yield* harness.takeEvent("turn_item.updated");
-        assert.strictEqual(node.node.status, "completed");
-        assert.strictEqual(item.turnItem.status, "completed");
+        assert.strictEqual(resolved.artifacts?.node.status, "completed");
+        assert.strictEqual(resolved.artifacts?.turnItem.status, "completed");
         acknowledgement.resolve({});
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
@@ -1467,6 +1469,31 @@ describe("MuseAdapterV2", () => {
       yield* fake.emit("turn/completed", { turnId: turn.nativeId, terminal: "cancelled" });
       yield* Fiber.join(interrupt);
       assert.strictEqual((yield* harness.takeEvent("turn.terminal")).status, "interrupted");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("rejects steering when completion wins the submission hook", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const harness = yield* makeHarness(fake);
+      const turn = yield* startConversation(harness, fake);
+      const input = yield* turnInput(harness.providerThread);
+      const error = yield* harness.runtime
+        .steerTurn({
+          threadId: THREAD_ID,
+          runId: input.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: turn.providerTurn.id,
+          message: input.message,
+          beforeSubmit: fake
+            .emit("turn/completed", { turnId: turn.nativeId, terminal: "completed" })
+            .pipe(Effect.andThen(harness.takeEvent("turn.terminal")), Effect.asVoid),
+        })
+        .pipe(Effect.flip);
+      assert.isTrue(
+        ProviderAdapter.isProviderAdapterSteerRunError(error) && error.deliveryNotSent === true,
+      );
+      assert.isFalse(fake.calls.some((call) => call.method === "turn/steer"));
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

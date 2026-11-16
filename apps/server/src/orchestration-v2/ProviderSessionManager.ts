@@ -292,7 +292,10 @@ export class ProviderSessionManagerV2 extends Context.Service<
 
 interface LiveSessionEntry {
   readonly attachedThreadIds: ReadonlySet<ThreadId>;
-  readonly loadedProviderThreadKeyByThread: ReadonlyMap<ThreadId, string>;
+  readonly loadedProviderThreadKeyByThread: ReadonlyMap<
+    ThreadId,
+    { readonly key: string; readonly runtimeKey: string }
+  >;
   /** null marks an unknown catalog; undefined means MCP refresh is not configured. */
   readonly openedWithLinkedEnvironments: boolean | null | undefined;
   readonly linkedEnvironmentsByThread: ReadonlyMap<ThreadId, boolean | null>;
@@ -1675,7 +1678,8 @@ export const layerWithOptions = (
             (current) =>
               current
                 .get(sessionKey(input.providerSessionId))
-                ?.loadedProviderThreadKeyByThread.get(input.threadId) === input.providerThreadKey,
+                ?.loadedProviderThreadKeyByThread.get(input.threadId)?.key ===
+              input.providerThreadKey,
           ),
         );
 
@@ -1684,6 +1688,7 @@ export const layerWithOptions = (
         readonly providerSessionId: ProviderSessionId;
         readonly threadId: ThreadId;
         readonly providerThreadKey: string;
+        readonly providerThread: OrchestrationV2ProviderThread;
         readonly linkedEnvironments: boolean | null | undefined;
       }) =>
         Ref.update(sessions, (current) => {
@@ -1693,7 +1698,10 @@ export const layerWithOptions = (
             return current;
           }
           const loadedProviderThreadKeyByThread = new Map(entry.loadedProviderThreadKeyByThread);
-          loadedProviderThreadKeyByThread.set(input.threadId, input.providerThreadKey);
+          loadedProviderThreadKeyByThread.set(input.threadId, {
+            key: input.providerThreadKey,
+            runtimeKey: providerThreadRuntimeKey(input.providerThread),
+          });
           const linkedEnvironmentsByThread = new Map(entry.linkedEnvironmentsByThread);
           if (
             input.linkedEnvironments !== undefined &&
@@ -1708,6 +1716,26 @@ export const layerWithOptions = (
             linkedEnvironmentsByThread,
           });
           return updated;
+        });
+
+      const invalidateProviderThread = (
+        runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        providerThread: OrchestrationV2ProviderThread,
+      ) =>
+        Ref.update(sessions, (current) => {
+          const key = sessionKey(runtime.providerSessionId);
+          const entry = current.get(key);
+          const threadId = providerThread.appThreadId;
+          if (
+            entry?.runtime !== runtime ||
+            threadId === null ||
+            entry.loadedProviderThreadKeyByThread.get(threadId)?.runtimeKey !==
+              providerThreadRuntimeKey(providerThread)
+          )
+            return current;
+          const loadedProviderThreadKeyByThread = new Map(entry.loadedProviderThreadKeyByThread);
+          loadedProviderThreadKeyByThread.delete(threadId);
+          return new Map(current).set(key, { ...entry, loadedProviderThreadKeyByThread });
         });
 
       const loadNatively = <A, E>(load: Effect.Effect<A, E>) =>
@@ -2331,6 +2359,7 @@ export const layerWithOptions = (
                 markProviderThreadLoaded({
                   providerSessionId,
                   threadId: input.threadId,
+                  providerThread,
                   providerThreadKey: providerThreadLoadKey({
                     runtime,
                     providerThread,
@@ -2392,6 +2421,7 @@ export const layerWithOptions = (
                 markProviderThreadLoaded({
                   providerSessionId,
                   threadId,
+                  providerThread,
                   providerThreadKey: providerThreadLoadKey({
                     runtime,
                     providerThread,
@@ -2422,6 +2452,7 @@ export const layerWithOptions = (
                 markProviderThreadLoaded({
                   providerSessionId,
                   threadId: input.targetThreadId,
+                  providerThread,
                   providerThreadKey: providerThreadLoadKey({
                     runtime,
                     providerThread,
@@ -2497,7 +2528,17 @@ export const layerWithOptions = (
             ),
           steerTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
-              Effect.andThen(runtime.steerTurn(input).pipe(turnMetrics("steer"))),
+              Effect.andThen(
+                runtime.steerTurn(input).pipe(
+                  Effect.tapError((error) =>
+                    error._tag === "ProviderAdapterSteerRunError" &&
+                    error.threadDisposition === "broken"
+                      ? invalidateProviderThread(runtime, input.providerThread)
+                      : Effect.void,
+                  ),
+                  turnMetrics("steer"),
+                ),
+              ),
             ),
           // A provider starved of memory can stop answering, so no caller may wait on it unbounded.
           interruptTurn: (input) =>
@@ -2808,20 +2849,7 @@ export const layerWithOptions = (
                     event.type === "provider_thread.updated" &&
                     event.providerThread.status === "error"
                   ) {
-                    const threadId = event.providerThread.appThreadId;
-                    yield* Ref.update(sessions, (sessions) => {
-                      const key = sessionKey(entry.runtime.providerSessionId);
-                      const latest = sessions.get(key);
-                      if (latest?.runtime !== entry.runtime || threadId === null) return sessions;
-                      const loadedProviderThreadKeyByThread = new Map(
-                        latest.loadedProviderThreadKeyByThread,
-                      );
-                      loadedProviderThreadKeyByThread.delete(threadId);
-                      return new Map(sessions).set(key, {
-                        ...latest,
-                        loadedProviderThreadKeyByThread,
-                      });
-                    });
+                    yield* invalidateProviderThread(entry.runtime, event.providerThread);
                   }
                   // Requests and recovered background commands can arrive before a run subscribes.
                   const threadId = sessionScopedArtifactThreadId(event);

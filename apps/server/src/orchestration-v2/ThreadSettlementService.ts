@@ -38,7 +38,11 @@ import { sourceControlDefinitions } from "../sourceControl/sourceControlDefiniti
 import { makeNoPullRequestRechecks } from "./noPullRequestRechecks.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import { QUIET_AFTER_MS, QUIET_SYNC_INTERVAL_MS } from "./PullRequestSyncReactor.ts";
+import {
+  QUIET_AFTER_MS,
+  QUIET_SYNC_INTERVAL_MS,
+  quietSyncIntervalMs,
+} from "./PullRequestSyncReactor.ts";
 
 export interface SettlementPullRequest {
   readonly state: "open" | "closed" | "merged";
@@ -323,7 +327,7 @@ export const make = Effect.gen(function* () {
   const shellClosedThreads = new Set<ThreadId>();
   // Each summary read can be a host CLI process (one `az` per read on Azure DevOps), so a quiet
   // open pull request is read on the sync reactor's quiet cadence rather than every sweep.
-  const quietOpenReadAt = new Map<string, number>();
+  const quietOpenReadAt = new Map<string, { readonly atMs: number; readonly intervalMs: number }>();
   const quietReadKey = (reference: {
     readonly projectId: string;
     readonly repository: string;
@@ -356,8 +360,8 @@ export const make = Effect.gen(function* () {
     const projectShells = yield* projectStore.listShells();
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const projects = new Map(projectShells.map((project) => [project.id, project]));
-    for (const [key, readAtMs] of quietOpenReadAt) {
-      if (nowMs - readAtMs >= QUIET_SYNC_INTERVAL_MS) quietOpenReadAt.delete(key);
+    for (const [key, read] of quietOpenReadAt) {
+      if (nowMs - read.atMs >= read.intervalMs) quietOpenReadAt.delete(key);
     }
     // Merge events resweep all candidates because unlinked threads settle through branch lookup.
     const candidates = threads.filter(
@@ -558,7 +562,10 @@ export const make = Effect.gen(function* () {
           nowMs - quietPausedAtMs >= QUIET_SYNC_INTERVAL_MS &&
           nowMs - Date.parse(summary.updatedAt) >= QUIET_AFTER_MS
         ) {
-          quietOpenReadAt.set(readKey, nowMs);
+          quietOpenReadAt.set(readKey, {
+            atMs: nowMs,
+            intervalMs: quietSyncIntervalMs(nowMs - Date.parse(summary.updatedAt)),
+          });
         }
         const terminal = {
           state: summary.state,

@@ -7,6 +7,7 @@ import * as AcpSchema from "./_generated/schema.gen.ts";
 const AcpRequestOperation = Schema.Literals([
   "decode-extension-request-payload",
   "encode-extension-response",
+  "enqueue-request",
   "handle-request",
   "handle-extension-request",
   "receive-response",

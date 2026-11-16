@@ -8,7 +8,10 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as TestClock from "effect/testing/TestClock";
+
+import * as WorkerChildProcessSpawner from "../process/workerChildProcessSpawner.ts";
 
 import {
   buildClaudeCapabilitiesProbeQueryOptions,
@@ -113,5 +116,55 @@ it.effect("keeps the probe subprocess alive while gateway model discovery can fi
     assert.equal(abortSignal?.aborted, false);
     yield* TestClock.adjust("3 seconds");
     assert.equal(abortSignal?.aborted, true);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+// every health check and workspace scan starts a Claude CLI, so on Linux it must not fork
+// the server.
+it.effect("starts the probe's CLI from the server's provider launcher on Linux", () =>
+  Effect.gen(function* () {
+    let spawnHook: ((options: ClaudeSdk.SpawnOptions) => ClaudeSdk.SpawnedProcess) | undefined;
+    const query = vi.spyOn(ClaudeSdk, "query").mockImplementation(({ options }) => {
+      spawnHook = options?.spawnClaudeCodeProcess;
+      return {
+        initializationResult: async () => ({ commands: [] }),
+      } as unknown as ReturnType<typeof ClaudeSdk.query>;
+    });
+    yield* Effect.addFinalizer(() => Effect.sync(() => query.mockRestore()));
+    const launched: Array<{ readonly argv: ReadonlyArray<string>; readonly stdio: unknown }> = [];
+    const launcher = WorkerChildProcessSpawner.ProviderProcessLauncher.of({
+      spawn: (command, args, options) => {
+        launched.push({ argv: [command, ...args], stdio: options.stdio });
+        return {} as ReturnType<
+          WorkerChildProcessSpawner.ProviderProcessLauncher["Service"]["spawn"]
+        >;
+      },
+      spawner: ChildProcessSpawner.make(() => Effect.die("unused")),
+    });
+    const fileSystem = yield* FileSystem.FileSystem;
+    const workspace = yield* fileSystem.makeTempDirectoryScoped();
+
+    yield* probeClaudeCapabilities(
+      yield* decodeClaudeSettings({ binaryPath: "claude" }),
+      { PATH: (yield* HostProcess.Environment).PATH, HOME: workspace },
+      workspace,
+      false,
+    ).pipe(
+      Effect.provideService(WorkerChildProcessSpawner.ProviderProcessLauncher, launcher),
+      Effect.provideService(HostProcess.Platform, "linux"),
+    );
+    spawnHook?.({
+      command: "t3-missing-claude-probe",
+      args: ["--probe"],
+      cwd: workspace,
+      env: {},
+      // @effect-diagnostics-next-line abortControllerInEffect:off - The fake launcher starts nothing.
+      signal: new AbortController().signal,
+    });
+
+    assert.deepStrictEqual(
+      launched.map(({ argv, stdio }) => ({ argv: argv.slice(-2), stdio })),
+      [{ argv: ["t3-missing-claude-probe", "--probe"], stdio: ["pipe", "pipe", "ignore"] }],
+    );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

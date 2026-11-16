@@ -15,6 +15,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as NonBlockingSpawner from "./NonBlockingSpawner.ts";
+import * as WorkerChildProcessSpawner from "./workerChildProcessSpawner.ts";
 
 vi.mock("node:fs/promises", { spy: true });
 
@@ -198,3 +199,120 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("NonBlockingSpa
     }),
   );
 });
+
+// The server's own spawners start commands from a spawner process (or a worker): upstream's guard
+// applies before a start leaves the server, so neither the server nor that spawner waits on a mount.
+describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
+  "the server's command and provider spawners",
+  () => {
+    it.live("give their spawner process only `env`, never a cwd or a command to look up", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const directory = yield* fileSystem.realPath(yield* fileSystem.makeTempDirectoryScoped());
+        const log = `${directory}/starts.log`;
+        const record = (kind: string) =>
+          `require("node:fs").appendFileSync(${JSON.stringify(log)}, JSON.stringify([${JSON.stringify(kind)}, message.command, message.options.cwd ?? null]) + "\\n");`;
+        const source = WorkerChildProcessSpawner.spawnerProcessSource
+          .replace(
+            "const start = (message) => {",
+            `const start = (message) => {\n${record("relayed")}`,
+          )
+          .replace(
+            "const launchHandoff = (message) => {",
+            `const launchHandoff = (message) => {\n${record("handoff")}`,
+          );
+        expect(source.match(/appendFileSync/g)).toHaveLength(2);
+        const node = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const { spawner, host } = yield* WorkerChildProcessSpawner.makeProcessSpawnerWithHost(
+          node,
+          { source },
+        );
+        const launcher = yield* WorkerChildProcessSpawner.makeProviderLauncher(node, host!);
+        for (const command of [
+          ChildProcess.make("true", [], { cwd: directory }),
+          ChildProcess.make("true", []),
+          ChildProcess.make("true", [], { cwd: directory, shell: true }),
+        ]) {
+          expect(yield* spawner.exitCode(command)).toBe(0);
+        }
+        expect(
+          yield* launcher.spawner.exitCode(ChildProcess.make("true", [], { cwd: directory })),
+        ).toBe(0);
+        const starts = (yield* fileSystem.readFileString(log))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as unknown);
+        expect(starts).toEqual([
+          ["relayed", "/usr/bin/env", null],
+          ["relayed", "/usr/bin/env", null],
+          ["relayed", "/usr/bin/env", null],
+          ["handoff", "/usr/bin/env", null],
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+
+    it.live("check at most two paths at once, however many directories hang", () =>
+      Effect.gen(function* () {
+        const allArrived = yield* Deferred.make<void>();
+        let arrivals = 0;
+        // Each start resolves its cwd, then starts its check within microtasks.
+        const arrivalPath = Layer.effect(
+          Path.Path,
+          Effect.map(Path.Path, (path) => ({
+            ...path,
+            resolve: (...segments: ReadonlyArray<string>) => {
+              if (
+                segments.some((segment) => segment.startsWith("/t3code-hung/")) &&
+                ++arrivals === 3
+              ) {
+                setImmediate(() => Deferred.doneUnsafe(allArrived, Effect.void));
+              }
+              return path.resolve(...segments);
+            },
+          })),
+        );
+        const hung: Array<() => void> = [];
+        let releasing = false;
+        let running = 0;
+        let mostRunning = 0;
+        using _access = vi.spyOn(NodeFSP, "access").mockImplementation(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              mostRunning = Math.max(mostRunning, ++running);
+              const fail = () => {
+                running--;
+                reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+              };
+              if (releasing) fail();
+              else hung.push(fail);
+            }),
+        );
+        const spawns = yield* Effect.gen(function* () {
+          const spawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(
+            yield* ChildProcessSpawner.ChildProcessSpawner,
+          );
+          return yield* Effect.forEach(
+            ["a", "b", "c"],
+            (name) =>
+              spawner
+                .exitCode(ChildProcess.make("true", [], { cwd: `/t3code-hung/${name}` }))
+                .pipe(Effect.flip),
+            { concurrency: "unbounded" },
+          );
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.merge(NodeServices.layer, arrivalPath.pipe(Layer.provide(NodeServices.layer))),
+          ),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(allArrived);
+        expect(mostRunning).toBe(2);
+        releasing = true;
+        for (const fail of hung.splice(0)) fail();
+        yield* Fiber.join(spawns);
+        expect(mostRunning).toBe(2);
+      }),
+    );
+  },
+);

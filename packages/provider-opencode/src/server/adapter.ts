@@ -308,12 +308,14 @@ interface ActiveOpenCodeTurn {
   readonly priorWakePromptIds: Set<string>;
   priorWakeSettled: Deferred.Deferred<void> | null;
   interrupted: boolean;
+  stopGeneration: number;
   finalized: boolean;
   contextOverflow: OrchestrationV2ProviderFailure | null;
   planId: PlanId | null;
   admissionGeneration: number;
   admissionReconciliationGeneration: number | null;
   admissionPending: boolean;
+  promptSent: boolean;
   admissionAccepted: boolean;
   admissionMessageObserved: boolean;
   idleDuringAdmission: boolean;
@@ -1133,26 +1135,46 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           threadId: input.threadId,
         });
 
-        const sdkCall = <A>(
+        const sdkInvoke = <A, E = never>(
+          method: string,
+          call: (signal: AbortSignal) => Promise<A>,
+          validateInvoke?: () => E | undefined,
+        ) =>
+          Effect.suspend(() => {
+            let refused: E | undefined;
+            return OpenCodeRuntime.runOpenCodeSdk(method, (signal) => {
+              // Validation and SDK invocation share one synchronous boundary, including in a child fiber.
+              refused = validateInvoke?.();
+              if (refused !== undefined) throw refused;
+              return call(signal);
+            }).pipe(
+              Effect.mapError((cause) => (refused === undefined ? cause : refused)),
+              Effect.tap((response) =>
+                logProtocolEvent({
+                  direction: "incoming",
+                  messageKind: "response",
+                  method,
+                  payload: sdkResponseForRawLog(response),
+                }),
+              ),
+            );
+          });
+
+        const sdkCall = <A, E = never>(
           method: string,
           payload: unknown,
           call: (signal: AbortSignal) => Promise<A>,
-        ): Effect.Effect<A, OpenCodeRuntime.OpenCodeRuntimeError> =>
+          beforeInvoke?: Effect.Effect<void, E>,
+          validateInvoke?: () => E | undefined,
+        ): Effect.Effect<A, OpenCodeRuntime.OpenCodeRuntimeError | E> =>
           logProtocolEvent({
             direction: "outgoing",
             messageKind: "request",
             method,
             payload,
           }).pipe(
-            Effect.andThen(OpenCodeRuntime.runOpenCodeSdk(method, call)),
-            Effect.tap((response) =>
-              logProtocolEvent({
-                direction: "incoming",
-                messageKind: "response",
-                method,
-                payload: sdkResponseForRawLog(response),
-              }),
-            ),
+            Effect.andThen(beforeInvoke ?? Effect.void),
+            Effect.andThen(sdkInvoke(method, call, validateInvoke)),
           );
 
         const abortDescendants = Effect.fn("OpencodeAdapter.abortDescendants")(function* (
@@ -2497,12 +2519,14 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             priorWakePromptIds: new Set(),
             priorWakeSettled: null,
             interrupted: false,
+            stopGeneration: 0,
             finalized: false,
             contextOverflow: null,
             planId: null,
             admissionGeneration: 0,
             admissionReconciliationGeneration: null,
             admissionPending: false,
+            promptSent: true,
             admissionAccepted: true,
             admissionMessageObserved: true,
             idleDuringAdmission: false,
@@ -3487,6 +3511,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             sessionID: string;
           },
           abortController: AbortController,
+          beforeSubmit?: Effect.Effect<void, ProviderAdapter.ProviderAdapterSteerRunError>,
+          validateSubmit?: () => ProviderAdapter.ProviderAdapterSteerRunError | undefined,
+          admitSubmit?: () => void,
+          startSubmit?: ProviderAdapter.ProviderAdapterV2TurnInput["submit"],
         ) {
           const { variant, ...payloadWithoutVariant } = inputPayload;
           const selectedVariant = yield* OpenCodeRuntime.resolveOpenCodeVariant(
@@ -3512,20 +3540,72 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 Effect.orElseSucceed(() => []),
               )).find((entry) => entry.name === match[1])
             : undefined;
+          const invoked = Deferred.makeUnsafe<void>();
+          let generation = validateSubmit === undefined ? turn.admissionGeneration : undefined;
+          let transportStarted = false;
+          let transportRefusal: ProviderAdapter.ProviderAdapterSteerRunError | undefined;
+          const guardedFetch: typeof fetch = (request, init) => {
+            const signal =
+              init?.signal ?? (request instanceof Request ? request.signal : undefined);
+            transportRefusal =
+              validateSubmit?.() ??
+              (signal?.aborted || abortController.signal.aborted
+                ? new ProviderAdapter.ProviderAdapterSteerRunError({
+                    driver: OPENCODE_PROVIDER,
+                    providerThreadId: turn.providerThreadId,
+                    providerTurnId: turn.providerTurnId,
+                    deliveryNotSent: true,
+                    cause: "The steer was aborted before transport submission.",
+                  })
+                : undefined);
+            if (transportRefusal !== undefined) throw transportRefusal;
+            admitSubmit?.();
+            generation = turn.admissionGeneration;
+            transportStarted = true;
+            turn.promptSent = true;
+            Deferred.doneUnsafe(invoked, Effect.void);
+            // Preserve the SDK's default timeout override when wrapping its fetch.
+            if (request instanceof Request) Object.assign(request, { timeout: false });
+            // @effect-diagnostics-next-line globalFetch:off - This is the SDK's synchronous transport boundary.
+            return fetch(request, init);
+          };
+          const fetchOptions =
+            startSubmit !== undefined
+              ? { fetch: yield* ProviderAdapter.startSubmissionFetch(startSubmit, guardedFetch) }
+              : validateSubmit === undefined
+                ? {}
+                : { fetch: guardedFetch };
+          // guardedFetch records the send itself; the SDK's own fetch sends unless already aborted.
+          const markPromptSent = (signal: AbortSignal) => {
+            if (!("fetch" in fetchOptions) && !signal.aborted && !abortController.signal.aborted)
+              turn.promptSent = true;
+          };
+          const preserveTransportRefusal = <E>(cause: E) =>
+            transportRefusal ??
+            (validateSubmit !== undefined && !transportStarted
+              ? new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver: OPENCODE_PROVIDER,
+                  providerThreadId: turn.providerThreadId,
+                  providerTurnId: turn.providerTurnId,
+                  deliveryNotSent: true,
+                  cause,
+                })
+              : cause);
           if (!command) {
-            return yield* sdkCall("session.promptAsync", payload, (signal) =>
-              client.session.promptAsync(payload, {
-                signal: AbortSignal.any([signal, abortController.signal]),
-              }),
-            ).pipe(Effect.asVoid);
+            return yield* sdkCall(
+              "session.promptAsync",
+              payload,
+              (signal) => {
+                markPromptSent(signal);
+                return client.session.promptAsync(payload, {
+                  signal: AbortSignal.any([signal, abortController.signal]),
+                  ...fetchOptions,
+                });
+              },
+              beforeSubmit,
+              validateSubmit,
+            ).pipe(Effect.mapError(preserveTransportRefusal), Effect.asVoid);
           }
-          const receipt = Deferred.makeUnsafe<void>();
-          commandReceipts.set(payload.messageID, receipt);
-          const controllers =
-            commandControllers.get(payload.sessionID) ?? new Set<AbortController>();
-          controllers.add(abortController);
-          commandControllers.set(payload.sessionID, controllers);
-          const generation = turn.admissionGeneration;
           const commandPayload = {
             sessionID: payload.sessionID,
             messageID: payload.messageID,
@@ -3538,15 +3618,40 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             ...(payload.variant ? { variant: payload.variant } : {}),
             parts: payload.parts?.filter((part) => part.type === "file") ?? [],
           };
-          const request = yield* sdkCall("session.command", commandPayload, (signal) =>
-            client.session.command(commandPayload, {
-              signal: AbortSignal.any([signal, abortController.signal]),
-            }),
+          // Preparation has no native receipt to time out; admission starts only after it finishes.
+          yield* logProtocolEvent({
+            direction: "outgoing",
+            messageKind: "request",
+            method: "session.command",
+            payload: commandPayload,
+          });
+          if (beforeSubmit !== undefined) yield* beforeSubmit;
+          const receipt = Deferred.makeUnsafe<void>();
+          commandReceipts.set(payload.messageID, receipt);
+          const controllers =
+            commandControllers.get(payload.sessionID) ?? new Set<AbortController>();
+          controllers.add(abortController);
+          commandControllers.set(payload.sessionID, controllers);
+          const request = yield* sdkInvoke(
+            "session.command",
+            (signal) => {
+              if (validateSubmit === undefined) Deferred.doneUnsafe(invoked, Effect.void);
+              markPromptSent(signal);
+              return client.session.command(commandPayload, {
+                signal: AbortSignal.any([signal, abortController.signal]),
+                ...fetchOptions,
+              });
+            },
+            validateSubmit,
           ).pipe(
+            Effect.mapError(preserveTransportRefusal),
             Effect.asVoid,
             // OpenCode answers only when generation ends; once admitted, the event stream owns the outcome.
             Effect.tapError((cause) =>
+              (ProviderAdapter.isProviderAdapterSteerRunError(cause) &&
+                cause.deliveryNotSent === true) ||
               Deferred.isDoneUnsafe(receipt) ||
+              generation === undefined ||
               abortController.signal.aborted ||
               turn.finalized ||
               turn.admissionGeneration !== generation
@@ -3564,6 +3669,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             ),
             Effect.forkIn(scope),
           );
+          yield* Effect.raceFirst(Fiber.join(request), Deferred.await(invoked));
           yield* Effect.raceFirst(Fiber.join(request), Deferred.await(receipt)).pipe(
             Effect.timeout("10 seconds"),
             Effect.catchTags({
@@ -3763,12 +3869,14 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 priorWakePromptIds: new Set(),
                 priorWakeSettled: null,
                 interrupted: false,
+                stopGeneration: 0,
                 finalized: false,
                 contextOverflow: null,
                 planId: null,
                 admissionGeneration: state.nextAdmissionGeneration++,
                 admissionReconciliationGeneration: null,
                 admissionPending: !isCompaction && !continuation,
+                promptSent: false,
                 admissionAccepted: isCompaction || continuation,
                 admissionMessageObserved: false,
                 idleDuringAdmission: false,
@@ -3880,13 +3988,20 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 }
               }
               if (isCompaction) {
+                const compactFetch =
+                  turnInput.submit === undefined
+                    ? undefined
+                    : yield* ProviderAdapter.startSubmissionFetch(turnInput.submit, fetch);
                 yield* sdkCall(
                   "session.summarize",
                   { sessionID: sessionId, ...parsedModel, auto: false },
                   (signal) =>
                     client.session.summarize(
                       { sessionID: sessionId, ...parsedModel, auto: false },
-                      { signal: AbortSignal.any([signal, admissionAbortController!.signal]) },
+                      {
+                        signal: AbortSignal.any([signal, admissionAbortController!.signal]),
+                        ...(compactFetch === undefined ? {} : { fetch: compactFetch }),
+                      },
                     ),
                 ).pipe(
                   Effect.tap(() =>
@@ -3920,6 +4035,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   parts,
                 },
                 admissionAbortController!,
+                undefined,
+                undefined,
+                undefined,
+                turnInput.submit,
               ).pipe(
                 Effect.tapError((cause) =>
                   admissionAbortController!.signal.aborted
@@ -3986,10 +4105,15 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 turn.providerTurnId !== steerInput.providerTurnId ||
                 turn.interrupted
               ) {
-                return yield* protocolError(
-                  `OpenCode turn ${steerInput.providerTurnId} is not active`,
-                );
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver: OPENCODE_PROVIDER,
+                  providerThreadId: steerInput.providerThread.id,
+                  providerTurnId: steerInput.providerTurnId,
+                  deliveryNotSent: true,
+                  cause: `OpenCode turn ${steerInput.providerTurnId} is not active`,
+                });
               }
+              const stopGeneration = turn.stopGeneration;
               const parsedModel = OpenCodeRuntime.parseOpenCodeModelSlug(turn.modelSelection.model);
               if (parsedModel === null) {
                 return yield* protocolError(
@@ -4002,10 +4126,19 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 resolveAttachmentPath: host.resolveAttachmentPath,
                 resolveExtractedTextPath: host.resolveExtractedTextPath,
               })).trim();
-              if (state.activeTurn !== turn || turn.interrupted || turn.finalized) {
-                return yield* protocolError(
-                  `OpenCode turn ${steerInput.providerTurnId} is not active`,
-                );
+              if (
+                state.activeTurn !== turn ||
+                turn.interrupted ||
+                turn.finalized ||
+                turn.stopGeneration !== stopGeneration
+              ) {
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver: OPENCODE_PROVIDER,
+                  providerThreadId: steerInput.providerThread.id,
+                  providerTurnId: steerInput.providerTurnId,
+                  deliveryNotSent: true,
+                  cause: `OpenCode turn ${steerInput.providerTurnId} is not active`,
+                });
               }
               const files = OpenCodeRuntime.toOpenCodeFileParts({
                 attachments: steerInput.message.attachments,
@@ -4025,27 +4158,59 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 // Another waiting steer may have claimed admission first.
                 if (turn.admissionSettled === pendingAdmission) break;
               }
-              if (state.activeTurn !== turn || turn.finalized || turn.interrupted) {
-                return yield* protocolError(
-                  `OpenCode turn ${steerInput.providerTurnId} is not active`,
-                );
+              if (
+                state.activeTurn !== turn ||
+                turn.interrupted ||
+                turn.finalized ||
+                turn.stopGeneration !== stopGeneration
+              ) {
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver: OPENCODE_PROVIDER,
+                  providerThreadId: steerInput.providerThread.id,
+                  providerTurnId: steerInput.providerTurnId,
+                  deliveryNotSent: true,
+                  cause: `OpenCode turn ${steerInput.providerTurnId} is not active`,
+                });
               }
-              // A retry of a steer whose earlier attempt may have reached OpenCode stays uncertain.
-              if (!turn.admissionPending) turn.admissionUncertain = false;
-              turn.admissionGeneration = state.nextAdmissionGeneration++;
-              turn.admissionMessageId = admissionMessageId;
-              turn.admissionPending = true;
-              turn.admissionAccepted = false;
-              turn.admissionMessageObserved = false;
-              turn.idleDuringAdmission = false;
-              turn.admissionSettled = Deferred.makeUnsafe<void>();
-              // @effect-diagnostics-next-line abortControllerInEffect:off - Steering replaces the admission request independently of this command fiber.
-              turn.admissionAbortController = new AbortController();
-              if (turn.admissionMessageId !== null)
-                turn.usage.promptMessageIds.add(turn.admissionMessageId);
-              const admissionSettled = turn.admissionSettled;
-              const admissionAbortController = turn.admissionAbortController;
-              const generation = turn.admissionGeneration;
+              const admissionSettled = Deferred.makeUnsafe<void>();
+              // @effect-diagnostics-next-line abortControllerInEffect:off - One controller owns this native admission.
+              const admissionAbortController = new AbortController();
+              turn.admissionSettled = admissionSettled;
+              turn.admissionAbortController = admissionAbortController;
+              const submissionRefusal = () =>
+                state.activeTurn !== turn ||
+                turn.interrupted ||
+                turn.finalized ||
+                turn.stopGeneration !== stopGeneration
+                  ? new ProviderAdapter.ProviderAdapterSteerRunError({
+                      driver: OPENCODE_PROVIDER,
+                      providerThreadId: steerInput.providerThread.id,
+                      providerTurnId: steerInput.providerTurnId,
+                      deliveryNotSent: true,
+                      cause: "The turn ended before the steer was sent.",
+                    })
+                  : undefined;
+              const ensureActive = Effect.suspend(() => {
+                const refusal = submissionRefusal();
+                return refusal === undefined ? Effect.void : Effect.fail(refusal);
+              });
+              const beforeSubmit = ensureActive.pipe(
+                Effect.andThen(steerInput.beforeSubmit ?? Effect.void),
+                Effect.andThen(ensureActive),
+              );
+              let generation: number | undefined;
+              const admitSubmit = () => {
+                // A retry of a steer whose earlier attempt may have reached OpenCode stays uncertain.
+                if (!turn.admissionPending) turn.admissionUncertain = false;
+                turn.admissionGeneration = state.nextAdmissionGeneration++;
+                generation = turn.admissionGeneration;
+                turn.admissionMessageId = admissionMessageId;
+                turn.admissionPending = true;
+                turn.admissionAccepted = false;
+                turn.admissionMessageObserved = false;
+                turn.idleDuringAdmission = false;
+                turn.usage.promptMessageIds.add(admissionMessageId);
+              };
               const acceptAdmission = Effect.suspend(() =>
                 state.activeTurn === turn &&
                 !turn.finalized &&
@@ -4059,15 +4224,22 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 turn,
                 {
                   sessionID: sessionId,
-                  messageID: turn.admissionMessageId,
+                  messageID: admissionMessageId,
                   model: parsedModel,
                   ...turnPromptOptions(turn),
                   parts,
                 },
-                admissionAbortController!,
+                admissionAbortController,
+                beforeSubmit,
+                submissionRefusal,
+                admitSubmit,
               ).pipe(
                 Effect.tapError((error) => {
-                  if (!promptAdmissionIsCurrent(state, turn, generation)) return Effect.void;
+                  if (
+                    generation === undefined ||
+                    !promptAdmissionIsCurrent(state, turn, generation)
+                  )
+                    return Effect.void;
                   if (isOpenCodePromptRejected(error) && !turn.admissionUncertain) {
                     return reconcilePromptAdmission(state, turn);
                   }
@@ -4090,14 +4262,15 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             },
             (effect, steerInput) =>
               effect.pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapter.ProviderAdapterSteerRunError({
-                      driver: OPENCODE_PROVIDER,
-                      providerThreadId: steerInput.providerThread.id,
-                      providerTurnId: steerInput.providerTurnId,
-                      cause,
-                    }),
+                Effect.mapError((cause) =>
+                  ProviderAdapter.isProviderAdapterSteerRunError(cause)
+                    ? cause
+                    : new ProviderAdapter.ProviderAdapterSteerRunError({
+                        driver: OPENCODE_PROVIDER,
+                        providerThreadId: steerInput.providerThread.id,
+                        providerTurnId: steerInput.providerTurnId,
+                        cause,
+                      }),
                 ),
               ),
           ),
@@ -4138,6 +4311,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                       `OpenCode turn ${interruptInput.providerTurnId} is not active`,
                     );
                   }
+                  turn.stopGeneration++;
                   turn.interrupted = true;
                   for (const controller of commandControllers.get(sessionId) ?? [])
                     controller.abort();
@@ -4166,6 +4340,12 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                               turn.interrupted = false;
                               return Effect.fail(cause);
                             }),
+                      ),
+                      // OpenCode never received a prompt Stop kept from being sent, so no event ends the turn.
+                      Effect.andThen(() =>
+                        admissionWasPending && !turn.promptSent
+                          ? finalizeTurn(state, turn, "interrupted")
+                          : Effect.void,
                       ),
                     ),
                   );

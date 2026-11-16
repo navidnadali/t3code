@@ -1,4 +1,5 @@
 import { CheckpointScopeId, ProjectId, RunId, ThreadId } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FiberMap from "effect/FiberMap";
@@ -6,6 +7,7 @@ import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 
 import * as ProjectEnrichment from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -32,6 +34,7 @@ export class RunFinalizationRefreshError extends Schema.TaggedError<RunFinalizat
 ) {}
 
 export class RunFinalizationObserver extends Context.Reference<{
+  /** Requests the project's pull request refresh after a turn; returns without waiting for it. */
   readonly refreshAfterTurn: (projectId: ProjectId) => Effect.Effect<void>;
   readonly refresh: (input: {
     readonly cwd: string;
@@ -76,7 +79,10 @@ const make = Effect.gen(function* () {
           (cause) => new RunFinalizationError({ ...input, operation: "refresh-workspace", cause }),
         ),
       );
-    const cwd = projection.checkpointScopes.find((scope) => scope.id === input.scopeId)?.cwd;
+    // Where the run worked; its scope keeps the spelling its workspace was first reached by.
+    const cwd =
+      projection.runs.find((run) => run.id === input.runId)?.workspaceCwd ??
+      projection.checkpointScopes.find((scope) => scope.id === input.scopeId)?.cwd;
     if (cwd !== undefined) {
       // The refresh only updates the display, so the thread's next turn must not wait for it.
       // Never replaced by a newer one: back-to-back turns would interrupt each before it publishes.
@@ -97,6 +103,9 @@ const make = Effect.gen(function* () {
 
 export const layer = Layer.effect(RunFinalizationService, make);
 
+// Projects whose after-turn pull request refreshes may run at once; the rest wait their turn.
+const AFTER_TURN_REFRESH_SLOTS = 4;
+
 export const layerObserver = Layer.effect(
   RunFinalizationObserver,
   Effect.gen(function* () {
@@ -107,6 +116,33 @@ export const layerObserver = Layer.effect(
     const projects = yield* ProjectService.ProjectService;
     const enrichment = yield* ProjectEnrichment.ProjectEnrichmentService;
     const pullRequestLookups = yield* FiberMap.make<string>();
+    // The refresh waits for the project's forge reads (GitLab lookups take tens of seconds behind
+    // the CLI permits), and a run is not over for its thread until its finalization returns, so it
+    // runs in the background, interrupted at shutdown. One per project at a time: turns ending
+    // while it runs coalesce into one more pass, which starts after their runs committed.
+    const afterTurnRefreshes = yield* FiberSet.make<void>();
+    const afterTurnRefreshSlots = yield* Semaphore.make(AFTER_TURN_REFRESH_SLOTS);
+    const afterTurnRefreshStates = new Map<ProjectId, "queued" | "running" | "rerun">();
+    const refreshProject = (projectId: ProjectId): Effect.Effect<void> =>
+      Effect.sync(() => afterTurnRefreshStates.set(projectId, "running")).pipe(
+        Effect.andThen(pullRequests.refreshAfterTurn(projectId)),
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) =>
+            Effect.logWarning("failed to refresh pull requests after a turn", {
+              projectId,
+              cause: Cause.pretty(cause),
+            }),
+        ),
+        afterTurnRefreshSlots.withPermits(1),
+        Effect.andThen(
+          Effect.suspend(() => {
+            if (afterTurnRefreshStates.get(projectId) === "rerun") return refreshProject(projectId);
+            afterTurnRefreshStates.delete(projectId);
+            return Effect.void;
+          }),
+        ),
+      );
     const identityRefreshes = yield* FiberMap.make<ProjectId>();
     // A turn can add the first remote (`git remote add`, `gh repo create --push`), which the
     // enrichment and resolver caches would otherwise keep reporting as missing for a minute.
@@ -131,7 +167,19 @@ export const layerObserver = Layer.effect(
         ),
     );
     return {
-      refreshAfterTurn: pullRequests.refreshAfterTurn,
+      refreshAfterTurn: Effect.fn("RunFinalizationObserver.refreshAfterTurn")(function* (
+        projectId: ProjectId,
+      ) {
+        const state = afterTurnRefreshStates.get(projectId);
+        if (state === "running") afterTurnRefreshStates.set(projectId, "rerun");
+        if (state !== undefined) return;
+        afterTurnRefreshStates.set(projectId, "queued");
+        yield* refreshProject(projectId).pipe(
+          // A refresh interrupted on its own (not at shutdown) must not hold the project.
+          Effect.onInterrupt(() => Effect.sync(() => afterTurnRefreshStates.delete(projectId))),
+          FiberSet.run(afterTurnRefreshes),
+        );
+      }),
       refresh: Effect.fn("RunFinalizationService.refresh")(
         function* ({ cwd, threadId, runId }) {
           const [, local] = yield* Effect.all(

@@ -19,7 +19,7 @@ import { vi } from "vite-plus/test";
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ServerOwnership from "../serverOwnership.ts";
-import { migrationManifest, runMigrations } from "./Migrations.ts";
+import { migrationManifest, runMigrations, type RunMigrationsOptions } from "./Migrations.ts";
 import * as SqlitePersistence from "./Sqlite.ts";
 
 const workerData = vi.hoisted((): Array<unknown> => []);
@@ -192,13 +192,32 @@ const ownT3Home = Effect.fn(function* () {
   );
 });
 
-const migrateTo = (toMigrationInclusive?: number) =>
+const migrateTo = (options: RunMigrationsOptions = {}) =>
   Effect.gen(function* () {
     const { dbPath } = yield* ServerConfig.ServerConfig;
-    yield* runMigrations({ toMigrationInclusive }).pipe(
+    yield* runMigrations(options).pipe(
       Effect.provide(NodeSqliteClient.layer({ filename: dbPath })),
     );
   });
+
+const ORDINAL_INDEX = "orchestration_v2_projection_turn_items_message_ordinal_idx";
+
+const withDatabase = <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
+  Effect.gen(function* () {
+    const { dbPath } = yield* ServerConfig.ServerConfig;
+    return yield* effect.pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
+  });
+
+const perfForkSchema = withDatabase(
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const ledger = yield* sql<{ readonly migration_id: number }>`
+      SELECT migration_id FROM t3_perf_fork_migrations ORDER BY migration_id
+    `;
+    const index = yield* sql`SELECT 1 FROM sqlite_master WHERE name = ${ORDINAL_INDEX}`;
+    return { ledger: ledger.map((row) => row.migration_id), index: index.length > 0 };
+  }),
+);
 
 const latestRecordedMigrationId = Effect.gen(function* () {
   const { dbPath } = yield* ServerConfig.ServerConfig;
@@ -217,7 +236,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("layerCliConfig",
   it.effect("does not migrate a T3 home a running server owns", () =>
     Effect.gen(function* () {
       const recorded = Math.max(...migrationManifest.map(([id]) => id)) - 1;
-      yield* migrateTo(recorded);
+      yield* migrateTo({ toMigrationInclusive: recorded });
       yield* ownT3Home();
 
       const opened = yield* Effect.void.pipe(
@@ -231,6 +250,40 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("layerCliConfig",
         assert.instanceOf(opened.failure, SqlitePersistence.ServerOwnsDatabaseError);
       }
     }).pipe(Effect.scoped, Effect.provide(layerT3Home)),
+  );
+
+  // Upstream's chain is current; the fork's chain, which runs after it, still has work.
+  it.effect.each([
+    { work: "a fork migration to run", toPerfForkMigrationInclusive: 1, dropIndex: false },
+    { work: "a fork index to restore", toPerfForkMigrationInclusive: undefined, dropIndex: true },
+  ])(
+    "does not migrate a T3 home a running server owns when only the fork's chain has $work",
+    ({ toPerfForkMigrationInclusive, dropIndex }) =>
+      Effect.gen(function* () {
+        yield* migrateTo({ toPerfForkMigrationInclusive });
+        if (dropIndex) {
+          yield* withDatabase(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql.unsafe(`DROP INDEX ${ORDINAL_INDEX}`);
+            }),
+          );
+        }
+        const before = yield* perfForkSchema;
+        assert.isFalse(before.index);
+        yield* ownT3Home();
+
+        const opened = yield* Effect.void.pipe(
+          Effect.provide(SqlitePersistence.layerCliConfig),
+          Effect.result,
+        );
+
+        assert.deepStrictEqual(yield* perfForkSchema, before);
+        assert.equal(opened._tag, "Failure");
+        if (opened._tag === "Failure") {
+          assert.instanceOf(opened.failure, SqlitePersistence.ServerOwnsDatabaseError);
+        }
+      }).pipe(Effect.scoped, Effect.provide(layerT3Home)),
   );
 
   it.effect("opens a current T3 home while a running server owns it", () =>

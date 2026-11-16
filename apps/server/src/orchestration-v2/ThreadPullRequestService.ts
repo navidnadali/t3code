@@ -1,6 +1,7 @@
 import {
   CommandId,
   type OrchestrationProjectShell,
+  type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ThreadShell,
   type PullRequestSummary,
@@ -30,6 +31,7 @@ import { makeLinkedThreadsChangeDetector } from "../pullRequest/linkedThreads.ts
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { forkParked } from "../serverActivation.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
+import { visibleThreadPullRequests } from "../sourceControl/threadPullRequests.ts";
 import { makeNoPullRequestRechecks } from "./noPullRequestRechecks.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 
@@ -109,8 +111,22 @@ const BACKFILL_ATTEMPTS = 5;
 
 interface RefreshRequest {
   readonly threadId: ThreadId | null;
-  readonly refresh: boolean;
+  /** A turn's "shared" refresh settles for a lookup of its branch made moments earlier. */
+  readonly refresh: boolean | "shared";
   readonly backfill?: boolean;
+}
+
+/** A link an agent's create command added that this thread's branch lookup has not found yet. */
+function hasUndiscoveredCreatedLink(thread: OrchestrationV2AppThread): boolean {
+  const discovered = thread.branchPullRequest;
+  return visibleThreadPullRequests(thread.pullRequests ?? []).some(
+    (link) =>
+      link.source === "created" &&
+      link.snapshot === null &&
+      (discovered == null ||
+        discovered.number !== link.number ||
+        discovered.repository.toLowerCase() !== link.repository.toLowerCase()),
+  );
 }
 
 export const make = Effect.gen(function* () {
@@ -142,6 +158,32 @@ export const make = Effect.gen(function* () {
     orchestrator.getPullRequestSnapshot(
       threadId === null ? { unsettledOnly: !(backfill || pendingBackfill.size > 0) } : { threadId },
     );
+
+  // Subagents mostly work in their parent's checkout, whose own turns look its branch up.
+  const lookupRefresh = (
+    refresh: RefreshRequest["refresh"],
+    thread: Pick<OrchestrationV2ThreadShell, "lineage" | "projectId" | "worktreePath" | "branch">,
+  ) => {
+    const parentThreadId = thread.lineage.parentThreadId;
+    if (
+      refresh !== "shared" ||
+      thread.lineage.relationshipToParent !== "subagent" ||
+      parentThreadId === null
+    ) {
+      return Effect.succeed(refresh);
+    }
+    return orchestrator.getThreadShell(parentThreadId).pipe(
+      Effect.map((parent) =>
+        parent !== null &&
+        parent.projectId === thread.projectId &&
+        parent.worktreePath === thread.worktreePath &&
+        parent.branch === thread.branch
+          ? false
+          : refresh,
+      ),
+      Effect.orElseSucceed(() => refresh),
+    );
+  };
 
   const synchronize = Effect.fn("ThreadPullRequestServiceV2.synchronize")(function* (
     request: RefreshRequest,
@@ -216,9 +258,10 @@ export const make = Effect.gen(function* () {
           const project = projects.get(first.projectId);
           if (project === undefined) return finishBackfill(group);
           if (scheduled.has(key) && !scheduledLookups.has(key)) return;
+          const refresh = yield* lookupRefresh(request.refresh, first);
           const { project: resolvedProject, repository } =
             yield* resolveProjectForPullRequestDiscovery(project, repositoryIdentities, {
-              refresh: request.refresh,
+              refresh: refresh !== false,
             });
           if (first.branch !== null && repository === null) return finishBackfill(group);
           // A worktree folder can outlive its .git, and git there fails with not_a_repository.
@@ -236,7 +279,7 @@ export const make = Effect.gen(function* () {
               ? null
               : yield* git.branchPullRequest(
                   { cwd, branch: first.branch },
-                  { refresh: request.refresh, confirmTerminal: false },
+                  { refresh, confirmTerminal: false },
                 );
           if (first.branch !== null) noPullRequestRechecks.record(key, nowMs, detected !== null);
           if (detected !== null && !pullRequestMatchesProject(detected, resolvedProject)) {
@@ -405,7 +448,10 @@ export const make = Effect.gen(function* () {
 
   // At most one queued request per thread, so a turn end's events share one lookup.
   // A request after that lookup starts queues another, so later host changes are still read.
-  const queuedThreadRequests = new Map<ThreadId, { threadId: ThreadId; refresh: boolean }>();
+  const queuedThreadRequests = new Map<
+    ThreadId,
+    { threadId: ThreadId; refresh: RefreshRequest["refresh"] }
+  >();
 
   const worker = yield* makeDrainableWorker((request: RefreshRequest) =>
     Effect.suspend(() => {
@@ -423,11 +469,11 @@ export const make = Effect.gen(function* () {
     ),
   );
 
-  const enqueueThread = (threadId: ThreadId, refresh: boolean) =>
+  const enqueueThread = (threadId: ThreadId, refresh: RefreshRequest["refresh"]) =>
     Effect.suspend(() => {
       const queued = queuedThreadRequests.get(threadId);
       if (queued !== undefined) {
-        queued.refresh ||= refresh;
+        if (queued.refresh !== true && refresh !== false) queued.refresh = refresh;
         return Effect.void;
       }
       const request = { threadId, refresh };
@@ -461,8 +507,10 @@ export const make = Effect.gen(function* () {
       case "thread.metadata-updated":
         return enqueueThread(event.threadId, false);
       case "thread.unsettled":
-      case "checkpoint.captured":
         return enqueueThread(event.threadId, true);
+      // A finished turn emits both; they share one lookup.
+      case "checkpoint.captured":
+        return enqueueThread(event.threadId, "shared");
       case "run.updated":
         if (
           event.payload.status === "completed" ||
@@ -470,6 +518,12 @@ export const make = Effect.gen(function* () {
           event.payload.status === "cancelled" ||
           event.payload.status === "interrupted"
         ) {
+          return enqueueThread(event.threadId, "shared");
+        }
+        break;
+      // A shared lookup may predate the change request the agent just opened.
+      case "thread.pull-request-synced":
+        if (hasUndiscoveredCreatedLink(event.payload)) {
           return enqueueThread(event.threadId, true);
         }
         break;

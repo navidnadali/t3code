@@ -28,6 +28,11 @@ import {
   STAGE_INSTALL_ARGS,
 } from "./build-desktop-artifact.ts";
 import { assertLinuxArm64PageCompatibility } from "./lib/linux-arm64-sea.ts";
+import {
+  CLI_ARCHIVE_MANIFEST,
+  CliArchiveManifest,
+  PROCESS_SPAWNER_EXECUTABLE,
+} from "./lib/process-spawner-sea.ts";
 import { selectCliRuntimeExternalDependencies } from "./lib/cli-external-packages.ts";
 import { signWithJsign } from "./lib/windows-jsign.ts";
 import { windowsSystemTar } from "./lib/windows-tar.ts";
@@ -46,6 +51,7 @@ const WorkspaceConfig = Schema.Struct({
 });
 const decodeWorkspaceConfig = Schema.decodeEffect(fromYaml(WorkspaceConfig));
 const encodeJsonString = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const encodeCliArchiveManifest = Schema.encodeEffect(Schema.fromJsonString(CliArchiveManifest));
 const StageWorkspaceConfig = Schema.Struct({
   supportedArchitectures: Schema.Struct({
     os: Schema.Array(Schema.String),
@@ -266,6 +272,7 @@ const bundleLinuxLibatomic = Effect.fn("bundleLinuxLibatomic")(function* (input:
   readonly repoRoot: string;
   readonly contentDir: string;
   readonly executablePath: string;
+  readonly otherExecutablePaths: ReadonlyArray<string>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -317,10 +324,12 @@ const bundleLinuxLibatomic = Effect.fn("bundleLinuxLibatomic")(function* (input:
   );
 
   // RUNPATH resolves through symlinks and is not inherited by child processes, unlike LD_LIBRARY_PATH.
-  yield* runCommand(
-    ChildProcess.make("patchelf", ["--set-rpath", "$ORIGIN/lib", input.executablePath]),
-    "patchelf --set-rpath",
-  );
+  for (const executablePath of [input.executablePath, ...input.otherExecutablePaths]) {
+    yield* runCommand(
+      ChildProcess.make("patchelf", ["--set-rpath", "$ORIGIN/lib", executablePath]),
+      "patchelf --set-rpath",
+    );
+  }
   yield* Effect.log(`[cli-archive] Bundled ${source} as lib/libatomic.so.1.`);
 });
 
@@ -416,6 +425,7 @@ export const signMacArchiveContents = Effect.fn("signMacArchiveContents")(functi
   readonly repoRoot: string;
   readonly contentDir: string;
   readonly executablePath: string;
+  readonly otherExecutablePaths: ReadonlyArray<string>;
   readonly notarySubmissionFile: Option.Option<string>;
 }) {
   const fs = yield* FileSystem.FileSystem;
@@ -426,6 +436,10 @@ export const signMacArchiveContents = Effect.fn("signMacArchiveContents")(functi
   if (deferred !== undefined) yield* fs.remove(deferred, { force: true });
 
   const entitlements = path.join(input.repoRoot, "apps/server/resources/cli-entitlements.plist");
+  const spawnerEntitlements = path.join(
+    input.repoRoot,
+    "apps/server/resources/spawner-entitlements.plist",
+  );
   const libraries = (yield* fs.readDirectory(input.contentDir, { recursive: true }))
     .filter(
       (entry) =>
@@ -436,14 +450,19 @@ export const signMacArchiveContents = Effect.fn("signMacArchiveContents")(functi
     )
     .map((entry) => path.join(input.contentDir, entry));
 
-  for (const target of [...libraries, input.executablePath]) {
+  const executables = [input.executablePath, ...input.otherExecutablePaths];
+  for (const target of [...libraries, ...executables]) {
     yield* runCommand(
       ChildProcess.make("codesign", [
         "--force",
         "--sign",
         identity,
         ...(identity === "-" ? [] : ["--options", "runtime", "--timestamp"]),
-        ...(target === input.executablePath ? ["--entitlements", entitlements] : []),
+        ...(target === input.executablePath
+          ? ["--entitlements", entitlements]
+          : input.otherExecutablePaths.includes(target)
+            ? ["--entitlements", spawnerEntitlements]
+            : []),
         target,
       ]),
       `codesign ${path.relative(input.contentDir, target)}`,
@@ -460,9 +479,15 @@ export const signMacArchiveContents = Effect.fn("signMacArchiveContents")(functi
     return;
   }
   // notarytool requires an archive; bare executables rely on online tickets because they cannot be stapled.
-  const notarizeZip = path.join(path.dirname(input.executablePath), ".notarize-t3.zip");
+  const notarizeDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-notarize-" });
+  const notarizeContents = path.join(notarizeDir, "executables");
+  yield* fs.makeDirectory(notarizeContents);
+  for (const executable of executables) {
+    yield* fs.copyFile(executable, path.join(notarizeContents, path.basename(executable)));
+  }
+  const notarizeZip = path.join(notarizeDir, "t3.zip");
   yield* runCommand(
-    ChildProcess.make("ditto", ["-c", "-k", "--keepParent", input.executablePath, notarizeZip]),
+    ChildProcess.make("ditto", ["-c", "-k", "--keepParent", notarizeContents, notarizeZip]),
     "ditto (notarization zip)",
   );
   const submission = yield* notarytool(
@@ -584,6 +609,34 @@ const signWindowsExecutable = Effect.fn("signWindowsExecutable")(function* (
   yield* Effect.log("[cli-archive] Signed t3.exe (Azure Trusted Signing).");
 });
 
+/**
+ * Stages the spawner, built for the host only; without it t3 starts its spawner from its own, much
+ * larger bundle. The archive records whether it has one, so the smoke check requires it exactly then.
+ */
+export const stageProcessSpawner = Effect.fn("stageProcessSpawner")(function* (input: {
+  readonly builtSpawner: string;
+  readonly contentDir: string;
+  readonly targetKey: string;
+  readonly hostKey: string;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const staged = input.targetKey === input.hostKey && (yield* fs.exists(input.builtSpawner));
+  const spawnerPath = path.join(input.contentDir, PROCESS_SPAWNER_EXECUTABLE);
+  if (staged) {
+    yield* fs.copyFile(input.builtSpawner, spawnerPath);
+  } else {
+    yield* Effect.logWarning(
+      `[cli-archive] No ${PROCESS_SPAWNER_EXECUTABLE} for ${input.targetKey}; t3 starts its spawner from its own bundle.`,
+    );
+  }
+  yield* fs.writeFileString(
+    path.join(input.contentDir, CLI_ARCHIVE_MANIFEST),
+    `${yield* encodeCliArchiveManifest({ processSpawner: staged })}\n`,
+  );
+  return staged ? Option.some(spawnerPath) : Option.none<string>();
+});
+
 const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
   readonly platform: BuildPlatform;
   readonly arch: BuildArch;
@@ -634,6 +687,16 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
 
   yield* Effect.log(`[cli-archive] Staging ${stem}...`);
   yield* fs.copyFile(builtExecutable, path.join(contentDir, executableName));
+  const otherExecutablePaths: Array<string> = [];
+  if (input.platform !== "win") {
+    const spawnerPath = yield* stageProcessSpawner({
+      builtSpawner: path.join(serverDir, "dist-exe", PROCESS_SPAWNER_EXECUTABLE),
+      contentDir,
+      targetKey,
+      hostKey,
+    });
+    if (Option.isSome(spawnerPath)) otherExecutablePaths.push(spawnerPath.value);
+  }
   yield* stageWebClient(webClient, path.join(contentDir, "client"));
   yield* fs.copy(resourceMonitorDir, path.join(contentDir, "resource-monitor"));
   yield* stageRuntimeExternals({
@@ -646,28 +709,31 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
 
   const executablePath = path.join(contentDir, executableName);
   if (input.platform === "linux") {
-    yield* bundleLinuxLibatomic({ repoRoot, contentDir, executablePath });
+    yield* bundleLinuxLibatomic({ repoRoot, contentDir, executablePath, otherExecutablePaths });
   }
   // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
   if (input.platform === "linux" && input.arch === "arm64") {
-    const bytes = yield* fs.readFile(executablePath);
-    yield* Effect.try({
-      try: () => assertLinuxArm64PageCompatibility(bytes),
-      catch: (cause) => new CliArchiveLinuxArm64PageError({ executablePath, cause }),
-    });
+    for (const target of [executablePath, ...otherExecutablePaths]) {
+      const bytes = yield* fs.readFile(target);
+      yield* Effect.try({
+        try: () => assertLinuxArm64PageCompatibility(bytes),
+        catch: (cause) => new CliArchiveLinuxArm64PageError({ executablePath: target, cause }),
+      });
+    }
   }
   if (input.platform === "mac") {
     yield* signMacArchiveContents({
       repoRoot,
       contentDir,
       executablePath,
+      otherExecutablePaths,
       notarySubmissionFile: input.notarySubmissionFile,
     });
   } else if (input.platform === "win") {
     yield* signWindowsExecutable(executablePath);
   }
   if (input.platform !== "win") {
-    yield* fs.chmod(executablePath, 0o755);
+    for (const target of [executablePath, ...otherExecutablePaths]) yield* fs.chmod(target, 0o755);
   }
 
   yield* fs.makeDirectory(input.outputDir, { recursive: true });

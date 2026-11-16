@@ -29,3 +29,15 @@ export function resolveTaggedSourceVersion(repoRoot: string, manifestVersion: st
   }
   return manifestVersion;
 }
+
+/**
+ * The version a server build is stamped with: the packager's APP_VERSION, else the tagged source
+ * version. Everything one build ships (the bundles and the spawner executable) must take it from here.
+ */
+export function resolveBuildVersion(
+  repoRoot: string,
+  manifestVersion: string,
+  appVersion: string | undefined = process.env.APP_VERSION,
+): string {
+  return appVersion?.trim() || resolveTaggedSourceVersion(repoRoot, manifestVersion);
+}

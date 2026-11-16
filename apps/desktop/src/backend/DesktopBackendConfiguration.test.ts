@@ -227,6 +227,7 @@ describe("DesktopBackendConfiguration", () => {
       Effect.gen(function* () {
         const environment = yield* DesktopEnvironment.DesktopEnvironment;
         const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+        const inheritedEnv = yield* HostProcess.Environment;
 
         const first = yield* configuration.resolvePrimary;
         const second = yield* configuration.resolvePrimary;
@@ -238,6 +239,13 @@ describe("DesktopBackendConfiguration", () => {
           environment.backendEntryPath,
         ]);
         assert.equal(first.entryPath, environment.backendEntryPath);
+        // The backend never relaunches: the desktop hands it the young-generation cap, with the marker
+        // that gives the backend's children the NODE_OPTIONS the desktop itself had.
+        assert.equal(
+          first.env.NODE_OPTIONS,
+          `${inheritedEnv.NODE_OPTIONS === undefined ? "" : `${inheritedEnv.NODE_OPTIONS} `}--max-semi-space-size=64`,
+        );
+        assert.equal(first.env.T3CODE_INHERITED_NODE_OPTIONS, inheritedEnv.NODE_OPTIONS ?? "");
         assert.equal(first.cwd, environment.backendCwd);
         assert.equal(first.captureOutput, true);
         assert.equal(first.env.ELECTRON_RUN_AS_NODE, "1");
@@ -419,7 +427,18 @@ describe("DesktopBackendConfiguration", () => {
         Effect.gen(function* () {
           const path = yield* Path.Path;
           const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
-          const config = yield* configuration.resolveWsl({ port: 5000, distro: "Ubuntu" });
+          // The WSL backend gets nothing new from the young-generation default: whatever the
+          // desktop's NODE_OPTIONS, hatch or WSLENV say, its arguments are what they were (the Linux
+          // executable has the cap built in; its bootstrap descriptor rules a relaunch out).
+          const inheritedEnv = yield* HostProcess.Environment;
+          const config = yield* configuration.resolveWsl({ port: 5000, distro: "Ubuntu" }).pipe(
+            Effect.provideService(HostProcess.Environment, {
+              ...inheritedEnv,
+              NODE_OPTIONS: "--max-semi-space-size=16",
+              T3CODE_V8_MAX_SEMI_SPACE_MB: "96",
+              WSLENV: "NODE_OPTIONS/u:T3CODE_V8_MAX_SEMI_SPACE_MB/u",
+            }),
+          );
 
           assert.deepEqual(observedArchives, [
             {

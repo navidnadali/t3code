@@ -223,6 +223,8 @@ const makeTestRelay = Effect.fnUntraced(function* (
               threads: thread === null ? [] : [thread],
             })),
           ),
+    getThreadShellForEvent: unused,
+    getThreadShellReadForEvent: unused,
     listActiveSubagentThreadIds: unused,
     listAppOwnedChildThreadIds: unused,
     countThreads: unused,

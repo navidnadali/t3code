@@ -13,6 +13,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import {
   providerAuth,
   type SourceControlProviderDiscoverySpec,
@@ -28,6 +29,10 @@ import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSour
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import {
+  commandsLeaveTheServer,
+  withServerCommandSpawner,
+} from "../testUtils/serverCommandSpawner.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as SourceControlDiscovery from "./SourceControlDiscovery.ts";
@@ -315,4 +320,132 @@ it.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
         ),
       ),
     ),
+);
+
+// A job the profile starts in the background can keep the shell's stderr open after it exits.
+it.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "refreshes PATH while a job the login shell started keeps its stderr open",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-discovery-stderr-job-" });
+      const home = path.join(root, "home");
+      const fakebin = path.join(home, "fakebin");
+      const loginShell = path.join(root, "loginsh");
+      const jobPid = path.join(root, "job.pid");
+      yield* fs.makeDirectory(fakebin, { recursive: true });
+      yield* fs.writeFileString(
+        loginShell,
+        `#!/bin/sh\nexport HOME=${home}\n. "$HOME/.profile"\ntail -f /dev/null </dev/null >/dev/null &\necho $! > ${jobPid}\nshift\nexec /bin/sh -c "$1"\n`,
+        { mode: 0o755 },
+      );
+      // The spawner usually ends the job with the shell's group; this covers it if not.
+      yield* Effect.addFinalizer(() =>
+        fs.readFileString(jobPid).pipe(
+          Effect.flatMap((pid) =>
+            Effect.try({
+              try: () => process.kill(Number(pid.trim()), "SIGKILL"),
+              catch: () => "already gone" as const,
+            }),
+          ),
+          Effect.ignore,
+        ),
+      );
+      const env = yield* HostProcess.Environment;
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const saved = { PATH: env.PATH, SHELL: env.SHELL };
+          env.SHELL = loginShell;
+          return saved;
+        }),
+        (saved) =>
+          Effect.sync(() => {
+            env.PATH = saved.PATH;
+            if (saved.SHELL === undefined) delete env.SHELL;
+            else env.SHELL = saved.SHELL;
+          }),
+      );
+      yield* fs.writeFileString(path.join(fakebin, "jj"), "#!/bin/sh\necho 'jj 0.99.0-test'\n", {
+        mode: 0o755,
+      });
+      yield* fs.writeFileString(path.join(home, ".profile"), 'export PATH="$HOME/fakebin:$PATH"\n');
+
+      const discovery = yield* SourceControlDiscovery.SourceControlDiscovery;
+      const jj = (yield* discovery.discover).versionControlSystems.find(
+        (item) => item.kind === "jj",
+      );
+
+      assert.deepStrictEqual(
+        { status: jj?.status, version: jj?.version },
+        { status: "available", version: Option.some("jj 0.99.0-test") },
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        SourceControlDiscovery.layer.pipe(
+          Layer.provide(VcsProcess.layer),
+          Layer.provideMerge(layerDiscovery()),
+        ),
+      ),
+    ),
+);
+
+// thread views, the palette and mobile run discovery, so its login shell must not fork the
+// server.
+it.effect.skipIf(!commandsLeaveTheServer)(
+  "reads the login shell from the server's command spawner",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-discovery-spawner-" });
+      const loginShell = path.join(root, "loginsh");
+      yield* fs.writeFileString(loginShell, '#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n', {
+        mode: 0o755,
+      });
+      const env = yield* HostProcess.Environment;
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const saved = env.SHELL;
+          env.SHELL = loginShell;
+          return saved;
+        }),
+        (saved) =>
+          Effect.sync(() => {
+            if (saved === undefined) delete env.SHELL;
+            else env.SHELL = saved;
+          }),
+      );
+
+      const { ambientCommands, serverCommands } = yield* withServerCommandSpawner(
+        Effect.gen(function* () {
+          const discovery = yield* SourceControlDiscovery.SourceControlDiscovery;
+          yield* discovery.discover;
+        }).pipe(
+          Effect.provide(
+            SourceControlDiscovery.layer.pipe(
+              Layer.provide(
+                // The ambient spawner wins over the one layerDiscovery's NodeServices brings.
+                Layer.merge(
+                  layerDiscovery(),
+                  Layer.effect(
+                    ChildProcessSpawner.ChildProcessSpawner,
+                    Effect.service(ChildProcessSpawner.ChildProcessSpawner),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      assert.deepStrictEqual(
+        {
+          ambient: ambientCommands.includes(loginShell),
+          server: serverCommands.includes(loginShell),
+        },
+        { ambient: false, server: true },
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

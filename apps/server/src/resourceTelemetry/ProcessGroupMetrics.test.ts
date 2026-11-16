@@ -68,6 +68,32 @@ describe("groupProcesses", () => {
   });
 });
 
+describe("groupProcesses through a spawner process", () => {
+  it("books what the server's spawner started as if the server had started it", () => {
+    const totals = groupProcesses(
+      [
+        process(10, 1, "node", "server"),
+        process(15, 10, "t3-process-spaw"),
+        process(16, 15, "claude"),
+        process(17, 16, "bash"),
+        process(18, 15, "codex"),
+        process(19, 15, "git"),
+        // A parent named like a spawner but not the server's own stays opaque.
+        process(25, 10, "t3-process-spaw"),
+        process(26, 25, "claude"),
+      ],
+      new Set([15]),
+    );
+
+    assert.deepStrictEqual(Object.fromEntries(totals), {
+      server: { residentBytes: 10_000, cpuPercent: 10, count: 1 },
+      claude: { residentBytes: 33_000, cpuPercent: 33, count: 2 },
+      codex: { residentBytes: 18_000, cpuPercent: 18, count: 1 },
+      other: { residentBytes: 85_000, cpuPercent: 85, count: 4 },
+    });
+  });
+});
+
 describe("ProcessGroupMetrics.layer", () => {
   it.effect("logs the first failed sample and the recovery, not every repeat", () => {
     const logs: Array<string> = [];

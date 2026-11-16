@@ -93,7 +93,10 @@ export interface PiRpcSpawnOptions {
 }
 
 export interface PiRpcConnection {
-  readonly send: (record: PiRpcRecord) => Effect.Effect<void, PiRpcError>;
+  readonly send: (
+    record: PiRpcRecord,
+    submit?: (enqueue: () => void) => Effect.Effect<void, PiRpcError>,
+  ) => Effect.Effect<void, PiRpcError>;
   readonly request: (
     record: PiRpcRecord,
     timeoutMs?: number,
@@ -188,22 +191,6 @@ function parsePiRecord(line: string): PiRpcRecord | undefined {
   }
 }
 
-/**
- * `hasExited` is consulted before each signal. Once the original child is
- * gone its pid/pgid can be recycled by the OS, so escalating blindly could
- * deliver SIGKILL to an unrelated process.
- */
-const terminatePiProcess = Effect.fn("PiRpc.terminatePiProcess")(function* (
-  kill: (signal: NodeJS.Signals) => boolean,
-  hasExited: () => boolean,
-) {
-  if (hasExited()) return;
-  if (!kill("SIGTERM")) return;
-  yield* Effect.sleep(TERMINATION_GRACE);
-  if (hasExited()) return;
-  kill("SIGKILL");
-});
-
 export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSpawnOptions) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const platform = yield* HostProcess.Platform;
@@ -229,19 +216,6 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
   let childExited = false;
   let diagnosingStdoutClose = false;
 
-  const killProcessGroup = (signal: NodeJS.Signals): boolean => {
-    try {
-      if (platform === "win32") {
-        process.kill(Number(child.pid), signal);
-      } else {
-        signalProcessGroup(Number(child.pid), signal);
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   const hasExited = (): boolean => {
     if (childExited) return true;
     try {
@@ -262,8 +236,16 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     yield* taskkill.exitCode;
   }).pipe(Effect.scoped, Effect.ignore);
 
+  // Once pi is gone its PID can name another process: the handle signals pi's group (SIGTERM, then
+  // SIGKILL after the grace) only while its PID is still pi's, as far as its spawner can tell.
   const terminateProcess =
-    platform === "win32" ? terminateWindowsTree : terminatePiProcess(killProcessGroup, hasExited);
+    platform === "win32"
+      ? terminateWindowsTree
+      : Effect.suspend(() =>
+          hasExited()
+            ? Effect.void
+            : child.kill({ killSignal: "SIGTERM", forceKillAfter: TERMINATION_GRACE }),
+        ).pipe(Effect.ignore);
 
   // Register teardown immediately after spawn so interrupted setup cannot leak a detached process.
   yield* Scope.addFinalizer(scope, terminateProcess.pipe(Effect.ignore, Effect.uninterruptible));
@@ -312,10 +294,15 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     });
 
   // Watch exit before reading stdout so immediate crashes populate exitDeferred for diagnosis.
+  // Exited either way: an exit without a code (a signal, or a status nobody could read) leaves no
+  // process of pi's to stop, and its PID may name another process by teardown.
   yield* child.exitCode.pipe(
     Effect.matchEffect({
       onFailure: (cause) =>
-        Deferred.fail(exitDeferred, new PiRpcError({ operation: "exit", cause })),
+        Effect.suspend(() => {
+          childExited = true;
+          return Deferred.fail(exitDeferred, new PiRpcError({ operation: "exit", cause }));
+        }),
       onSuccess: (code) =>
         Effect.suspend(() => {
           childExited = true;
@@ -409,11 +396,17 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
 
   const send =
     /* Protocol records and writes include streaming deltas; avoid a span per record. */
-    Effect.fnUntraced(function* (record: PiRpcRecord): Effect.fn.Return<void, PiRpcError> {
-      const accepted = yield* Queue.offer(
-        outgoing,
-        new TextEncoder().encode(`${encodeJsonLine(record)}\n`),
-      );
+    Effect.fnUntraced(function* (
+      record: PiRpcRecord,
+      submit?: (enqueue: () => void) => Effect.Effect<void, PiRpcError>,
+    ): Effect.fn.Return<void, PiRpcError> {
+      const encoded = new TextEncoder().encode(`${encodeJsonLine(record)}\n`);
+      let accepted = false;
+      if (submit === undefined) accepted = yield* Queue.offer(outgoing, encoded);
+      else
+        yield* submit(() => {
+          accepted = Queue.offerUnsafe(outgoing, encoded);
+        });
       if (!accepted) {
         return yield* Deferred.await(transportDown);
       }

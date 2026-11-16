@@ -1794,6 +1794,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         [
           {
             type: "provider-turn.steer",
+            durableDelivery: true,
+            acceptDelegatedCompletion: false,
+            deliveryIntent: "auto",
             providerSessionId: providerSession.id,
             providerThreadId: providerThread.id,
             providerTurnId: providerTurn.id,

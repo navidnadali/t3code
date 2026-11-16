@@ -37,6 +37,10 @@ import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import {
+  ProviderIoStageTiming,
+  timeProviderIoStage,
+} from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import { makeProviderFailureTurnItem } from "@t3tools/provider-core/server/failure";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { stripUnservedToolOutputImageBytes } from "./toolOutputImageBytes.ts";
@@ -258,6 +262,7 @@ export const layer: Layer.Layer<
     const instances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
     const usageLimitResets = yield* UsageLimitResetFallback;
     const scope = yield* Effect.scope;
+    const stageTiming = yield* ProviderIoStageTiming;
     const completedTurnAnalytics = new Set<string>();
 
     const makeDomainEvent =
@@ -585,6 +590,26 @@ export const layer: Layer.Layer<
               ];
             case "runtime_request.updated":
               return [
+                ...(input.event.artifacts === undefined
+                  ? []
+                  : [
+                      yield* makeDomainEvent(input, {
+                        type: "node.updated",
+                        threadId: input.event.artifacts.node.threadId,
+                        runId: input.event.artifacts.node.runId,
+                        nodeId: input.event.artifacts.node.id,
+                        payload: input.event.artifacts.node,
+                      }),
+                      yield* makeDomainEvent(input, {
+                        type: "turn-item.updated",
+                        threadId: input.event.artifacts.turnItem.threadId,
+                        runId: input.event.artifacts.turnItem.runId,
+                        nodeId: input.event.artifacts.turnItem.nodeId,
+                        payload: boundFileChangeForStorage(
+                          stripUnservedToolOutputImageBytes(input.event.artifacts.turnItem),
+                        ),
+                      }),
+                    ]),
                 yield* makeDomainEvent(input, {
                   type: "runtime-request.updated",
                   ...(input.event.threadId === undefined ? {} : { threadId: input.event.threadId }),
@@ -877,6 +902,13 @@ export const layer: Layer.Layer<
                 input.event.type === "app_thread.created"
                   ? threadCommands.withLock(input.event.appThread.id, effect)
                   : effect,
+            ),
+          (effect, input) =>
+            timeProviderIoStage(
+              stageTiming?.forProvider(input.event.driver),
+              "ingest",
+              0,
+              () => effect,
             ),
         ),
     });

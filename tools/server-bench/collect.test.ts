@@ -10,6 +10,7 @@ import {
   knobsFromEnv,
   parseOtlpGauges,
   parseProcIo,
+  parseSpanLine,
   parseProcStat,
   parsePsTime,
   primaryRole,
@@ -292,6 +293,24 @@ const withTraceDir = async (run: (trace: string) => Promise<void>) => {
   }
 };
 
+describe("parseSpanLine", () => {
+  // Spans relayed from browser clients are written as otlp-span records, with an OTLP status
+  // (2 is an error) instead of an Effect exit.
+  it("counts a failed span as an error, in the server's Effect and OTLP records alike", () => {
+    const span = (fields: Record<string, unknown>) =>
+      JSON.stringify({ name: "span", endTimeUnixNano: "1000000000", durationMs: 1, ...fields });
+    expect(
+      [
+        span({ type: "effect-span", exit: { _tag: "Success" } }),
+        span({ type: "effect-span", exit: { _tag: "Failure", cause: "boom" } }),
+        span({ type: "otlp-span", status: { code: "0" } }),
+        span({ type: "otlp-span", status: { code: "1" } }),
+        span({ type: "otlp-span", status: { code: "2", message: "boom" } }),
+      ].map((line) => parseSpanLine(line)?.ok),
+    ).toEqual([true, false, true, true, false]);
+  });
+});
+
 describe("readTraceWindow", () => {
   it("reads the rotated files once each and keeps only spans ending in the window", async () => {
     await withTraceDir(async (trace) => {
@@ -366,6 +385,37 @@ describe("readTraceWindow", () => {
       expect(partial.spans).toEqual([]);
       expect(old.problems).toEqual(["trace_stale"]);
       expect(old.spans).toEqual([]);
+    });
+  });
+
+  // A browser span the server relays is written when its batch arrives, so its end can be older
+  // than the file it lands in: it says nothing about where the server's own records start.
+  it("reads older files for the window whatever a relayed browser span's end says", async () => {
+    await withTraceDir(async (trace) => {
+      const relayed = `${JSON.stringify({
+        type: "otlp-span",
+        name: "browser.navigate",
+        endTimeUnixNano: String(BigInt((T0 - 60_000) * 1e6)),
+        durationMs: 3,
+        status: { code: "1" },
+      })}\n`;
+      NodeFS.writeFileSync(
+        `${trace}.1`,
+        spanLine("sqlite", T0 - 1000, 5, { "db.connection": "writer" }) +
+          spanLine("sqlite", T0 + 100, 7, { "db.connection": "writer" }),
+      );
+      NodeFS.writeFileSync(
+        trace,
+        relayed + spanLine("sqlite", T0 + 600, 9, { "db.connection": "writer" }),
+      );
+      const read = await readTraceWindow(trace, { startMs: T0, endMs: T0 + 1000 });
+
+      expect(read.valid).toBe(true);
+      expect(read.files.map((file) => file.name)).toEqual([
+        "server.trace.ndjson",
+        "server.trace.ndjson.1",
+      ]);
+      expect(read.spans.map((span) => span.durationMs).toSorted()).toEqual([7, 9]);
     });
   });
 

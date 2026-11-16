@@ -1,6 +1,7 @@
 import {
   type ChatAttachment,
   CommandId,
+  latestProviderTurnForAttempt,
   type OrchestrationV2Command,
   OrchestrationV2ProviderCapabilities,
   type OrchestrationV2GoalCommand,
@@ -95,12 +96,14 @@ export function resolveMessageDispatchIntent(
   requestedMode: MessageDispatchMode,
   deliveryIntent?: "auto" | "steer" | "restart",
   preferRestartSteering = false,
+  scheduledPrompt = false,
 ): MessageDispatchMode {
   const mode = resolveDeliveryIntent(
     projection,
     requestedMode,
     deliveryIntent,
     preferRestartSteering,
+    scheduledPrompt,
   );
   if (mode.type !== "steer_active") return mode;
   // Compaction and sign-out cannot accept steers; queue follow-ups.
@@ -157,11 +160,49 @@ function providerTurnCapabilities(
   return providerSession?.capabilities.turns;
 }
 
+/** Automatic input steers a provider that steers natively, or by restart when MCP prefers it. */
+export function automaticDeliverySteers(
+  turns: OrchestrationV2ProviderCapabilities["turns"],
+  preferRestartSteering: boolean,
+): boolean {
+  return (
+    turns.supportsActiveSteering ||
+    (preferRestartSteering && turns.supportsInterrupt && turns.supportsSteeringByInterruptRestart)
+  );
+}
+
+/**
+ * A scheduled prompt must not cancel the tools running in its thread: it steers a live turn only
+ * where native steering leaves them running, and otherwise waits as a queued run.
+ */
+export function scheduledPromptSteersLiveTurn(
+  turns: OrchestrationV2ProviderCapabilities["turns"],
+): boolean {
+  return turns.supportsActiveSteering && turns.activeSteeringInterruptsTools !== true;
+}
+
+/** A run whose next provider turn has yet to run, so a steer can wait for it. */
+function awaitsNextTurn(
+  projection: OrchestrationV2ThreadProjection,
+  run: OrchestrationV2Run,
+): boolean {
+  return (
+    run.status === "preparing" ||
+    run.status === "starting" ||
+    (run.status === "running" &&
+      (latestProviderTurnForAttempt(
+        projection.providerTurns.filter((turn) => turn.nodeId === run.rootNodeId),
+        run.activeAttemptId,
+      )?.status ?? "pending") === "pending")
+  );
+}
+
 function resolveDeliveryIntent(
   projection: OrchestrationV2ThreadProjection,
   requestedMode: MessageDispatchMode,
   deliveryIntent?: "auto" | "steer" | "restart",
   preferRestartSteering = false,
+  scheduledPrompt = false,
 ): MessageDispatchMode {
   if (deliveryIntent === undefined) return requestedMode;
 
@@ -173,8 +214,10 @@ function resolveDeliveryIntent(
   if (deliveryIntent === "restart") {
     return { type: "restart_active", targetRunId: activeRun.id };
   }
-  // A run can be active before its provider turn starts or after it finishes.
-  // Queue automatic input in those gaps so steering cannot reject the message.
+  const capabilities = providerTurnCapabilities(projection, activeRun);
+  // A run can be active before its provider turn starts or after it finishes. Automatic input
+  // steers the next turn as an explicit steer would, where it would steer a live turn; dispatch
+  // checks the provider's own capabilities before a session reports any.
   if (
     activeRun.status === "preparing" ||
     activeRun.status === "starting" ||
@@ -182,21 +225,23 @@ function resolveDeliveryIntent(
       (turn) => turn.runAttemptId === activeRun.activeAttemptId && turn.status === "running",
     )
   ) {
-    return { type: "queue_after_active" };
+    return awaitsNextTurn(projection, activeRun) &&
+      (capabilities === undefined || automaticDeliverySteers(capabilities, preferRestartSteering))
+      ? { type: "steer_active", targetRunId: activeRun.id }
+      : { type: "queue_after_active" };
   }
 
-  const capabilities = providerTurnCapabilities(projection, activeRun);
   // MCP automatic sends have always used restart steering where the provider supports it.
   // Resolve that preference only after confirming this attempt still has a live provider turn.
   if (
-    capabilities?.supportsActiveSteering === true ||
-    (preferRestartSteering &&
-      capabilities?.supportsInterrupt === true &&
-      capabilities.supportsSteeringByInterruptRestart === true)
+    capabilities !== undefined &&
+    (scheduledPrompt
+      ? scheduledPromptSteersLiveTurn(capabilities)
+      : automaticDeliverySteers(capabilities, preferRestartSteering))
   ) {
     return { type: "steer_active", targetRunId: activeRun.id };
   }
-  if (capabilities?.supportsQueuedMessages === true) {
+  if (capabilities?.supportsQueuedMessages === true || scheduledPrompt) {
     return { type: "queue_after_active" };
   }
   if (capabilities?.supportsSteeringByInterruptRestart === true) {

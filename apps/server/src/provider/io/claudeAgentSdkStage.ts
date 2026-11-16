@@ -28,6 +28,7 @@ import {
   toWorkerOutput,
   toWorkerReply,
 } from "./claudeAgentSdkProtocol.ts";
+import { withoutClaudeCanUseToolShadowedWarning } from "./claudeAgentSdkWarnings.ts";
 import type { ProviderIoStage, ProviderIoStageHost } from "./providerIoProtocol.ts";
 
 const fromProcessError = (error: ClaudeAgentSdkProcessError) => {
@@ -280,15 +281,17 @@ export const claudeAgentSdkStage: ProviderIoStage<
 
     const start = async () => {
       const sdk = await loadClaudeAgentSdk();
-      query = sdk.query({
-        prompt: prompts.iterable,
-        options: {
-          ...stageOptions.options,
-          ...relay.callbacks(stageOptions.callbacks),
-          ...(stageOptions.hooks === undefined ? {} : { hooks: relay.hooks(stageOptions.hooks) }),
-          spawnClaudeCodeProcess,
-        },
-      });
+      query = withoutClaudeCanUseToolShadowedWarning(() =>
+        sdk.query({
+          prompt: prompts.iterable,
+          options: {
+            ...stageOptions.options,
+            ...relay.callbacks(stageOptions.callbacks),
+            ...(stageOptions.hooks === undefined ? {} : { hooks: relay.hooks(stageOptions.hooks) }),
+            spawnClaudeCodeProcess,
+          },
+        }),
+      );
       void readMessages(query);
     };
 

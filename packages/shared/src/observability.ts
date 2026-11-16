@@ -197,6 +197,8 @@ export interface LocalFileTracerOptions extends TraceSinkOptions {
   readonly sink?: TraceSink;
   /** Above 0, fast successful SQL spans are summarised per name instead of written. */
   readonly sqlMinDurationMs?: number;
+  /** Sees every span as it ends, sampled or not, before the SQL summary. Runs per span: keep it O(1). */
+  readonly onSpanEnd?: (name: string, startTime: bigint, endTime: bigint) => void;
 }
 
 type OtlpSpan = OtlpTracer.ScopeSpan["spans"][number];
@@ -686,16 +688,19 @@ class LocalFileSpan implements Tracer.Span {
   private readonly delegate: Tracer.Span;
   private readonly push: (record: EffectTraceRecord) => void;
   private readonly sqlSummary: SqlSpanSummary | undefined;
+  private readonly onSpanEnd: LocalFileTracerOptions["onSpanEnd"];
 
   constructor(
     options: Parameters<Tracer.Tracer["span"]>[0],
     delegate: Tracer.Span,
     push: (record: EffectTraceRecord) => void,
     sqlSummary: SqlSpanSummary | undefined,
+    onSpanEnd: LocalFileTracerOptions["onSpanEnd"],
   ) {
     this.delegate = delegate;
     this.push = push;
     this.sqlSummary = sqlSummary;
+    this.onSpanEnd = onSpanEnd;
     this.name = delegate.name;
     this.spanId = delegate.spanId;
     this.traceId = delegate.traceId;
@@ -715,13 +720,15 @@ class LocalFileSpan implements Tracer.Span {
   end(endTime: bigint, exit: Exit.Exit<unknown, unknown>): void {
     // Cached lookup fibers retain parent spans. Traces need success status, not result payloads.
     const traceExit = ExitRuntime.isSuccess(exit) ? ExitRuntime.void : exit;
+    const startTime = this.status.startTime;
     this.status = {
       _tag: "Ended",
-      startTime: this.status.startTime,
+      startTime,
       endTime,
       exit: traceExit,
     };
     this.delegate.end(endTime, redactExitCredentials(traceExit));
+    this.onSpanEnd?.(this.name, startTime, endTime);
 
     if (this.sampled && !this.sqlSummary?.summarise(this)) {
       this.push(spanToTraceRecord(this));
@@ -788,7 +795,13 @@ export const makeLocalFileTracer = Effect.fn("makeLocalFileTracer")(function* (
 
   return Tracer.make({
     span(spanOptions) {
-      return new LocalFileSpan(spanOptions, delegate.span(spanOptions), sink.push, sqlSummary);
+      return new LocalFileSpan(
+        spanOptions,
+        delegate.span(spanOptions),
+        sink.push,
+        sqlSummary,
+        options.onSpanEnd,
+      );
     },
     ...(delegate.context ? { context: delegate.context } : {}),
   });

@@ -91,6 +91,32 @@ export async function withArchivedThreads(
   };
 }
 
+/**
+ * History mode: a seeded thread's queued runs, which its shell hides while held. A session's first
+ * message is a client's and would release them to run the fixture's prompts; they are cancelled.
+ */
+export async function cancelSeededQueue(
+  http: HttpTarget,
+  socket: RpcSocket,
+  threadId: string,
+  timeoutMs: number,
+): Promise<number> {
+  const { value } = await httpJson<{
+    readonly projection: {
+      readonly runs: ReadonlyArray<{ readonly id: string; readonly status: string }>;
+    };
+  }>(http, `/api/orchestration/threads/${encodeURIComponent(threadId)}/bounded`);
+  const queued = value.projection.runs.filter((run) => run.status === "queued");
+  for (const run of queued) {
+    await socket.call(
+      "orchestration.dispatchCommand",
+      { type: "queued-run.cancel", commandId: newId(), threadId, runId: run.id },
+      timeoutMs,
+    );
+  }
+  return queued.length;
+}
+
 interface StreamItem {
   readonly kind?: string;
   readonly sequence?: number;

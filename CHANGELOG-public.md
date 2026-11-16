@@ -2,6 +2,25 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.9-perf.9 (2026-11-16)
+
+Queued-message delivery, completion wakes and restart recovery
+
+Upstream base: c2e54e3ac9c8.
+
+Upstream T3 Code 0.1.9 at main of 2026-11-15, with upstream migrations 93 to 95; Node 26.13.1.
+
+- Migrations: upstream's migrations 93 to 95 apply in order, and the fork's migrations leave the message-ordinal index to upstream's migration 94.
+- Queued messages: a message queued while a run is busy steers into it after 60 seconds, whether a person, an automation or another thread queued it. Due messages merge into one steer, oldest first and within the provider's text limit, with slash commands sent on their own; a turn takes at most one automatic steer a minute. Send now is offered on a waiting run only when the server can end its wait.
+- Completion and pull request wakes: a thread's queued completion wakes, and its pull request watch wakes, merge into one wake of at most 25 results. A wake whose start failed, or that a restart cut, sends its results again with backoff, at most eight times; merged pull request news survives a restart.
+- Restart recovery holds only the messages a person queued (unattended work only when continuation is off) and wakes a delegated seat whose waiter the restart cut.
+- Run ends are handled per thread, in commit order and with bounded workers, so one busy thread no longer holds up the others; provider wakes dispatch in a pool of their own.
+- A full thread snapshot is capped at 32 MiB of JSON by default and refused when too long for one socket frame.
+- MCP tools in a wake turn wait for the turn's run (port of upstream #33330); a run that ends its wait early still captures its checkpoint.
+- Traces: a per-minute span aggregate is written beside the trace file.
+- Includes 0.1.9-perf.8's checkpoint cohort and descendant process fixes.
+- Bench parameters in tools/server-bench set to chosen defaults.
+
 ## v0.1.9-perf.8 (2026-11-15)
 
 Hotfix: checkpoint cohorts and descendant process tracking

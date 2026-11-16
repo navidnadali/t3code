@@ -2080,16 +2080,34 @@ it.effect.each([
             };
           }),
       });
-      // The settlement promotes the follow-up; optionally its turn starts before Force stop releases.
+      // The settlement promotes the follow-up before Force stop releases (the run-end reaction runs
+      // on its own fiber, so wait for it); optionally its turn starts first too.
       const layerSessionsStartingFollowUpFirst = Layer.effect(
         ProviderSessionManager.ProviderSessionManagerV2,
         Effect.gen(function* () {
           const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
           const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const promoted = orchestrator
+            .streamStoredEventsFrom({
+              threadId: ThreadId.make("thread:force-stop-follow-up"),
+              eventType: "run.updated",
+            })
+            .pipe(
+              Stream.filter(
+                ({ event }) =>
+                  event.type === "run.updated" &&
+                  event.payload.ordinal === 2 &&
+                  event.payload.status !== "queued",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.orDie,
+            );
           return ProviderSessionManager.ProviderSessionManagerV2.of({
             ...sessions,
             releaseUnlessBusy: (input) =>
-              (startedBeforeRelease ? worker.drain().pipe(Effect.orDie) : Effect.void).pipe(
+              (startedBeforeRelease ? worker.drain().pipe(Effect.orDie) : promoted).pipe(
                 Effect.andThen(sessions.releaseUnlessBusy(input)),
               ),
           });

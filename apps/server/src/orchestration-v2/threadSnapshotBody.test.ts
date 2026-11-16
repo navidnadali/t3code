@@ -33,7 +33,7 @@ import { HttpMiddleware, HttpRouter, HttpServerResponse } from "effect/http";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import { encodeThreadSnapshotBody } from "./threadSnapshotBody.ts";
+import { encodeThreadSnapshotBody, jsonLongerThan } from "./threadSnapshotBody.ts";
 import { projectThreadProjectionForWire } from "./WireProjection.ts";
 
 const provider = ProviderInstanceId.make("codex");
@@ -419,6 +419,31 @@ it.layer(TestLayer)("thread snapshot body", (it) => {
       const streamed = yield* streamedBody(snapshot);
       assert.isTrue(streamed.bytes.equals(referenceBody(snapshot)));
       assert.isAtMost(streamed.largestChunk, 1024 * 1024);
+    }),
+  );
+
+  it.effect("measures a snapshot's JSON length exactly as JSON.stringify writes it", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const { snapshotSequence, projection } = yield* projections.getThreadSnapshot(FORK);
+      let deep: unknown = TEXT.repeat(40_000);
+      for (let depth = 0; depth < 3_000; depth++) deep = depth % 2 === 0 ? [deep] : { deep };
+      const encoded = encodeAsEndpoint({
+        snapshotSequence,
+        projection: {
+          ...projectThreadProjectionForWire(projection),
+          runtimeRequests: runtimeRequests([
+            { reply: `${TEXT}\n`.repeat(40_000) },
+            { [TEXT.repeat(40_000)]: 0 },
+            { nul: "\u0000".repeat(200_000) },
+            { many: Array.from({ length: 200_000 }, (_, index) => ({ index, text: "x" })) },
+            { deep },
+          ]),
+        },
+      });
+      const length = JSON.stringify(encoded).length;
+      assert.isFalse(yield* jsonLongerThan(encoded, length));
+      assert.isTrue(yield* jsonLongerThan(encoded, length - 1));
     }),
   );
 

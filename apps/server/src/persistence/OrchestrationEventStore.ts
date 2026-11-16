@@ -63,6 +63,7 @@ export class OrchestrationEventStore extends Context.Service<
       readonly threadId?: ThreadId;
       readonly commandId?: CommandId;
       readonly eventType?: OrchestrationV2DomainEvent["type"];
+      readonly eventTypes?: ReadonlyArray<OrchestrationV2DomainEvent["type"]>;
       readonly limit?: number;
       readonly skipUnknownEventTypes?: boolean;
     }) => Stream.Stream<OrchestrationV2StoredEvent, OrchestrationEventStoreError>;
@@ -404,6 +405,7 @@ const makeEventStore = Effect.gen(function* () {
     readonly threadId?: ThreadId;
     readonly commandId?: CommandId;
     readonly eventType?: OrchestrationV2DomainEvent["type"];
+    readonly eventTypes?: ReadonlyArray<OrchestrationV2DomainEvent["type"]>;
     readonly onlyAgentEvents?: boolean;
     readonly limit: number;
   }) =>
@@ -444,6 +446,9 @@ const makeEventStore = Effect.gen(function* () {
           ...(input.threadId === undefined ? [] : [sql`stream_id = ${input.threadId}`]),
           ...(input.commandId === undefined ? [] : [sql`command_id = ${input.commandId}`]),
           ...(input.eventType === undefined ? [] : [sql`event_type = ${input.eventType}`]),
+          ...(input.eventTypes === undefined
+            ? []
+            : [sql`event_type IN ${sql.in(input.eventTypes)}`]),
         ])}
       ORDER BY sequence ASC
       LIMIT ${input.limit}
@@ -568,6 +573,7 @@ const makeEventStore = Effect.gen(function* () {
           ...(input?.threadId === undefined ? {} : { threadId: input.threadId }),
           ...(input?.commandId === undefined ? {} : { commandId: input.commandId }),
           ...(input?.eventType === undefined ? {} : { eventType: input.eventType }),
+          ...(input?.eventTypes === undefined ? {} : { eventTypes: input.eventTypes }),
           onlyAgentEvents: true,
           limit: pageLimit,
         }).pipe(

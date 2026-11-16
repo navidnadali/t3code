@@ -106,6 +106,8 @@ export interface AcpSessionRuntimeOptions {
   readonly resumeMethod?: "load" | "resume";
   readonly sessionLoadTimeout?: Duration.Input;
   readonly sessionLoadReplayIdleGap?: Duration.Input;
+  // Treat replay going quiet as loaded, for agents whose session/load may never reply.
+  readonly sessionLoadReplayIdleReadiness?: boolean;
   readonly interruptPromptOnCancel?: boolean;
   readonly cancelMeta?: EffectAcpSchema.CancelNotification["_meta"];
   readonly initializeMeta?: EffectAcpSchema.InitializeRequest["_meta"];
@@ -1417,6 +1419,13 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       const written = Deferred.makeUnsafe<void>();
       const previous = lastRecord;
       lastRecord = written;
+      const drop = Effect.suspend(() => {
+        if (recordsClosed) {
+          return Effect.logWarning("Dropped a native ACP request record after the runtime closed.");
+        }
+        droppedRecords += 1;
+        return Effect.void;
+      }).pipe(Effect.andThen(Deferred.succeed(written, undefined)));
       return Effect.gen(function* () {
         if (previous !== undefined && !(yield* Deferred.isDone(previous))) {
           yield* Effect.exit(Deferred.await(previous));
@@ -1431,20 +1440,12 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         return yield* Effect.exit(Effect.suspend(() => logRequest(event)));
       }).pipe(
         // Only an interrupt (the runtime closing) ends it otherwise: the record is dropped.
-        Effect.onExit((exit) =>
-          Exit.isSuccess(exit)
-            ? Deferred.done(written, exit.value)
-            : Effect.suspend(() => {
-                if (recordsClosed) {
-                  return Effect.logWarning(
-                    "Dropped a native ACP request record after the runtime closed.",
-                  );
-                }
-                droppedRecords += 1;
-                return Effect.void;
-              }).pipe(Effect.andThen(Deferred.succeed(written, undefined))),
-        ),
+        Effect.onExit((exit) => (Exit.isSuccess(exit) ? Deferred.done(written, exit.value) : drop)),
         Effect.forkIn(recordScope, { startImmediately: true }),
+        // A closed scope returns the record's fiber ended without running it.
+        Effect.flatMap((fiber) =>
+          fiber.pollUnsafe() !== undefined && !Deferred.isDoneUnsafe(written) ? drop : Effect.void,
+        ),
         Effect.as(written),
       );
     });
@@ -2133,34 +2134,36 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         );
 
         return yield* Effect.gen(function* () {
+          const loadOrReplayIdle =
+            options.sessionLoadReplayIdleReadiness === true
+              ? Effect.gen(function* () {
+                  const idleFiber = yield* waitForSessionLoadReplayIdle({
+                    gateRef: sessionLoadGateRef,
+                  }).pipe(Effect.forkIn(runtimeScope));
+                  return yield* Effect.raceFirst(
+                    acp.agent.loadSession(loadPayload),
+                    Fiber.join(idleFiber),
+                  ).pipe(Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)));
+                })
+              : acp.agent.loadSession(loadPayload);
           const loaded = yield* withRequestRecords(
             "session/load",
             loadPayload,
-            Effect.gen(function* () {
-              const idleFiber = yield* waitForSessionLoadReplayIdle({
-                gateRef: sessionLoadGateRef,
-              }).pipe(Effect.forkIn(runtimeScope));
-              return yield* Effect.raceFirst(
-                acp.agent.loadSession(loadPayload),
-                Fiber.join(idleFiber),
-              ).pipe(
-                Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)),
-                Effect.timeoutOption(sessionLoadTimeout),
-                Effect.flatMap((result) =>
-                  Effect.fromOption(
-                    result,
-                    () =>
-                      new EffectAcpErrors.AcpTransportError({
-                        operation: "call-rpc",
-                        method: "session/load",
-                        detail:
-                          "session/load timed out waiting for RPC response or replay idle gap",
-                        cause: undefined,
-                      }),
-                  ),
+            loadOrReplayIdle.pipe(
+              Effect.timeoutOption(sessionLoadTimeout),
+              Effect.flatMap((result) =>
+                Effect.fromOption(
+                  result,
+                  () =>
+                    new EffectAcpErrors.AcpTransportError({
+                      operation: "call-rpc",
+                      method: "session/load",
+                      detail: "session/load timed out waiting for RPC response or replay idle gap",
+                      cause: undefined,
+                    }),
                 ),
-              );
-            }),
+              ),
+            ),
           );
 
           const gate = yield* Ref.get(sessionLoadGateRef);
@@ -2544,9 +2547,9 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       sessionId: started.sessionId,
       ...(options.cancelMeta === undefined ? {} : { _meta: options.cancelMeta }),
     } satisfies EffectAcpSchema.CancelNotification;
-    // An agent drops a cancel that comes before the prompt it targets, so it waits for the prompt
-    // to be queued, for at most the cancel timeout. A prompt that is interrupted, or still not
-    // queued then, is never sent. Yields whether the prompt was abandoned.
+    // An agent drops a cancel that reaches it before the prompt it targets, so the cancel waits
+    // until the prompt is queued, for at most the cancel timeout. A prompt that is interrupted, or
+    // still not queued then, is never sent. Yields whether the prompt was abandoned.
     const promptQueued = Option.isSome(activePrompt)
       ? awaitPromptQueued(activePrompt.value).pipe(
           Effect.timeoutOption(options.cancelTimeout ?? defaultCancelTimeout),

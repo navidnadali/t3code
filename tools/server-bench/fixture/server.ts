@@ -368,6 +368,9 @@ export const runnableWork = Effect.gen(function* () {
     recoveryThreads: (yield* recoveryThreadIds).size,
     settlementCandidates: (yield* projections.getSettlementCandidates()).length,
     remoteDelegatedTasks: (yield* projections.getOpenRemoteDelegatedTasks).length,
+    // Any age: a boot's retry window counts from whenever it starts.
+    pullRequestWakeRetries: (yield* projections.getPullRequestWakesToRetry(DateTime.makeUnsafe(0)))
+      .length,
   };
   for (const [name, table, query] of RUNNABLE_QUERIES) {
     if (!tables.has(table)) continue;

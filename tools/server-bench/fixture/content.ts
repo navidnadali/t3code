@@ -378,25 +378,6 @@ export const emptyCounts = (): ContentCounts => ({
 
 const mask = (text: string) => text.replace(/\S/g, "*");
 
-/** The same member counts at every depth (rewritten keys did not collide); iterative. */
-const sameShape = (left: unknown, right: unknown): boolean => {
-  const pending: Array<readonly [unknown, unknown]> = [[left, right]];
-  for (let pair = pending.pop(); pair !== undefined; pair = pending.pop()) {
-    const [a, b] = pair;
-    if (Array.isArray(a)) {
-      if (!Array.isArray(b) || a.length !== b.length) return false;
-      a.forEach((item, index) => pending.push([item, b[index]]));
-    } else if (typeof a === "object" && a !== null) {
-      if (typeof b !== "object" || b === null || Array.isArray(b)) return false;
-      const aValues = Object.values(a);
-      const bValues = Object.values(b);
-      if (aValues.length !== bValues.length) return false;
-      aValues.forEach((item, index) => pending.push([item, bValues[index]]));
-    }
-  }
-  return true;
-};
-
 export class ContentRewriteError extends Error {}
 
 /**
@@ -412,15 +393,13 @@ export const rewriteContent = (
 ): string => {
   if (text === "") return text;
   if (parseJsonContainer(text) !== null) {
-    let keysChanged = false;
-    const out = rewriteJson(
+    return rewriteJson(
       text,
       (decoded, where) => {
         if (where.role === "value") {
           return rewriteContent(decoded, where.key, mode, counts, where.marked);
         }
         if (keepsKey(decoded)) return decoded;
-        keysChanged = true;
         counts.keys++;
         return blankKey(decoded);
       },
@@ -433,12 +412,11 @@ export const rewriteContent = (
           counts.numbers++;
           return zeroed(raw);
         },
+        onKeyCollision: () => {
+          throw new ContentRewriteError("Two rewritten object keys collided; nothing was written.");
+        },
       },
     );
-    if (keysChanged && !sameShape(JSON.parse(text), JSON.parse(out))) {
-      throw new ContentRewriteError("Two rewritten object keys collided; nothing was written.");
-    }
-    return out;
   }
   const kept = keptAs(key, text, marked);
   if (kept !== null) {

@@ -435,6 +435,54 @@ describe("fake claude process", () => {
     ]);
   });
 
+  // A background task's launch, progress and end must name one task, as the adapter correlates
+  // them by its task and tool ids: across prompts of a cycle (claude_background_subagent_lifecycle
+  // stops a subagent launched a prompt earlier), and with a looped body whose wake ends its task.
+  it.each([
+    ["claude_background_subagent_lifecycle", "1", 2],
+    ["claude_background_task_wake", "2", 1],
+  ])(
+    "keeps %s's task identities whole (BENCH_TURN_LOOPS=%s, %i cycles)",
+    async (name, loops, cycles) => {
+      const groups = await groupsOf(name);
+      const results = cycles * groups.reduce((sum, group) => sum + 1 + group.wakes.length, 0);
+      using fake = startFake(STREAM_ARGS, {
+        BENCH_SPEED: "0",
+        BENCH_TRANSCRIPT: name,
+        BENCH_TURN_LOOPS: loops,
+      });
+      for (let prompt = 0; prompt < cycles * groups.length; prompt++) {
+        fake.send({ type: "user", message: { role: "user", content: "go" }, uuid: PROMPT });
+      }
+      let seen = 0;
+      const frames = parseAll(await fake.until((line) => isResult(line) && ++seen === results));
+      fake.end();
+
+      const launched = frames.flatMap((frame) =>
+        frame.type === "assistant"
+          ? frame.message.content.filter((block) => block.type === "tool_use").map((b) => b.id)
+          : [],
+      );
+      const started = new Map();
+      const unmatched = [];
+      for (const frame of frames) {
+        if (frame.type !== "system" || typeof frame.task_id !== "string") continue;
+        // A resumed subagent (SendMessage) starts its task id again under the new tool call.
+        if (frame.subtype === "task_started") started.set(frame.task_id, frame.tool_use_id);
+        else if (
+          !started.has(frame.task_id) ||
+          (frame.tool_use_id !== undefined && started.get(frame.task_id) !== frame.tool_use_id)
+        ) {
+          unmatched.push(frame.subtype);
+        }
+      }
+
+      expect(started.size).toBeGreaterThan(0);
+      expect(unmatched).toEqual([]);
+      expect(new Set(launched).size).toBe(launched.length);
+    },
+  );
+
   it.each([
     [
       "an unknown transcript",

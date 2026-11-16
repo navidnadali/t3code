@@ -35,6 +35,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as HttpApi from "effect/http-api/HttpApi";
@@ -45,11 +46,12 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
-import { subscribeOrchestrationV2Thread } from "../ws.ts";
+import { subscribeOrchestrationV2Thread, subscribeThreadRpcHandler } from "../ws.ts";
 import * as OrchestrationHttp from "./http.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import { ThreadFullSnapshotMaxJsonLength } from "./ThreadStream.ts";
 
 const decodeBounded = Schema.decodeUnknownSync(
   Schema.fromJsonString(Schema.toCodecJson(OrchestrationV2ThreadBoundedSnapshot)),
@@ -72,6 +74,8 @@ const BODIES = ThreadId.make("thread:compact-transport:bodies");
 const parentRun = RunId.make("run:compact-transport:parent");
 const longRun = RunId.make("run:compact-transport:long");
 const bodiesRun = RunId.make("run:compact-transport:bodies");
+const HUGE = ThreadId.make("thread:compact-transport:huge");
+const hugeRun = RunId.make("run:compact-transport:huge");
 
 const store = Layer.mergeAll(
   ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
@@ -573,6 +577,79 @@ it.layer(TestLayer)("compact bounded snapshot transport", (it) => {
       }),
     );
   });
+
+  // V8 cannot make a string past its limit: a full snapshot over it would fail as RpcServer's
+  // JSON.stringify of the frame, a Defect that ends every request on the client's socket.
+  it.effect(
+    "WS: a full snapshot longer than one frame can hold is refused as the thread's error",
+    () =>
+      Effect.gen(function* () {
+        const firstFrame = (
+          input: Parameters<typeof subscribeThreadRpcHandler>[0],
+          maxJsonLength: number,
+        ) =>
+          subscribeThreadRpcHandler(input).pipe(
+            Stream.runHead,
+            Effect.provideService(ThreadFullSnapshotMaxJsonLength, maxJsonLength),
+          );
+        const full = JSON.stringify(
+          encodeStreamItem((yield* firstSnapshot({ threadId: LONG })).raw),
+        );
+
+        const atLimit = yield* firstFrame({ threadId: LONG }, full.length);
+        assert.strictEqual(JSON.stringify(Option.getOrUndefined(atLimit)), full);
+        const refused = yield* Effect.flip(firstFrame({ threadId: LONG }, full.length - 1));
+        assert.strictEqual(refused._tag, "OrchestrationV2GetThreadProjectionError");
+        assert.strictEqual(refused.threadId, LONG);
+        assert.include(refused.message, "acceptBoundedSnapshot");
+
+        // A client that pages history gets its bounded window whatever the limit.
+        const bounded = yield* firstFrame({ threadId: LONG, acceptBoundedSnapshot: true }, 0);
+        const decoded = decodeStreamItem(Option.getOrThrow(bounded));
+        assert.isTrue(decoded.kind === "snapshot" && decoded.hasMoreHistory === true);
+      }),
+  );
+
+  // The frame is made by one JSON.stringify on the event loop: on the repro bench ~2^29
+  // characters took 9.7 s. By default a full snapshot stops well short of that.
+  it.effect("WS: by default a full snapshot of tens of MiB of JSON is refused", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const at = yield* DateTime.now;
+      const events: OrchestrationV2DomainEvent[] = [
+        threadCreated(HUGE, at),
+        runCreated(HUGE, hugeRun, at),
+        {
+          id: EventId.make(`event:${HUGE}:reply`),
+          type: "message.updated",
+          threadId: HUGE,
+          runId: hugeRun,
+          occurredAt: at,
+          payload: {
+            id: MessageId.make(`message:${HUGE}:reply`),
+            threadId: HUGE,
+            runId: hugeRun,
+            nodeId: null,
+            role: "assistant",
+            text: "x".repeat(34_000_000),
+            attachments: [],
+            streaming: false,
+            createdBy: "agent",
+            creationSource: "provider",
+            createdAt: at,
+            updatedAt: at,
+          },
+        },
+      ];
+      for (const event of events) yield* projections.apply(event);
+
+      const refused = yield* Effect.flip(
+        subscribeThreadRpcHandler({ threadId: HUGE }).pipe(Stream.runHead, Effect.as("sent")),
+      );
+      assert.strictEqual(refused._tag, "OrchestrationV2GetThreadProjectionError");
+      assert.strictEqual(refused.threadId, HUGE);
+    }),
+  );
 
   describe("deduped bodies", () => {
     const markers = ["textOmitted", "filesOmitted", "promptOmitted", "resultOmitted"];

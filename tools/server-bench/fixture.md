@@ -51,7 +51,8 @@ server does it, so the fixture keeps the source's scale and a boot writes nothin
    continuation off): active runs, attempts, nodes, provider turns and items cancelled, pending runtime requests
    closed, provider threads idle, sessions stopped, unheld queues held.
 4. Settle what a boot would still deliver or finish, as the server leaves it once done: remote delegated completions lose their pending delivery, subagent completion
-   deliveries are disposed, messages still streaming are final, a finished app-owned subagent child gets its
+   deliveries are disposed, a merged pull request wake whose run failed, was cut or rolled back keeps only its
+   first pull request (a boot sends such news again), messages still streaming are final, a finished app-owned subagent child gets its
    task's result (`[bench fixture] Result withheld…`) and a consumed `subagent_result` transfer to its parent,
    and the task, its node and the parent's mirrored item end as the child's run did; a task delegated to another
    machine gets a result and `stoppedThere` (its follower would resume it). What the restart recovery leaves open
@@ -171,7 +172,7 @@ Three independent gates, on every value of every table:
   no credential-named column is non-null.
 
 And nothing a server would run on start: recovery threads (runtime, subagent results, delegated completions),
-startable queued runs, settlement candidates, usage-limit recovery and snoozes, open remote delegations, pending subagent deliveries,
+startable queued runs, pull request wakes to send again, settlement candidates, usage-limit recovery and snoozes, open remote delegations, pending subagent deliveries,
 streaming messages, live v1 sessions, scheduled tasks, outbox, launch workflows, peer links, sessions, pairing
 links, provider runtime, auto-pull, pull request watches, links or branches, and pending v1 shell and transcript
 imports (`runnable`). Anything planted after sanitising, a token in an id or prose in a message, fails it.

@@ -2,20 +2,28 @@ import {
   CommandId,
   type MessageId,
   type OrchestrationV2ThreadProjection,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
-import type * as Orchestrator from "./Orchestrator.ts";
+import { makeKeyedReactor } from "./KeyedReactor.ts";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 
 const CONTINUATION_MESSAGE_TEXT = "Background task completed.";
+/** Delegation families whose provider wakes may dispatch at once. */
+const WAKE_DISPATCH_CONCURRENCY = 16;
+/** Completion deliveries dispatched at once, which paces the restart re-delivery wave. */
+const COMPLETION_DISPATCH_CONCURRENCY = 16;
+const FAMILY_KEY_CACHE_SIZE = 10_000;
 
 function delegatedCompletionText(taskIds: ReadonlyArray<string>): string {
   const taskList = taskIds.join(", ");
@@ -318,44 +326,87 @@ export const layer = Layer.effectDiscard(
       },
     );
 
+    // A wake to a delegated child takes its parent's lock first, so it keys on the parent, as the
+    // run-end reactor does. A completion takes only its own thread's lock and keys on that thread.
+    const familyKeys = new Map<ThreadId, ThreadId>();
+    const wakeFamily = (threadId: ThreadId) => {
+      const known = familyKeys.get(threadId);
+      if (known !== undefined) return Effect.succeed(known);
+      return threads.getThreadRecords(threadId, []).pipe(
+        Effect.map(({ thread }) => Orchestrator.appOwnedSubagentParentOf(thread) ?? threadId),
+        Effect.tap((family) =>
+          Effect.sync(() => {
+            if (familyKeys.size >= FAMILY_KEY_CACHE_SIZE) {
+              familyKeys.delete(familyKeys.keys().next().value!);
+            }
+            familyKeys.set(threadId, family);
+          }),
+        ),
+        // The key only orders dispatches; a thread whose lineage can't be read keys on itself.
+        Effect.catchCause(() => Effect.succeed(threadId)),
+      );
+    };
+
+    const scope = yield* Effect.scope;
+    const handle = (request: ProviderContinuationRequests.ProviderContinuationRequest) =>
+      dispatchContinuation(request).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            yield* Effect.logWarning("orchestration-v2.provider-continuation.dispatch-failed", {
+              threadId: request.threadId,
+              providerThreadId: request.providerThreadId,
+              cause,
+            });
+            if (request.delegatedCompletion !== undefined) {
+              const completion = request.delegatedCompletion;
+              const retryKey = delegatedCompletionRetryKey(request, completion);
+              const retryDelay = yield* nextRetryDelay(retryKey);
+              yield* Effect.gen(function* () {
+                yield* Effect.sleep(`${retryDelay} millis`);
+                const projection = yield* readDeliveryState(request);
+                if (currentDelegatedCompletionDelivery(projection, completion) !== undefined) {
+                  yield* requests.offer(request);
+                } else {
+                  yield* clearRetryAttempt(retryKey);
+                }
+              }).pipe(
+                Effect.catchCause((retryCause) =>
+                  Effect.logWarning("orchestration-v2.provider-continuation.retry-check-failed", {
+                    threadId: request.threadId,
+                    providerThreadId: request.providerThreadId,
+                    cause: retryCause,
+                  }).pipe(Effect.andThen(requests.offer(request))),
+                ),
+                Effect.forkScoped,
+              );
+            } else if (request.clearIfCurrent !== undefined) {
+              yield* request.clearIfCurrent();
+            }
+          }),
+        ),
+        // MCP calls from a wake turn wait for this; a retry is offered, and settled, anew.
+        Effect.ensuring(requests.settle(request.threadId)),
+        Scope.provide(scope),
+      );
+    // A dispatch can wait minutes for a lock, so each key dispatches in order, many keys at once.
+    // Wakes and completions have separate pools: a restart's re-delivery wave or a few blocked
+    // completions never hold up a wake.
+    const wakes = yield* makeKeyedReactor<
+      ThreadId,
+      ProviderContinuationRequests.ProviderContinuationRequest
+    >({ concurrency: WAKE_DISPATCH_CONCURRENCY, handle });
+    const completions = yield* makeKeyedReactor<
+      ThreadId,
+      ProviderContinuationRequests.ProviderContinuationRequest
+    >({ concurrency: COMPLETION_DISPATCH_CONCURRENCY, handle });
+
     yield* requests.take.pipe(
       Effect.flatMap((request) =>
-        dispatchContinuation(request).pipe(
-          Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              yield* Effect.logWarning("orchestration-v2.provider-continuation.dispatch-failed", {
-                threadId: request.threadId,
-                providerThreadId: request.providerThreadId,
-                cause,
-              });
-              if (request.delegatedCompletion !== undefined) {
-                const completion = request.delegatedCompletion;
-                const retryKey = delegatedCompletionRetryKey(request, completion);
-                const retryDelay = yield* nextRetryDelay(retryKey);
-                yield* Effect.gen(function* () {
-                  yield* Effect.sleep(`${retryDelay} millis`);
-                  const projection = yield* readDeliveryState(request);
-                  if (currentDelegatedCompletionDelivery(projection, completion) !== undefined) {
-                    yield* requests.offer(request);
-                  } else {
-                    yield* clearRetryAttempt(retryKey);
-                  }
-                }).pipe(
-                  Effect.catchCause((retryCause) =>
-                    Effect.logWarning("orchestration-v2.provider-continuation.retry-check-failed", {
-                      threadId: request.threadId,
-                      providerThreadId: request.providerThreadId,
-                      cause: retryCause,
-                    }).pipe(Effect.andThen(requests.offer(request))),
-                  ),
-                  Effect.forkScoped,
-                );
-              } else if (request.clearIfCurrent !== undefined) {
-                yield* request.clearIfCurrent();
-              }
-            }),
-          ),
-        ),
+        request.delegatedCompletion === undefined
+          ? wakeFamily(request.threadId).pipe(
+              Effect.flatMap((family) => wakes.offer(family, request)),
+            )
+          : completions.offer(request.threadId, request),
       ),
       Effect.forever,
       Effect.forkScoped,

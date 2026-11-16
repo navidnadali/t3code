@@ -244,7 +244,7 @@ export class McpSession {
 
 interface StreamHandlers {
   readonly onValues: (values: ReadonlyArray<unknown>, bytes: number) => void;
-  readonly onEnd: (error: CallError | null) => void;
+  readonly onEnd: (error: CallError | FatalError | null) => void;
 }
 
 type Pending =
@@ -411,15 +411,17 @@ export class RpcSocket {
     if (this.finished) return;
     this.finished = true;
     clearInterval(this.pinger);
-    for (const entry of this.pending.values()) {
+    const entries = [...this.pending.values()];
+    this.pending.clear();
+    this.socket.close();
+    // The run hears first, so a stream handler that checks for a stopping run stays quiet.
+    this.onLost(error);
+    for (const entry of entries) {
       if (entry.kind === "call") {
         clearTimeout(entry.timer);
         entry.reject(error);
-      }
+      } else entry.onEnd(error);
     }
-    this.pending.clear();
-    this.socket.close();
-    this.onLost(error);
   }
 
   private closed(code: number): void {

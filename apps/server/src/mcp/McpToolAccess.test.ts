@@ -3,16 +3,26 @@ import {
   EnvironmentId,
   OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpFailure,
+  ProviderDriverKind,
   ProviderInstanceId,
   ProviderInteractionMode,
+  ProviderThreadId,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
@@ -113,8 +123,14 @@ const probe = {
 };
 const ProbeToolkit = Toolkit.make(
   Tool.make("reads", probe),
-  Tool.make("reads_as_caller", probe),
-  Tool.make("acts_as_caller", probe),
+  Tool.make("reads_as_caller", probe).annotate(
+    McpSchema.EnabledWhen,
+    McpInvocationContext.hiddenFromOutsideClients,
+  ),
+  Tool.make("acts_as_caller", probe).annotate(
+    McpSchema.EnabledWhen,
+    McpInvocationContext.hiddenFromOutsideClients,
+  ),
   Tool.make("writes", probe),
   Tool.make("writes_with_capability", probe),
   Tool.make("writes_threads", {
@@ -254,7 +270,6 @@ it.effect.each([
   ["writes_environment", readOnlyClient, {}, "capability_denied"],
 
   ["reads_as_caller", ended, {}, "ran"],
-  ["reads_as_caller", fullAccessClient, {}, "thread_credential_required"],
   ["acts_as_caller", supervised, {}, "ran"],
   ["acts_as_caller", ended, {}, "parent_not_active"],
   ["acts_as_caller", background, {}, "ran"],
@@ -262,7 +277,6 @@ it.effect.each([
   ["acts_as_caller", mismatchedProvider, {}, "parent_not_active"],
   ["acts_as_caller", archivedBackground, {}, "parent_not_active"],
   ["acts_as_caller", unknownOwnerBackground, {}, "parent_not_active"],
-  ["acts_as_caller", fullAccessClient, {}, "thread_credential_required"],
 
   ["writes", supervised, {}, "ran"],
   ["writes", ended, {}, "parent_not_active"],
@@ -328,6 +342,67 @@ it.effect.each([
   ),
 );
 
+it.effect("logs a refused caller at Warn with ids only, and a live caller not at all", () =>
+  Effect.gen(function* () {
+    const lines: Array<unknown> = [];
+    const logger = Logger.make(({ message, logLevel }) => {
+      if (
+        logLevel === "Warn" &&
+        Array.isArray(message) &&
+        message[0] === "orchestrator-mcp.caller-not-active"
+      ) {
+        lines.push(message[1]);
+      }
+    });
+    const threads = probeServer(
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+      }),
+    );
+    const outcomes = yield* Effect.all([
+      call("acts_as_caller", supervised),
+      call("writes", ended),
+      call("acts_as_caller", archivedBackground),
+      call("acts_as_caller", mismatchedProvider),
+    ]).pipe(
+      Effect.provide(Layer.merge(threads, Logger.layer([logger], { mergeWithExisting: true }))),
+    );
+
+    expect(outcomes).toEqual([
+      "ran",
+      "parent_not_active",
+      "parent_not_active",
+      "parent_not_active",
+    ]);
+    expect(lines).toEqual([
+      {
+        operation: "write",
+        threadId: endedThreadId,
+        providerInstanceId: "codex",
+        threadProviderInstanceId: "codex",
+        activeRunId: null,
+        archived: false,
+      },
+      {
+        operation: "write",
+        threadId: archivedThreadId,
+        providerInstanceId: "codex",
+        threadProviderInstanceId: "codex",
+        activeRunId: null,
+        archived: true,
+      },
+      {
+        operation: "write",
+        threadId: backgroundThreadId,
+        providerInstanceId: "claude",
+        threadProviderInstanceId: "codex",
+        activeRunId: null,
+        archived: false,
+      },
+    ]);
+  }),
+);
+
 it("refuses a declaration or handlers layer that only wears another's fields", () => {
   const copiedDeclaration = Object.assign(
     unchecked,
@@ -356,6 +431,115 @@ it.effect("refuses a change when the calling thread cannot be read", () =>
       ),
     ),
   ),
+);
+
+it.effect("reads a waking caller's modes after its continuation starts the run", () =>
+  Effect.gen(function* () {
+    const shell = yield* Ref.make(liveThreadShell(fullAccessThreadId, { activeRunId: null }));
+    const waiting = yield* Deferred.make<void>();
+    const settled = yield* Deferred.make<void>();
+    const outcome = yield* call("writes_environment", fullAccess).pipe(
+      Effect.provide(
+        probeServer(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: () => Ref.get(shell),
+          }),
+        ),
+      ),
+      Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+        offer: () => Effect.void,
+        take: Effect.never,
+        settle: () => Effect.void,
+        progress: () => Effect.succeed({ pending: 1, settles: 0 }),
+        awaitSettle: () =>
+          Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Deferred.await(settled))),
+      }),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(waiting);
+    // The wake turn's run starts after the user lowered the thread's modes.
+    yield* Ref.set(
+      shell,
+      liveThreadShell(fullAccessThreadId, { runtimeMode: "approval-required" }),
+    );
+    yield* Deferred.succeed(settled, undefined);
+    expect(yield* Fiber.join(outcome)).toBe("capability_denied");
+  }),
+);
+
+it.effect("logs a wake caller's wait that gave up at a minute, before its refusal", () =>
+  Effect.gen(function* () {
+    const lines: Array<{ readonly event: unknown; readonly fields: unknown }> = [];
+    const logger = Logger.make(({ message, logLevel }) => {
+      if (logLevel === "Warn" && Array.isArray(message)) {
+        lines.push({ event: message[0], fields: message[1] });
+      }
+    });
+    const waiting = yield* Deferred.make<void>();
+    const outcome = yield* call("acts_as_caller", ended).pipe(
+      Effect.provide(
+        Layer.merge(
+          probeServer(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+            }),
+          ),
+          Logger.layer([logger], { mergeWithExisting: true }),
+        ),
+      ),
+      // Its continuation never settles: the dispatch waits behind a lock for minutes.
+      Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+        offer: () => Effect.void,
+        take: Effect.never,
+        settle: () => Effect.void,
+        progress: () => Effect.succeed({ pending: 1, settles: 0 }),
+        awaitSettle: () => Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Effect.never)),
+      }),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(waiting);
+    yield* TestClock.adjust("60 seconds");
+    expect(yield* Fiber.join(outcome)).toBe("parent_not_active");
+    expect(lines.map((line) => line.event)).toEqual([
+      "orchestrator-mcp.wake-run-wait-timed-out",
+      "orchestrator-mcp.caller-not-active",
+    ]);
+    expect(lines[0]?.fields).toEqual({ threadId: endedThreadId, pending: 1 });
+  }),
+);
+
+it.effect("lets a waking caller act once its run starts, while later continuations queue", () =>
+  Effect.gen(function* () {
+    const continuations = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+    const continuation = (threadId: ThreadId) => ({
+      threadId,
+      providerThreadId: ProviderThreadId.make(`provider-thread:${threadId}`),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      detail: null,
+    });
+    // The native wake, then another thread's slow continuation.
+    yield* continuations.offer(continuation(fullAccessThreadId));
+    yield* continuations.offer(continuation(supervisedThreadId));
+    const shell = yield* Ref.make(liveThreadShell(fullAccessThreadId, { activeRunId: null }));
+    const shellRead = yield* Deferred.make<void>();
+    const outcome = yield* call("writes_environment", fullAccess).pipe(
+      Effect.provide(
+        probeServer(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: () =>
+              Ref.get(shell).pipe(Effect.tap(() => Deferred.succeed(shellRead, undefined))),
+          }),
+        ),
+      ),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(shellRead);
+    // A delegated completion is offered while the wake's dispatch commits its run and settles.
+    yield* continuations.offer(continuation(fullAccessThreadId));
+    yield* Ref.set(shell, liveThreadShell(fullAccessThreadId));
+    yield* continuations.settle(fullAccessThreadId);
+    expect(yield* Fiber.join(outcome)).toBe("ran");
+  }).pipe(Effect.provide(ProviderContinuationRequests.layer)),
 );
 
 const box = EnvironmentId.make("environment-box");
@@ -455,7 +639,12 @@ it.effect.each([
 
 it.effect("refuses a linked environment to a tool that acts as its calling thread", () =>
   Effect.gen(function* () {
-    const CallerToolkit = Toolkit.make(Tool.make("acts_as_caller", linkedProbe));
+    const CallerToolkit = Toolkit.make(
+      Tool.make("acts_as_caller", linkedProbe).annotate(
+        McpSchema.EnabledWhen,
+        McpInvocationContext.hiddenFromOutsideClients,
+      ),
+    );
     const built = yield* Layer.build(
       McpToolAccess.HandlersLayer.layer(
         McpToolAccess.toLayer(CallerToolkit, {
@@ -464,5 +653,38 @@ it.effect("refuses a linked environment to a tool that acts as its calling threa
       ),
     ).pipe(Effect.scoped, Effect.exit);
     expect(Exit.isFailure(built) && Cause.hasDies(built.cause)).toBe(true);
+  }),
+);
+
+// Discovery hides these tools. The handler must refuse on its own if that ever changes.
+it.effect.each(["reads_as_caller", "acts_as_caller"] as const)(
+  "%s refuses an outside client behind discovery",
+  (tool) =>
+    Effect.gen(function* () {
+      const built = yield* ProbeToolkit;
+      const { result } = yield* built
+        .handle(tool, {})
+        .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption));
+      expect(result).toMatchObject({ code: "thread_credential_required" });
+    }).pipe(
+      Effect.provide(McpToolAccess.HandlersLayer.layer(layerProbeHandlers)),
+      Effect.provideService(McpInvocationContext.McpInvocationContext, fullAccessClient),
+      Effect.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
+    ),
+);
+
+it.effect("refuses to build a thread-bound tool that outside clients would be offered", () =>
+  Effect.gen(function* () {
+    const CallerToolkit = Toolkit.make(Tool.make("reads_as_caller", probe));
+    const built = yield* Layer.build(
+      McpToolAccess.HandlersLayer.layer(
+        McpToolAccess.toLayer(CallerToolkit, {
+          reads_as_caller: McpToolAccess.readsAsCaller(() => ran),
+        }),
+      ),
+    ).pipe(Effect.scoped, Effect.exit);
+    expect(Exit.isFailure(built) && Cause.pretty(built.cause)).toContain(
+      "reads_as_caller acts as its calling thread",
+    );
   }),
 );

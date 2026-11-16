@@ -40,7 +40,8 @@ Metric definitions:
           p95_lock_wait_ms plus p50/max. Only names, durations, exit tags
           and the db.* attributes are kept. A trace that does not reach back to the window start
           (trace_coverage), rotated during every read (trace_rotated_during_read) or whose newest
-          span ends 30 s or more before the window end (trace_stale) yields no span statistics.
+          span ends 30 s or more before the window end (trace_stale) yields no span statistics;
+          only server spans date a file, not the browser spans it relays (otlp-span).
 
 Thread labels ("role", a fixed rule; every Node worker thread has comm "WorkerThread"):
   main           tid == pid.
@@ -730,6 +731,8 @@ export interface SpanRecord {
   readonly durationMs: number;
   readonly endMs: number;
   readonly ok: boolean;
+  /** A browser span the server relays (otlp-span), written when its batch arrives. */
+  readonly relayed?: true;
   readonly connection?: string;
   readonly lockWaitMs?: number;
   readonly lockOwner?: string;
@@ -747,10 +750,12 @@ export function parseSpanLine(line: string): SpanRecord | undefined {
   }
   if (typeof record !== "object" || record === null) return undefined;
   const span = record as {
+    type?: unknown;
     name?: unknown;
     durationMs?: unknown;
     endTimeUnixNano?: unknown;
     exit?: { _tag?: unknown } | null;
+    status?: { code?: unknown } | null;
     attributes?: Record<string, unknown> | null;
   };
   const endNs = Number(span.endTimeUnixNano);
@@ -761,7 +766,9 @@ export function parseSpanLine(line: string): SpanRecord | undefined {
     name,
     durationMs: span.durationMs,
     endMs: endNs / 1e6,
-    ok: exitTag === undefined || exitTag === "Success",
+    // An otlp-span record (a relayed browser span) has an OTLP status instead: 2 is an error.
+    ok: exitTag === undefined ? String(span.status?.code ?? "0") !== "2" : exitTag === "Success",
+    ...(span.type === "otlp-span" ? { relayed: true as const } : {}),
   };
   if (!SQL_SPANS.has(name)) return base;
   const attributes = span.attributes ?? {};
@@ -859,8 +866,11 @@ export async function readTraceWindow(
           continue;
         }
         records++;
-        oldest = Math.min(oldest, span.endMs);
-        newest = Math.max(newest, span.endMs);
+        // Only the server's own records, written as they end, date a file.
+        if (span.relayed !== true) {
+          oldest = Math.min(oldest, span.endMs);
+          newest = Math.max(newest, span.endMs);
+        }
         if (span.endMs >= bounds.startMs && span.endMs <= bounds.endMs) spans.push(span);
       }
       files.push({ name: NodePath.basename(name), records });

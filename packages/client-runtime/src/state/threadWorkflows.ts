@@ -3,6 +3,7 @@ import {
   isCompactionCommandMessage,
   type OrchestrationV2ProjectedTurnItem,
   type OrchestrationV2ProviderCapabilities,
+  waitEndableRun,
 } from "@t3tools/contracts";
 import { copySorted } from "@t3tools/shared/Array";
 
@@ -38,6 +39,8 @@ export interface ThreadQueueWorkflowState {
   readonly canPromoteToSteer: boolean;
   /** The active run is a compaction, so promoting a queued message stops it instead of steering. */
   readonly promoteSkipsCompaction: boolean;
+  /** The active run's turn is over and only its checkpoint is pending, so promoting starts the message. */
+  readonly promoteEndsWait: boolean;
   readonly canSendNow: boolean;
 }
 
@@ -145,6 +148,13 @@ export function deriveThreadQueueWorkflowState(projection: Projection): ThreadQu
   );
   const promoteSkipsCompaction =
     activeMessage !== undefined && isCompactionCommandMessage(activeMessage);
+  // As the server ends a wait: its own read sees a Stop that this projection shows as a stop request.
+  const waitEnding = waitEndableRun(projection);
+  const promoteEndsWait =
+    waitEnding !== undefined &&
+    !projection.turnItems.some(
+      (item) => item.runId === waitEnding.id && item.type === "run_interrupt_request",
+    );
   const hasSteerableProviderTurn =
     activeRun?.status === "running" &&
     activeRun.activeAttemptId !== null &&
@@ -179,6 +189,7 @@ export function deriveThreadQueueWorkflowState(projection: Projection): ThreadQu
       projection.thread.deletedAt == null,
     canPromoteToSteer:
       promoteSkipsCompaction ||
+      promoteEndsWait ||
       ((activeRun?.status === "preparing" || activeRun?.status === "starting") &&
         (capabilities === undefined ||
           capabilities.supportsActiveSteering ||
@@ -187,6 +198,7 @@ export function deriveThreadQueueWorkflowState(projection: Projection): ThreadQu
         (capabilities?.supportsActiveSteering === true ||
           capabilities?.supportsSteeringByInterruptRestart === true)),
     promoteSkipsCompaction,
+    promoteEndsWait,
   };
 }
 

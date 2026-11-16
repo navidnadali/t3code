@@ -172,6 +172,22 @@ function* jsonParts(root: Json): Generator<string> {
   }
 }
 
+/** Whether `JSON.stringify` of a JSON value is longer than `limit`, measured without making it. */
+export const jsonLongerThan = Effect.fnUntraced(function* (value: unknown, limit: number) {
+  let length = 0;
+  let sinceYield = 0;
+  for (const part of jsonParts(value as Json)) {
+    length += part.length;
+    if (length > limit) return true;
+    sinceYield += part.length;
+    if (sinceYield >= 16 * CHUNK_CHARS) {
+      sinceYield = 0;
+      yield* Effect.yieldNow;
+    }
+  }
+  return false;
+});
+
 function* objectParts(
   value: Readonly<Record<string, Json>>,
   memberParts: (key: string, member: Json) => Iterable<string>,

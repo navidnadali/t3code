@@ -54,6 +54,7 @@ import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
 } from "@t3tools/provider-core/server/failure";
+import { RUN_PREPARATION_FAILED_CODE, RUN_START_FAILED_CODE } from "./RunFailureCodes.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
@@ -370,6 +371,10 @@ export function routeProviderEvent(
   const ownsChildThread = (threadId: ThreadId): boolean =>
     threadId !== input.threadId && ownsThread(threadId);
   const ownsRun = (runId: string | null): boolean => runId === input.runId;
+  // ACP plan ids are session-scoped, so a turn can update a plan an earlier turn of this
+  // thread reported. Only an active root turn adopts those rows, never a lingering run.
+  const adoptsEarlierPlan = (threadId: ThreadId): boolean =>
+    threadId === input.threadId && !state.rootTurnEnded;
   const addProviderThread = (providerThreadId: ProviderThreadId): ProviderEventRoutingState => ({
     ...state,
     ownedProviderThreadIds: new Set([...state.ownedProviderThreadIds, providerThreadId]),
@@ -431,7 +436,11 @@ export function routeProviderEvent(
         : [false, state];
     }
     case "node.updated": {
-      const belongs = ownsRun(event.node.runId) || ownsChildThread(event.node.threadId);
+      const belongs =
+        ownsRun(event.node.runId) ||
+        ownsChildThread(event.node.threadId) ||
+        ((event.node.kind === "todo_list" || event.node.kind === "plan") &&
+          adoptsEarlierPlan(event.node.threadId));
       if (!belongs || event.node.providerThreadId === null) {
         return [belongs, state];
       }
@@ -492,7 +501,12 @@ export function routeProviderEvent(
     case "steer.updated":
       return [ownsRun(event.runId), state];
     case "turn_item.updated": {
-      if (ownsRun(event.turnItem.runId) || ownsChildThread(event.turnItem.threadId)) {
+      if (
+        ownsRun(event.turnItem.runId) ||
+        ownsChildThread(event.turnItem.threadId) ||
+        ((event.turnItem.type === "todo_list" || event.turnItem.type === "proposed_plan") &&
+          adoptsEarlierPlan(event.turnItem.threadId))
+      ) {
         return [true, state];
       }
       const inheritedRunId = state.inheritedBackgroundTurnItems.get(event.turnItem.id);
@@ -512,7 +526,12 @@ export function routeProviderEvent(
       return [true, { ...state, inheritedBackgroundTurnItems }];
     }
     case "plan.updated":
-      return [ownsRun(event.plan.runId) || ownsChildThread(event.plan.threadId), state];
+      return [
+        ownsRun(event.plan.runId) ||
+          ownsChildThread(event.plan.threadId) ||
+          adoptsEarlierPlan(event.plan.threadId),
+        state,
+      ];
     case "runtime_request.updated":
       return [
         (event.threadId !== undefined && ownsChildThread(event.threadId)) ||
@@ -1042,6 +1061,7 @@ export const layer: Layer.Layer<
                   makeProviderFailure({
                     cause: Cause.squash(cause),
                     message: "Run preparation failed.",
+                    code: RUN_PREPARATION_FAILED_CODE,
                     class: "unknown",
                   }),
                   input.providerTurnOrdinal * 100 + 1,
@@ -1142,6 +1162,9 @@ export const layer: Layer.Layer<
         const openRunOwnedSubagents = yield* Ref.make(emptyOpenRunOwnedSubagentProjection());
         // The last stored root snapshot's pendingBackgroundWork; adapters that omit it leave it false.
         let rootSnapshotPendingWork = false;
+        // Owned child threads whose last snapshot reported pending work, such as a queued native
+        // continuation. Unlike the root's, these must hold the stream past owner loss.
+        const childSnapshotPendingWork = new Set<ProviderThreadId>();
         let rootTurnOwnershipChecked = false;
         const assistantStreaming = makeAssistantStreamingFilter(responseStreamingMode);
         // Set when ingestion ends or finalization settles the run's open items, which a later
@@ -1390,7 +1413,7 @@ export const layer: Layer.Layer<
           // while these sets are non-empty: turn_item.updated writes are not ownership-gated, so
           // late completions still land.
           const backgroundItems = yield* Ref.get(activeBackgroundTurnItems);
-          if (backgroundItems.size > 0) {
+          if (backgroundItems.size > 0 || childSnapshotPendingWork.size > 0) {
             return false;
           }
           if (yield* Ref.get(providerThreadOwnerLost)) {
@@ -1488,6 +1511,10 @@ export const layer: Layer.Layer<
               if (!routing.ownedProviderTurns.has(id)) {
                 pendingBackgroundProviderTurns.delete(id);
               }
+            }
+            // Routing now rejects the moved thread's snapshots, so none would clear its entry.
+            for (const id of childSnapshotPendingWork) {
+              if (!routing.ownedProviderThreadIds.has(id)) childSnapshotPendingWork.delete(id);
             }
             yield* Ref.update(
               activeBackgroundTurnItems,
@@ -1690,6 +1717,12 @@ export const layer: Layer.Layer<
             if (event.providerThread.id === input.providerThread.id && storedEventCount > 0) {
               yield* Ref.set(latestProviderThread, event.providerThread);
               rootSnapshotPendingWork = event.pendingBackgroundWork === true;
+            } else if (event.providerThread.id !== input.providerThread.id) {
+              if (event.pendingBackgroundWork === true) {
+                childSnapshotPendingWork.add(event.providerThread.id);
+              } else if (event.pendingBackgroundWork === false) {
+                childSnapshotPendingWork.delete(event.providerThread.id);
+              }
             }
           }
           if (
@@ -1715,6 +1748,18 @@ export const layer: Layer.Layer<
           yield* trackChildLifecycle(event, deliveredEvent !== null);
           yield* scheduleIdleFlush;
         });
+        // A run that fails before its start call returned (a terminal its provider reports, as
+        // OpenCode can, or a failed event stream) may never have handed over the prompt, and the
+        // start call's own failure write then finds the run ended.
+        const startCallReturned = yield* Ref.make(false);
+        const markUnstartedFailure = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+          Ref.get(startCallReturned).pipe(
+            Effect.map((returned) =>
+              returned || event.type !== "turn.terminal" || event.status !== "failed"
+                ? event
+                : { ...event, failure: { ...event.failure, code: RUN_START_FAILED_CODE } },
+            ),
+          );
         const providerEventFiber = yield* eventSink
           .consumeProviderEvents(
             eventSubscription.events.pipe(
@@ -1724,7 +1769,7 @@ export const layer: Layer.Layer<
               event.type === "idle_flush"
                 ? flushIdleAssistantText(event.at)
                 : Effect.gen(function* () {
-                    yield* ingestEvent(yield* routeEvent(event));
+                    yield* ingestEvent(yield* routeEvent(yield* markUnstartedFailure(event)));
                   }),
             Effect.gen(function* () {
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
@@ -1863,6 +1908,9 @@ export const layer: Layer.Layer<
                           knownProviderFailureMessage(squashed) ??
                           userFacingDatabaseErrorMessage(squashed),
                         class: "unknown",
+                        ...((yield* Ref.get(startCallReturned))
+                          ? {}
+                          : { code: RUN_START_FAILED_CODE }),
                       }),
                       latestItemOrdinal + 1,
                     ),
@@ -2049,6 +2097,7 @@ export const layer: Layer.Layer<
                 ))
               : input.session.startTurn(turnInput);
         yield* Effect.andThen(shouldStart, startTurn).pipe(
+          Effect.tap(() => Ref.set(startCallReturned, true)),
           // Wait for acceptance so abandoned startup cannot leave a refresher
           // on the already-detached ingestion fiber.
           Effect.tap(() =>
@@ -2084,6 +2133,11 @@ export const layer: Layer.Layer<
                             makeProviderFailure({
                               cause: Cause.squash(cause),
                               class: Exit.isFailure(shouldStart) ? "unknown" : "provider_error",
+                              // A failed start check means the provider was never called; a failed
+                              // start call may not have handed the prompt over either.
+                              code: Exit.isFailure(shouldStart)
+                                ? RUN_PREPARATION_FAILED_CODE
+                                : RUN_START_FAILED_CODE,
                             }),
                             latestItemOrdinal + 1,
                           ),

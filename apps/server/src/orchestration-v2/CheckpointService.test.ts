@@ -17,7 +17,9 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -178,6 +180,69 @@ it.effect("chooses a scope created at a real path without a file system lookup",
       assert.isAbove(other.lookups.length, 0);
     }).pipe(Effect.provide(layer));
   }),
+);
+
+// A removed worktree reached through a symlinked folder is scoped where git recreates it, as the
+// restore check places it: by its nearest folder's real path, not by the spelling the link may move.
+it.effect("scopes a removed worktree under a symlinked folder at its real location", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const base = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-scope-missing-" });
+      yield* fileSystem.makeDirectory(path.join(base, "real"));
+      yield* fileSystem.symlink(path.join(base, "real"), path.join(base, "link"));
+      const spelling = path.join(base, "link", "repo", "feature");
+      const real = yield* CheckpointService.resolveWorkspacePath(fileSystem, path, spelling);
+      const threadId = ThreadId.make("thread:scope-missing");
+      const rootScope: OrchestrationV2CheckpointScope = {
+        id: CheckpointScopeId.make("checkpoint-scope:thread:thread%3Ascope-missing:name:root"),
+        threadId,
+        runId: RunId.make("run:scope-missing:1"),
+        nodeId: NodeId.make("node:scope-missing:1"),
+        parentScopeId: null,
+        providerThreadId: ProviderThreadId.make("provider-thread:scope-missing"),
+        kind: "root_run",
+        ordinalWithinParent: 0,
+        advancesAppRunCount: true,
+        cwd: spelling,
+        realCwd: real,
+        createdAt: DateTime.makeUnsafe("2026-07-28T00:00:00.000Z"),
+      };
+      const prepare = (threadScopes: ReadonlyArray<OrchestrationV2CheckpointScope>) =>
+        Effect.gen(function* () {
+          const checkpoints = yield* CheckpointService.CheckpointServiceV2;
+          return yield* checkpoints.prepareRootRunScope({
+            threadId,
+            runId: RunId.make("run:scope-missing:2"),
+            rootNodeId: NodeId.make("node:scope-missing:2"),
+            providerThreadId: ProviderThreadId.make("provider-thread:scope-missing"),
+            cwd: spelling,
+            createdAt: DateTime.makeUnsafe("2026-07-28T00:00:01.000Z"),
+            threadScopes,
+          });
+        }).pipe(
+          Effect.provide(
+            CheckpointService.layer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  IdAllocator.layer,
+                  NodeServices.layer,
+                  Layer.mock(CheckpointStore.CheckpointStore)({}),
+                ),
+              ),
+              Layer.provideMerge(NodeCrypto.layer),
+            ),
+          ),
+        );
+
+      assert.notEqual(real, spelling);
+      const first = yield* prepare([]);
+      assert.deepEqual([first.cwd, first.realCwd], [spelling, real]);
+      // The scope it was recorded in while the worktree existed is the same workspace.
+      assert.equal((yield* prepare([rootScope])).id, rootScope.id);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  ),
 );
 
 it.effect(

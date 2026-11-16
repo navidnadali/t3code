@@ -1987,6 +1987,57 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
+  it.effect(
+    "answers an elicitation that a consumer's MCP resource read waits on, as in-thread",
+    () =>
+      Effect.gen(function* () {
+        const run = (mode: Mode) =>
+          withRunner(mode, ({ runner }) =>
+            Effect.gen(function* () {
+              const elicited: Array<string> = [];
+              const read = yield* Deferred.make<unknown>();
+              const cli = new FakeClaudeCli({
+                pipeLatency: true,
+                onUser: streamThenAsk(1),
+                // The MCP server asks for input before it returns the resource.
+                control: (request, cli) =>
+                  request.subtype === "mcp_read_resource"
+                    ? cli.request(elicitationRequest("Sign in to show the app")).then((answer) => ({
+                        response: { contents: [{ uri: "ui://app", text: JSON.stringify(answer) }] },
+                      }))
+                    : undefined,
+              });
+              const session = yield* runner.open(
+                openInput(cli, {
+                  onElicitation: async (request) => {
+                    elicited.push(request.message);
+                    return { action: "accept", content: { choice: "yes" } };
+                  },
+                  canUseTool: async () => ({ behavior: "allow", updatedInput: {} }),
+                }),
+              );
+              yield* session.messages.pipe(
+                Stream.runForEach(() =>
+                  session.readMcpResource({ server: "fixture", uri: "ui://app" }).pipe(
+                    Effect.flatMap((result) => Deferred.succeed(read, result)),
+                    Effect.asVoid,
+                  ),
+                ),
+                Effect.forkChild,
+              );
+              yield* session.offer(prompt("Show the app."));
+              const result = yield* Deferred.await(read);
+              yield* session.close;
+              return { elicited, result };
+            }),
+          );
+
+        const inThread = yield* run("thread");
+        assert.deepStrictEqual(inThread.elicited, ["Sign in to show the app"]);
+        assert.deepStrictEqual(yield* run("worker"), inThread);
+      }),
+  );
+
   it.effect("runs the hooks the query opened with, as the SDK captures them at initialize", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>

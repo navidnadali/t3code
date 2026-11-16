@@ -31,6 +31,7 @@ import * as Option from "effect/Option";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import { logCallerNotActive } from "../mcp/threadAccess.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 
@@ -257,6 +258,13 @@ const make = Effect.gen(function* () {
         run.rootNodeId === null ||
         run.providerInstanceId !== threadScope.thread.providerInstanceId
       ) {
+        yield* logCallerNotActive({
+          operation: "t3_environment_link",
+          threadId,
+          providerInstanceId: threadScope.thread.providerInstanceId,
+          thread: parent.thread,
+          activeRunId: run?.id ?? null,
+        });
         return yield* new OrchestratorMcpFailure({
           code: "parent_not_active",
           message:

@@ -13,8 +13,10 @@ import {
   type OrchestrationV2Notification,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
+import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -35,7 +37,12 @@ const driver = ProviderDriverKind.make("continuation-test");
 const parentRunId = RunId.make("run-provider-continuation-parent");
 const delegatedMessageId = MessageId.make("message-provider-continuation-delegated");
 const projection = {
-  thread: { archivedAt: null, deletedAt: null },
+  thread: {
+    archivedAt: null,
+    deletedAt: null,
+    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+    forkedFrom: null,
+  },
   messages: [],
 } as unknown as OrchestrationV2ThreadProjection;
 
@@ -99,7 +106,9 @@ function layerTest(input: {
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
 }) {
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-    getThreadRecords: input.getThreadRecords,
+    // A wake's dispatch key reads only the thread's lineage; the tests' reads are the deliveries'.
+    getThreadRecords: ((_threadId: ThreadId, fields: ReadonlyArray<string>) =>
+      fields.length === 0 ? Effect.succeed(projection) : input.getThreadRecords()) as never,
     dispatch: (command) => Queue.offer(input.dispatched, command).pipe(Effect.as({} as never)),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
@@ -111,6 +120,45 @@ function layerTest(input: {
 }
 
 describe("ProviderContinuationService", () => {
+  it.effect("releases run checks waiting on a continuation whose dispatch fails", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer(request());
+        yield* requests.awaitSettle(0);
+        assert.equal(yield* Queue.size(dispatched), 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({ dispatched, getThreadRecords: () => Effect.die("projection unavailable") }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("settles each request once in its own pool, wakes and completions alike", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer(request());
+        yield* requests.offer({
+          ...request(),
+          delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+        });
+        assert.equal((yield* requests.progress(threadId)).pending, 2);
+        yield* requests.awaitSettle(1);
+        assert.deepEqual(yield* requests.progress(threadId), { pending: 0, settles: 2 });
+      }).pipe(
+        Effect.provide(
+          layerTest({ dispatched, getThreadRecords: () => Effect.die("projection unavailable") }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
   it.effect("recovers an unaccepted persisted steer using the same delivery identity", () =>
     Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();
@@ -735,4 +783,378 @@ describe("ProviderContinuationService", () => {
       );
     });
   });
+});
+
+// A fleet of threads whose dispatches take the locks Orchestrator's dispatch takes: a completion
+// its own thread's, a wake to a delegated child its parent's first.
+interface FleetEntry {
+  readonly kind: "wake" | "completion";
+  readonly threadId: ThreadId;
+  readonly label: string;
+}
+
+const fleetThread = (name: string) => ThreadId.make(`thread-fleet-${name}`);
+const fleetRunPrefix = "run-fleet-";
+const fleetMessagePrefix = "message-fleet-";
+
+const fleetWake = (
+  child: string,
+  label: string = child,
+  extra: Partial<ProviderContinuationRequests.ProviderContinuationRequest> = {},
+): ProviderContinuationRequests.ProviderContinuationRequest => ({
+  threadId: fleetThread(child),
+  providerThreadId,
+  driver,
+  detail: label,
+  ...extra,
+});
+
+const fleetCompletion = (
+  thread: string,
+  label: string,
+): ProviderContinuationRequests.ProviderContinuationRequest => ({
+  threadId: fleetThread(thread),
+  providerThreadId,
+  driver,
+  detail: null,
+  delivery: "message_text",
+  delegatedCompletion: {
+    parentRunId: RunId.make(`${fleetRunPrefix}${label}`),
+    generation: 1,
+    messageId: MessageId.make(`${fleetMessagePrefix}${label}`),
+  },
+});
+
+function makeFleet(input: {
+  /** Child name to parent name. */
+  readonly parents?: Readonly<Record<string, string>>;
+  /** How long a dispatch takes once it holds its locks. */
+  readonly cost?: Duration.Input;
+  readonly outcome?: (entry: FleetEntry, attempt: number) => "ok" | "fail" | "die";
+}) {
+  const parents = new Map(
+    Object.entries(input.parents ?? {}).map(([child, parent]) => [
+      fleetThread(child),
+      fleetThread(parent),
+    ]),
+  );
+  const locks = new Map<ThreadId, Semaphore.Semaphore>();
+  const lockOf = (threadId: ThreadId) => {
+    const known = locks.get(threadId);
+    if (known !== undefined) return known;
+    const lock = Semaphore.makeUnsafe(1);
+    locks.set(threadId, lock);
+    return lock;
+  };
+  const state = {
+    entered: [] as Array<FleetEntry>,
+    landed: [] as Array<FleetEntry>,
+    inFlight: { wake: 0, completion: 0 },
+    peak: { wake: 0, completion: 0 },
+    attempts: new Map<string, number>(),
+  };
+  const landedLabels = (kind?: FleetEntry["kind"]) =>
+    state.landed.filter((entry) => kind === undefined || entry.kind === kind).map((e) => e.label);
+  const thread = (threadId: ThreadId) => {
+    const parent = parents.get(threadId);
+    return {
+      archivedAt: null,
+      deletedAt: null,
+      lineage:
+        parent === undefined
+          ? { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId }
+          : { parentThreadId: parent, relationshipToParent: "subagent", rootThreadId: parent },
+      forkedFrom: parent === undefined ? null : { type: "node", nodeId: `node-${threadId}` },
+    };
+  };
+  const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: ((threadId: ThreadId, _fields: unknown, filter?: ProjectionRecordFilter) =>
+      Effect.sync(() => ({
+        thread: thread(threadId),
+        // A delivered completion is no longer current, so a retry of it is dropped.
+        messages: (filter?.messageIds ?? [])
+          .filter((id) =>
+            state.landed.some(
+              (entry) =>
+                entry.kind === "completion" && `${fleetMessagePrefix}${entry.label}` === id,
+            ),
+          )
+          .map((id) => ({ id })),
+        runs: (filter?.runIds ?? []).map((id) => ({
+          id,
+          delegatedCompletion: {
+            disposition: "open",
+            nextGeneration: 2,
+            delivery: {
+              generation: 1,
+              messageId: MessageId.make(
+                `${fleetMessagePrefix}${String(id).slice(fleetRunPrefix.length)}`,
+              ),
+              taskIds: [`task-${String(id)}`],
+            },
+          },
+        })),
+        providerTurns: [],
+      }))) as never,
+    dispatch: (command) => {
+      const message = command as unknown as {
+        readonly threadId: ThreadId;
+        readonly messageId: MessageId;
+        readonly text: string;
+        readonly delegatedCompletion?: unknown;
+      };
+      const entry: FleetEntry =
+        message.delegatedCompletion === undefined
+          ? { kind: "wake", threadId: message.threadId, label: message.text }
+          : {
+              kind: "completion",
+              threadId: message.threadId,
+              label: String(message.messageId).slice(fleetMessagePrefix.length),
+            };
+      const body = Effect.gen(function* () {
+        const attempt = (state.attempts.get(entry.label) ?? 0) + 1;
+        state.attempts.set(entry.label, attempt);
+        if (input.cost !== undefined) yield* Effect.sleep(input.cost);
+        const outcome = input.outcome?.(entry, attempt) ?? "ok";
+        if (outcome === "fail") {
+          return yield* new Orchestrator.OrchestratorDispatchError({
+            commandId: CommandId.make(String(command.commandId)),
+            commandType: command.type,
+            cause: new Error("dispatch failed"),
+          });
+        }
+        if (outcome === "die") return yield* Effect.die(new Error("dispatch died"));
+        state.landed.push(entry);
+        return {} as never;
+      });
+      const parent = entry.kind === "wake" ? parents.get(entry.threadId) : undefined;
+      const own = lockOf(entry.threadId).withPermit(body);
+      return Effect.sync(() => {
+        state.entered.push(entry);
+        state.inFlight[entry.kind] += 1;
+        state.peak[entry.kind] = Math.max(state.peak[entry.kind], state.inFlight[entry.kind]);
+      }).pipe(
+        Effect.andThen(parent === undefined ? own : lockOf(parent).withPermit(own)),
+        Effect.ensuring(Effect.sync(() => (state.inFlight[entry.kind] -= 1))),
+      );
+    },
+  });
+  const layer = Layer.merge(
+    ProviderContinuationRequests.layer,
+    ProviderContinuationService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
+      ),
+    ),
+  );
+  return { layer, lockOf, state, landedLabels };
+}
+
+// Runs `effect` from a test-clock wake-up, so adjusting the clock returns only once everything it
+// set off has run as far as it can: one tick.
+const inOneTick = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const fiber = yield* Effect.forkChild(Effect.delay(effect, "1 millis"));
+    yield* TestClock.adjust("1 millis");
+    return yield* Fiber.join(fiber);
+  });
+
+describe("ProviderContinuationService dispatch per key", () => {
+  it.effect(
+    "dispatches a wake to another parent's child within one tick while a parent's lock is held with 50 completions queued for it",
+    () => {
+      const fleet = makeFleet({ parents: { seat: "q" } });
+      return Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const held = fleet.lockOf(fleetThread("p"));
+        yield* held.take(1);
+        const completions = Array.from({ length: 50 }, (_, index) => `p-${index}`);
+        yield* inOneTick(
+          Effect.gen(function* () {
+            for (const label of completions) yield* requests.offer(fleetCompletion("p", label));
+            yield* requests.offer(fleetWake("seat"));
+          }),
+        );
+        assert.deepEqual(fleet.landedLabels(), ["seat"]);
+
+        yield* inOneTick(held.release(1));
+        assert.deepEqual(fleet.landedLabels("completion"), completions);
+        assert.deepEqual(fleet.landedLabels("wake"), ["seat"]);
+      }).pipe(Effect.provide(fleet.layer), Effect.scoped);
+    },
+  );
+
+  it.effect(
+    "keeps each family's order: a parent's children's wakes wait for each other, not for other families",
+    () => {
+      const fleet = makeFleet({ parents: { s1: "p", s2: "p", s3: "p", t1: "q", t2: "q" } });
+      return Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const held = fleet.lockOf(fleetThread("p"));
+        yield* held.take(1);
+        yield* inOneTick(
+          Effect.forEach(
+            [fleetWake("s1"), fleetWake("t1"), fleetWake("s2"), fleetWake("t2"), fleetWake("s3")],
+            requests.offer,
+            { discard: true },
+          ),
+        );
+        assert.deepEqual(fleet.landedLabels(), ["t1", "t2"]);
+        // The family waits on its first wake; the others are not also queued on the parent's lock.
+        assert.deepEqual(
+          fleet.state.entered.filter((entry) => entry.label.startsWith("s")).map((e) => e.label),
+          ["s1"],
+        );
+
+        yield* inOneTick(held.release(1));
+        assert.deepEqual(fleet.landedLabels(), ["t1", "t2", "s1", "s2", "s3"]);
+      }).pipe(Effect.provide(fleet.layer), Effect.scoped);
+    },
+  );
+
+  it.effect(
+    "logs a failing dispatch and keeps going: other keys are not held up, completions retry, refused wakes are cleared",
+    () => {
+      const fleet = makeFleet({
+        parents: { seat: "q" },
+        outcome: (entry, attempt) =>
+          attempt > 1
+            ? "ok"
+            : entry.label === "p-0"
+              ? "fail"
+              : entry.label === "r-0"
+                ? "die"
+                : "ok",
+      });
+      const refused = makeFleet({ outcome: () => "fail" });
+      return Effect.gen(function* () {
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* inOneTick(
+            Effect.forEach(
+              [
+                fleetCompletion("p", "p-0"),
+                fleetCompletion("r", "r-0"),
+                fleetCompletion("p", "p-1"),
+                fleetWake("seat"),
+              ],
+              requests.offer,
+              { discard: true },
+            ),
+          );
+          assert.deepEqual(fleet.landedLabels().toSorted(), ["p-1", "seat"]);
+          yield* TestClock.adjust("1 minute");
+          assert.deepEqual(fleet.landedLabels().toSorted(), ["p-0", "p-1", "r-0", "seat"]);
+          assert.equal(fleet.state.attempts.get("p-0"), 2);
+          assert.equal(fleet.state.attempts.get("r-0"), 2);
+          assert.equal(fleet.state.attempts.get("p-1"), 1);
+        }).pipe(Effect.provide(fleet.layer), Effect.scoped);
+
+        const cleared = yield* Ref.make<ReadonlyArray<string>>([]);
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* inOneTick(
+            Effect.forEach(
+              ["w-0", "w-1", "w-2"],
+              (label) =>
+                requests.offer(
+                  fleetWake(label, label, {
+                    clearIfCurrent: () => Ref.update(cleared, (labels) => [...labels, label]),
+                  }),
+                ),
+              { discard: true },
+            ),
+          );
+          yield* TestClock.adjust("1 minute");
+          assert.deepEqual((yield* Ref.get(cleared)).toSorted(), ["w-0", "w-1", "w-2"]);
+          assert.deepEqual(
+            [...refused.state.attempts.values()],
+            [1, 1, 1],
+            "a refused wake is cleared, not retried",
+          );
+        }).pipe(Effect.provide(refused.layer), Effect.scoped);
+      });
+    },
+  );
+
+  // The service's bounds: completion re-deliveries and provider wakes each have their own pool.
+  const completionsInFlight = 16;
+  const wakesInFlight = 16;
+
+  it.effect("dispatches a wake queued behind 1,000 completion re-deliveries first", () => {
+    const fleet = makeFleet({ parents: { seat: "q" }, cost: "100 millis" });
+    return Effect.gen(function* () {
+      const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      const owners = Array.from({ length: 100 }, (_, index) => `owner-${index}`);
+      const redeliveries = Array.from({ length: 1_000 }, (_, index) => ({
+        owner: owners[index % owners.length]!,
+        label: `c-${index}`,
+      }));
+      yield* inOneTick(
+        Effect.gen(function* () {
+          for (const { owner, label } of redeliveries) {
+            yield* requests.offer(fleetCompletion(owner, label));
+          }
+          yield* requests.offer(fleetWake("seat"));
+        }),
+      );
+      yield* TestClock.adjust("100 millis");
+      assert.deepEqual(fleet.landedLabels("wake"), ["seat"]);
+      assert.isAtMost(fleet.landedLabels("completion").length, completionsInFlight);
+
+      yield* TestClock.adjust("10 minutes");
+      const landed = fleet.landedLabels("completion");
+      assert.equal(landed.length, redeliveries.length);
+      assert.equal(new Set(landed).size, redeliveries.length);
+      for (const owner of owners) {
+        assert.deepEqual(
+          fleet.state.landed
+            .filter((entry) => entry.threadId === fleetThread(owner))
+            .map((entry) => entry.label),
+          redeliveries.filter((entry) => entry.owner === owner).map((entry) => entry.label),
+          owner,
+        );
+      }
+      assert.equal(fleet.state.peak.completion, completionsInFlight);
+    }).pipe(Effect.provide(fleet.layer), Effect.scoped);
+  });
+
+  it.effect(
+    "bounds completions and wakes in flight separately, so blocked completions never take a wake's slot",
+    () => {
+      const families = Array.from({ length: 40 }, (_, index) => index);
+      const fleet = makeFleet({
+        parents: Object.fromEntries(families.map((index) => [`seat-${index}`, `owner-${index}`])),
+      });
+      return Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const held = families.flatMap((index) => [
+          fleet.lockOf(fleetThread(`parent-${index}`)),
+          fleet.lockOf(fleetThread(`owner-${index}`)),
+        ]);
+        yield* Effect.forEach(held, (lock) => lock.take(1), { discard: true });
+        yield* inOneTick(
+          Effect.gen(function* () {
+            for (const index of families) {
+              yield* requests.offer(fleetCompletion(`parent-${index}`, `c-${index}`));
+            }
+            for (const index of families) yield* requests.offer(fleetWake(`seat-${index}`));
+          }),
+        );
+        assert.deepEqual(fleet.state.inFlight, {
+          completion: completionsInFlight,
+          wake: wakesInFlight,
+        });
+
+        yield* inOneTick(Effect.forEach(held, (lock) => lock.release(1), { discard: true }));
+        assert.equal(new Set(fleet.landedLabels("completion")).size, families.length);
+        assert.equal(new Set(fleet.landedLabels("wake")).size, families.length);
+        assert.equal(fleet.state.landed.length, 2 * families.length);
+        assert.deepEqual(fleet.state.peak, {
+          completion: completionsInFlight,
+          wake: wakesInFlight,
+        });
+      }).pipe(Effect.provide(fleet.layer), Effect.scoped);
+    },
+  );
 });

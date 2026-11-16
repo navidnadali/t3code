@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  cancelSeededQueue,
   isProviderOutputEvent,
   Session,
   ShellWatcher,
@@ -312,5 +313,49 @@ describe("withArchivedThreads", () => {
     expect(merged.snapshotSequence).toBe(7);
     expect(merged.threads.map((thread) => thread.id)).toEqual(["thread-1"]);
     expect(merged.archivedThreads?.map((thread) => thread.id)).toEqual(["archived-1"]);
+  });
+});
+
+describe("cancelSeededQueue", () => {
+  it("cancels a seeded thread's queued runs, the held ones its shell hides included", async () => {
+    // A completed thread whose queue a Stop or restart held: its shell shows only the last run.
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          snapshotSequence: 4,
+          projection: {
+            runs: [
+              { id: "run-1", status: "completed", queueHeld: false },
+              { id: "run-2", status: "queued", queueHeld: true },
+              { id: "run-3", status: "queued", queueHeld: true },
+            ],
+          },
+        }),
+      ),
+    );
+    const commands: Array<Record<string, unknown>> = [];
+    const socket = {
+      call: async (tag: string, payload: Record<string, unknown>) => {
+        commands.push({ tag, ...payload });
+        return { sequence: 1 };
+      },
+    } as unknown as RpcSocket;
+    const http = {
+      origin: "http://bench.invalid",
+      token: "t",
+      timeoutMs: 1000,
+      protocolVersion: 2,
+    };
+
+    const cancelled = await cancelSeededQueue(http, socket, "thread-1", 1000);
+    const urls = fetchMock.mock.calls.map(([url]) => String(url));
+    fetchMock.mockRestore();
+
+    expect(urls).toEqual(["http://bench.invalid/api/orchestration/threads/thread-1/bounded"]);
+    expect(commands.map(({ tag, type, threadId, runId }) => [tag, type, threadId, runId])).toEqual([
+      ["orchestration.dispatchCommand", "queued-run.cancel", "thread-1", "run-2"],
+      ["orchestration.dispatchCommand", "queued-run.cancel", "thread-1", "run-3"],
+    ]);
+    expect(cancelled).toBe(2);
   });
 });

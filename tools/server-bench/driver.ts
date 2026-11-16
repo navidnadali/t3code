@@ -6,6 +6,7 @@
  * with the measured window's client-side latencies and event rates. A run that cannot finish
  * cleanly writes `driver.failed` and a result without any table.
  */
+import "../../packages/shared/src/testing/gitEnv.ts";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
@@ -48,6 +49,7 @@ import {
   withEnvironment,
 } from "./providers.ts";
 import {
+  cancelSeededQueue,
   newId,
   now,
   Poller,
@@ -79,7 +81,7 @@ function git(args: ReadonlyArray<string>, cwd: string): string {
 }
 
 /** An empty git repository: sessions check out and checkpoint here, never in fixture paths. */
-function createWorkspace(directory: string): void {
+export function createWorkspace(directory: string): void {
   NodeFS.mkdirSync(directory, { recursive: true });
   if (NodeFS.existsSync(NodePath.join(directory, ".git"))) return;
   git(["init", "-q"], directory);
@@ -98,7 +100,7 @@ function createWorkspace(directory: string): void {
   );
 }
 
-function driverRevision(): { readonly sha: string | null; readonly dirty: boolean | null } {
+export function driverRevision(): { readonly sha: string | null; readonly dirty: boolean | null } {
   try {
     const directory = import.meta.dirname;
     return {
@@ -692,7 +694,15 @@ class BenchRun implements RunContext {
       await this.mutateProject({ type: "project.update", projectId, workspaceRoot: directory });
     });
     let modeChanges = 0;
+    let seededQueuedRunsCancelled = 0;
     await this.parallel(chosen, async (thread, index) => {
+      const cancelled = await cancelSeededQueue(
+        this.http,
+        this.socketFor(index),
+        thread.id,
+        options.callTimeoutMs,
+      );
+      seededQueuedRunsCancelled += cancelled;
       const commands: Array<Record<string, unknown>> = [];
       if (thread.runtimeMode !== options.runtimeMode) {
         commands.push({ type: "thread.runtime-mode.set", runtimeMode: options.runtimeMode });
@@ -737,6 +747,7 @@ class BenchRun implements RunContext {
         sessionCandidates: candidates.length,
         rerootedProjects: rerooted.length,
         modeChanges,
+        seededQueuedRunsCancelled,
         providerSwitches: switches,
         modelSwitches,
         sessionThreadIds: chosen.map((thread) => thread.id),
@@ -1136,4 +1147,4 @@ async function main(): Promise<number> {
   return result.status === "ok" ? 0 : 1;
 }
 
-process.exit(await main());
+if (import.meta.main) process.exit(await main());

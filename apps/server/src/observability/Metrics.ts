@@ -23,6 +23,13 @@ export const orchestrationCommandDuration = Metric.timer("t3_orchestration_comma
   description: "Orchestration command handling duration, excluding thread dispatch lock wait.",
 });
 
+export const orchestrationRunReactorEventsTotal = Metric.counter(
+  "t3_orchestration_run_reactor_events_total",
+  {
+    description: "Events the run-end reactor took in from the event stream.",
+  },
+);
+
 export const orchestrationEffectClaimsTotal = Metric.counter(
   "t3_orchestration_effect_claims_total",
   {

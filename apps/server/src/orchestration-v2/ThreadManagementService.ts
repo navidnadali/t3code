@@ -168,6 +168,7 @@ export interface ThreadManagementSendInput {
 
 export interface ThreadManagementSendResult {
   readonly dispatch: Orchestrator.OrchestratorV2DispatchResult;
+  /** The sent message, its run and its user item. */
   readonly projection: Pick<
     OrchestrationV2ThreadProjection,
     "thread" | "runs" | "messages" | "turnItems"
@@ -974,13 +975,21 @@ const make = Effect.gen(function* () {
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
   )(function* (input) {
-    const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"]);
+    // Only a running or waiting run with a running provider turn can be steered.
+    const target = yield* getProjectThreadRecords(input, ["runs"], {
+      runStatuses: ["running", "waiting"],
+    });
     if (target.thread.archivedAt !== null) {
       return yield* new ThreadManagementThreadArchivedError({
         threadId: input.threadId,
       });
     }
-    const steerableRun = latestSteerableRun(target);
+    const { providerTurns } = yield* getProjectThreadRecords(input, ["providerTurns"], {
+      providerTurnAttemptIds: target.runs.flatMap((run) =>
+        run.activeAttemptId === null ? [] : [run.activeAttemptId],
+      ),
+    });
+    const steerableRun = latestSteerableRun({ runs: target.runs, providerTurns });
     // A fresh send never joins a running turn, so it needs none to steer or restart.
     const mode = input.freshContext ? "queue" : input.mode;
     let dispatchMode: Extract<
@@ -1045,9 +1054,12 @@ const make = Effect.gen(function* () {
       createdBy: input.createdBy,
       creationSource: input.creationSource,
     });
+    // One read, so a promotion committing meanwhile is seen whole or not at all.
     const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
       messageIds: [input.messageId],
+      runMessageIds: [input.messageId],
       turnItemTypes: ["user_message"],
+      turnItemMessageIds: [input.messageId],
     });
     const message = projection.messages.find((candidate) => candidate.id === input.messageId);
     const run =
@@ -1107,7 +1119,10 @@ const make = Effect.gen(function* () {
     const afterSequence = yield* orchestrator
       .getThreadEventSequence(input.threadId)
       .pipe(Effect.mapError(loadError));
-    const target = yield* getProjectThreadRecords(input, ["runs"]);
+    // The selected run and the runs that may continue it after a restart, not the history.
+    const target = yield* getProjectThreadRecords(input, ["runs"], {
+      runWithContinuations: input.runId ?? "latest",
+    });
     const selectedRun =
       input.runId === undefined
         ? latestRun(target)
@@ -1214,7 +1229,7 @@ const make = Effect.gen(function* () {
         : Stream.empty,
     ).pipe(
       Stream.mapEffect(() =>
-        getProjectThreadRecords(input, ["runs"]).pipe(
+        getProjectThreadRecords(input, ["runs"], { runWithContinuations: selectedRun.id }).pipe(
           Effect.flatMap((current) => evaluate(current.runs)),
         ),
       ),
@@ -1227,7 +1242,12 @@ const make = Effect.gen(function* () {
     // The run may have reached a terminal status while the timeout was
     // winning the race; the final projection read decides what actually
     // happened, so only a still-active run counts as timed out.
-    return settledResult(yield* evaluate((yield* getProjectThreadRecords(input, ["runs"])).runs));
+    return settledResult(
+      yield* evaluate(
+        (yield* getProjectThreadRecords(input, ["runs"], { runWithContinuations: selectedRun.id }))
+          .runs,
+      ),
+    );
   });
 
   const settleAfterRun: ThreadManagementServiceShape["settleAfterRun"] = Effect.fn(

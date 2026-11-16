@@ -20,6 +20,8 @@ export interface RewriteOptions {
   readonly mark?: (key: string) => boolean;
   /** Called with each number as written; a different return replaces it. */
   readonly onNumber?: (raw: string, where: NumberPlace) => string;
+  /** Called when two different keys of one object are rewritten to the same key. */
+  readonly onKeyCollision?: () => void;
 }
 
 /** The text when it is a JSON object or array, else null. Scalars stay plain text. */
@@ -50,6 +52,8 @@ interface Frame {
   readonly marked: boolean;
   key: string | null;
   expectKey: boolean;
+  /** An object's keys as written, each to the key it was written from. */
+  readonly written?: Map<string, string>;
 }
 
 /**
@@ -62,7 +66,7 @@ export const rewriteJson = (
   onString: (decoded: string, where: StringRole) => string,
   options: RewriteOptions = {},
 ): string => {
-  const { rootKey = null, rootMarked = false, mark, onNumber } = options;
+  const { rootKey = null, rootMarked = false, mark, onNumber, onKeyCollision } = options;
   const stack: Array<Frame> = [];
   let out = "";
   let copied = 0;
@@ -85,6 +89,7 @@ export const rewriteJson = (
         marked: markedHere(),
         key: inherited,
         expectKey: char === "{",
+        ...(char === "{" && onKeyCollision !== undefined ? { written: new Map() } : {}),
       });
     } else if (char === "}" || char === "]") {
       stack.pop();
@@ -104,7 +109,12 @@ export const rewriteJson = (
         decoded,
         isKey ? { role: "key" } : { role: "value", key: valueKey(), marked: markedHere() },
       );
-      if (isKey && top !== undefined) top.key = decoded;
+      if (isKey && top !== undefined) {
+        top.key = decoded;
+        const from = top.written?.get(next);
+        if (from !== undefined && from !== decoded) onKeyCollision?.();
+        top.written?.set(next, decoded);
+      }
       if (next !== decoded) replace(index, close + 1, JSON.stringify(next));
       index = close;
     } else if (onNumber !== undefined && (char === "-" || (char >= "0" && char <= "9"))) {

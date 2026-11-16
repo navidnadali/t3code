@@ -119,6 +119,36 @@ minutes. The rate is per minute between the first and last span end. A `span-sum
 (see [Fast SQL spans](#fast-sql-spans)) counts from its start, and `--since` keeps the whole
 record when it ends inside the window.
 
+#### Span minutes
+
+The trace file rotates within minutes on a busy server. To see what the server spent its time on
+hours or days ago, it also writes one line a minute to `server.span-minutes.ndjson`, next to the
+trace file. A line counts every span that ended in that minute: sampled or not, and including the
+SQL spans that `T3CODE_TRACE_SQL_MIN_DURATION_MS` only counts.
+
+- `start`, `end`: the window, aligned to wall-clock minutes. The first line after a start and the
+  line written when the server stops cover part of a minute. A window much longer than a minute
+  means the event loop was blocked.
+- `pid`: the server process. It changes with each restart.
+- `spans`: `[count, totalMs, maxMs, p95Ms]` per span name. The p95 is within about 6% of the exact
+  value, and exact up to 19 spans. Names only: no attributes, events, ids or messages. Past 2,000
+  names in a minute the rest count under `(other)`.
+- `loop`: event loop delay p50, p99 and max beyond a 20 ms timer, and the share of the minute the
+  loop was busy (`utilization`).
+- `cpu`: user and system CPU time of the whole process, worker threads included, in ms.
+- `memory`: resident memory, and JavaScript heap used and allocated, in bytes.
+
+At 4 MiB the file is gzipped to `server.span-minutes.ndjson.<UTC close time>.gz`. The newest 48
+archives are kept, at most 48 MiB together: several days on a busy server, more on a quieter one. To list the five span names with the most time each minute:
+
+```bash
+cd ~/.t3/userdata/logs
+(gzip -dc server.span-minutes.ndjson.*.gz; cat server.span-minutes.ndjson) |
+  jq -c '{start, top: (.spans | to_entries | sort_by(-.value[1]) | .[:5] | map([.key, .value[1]]))}'
+```
+
+A crash or kill loses the current minute. `T3CODE_TRACE_SPAN_MINUTES=false` turns the file off.
+
 ### Metrics
 
 Metrics are not written to a local file.
@@ -666,6 +696,34 @@ Use traces when the question is:
 2. Inspect `git.hook.started` and `git.hook.finished` events.
 3. Compare hook timing to the enclosing git span duration.
 
+### "Why were an agent's T3 tool calls refused while it kept working?"
+
+When a background task ends, Claude starts a wake turn on its own. T3 shows that turn only once
+its continuation run is dispatched. Until then, a run-scoped T3 tool call from the turn waits, for
+at most a minute, for that run; one that still finds no run fails with `parent_not_active`. These lines are at Warn and carry ids only, so a server logging at Warn keeps
+them. Each wake line is written at most once a minute per thread and decision; `suppressed`
+counts the ones skipped since the last.
+
+- `orchestration-v2.claude-wake-turn-detected`: a wake turn began and its continuation was offered.
+- `orchestration-v2.claude-wake-latch-released`: the wake is settled. `decision` says how:
+  `continuation-started` (with its `runId`), `drained-by-resumed-run` (a user run resumed after a
+  restart replayed it, with that run's `runId`), `run-ended-unstarted`, `dispatch-cleared`,
+  `absorbed-by-user-turn`, `retired-wake-ended`, `next-notification` or `process-reset`.
+- `orchestration-v2.claude-wake-latch-retired`: the continuation ended or was cleared while the wake
+  turn still ran (`state` `opened` or `unopened`), or a request for an older wake arrived
+  (`stale`).
+- `orchestrator-mcp.caller-not-active`: a refused call, with its `operation` (`write`,
+  `cross-thread write`, `cross-project write`, `delegate_task`, `remote delegate_task`,
+  `create_threads`, `request_secret` or `t3_environment_link`), the calling `threadId`, the
+  provider instance of its credential and of the thread, the thread's active run and whether it is
+  archived.
+- `orchestrator-mcp.wake-run-wait-timed-out`: a call from a thread with no run waited the most it
+  may, a minute, for that thread's pending continuations (`pending`) to open a run, then went on to
+  its run check.
+
+A refusal between a thread's `claude-wake-turn-detected` and its `continuation-started` came from
+the wake turn.
+
 ### "Why do I have spans locally but nothing in Grafana?"
 
 Usually one of these is true:
@@ -812,6 +870,8 @@ Local trace file:
 - `T3CODE_TRACE_SQL_MIN_DURATION_MS`: count successful SQL spans shorter than this many
   milliseconds instead of writing them, default `0` (write all), at most `1000`, the Diagnostics
   slow-span cutoff. See [Fast SQL spans](#fast-sql-spans).
+- `T3CODE_TRACE_SPAN_MINUTES`: write the per-minute span aggregate, default `true`. See
+  [Span minutes](#span-minutes).
 
 OTLP export:
 

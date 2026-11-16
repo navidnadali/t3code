@@ -35,6 +35,7 @@ import { withExecutedModelNote } from "@t3tools/provider-core/server/subagentPro
 
 import type * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import { ProjectToolkit } from "../mcp/toolkits/project/tools.ts";
+import { logCallerNotActive } from "../mcp/threadAccess.ts";
 import {
   resolveInteractionMode,
   resolveRuntimeMode,
@@ -281,6 +282,13 @@ const make = Effect.gen(function* () {
         parentRun.rootNodeId === null ||
         parentRun.providerInstanceId !== scope.thread.providerInstanceId
       ) {
+        yield* logCallerNotActive({
+          operation: "remote delegate_task",
+          threadId: scope.thread.threadId,
+          providerInstanceId: scope.thread.providerInstanceId,
+          thread: parent.thread,
+          activeRunId: parentRun?.id ?? null,
+        });
         return yield* new OrchestratorMcpFailure({
           code: "parent_not_active",
           message: "Delegated tasks require an active run owned by this MCP provider session.",

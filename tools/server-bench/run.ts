@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off globalConsole:off globalDate:off globalTimers:off globalFetch:off preferSchemaOverJson:off cryptoRandomUUID:off - standalone bench orchestrator outside the Effect runtime; it owns child processes and deadlines.
+import "../../packages/shared/src/testing/gitEnv.ts";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
@@ -556,7 +557,7 @@ const sanitiseLabel = (text: string) =>
   text.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 
 /** HEAD and, for a tree with changes (tracked or untracked), a hash of them. */
-function treeState(dir: string) {
+export function treeState(dir: string) {
   const sha = git(dir, ["rev-parse", "HEAD"]);
   const dirty = git(dir, ["status", "--porcelain"]).length > 0;
   if (!dirty) return { sha, dirty, tree: sha };
@@ -797,7 +798,7 @@ const live = new Set<NodeChildProcess.ChildProcess>();
 const pinned = (cpus: string | undefined, command: ReadonlyArray<string>) =>
   cpus === undefined ? command : ["taskset", "-c", cpus, ...command];
 
-function cleanEnv(): Record<string, string> {
+export function cleanEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(process.env)) {
     if (value === undefined || STRIPPED_NAMES.has(name)) continue;

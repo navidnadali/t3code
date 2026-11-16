@@ -12,6 +12,7 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
+  type OrchestrationV2ProviderFailure,
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2StoredEvent,
@@ -613,6 +614,73 @@ it("routes only exact same-thread background items inherited from settled runs",
     RunExecutionService.routeProviderEvent(inheritedRunning, identity, afterTerminal)[0],
     "a nonterminal replay must not resurrect an inherited terminal",
   );
+});
+
+it("routes an earlier run's plan rows to this thread's active root turn only", () => {
+  const threadId = ThreadId.make("thread:earlier-plan-routing");
+  const priorRunId = RunId.make("run:earlier-plan-routing:prior");
+  const rootTurnId = ProviderTurnId.make("provider-turn:earlier-plan-routing:current");
+  const identity: RunExecutionService.ProviderEventRouteIdentity = {
+    threadId,
+    runId: RunId.make("run:earlier-plan-routing:current"),
+    attemptId: RunAttemptId.make("attempt:earlier-plan-routing:current"),
+    providerThreadId: ProviderThreadId.make("provider-thread:earlier-plan-routing"),
+  };
+  const active = RunExecutionService.makeProviderEventRoutingState({
+    identity,
+    providerTurnId: rootTurnId,
+  });
+  const planRow = {
+    type: "turn_item.updated",
+    driver,
+    turnItem: {
+      id: TurnItemId.make("turn-item:earlier-plan-routing"),
+      threadId,
+      runId: priorRunId,
+      type: "todo_list",
+    },
+  } as ProviderAdapter.ProviderAdapterV2Event;
+  const plan = {
+    type: "plan.updated",
+    driver,
+    plan: { threadId, runId: priorRunId },
+  } as ProviderAdapter.ProviderAdapterV2Event;
+  const otherThreadPlan = {
+    type: "plan.updated",
+    driver,
+    plan: { threadId: ThreadId.make("thread:earlier-plan-routing:other"), runId: priorRunId },
+  } as ProviderAdapter.ProviderAdapterV2Event;
+  const ordinaryRow = {
+    type: "turn_item.updated",
+    driver,
+    turnItem: {
+      id: TurnItemId.make("turn-item:earlier-plan-routing:tool"),
+      threadId,
+      runId: priorRunId,
+      type: "reasoning",
+    },
+  } as ProviderAdapter.ProviderAdapterV2Event;
+  const [, ended] = RunExecutionService.routeProviderEvent(
+    {
+      type: "turn.terminal",
+      driver,
+      providerThreadId: identity.providerThreadId,
+      providerTurnId: rootTurnId,
+      runOrdinal: 2,
+      status: "completed",
+      failure: null,
+      threadDisposition: "reusable",
+    },
+    identity,
+    active,
+  );
+
+  assert.isTrue(RunExecutionService.routeProviderEvent(planRow, identity, active)[0]);
+  assert.isTrue(RunExecutionService.routeProviderEvent(plan, identity, active)[0]);
+  assert.isFalse(RunExecutionService.routeProviderEvent(otherThreadPlan, identity, active)[0]);
+  assert.isFalse(RunExecutionService.routeProviderEvent(ordinaryRow, identity, active)[0]);
+  assert.isFalse(RunExecutionService.routeProviderEvent(planRow, identity, ended)[0]);
+  assert.isFalse(RunExecutionService.routeProviderEvent(plan, identity, ended)[0]);
 });
 
 it("selects only live background items from non-completed settled prior runs", () => {
@@ -1566,6 +1634,8 @@ it.effect.each(["failure", "interruption", "stale-attempt", "start-guard"] as co
       assert.isDefined(errorItem);
       if (errorItem?.type === "turn-item.updated" && errorItem.payload.type === "error") {
         assert.equal(errorItem.payload.failure.message, "Run preparation failed.");
+        // The provider never had the prompt, which decides whether a wake delivered its results.
+        assert.equal(errorItem.payload.failure.code, "run_preparation_failed");
       }
     }),
 );
@@ -1983,6 +2053,89 @@ it.effect("ends a nested native subagent and its thread when the root run is int
   }),
 );
 
+it.effect("drains queued child output after the root loses provider-thread ownership", () =>
+  Effect.gen(function* () {
+    const childEvents: Array<string> = [];
+    yield* runBackgroundItemScenario(
+      "queued-child-output",
+      (ids) => {
+        const childProviderThreadId = ProviderThreadId.make(
+          "provider-thread:queued-child-output:child",
+        );
+        const snapshot = (child: boolean, pendingBackgroundWork: boolean) => ({
+          type: "provider_thread.updated" as const,
+          driver,
+          providerThread: {
+            id: child ? childProviderThreadId : ids.providerThreadId,
+            driver,
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            providerSessionId: null,
+            appThreadId: child ? ids.childThreadId : ids.threadId,
+            ownerNodeId: null,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            status: "idle",
+            firstRunOrdinal: 1,
+            lastRunOrdinal: 1,
+            handoffIds: [],
+            forkedFrom: null,
+            pendingBackgroundTasks: [],
+            createdAt: DateTime.makeUnsafe(0),
+            updatedAt: DateTime.makeUnsafe(0),
+          } satisfies OrchestrationV2ProviderThread,
+          pendingBackgroundWork,
+        });
+        const childTurn = (status: "running" | "completed") => ({
+          type: "provider_turn.updated" as const,
+          driver,
+          threadId: ids.childThreadId,
+          providerTurn: {
+            id: ProviderTurnId.make("provider-turn:queued-child-output:child"),
+            providerThreadId: childProviderThreadId,
+            runAttemptId: null,
+            ordinal: 2,
+            status,
+          } as OrchestrationV2ProviderTurn,
+        });
+        const message = (text: string) =>
+          ({
+            type: "message.updated",
+            driver,
+            message: { threadId: ids.childThreadId, runId: null, text },
+          }) as ProviderAdapter.ProviderAdapterV2Event;
+        return [
+          childThreadCreatedEvent(ids),
+          snapshot(false, true),
+          snapshot(true, true),
+          subagentEvent(ids, "running"),
+          rootTerminalEvent(ids, "completed"),
+          snapshot(false, true),
+          subagentEvent(ids, "completed"),
+          childTurn("running"),
+          message("GRANDCHILD_OK"),
+          childTurn("completed"),
+          snapshot(true, false),
+          snapshot(false, false),
+          message("after-drain"),
+        ];
+      },
+      {
+        keepEventStreamOpen: true,
+        hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+        providerThreadOwnerLost: true,
+        onIngest: (event) =>
+          Effect.sync(() => {
+            if (event.type === "provider_turn.updated") {
+              childEvents.push(event.providerTurn.status);
+            }
+            if (event.type === "message.updated") childEvents.push(event.message.text);
+          }),
+      },
+    );
+    assert.deepEqual(childEvents, ["running", "GRANDCHILD_OK", "completed"]);
+  }),
+);
+
 it.effect("keeps ingesting until queued background work clears after the probe goes idle", () =>
   Effect.gen(function* () {
     // The adapter's probe runs ahead of its event queue, so only the queued update may release.
@@ -2161,6 +2314,93 @@ it.effect.each([null, "run:nested-sdk"] as const)(
           "turn_item:running",
           "root-finalized",
         ]);
+    }),
+);
+
+it.effect.each(["none", "sibling", "grandchild"] as const)(
+  "drops a transferred child's pending snapshot but keeps other owned pending work (%s)",
+  (otherPending) =>
+    Effect.gen(function* () {
+      const consumed = yield* Deferred.make<void>();
+      const result = yield* Effect.raceFirst(
+        runBackgroundItemScenario(
+          "child-transfer-pending",
+          (ids) => {
+            const childProviderThreadId = ProviderThreadId.make(
+              "provider-thread:child-transfer-pending:child",
+            );
+            const otherThreadId = ThreadId.make("thread:child-transfer-pending:other");
+            const snapshot = (
+              providerThreadId: ProviderThreadId,
+              appThreadId: ThreadId,
+              pendingBackgroundWork: boolean,
+            ) => ({
+              type: "provider_thread.updated" as const,
+              driver,
+              providerThread: {
+                id: providerThreadId,
+                appThreadId,
+                status: "idle",
+              } as OrchestrationV2ProviderThread,
+              pendingBackgroundWork,
+            });
+            const running = subagentEvent(ids, "running");
+            if (running.type !== "subagent.updated") throw new Error("Missing subagent");
+            const linked = {
+              ...running,
+              subagent: {
+                ...running.subagent,
+                origin: "provider_native" as const,
+                childThreadId: ids.childThreadId,
+                providerThreadId: childProviderThreadId,
+              },
+            };
+            // A grandchild stays with this run when its parent moves; a sibling was never the child's.
+            const other =
+              otherPending === "none"
+                ? []
+                : [
+                    {
+                      ...childThreadCreatedEvent(ids),
+                      appThread: {
+                        id: otherThreadId,
+                        lineage: {
+                          parentThreadId:
+                            otherPending === "grandchild" ? ids.childThreadId : ids.threadId,
+                          relationshipToParent: "subagent",
+                          rootThreadId: ids.threadId,
+                        },
+                      },
+                    } as ProviderAdapter.ProviderAdapterV2Event,
+                    snapshot(
+                      ProviderThreadId.make("provider-thread:child-transfer-pending:other"),
+                      otherThreadId,
+                      true,
+                    ),
+                  ];
+            return [
+              childThreadCreatedEvent(ids),
+              linked,
+              snapshot(childProviderThreadId, ids.childThreadId, true),
+              ...other,
+              rootTerminalEvent(ids, "completed"),
+              { ...linked, subagent: { ...linked.subagent, runId: RunId.make("run:replacement") } },
+              snapshot(childProviderThreadId, ids.childThreadId, false),
+            ];
+          },
+          {
+            keepEventStreamOpen: true,
+            hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+            onEventsConsumed: Deferred.succeed(consumed, undefined).pipe(Effect.asVoid),
+          },
+        ).pipe(Effect.asSome),
+        Deferred.await(consumed).pipe(Effect.as(Option.none())),
+      );
+      assert.strictEqual(
+        Option.isSome(result),
+        otherPending === "none",
+        "only pending work this run still owns may keep the prior subscription open",
+      );
     }),
 );
 
@@ -3094,6 +3334,123 @@ it.effect("records a provider's input rejection at turn start in the terminal er
     assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
     const error = written.find((item) => item.type === "error");
     assert.include(error?.failure.message ?? "", rejection);
+  }),
+);
+
+it.effect("marks a failed provider start call, so a wake it carried is sent again", () =>
+  Effect.gen(function* () {
+    const { written } = yield* captureRootRunTermination({
+      key: "start-failure:call-failed",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () => Stream.never,
+      afterStart: (closed) => Deferred.succeed(closed, undefined),
+      startTurn: (turnInput) =>
+        Effect.fail(
+          new ProviderAdapter.ProviderAdapterTurnStartError({
+            driver,
+            threadId: turnInput.threadId,
+            providerThreadId: turnInput.providerThread.id,
+            runId: turnInput.runId,
+            cause: "The provider query closed before the prompt was queued.",
+          }),
+        ),
+    });
+    const error = written.find((item) => item.type === "error");
+    assert.equal(error?.failure.class, "provider_error");
+    assert.equal(error?.failure.code, "run_start_failed");
+  }),
+);
+
+it.effect(
+  "marks a turn that failed before its start call returned, so its wake is sent again",
+  () =>
+    Effect.gen(function* () {
+      const ingested: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+      const terminalWritten = yield* Deferred.make<void>();
+      let terminalWrites = 0;
+      yield* captureRootRunTermination({
+        key: "start-failure:terminal-first",
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) => Stream.make(rootTerminalEvent(ids, "failed")),
+        ingestNormalized: (input) =>
+          Effect.sync(() => {
+            ingested.push(input.event);
+            return [];
+          }),
+        // The provider reports the turn failed while its start call is pending, as OpenCode can;
+        // the start call's own failure write then finds the run ended.
+        beforeTerminalWrite: () =>
+          Effect.sync(() => (terminalWrites += 1) === 1).pipe(
+            Effect.tap(() => Deferred.succeed(terminalWritten, undefined)),
+          ),
+        startTurn: (turnInput) =>
+          Deferred.await(terminalWritten).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver,
+                  threadId: turnInput.threadId,
+                  providerThreadId: turnInput.providerThread.id,
+                  runId: turnInput.runId,
+                  cause: "The prompt request failed.",
+                }),
+              ),
+            ),
+          ),
+      });
+      const terminal = ingested.find((event) => event.type === "turn.terminal");
+      assert.equal(
+        terminal?.type === "turn.terminal" && terminal.status === "failed"
+          ? terminal.failure.code
+          : undefined,
+        "run_start_failed",
+      );
+    }),
+);
+
+it.effect("marks a run whose event stream failed before its start call returned", () =>
+  Effect.gen(function* () {
+    const failureWritten = yield* Deferred.make<void>();
+    const committedFailures: Array<OrchestrationV2ProviderFailure> = [];
+    yield* captureRootRunTermination({
+      key: "start-failure:stream-first",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      // The provider's stream fails while its start call is pending; the start call's own
+      // failure write then finds the run ended.
+      events: () =>
+        Stream.fail(
+          new ProviderAdapter.ProviderAdapterEventStreamError({
+            driver,
+            providerSessionId: ProviderSessionId.make("session:stream-first"),
+            cause: "provider process exited",
+          }),
+        ),
+      beforeTerminalWrite: (request) =>
+        Effect.sync(() => {
+          const first = committedFailures.length === 0;
+          for (const event of request.events) {
+            if (event.type === "turn-item.updated" && event.payload.type === "error" && first)
+              committedFailures.push(event.payload.failure);
+          }
+          return first;
+        }).pipe(Effect.tap(() => Deferred.succeed(failureWritten, undefined))),
+      startTurn: (turnInput) =>
+        Deferred.await(failureWritten).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver,
+                threadId: turnInput.threadId,
+                providerThreadId: turnInput.providerThread.id,
+                runId: turnInput.runId,
+                cause: "The prompt request failed.",
+              }),
+            ),
+          ),
+        ),
+    });
+    assert.lengthOf(committedFailures, 1);
+    assert.equal(committedFailures[0]?.code, "run_start_failed");
   }),
 );
 
@@ -4301,6 +4658,8 @@ function runBackgroundItemScenario(
     >;
     readonly onSubscribe?: Effect.Effect<void>;
     readonly onEventsConsumed?: Effect.Effect<void>;
+    // Owner-gated root snapshots store nothing, as after a newer run claims the thread.
+    readonly providerThreadOwnerLost?: boolean;
     readonly afterEvents?: (
       activity: PreviewAgentActivity.PreviewAgentActivity["Service"],
     ) => Effect.Effect<void>;
@@ -4379,7 +4738,11 @@ function runBackgroundItemScenario(
                   ]);
                 }
                 // Only the count of stored events matters to the run.
-                return event.type === "provider_thread.updated"
+                return event.type === "provider_thread.updated" &&
+                  !(
+                    options?.providerThreadOwnerLost === true &&
+                    input.writeIfProviderThreadOwner !== undefined
+                  )
                   ? [{} as OrchestrationV2StoredEvent]
                   : [];
               });

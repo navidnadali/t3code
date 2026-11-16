@@ -33,6 +33,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlError from "effect/sql/SqlError";
@@ -2633,4 +2634,70 @@ it.effect.each([
     );
     assert.isEmpty(persisted);
   }).pipe(Effect.provide(layerFailingWrites(errors))),
+);
+
+it.effect(
+  "an out-of-memory kill keeps the mark of a turn that failed before its start call returned",
+  () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId: threadEvent.threadId,
+      });
+      yield* eventSink.write({ events: [threadEvent] });
+      yield* ingestor.ingestNormalized({
+        providerSessionId,
+        providerInstanceId: modelSelection.instanceId,
+        threadId: threadEvent.threadId,
+        event: {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: idAllocator.derive.providerThread({
+            driver: CODEX_DRIVER,
+            nativeThreadId: "native-thread-oom",
+          }),
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: CODEX_DRIVER,
+            nativeTurnId: "native-turn-oom",
+          }),
+          runOrdinal: 1,
+          failureItemOrdinal: 102,
+          status: "failed",
+          failure: makeProviderFailure({
+            message: "The provider process exited.",
+            code: "run_start_failed",
+            class: "provider_error",
+          }),
+          threadDisposition: "broken",
+        },
+      });
+      const projection = yield* projectionStore.getThreadProjection(threadEvent.threadId);
+      const errorItem = projection.visibleTurnItems.find(
+        (candidate) => candidate.item.type === "error",
+      )?.item;
+      assert.equal(errorItem?.type, "error");
+      if (errorItem?.type !== "error") return;
+      assert.equal(errorItem.failure.message, "Killed: out of memory.");
+      assert.equal(errorItem.failure.code, "run_start_failed");
+    }).pipe(
+      Effect.provide(
+        makeLayerTest(layerTestEventSink).pipe(
+          Layer.provide(
+            Layer.succeed(AgentScope, {
+              wrap: ({ command, args }) => Effect.succeed({ command, args }),
+              oomKilled: () => Effect.succeed(true),
+              stop: () => Effect.void,
+              kill: () => Effect.succeed(false),
+              clear: () => Effect.void,
+            }),
+          ),
+        ),
+      ),
+    ),
 );

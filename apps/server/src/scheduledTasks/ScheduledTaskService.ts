@@ -53,6 +53,8 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import { OrchestratorDispatchError } from "../orchestration-v2/Orchestrator.ts";
+import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as DueHint from "../scheduling/DueHint.ts";
@@ -79,6 +81,7 @@ import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerificatio
 
 export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
 const isScheduledTaskError = Schema.is(ScheduledTaskError);
+const isOrchestratorDispatchError = Schema.is(OrchestratorDispatchError);
 const PROMPT_TOO_LONG = "The filled-in prompt is too long.";
 const WEBHOOK_DELIVERY_RETENTION = 50;
 const WEBHOOK_DEDUPE_DELIVERY_RETENTION = 20;
@@ -362,6 +365,14 @@ function requireFutureOnce(
 function errorMessage(error: unknown): string {
   const failure = Cause.isCause(error) ? Cause.squash(error) : error;
   return failure instanceof Error ? failure.message : String(failure);
+}
+
+function dispatchErrorMessage(cause: Cause.Cause<unknown>): string {
+  const failure = Cause.squash(cause);
+  // Direct orchestration refusals are user-facing; nested defects can contain private data.
+  return isOrchestratorDispatchError(failure) && typeof failure.cause === "string"
+    ? (userFacingDispatchErrorMessage(failure.cause) ?? errorMessage(failure))
+    : errorMessage(failure);
 }
 
 function webhookPath(taskId: string, token: string): string {
@@ -835,13 +846,15 @@ export const layer = Layer.effect(
         ),
     );
 
-    // Reads every run row but only the queued runs' messages, so the cost per
-    // due interval tracks the thread's run count, not its transcript.
+    // Reads only the queued runs and their messages, so the cost per due interval
+    // tracks the thread's queue, not its history.
     const hasQueuedOccurrence = Effect.fn("ScheduledTaskService.hasQueuedOccurrence")(function* (
       taskId: ScheduledTaskId,
       threadId: ThreadId,
     ) {
-      const { runs } = yield* threadManagement.getThreadRecords(threadId, ["runs"]);
+      const { runs } = yield* threadManagement.getThreadRecords(threadId, ["runs"], {
+        runStatuses: ["queued"],
+      });
       const queued = runs.filter((run) => run.status === "queued");
       if (queued.length === 0) return false;
       const queuedMessageIds = new Set(queued.map((run) => run.userMessageId));
@@ -883,7 +896,9 @@ export const layer = Layer.effect(
       const shell = yield* threadManagement.getThreadShell(threadId);
       if (shell === null) return;
       const thread = { projectId: shell.projectId, threadId };
-      const { runs } = yield* threadManagement.getProjectThreadRecords(thread, ["runs"]);
+      const { runs } = yield* threadManagement.getProjectThreadRecords(thread, ["runs"], {
+        runUserMessageIds: [messageId],
+      });
       const dispatched = runs.find((run) => run.userMessageId === messageId);
       if (dispatched === undefined) return;
       const { run } = yield* threadManagement.waitForThread({
@@ -897,10 +912,11 @@ export const layer = Layer.effect(
         !ThreadManagementService.isTerminalRunStatus(run.status)
       )
         return;
-      const { turnItems, messages } = yield* threadManagement.getProjectThreadRecords(thread, [
-        "turnItems",
-        "messages",
-      ]);
+      const { turnItems, messages } = yield* threadManagement.getProjectThreadRecords(
+        thread,
+        ["turnItems", "messages"],
+        { turnItemTypes: ["error"], turnItemRunIds: [run.id], messageIds: [messageId] },
+      );
       // A queued message promoted to a steer cancels its run and joins the active one.
       if (
         run.status === "cancelled" &&
@@ -1036,7 +1052,8 @@ export const layer = Layer.effect(
               scheduledTaskId: active.id,
               text: prompt,
               attachments: [],
-              mode: "queue",
+              // A continued thread takes it in its live or next turn, as dispatch policy allows.
+              mode: threadMode === "fresh_session" ? "queue" : "auto",
               ...(threadMode === "fresh_session" ? { freshContext: true } : {}),
               createdBy: active.createdBy,
               creationSource: active.creationSource,
@@ -1098,7 +1115,7 @@ export const layer = Layer.effect(
         if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
         const completedAt = yield* localNow;
         const lastRunStatus = runSucceeded ? ("succeeded" as const) : ("failed" as const);
-        const lastRunError = runSucceeded ? null : errorMessage(result.cause);
+        const lastRunError = runSucceeded ? null : dispatchErrorMessage(result.cause);
         const threadId = runSucceeded ? result.value : null;
         // One transaction, so an edit cannot land between reading the schedule and
         // writing the next run computed from it. The origin is read first: it reads

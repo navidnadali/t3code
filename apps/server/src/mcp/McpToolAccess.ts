@@ -7,19 +7,23 @@ import {
   type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Ref from "effect/Ref";
 import * as Struct from "effect/Struct";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import type * as Layer from "effect/Layer";
 import type * as Scope from "effect/Scope";
+import { McpSchema } from "effect/ai";
 import type { Tool, Toolkit } from "effect/ai";
 
 import {
   DispatchModeLimit,
   type DispatchModeRefusal,
 } from "../orchestration-v2/DispatchModeLimit.ts";
+import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import { assertNotLinked, assertSameLink, callerLinkOrigin } from "./linkOrigin.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -111,6 +115,46 @@ export class Declaration<out Handler> {
   }
 }
 
+/**
+ * A provider-started wake turn calls tools before its continuation dispatch commits the run.
+ * Wait for that dispatch before the caller is read. Never under a thread lock: the dispatch takes it.
+ */
+const awaitPendingWakeRun = Effect.fn("McpToolAccess.awaitPendingWakeRun")(function* () {
+  const scope = yield* McpInvocationContext.McpInvocationContext;
+  if (scope.thread === undefined) return;
+  const { threadId } = scope.thread;
+  const continuations = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+  const threads = yield* ThreadManagement.ThreadManagementService;
+  // Recheck after each settle: other continuations for the thread may queue behind a slow one.
+  const waitForRun = Effect.gen(function* () {
+    while (true) {
+      const { pending, settles } = yield* continuations.progress(threadId);
+      if (pending === 0) return;
+      // A run commits before its continuation settles, so a run missing here has not settled yet.
+      const shell = yield* threads.getThreadShell(threadId).pipe(Effect.orElseSucceed(() => null));
+      if (shell === null || shell.activeRunId !== null) return;
+      yield* continuations.awaitSettle(settles);
+    }
+  });
+  const waited = yield* waitForRun.pipe(Effect.timeoutOption("60 seconds"));
+  if (Option.isNone(waited)) {
+    yield* Effect.logWarning("orchestrator-mcp.wake-run-wait-timed-out", {
+      threadId,
+      pending: (yield* continuations.progress(threadId)).pending,
+    });
+  }
+});
+
+/** Declares a tool that checks its caller's run, which a wake turn may not have committed yet. */
+const declareLive = <P, A, E, R>(
+  handle: (params: P) => Effect.Effect<A, E, R>,
+  remote: RemoteCheck<P> | undefined,
+) =>
+  declare(
+    (params: P) => awaitPendingWakeRun().pipe(Effect.andThen(() => handle(params))),
+    remote && ((params: P) => awaitPendingWakeRun().pipe(Effect.andThen(() => remote(params)))),
+  );
+
 const refuseReadOnlyClient = McpInvocationContext.McpInvocationContext.pipe(
   Effect.flatMap((scope) =>
     scope.client?.access === "read-only"
@@ -149,7 +193,7 @@ export const readsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A
   declare((params: P) => requireThreadCaller.pipe(Effect.flatMap(() => handle(params))), undefined);
 
 export const actsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
-  declare(
+  declareLive(
     (params: P) =>
       requireThreadCaller.pipe(
         Effect.andThen(writingCaller),
@@ -170,7 +214,7 @@ export const writes = <P, A, E, R>(
     readonly linkedCallers?: "allowed";
   },
 ) =>
-  declare(
+  declareLive(
     (params: P) =>
       orchestratingCaller.pipe(
         Effect.tap((caller) =>
@@ -185,7 +229,7 @@ export const writes = <P, A, E, R>(
 
 /** Requires handler capability checks, not thread control; linked work is refused the same way. */
 export const writesWithCapability = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
-  declare(
+  declareLive(
     (params: P) =>
       writingCaller.pipe(
         Effect.tap((caller) => assertNotLinked(caller, "start work here that is not its link's")),
@@ -198,7 +242,7 @@ export const writesThreads = <P, A, E, R>(
   threads: (params: P) => ReadonlyArray<ThreadId | undefined>,
   handle: (params: P) => Effect.Effect<A, E, R>,
 ) =>
-  declare(
+  declareLive(
     (params: P) =>
       Effect.gen(function* () {
         const caller = yield* writingCaller;
@@ -268,7 +312,7 @@ export const startsThreads = <P, A, E, R>(
       linkOrigin: callerLinkOrigin(caller),
     } satisfies StartedModes;
   });
-  return declare(
+  return declareLive(
     (params: P) =>
       Effect.gen(function* () {
         const caller = yield* writingCaller;
@@ -341,7 +385,8 @@ export const writesEnvironment = <P, A, E, R>(
     ),
     Effect.tap((caller) => assertFullAccess(caller, fullAccessRequired)),
   );
-  return declare(
+  // `check` reruns under handlers' thread locks, so only the first one waits for a wake turn.
+  return declareLive(
     (params: P) => check.pipe(Effect.flatMap(() => handle(params, check))),
     // Linked work never reaches a link at all; that is checked as the call goes.
     () =>
@@ -420,8 +465,17 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
   const handlers: Record<string, unknown> = { ...checked };
   for (const [name, declaration] of Object.entries<Declaration<unknown>>(declarations)) {
     const tool = toolkit.tools[name];
-    if (tool === undefined || !takesLinkedEnvironment(tool)) continue;
+    if (tool === undefined) continue;
     const remote = remoteCheckOf(declaration);
+    if (
+      remote === undefined &&
+      Context.getOrUndefined(tool.annotations, McpSchema.EnabledWhen) !==
+        McpInvocationContext.hiddenFromOutsideClients
+    )
+      return yield* Effect.die(
+        `${name} acts as its calling thread, so outside clients must not be offered it.`,
+      );
+    if (!takesLinkedEnvironment(tool)) continue;
     const forwarded = forwardedOf(declaration) as
       | Forwarded<object, unknown, Tool.Failure<Tools[keyof Tools]>, never>
       | undefined;

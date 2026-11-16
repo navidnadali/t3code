@@ -13,7 +13,6 @@ import Migration0002 from "./PerfForkMigrations/002_TurnItemMessageOrdinalIndex.
  */
 export const PERF_FORK_MIGRATIONS_TABLE = "t3_perf_fork_migrations";
 
-const TURN_ITEMS = "orchestration_v2_projection_turn_items";
 const TURN_ITEM_COUNTS = "orchestration_v2_projection_turn_item_counts";
 
 type PerfForkObject = readonly [type: "table" | "trigger" | "index", name: string, table: string];
@@ -28,12 +27,8 @@ const TURN_ITEM_COUNT_TRIGGERS = [
 const perfForkMigrationEntries = [
   // Upstream's migration 85 owns the turn-item counts now; see replacePerfForkTurnItemCounts.
   [1, "ProjectionTurnItemCounts", Migration0001, []],
-  [
-    2,
-    "TurnItemMessageOrdinalIndex",
-    Migration0002,
-    [["index", "orchestration_v2_projection_turn_items_message_ordinal_idx", TURN_ITEMS]],
-  ],
+  // Upstream's migration 94 owns the message-ordinal index now.
+  [2, "TurnItemMessageOrdinalIndex", Migration0002, []],
 ] as const;
 
 export const PERF_FORK_MIGRATION_HEAD = Math.max(...perfForkMigrationEntries.map(([id]) => id));

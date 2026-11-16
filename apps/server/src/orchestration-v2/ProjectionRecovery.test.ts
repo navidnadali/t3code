@@ -13,8 +13,10 @@ import {
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
+  RunAttemptId,
   RunId,
   RuntimeRequestId,
+  ScheduledTaskId,
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
@@ -54,6 +56,21 @@ const layerRecoveryTest = ProviderRuntimeRecovery.layer.pipe(
     ),
   ),
   Layer.provide(ServerSettings.layerTest()),
+);
+const layerRecoveryWithoutContinuationTest = ProviderRuntimeRecovery.layer.pipe(
+  Layer.provideMerge(
+    EventSink.layer.pipe(
+      Layer.provideMerge(
+        Layer.mergeAll(
+          EventStore.layer,
+          ProjectionStore.layer,
+          EffectOutbox.layer,
+          IdAllocator.layer,
+        ).pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
+      ),
+    ),
+  ),
+  Layer.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: false })),
 );
 const providerInstanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId: providerInstanceId, model: "gpt-5.4" };
@@ -138,7 +155,7 @@ const createRun = Effect.fn(function* (
 });
 
 it.effect.each(["startup", "shutdown"] as const)(
-  "%s cancels queued buffered wakes and holds durable messages",
+  "%s cancels queued buffered wakes and keeps durable messages",
   (trigger) =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -204,12 +221,175 @@ it.effect.each(["startup", "shutdown"] as const)(
         assert.isNull(projection.runs[0]?.queuePosition);
         assert.equal(projection.runs[1]?.status, "completed");
       }
+      const userThread = ThreadId.make(`thread:recovery:wake:${trigger}:user`);
       for (const threadId of durableThreads) {
         const projection = yield* projections.getThreadProjection(threadId);
         assert.equal(projection.runs[0]?.status, "queued");
-        assert.isTrue(projection.runs[0]?.queueHeld);
+        assert.equal(projection.runs[0]?.queueHeld === true, threadId === userThread);
       }
-      assert.deepEqual(yield* projections.getRecoveryThreadIds("runtime"), []);
+      // Unheld queues stay startable, so only the held thread leaves the recovery set.
+      assert.deepEqual(
+        new Set(yield* projections.getRecoveryThreadIds("runtime")),
+        new Set(durableThreads.filter((threadId) => threadId !== userThread)),
+      );
+    }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+it.effect.each(["startup", "shutdown"] as const)(
+  "%s holds a person's queued message but leaves unattended queued work unheld",
+  (trigger) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const now = yield* DateTime.now;
+      const kinds = ["user", "automation", "cross-thread", "delegated", "notification"] as const;
+      const threads = new Map<(typeof kinds)[number], ThreadId>();
+      for (const kind of kinds) {
+        const threadId = yield* createThread(`unattended:${trigger}:${kind}`);
+        threads.set(kind, threadId);
+        const messageId = MessageId.make(`message:${threadId}`);
+        const runId = yield* createRun(threadId, "queued", {
+          userMessageId: messageId,
+          startedAt: null,
+          queuePosition: 1,
+        });
+        yield* createRun(threadId, "completed", { ordinal: 2 });
+        yield* projections.apply({
+          id: EventId.make(`message:${threadId}`),
+          type: "message.updated",
+          threadId,
+          runId,
+          occurredAt: now,
+          payload: {
+            id: messageId,
+            threadId,
+            runId,
+            nodeId: null,
+            role: "user",
+            text: "Queued work",
+            attachments: [],
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            createdBy: kind === "user" ? "user" : "agent",
+            creationSource: kind === "user" ? "web" : kind === "automation" ? "mcp" : "server",
+            ...(kind === "automation"
+              ? { scheduledTaskId: ScheduledTaskId.make(`task:${threadId}`) }
+              : {}),
+            ...(kind === "cross-thread"
+              ? { senderThreadId: ThreadId.make(`sender:${threadId}`) }
+              : {}),
+            ...(kind === "delegated"
+              ? { delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [] } }
+              : {}),
+            ...(kind === "notification"
+              ? {
+                  notification: {
+                    source: { kind: "background_task" as const },
+                    outcome: "updated" as const,
+                    summary: "Background activity updated",
+                  },
+                }
+              : {}),
+          },
+        });
+      }
+      yield* recovery.reconcile(trigger);
+      for (const [kind, threadId] of threads) {
+        const queued = (yield* projections.getThreadProjection(threadId)).runs[0];
+        assert.equal(queued?.status, "queued", kind);
+        assert.equal(queued?.queueHeld === true, kind === "user", kind);
+      }
+    }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+it.effect.each(["startup", "shutdown"] as const)(
+  "%s still holds unattended queued work when restart continuation is off",
+  (trigger) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const now = yield* DateTime.now;
+      const threadId = yield* createThread(`unattended-off:${trigger}`);
+      const messageId = MessageId.make(`message:${threadId}`);
+      const runId = yield* createRun(threadId, "queued", {
+        userMessageId: messageId,
+        startedAt: null,
+        queuePosition: 1,
+      });
+      yield* createRun(threadId, "completed", { ordinal: 2 });
+      yield* projections.apply({
+        id: EventId.make(`message:${threadId}`),
+        type: "message.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          id: messageId,
+          threadId,
+          runId,
+          nodeId: null,
+          role: "user",
+          text: "Queued work",
+          attachments: [],
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: "agent",
+          creationSource: "mcp",
+          scheduledTaskId: ScheduledTaskId.make(`task:${threadId}`),
+        },
+      });
+      yield* recovery.reconcile(trigger);
+      assert.isTrue((yield* projections.getThreadProjection(threadId)).runs[0]?.queueHeld);
+    }).pipe(Effect.provide(layerRecoveryWithoutContinuationTest)),
+);
+
+it.effect.each(["startup", "shutdown"] as const)(
+  "%s holds unattended work queued behind a worktree it never created",
+  (trigger) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const now = yield* DateTime.now;
+      const threadId = yield* createThread(`unattended-worktree:${trigger}`);
+      yield* createRun(threadId, "preparing", {
+        startedAt: null,
+        workspacePreparation: { type: "worktree", baseRef: "main" },
+      });
+      const messageId = MessageId.make(`message:${threadId}`);
+      const runId = yield* createRun(threadId, "queued", {
+        ordinal: 2,
+        userMessageId: messageId,
+        startedAt: null,
+        queuePosition: 1,
+      });
+      yield* projections.apply({
+        id: EventId.make(`message:${threadId}`),
+        type: "message.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          id: messageId,
+          threadId,
+          runId,
+          nodeId: null,
+          role: "user",
+          text: "Queued work",
+          attachments: [],
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: "agent",
+          creationSource: "mcp",
+          senderThreadId: ThreadId.make(`sender:${threadId}`),
+        },
+      });
+      yield* recovery.reconcile(trigger);
+      const { runs } = yield* projections.getThreadProjection(threadId);
+      assert.equal(runs.find((run) => run.id !== runId)?.status, "cancelled");
+      assert.isTrue(runs.find((run) => run.id === runId)?.queueHeld);
     }).pipe(Effect.provide(layerRecoveryTest)),
 );
 
@@ -522,6 +702,54 @@ it.effect("selects unfinished recovery work without reading settled thread histo
       queued,
       ThreadId.make("thread:recovery:settled-599"),
     ]);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("lists idle threads whose queue waits unheld, through the recovery index", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const now = yield* DateTime.now;
+    for (let index = 0; index < 200; index += 1) {
+      yield* createRun(yield* createThread(`idle-queue-settled-${index}`), "completed");
+    }
+    const idle = yield* createThread("idle-queue");
+    const mixed = yield* createThread("idle-queue-mixed");
+    const held = yield* createThread("idle-queue-held");
+    const active = yield* createThread("idle-queue-active");
+    const archived = yield* createThread("idle-queue-archived", { archivedAt: now });
+    for (const threadId of [idle, mixed, held, active, archived]) {
+      yield* createRun(threadId, "completed");
+      yield* createRun(threadId, "queued", {
+        ordinal: 2,
+        startedAt: null,
+        queueHeld: threadId === held || threadId === mixed,
+      });
+    }
+    yield* createRun(mixed, "queued", { ordinal: 3, startedAt: null, queueHeld: false });
+    yield* createRun(active, "running", { ordinal: 3 });
+
+    const statements: Array<ReturnType<Statement.Statement<unknown>["compile"]>> = [];
+    const observe: Statement.Transformer = (statement) => {
+      statements.push(statement.compile());
+      return Effect.succeed(statement);
+    };
+    // The queue's shape lets a caller tell a changed queue from one still blocked as it was.
+    assert.deepEqual(
+      yield* projections
+        .getIdleQueuedThreads()
+        .pipe(Effect.provideService(Statement.CurrentTransformer, observe)),
+      [
+        { threadId: idle, unheldQueuedRuns: 1, firstQueuedOrdinal: 2, latestRunOrdinal: 2 },
+        { threadId: mixed, unheldQueuedRuns: 1, firstQueuedOrdinal: 3, latestRunOrdinal: 3 },
+      ],
+    );
+    const [query, params] = statements[0]!;
+    const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, params);
+    assert.isTrue(
+      plan.some((row) => row.detail.includes("runs_recovery_idx")),
+      JSON.stringify(plan),
+    );
   }).pipe(Effect.provide(layerTest)),
 );
 
@@ -1239,7 +1467,13 @@ it.effect("reads the run that owns a background roster, not a queued or resumed 
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("wakes the run whose subagent lost its shell, past a wake cut before it started", () =>
+it.effect.each([
+  ["a wake cut before it started", { status: "starting", startedAt: null }],
+  [
+    "a prompt the provider never accepted",
+    { status: "running", activeAttemptId: RunAttemptId.make("attempt:unaccepted") },
+  ],
+] as const)("wakes the run whose subagent lost its shell, past %s", ([, later]) =>
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
@@ -1269,11 +1503,11 @@ it.effect("wakes the run whose subagent lost its shell, past a wake cut before i
       },
     });
     const settledRun = yield* createRun(threadId, "completed", { providerThreadId });
-    yield* createRun(threadId, "starting", {
+    yield* createRun(threadId, later.status, {
       ordinal: 2,
       providerThreadId,
-      startedAt: null,
       completedAt: null,
+      ...later,
     });
     yield* projections.apply({
       id: EventId.make(`event:${threadId}:roster`),

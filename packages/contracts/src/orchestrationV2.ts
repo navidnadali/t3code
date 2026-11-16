@@ -737,6 +737,8 @@ export const OrchestrationV2Run = Schema.Struct({
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
   queueHeld: Schema.optional(Schema.Boolean),
   steerWhenReadyRunId: Schema.optional(RunId),
+  /** Re-sends a steer the provider did not take into this run. */
+  steerFollowUpOfRunId: Schema.optional(RunId),
   requestedAt: Schema.DateTimeUtc,
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
@@ -1419,7 +1421,18 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
     Schema.Struct({
       parentRunId: RunId,
       generation: PositiveInt,
+      /** Every task the wake carries, the merged parent runs' included. */
       taskIds: Schema.Array(NodeId),
+      /** Other parent runs' results this one wake also delivers, each its cohort's delivery. */
+      merged: Schema.optional(
+        Schema.Array(
+          Schema.Struct({
+            parentRunId: RunId,
+            generation: PositiveInt,
+            taskIds: Schema.Array(NodeId),
+          }),
+        ),
+      ),
     }),
   ),
 });
@@ -1726,6 +1739,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
     workflowScript: OrchestrationV2ConversationMessage.fields.workflowScript,
     freshContext: OrchestrationV2Run.fields.freshContext,
     inputIntent: OrchestrationV2UserMessageInputIntent,
+    /** The server steered it in on its own (automatic Send now), not a user or agent. */
+    automaticDelivery: Schema.optional(Schema.Literal(true)),
     text: Schema.String,
     /** Same as the text of message `messageId`. */
     textOmitted: DedupedBodyMarker,
@@ -2164,6 +2179,36 @@ export const OrchestrationV2ThreadProjection = Schema.Struct({
   updatedAt: Schema.DateTimeUtc,
 });
 export type OrchestrationV2ThreadProjection = typeof OrchestrationV2ThreadProjection.Type;
+
+const ACTIVE_RUN_STATUSES: ReadonlySet<OrchestrationV2RunStatus> = new Set([
+  "preparing",
+  "starting",
+  "running",
+  "waiting",
+]);
+
+/**
+ * The run only its checkpoint capture keeps active: the thread's one active run, waiting with its
+ * turn over and nothing asked of the user. Visible input may end that wait instead of queueing
+ * behind the capture, which still runs first in the thread's effect order.
+ */
+export function waitEndableRun(
+  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "providerTurns" | "runtimeRequests">,
+): OrchestrationV2Run | undefined {
+  const active = projection.runs.filter((run) => ACTIVE_RUN_STATUSES.has(run.status));
+  const run = active[0];
+  if (active.length !== 1 || run?.status !== "waiting") return undefined;
+  const turn = latestProviderTurnForAttempt(
+    projection.providerTurns.filter((candidate) => candidate.nodeId === run.rootNodeId),
+    run.activeAttemptId,
+  );
+  return turn !== undefined &&
+    turn.status !== "pending" &&
+    turn.status !== "running" &&
+    !projection.runtimeRequests.some((request) => request.status === "pending")
+    ? run
+    : undefined;
+}
 
 export const OrchestrationV2ThreadTranscript = Schema.Struct({
   threadId: ThreadId,
@@ -2616,6 +2661,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     workflowScript: OrchestrationV2ConversationMessage.fields.workflowScript,
     freshContext: OrchestrationV2Run.fields.freshContext,
     inputIntent: OrchestrationV2UserMessageInputIntent,
+    automaticDelivery: Schema.optional(Schema.Literal(true)),
     text: Schema.String,
     context: Schema.optional(OrchestrationMessageContext),
     attachments: Schema.Array(ChatAttachment),
@@ -3456,6 +3502,8 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     queuedRunId: RunId,
     targetRunId: RunId,
+    /** Further queued runs that join the same steer, in this order (automatic Send now). */
+    mergedQueuedRunIds: Schema.optional(Schema.Array(RunId)),
   }),
   Schema.Struct({
     type: Schema.Literal("queue.resume"),

@@ -9,6 +9,7 @@ import {
   type OrchestrationV2ServerCommand,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -637,6 +638,153 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         ]);
       }).pipe(Effect.provide(dependencies));
     }),
+  );
+
+  // GitManager keeps a lookup's answer (a missing pull request for 5 minutes); a shared refresh
+  // settles for one that started within 30 s. The parent's turn end looked the branch up a minute
+  // before the pull request was opened; its subagent, finishing in the same checkout, must see it.
+  it.effect(
+    "a subagent finishing in its parent's checkout discovers a pull request opened since",
+    () =>
+      Effect.gen(function* () {
+        const parent = {
+          ...threadShell("busy-parent"),
+          branch: "feature/shared",
+          worktreePath: "/workspace/shared",
+        };
+        const child: OrchestrationV2ThreadShell = {
+          ...threadShell("finishing-child"),
+          branch: parent.branch,
+          worktreePath: parent.worktreePath,
+          lineage: {
+            rootThreadId: parent.id,
+            parentThreadId: parent.id,
+            relationshipToParent: "subagent",
+          },
+        };
+        const project: OrchestrationProjectShell = {
+          id: parent.projectId,
+          title: "Project",
+          workspaceRoot: "/workspace/project",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-08-01T00:00:00.000Z",
+          updatedAt: "2026-08-01T00:00:00.000Z",
+        };
+        const opened = {
+          number: 7,
+          url: "https://github.com/acme/project/pull/7",
+          title: "Shared work",
+          baseRef: "main",
+          headRef: parent.branch,
+          state: "open" as const,
+          updatedAt: "2026-09-20T00:01:00.000Z",
+          closedAt: null,
+          mergedAt: null,
+          repositoryKey: "github.com/acme/project",
+        };
+        let hosted: typeof opened | null = null;
+        let cached: { readonly answer: typeof opened | null; readonly startedAtMs: number } | null =
+          null;
+        const activation = yield* Deferred.make<void>();
+        const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
+        const lookups = yield* Queue.unbounded<string>();
+        const commands: Array<OrchestrationV2ServerCommand> = [];
+        const dependencies = Layer.mergeAll(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadShell: (threadId) => Effect.succeed(threadId === parent.id ? parent : child),
+            streamDomainEvents: Stream.fromQueue(domainEvents),
+            getPullRequestSnapshot: ({ threadId }) =>
+              Effect.succeed({
+                snapshotSequence: 1,
+                threads: [parent, child].filter((thread) => thread.id === threadId),
+              }),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command);
+                return { sequence: 2, storedEvents: [] };
+              }),
+          }),
+          Layer.mock(ProjectStore.ProjectStoreV2)({
+            listShells: () => Effect.succeed([project]),
+            getShell: () => Effect.succeedSome(project),
+          }),
+          Layer.mock(GitManager.GitManager)({
+            branchPullRequest: (_input, options) =>
+              Effect.gen(function* () {
+                const nowMs = yield* Clock.currentTimeMillis;
+                const refresh = options?.refresh ?? false;
+                const ageMs = cached === null ? Infinity : nowMs - cached.startedAtMs;
+                if (
+                  refresh === true ||
+                  (refresh === "shared" && ageMs >= 30_000) ||
+                  (refresh === false && ageMs >= 300_000)
+                ) {
+                  cached = { answer: hosted, startedAtMs: nowMs };
+                }
+                if (options?.freshGitState !== true) yield* Queue.offer(lookups, String(refresh));
+                return cached!.answer;
+              }),
+          }),
+          Layer.mock(PullRequestService.PullRequestService)({
+            notifyLinkedThreadsChanged: Effect.void,
+          }),
+          Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+            resolve: () =>
+              Effect.succeed({
+                canonicalKey: "github.com/acme/project",
+                locator: {
+                  source: "git-remote" as const,
+                  remoteName: "origin",
+                  remoteUrl: "git@github.com:acme/project.git",
+                },
+                provider: SourceControlProviderKind.make("github"),
+                owner: "acme",
+                name: "project",
+              }),
+          }),
+          Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+            shouldRunScopeWork: () => Effect.succeed(false),
+            shouldRunOpportunisticWork: Effect.succeed(false),
+          }),
+          Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
+          Layer.succeed(
+            SecureRandom.SecureRandom,
+            SecureRandom.make((size) => new Uint8Array(size).fill(1)),
+          ),
+          FileSystem.layerNoop({}),
+          Path.layer,
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* ThreadPullRequestService.make;
+          yield* service.start();
+          yield* Deferred.succeed(activation, undefined);
+          yield* service.drain;
+
+          yield* Queue.offer(domainEvents, {
+            type: "checkpoint.captured",
+            threadId: parent.id,
+          } as OrchestrationV2DomainEvent);
+          yield* Queue.take(lookups);
+          yield* service.drain;
+          yield* TestClock.adjust("1 minute");
+          hosted = opened;
+          yield* Queue.offer(domainEvents, {
+            type: "checkpoint.captured",
+            threadId: child.id,
+          } as OrchestrationV2DomainEvent);
+          yield* Queue.take(lookups);
+          yield* service.drain;
+        }).pipe(Effect.provide(dependencies));
+
+        expect(
+          commands.flatMap((command) =>
+            command.type === "thread.pull-request.sync"
+              ? [[command.threadId, command.branchPullRequest?.number ?? null]]
+              : [],
+          ),
+        ).toEqual([[child.id, opened.number]]);
+      }),
   );
 
   it.effect.each([

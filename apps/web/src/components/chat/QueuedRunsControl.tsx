@@ -110,11 +110,11 @@ export function QueuedRunsControl({
   const workflow = projection ? deriveThreadQueueWorkflowState(projection) : null;
   const queued = workflow?.queuedRuns ?? [];
   const activeRun = workflow?.activeRun ?? null;
-  // A fresh message starts its own turn: it may skip compaction, but not steer into a turn.
+  // A fresh message starts its own turn: it may skip compaction or end a wait, not steer a turn.
   const canSendRun = (freshContext: boolean) =>
     workflow?.canSendNow === true ||
     (workflow?.canPromoteToSteer === true &&
-      (!freshContext || workflow.promoteSkipsCompaction === true));
+      (!freshContext || workflow.promoteSkipsCompaction || workflow.promoteEndsWait));
   const queuedImageUrlById = new Map(
     queuedImageAttachmentUrls.flatMap((url, index) => {
       const resource = queuedImageAttachmentResources[index];
@@ -285,7 +285,7 @@ export function QueuedRunsControl({
                         </Button>
                       </TooltipTrigger>
                       <TooltipPopup>
-                        {`${workflow?.canSendNow ? "Start a turn with this message" : workflow?.promoteSkipsCompaction ? "Skip compaction and send this message" : "Send into the current turn"}${item.serverIndex === 0 && props.steerShortcutLabel ? ` (${props.steerShortcutLabel})` : ""}`}
+                        {`${workflow?.canSendNow || workflow?.promoteEndsWait ? "Start a turn with this message" : workflow?.promoteSkipsCompaction ? "Skip compaction and send this message" : "Send into the current turn"}${item.serverIndex === 0 && props.steerShortcutLabel ? ` (${props.steerShortcutLabel})` : ""}`}
                       </TooltipPopup>
                     </Tooltip>
                   </>

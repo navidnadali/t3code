@@ -28,6 +28,7 @@ import * as Fiber from "effect/Fiber";
 import * as HttpServer from "effect/http/HttpServer";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -156,6 +157,9 @@ const makeLaptopWith = (
         Layer.succeed(ProviderContinuationRequests.ProviderContinuationRequests, {
           offer: () => Effect.void,
           take: Effect.never,
+          settle: () => Effect.void,
+          progress: () => Effect.succeed({ pending: 0, settles: 0 }),
+          awaitSettle: () => Effect.void,
         }),
       ),
     );
@@ -776,6 +780,39 @@ it.live("a card shows up only while its run is going, and takes an answer after"
       expect(String(late.cause)).toContain("not active");
       yield* a.requests.answer({ threadId, turnItemId: card.id, answer: { type: "decline" } });
       expect(yield* cardOf(a)).toMatchObject({ linkStatus: "declined" });
+    }),
+  ),
+);
+
+it.live("a request after the run ended is refused and logged at Warn with ids only", () =>
+  withBoth((a, b) =>
+    Effect.gen(function* () {
+      yield* seedThread(a);
+      yield* endRun(a);
+      const lines: Array<unknown> = [];
+      const logger = Logger.make(({ message, logLevel }) => {
+        if (
+          logLevel === "Warn" &&
+          Array.isArray(message) &&
+          message[0] === "orchestrator-mcp.caller-not-active"
+        ) {
+          lines.push(message[1]);
+        }
+      });
+      const refused = yield* a.requests
+        .request(scope, { url: b.url })
+        .pipe(Effect.flip, Effect.provide(Logger.layer([logger], { mergeWithExisting: true })));
+      expect(refused.code).toBe("parent_not_active");
+      expect(lines).toEqual([
+        {
+          operation: "t3_environment_link",
+          threadId,
+          providerInstanceId: instanceId,
+          threadProviderInstanceId: instanceId,
+          activeRunId: null,
+          archived: false,
+        },
+      ]);
     }),
   ),
 );

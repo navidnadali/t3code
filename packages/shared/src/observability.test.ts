@@ -151,6 +151,7 @@ describe("observability", () => {
         for (const sampled of [true, false]) {
           const delegates: Array<Tracer.Span> = [];
           const records: Array<EffectTraceRecord> = [];
+          const ended: Array<string> = [];
           const tracer = yield* makeLocalFileTracer({
             filePath: "unused",
             maxBytes: 1024,
@@ -172,6 +173,7 @@ describe("observability", () => {
                 return span;
               },
             }),
+            onSpanEnd: (name) => ended.push(name),
           });
           const payload = { turnItems: [{ output: [{ text: "synthetic-result" }] }] };
           let span: Tracer.Span | undefined;
@@ -194,6 +196,7 @@ describe("observability", () => {
             records.map((record) => record.exit),
             sampled ? [{ _tag: "Success" }] : [],
           );
+          assert.deepStrictEqual(ended, ["read-thread-projection"]);
         }
       }).pipe(Effect.provide(NodeServices.layer)),
   );
@@ -203,6 +206,7 @@ describe("observability", () => {
     () =>
       Effect.gen(function* () {
         const written: Array<TraceRecord> = [];
+        const ended: Array<readonly [string, bigint]> = [];
         const sink: TraceSink = {
           filePath: "unused",
           push: (record) => {
@@ -220,6 +224,7 @@ describe("observability", () => {
             batchWindowMs: 10_000,
             sink,
             sqlMinDurationMs,
+            onSpanEnd: (name, startTime, endTime) => ended.push([name, endTime - startTime]),
           });
         const nanos = (ms: number) => BigInt(Math.round(ms * 1_000_000));
         const runSpan = (
@@ -279,6 +284,18 @@ describe("observability", () => {
               { name: "sqlite", durationMs: 0.5, exit: "Success" },
               { name: "sql.transaction", durationMs: 0.5, exit: "Success" },
               { name: "ProjectionStore.getThreadShell", durationMs: 0.25, exit: "Success" },
+            ]);
+            // Every span reaches the hook, including the ones only counted.
+            assert.deepStrictEqual(ended.splice(0), [
+              ["sqlite", nanos(0.5)],
+              ["sqlite", nanos(1.5)],
+              ["sql.transaction", nanos(1)],
+              ["sqlite", nanos(2)],
+              ["sqlite", nanos(0.5)],
+              ["sqlite", nanos(0.5)],
+              ["sqlite", nanos(0.5)],
+              ["sql.transaction", nanos(0.5)],
+              ["ProjectionStore.getThreadShell", nanos(0.25)],
             ]);
 
             yield* TestClock.adjust("1 minute");

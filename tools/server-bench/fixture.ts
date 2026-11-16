@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off - a host CLI entry: it installs the module resolve hook.
+import "../../packages/shared/src/testing/gitEnv.ts";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";

@@ -384,9 +384,10 @@ function alignDeltas(frames, pattern) {
 /**
  * Compiles a prompted turn and its wake turns into line templates. Recorded ids become slots:
  * the session id, the prompt the result echoes and the recorded cwd take live values, ids seen
- * only in the loop body change on every loop, and the rest change once per play.
+ * only in the loop body change on every loop, and the rest change once per play (`sharedIds`,
+ * the ones other prompts of the transcript use too, once per cycle of its prompts).
  */
-export function compileGroup(group) {
+export function compileGroup(group, sharedIds = new Set()) {
   const frames = group.frames;
   const wakes = group.wakes;
   const all = [...frames, ...wakes.flat()];
@@ -459,13 +460,19 @@ export function compileGroup(group) {
     return align(turn).map((frame) => compile(frame, false, turnStreamed));
   });
   const idSlots = ids.map((id) => slots.get(id)).filter((slot) => slot >= FIRST_ID);
+  const originals = ["", "", "", "", "", ...ids];
+  const looped = (slot) =>
+    inBody.has(slot) && !outsideBody.has(slot) && !sharedIds.has(originals[slot]);
   return {
     prefix: compiled.slice(0, bodyStart),
     body: compiled.slice(bodyStart, resultIndex),
     suffix: [...compiled.slice(resultIndex), ...compiledWakes],
-    originals: ["", "", "", "", "", ...ids],
-    loopSlots: idSlots.filter((slot) => inBody.has(slot) && !outsideBody.has(slot)),
-    playSlots: idSlots.filter((slot) => !inBody.has(slot) || outsideBody.has(slot)),
+    originals,
+    loopSlots: idSlots.filter(looped),
+    playSlots: idSlots.filter((slot) => !looped(slot)),
+    // A body that starts work its result or another prompt refers to (a background task) plays
+    // once: a second copy would start the same task again.
+    maxLoops: idSlots.every((slot) => !inBody.has(slot) || looped(slot)) ? Infinity : 1,
     recordedModel: typeof init?.model === "string" ? init.model : "claude-sonnet-4-6",
     // A steer or interrupt ended the recorded turn here.
     cut: result.terminal_reason === "aborted_streaming",
@@ -504,11 +511,26 @@ function render(frame, values) {
   return line;
 }
 
+/** Compiles a transcript's prompted turns, each knowing the ids the others share. */
+export function compileTranscript(groups) {
+  const alone = groups.map((group) => compileGroup(group));
+  const seen = new Map();
+  for (const compiled of alone) {
+    for (const slot of [...compiled.loopSlots, ...compiled.playSlots]) {
+      const id = compiled.originals[slot];
+      seen.set(id, (seen.get(id) ?? 0) + 1);
+    }
+  }
+  const shared = new Set([...seen].filter(([, count]) => count > 1).map(([id]) => id));
+  return shared.size === 0 ? alone : groups.map((group) => compileGroup(group, shared));
+}
+
 /**
- * The lines one prompt plays: prefix, the body `loops` times, then the result and wake turns.
- * `live` is read at every loop, so set_model and set_permission_mode apply mid-turn.
+ * The lines one prompt plays: prefix, the body `loops` times (at most `maxLoops`), then
+ * the result and wake turns. `live` is read at every loop, so set_model and set_permission_mode
+ * apply mid-turn. `cycleIds` keeps an id the transcript's prompts share alike through a cycle.
  */
-export function* turnLines(compiled, live, loops) {
+export function* turnLines(compiled, live, loops, cycleIds = new Map()) {
   const values = [...compiled.originals];
   values[SESSION] = jsonText(live.sessionId);
   values[PROMPT] = jsonText(live.promptUuid ?? NodeCrypto.randomUUID());
@@ -518,10 +540,15 @@ export function* turnLines(compiled, live, loops) {
     values[PERMISSION_MODE] = jsonText(live.permissionMode);
   };
   refreshLive();
-  for (const slot of compiled.playSlots) values[slot] = freshId(compiled.originals[slot]);
+  for (const slot of compiled.playSlots) {
+    const original = compiled.originals[slot];
+    if (!cycleIds.has(original)) cycleIds.set(original, freshId(original));
+    values[slot] = cycleIds.get(original);
+  }
   for (const frame of compiled.prefix) yield { frame, line: render(frame, values) };
   const faultIndex = Math.floor(compiled.body.length / 2);
-  for (let loop = 0; loop < (compiled.body.length === 0 ? 0 : loops); loop++) {
+  const plays = compiled.body.length === 0 ? 0 : Math.min(loops, compiled.maxLoops);
+  for (let loop = 0; loop < plays; loop++) {
     refreshLive();
     for (const slot of compiled.loopSlots) values[slot] = freshId(compiled.originals[slot]);
     for (let index = 0; index < compiled.body.length; index++) {
@@ -730,7 +757,7 @@ export async function loadMix(config) {
     });
     const groups = splitTurns(entries);
     if (groups.length === 0) throw new Error(`Transcript ${name} has no completed turn.`);
-    transcripts.set(name, groups.map(compileGroup));
+    transcripts.set(name, compileTranscript(groups));
   }
   return transcripts;
 }
@@ -779,6 +806,7 @@ async function runStream(flags, config) {
   const mix = Object.fromEntries(config.mix.map(({ name, weight }) => [name, weight]));
   let assignment;
   let played = 0;
+  let cycleIds = new Map();
   let active;
   let draining = false;
   let faultPending = config.fault !== undefined;
@@ -813,14 +841,16 @@ async function runStream(flags, config) {
     }
     const groups = transcripts.get(assignment.transcript);
     const turn = played++ % groups.length;
+    if (turn === 0) cycleIds = new Map();
     const compiled = groups[turn];
+    const loops = Math.min(config.turnLoops, compiled.maxLoops);
     // The frames recorded before the cut play whenever the live steer comes, then the turn
     // waits there for it, so the replay ends where the recording did.
     const holdCut = config.holdCutTurns && compiled.cut;
     const frames = {};
     let bytes = 0;
     let unpaced = 0;
-    for (const { frame, line, faultPoint } of turnLines(compiled, live, config.turnLoops)) {
+    for (const { frame, line, faultPoint } of turnLines(compiled, live, loops, cycleIds)) {
       if (holdCut && frame === compiled.suffix[0]) {
         await abortedBy(controller.signal);
         break;
@@ -851,7 +881,7 @@ async function runStream(flags, config) {
       ordinal: assignment.ordinal,
       seed: config.seed,
       mix,
-      loops: config.turnLoops,
+      loops,
       aborted,
       frames,
       bytes,

@@ -2,6 +2,7 @@ import type {
   OrchestrationV2ThreadProjection,
   OrchestrationV2ThreadStreamItem,
 } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 
 import { omitLocalVisibleTurnItems } from "@t3tools/shared/orchestrationV2BoundedSnapshot";
 import { dedupeSnapshotBodies } from "@t3tools/shared/orchestrationV2DedupedBodies";
@@ -21,6 +22,15 @@ export const THREAD_RESUME_MAX_REPLAY_ENCODED_BYTES = 1_048_576;
 
 /** Decoded objects and temporary strings exceed stored JSON size, even before wire slimming. */
 export const THREAD_RESUME_MAX_RAW_PAYLOAD_BYTES = 1_048_576;
+
+/**
+ * A full snapshot goes out as one socket frame, made by one JSON.stringify on the event loop
+ * (~2^29 characters, V8's limit, took 9.7 s on the repro bench). This keeps that well under 1 s.
+ */
+export const ThreadFullSnapshotMaxJsonLength = Context.Reference<number>(
+  "t3/orchestration-v2/ThreadFullSnapshotMaxJsonLength",
+  { defaultValue: () => 32 * 1024 * 1024 },
+);
 
 export function isThreadReplayRawPayloadSafe(rawPayloadBytes: number): boolean {
   return rawPayloadBytes <= THREAD_RESUME_MAX_RAW_PAYLOAD_BYTES;

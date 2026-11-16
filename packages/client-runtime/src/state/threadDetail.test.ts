@@ -6,6 +6,7 @@ import {
   EventId,
   MessageId,
   NodeId,
+  RunAttemptId,
   RunId,
   TurnItemId,
   type OrchestrationV2Checkpoint,
@@ -443,6 +444,78 @@ describe("derived thread state through a streamed message", () => {
     });
     expect(thread.checkpoints().map((summary) => summary.checkpointTurnCount)).toEqual([1, 2]);
   });
+});
+
+it("follows a waiting run's open requests and Stop request for Send now", () => {
+  const ref = { environmentId: EnvironmentId.make("environment-1"), threadId: v2ThreadId };
+  const nodeId = NodeId.make("node-waiting");
+  const attemptId = RunAttemptId.make("attempt-waiting");
+  const waiting: OrchestrationV2Run = {
+    id: RunId.make("run-1"),
+    threadId: v2ThreadId,
+    ordinal: 1,
+    providerInstanceId: v2Projection.thread.providerInstanceId,
+    modelSelection: v2Projection.thread.modelSelection,
+    providerThreadId: null,
+    userMessageId: MessageId.make("message-1"),
+    rootNodeId: nodeId,
+    activeAttemptId: attemptId,
+    status: "waiting",
+    requestedAt: v2Now,
+    startedAt: v2Now,
+    completedAt: null,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  const queued: OrchestrationV2Run = {
+    ...waiting,
+    id: RunId.make("run-2"),
+    ordinal: 2,
+    userMessageId: MessageId.make("message-2"),
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "queued",
+    startedAt: null,
+  };
+  let projection: OrchestrationV2ThreadProjection = {
+    ...v2Projection,
+    runs: [waiting, queued],
+    providerTurns: [
+      { nodeId, runAttemptId: attemptId, ordinal: 1, status: "completed" },
+    ] as unknown as OrchestrationV2ThreadProjection["providerTurns"],
+  };
+  const stateAtom = Atom.make(
+    AsyncResult.success({ ...EMPTY_ENVIRONMENT_THREAD_STATE, data: Option.some(projection) }),
+  );
+  const queue = createEnvironmentThreadDetailAtoms(() => stateAtom).queueWorkflowAtom(ref);
+  const registry = AtomRegistry.make();
+  using _registry = { [Symbol.dispose]: () => registry.dispose() };
+  registry.mount(queue);
+  const update = (next: Partial<OrchestrationV2ThreadProjection>) => {
+    projection = { ...projection, ...next };
+    registry.set(
+      stateAtom,
+      AsyncResult.success({ ...EMPTY_ENVIRONMENT_THREAD_STATE, data: Option.some(projection) }),
+    );
+    return registry.get(queue)?.promoteEndsWait;
+  };
+
+  expect(registry.get(queue)?.promoteEndsWait).toBe(true);
+  expect(
+    update({
+      runtimeRequests: [
+        { status: "pending" },
+      ] as unknown as OrchestrationV2ThreadProjection["runtimeRequests"],
+    }),
+  ).toBe(false);
+  expect(update({ runtimeRequests: [] })).toBe(true);
+  expect(
+    update({
+      turnItems: [
+        { runId: waiting.id, type: "run_interrupt_request" },
+      ] as unknown as OrchestrationV2ThreadProjection["turnItems"],
+    }),
+  ).toBe(false);
 });
 
 function replaceItem(projection: OrchestrationV2ThreadProjection, item: OrchestrationV2TurnItem) {

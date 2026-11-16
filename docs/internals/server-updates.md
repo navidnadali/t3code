@@ -109,13 +109,31 @@ Restart continuation is an environment-owned preference, on by default. A
 opt-out. The
 [v2 recovery service](../../apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts)
 requires matching durable run, provider thread, session, and native resume identity.
-Queued runs never started, so recovery holds them and continues the run they wait
-behind. A settled run qualifies only when the restart cancels work the agent waits on
+Queued runs never started. Recovery holds them and continues the run they wait behind.
+With restart continuation on, it holds only the ones a person queued, for review: the queue
+does not start while that run's continuation is pending in the outbox, so the continuation
+goes first, and a hold on unattended work would outlive it. A settled run qualifies only when the restart cancels work the agent waits on
 (a subagent, a background task, or a shell or monitor the agent marked with
 `t3_background_wait`) and its session was live, so stale records from an older crash
 never wake it. Its continuation prompt is the note of what will not report back. An
 unmarked shell or monitor does not wake a settled run: most are dev servers and their
 watchdogs that nobody waits on, so that note waits for the next user message.
+
+A delegated seat (a `delegate_task` child) is the exception: its parent reaches it through such a
+waiter, and the restart killed it. Its settled run is continued with the note when its parent
+still waits on its task, or when the run ended within the last 4 hours, the idle pin's bound: a
+seat idle longer would have lost its session, and the waiter with it, anyway. The note leaves the
+task's outcome alone: the task settles from the completed run, and the note's turn stays on the
+seat's thread. Seat wakes are due at once, like other continuations; the admission gate bounds how
+many turn starts run together.
+
+A run is marked running before its provider accepts the prompt, so recovery treats a run
+without a provider turn as never started. A user's prompt the provider never received
+joins the held queue. With restart continuation on, a delegated, agent-sent, or scheduled
+prompt has nobody to review it, so recovery starts it again under the same run. The resend
+skips every thread and Stop that a continuation skips, and gives up after three tries so a
+start that crashes the server cannot loop. A crash after the provider received the prompt
+but before its turn was recorded can repeat that prompt.
 
 Recovery retires effects tied to the lost process and records continuation intent
 in the durable outbox. That intent survives another restart before provider startup.

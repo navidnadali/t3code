@@ -1,12 +1,15 @@
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- A synchronous digest inside the pure provider mapping.
 import * as NodeCrypto from "node:crypto";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
+import * as NodeHttpServerRequest from "@effect/platform-node/NodeHttpServerRequest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as PeerLinkRequests from "./peer/PeerLinkRequests.ts";
 import * as PeerLinks from "./peer/PeerLinks.ts";
 
+import type * as Arr from "effect/Array";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Base64 from "effect/encoding/Base64";
@@ -156,9 +159,11 @@ import {
   buildBoundedThreadStreamSnapshot,
   decideThreadResume,
   isThreadReplayRawPayloadSafe,
+  ThreadFullSnapshotMaxJsonLength,
   threadReplayEncodedBytes,
   THREAD_RESUME_MAX_REPLAY_EVENTS,
 } from "./orchestration-v2/ThreadStream.ts";
+import { jsonLongerThan } from "./orchestration-v2/threadSnapshotBody.ts";
 import {
   buildBoundedThreadProjection,
   THREAD_HISTORY_PAGE_POLICY,
@@ -1538,18 +1543,42 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   },
 );
 
+// A full snapshot is one frame, which RpcServer makes with one JSON.stringify: a long one stalls
+// the event loop, and past V8's string limit the client's every request on the socket dies with
+// the Defect. Measure it in parts instead, and refuse a long one as this request's error.
+const refuseOversizedFullSnapshots = (threadId: ThreadId) =>
+  Effect.fnUntraced(function* (items: Arr.NonEmptyReadonlyArray<unknown>) {
+    const maxJsonLength = yield* ThreadFullSnapshotMaxJsonLength;
+    for (const item of items) {
+      if (
+        (item as { readonly kind?: unknown }).kind === "snapshot" &&
+        (yield* jsonLongerThan(item, maxJsonLength))
+      ) {
+        return yield* new OrchestrationV2GetThreadProjectionError({
+          threadId,
+          message: `Thread ${threadId} is too large to send as one snapshot; subscribe with acceptBoundedSnapshot.`,
+        });
+      }
+    }
+    return items;
+  });
+
 /** The stream handlers as `layerWsRpc` registers them: each item encoded once, shared across clients. */
 export const subscribeShellRpcHandler = (
   input: Parameters<typeof subscribeOrchestrationV2Shell>[0],
 ) => Stream.unwrap(subscribeOrchestrationV2Shell(input)).pipe(Stream.map(encodeShellStreamItem));
 export const subscribeThreadRpcHandler = (
   input: Parameters<typeof subscribeOrchestrationV2Thread>[0],
-) =>
-  Stream.unwrap(
+) => {
+  const items = Stream.unwrap(
     Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
       Effect.andThen(subscribeOrchestrationV2Thread(input)),
     ),
   ).pipe(Stream.map(encodeThreadStreamItem));
+  return shouldUseBoundedThreadSnapshot(input)
+    ? items
+    : items.pipe(Stream.mapArrayEffect(refuseOversizedFullSnapshots(input.threadId)));
+};
 
 export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
@@ -1744,31 +1773,36 @@ export const layerWsRpc = (
         const sessions = yield* Effect.forEach(
           listed.sessions,
           (session) => {
-            const threadId = AcpRegistrySessions.importedThreadId({
+            const idInput = {
               driver: instance.driverKind,
               instanceId: input.instanceId,
               sessionId: session.sessionId,
-            });
-            return threadManagement.getThreadShell(threadId).pipe(
-              Effect.map((thread) => ({
-                ...session,
-                importedThreadId: thread === null ? null : threadId,
-                ...(thread !== null &&
-                AgentSessionImporter.isNativeHistoryPending({
-                  historyOrigin: thread.historyOrigin,
-                  hasRun: thread.latestRunId !== null,
-                })
-                  ? { nativeHistoryPending: true }
-                  : {}),
-              })),
-              Effect.mapError(
-                (cause) =>
-                  new AcpRegistryOperationError({
-                    reason: "session_import_failed",
-                    message: "Could not inspect existing imported ACP sessions.",
-                    cause,
-                  }),
-              ),
+            };
+            return acpRegistrySessions.findOwner(idInput).pipe(
+              Effect.flatMap((owner) => {
+                const threadId = owner ?? AcpRegistrySessions.importedThreadId(idInput);
+                return threadManagement.getThreadShell(threadId).pipe(
+                  Effect.map((thread) => ({
+                    ...session,
+                    importedThreadId: thread === null ? null : threadId,
+                    ...(thread !== null &&
+                    AgentSessionImporter.isNativeHistoryPending({
+                      historyOrigin: thread.historyOrigin,
+                      hasRun: thread.latestRunId !== null,
+                    })
+                      ? { nativeHistoryPending: true }
+                      : {}),
+                  })),
+                  Effect.mapError(
+                    (cause) =>
+                      new AcpRegistryOperationError({
+                        reason: "session_import_failed",
+                        message: "Could not inspect existing imported ACP sessions.",
+                        cause,
+                      }),
+                  ),
+                );
+              }),
             );
           },
           { concurrency: 16 },
@@ -1792,11 +1826,14 @@ export const layerWsRpc = (
                 message: "The ACP agent does not advertise session deletion.",
               });
             }
-            const threadId = AcpRegistrySessions.importedThreadId({
+            const idInput = {
               driver: instance.driverKind,
               instanceId: input.instanceId,
               sessionId: input.sessionId,
-            });
+            };
+            const threadId =
+              (yield* acpRegistrySessions.findOwner(idInput)) ??
+              AcpRegistrySessions.importedThreadId(idInput);
             const importedThread = yield* threadManagement.getThreadShell(threadId).pipe(
               Effect.mapError(
                 (cause) =>
@@ -1970,6 +2007,7 @@ export const layerWsRpc = (
           environment,
           auth,
           cwd: config.cwd,
+          hostname: yield* HostProcess.Hostname,
           keybindingsConfigPath: config.keybindingsConfigPath,
           keybindings: keybindingsConfig.keybindings,
           issues: keybindingsConfig.issues,
@@ -3341,7 +3379,8 @@ export const layerWsRpc = (
               ),
             ),
           ),
-        [WS_METHODS.terminalWrite]: (input) => terminalManager.write(input),
+        [WS_METHODS.terminalWrite]: (input, metadata) =>
+          terminalManager.write(input, terminalViewerId(metadata)),
         [WS_METHODS.terminalResize]: (input, metadata) =>
           terminalManager.resize(input, terminalViewerId(metadata)),
         [WS_METHODS.terminalClear]: (input) => terminalManager.clear(input),
@@ -3719,6 +3758,12 @@ export const layer = Layer.unwrap(
             failEnvironmentInternal("internal_error", error),
           ),
         );
+        // Desktop bootstrap sessions connect to their own backend, including same-machine WSL.
+        if (session.subject === "desktop-bootstrap") {
+          delete NodeHttpServerRequest.toIncomingMessage(request).headers[
+            "sec-websocket-extensions"
+          ];
+        }
         const clientAnalyticsProps = readClientAnalyticsProps(request);
         yield* analytics.recordOwners(readClientOwners(request), "client");
         const reportProfiles = yield* serverBrowser.profileReporter;
@@ -3761,8 +3806,8 @@ export const layer = Layer.unwrap(
               Layer.provideMerge(RpcSerialization.layerJson),
               // Handler-context reporters see only request defects, not server-wide defects.
               Layer.provide(DefectReporter.layer),
-              Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provide(AcpRegistrySessions.layer),
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(Layer.succeed(NpmRelease.NpmRelease, npmRelease)),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),

@@ -10,6 +10,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  waitEndableRun,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
@@ -120,7 +121,7 @@ it("resolves automatic message delivery from authoritative provider capabilities
 });
 
 it.each(["preparing", "starting"] as const)(
-  "queues an automatic message while the handoff run is %s",
+  "steers an automatic message into the next turn while the handoff run is %s",
   (status) => {
     const projection = dispatchProjection(baseCapabilities);
     assert.deepEqual(
@@ -129,7 +130,7 @@ it.each(["preparing", "starting"] as const)(
         { type: "start_immediately" },
         "auto",
       ),
-      { type: "queue_after_active" },
+      { type: "steer_active", targetRunId: activeRunId },
     );
   },
 );
@@ -138,18 +139,24 @@ it.each([
   ["has not started", []],
   ["is pending", [{ runAttemptId: activeAttemptId, status: "pending" }]],
   ["has completed", [{ runAttemptId: activeAttemptId, status: "completed" }]],
+  ["has failed", [{ runAttemptId: activeAttemptId, status: "failed" }]],
+  ["was interrupted", [{ runAttemptId: activeAttemptId, status: "interrupted" }]],
+  ["was cancelled", [{ runAttemptId: activeAttemptId, status: "cancelled" }]],
   [
     "belongs to a previous attempt",
     [{ runAttemptId: RunAttemptId.make("previous-attempt"), status: "running" }],
   ],
-])("queues only automatic delivery when the active run's provider turn %s", (_, providerTurns) => {
+])("resolves delivery when the active run's provider turn %s", (label, providerTurns) => {
   const projection = {
     ...dispatchProjection(baseCapabilities),
     providerTurns,
   } as unknown as OrchestrationV2ThreadProjection;
   assert.deepEqual(
     CommandPolicy.resolveMessageDispatchIntent(projection, { type: "start_immediately" }, "auto"),
-    { type: "queue_after_active" },
+    // An ended turn means its run is ending, so the next run takes the message.
+    label === "has not started" || label === "is pending" || label.includes("previous attempt")
+      ? { type: "steer_active", targetRunId: activeRunId }
+      : { type: "queue_after_active" },
   );
   assert.deepEqual(
     CommandPolicy.resolveMessageDispatchIntent(projection, { type: "start_immediately" }, "steer"),
@@ -163,6 +170,100 @@ it.each([
     ),
     { type: "restart_active", targetRunId: activeRunId },
   );
+});
+
+it("steers automatic delivery into a turn gap only where it would steer a live turn", () => {
+  const gap = (
+    sessionCapabilities: OrchestrationV2ProviderCapabilities | undefined,
+    status: "starting" | "waiting" = "starting",
+    text = "first",
+  ) => {
+    const projection = dispatchProjection(baseCapabilities);
+    return {
+      ...projection,
+      runs: projection.runs.map((run) => ({ ...run, status })),
+      messages: [{ id: userMessageId, text, attachments: [] }],
+      providerSessions: projection.providerSessions.flatMap((session) =>
+        sessionCapabilities === undefined
+          ? []
+          : [{ ...session, capabilities: sessionCapabilities }],
+      ),
+      providerTurns: [],
+    } as unknown as OrchestrationV2ThreadProjection;
+  };
+  const restartOnly = capabilities((current) => ({
+    ...current,
+    turns: {
+      ...current.turns,
+      supportsActiveSteering: false,
+      supportsInterrupt: true,
+      supportsSteeringByInterruptRestart: true,
+      supportsQueuedMessages: true,
+    },
+  }));
+  const queueOnly = capabilities((current) => ({
+    ...current,
+    turns: {
+      ...current.turns,
+      supportsActiveSteering: false,
+      supportsSteeringByInterruptRestart: false,
+      supportsQueuedMessages: true,
+    },
+  }));
+  const resolve = (projection: OrchestrationV2ThreadProjection, preferRestartSteering = false) =>
+    CommandPolicy.resolveMessageDispatchIntent(
+      projection,
+      { type: "start_immediately" },
+      "auto",
+      preferRestartSteering,
+    );
+  const steer = { type: "steer_active" as const, targetRunId: activeRunId };
+  const queue = { type: "queue_after_active" as const };
+  // Before its session opens the run has no capabilities; dispatch checks the provider's own.
+  assert.deepEqual(resolve(gap(undefined)), steer);
+  assert.deepEqual(resolve(gap(restartOnly)), queue);
+  assert.deepEqual(resolve(gap(restartOnly), true), steer);
+  assert.deepEqual(resolve(gap(queueOnly), true), queue);
+  assert.deepEqual(resolve(gap(baseCapabilities, "waiting")), queue);
+  assert.deepEqual(resolve(gap(baseCapabilities, "starting", "/compact")), queue);
+});
+
+// regression: #15892 a scheduled prompt cancels the tools running in its bound thread
+it("steers a scheduled prompt into a live turn only where its running tools keep running", () => {
+  const interruptsTools = capabilities((current) => ({
+    ...current,
+    turns: { ...current.turns, supportsActiveSteering: true, activeSteeringInterruptsTools: true },
+  }));
+  const restartOnly = capabilities((current) => ({
+    ...current,
+    turns: {
+      ...current.turns,
+      supportsActiveSteering: false,
+      supportsInterrupt: true,
+      supportsSteeringByInterruptRestart: true,
+      supportsQueuedMessages: true,
+    },
+  }));
+  const resolve = (projection: OrchestrationV2ThreadProjection, scheduledPrompt: boolean) =>
+    CommandPolicy.resolveMessageDispatchIntent(
+      projection,
+      { type: "start_immediately" },
+      "auto",
+      true,
+      scheduledPrompt,
+    );
+  const steer = { type: "steer_active" as const, targetRunId: activeRunId };
+  const queue = { type: "queue_after_active" as const };
+  assert.deepEqual(resolve(dispatchProjection(baseCapabilities), true), steer);
+  assert.deepEqual(resolve(dispatchProjection(interruptsTools), true), queue);
+  assert.deepEqual(resolve(dispatchProjection(restartOnly), true), queue);
+  assert.deepEqual(resolve(dispatchProjection(interruptsTools), false), steer);
+  // The run's next turn has no tools running yet, so a gap still takes it as a deferred steer.
+  const gap = {
+    ...dispatchProjection(interruptsTools),
+    providerTurns: [],
+  } as unknown as OrchestrationV2ThreadProjection;
+  assert.deepEqual(resolve(gap, true), steer);
 });
 
 // regression: #26695 an interrupt-restart steer cancels Copilot's background agents
@@ -265,6 +366,63 @@ it.each(["/compact", " /LOGOUT "])("queues a steer sent while %s runs", (text) =
     ),
     { type: "restart_active", targetRunId: activeRunId },
   );
+});
+
+const waitingRootNodeId = "command-policy-root-node";
+
+function waitingProjection(input: {
+  readonly runStatus?: "waiting" | "running";
+  readonly turnStatus?: "pending" | "running" | "completed" | "interrupted" | null;
+  readonly pendingRequest?: boolean;
+  readonly otherActive?: boolean;
+}): OrchestrationV2ThreadProjection {
+  const turnStatus = input.turnStatus === undefined ? "completed" : input.turnStatus;
+  return {
+    runs: [
+      {
+        id: activeRunId,
+        status: input.runStatus ?? "waiting",
+        rootNodeId: waitingRootNodeId,
+        activeAttemptId,
+        userMessageId,
+      },
+      ...(input.otherActive === true
+        ? [{ id: RunId.make("command-policy-other-run"), status: "starting" }]
+        : []),
+    ],
+    providerTurns:
+      turnStatus === null
+        ? []
+        : [
+            {
+              nodeId: waitingRootNodeId,
+              runAttemptId: activeAttemptId,
+              ordinal: 1,
+              status: "running",
+            },
+            {
+              nodeId: waitingRootNodeId,
+              runAttemptId: activeAttemptId,
+              ordinal: 2,
+              status: turnStatus,
+            },
+          ],
+    runtimeRequests:
+      input.pendingRequest === true ? [{ status: "pending" }] : [{ status: "resolved" }],
+  } as unknown as OrchestrationV2ThreadProjection;
+}
+
+it.each([
+  { when: "its turn is over", input: {}, ends: true },
+  { when: "its turn was interrupted", input: { turnStatus: "interrupted" }, ends: true },
+  { when: "its turn is pending", input: { turnStatus: "pending" }, ends: false },
+  { when: "its turn still runs", input: { turnStatus: "running" }, ends: false },
+  { when: "it has no turn", input: { turnStatus: null }, ends: false },
+  { when: "a request waits on the user", input: { pendingRequest: true }, ends: false },
+  { when: "it is running", input: { runStatus: "running" }, ends: false },
+  { when: "another run is active", input: { otherActive: true }, ends: false },
+] as const)("lets visible input end a waiting run's wait when $when: $ends", ({ input, ends }) => {
+  assert.equal(waitEndableRun(waitingProjection(input))?.id, ends ? activeRunId : undefined);
 });
 
 const layer = it.layer(CommandPolicy.layer);

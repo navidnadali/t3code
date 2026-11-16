@@ -739,12 +739,13 @@ async function runAppServer(config) {
       }
       case "turn/steer": {
         const active = threads.get(String(params.threadId))?.active;
-        if (active === undefined) return fail(id, -32600, "No active turn to steer");
+        // Codex's own refusals, which the adapter reads as input not delivered.
+        if (active === undefined) return fail(id, -32600, "no active turn to steer");
         if (params.expectedTurnId !== active.turnId) {
           return fail(
             id,
             -32600,
-            `Expected turn ${params.expectedTurnId}, active ${active.turnId}`,
+            `expected active turn id \`${params.expectedTurnId}\` but found \`${active.turnId}\``,
           );
         }
         return respond(id, { turnId: active.turnId });

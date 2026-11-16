@@ -221,16 +221,23 @@ export const resolveWorkspacePath = (
 
 // The scope choice runs on the command path, where an asynchronous lookup yields the fiber and lets
 // provider output commit first (an order the product leaves open, which an equivalence test pins);
-// a synchronous realpath does not. Only spellings that were not real paths get here. Missing: lexical.
+// a synchronous realpath does not. Only spellings that were not real paths get here. A missing one
+// is placed as resolveWorkspacePath places it.
 const resolveWorkspaceNow = (path: Path.Path, target: string) =>
   Effect.try({
     try: () => {
-      try {
-        return NodeFS.realpathSync(target);
-      } catch (cause) {
-        const code = (cause as { readonly code?: unknown }).code;
-        if (code === "ENOENT" || code === "ENOTDIR") return path.resolve(target);
-        throw cause;
+      const missing: Array<string> = [];
+      for (let candidate = path.resolve(target); ; candidate = path.dirname(candidate)) {
+        try {
+          return path.join(NodeFS.realpathSync(candidate), ...missing);
+        } catch (cause) {
+          const code = (cause as { readonly code?: unknown }).code;
+          if (code === "ENOTDIR" || (code === "ENOENT" && path.dirname(candidate) === candidate)) {
+            return path.resolve(target);
+          }
+          if (code !== "ENOENT") throw cause;
+          missing.unshift(path.basename(candidate));
+        }
       }
     },
     catch: (cause) => new CheckpointWorkspaceResolveError({ cwd: target, cause }),

@@ -27,6 +27,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -664,6 +665,9 @@ const makeLaptop = (
         Layer.succeed(ProviderContinuationRequests.ProviderContinuationRequests, {
           offer: (request) => SubscriptionRef.update(offers, (seen) => [...seen, request]),
           take: Effect.never,
+          settle: () => Effect.void,
+          progress: () => Effect.succeed({ pending: 0, settles: 0 }),
+          awaitSettle: () => Effect.void,
         }),
       ),
     );
@@ -1304,6 +1308,56 @@ it.effect("refuses worktree isolation for a task there before launching anything
       });
       expect(result.isError).toBe(true);
       expect(JSON.stringify(result.content)).toContain("isolation");
+      expect(yield* Ref.get(thread.launched)).toBeNull();
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("logs a refused task there at Warn with ids only", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const a = yield* makeLaptop(database, offers);
+      yield* linkTo(a.links, b, "auto");
+      yield* seedParent(a);
+      const lines: Array<unknown> = [];
+      const logger = Logger.make(({ message, logLevel }) => {
+        if (
+          logLevel === "Warn" &&
+          Array.isArray(message) &&
+          message[0] === "orchestrator-mcp.caller-not-active"
+        ) {
+          lines.push(message[1]);
+        }
+      });
+      // A credential for another instance than the one the parent's run is on.
+      const otherInstance = {
+        ...parentScope,
+        thread: { ...parentScope.thread!, providerInstanceId: ProviderInstanceId.make("claude") },
+      };
+
+      const refused = yield* a.remote
+        .delegate(otherInstance, {
+          task: "Run the suite on the box.",
+          target: { environmentId: box.environmentId },
+        })
+        .pipe(Effect.flip, Effect.provide(Logger.layer([logger], { mergeWithExisting: true })));
+      expect(refused.code).toBe("parent_not_active");
+      expect(lines).toEqual([
+        {
+          operation: "remote delegate_task",
+          threadId: parentThreadId,
+          providerInstanceId: "claude",
+          threadProviderInstanceId: instanceId,
+          activeRunId: parentRunId,
+          archived: false,
+        },
+      ]);
       expect(yield* Ref.get(thread.launched)).toBeNull();
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),

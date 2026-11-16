@@ -5,6 +5,7 @@
  * then checks each Codex and ACP session against the transcript turns its fake played: frames,
  * server items, replies. A failed, hung or mismatched run also writes provider-check.failed.
  */
+import "../../packages/shared/src/testing/gitEnv.ts";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";

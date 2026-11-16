@@ -1,3 +1,5 @@
+import * as NodeSqlite from "node:sqlite";
+
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -15,6 +17,7 @@ import {
   ProviderTurnId,
   RunAttemptId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
@@ -31,6 +34,9 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
+import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const instanceId = ProviderInstanceId.make("codex");
@@ -53,6 +59,26 @@ const layerTest = Layer.mergeAll(
     { name: "message-dispatch-reads" },
     ProviderAdapterRegistry.layerFromAdapters([adapter]),
     { databaseLayer: layerDatabase, runEffectWorker: false },
+  ),
+);
+
+const runtimeManagement = ProviderReplayHarness.layerWithRegistry(
+  { name: "message-dispatch-reads:management" },
+  ProviderAdapterRegistry.layerFromAdapters([adapter]),
+  { databaseLayer: layerDatabase, runEffectWorker: false },
+);
+const layerManagement = Layer.mergeAll(
+  layerDatabase,
+  ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
+  runtimeManagement,
+  ThreadManagementService.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        runtimeManagement,
+        CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase)),
+        ServerSettings.layerTest({}),
+      ),
+    ),
   ),
 );
 
@@ -628,6 +654,34 @@ const dispatchReads = Effect.fn("dispatchReads")(function* <A, E>(
   return reads;
 });
 
+let stepCopies = 0;
+
+/** The SQLite VM steps of every SELECT a dispatch issues on the thread, replayed once it committed. */
+const dispatchSteps = Effect.fn("dispatchSteps")(function* <A, E>(
+  threadId: ThreadId,
+  dispatch: Effect.Effect<A, E>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const statements: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+  const observe: Statement.Transformer = (statement) => {
+    const [query, params] = statement.compile();
+    if (/^\s*(SELECT|WITH)\b/i.test(query) && params.includes(threadId)) {
+      statements.push([query, params]);
+    }
+    return Effect.succeed(statement);
+  };
+  yield* dispatch.pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+  const copyPath = `file:/message-dispatch-steps-${++stepCopies}?vfs=memdb`;
+  // The memdb copy lives while a connection holds it, so open it before writing it.
+  using copy = new NodeSqlite.DatabaseSync(copyPath);
+  yield* sql`VACUUM INTO ${copyPath}`;
+  return statements.reduce((steps, [query, params]) => {
+    const statement = copy.prepare(query);
+    statement.all(...(params as ReadonlyArray<NodeSqlite.SQLInputValue>));
+    return steps + (statement as unknown as { stat(counter: "vmStep"): number }).stat("vmStep");
+  }, 0);
+});
+
 const assertSameReads = (
   short: ReadonlyArray<{ readonly query: string; readonly rows: number }>,
   long: ReadonlyArray<{ readonly query: string; readonly rows: number }>,
@@ -697,6 +751,525 @@ it.effect("dispatch reads as many rows on a long history as on a short one", () 
     }
     for (const [short, long] of Object.values(reads)) assertSameReads(short!, long!);
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "starting the next queued run reads as many rows on a long history as on a short one",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const reads: Array<Array<{ readonly query: string; readonly rows: number }>> = [];
+      for (const size of [40, 80]) {
+        // The run ahead ended; an agent's message finds the queue waiting and starts it first.
+        const threadId = ThreadId.make(`thread:queue-start-reads:${size}`);
+        yield* seedThread({
+          threadId,
+          runs: history(size, [
+            { shown: true, status: "queued", tasks: 0 },
+            { status: "queued", tasks: 0 },
+          ]),
+        });
+        reads.push(
+          yield* dispatchReads(
+            threadId,
+            orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`queue-start-reads:${size}`),
+              threadId,
+              messageId: MessageId.make(`message:queue-start-reads:${size}`),
+              text: "Also this.",
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "agent",
+              creationSource: "mcp",
+              senderThreadId: ThreadId.make("thread:queue-start-reads:sender"),
+            }),
+          ),
+        );
+        const started = (yield* projections.getThreadProjection(threadId)).runs.find(
+          (run) => run.status === "starting",
+        );
+        assert.equal(started?.userMessageId, `message:${threadId}:${size + 1}`);
+      }
+      assertSameReads(reads[0]!, reads[1]!);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "promoting a queued message to steer reads as many rows on a long history as on a short one",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const reads: Array<Array<{ readonly query: string; readonly rows: number }>> = [];
+      for (const size of [40, 80]) {
+        // The run is starting, so the promoted message steers it once its turn is live.
+        const threadId = ThreadId.make(`thread:promote-reads:${size}`);
+        const seeded = yield* seedThread({
+          threadId,
+          runs: history(size, [
+            { shown: true, status: "starting", tasks: 0 },
+            { shown: true, status: "queued", tasks: 0 },
+            { status: "queued", tasks: 0 },
+          ]),
+        });
+        const [target, queued] = seeded.runs.slice(-3);
+        reads.push(
+          yield* dispatchReads(
+            threadId,
+            orchestrator.dispatch({
+              type: "queued-message.promote-to-steer",
+              commandId: CommandId.make(`promote-reads:${size}`),
+              threadId,
+              queuedRunId: queued!.id,
+              targetRunId: target!.id,
+            }),
+          ),
+        );
+        const promoted = (yield* projections.getThreadProjection(threadId)).runs.find(
+          (run) => run.id === queued!.id,
+        );
+        assert.equal(promoted?.steerWhenReadyRunId, target!.id);
+      }
+      assertSameReads(reads[0]!, reads[1]!);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("sending to another thread reads as many rows on a long history as on a short one", () =>
+  Effect.gen(function* () {
+    const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    const reads: Array<Array<{ readonly query: string; readonly rows: number }>> = [];
+    for (const size of [40, 80]) {
+      // An agent's message to a busy thread: its running turn has no live session here, so it queues.
+      const threadId = ThreadId.make(`thread:send-reads:${size}`);
+      yield* seedThread({
+        threadId,
+        runs: history(size, [{ shown: true, status: "running", tasks: 0 }]),
+      });
+      const sent = yield* dispatchReads(
+        threadId,
+        threadManagement.sendToThread({
+          projectId: ProjectId.make(`project:${threadId}`),
+          commandId: CommandId.make(`send-reads:${size}`),
+          threadId,
+          messageId: MessageId.make(`message:send-reads:${size}`),
+          senderThreadId: ThreadId.make("thread:send-reads:sender"),
+          text: "Also check this.",
+          attachments: [],
+          mode: "auto",
+          createdBy: "agent",
+          creationSource: "mcp",
+        }),
+      );
+      reads.push(sent);
+    }
+    assertSameReads(reads[0]!, reads[1]!);
+  }).pipe(Effect.provide(layerManagement)),
+);
+
+it.effect("cancelling a queued run reads as many rows on a long history as on a short one", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const reads = { message: [], wake: [] } as Record<
+      "message" | "wake",
+      Array<Array<{ readonly query: string; readonly rows: number }>>
+    >;
+    for (const size of [40, 80]) {
+      const threadId = ThreadId.make(`thread:cancel-reads:${size}`);
+      const seeded = yield* seedThread({
+        threadId,
+        runs: history(size, [
+          { shown: true, status: "running", tasks: 0 },
+          { shown: true, status: "queued", tasks: 0 },
+        ]),
+      });
+      const [active, queued] = seeded.runs.slice(-2);
+      reads.message.push(
+        yield* dispatchReads(
+          threadId,
+          orchestrator.dispatch({
+            type: "queued-run.cancel",
+            commandId: CommandId.make(`cancel-reads:message:${size}`),
+            threadId,
+            runId: queued!.id,
+          }),
+        ),
+      );
+      // A queued result wake: cancelling it disposes the results it carried.
+      const delivery = yield* openDelivery(threadId, active!);
+      yield* orchestrator.dispatch(delivery.command);
+      const wake = (yield* projections.getThreadProjection(threadId)).runs.find(
+        (run) => run.userMessageId === delivery.command.messageId,
+      );
+      reads.wake.push(
+        yield* dispatchReads(
+          threadId,
+          orchestrator.dispatch({
+            type: "queued-run.cancel",
+            commandId: CommandId.make(`cancel-reads:wake:${size}`),
+            threadId,
+            runId: wake!.id,
+          }),
+        ),
+      );
+      const after = yield* projections.getThreadProjection(threadId);
+      assert.deepEqual(
+        [
+          after.runs.find((run) => run.id === wake!.id)?.status,
+          after.subagents.find((task) => task.id === delivery.taskId)?.completionDelivery?.state,
+        ],
+        ["cancelled", "disposed"],
+      );
+    }
+    for (const [short, long] of Object.values(reads)) assertSameReads(short!, long!);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("checking a queued question wake reads the child's open requests only", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const reads: Array<Array<{ readonly query: string; readonly rows: number }>> = [];
+    for (const answered of [20, 60]) {
+      // The parent's queue holds a wake for its task's open question; the child answered many.
+      const parentId = ThreadId.make(`thread:question-reads:${answered}`);
+      const childId = ThreadId.make(`thread:question-reads:${answered}:child`);
+      yield* seedThread({
+        threadId: childId,
+        runs: history(2, [{ shown: true, status: "running", tasks: 0 }]),
+      });
+      const child = (yield* projections.getThreadRecords(childId, ["runs"])).runs.at(-1)!;
+      for (let request = 0; request <= answered; request++) {
+        const open = request === answered;
+        yield* projections.apply({
+          id: EventId.make(`event:${childId}:request:${request}`),
+          type: "runtime-request.updated",
+          threadId: childId,
+          runId: child.id,
+          occurredAt: at(5_000),
+          payload: {
+            id: RuntimeRequestId.make(`request:${request}`),
+            nodeId: child.rootNodeId!,
+            providerTurnId: null,
+            nativeRequestRef: null,
+            kind: "user_input",
+            status: open ? "pending" : "resolved",
+            responseCapability: { type: "message" },
+            createdAt: at(5_000),
+            resolvedAt: open ? null : at(5_000),
+          },
+        } as OrchestrationV2DomainEvent);
+      }
+      const seeded = yield* seedThread({
+        threadId: parentId,
+        runs: history(4, [{ shown: true, status: "running", tasks: 0 }]),
+      });
+      const active = seeded.runs.at(-1)!;
+      const taskId = NodeId.make(`node:${parentId}:asking-task`);
+      yield* projections.apply({
+        id: EventId.make(`event:${parentId}:asking-task`),
+        type: "subagent.updated",
+        threadId: parentId,
+        runId: active.id,
+        nodeId: taskId,
+        occurredAt: at(5_000),
+        payload: {
+          id: taskId,
+          threadId: parentId,
+          runId: active.id,
+          parentNodeId: active.rootNodeId!,
+          origin: "app_owned",
+          createdBy: "agent",
+          driver,
+          providerInstanceId: instanceId,
+          providerThreadId: null,
+          childThreadId: childId,
+          nativeTaskRef: null,
+          prompt: "Ask.",
+          title: "Ask",
+          model: null,
+          status: "running",
+          result: null,
+          startedAt: at(5_000),
+          completedAt: null,
+          updatedAt: at(5_000),
+        },
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`question-reads:wake:${answered}`),
+        threadId: parentId,
+        messageId: MessageId.make(
+          `message:delegated-task-question:${parentId}:request:${answered}`,
+        ),
+        text: "The task asks a question.",
+        notification: {
+          source: { kind: "delegated_task", taskIds: [taskId], childThreadId: childId },
+          outcome: "updated",
+          summary: "Question",
+        },
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "server",
+      });
+      yield* projections.apply({
+        id: EventId.make(`event:${parentId}:active-ends`),
+        type: "run.updated",
+        threadId: parentId,
+        runId: active.id,
+        occurredAt: at(6_000),
+        payload: { ...active, status: "completed", completedAt: at(6_000) },
+      });
+      // A send starts the queue first: its question wake is still open, so it starts.
+      reads.push(
+        yield* dispatchReads(
+          childId,
+          orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`question-reads:start:${answered}`),
+            threadId: parentId,
+            messageId: MessageId.make(`message:question-reads:start:${answered}`),
+            text: "Go on.",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "agent",
+            creationSource: "mcp",
+            senderThreadId: ThreadId.make("thread:question-reads:sender"),
+          }),
+        ),
+      );
+      const wake = (yield* projections.getThreadProjection(parentId)).runs.find(
+        (run) =>
+          run.userMessageId === `message:delegated-task-question:${parentId}:request:${answered}`,
+      );
+      assert.equal(wake?.status, "starting");
+    }
+    assertSameReads(reads[0]!, reads[1]!);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a queued message and a promotion take about as many SQL steps on a long history", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sizes = [40, 120] as const;
+    const steps = { queued: [] as Array<number>, promoted: [] as Array<number> };
+    for (const size of sizes) {
+      const threadId = ThreadId.make(`thread:dispatch-steps:${size}`);
+      const seeded = yield* seedThread({
+        threadId,
+        runs: [
+          ...history(size, []).map((run) => ({ ...run, tasks: 0 })),
+          { shown: true, status: "starting", tasks: 0 },
+          { shown: true, status: "queued", tasks: 0 },
+        ],
+      });
+      const [target, queued] = seeded.runs.slice(-2);
+      steps.queued.push(
+        yield* dispatchSteps(
+          threadId,
+          orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`dispatch-steps:queued:${size}`),
+            threadId,
+            messageId: MessageId.make(`message:dispatch-steps:queued:${size}`),
+            text: "Background activity updated",
+            notification: {
+              source: { kind: "background_task" },
+              outcome: "updated",
+              summary: "Background activity updated",
+            },
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "agent",
+            creationSource: "provider",
+          }),
+        ),
+      );
+      steps.promoted.push(
+        yield* dispatchSteps(
+          threadId,
+          orchestrator.dispatch({
+            type: "queued-message.promote-to-steer",
+            commandId: CommandId.make(`dispatch-steps:promoted:${size}`),
+            threadId,
+            queuedRunId: queued!.id,
+            targetRunId: target!.id,
+          }),
+        ),
+      );
+    }
+    // Reading a run's row costs some 100 steps; a check that touches every run costs a few.
+    for (const [command, [short, long]] of Object.entries(steps)) {
+      assert.isAtMost((long! - short!) / (sizes[1] - sizes[0]), 25, `${command}: steps per run`);
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a send reports its message, run and item from one snapshot when Send now lands", () => {
+  const threadId = ThreadId.make("thread:send-snapshot");
+  const messageId = MessageId.make("message:send-snapshot");
+  let promoted = false;
+  // Another client's Send now moves the queued message into the running turn right after the
+  // send's first read of it, as a promotion committing between two reads would.
+  const promote = Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const { runs, messages } = yield* projections.getThreadRecords(threadId, ["runs", "messages"], {
+      runStatuses: ["running", "queued"],
+      messageIds: [messageId],
+    });
+    const active = runs.find((run) => run.status === "running")!;
+    const queued = runs.find((run) => run.userMessageId === messageId)!;
+    const message = messages[0]!;
+    for (const event of [
+      {
+        type: "run.updated",
+        runId: queued.id,
+        payload: { ...queued, status: "cancelled", queuePosition: null, completedAt: at(9_000) },
+      },
+      {
+        type: "message.updated",
+        runId: active.id,
+        payload: { ...message, runId: active.id, nodeId: active.rootNodeId },
+      },
+      {
+        type: "turn-item.updated",
+        runId: active.id,
+        payload: {
+          id: TurnItemId.make("item:send-snapshot"),
+          threadId,
+          runId: active.id,
+          nodeId: active.rootNodeId!,
+          providerThreadId: active.providerThreadId,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 100_000,
+          status: "completed",
+          title: null,
+          startedAt: at(9_000),
+          completedAt: at(9_000),
+          updatedAt: at(9_000),
+          type: "user_message",
+          messageId,
+          inputIntent: "promoted_queued_to_steer",
+          text: message.text,
+          attachments: [],
+          createdBy: "agent",
+          creationSource: "mcp",
+        },
+      },
+    ]) {
+      yield* projections.apply({
+        ...event,
+        id: EventId.make(`event:send-snapshot:${event.type}`),
+        threadId,
+        occurredAt: at(9_000),
+      } as OrchestrationV2DomainEvent);
+    }
+  });
+  const runtime = ProviderReplayHarness.layerWithRegistry(
+    { name: "message-dispatch-reads:send-snapshot" },
+    ProviderAdapterRegistry.layerFromAdapters([adapter]),
+    { databaseLayer: layerDatabase, runEffectWorker: false },
+  );
+  const stores = ProjectionStore.layer.pipe(Layer.provide(layerDatabase));
+  const orchestratorPromotingMidRead = Layer.effect(
+    Orchestrator.OrchestratorV2,
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const context = yield* Effect.context<ProjectionStore.ProjectionStoreV2>();
+      return {
+        ...orchestrator,
+        getThreadRecords: ((id, fields, filter) =>
+          orchestrator.getThreadRecords(id, fields, filter).pipe(
+            Effect.tap(() =>
+              promoted || filter?.messageIds?.includes(messageId) !== true
+                ? Effect.void
+                : Effect.suspend(() => {
+                    promoted = true;
+                    return promote.pipe(Effect.provide(context), Effect.orDie);
+                  }),
+            ),
+          )) as typeof orchestrator.getThreadRecords,
+      };
+    }),
+  ).pipe(Layer.provide(Layer.mergeAll(runtime, stores)));
+  return Effect.gen(function* () {
+    const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    const seeded = yield* seedThread({
+      threadId,
+      runs: history(4, [{ shown: true, status: "running", tasks: 0 }]),
+    });
+    const result = yield* threadManagement.sendToThread({
+      projectId: ProjectId.make(`project:${threadId}`),
+      commandId: CommandId.make("send-snapshot"),
+      threadId,
+      messageId,
+      senderThreadId: ThreadId.make("thread:send-snapshot:sender"),
+      text: "Then this.",
+      attachments: [],
+      mode: "queue",
+      createdBy: "agent",
+      creationSource: "mcp",
+    });
+    assert.isTrue(promoted);
+    // Before the promotion: queued on its own run. After it: steered into the running turn.
+    assert.deepEqual(
+      [result.delivery, result.run.id, result.run.status, result.message.runId],
+      result.delivery === "queued"
+        ? ["queued", result.message.runId, "queued", result.run.id]
+        : ["steered", seeded.runs.at(-1)!.id, "running", seeded.runs.at(-1)!.id],
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        layerDatabase,
+        stores,
+        runtime,
+        ThreadManagementService.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              runtime,
+              CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase)),
+              ServerSettings.layerTest({}),
+              // Last, so management reads through it.
+              orchestratorPromotingMidRead,
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+});
+
+it.effect("waiting for a run reads as many rows on a long history as on a short one", () =>
+  Effect.gen(function* () {
+    const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    const reads = { run: [], latest: [] } as Record<
+      "run" | "latest",
+      Array<Array<{ readonly query: string; readonly rows: number }>>
+    >;
+    for (const size of [40, 80]) {
+      const threadId = ThreadId.make(`thread:wait-reads:${size}`);
+      const seeded = yield* seedThread({ threadId, runs: history(size, []) });
+      const input = {
+        projectId: ProjectId.make(`project:${threadId}`),
+        threadId,
+        timeoutMs: 1,
+      };
+      // A finished run settles at once: the wait reads it and any run continuing it.
+      const byRun = yield* dispatchReads(
+        threadId,
+        threadManagement.waitForThread({ ...input, runId: seeded.runs[size - 3]!.id }),
+      );
+      reads.run.push(byRun);
+      reads.latest.push(yield* dispatchReads(threadId, threadManagement.waitForThread(input)));
+    }
+    for (const [short, long] of Object.values(reads)) assertSameReads(short!, long!);
+  }).pipe(Effect.provide(layerManagement)),
 );
 
 // The runs, tasks and messages a dispatch decides on, on a thread whose history holds many more.

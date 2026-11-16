@@ -26,7 +26,9 @@ bench instance; the fake answers `-p --json-schema` with a minimal schema-valid 
   unknown ones succeed).
 - Each stdin user message plays the session's next recorded turn, then the wake turns recorded
   after it. The session id comes from `--session-id` or `--resume`, the prompt uuid the result
-  echoes is the live prompt's, and every other recorded id is fresh on each play and each loop.
+  echoes is the live prompt's, and every other recorded id is fresh on each play and each loop. An
+  id two recorded prompts share (a background task one starts and a later one stops) keeps one
+  value through each cycle of the transcript's prompts.
 - A prompt sent with `priority: "now"` or an `interrupt` ends the running turn with an
   `error_during_execution` result, as the CLI does.
 - With `BENCH_HOLD_CUT_TURNS=1`, a turn the recording's steer or interrupt cut off (its result's
@@ -51,7 +53,7 @@ the file, and files are not removed).
 | `BENCH_STATE_DIR`           | `$CLAUDE_CONFIG_DIR/fake-claude`, else `<tmpdir>/t3-fake-claude` | Where sessions claim their ordinals.                                                                                                                                                                                                                |
 | `BENCH_SPEED`               | `1`                                                              | Time scale for every wait; `0` never waits.                                                                                                                                                                                                         |
 | `BENCH_DELTAS_PER_SEC`      | `40`                                                             | `stream_event` delta rate at speed 1.                                                                                                                                                                                                               |
-| `BENCH_TURN_LOOPS`          | `1`                                                              | Times a turn's body plays before its result.                                                                                                                                                                                                        |
+| `BENCH_TURN_LOOPS`          | `1`                                                              | Times a turn's body plays before its result; once for a body that starts work its result or a later prompt refers to (a background task), which a second copy would start again. Stats record the loops played.                                     |
 | `BENCH_TOOL_PAYLOAD_BYTES`  | `262144`                                                         | Payload size of the `large-tool-payload` transcript.                                                                                                                                                                                                |
 | `BENCH_STATS_DIR`           | unset                                                            | Append one JSON line per played turn to `<dir>/fake-claude-<pid>.ndjson`.                                                                                                                                                                           |
 | `BENCH_MCP_CREDENTIALS_DIR` | unset                                                            | Write each session's T3 MCP URL and authorization to `<dir>/<session-id>.json` (see above).                                                                                                                                                         |

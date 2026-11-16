@@ -379,6 +379,10 @@
       "types": "./src/HostProcess.ts",
       "import": "./src/HostProcess.ts"
     },
+    "./testing/gitRepositoryEnv": {
+      "types": "./src/testing/gitRepositoryEnv.ts",
+      "import": "./src/testing/gitRepositoryEnv.ts"
+    },
     "./testing/longTempDir": {
       "types": "./src/testing/longTempDir.ts",
       "import": "./src/testing/longTempDir.ts"
@@ -466,6 +470,10 @@
     "./cliRelease": {
       "types": "./src/cliRelease.ts",
       "import": "./src/cliRelease.ts"
+    },
+    "./diffCutLines": {
+      "types": "./src/diffCutLines.ts",
+      "import": "./src/diffCutLines.ts"
     },
     "./gitPatchPath": {
       "types": "./src/gitPatchPath.ts",
@@ -578,6 +586,10 @@
     "./speech": {
       "types": "./src/speech.ts",
       "import": "./src/speech.ts"
+    },
+    "./pinOrderKey": {
+      "types": "./src/pinOrderKey.ts",
+      "import": "./src/pinOrderKey.ts"
     }
   },
   "scripts": {
@@ -595,6 +607,7 @@
     "mdast-util-to-hast": "^13.2.1",
     "micromark-extension-directive": "catalog:",
     "micromark-util-character": "catalog:",
+    "micromark-util-decode-string": "catalog:",
     "property-information": "^7.2.0",
     "rehype-raw": "catalog:",
     "rehype-sanitize": "catalog:",

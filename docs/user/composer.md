@@ -63,7 +63,7 @@ See [images and videos](#images-and-videos-in-messages) for previewing and savin
 ## Send while the agent is working
 
 On web and desktop, choose **Settings → Chat → Follow-up behavior** to queue
-new messages for a later turn or steer the running turn immediately. The setting
+new messages behind the running turn or steer it immediately. The setting
 applies to this client; already queued messages keep their place. Queued messages
 are saved on the server and can be edited or removed before they send.
 When Enter sends, `Cmd+Enter` on macOS or `Ctrl+Enter` on Windows and Linux uses
@@ -72,6 +72,20 @@ default is Steer.
 If your **Send shortcut** requires `Cmd+Enter` or `Ctrl+Enter`, that shortcut uses
 your default follow-up behavior; add **Shift** to use the opposite action. This
 applies only to multiline messages when you choose the multiline send option.
+
+A queued message does not always wait for the turn to end. If the agent is still
+working 60 seconds later, T3 Code steers it into the running turn. Automations and
+messages from other threads are sent the same way. Queued messages go together in
+one steer, at most one a minute: yours first, then automations, then other
+threads'. A message can join such a steer before its 60 seconds are up, so edit or
+remove it right away if you change your mind. On providers like Claude, a steer
+can stop the tools the agent is running. These wait for the turn to end instead:
+
+- messages in a held queue, for example after Stop;
+- messages that start a fresh session;
+- `/goal`, `/compact` and `/logout`;
+- messages the running turn cannot take, such as another model or attachments
+  the provider cannot steer.
 
 Use `Cmd+Shift+Enter` on macOS or `Ctrl+Shift+Enter` on Windows and Linux to send
 the oldest queued message as a steer. This leaves the current draft intact and
@@ -258,6 +272,8 @@ images. **Send now** sends a message right away, into the running turn if there 
 also edit or remove it.
 
 If you stop the agent or the server restarts, queued messages keep their order and are held.
+With **Continue threads after restarts** on, a restart holds only the messages you queued; messages
+from automations, other threads and delegated tasks run once the interrupted turn has continued.
 Press **Resume** in an empty composer to continue. For stopped runs and usage limits,
 this uses the provider's native continuation without sending a new prompt. If the provider
 does not support it, send a message to continue instead. If the original request never reached

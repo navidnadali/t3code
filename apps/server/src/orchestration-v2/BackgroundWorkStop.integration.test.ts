@@ -11,6 +11,7 @@ import {
   ProviderTurnId,
   RunAttemptId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2DomainEvent,
@@ -39,6 +40,7 @@ const stopEarlierBackgroundWork = ({
   wakeAfterStop = false,
   failedStart = false,
   stopWithQueue,
+  sentDuringCheckpoint = false,
   olderStart = false,
   backgroundWorkAfterStop,
   stalledRun,
@@ -48,6 +50,8 @@ const stopEarlierBackgroundWork = ({
   readonly failedStart?: boolean;
   readonly backgroundWorkAfterStop?: "running" | "unknown";
   readonly stopWithQueue?: "thread.stop" | "run.interrupt";
+  /** The latest run waits for its checkpoint when a message is sent; the send starts at once. */
+  readonly sentDuringCheckpoint?: boolean;
   readonly olderStart?: boolean;
   readonly workflowMember?: boolean;
   readonly stalledRun?: "missing-session-terminal" | "returned-interrupt" | "superseded-attempt";
@@ -385,6 +389,79 @@ const stopEarlierBackgroundWork = ({
             },
           ],
         });
+        // Shaped like CodexAdapterV2's buildApprovalRequestArtifacts output.
+        const approvalRequestId = RuntimeRequestId.make("request:stalled-approval");
+        const approvalNodeId = NodeId.make("node:stalled-approval");
+        const approvalItemId = TurnItemId.make("turn-item:stalled-approval");
+        if (stalledRun === "returned-interrupt") {
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("stalled-approval-node"),
+                type: "node.updated",
+                threadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: {
+                  ...node,
+                  id: approvalNodeId,
+                  parentNodeId: node.id,
+                  kind: "approval_request",
+                  status: "waiting",
+                  countsForRun: false,
+                  runtimeRequestId: approvalRequestId,
+                },
+              },
+              {
+                id: EventId.make("stalled-approval-request"),
+                type: "runtime-request.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  id: approvalRequestId,
+                  nodeId: approvalNodeId,
+                  providerTurnId: codexTurn.id,
+                  nativeRequestRef: { driver, nativeId: "approval", strength: "strong" },
+                  kind: "command",
+                  status: "pending",
+                  responseCapability: {
+                    type: "live",
+                    providerSessionId: first.providerThread.providerSessionId!,
+                  },
+                  createdAt: now,
+                  resolvedAt: null,
+                },
+              },
+              {
+                id: EventId.make("stalled-approval-item"),
+                type: "turn-item.updated",
+                threadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: {
+                  id: approvalItemId,
+                  threadId,
+                  runId: run.id,
+                  nodeId: approvalNodeId,
+                  providerThreadId: codexTurn.providerThreadId,
+                  providerTurnId: codexTurn.id,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: 101,
+                  status: "waiting",
+                  title: null,
+                  startedAt: now,
+                  completedAt: null,
+                  updatedAt: now,
+                  type: "approval_request",
+                  requestId: approvalRequestId,
+                  requestKind: "command",
+                  prompt: "rm -rf build",
+                },
+              },
+            ],
+          });
+        }
         if (stalledRun === "superseded-attempt") {
           yield* sink.write({
             events: [
@@ -446,6 +523,16 @@ const stopEarlierBackgroundWork = ({
           interrupted ? 1 : 0,
         );
         assert.isEmpty(after.runs.filter((candidate) => candidate.status === "waiting"));
+        if (stalledRun === "returned-interrupt") {
+          assert.deepEqual(
+            [
+              after.runtimeRequests.find((candidate) => candidate.id === approvalRequestId)?.status,
+              after.nodes.find((candidate) => candidate.id === approvalNodeId)?.status,
+              after.turnItems.find((candidate) => candidate.id === approvalItemId)?.status,
+            ],
+            ["cancelled", "interrupted", "interrupted"],
+          );
+        }
         return;
       }
       const settled = yield* watch(
@@ -877,15 +964,17 @@ const stopEarlierBackgroundWork = ({
         const owner = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
           (run) => run.id === latestRun.runId,
         )!;
+        // Upstream queued the follow-up behind a checkpoint wait; A2 starts a visible message
+        // instead of queueing it there, so queue it behind an active run.
         yield* sink.write({
           events: [
             {
-              id: EventId.make("latest-run-waiting"),
+              id: EventId.make("latest-run-active"),
               type: "run.updated",
               threadId,
               runId: owner.id,
               occurredAt: now,
-              payload: { ...owner, status: "waiting", completedAt: null },
+              payload: { ...owner, status: "running", completedAt: null },
             },
           ],
         });
@@ -924,6 +1013,59 @@ const stopEarlierBackgroundWork = ({
         });
       }
 
+      const followUpMessageId = MessageId.make("message:sent-during-checkpoint");
+      if (sentDuringCheckpoint) {
+        const owner = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+          (run) => run.id === latestRun.runId,
+        )!;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("latest-run-checkpointing"),
+              type: "run.updated",
+              threadId,
+              runId: owner.id,
+              occurredAt: now,
+              payload: { ...owner, status: "waiting", completedAt: null },
+            },
+          ],
+        });
+        const followUpStarting = yield* watch(
+          (event) =>
+            event.type === "run.updated" &&
+            event.payload.userMessageId === followUpMessageId &&
+            event.payload.status === "starting",
+        );
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("send-during-checkpoint"),
+          threadId,
+          messageId: followUpMessageId,
+          text: "Follow up while the checkpoint is taken",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          deliveryIntent: "auto",
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* Fiber.join(followUpStarting);
+        const followUpTurn = yield* watch(
+          (event) =>
+            event.type === "provider-turn.updated" &&
+            event.payload.status === "running" &&
+            event.payload.runAttemptId === started[1]?.attemptId,
+        );
+        yield* worker.drain();
+        assert.lengthOf(started, 2);
+        yield* Fiber.join(followUpTurn);
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.id === latestRun.runId,
+          )?.status,
+          "completed",
+        );
+      }
+
       if (olderStart) {
         const older = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
           (run) => run.id === watcherRun.runId,
@@ -943,7 +1085,7 @@ const stopEarlierBackgroundWork = ({
       }
 
       yield* orchestrator.dispatch(
-        stopWithQueue === "thread.stop"
+        stopWithQueue === "thread.stop" || sentDuringCheckpoint
           ? {
               type: "thread.stop",
               commandId: CommandId.make("stop-background-work"),
@@ -961,16 +1103,33 @@ const stopEarlierBackgroundWork = ({
               ...(stopWithQueue === undefined ? {} : { holdQueue: true }),
             },
       );
-      yield* worker.drain();
+      yield* sentDuringCheckpoint ? drainUnconfirmedStop : worker.drain();
 
+      // A provider thread's work is stopped through its latest turn: the follow-up's, once it runs.
+      const followUp = started[1];
       assert.sameDeepMembers(
         interrupts.map((interrupt) => [interrupt.providerThread.id, interrupt.providerTurnId]),
         [
-          ...(olderStart || failedStart ? [] : [[otherProviderThreadId, latestRun.providerTurnId]]),
+          ...(sentDuringCheckpoint && followUp !== undefined
+            ? [
+                [
+                  followUp.providerThread.id,
+                  ProviderTurnId.make(`provider-turn:${followUp.attemptId}`),
+                ],
+              ]
+            : olderStart || failedStart
+              ? []
+              : [[otherProviderThreadId, latestRun.providerTurnId]]),
           [codexProviderThread.id, reviewerRun.providerTurnId],
         ],
       );
       const after = yield* orchestrator.getThreadProjection(threadId);
+      if (sentDuringCheckpoint) {
+        assert.equal(
+          after.runs.find((run) => run.userMessageId === followUpMessageId)?.status,
+          "interrupted",
+        );
+      }
       if (olderStart) {
         assert.equal(after.runs.find((run) => run.id === watcherRun.runId)?.status, "interrupted");
       }
@@ -1046,6 +1205,12 @@ it.effect("Stop preserves the roster when the background work probe fails", () =
 it.effect.each(["thread.stop", "run.interrupt"] as const)(
   "%s stops background work when a later message is queued",
   (stopType) => stopEarlierBackgroundWork({ stopWithQueue: stopType }),
+);
+
+// With the send ending the checkpoint wait, its turn runs when Stop comes, not a held queue.
+it.effect(
+  "thread.stop after a send ended the wait still reaches the earlier provider thread's background work",
+  () => stopEarlierBackgroundWork({ sentDuringCheckpoint: true }),
 );
 
 it.effect.each(["thread.stop", "run.interrupt"] as const)(

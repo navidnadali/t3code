@@ -39,6 +39,7 @@ import {
 } from "../orchestration-v2/EffectWorker.ts";
 import { PROVIDER_IO_MAX_WORKERS } from "../provider/io/ProviderIoWorkerPool.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
+import { resolveHostCliCommand } from "./invocation.ts";
 
 const modeFlag = Flag.Literals("mode", ServerConfig.RuntimeMode.literals).pipe(
   Flag.withDescription("Runtime mode. `desktop` keeps loopback defaults unless overridden."),
@@ -136,6 +137,7 @@ const EnvServerConfig = Config.all({
     Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: DEFAULT_SLOW_SPAN_THRESHOLD_MS })),
     "T3CODE_TRACE_SQL_MIN_DURATION_MS",
   ).pipe(Config.withDefault(0)),
+  traceSpanMinutes: Config.Boolean("T3CODE_TRACE_SPAN_MINUTES").pipe(Config.withDefault(true)),
   otlpTracesUrl: Config.String("T3CODE_OTLP_TRACES_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -422,8 +424,13 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
       runtime.value.pid !== process.pid &&
       isProcessAlive(runtime.value.pid)
     ) {
+      // Bare `t3 pair` prefers a linked worktree's `.t3`, so always name this home.
+      const { command: pairCommand } = yield* resolveHostCliCommand("pair", [
+        "--base-dir",
+        baseDir,
+      ]);
       return yield* new CliError.UserError({
-        cause: `A T3 Code server is already running for ${baseDir} (pid ${runtime.value.pid}, ${runtime.value.origin}). Connect to that server, stop it before starting another, or use a different --base-dir.`,
+        cause: `A T3 Code server is already running for ${baseDir} (pid ${runtime.value.pid}, ${runtime.value.origin}). To open it, run \`${pairCommand}\` and open the pairing URL it prints. To start another server, stop this one first or use a different --base-dir.`,
       });
     }
   }
@@ -553,6 +560,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     traceMaxBytes: env.traceMaxBytes,
     traceMaxFiles: env.traceMaxFiles,
     ...(env.traceSqlMinDurationMs > 0 ? { traceSqlMinDurationMs: env.traceSqlMinDurationMs } : {}),
+    ...(env.traceSpanMinutes ? {} : { traceSpanMinutes: false }),
     otlpTracesUrl: traces?.url,
     otlpMetricsUrl: metrics?.url,
     otlpLogsUrl: logs?.url,

@@ -14,6 +14,7 @@ import { afterAll, describe, expect, it, onTestFinished, vi } from "vite-plus/te
 import { BUILD_MIGRATION_HEAD } from "../../apps/server/src/persistence/databaseMigrationHead.ts";
 import {
   contentFindings,
+  ContentRewriteError,
   emptyCounts,
   fillText,
   isFiller,
@@ -512,6 +513,86 @@ const seedPendingWork = (path: string) => {
          '$.remoteChild', json_object('environmentId', 'peer-1', 'threadId', 'remote-thread', 'label', 'Peer'))
      WHERE subagent_id = (SELECT MAX(subagent_id) FROM orchestration_v2_projection_subagents WHERE subagent_id <> ?)`,
   ).run(task);
+  // Merged pull request news a boot sends again: a wake that failed before its provider ran, one
+  // rolled back before it, and one still starting that the restart recovery cuts. Each tells two
+  // pull requests' news.
+  const stamp = (number: number) => ({
+    host: "github.com",
+    repository: "bench/fixture",
+    number,
+    watchStartedAt: at,
+    headSha: null,
+  });
+  const notification = JSON.stringify({
+    source: { kind: "monitor", pullRequest: stamp(12), otherPullRequests: [stamp(13)] },
+    outcome: "updated",
+    summary: "Pull request news",
+  });
+  // Dated ahead, so it falls inside the retry window of a boot at any time.
+  const recent = "2099-01-01T00:00:00.000Z";
+  const wakeThreads = (
+    db
+      .prepare(
+        `SELECT DISTINCT r.thread_id AS id FROM orchestration_v2_projection_runs r
+         JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
+         WHERE json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NULL
+           AND t.archived_at IS NULL AND t.deleted_at IS NULL
+           AND r.thread_id NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ORDER BY r.thread_id LIMIT 3`,
+      )
+      .all(
+        running,
+        queued,
+        limited,
+        watched,
+        kept,
+        idle,
+        startable,
+        child.id,
+        child.parent,
+      ) as Array<{
+      id: string;
+    }>
+  ).map((row) => row.id);
+  // Unsettled: a boot sends no pull request news to a settled thread (the watcher's rule).
+  for (const threadId of wakeThreads) {
+    db.prepare(
+      `UPDATE orchestration_v2_projection_threads
+       SET payload_json = json_set(payload_json, '$.settledOverride', NULL, '$.settledAt', NULL)
+       WHERE thread_id = ?`,
+    ).run(threadId!);
+  }
+  for (const [threadId, status] of [
+    [wakeThreads[0], "failed"],
+    [wakeThreads[1], "starting"],
+    [wakeThreads[2], "rolled_back"],
+  ] as const) {
+    const wake = db
+      .prepare(
+        `SELECT run_id AS id, json_extract(payload_json, '$.userMessageId') AS message
+         FROM orchestration_v2_projection_runs WHERE thread_id = ? ORDER BY ordinal DESC LIMIT 1`,
+      )
+      .get(threadId!) as { id: string; message: string };
+    db.prepare(
+      `UPDATE orchestration_v2_projection_messages SET run_id = ?,
+         payload_json = json_set(payload_json, '$.createdBy', 'agent', '$.creationSource', 'server',
+           '$.notification', json(?))
+       WHERE message_id = ?`,
+    ).run(wake.id, notification, wake.message);
+    db.prepare(
+      `UPDATE orchestration_v2_projection_runs SET status = ?, completed_at = ?,
+         payload_json = json_set(payload_json, '$.status', ?, '$.completedAt', ?,
+           '$.startedAt', json('null'), '$.activeAttemptId', ?)
+       WHERE run_id = ?`,
+    ).run(
+      status,
+      status === "starting" ? null : recent,
+      status,
+      status === "starting" ? null : recent,
+      `${wake.id}:attempt-before-provider`,
+      wake.id,
+    );
+  }
   db.close();
   return {
     busy: [running, queued, limited, watched, transcript, startable, child.id, child.parent],
@@ -1585,6 +1666,26 @@ describe("allowlist limits", () => {
     expect(isFiller(nested.pass.id)).toBe(true);
   });
 
+  // JSON.parse lists integer keys first and ascending, while their rewritten keys keep the order
+  // they were written in: keys of one object are compared with each other, not by position.
+  it("rewrites integer keys in any order, and refuses only keys that really collide", () => {
+    // Written out: a JavaScript object literal would list them ascending too.
+    const descending = '{"1":"hello","0":[],"2":{"/k":1}}';
+    const stored = rewriteContent(descending, "payload_json", "blank", emptyCounts());
+    expect(Object.keys(JSON.parse(stored))).toHaveLength(3);
+    const rewritten = Object.keys(
+      JSON.parse(rewriteContent(JSON.stringify({ "/odd key": 1 }), null, "blank", emptyCounts())),
+    )[0]!;
+    expect(() =>
+      rewriteContent(
+        `{${JSON.stringify(rewritten)}:1,"/odd key":2}`,
+        "payload_json",
+        "blank",
+        emptyCounts(),
+      ),
+    ).toThrow(ContentRewriteError);
+  });
+
   // The project timeout (60 s) is the linearity check: a quadratic rule needs minutes on 1 MB here.
   it("runs the extended rules in linear time and walks deep JSON without recursion", () => {
     const rows: Array<string> = [];
@@ -1759,7 +1860,12 @@ describe("server on a fixture", () => {
     expect(count(sanitised.copy, `SELECT COUNT(*) AS n FROM orchestration_v2_effect_outbox`)).toBe(
       0,
     );
+    const noticeRetries = `SELECT COUNT(*) AS n FROM orchestration_v2_projection_messages
+      WHERE message_id LIKE 'message:notice-retry:%'`;
+    expect(count(sanitised.copy, noticeRetries)).toBe(0);
     const unsanitised = await boot(seeded);
     expect(recoveryCounts(unsanitised.log).terminalizedRuns).toBeGreaterThan(0);
+    // The seeded pull request news: the failed, rolled-back and restart-cut wakes, all sent again.
+    expect(count(unsanitised.copy, noticeRetries)).toBe(3);
   });
 });

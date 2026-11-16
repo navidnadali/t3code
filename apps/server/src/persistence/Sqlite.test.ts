@@ -252,25 +252,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("layerCliConfig",
     }).pipe(Effect.scoped, Effect.provide(layerT3Home)),
   );
 
-  // Upstream's chain is current; the fork's chain, which runs after it, still has work.
-  it.effect.each([
-    { work: "a fork migration to run", toPerfForkMigrationInclusive: 1, dropIndex: false },
-    { work: "a fork index to restore", toPerfForkMigrationInclusive: undefined, dropIndex: true },
-  ])(
-    "does not migrate a T3 home a running server owns when only the fork's chain has $work",
-    ({ toPerfForkMigrationInclusive, dropIndex }) =>
+  // Upstream's chain is current; the fork's chain, which runs after it, still has a migration to run.
+  it.effect(
+    "does not migrate a T3 home a running server owns when only the fork's chain has a fork migration to run",
+    () =>
       Effect.gen(function* () {
-        yield* migrateTo({ toPerfForkMigrationInclusive });
-        if (dropIndex) {
-          yield* withDatabase(
-            Effect.gen(function* () {
-              const sql = yield* SqlClient.SqlClient;
-              yield* sql.unsafe(`DROP INDEX ${ORDINAL_INDEX}`);
-            }),
-          );
-        }
+        yield* migrateTo({ toPerfForkMigrationInclusive: 1 });
         const before = yield* perfForkSchema;
-        assert.isFalse(before.index);
+        assert.deepStrictEqual(before, { ledger: [1], index: true });
         yield* ownT3Home();
 
         const opened = yield* Effect.void.pipe(

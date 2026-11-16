@@ -9,8 +9,10 @@ The performance fork runs its own migrations as a separate chain, recorded in
   keep it. Upstream's `085_TurnItemCounts` creates both under the same names, keyed by `run_key`. A
   later fork build drops the fork's in the transaction that runs upstream's 85, which then creates
   and fills its own.
-- 2 `TurnItemMessageOrdinalIndex`: the `orchestration_v2_projection_turn_items_message_ordinal_idx`
-  index.
+- 2 `TurnItemMessageOrdinalIndex`: changes nothing now. In fork builds up to 0.1.9-perf.7 it created
+  the `orchestration_v2_projection_turn_items_message_ordinal_idx` index. Upstream's
+  `094_TurnItemMessageOrdinalIndex` creates the same index (same name, columns and `WHERE`) with
+  `IF NOT EXISTS`: on a database that has the fork's, it records 94 and keeps that index as its own.
 
 The fork's first release candidate recorded them in `effect_sql_migrations` as 77 and 78, ids
 upstream uses for its own migrations. Any later fork build moves those two rows to
@@ -23,11 +25,9 @@ an upstream build that ships 85 stops there with "table orchestration_v2_project
 already exists". Start a fork build that ships 85 first, or remove the fork's schema as below.
 
 Once both are done (rows moved, 85 run), an upstream build starts on the database and runs its own
-migrations. It ignores `t3_perf_fork_migrations` and leaves the fork's index in place, where writes
-keep it current. An upstream migration that rebuilds `orchestration_v2_projection_turn_items` drops
-the index with that table, or leaves it on the old table if it keeps that aside. On its next start
-the fork runs migration 2 again (dropping an index left on the old table) and logs a warning that
-names it. Remove the fork's schema when you go back to an upstream build for good:
+migrations. It ignores `t3_perf_fork_migrations`. A build before 94 keeps the fork's index current
+on every write, and 94 takes it as it is. Remove the fork's schema when you go back to an upstream
+build for good:
 
 1. Stop the server and anything else that opens the database, such as `t3` CLI commands.
 2. Copy `<T3 home>/userdata/statev2.sqlite` with its `-wal` and `-shm` files.
@@ -90,11 +90,14 @@ past 76 recorded, only the backup is safe.
 ## What the scripts do
 
 Each script runs in one transaction and keeps every other row. First it checks the counts table and
-stops, with nothing changed, on the other script's database. Both drop the index and
-`t3_perf_fork_migrations`, and delete only the first release candidate's records of 77 and 78.
+stops, with nothing changed, on the other script's database. Both drop `t3_perf_fork_migrations`
+and delete only the first release candidate's records of 77 and 78. Neither drops the
+message-ordinal index, since it is upstream's 94's too: a build past 94 never creates it again,
+and a build before 94 keeps it current on every write and takes it as its own at 94.
 `perf-fork-schema-exit-before-085.sql` also drops the fork's counts table and its triggers, the
 triggers first, since a turn-item write fails while they outlive the table they write.
 `perf-fork-schema-exit.sql` leaves upstream's counts and triggers. Running either twice, or on a
-database the fork never migrated, changes nothing. Starting the fork again re-applies migration 2.
+database the fork never migrated, changes nothing. Starting the fork again records its migrations
+again.
 After `perf-fork-schema-exit-before-085.sql`, the first build to start that ships upstream's 85,
 upstream's or the fork's, creates the counts again and fills them from the turn items.

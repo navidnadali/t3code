@@ -117,6 +117,17 @@ it must not collect the entire event log before projecting it.
 The focused regression coverage lives in `OrchestrationEventStore.sequence.test.ts`,
 `ProjectionRecovery.test.ts`, and the provider runtime recovery tests under `apps/server/src`.
 
+## Full thread snapshots
+
+A thread subscription without `acceptBoundedSnapshot` sends the whole thread as one frame, built
+by one `JSON.stringify` on the event loop. Its JSON is measured in parts first, and past
+`ThreadFullSnapshotMaxJsonLength` (default 32 MiB, about 0.6 s of stringify) the request fails
+with `OrchestrationV2GetThreadProjectionError` naming `acceptBoundedSnapshot`. Shipped web,
+desktop and mobile clients always send that flag. The default is a signed-off exception to the
+fork's rule that new limits keep the previous behaviour: before it, such a request stalled the
+event loop for seconds and failed past V8's string limit. Coverage:
+`boundedSnapshotTransport.test.ts`.
+
 ## Background work and navigation
 
 The settlement worker reads active, unpinned threads without explicit settlement overrides from
@@ -140,17 +151,12 @@ to that table: dropping the table while they remain makes every turn-item insert
 three triggers first.
 
 A projection read that orders messages by their first user or assistant turn item groups those
-items by `$.messageId` through a partial index on that expression (the fork's migration 2), so it
-does not parse every message item's payload; the index's expression and `WHERE` must stay identical
-to the query's. That migration scans the turn-item table once on first start, and leaves out a
-message item whose payload is not valid JSON. Each message-item write re-parses the old and new
-payload for the index, so its cost grows with the payload. An upstream build starts with the index
-in place, which writes keep current;
-`DROP INDEX orchestration_v2_projection_turn_items_message_ordinal_idx` removes it. An upstream
-migration that rebuilds the turn-item table (create, copy, drop, rename) drops the index with it,
-or leaves it on an old table it keeps aside. After upstream's migrations, every start runs a
-recorded fork migration whose objects are not on their table again, checking again under the write
-lock so that concurrent starts run it once; migration 2 must stay safe to re-run.
+items by `$.messageId` through a partial index on that expression (migration 94), so it does not
+parse every message item's payload; the index's expression and `WHERE` must stay identical to the
+query's. Migration 94 scans the turn-item table once on first start; a message item whose payload
+is not valid JSON is left out of the index. Each message-item write re-parses the old and new
+payload for the index, so its cost grows with the payload.
+
 Finalizing a delegated task reads from the parent only that child's tasks and the transfers it
 sent, through the child and source indexes, and the node, card, runs and delivery message it
 changes, by id. A message dispatch does not read the command projection: the store's

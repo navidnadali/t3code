@@ -73,15 +73,13 @@ export const layer: Layer.Layer<
     }) {
       const { run, rootNode, scope, providerThread, preservedCheckpointOrdinals, sideChat } =
         yield* projections.getCheckpointCaptureContext(input.threadId, input);
-      // Stopped runs remain terminal; their checkpoint is the next message's rollback point.
-      const stopped = run?.status === "interrupted" || run?.status === "cancelled";
+      // Stopped runs remain terminal; their checkpoint is the next message's rollback point. A run
+      // whose wait visible input ended completed before this ran, and keeps that end too.
+      const ended =
+        run?.status === "interrupted" || run?.status === "cancelled" || run?.status === "completed";
 
       // A checkpoint on a settled run proves this at-least-once effect already committed.
-      if (
-        run !== undefined &&
-        run.checkpointId !== null &&
-        (run.status === "completed" || stopped)
-      ) {
+      if (run !== undefined && run.checkpointId !== null && ended) {
         return;
       }
       // Rollback uses the same lane and can precede a capture retry; preserve the restored workspace and discarded run.
@@ -91,7 +89,7 @@ export const layer: Layer.Layer<
 
       if (
         run === undefined ||
-        (run.status !== "waiting" && !stopped) ||
+        (run.status !== "waiting" && !ended) ||
         rootNode === undefined ||
         scope === undefined ||
         rootNode.checkpointScopeId !== scope.id ||
@@ -160,8 +158,12 @@ export const layer: Layer.Layer<
         capturedAt,
         forceMissing: sideChat,
       });
+      // Visible input can end the run's wait while the workspace is read; it keeps that end.
+      const latest = ended ? undefined : yield* projections.getRun(input.threadId, run.id);
+      const endedMeanwhile = latest?.status === "completed";
       // Omit delegatedCompletion to preserve cohort writes made after capture loaded the run.
-      const { delegatedCompletion: _delegatedCompletion, ...runWithoutDelegatedCompletion } = run;
+      const { delegatedCompletion: _delegatedCompletion, ...runWithoutDelegatedCompletion } =
+        endedMeanwhile ? latest : run;
       const commandId = CommandId.make(`command:effect:checkpoint.capture:${run.id}`);
       yield* eventSink.commitCommand({
         commandId,
@@ -235,17 +237,18 @@ export const layer: Layer.Layer<
             nodeId: rootNode.id,
             providerInstanceId: run.providerInstanceId,
             occurredAt: capturedAt,
-            payload: stopped
-              ? { ...runWithoutDelegatedCompletion, ...recorded, checkpointId: checkpoint.id }
-              : {
-                  ...runWithoutDelegatedCompletion,
-                  ...recorded,
-                  status: "completed",
-                  completedAt: capturedAt,
-                  checkpointId: checkpoint.id,
-                },
+            payload:
+              ended || endedMeanwhile
+                ? { ...runWithoutDelegatedCompletion, ...recorded, checkpointId: checkpoint.id }
+                : {
+                    ...runWithoutDelegatedCompletion,
+                    ...recorded,
+                    status: "completed",
+                    completedAt: capturedAt,
+                    checkpointId: checkpoint.id,
+                  },
           },
-          ...(stopped
+          ...(ended || endedMeanwhile
             ? []
             : [
                 {

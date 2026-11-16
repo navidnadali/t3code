@@ -42,6 +42,7 @@ import {
   timeProviderIoStage,
 } from "@t3tools/provider-core/server/ProviderIoStageTiming";
 import { makeProviderFailureTurnItem } from "@t3tools/provider-core/server/failure";
+import { RUN_START_FAILED_CODE } from "./RunFailureCodes.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { stripUnservedToolOutputImageBytes } from "./toolOutputImageBytes.ts";
 import { boundFileChangeForStorage } from "./WireProjection.ts";
@@ -684,8 +685,16 @@ export const layer: Layer.Layer<
                 return dismissed;
               }
               const occurredAt = yield* DateTime.now;
+              // A start that never handed over the prompt keeps its mark, so its wake is sent again.
               const reported = (yield* agentScope.oomKilled(input.threadId))
-                ? { ...input.event.failure, message: "Killed: out of memory.", code: "oom_kill" }
+                ? {
+                    ...input.event.failure,
+                    message: "Killed: out of memory.",
+                    code:
+                      input.event.failure.code === RUN_START_FAILED_CODE
+                        ? RUN_START_FAILED_CODE
+                        : "oom_kill",
+                  }
                 : input.event.failure;
               // A proxied CLI can drop the reset time; the hub still knows when its pool refills.
               const endpoint =

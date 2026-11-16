@@ -1,5 +1,6 @@
 import type {
   NodeId,
+  OrchestrationV2AppThread,
   OrchestrationV2ConversationMessage,
   OrchestrationV2PendingBackgroundTask,
   OrchestrationV2ProviderThread,
@@ -10,6 +11,7 @@ import type {
   OrchestrationV2Subagent,
   OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
+import { isProviderNativeSubagentThread } from "@t3tools/contracts";
 import { subagentHoldsCompletion } from "@t3tools/provider-core/server/subagentProjection";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { latestRootProviderFailure, runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
@@ -169,6 +171,21 @@ export function isAwaitedWork(work: Pick<Work, "kind" | "awaited">): boolean {
   return work.awaited === true || (work.kind !== "shell" && work.kind !== "monitor");
 }
 
+/**
+ * A delegate_task child. Its parent reaches it through waiters it leaves running, unawaited, so
+ * a restart that cuts them wakes it with the note instead of waiting for a message.
+ */
+export function isDelegatedSeat(
+  thread: Pick<OrchestrationV2AppThread, "lineage" | "forkedFrom" | "creationSource">,
+): boolean {
+  return (
+    thread.lineage.relationshipToParent === "subagent" &&
+    thread.lineage.parentThreadId !== null &&
+    thread.forkedFrom?.type === "node" &&
+    !isProviderNativeSubagentThread(thread)
+  );
+}
+
 export function runOutcome(
   run: Pick<OrchestrationV2Run, "status" | "restartCancelledBackgroundWork">,
 ): OrchestrationV2Run["status"] {
@@ -183,6 +200,21 @@ export function neverStarted(
   run: Pick<OrchestrationV2Run, "startedAt" | "restartContinuationOfRunId">,
 ): boolean {
   return run.startedAt === null && run.restartContinuationOfRunId === undefined;
+}
+
+/** The run a restart continuation resumes: the thread's latest run that started. */
+export function restartContinuationSource<Run extends OrchestrationV2Run>(
+  runs: ReadonlyArray<Run>,
+): Run | undefined {
+  return runs.reduce<Run | undefined>(
+    (latest, candidate) =>
+      candidate.status !== "queued" &&
+      !neverStarted(candidate) &&
+      (!latest || runRanAfter(candidate, latest))
+        ? candidate
+        : latest,
+    undefined,
+  );
 }
 
 /** Restart-cancelled unstarted runs supersede nothing; user-stopped unstarted runs do. */
@@ -265,6 +297,85 @@ export function delegatedTaskResultRun(
   return executing ?? awaited.find((run) => run.status === "queued") ?? awaited[0] ?? taskRuns[0];
 }
 
+/** A task's runs and the run its result comes from, as finalizing the task reads them. */
+export function delegatedTaskChildRun(
+  child: Parameters<typeof delegatedTaskRuns>[0],
+  taskId: NodeId,
+  originalTaskId: NodeId,
+  resultRun: OrchestrationV2Run | undefined,
+): {
+  readonly taskRuns: ReadonlyArray<OrchestrationV2Run>;
+  readonly childRun: OrchestrationV2Run | undefined;
+} {
+  const taskRuns = delegatedTaskRuns(child, taskId);
+  const childRun =
+    taskRuns.length === 0
+      ? taskId === originalTaskId
+        ? resultRun
+        : undefined
+      : delegatedTaskResultRun(taskRuns);
+  return { taskRuns, childRun };
+}
+
+const UNFINISHED_RUN_STATUSES: ReadonlySet<OrchestrationV2Run["status"]> = new Set([
+  "queued",
+  "preparing",
+  "starting",
+  "running",
+  "waiting",
+]);
+
+/**
+ * Whether a windowed read of a delegated child holds every run finalizing it decides on (see
+ * `ProjectionStore.getDelegatedTaskRecords`). A task's result run is an awaited unfinished run,
+ * which the read always holds, or its newest awaited run. A finished result run is checked for a
+ * restart continuation against every run that ended after it; the read holds those that await one.
+ */
+export function delegatedTaskReadCovers(
+  read: {
+    readonly records: Parameters<typeof delegatedTaskRuns>[0];
+    readonly ordinalFloor: number | null;
+    readonly endedFloor: OrchestrationV2Run["id"] | null;
+  },
+  input: {
+    readonly tasks: ReadonlyArray<Pick<OrchestrationV2Subagent, "id">>;
+    readonly originalTaskId: NodeId;
+    readonly resultRun: OrchestrationV2Run | undefined;
+    readonly stoppedResultRun: OrchestrationV2Run | undefined;
+  },
+): boolean {
+  const { records, ordinalFloor, endedFloor } = read;
+  if (ordinalFloor === null) return true;
+  const floor = records.runs.find((run) => run.id === endedFloor);
+  const endedInRead = (run: OrchestrationV2Run) =>
+    endedFloor === null ||
+    (floor !== undefined && (run.id === floor.id || runRanAfter(run, floor)));
+  for (const task of input.tasks) {
+    const { taskRuns, childRun } = delegatedTaskChildRun(
+      records,
+      task.id,
+      input.originalTaskId,
+      input.resultRun,
+    );
+    if (
+      !taskRuns.some(
+        (run) =>
+          !cancelledBeforeStart(run) &&
+          !(run.status === "queued" && run.queueHeld === true) &&
+          (UNFINISHED_RUN_STATUSES.has(run.status) || run.ordinal >= ordinalFloor),
+      )
+    )
+      return false;
+    if (
+      childRun !== undefined &&
+      !UNFINISHED_RUN_STATUSES.has(childRun.status) &&
+      !endedInRead(childRun)
+    )
+      return false;
+  }
+  return input.stoppedResultRun === undefined || endedInRead(input.stoppedResultRun);
+}
+
 /** The provider never accepted this continuation's prompt, so starting it again repeats nothing. */
 export function continuationFailedBeforePrompt(
   run: Pick<OrchestrationV2Run, "status" | "activeAttemptId" | "restartContinuationOfRunId">,
@@ -309,12 +420,29 @@ export function continuationStartRetryDelayMs(
   return CONTINUATION_START_RETRY_DELAYS_MS[failedStarts - 1];
 }
 
-export function isRestartContinuationSource(
+/**
+ * Its restart cut only work nobody awaited, so its note wakes a seat but leaves its outcome.
+ * Recovery records lost work only on a started run, so the run has an attempt to read turns by.
+ */
+export function restartNoteOnly(
   source: Pick<OrchestrationV2Run, "status" | "activeAttemptId" | "restartCancelledBackgroundWork">,
   providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>,
 ): boolean {
+  return (
+    source.activeAttemptId !== null &&
+    isRestartNoteSource(source, providerTurns) &&
+    !isRestartContinuationSource(source, providerTurns)
+  );
+}
+
+export function isRestartContinuationSource(
+  source: Pick<OrchestrationV2Run, "status" | "activeAttemptId" | "restartCancelledBackgroundWork">,
+  providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>,
+  thread?: Parameters<typeof isDelegatedSeat>[0],
+): boolean {
   return isRestartNoteSource(source, providerTurns)
-    ? (source.restartCancelledBackgroundWork ?? []).some(isAwaitedWork)
+    ? (source.restartCancelledBackgroundWork ?? []).some(isAwaitedWork) ||
+        (thread !== undefined && isDelegatedSeat(thread))
     : source.status === "cancelled";
 }
 

@@ -11,7 +11,12 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import type { ProjectionRuntimeRecoveryState } from "./ProjectionStore.ts";
+import type {
+  ProjectionRecordField,
+  ProjectionRecordFilter,
+  ProjectionRecords,
+  ProjectionRuntimeRecoveryState,
+} from "./ProjectionStore.ts";
 
 import * as ServerSettings from "../serverSettings.ts";
 import { isNativeMaintenanceCommand } from "./CommandPolicy.ts";
@@ -22,12 +27,14 @@ import {
   cancelledTurnItemWork,
   continuationFailedBeforePrompt,
   isAwaitedWork,
+  isDelegatedSeat,
   isRestartContinuationSource,
   cancelledBeforeStart,
   isRestartNoteSource,
-  neverStarted,
   restartCancelledBackgroundWorkNote,
   restartContinuationNote,
+  restartContinuationSource,
+  restartNoteOnly,
 } from "./RestartBackgroundNote.ts";
 
 const CONTINUE_PROMPT =
@@ -35,8 +42,10 @@ const CONTINUE_PROMPT =
 
 const MAX_CONTINUATION_CHAIN = 3;
 const CONTINUATION_LOOP_WINDOW_MS = 5 * 60 * 1_000;
+/** The idle pin's bound: a seat idle longer would have lost its session, and its waiter, anyway. */
+const SEAT_RESTART_WAKE_WINDOW_MS = 4 * 60 * 60 * 1_000;
 
-function restartContinuationBlocked(
+export function restartContinuationBlocked(
   projection: Pick<
     ProjectionRuntimeRecoveryState,
     "thread" | "runtimeRequests" | "providerTurns" | "turnItems"
@@ -84,10 +93,60 @@ function restartContinuationBlocked(
   );
 }
 
+/** A Stop from the user, or from the parent that delegated the task, that a restart cut short. */
+export const restartStopRequested = Effect.fn("RestartContinuation.restartStopRequested")(
+  function* <E>(
+    getThreadRecords: <K extends ProjectionRecordField>(
+      threadId: ThreadId,
+      fields: ReadonlyArray<K>,
+      filter: ProjectionRecordFilter,
+    ) => Effect.Effect<ProjectionRecords<K>, E>,
+    thread: Pick<ProjectionRuntimeRecoveryState["thread"], "id" | "lineage" | "forkedFrom">,
+    source: Pick<OrchestrationV2Run, "id" | "delegatedTaskId" | "startedAt" | "requestedAt">,
+    // A seat's note continues the run its task settled from, so a parent's Stop requested since
+    // still applies; the marker's start is the request, later updates request nothing.
+    settledTask = false,
+  ) {
+    const { turnItems } = yield* getThreadRecords(thread.id, ["turnItems"], {
+      turnItemRunIds: [source.id],
+      turnItemTypes: ["run_interrupt_request"],
+    });
+    if (turnItems.some((item) => item.runId === source.id && item.type === "run_interrupt_request"))
+      return true;
+    const { lineage, forkedFrom } = thread;
+    const taskId =
+      source.delegatedTaskId ?? (forkedFrom?.type === "node" ? forkedFrom.nodeId : undefined);
+    if (
+      lineage.relationshipToParent !== "subagent" ||
+      lineage.parentThreadId === null ||
+      taskId === undefined
+    )
+      return false;
+    const task = (yield* getThreadRecords(lineage.parentThreadId, ["subagents"], {
+      subagentIds: [taskId],
+    })).subagents.find((candidate) => candidate.id === taskId);
+    // A settled task no longer owns later work in its thread.
+    const open =
+      task !== undefined && task.result === null && isOrchestrationV2WorkActive(task.status);
+    if (task === undefined || task.runId === null || (!open && !settledTask)) return false;
+    const stops = (yield* getThreadRecords(lineage.parentThreadId, ["turnItems"], {
+      turnItemTypes: ["run_interrupt_request"],
+      turnItemRunIds: [task.runId],
+    })).turnItems;
+    const since = source.startedAt ?? source.requestedAt;
+    return open
+      ? stops.length > 0
+      : stops.some((item) =>
+          DateTime.isGreaterThanOrEqualTo(item.startedAt ?? item.updatedAt, since),
+        );
+  },
+);
+
 /** App-owned delegations continue in their own threads and report back. */
-function hasOpenAwaitedWork(
+function hasOpenWork(
   projection: Pick<ProjectionRuntimeRecoveryState, "runs" | "turnItems">,
   providerThread: ProjectionRuntimeRecoveryState["providerThreads"][number],
+  awaited: boolean,
 ): boolean {
   const openItem = projection.turnItems.some((item) => {
     if (item.status !== "pending" && item.status !== "running" && item.status !== "waiting")
@@ -97,42 +156,99 @@ function hasOpenAwaitedWork(
     const work = cancelledTurnItemWork(item);
     return (
       work !== undefined &&
-      isAwaitedWork(work) &&
+      isAwaitedWork(work) === awaited &&
       awaitingProviderThreadId(item, projection.runs) === providerThread.id
     );
   });
   return (
     openItem ||
     (providerThread.ownerNodeId === null &&
-      (providerThread.pendingBackgroundTasks ?? []).some((task) =>
-        isAwaitedWork(cancelledRosterTaskWork(task)),
+      (providerThread.pendingBackgroundTasks ?? []).some(
+        (task) => isAwaitedWork(cancelledRosterTaskWork(task)) === awaited,
       ))
   );
 }
 
+type RestartProjection = Pick<
+  ProjectionRuntimeRecoveryState,
+  | "thread"
+  | "runs"
+  | "providerThreads"
+  | "providerSessions"
+  | "providerTurns"
+  | "runtimeRequests"
+  | "turnItems"
+>;
+
 /** Settled runs require a live session so stale crash records cannot wake them. */
 export function restartContinuationRun(
-  projection: Pick<
-    ProjectionRuntimeRecoveryState,
-    | "thread"
-    | "runs"
-    | "providerThreads"
-    | "providerSessions"
-    | "providerTurns"
-    | "runtimeRequests"
-    | "turnItems"
-  >,
+  projection: RestartProjection,
   now: DateTime.Utc,
 ): OrchestrationV2Run | undefined {
-  const run = projection.runs.reduce<OrchestrationV2Run | undefined>(
-    (latest, candidate) =>
-      candidate.status !== "queued" &&
-      !neverStarted(candidate) &&
-      (!latest || runRanAfter(candidate, latest))
-        ? candidate
-        : latest,
-    undefined,
-  );
+  const source = liveRestartSource(projection, now);
+  if (source === undefined) return;
+  const { run, providerThread, settled, liveTurnRequired } = source;
+  if (settled) return hasOpenWork(projection, providerThread, true) ? run : undefined;
+  if (
+    liveTurnRequired &&
+    !projection.providerTurns.some(
+      (turn) =>
+        turn.providerThreadId === providerThread.id &&
+        turn.runAttemptId === run.activeAttemptId &&
+        turn.status === "running",
+    )
+  )
+    return;
+  return run;
+}
+
+/**
+ * A delegated seat's settled run whose restart cut only unawaited work, such as its inbox waiter.
+ * Its note wakes it while its parent still waits on the task, or when it ran within the window.
+ * Stop is checked here, before startup settles the task and the handler stops seeing a parent's.
+ */
+export const restartSeatWakeRun = Effect.fn("RestartContinuation.restartSeatWakeRun")(function* <E>(
+  getThreadRecords: <K extends ProjectionRecordField>(
+    threadId: ThreadId,
+    fields: ReadonlyArray<K>,
+    filter: ProjectionRecordFilter,
+  ) => Effect.Effect<ProjectionRecords<K>, E>,
+  projection: RestartProjection,
+  now: DateTime.Utc,
+) {
+  const { thread } = projection;
+  const source = liveRestartSource(projection, now);
+  if (
+    source === undefined ||
+    !source.settled ||
+    hasOpenWork(projection, source.providerThread, true) ||
+    !hasOpenWork(projection, source.providerThread, false) ||
+    !isDelegatedSeat(thread)
+  )
+    return;
+  const { run } = source;
+  if (yield* restartStopRequested(getThreadRecords, thread, run, true)) return;
+  const ranAt = run.completedAt ?? run.startedAt ?? run.requestedAt;
+  if (DateTime.toEpochMillis(now) - DateTime.toEpochMillis(ranAt) <= SEAT_RESTART_WAKE_WINDOW_MS)
+    return run;
+  const taskId =
+    run.delegatedTaskId ??
+    (thread.forkedFrom?.type === "node" ? thread.forkedFrom.nodeId : undefined);
+  if (taskId === undefined || thread.lineage.parentThreadId === null) return;
+  const task = (yield* getThreadRecords(thread.lineage.parentThreadId, ["subagents"], {
+    subagentIds: [taskId],
+  })).subagents.find((candidate) => candidate.id === taskId);
+  return task !== undefined &&
+    task.origin === "app_owned" &&
+    task.childThreadId === thread.id &&
+    task.result === null &&
+    isOrchestrationV2WorkActive(task.status)
+    ? run
+    : undefined;
+});
+
+function liveRestartSource(projection: RestartProjection, now: DateTime.Utc) {
+  const run = restartContinuationSource(projection.runs);
   if (!run) return;
   const preparedContinuation =
     run.status === "starting" && run.restartContinuationOfRunId !== undefined;
@@ -168,18 +284,7 @@ export function restartContinuationRun(
     (!preparedContinuation && (session.status === "stopped" || session.status === "error"))
   )
     return;
-  if (settled) return hasOpenAwaitedWork(projection, providerThread) ? run : undefined;
-  if (
-    liveTurnRequired &&
-    !projection.providerTurns.some(
-      (turn) =>
-        turn.providerThreadId === providerThread.id &&
-        turn.runAttemptId === run.activeAttemptId &&
-        turn.status === "running",
-    )
-  )
-    return;
-  return run;
+  return { run, providerThread, settled, liveTurnRequired };
 }
 
 export const continueRestartedRun = Effect.fn("RestartContinuation.continueRestartedRun")(
@@ -208,7 +313,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     if (
       !source ||
       !(
-        isRestartContinuationSource(source, projection.providerTurns) ||
+        isRestartContinuationSource(source, projection.providerTurns, projection.thread) ||
         continuationFailedBeforePrompt(source, projection.providerTurns)
       ) ||
       restartContinuationBlocked(
@@ -254,50 +359,18 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       });
       return;
     }
-    const sourceRecords = yield* threads.getThreadRecords(
-      input.threadId,
-      ["messages", "turnItems"],
-      {
-        messageIds: [source.userMessageId],
-        turnItemRunIds: [source.id],
-        turnItemTypes: ["run_interrupt_request"],
-      },
-    );
     if (
-      sourceRecords.turnItems.some(
-        (item) => item.runId === source.id && item.type === "run_interrupt_request",
+      yield* restartStopRequested(
+        threads.getThreadRecords,
+        projection.thread,
+        source,
+        isDelegatedSeat(projection.thread) && restartNoteOnly(source, projection.providerTurns),
       )
     )
       return;
-    // A parent's Stop reaches its open delegated tasks through an effect a restart can cut short.
-    const { lineage, forkedFrom } = projection.thread;
-    const taskId =
-      source.delegatedTaskId ?? (forkedFrom?.type === "node" ? forkedFrom.nodeId : undefined);
-    if (
-      lineage.relationshipToParent === "subagent" &&
-      lineage.parentThreadId !== null &&
-      taskId !== undefined
-    ) {
-      const task = (yield* threads.getThreadRecords(lineage.parentThreadId, ["subagents"], {
-        subagentIds: [taskId],
-      })).subagents.find((candidate) => candidate.id === taskId);
-      // A settled task no longer owns later work in its thread.
-      const parentRunId =
-        task !== undefined && task.result === null && isOrchestrationV2WorkActive(task.status)
-          ? task.runId
-          : null;
-      if (
-        parentRunId !== null &&
-        (yield* threads.getThreadRecords(lineage.parentThreadId, ["turnItems"], {
-          turnItemTypes: ["run_interrupt_request"],
-          turnItemRunIds: [parentRunId],
-        })).turnItems.length > 0
-      )
-        return;
-    }
-    const sourceMessage = sourceRecords.messages.find(
-      (message) => message.id === source.userMessageId,
-    );
+    const sourceMessage = (yield* threads.getThreadRecords(input.threadId, ["messages"], {
+      messageIds: [source.userMessageId],
+    })).messages.find((message) => message.id === source.userMessageId);
     if (sourceMessage !== undefined && isNativeMaintenanceCommand(sourceMessage)) return;
     const note = restartContinuationNote(
       source,

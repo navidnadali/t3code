@@ -1685,6 +1685,9 @@ describe("OpenCodeAdapterV2", () => {
                 offers.push(offer);
               }),
             take: Effect.never,
+            settle: () => Effect.void,
+            progress: () => Effect.succeed({ pending: 0, settles: 0 }),
+            awaitSettle: () => Effect.void,
           }),
         );
         const user = (id: string) => ({
@@ -2413,6 +2416,9 @@ describe("OpenCodeAdapterV2", () => {
                   replacementOffers.push(offer);
                 }),
               take: Effect.never,
+              settle: () => Effect.void,
+              progress: () => Effect.succeed({ pending: 0, settles: 0 }),
+              awaitSettle: () => Effect.void,
             }),
           );
           const resumed = yield* replacement.runtime.resumeThread({
@@ -5186,6 +5192,13 @@ describe("OpenCodeAdapterV2", () => {
     const fullAccess = openCodePermissionRules(runtimePolicy("full-access"));
     assert.equal(permissionAction(fullAccess, "bash"), "allow");
     assert.equal(permissionAction(fullAccess, "edit"), "allow");
+    const fullAccessRulesCopiedToTaskChildren = fullAccess.filter(
+      (rule) => rule.permission === "external_directory" || rule.action === "deny",
+    );
+    assert.equal(
+      permissionAction(fullAccessRulesCopiedToTaskChildren, "external_directory"),
+      "allow",
+    );
 
     const granularApproval = openCodePermissionRules(
       runtimePolicy("full-access", {

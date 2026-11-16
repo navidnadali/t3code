@@ -105,7 +105,7 @@ const countedFromItems = Effect.gen(function* () {
   `;
 });
 
-// Each count object and the fork's ordinal index exactly once, on the table it belongs to.
+// Each count object and the message-ordinal index exactly once, on the table it belongs to.
 const assertCountObjectsOnce = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const rows = yield* sql<{
@@ -218,7 +218,7 @@ describe("turn-item counts across the upgrade to upstream's migration 85", () =>
       }).pipe(Effect.provide(memory)),
   );
 
-  it.effect("a fresh database gets upstream's counts and the fork's index, once each", () =>
+  it.effect("a fresh database gets upstream's counts and message-ordinal index, once each", () =>
     Effect.gen(function* () {
       yield* runMigrations();
       assert.deepStrictEqual(yield* ledger, upstreamChain);

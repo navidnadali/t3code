@@ -5,6 +5,7 @@ import * as SharedObservability from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as References from "effect/References";
 import * as Tracer from "effect/Tracer";
 import * as OtlpExporter from "effect/observability/OtlpExporter";
@@ -17,6 +18,7 @@ import * as ResourceAttribution from "../resourceTelemetry/ResourceAttribution.t
 import * as ServerLogger from "../serverLogger.ts";
 import * as BrowserTraceCollector from "./BrowserTraceCollector.ts";
 import * as HeapAttribution from "./HeapAttribution.ts";
+import * as SpanMinutes from "./SpanMinutes.ts";
 
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
@@ -67,6 +69,19 @@ export const layer = Layer.unwrap(
         const sqlMinDurationMs = config.traceTimingEnabled
           ? (config.traceSqlMinDurationMs ?? 0)
           : 0;
+        const path = yield* Path.Path;
+        const spanMinutes =
+          config.traceSpanMinutes === false
+            ? undefined
+            : yield* SpanMinutes.make(
+                path.join(path.dirname(config.serverTracePath), SpanMinutes.SPAN_MINUTES_FILE_NAME),
+              ).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Span minute log unavailable", cause).pipe(
+                    Effect.as(undefined),
+                  ),
+                ),
+              );
         const tracer = yield* makeLocalFileTracer({
           filePath: config.serverTracePath,
           maxBytes: config.traceMaxBytes,
@@ -75,6 +90,7 @@ export const layer = Layer.unwrap(
           sink,
           ...(delegate ? { delegate } : {}),
           sqlMinDurationMs,
+          ...(spanMinutes ? { onSpanEnd: spanMinutes.record } : {}),
         });
 
         // Whether a SQL span is fast is known only at its end, so none is measured.

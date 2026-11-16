@@ -194,6 +194,7 @@ it.effect("keeps one queued occurrence of a recurring task while its bound threa
       readonly runs: ReadonlyArray<OrchestrationV2Run>;
       readonly messages: ReadonlyArray<OrchestrationV2ConversationMessage>;
     }>({ runs: [activeRun], messages: [] });
+    const reads = yield* Ref.make<ReadonlyArray<readonly [ReadonlyArray<string>, unknown]>>([]);
     const runDueWork = yield* Ref.make<Effect.Effect<void>>(Effect.void);
     const layerDependencies = Layer.mergeAll(
       NodeCrypto.layer,
@@ -241,7 +242,11 @@ it.effect("keeps one queued occurrence of a recurring task while its bound threa
               { runs: [...current.runs, run], messages: [...current.messages, message] },
             ];
           }),
-        getThreadRecords: () => Ref.get(thread).pipe(Effect.map((records) => records as never)),
+        getThreadRecords: (_threadId, fields, filter) =>
+          Ref.update(reads, (all) => [...all, [fields, filter] as const]).pipe(
+            Effect.andThen(Ref.get(thread)),
+            Effect.map((records) => records as never),
+          ),
         getThreadShell: () =>
           Effect.succeed({
             projectId: "project-busy-thread",
@@ -286,6 +291,12 @@ it.effect("keeps one queued occurrence of a recurring task while its bound threa
         );
       const queuedOccurrences = queuedOccurrencesOf(task.id);
       expect(yield* queuedOccurrences).toBe(1);
+      // A long-lived thread holds thousands of finished runs; the check reads only queued ones.
+      expect(
+        (yield* Ref.get(reads))
+          .filter(([fields]) => fields.includes("runs"))
+          .map(([, filter]) => filter),
+      ).toEqual(Array.from({ length: 3 }, () => ({ runStatuses: ["queued"] })));
       // Skipped intervals still move the schedule forward.
       const [listed] = (yield* service.list()).tasks;
       expect(Date.parse(listed?.nextRunAt ?? "")).toBeGreaterThan(

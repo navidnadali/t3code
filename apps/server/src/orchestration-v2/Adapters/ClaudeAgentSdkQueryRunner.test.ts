@@ -19,6 +19,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Scheduler from "effect/Scheduler";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -43,6 +44,7 @@ import {
 import {
   ClaudeAgentSdkQueryRunner,
   type ClaudeAgentSdkQueryOpenInput,
+  claudeProcessRead,
   layerQueryRunner,
   makeClaudeDescendantTracker,
   parseClaudeProcessTable,
@@ -381,6 +383,45 @@ it.effect("reopens a stalled MCP registration before delivering the resumed prom
     const delivered = yield* Effect.promise(() => prompts[1]![Symbol.asyncIterator]().next());
     assert.deepEqual(delivered.value, message);
     assert.isFalse(delivered.done);
+  }).pipe(Effect.provide(realQueryRunner)),
+);
+
+it.effect("fails a guarded prompt whose query closes while its submission waits", () =>
+  Effect.gen(function* () {
+    const querySpy = vi
+      .spyOn(ClaudeSdk, "query")
+      .mockImplementation(() => ({ close: vi.fn() }) as unknown as ClaudeSdk.Query);
+    yield* Effect.addFinalizer(() => Effect.sync(() => querySpy.mockRestore()));
+    const runner = yield* ClaudeAgentSdkQueryRunner;
+    const { mcpServers: _mcpServers, ...options } = resumedMcpQueryInput.options;
+    const session = yield* runner.open({ ...resumedMcpQueryInput, options });
+    const waiting = yield* Deferred.make<void>();
+    const claimed = yield* Deferred.make<void>();
+    let queued = false;
+    const offering = yield* session
+      .offer(
+        {
+          type: "user",
+          message: { role: "user", content: "Restart with this." },
+          parent_tool_use_id: null,
+          session_id: FORK_SESSION_ID,
+        },
+        () => {
+          queued = true;
+        },
+        (enqueue) =>
+          Deferred.succeed(waiting, undefined).pipe(
+            Effect.andThen(Deferred.await(claimed)),
+            Effect.andThen(Effect.sync(enqueue)),
+          ),
+      )
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(waiting);
+    yield* session.close;
+    yield* Deferred.succeed(claimed, undefined);
+
+    assert.isTrue(Exit.isFailure(yield* Fiber.await(offering)));
+    assert.isFalse(queued);
   }).pipe(Effect.provide(realQueryRunner)),
 );
 
@@ -950,30 +991,42 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     );
   });
 
-  // A close records what started since the last poll, but its read can begin before a poll
-  // that ends first: the job that poll found is still stopped when the CLI exits.
-  it.effect("stops a job a poll found while the close's own earlier read was running", () => {
+  // A close records what started since the last poll, but its read can begin before a poll that
+  // ends first. The close's read sees an orphaned job with the child it just started; the poll sees
+  // that job gone, the child orphaned, and a job started since. Exit stops both jobs it can reach.
+  it.effect("stops at exit what a poll and the close's own earlier read each found", () => {
     const agents = countedAgents(1);
     const firstRead = Deferred.makeUnsafe<void>();
     const closeReadStarted = Deferred.makeUnsafe<void>();
     const closeReadHeld = Deferred.makeUnsafe<void>();
-    let phase: "open" | "closing" | "polling" | "exiting" = "open";
+    let phase: "open" | "tree" | "orphaned" | "closing" | "polling" | "exiting" = "open";
     let cliPid = "";
     let jobPid: number | undefined;
+    let childPid: number | undefined;
+    // Never live pids: above Linux's largest pid_max.
+    const shell = 4_194_400;
+    const orphan = 4_194_401;
     const table = () => {
-      const cli = `${cliPid} 10 ${cliPid} Sun Nov 15 10:00:00 2026`;
-      const job = (ppid: string) => `${jobPid} ${ppid} ${jobPid} Sun Nov 15 10:00:01 2026`;
+      const row = (pid: number | string | undefined, ppid: number | string, started: number) =>
+        `${pid} ${ppid} ${pid} Sun Nov 15 10:00:0${started} 2026`;
+      const cli = row(cliPid, 10, 0);
       switch (phase) {
         case "open":
           Deferred.doneUnsafe(firstRead, Effect.void);
           return cli;
-        case "closing":
+        case "tree":
+          return [cli, row(shell, cliPid, 1), row(orphan, shell, 1)].join("\n");
+        case "orphaned":
+          return [cli, row(orphan, 1, 1)].join("\n");
+        case "closing": {
           Deferred.doneUnsafe(closeReadStarted, Effect.void);
-          return Deferred.await(closeReadHeld).pipe(Effect.as(cli));
+          const seen = [cli, row(orphan, 1, 1), row(childPid, orphan, 2)].join("\n");
+          return Deferred.await(closeReadHeld).pipe(Effect.as(seen));
+        }
         case "polling":
-          return [cli, job(cliPid)].join("\n");
+          return [cli, row(jobPid, cliPid, 2), row(childPid, 1, 2)].join("\n");
         case "exiting":
-          return job("1");
+          return [row(jobPid, 1, 2), row(childPid, 1, 2)].join("\n");
       }
     };
     return Effect.gen(function* () {
@@ -992,10 +1045,22 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
         NodeFS.promises.readFile(NodePath.join(dir, "pid"), "utf8"),
       )).trim();
       yield* Deferred.await(firstRead);
-      const job = NodeChildProcess.spawn("sleep", ["600"], { detached: true, stdio: "ignore" });
-      yield* Effect.addFinalizer(() => Effect.sync(() => job.kill("SIGKILL")));
+      phase = "tree";
+      yield* TestClock.adjust("1 second");
+      phase = "orphaned";
+      yield* TestClock.adjust("1 second");
+      const sleeper = () =>
+        NodeChildProcess.spawn("sleep", ["600"], { detached: true, stdio: "ignore" });
+      const job = sleeper();
+      const child = sleeper();
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => [job, child].forEach((spawned) => spawned.kill("SIGKILL"))),
+      );
       jobPid = job.pid;
-      const stopped = new Promise((resolve) => job.once("exit", resolve));
+      childPid = child.pid;
+      const stopped = [job, child].map(
+        (spawned) => new Promise((resolve) => spawned.once("exit", resolve)),
+      );
       phase = "closing";
       const closing = yield* session.close.pipe(Effect.forkChild);
       yield* Deferred.await(closeReadStarted);
@@ -1003,21 +1068,17 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
       yield* TestClock.adjust("1 second");
       phase = "exiting";
       Deferred.doneUnsafe(closeReadHeld, Effect.void);
-      yield* Effect.promise(() => stopped);
+      yield* Effect.promise(() => Promise.all(stopped));
       yield* Fiber.join(closing);
     }).pipe(Effect.provide(fakeTableRunner(processTableSpawner(table), agents.layer)));
   });
 
-  // The nth of a series of reads, each begun after the one before it ended.
-  const psTable = (
-    rows: ReadonlyArray<readonly [pid: number, ppid: number, started: number]>,
-    read: number,
-  ) =>
+  const psTable = (rows: ReadonlyArray<readonly [pid: number, ppid: number, started: number]>) =>
     parseClaudeProcessTable(
       rows
         .map(([pid, ppid, started]) => `${pid} ${ppid} ${pid} Sun Nov 15 10:00:0${started} 2026`)
         .join("\n"),
-      { began: 2 * read, ended: 2 * read + 1 },
+      false,
     );
   const byNumber = (left: number, right: number) => left - right;
 
@@ -1038,7 +1099,6 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
           [cli + 2, poll === 0 ? cli + 3 : 1, 0] as const,
           ...jobs(cli, poll).map((pid) => [pid, cli + 1, 1] as const),
         ]),
-        poll,
       );
       for (const tracker of trackers) tracker.record(table);
     }
@@ -1058,30 +1118,55 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     const tracker = makeClaudeDescendantTracker(1000);
     const orphan = [1300, 1, 1] as const;
     tracker.record(
-      psTable(
-        [
-          [1000, 10, 0],
-          [1001, 1000, 0],
-          [1100, 1001, 1],
-          [1200, 1001, 1],
-          [1300, 1001, 1],
-        ],
-        0,
-      ),
+      psTable([
+        [1000, 10, 0],
+        [1001, 1000, 0],
+        [1100, 1001, 1],
+        [1200, 1001, 1],
+        [1300, 1001, 1],
+      ]),
     );
-    tracker.record(psTable([[1000, 10, 0], orphan], 1));
+    tracker.record(psTable([[1000, 10, 0], orphan]));
     // Unrelated processes take both finished jobs' pids, one in the second its job started.
     const unrelated = [
       [1100, 1, 2],
       [1200, 1, 1],
     ] as const;
-    tracker.record(psTable([[1000, 10, 0], ...unrelated, orphan], 2));
+    tracker.record(psTable([[1000, 10, 0], ...unrelated, orphan]));
     tracker.cliExited();
     assert.deepStrictEqual(
-      tracker.leftovers(psTable([...unrelated, orphan], 3)).map((row) => row.pid),
+      tracker.leftovers(psTable([...unrelated, orphan])).map((row) => row.pid),
       [1300],
     );
   });
+
+  // A read is interrupted whenever the last CLI's exit stops the poll. One left in flight would
+  // mark every later read overlapped, and no CLI's record would be pruned again.
+  it.effect("leaves no read in flight wherever a read is interrupted", () =>
+    Effect.gen(function* () {
+      for (let steps = 0; ; steps++) {
+        const tasks: Array<() => void> = [];
+        // Yields before every operation, so each task runs one and the test chooses where to stop.
+        const stepper: Scheduler.Scheduler = {
+          executionMode: "async",
+          shouldYield: () => true,
+          makeDispatcher: () => ({ scheduleTask: (task) => tasks.push(task), flush: () => {} }),
+        };
+        const inFlight = new Set<{ overlapped: boolean }>();
+        const reading = yield* claudeProcessRead(inFlight, () => Effect.never).pipe(
+          Effect.provideService(Scheduler.Scheduler, stepper),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        for (let step = 0; step < steps; step++) tasks.shift()?.();
+        const reachedUse = tasks.length === 0;
+        reading.interruptUnsafe();
+        while (tasks.length > 0) tasks.shift()?.();
+        const next = yield* claudeProcessRead(inFlight, (read) => Effect.succeed(read.overlapped));
+        assert.isFalse(next, `a read interrupted after ${steps} steps stayed in flight`);
+        if (reachedUse) break;
+      }
+    }),
+  );
 
   // the server's command spawner runs `ps`, so polling never forks the server itself.
   it.effect("reads the process table through the server's command spawner", () =>

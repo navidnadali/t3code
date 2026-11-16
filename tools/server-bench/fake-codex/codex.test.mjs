@@ -294,21 +294,28 @@ describe("fake codex app-server", () => {
     expect(frames.at(-1).params.turn.status).toBe("completed");
   });
 
+  // Refused with Codex's own messages, which CodexAdapterV2 reads as input not delivered.
   it("steers only the turn the request expects", async () => {
     using fake = startFake({ BENCH_SPEED: "1" });
     fake.send({ id: 1, method: "thread/start", params: { cwd: LIVE.cwd, model: LIVE.model } });
     const threadId = frameOf((await fake.until(answerTo(1))).at(-1)).result.thread.id;
-    fake.send({ id: 2, method: "turn/start", params: { threadId, input: [] } });
-    const turnId = frameOf((await fake.until(answerTo(2))).at(-1)).result.turn.id;
     const steer = (id, expectedTurnId) => ({
       id,
       method: "turn/steer",
       params: { threadId, expectedTurnId, input: [{ type: "text", text: "Steer." }] },
     });
-    fake.send(steer(3, "stale-turn"), steer(4, turnId));
-    const frames = (await fake.until(answerTo(4))).map(frameOf);
+    fake.send(steer(2, "no-turn-yet"));
+    const idle = frameOf((await fake.until(answerTo(2))).at(-1));
+    fake.send({ id: 3, method: "turn/start", params: { threadId, input: [] } });
+    const turnId = frameOf((await fake.until(answerTo(3))).at(-1)).result.turn.id;
+    fake.send(steer(4, "stale-turn"), steer(5, turnId));
+    const frames = (await fake.until(answerTo(5))).map(frameOf);
 
-    expect(frames.find((frame) => frame.id === 3)).toMatchObject({ error: { code: -32600 } });
+    expect(idle.error).toEqual({ code: -32600, message: "no active turn to steer" });
+    expect(frames.find((frame) => frame.id === 4).error).toEqual({
+      code: -32600,
+      message: `expected active turn id \`stale-turn\` but found \`${turnId}\``,
+    });
     expect(frames.at(-1).result).toEqual({ turnId });
     expect(() => decodeSteerResponse(frames.at(-1).result)).not.toThrow();
   });

@@ -1,4 +1,3 @@
-import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   MessageId,
   type ModelSelection,
@@ -21,6 +20,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import { mergedSteerText, steerProviderText } from "./QueuedDeliveryPromotion.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
   Effect.andThen(
@@ -74,6 +74,8 @@ export interface ProviderTurnControlServiceV2Shape {
     readonly providerThreadId: ProviderThreadId;
     readonly providerTurnId: ProviderTurnId;
     readonly messageId: MessageId;
+    /** Queued messages sent in the same steer after `messageId`, in this order. */
+    readonly mergedMessageIds?: ReadonlyArray<MessageId>;
     readonly modelSelection?: ModelSelection;
     readonly beforeInvoke?: Effect.Effect<void, unknown>;
   }) => Effect.Effect<void, ProviderTurnControlError>;
@@ -83,6 +85,16 @@ export interface ProviderTurnControlServiceV2Shape {
     readonly providerSessionId: ProviderSessionId;
     readonly providerThreadId: ProviderThreadId;
     readonly modelSelection: ModelSelection;
+  }) => Effect.Effect<
+    void,
+    | ProjectionStore.ProjectionStoreV2Error
+    | ProviderSessionManager.ProviderSessionManagerV2Error
+    | ProviderAdapter.ProviderAdapterV2Error
+  >;
+  /** Best effort: a provider thread that is no longer live picks the title up when its next turn starts. */
+  readonly applyThreadTitle: (input: {
+    readonly threadId: ThreadId;
+    readonly title: string;
   }) => Effect.Effect<
     void,
     | ProjectionStore.ProjectionStoreV2Error
@@ -257,6 +269,18 @@ export const layer: Layer.Layer<
           });
         },
       ),
+      applyThreadTitle: Effect.fn("ProviderTurnControlService.applyThreadTitle")(function* (input) {
+        const { thread, providerThreads } = yield* projections.getThreadRecords(input.threadId, [
+          "providerThreads",
+        ]);
+        const providerThread = providerThreads.find(
+          (candidate) => candidate.id === thread.activeProviderThreadId,
+        );
+        if (!providerThread?.providerSessionId) return;
+        const session = yield* sessions.get(providerThread.providerSessionId);
+        if (Option.isNone(session) || session.value.applyThreadTitle === undefined) return;
+        yield* session.value.applyThreadTitle({ providerThread, title: input.title });
+      }),
       interrupt: Effect.fn("ProviderTurnControlService.interrupt")(
         function* (input) {
           const loaded = yield* load({ ...input, operation: "interrupt" });
@@ -422,7 +446,15 @@ export const layer: Layer.Layer<
           const loaded = yield* load({ ...input, operation: "steer" });
           if (Option.isNone(loaded.session)) return;
           const { message, run } = loaded.context;
-          if (message === undefined || run === undefined) {
+          const mergedIds = input.mergedMessageIds ?? [];
+          const merged =
+            mergedIds.length === 0
+              ? []
+              : (yield* projections.getThreadRecords(input.threadId, ["messages"], {
+                  messageIds: [...mergedIds],
+                })).messages;
+          const parts = [message, ...mergedIds.map((id) => merged.find((row) => row.id === id))];
+          if (message === undefined || run === undefined || parts.includes(undefined)) {
             return yield* new ProviderTurnControlError({
               threadId: input.threadId,
               operation: "steer",
@@ -431,6 +463,7 @@ export const layer: Layer.Layer<
               cause: "The persisted steering message or target run is missing.",
             });
           }
+          const mergedParts = parts.flatMap((part) => (part === undefined ? [] : [part]));
           yield* loaded.session.value
             .steerTurn({
               ...(input.beforeInvoke === undefined
@@ -458,11 +491,16 @@ export const layer: Layer.Layer<
                 : { modelSelection: input.modelSelection }),
               message: {
                 messageId: message.id,
-                text: projectComposerContextForProvider({
-                  text: message.text,
-                  records: message.context?.records ?? [],
-                }),
-                attachments: message.attachments,
+                text:
+                  mergedParts.length === 1
+                    ? steerProviderText(message)
+                    : mergedSteerText(
+                        mergedParts.map((part) => ({
+                          text: steerProviderText(part),
+                          message: part,
+                        })),
+                      ),
+                attachments: mergedParts.flatMap((part) => part.attachments),
                 createdBy: message.createdBy,
                 creationSource: message.creationSource,
                 ...(message.scheduledTaskId === undefined

@@ -1,7 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off - a second connection plays another server starting.
-import * as NodeSqlite from "node:sqlite";
-
-import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   DATABASE_MIGRATIONS_FINISHED_MESSAGE,
@@ -11,22 +7,32 @@ import {
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
-import * as Path from "effect/Path";
 import * as References from "effect/References";
 import * as Tracer from "effect/Tracer";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { hasPendingMigrations, migrationManifest, runMigrations } from "./Migrations.ts";
+import {
+  hasPendingMigrations,
+  migrationManifest,
+  runMigrationChains,
+  runMigrations,
+} from "./Migrations.ts";
 import TurnItemCounts from "./Migrations/085_TurnItemCounts.ts";
+import ProviderTurnAttemptIndex from "./Migrations/093_ProviderTurnAttemptIndex.ts";
+import TurnItemMessageOrdinalIndex from "./Migrations/094_TurnItemMessageOrdinalIndex.ts";
+import TurnItemInlineWorkOutput from "./Migrations/095_TurnItemInlineWorkOutput.ts";
 import {
   replacePerfForkTurnItemCounts,
   runPerfForkMigrations,
   UPSTREAM_TURN_ITEM_COUNTS_MIGRATION_ID,
 } from "./PerfForkMigrations.ts";
-import TurnItemMessageOrdinalIndex from "./PerfForkMigrations/002_TurnItemMessageOrdinalIndex.ts";
+import {
+  normalizeSql,
+  ORDINAL_INDEX,
+  PERF_FORK_ORDINAL_INDEX,
+} from "./testkit/PerfForkOrdinalIndex.ts";
 import { PERF_FORK_RUN_ID_TURN_ITEM_COUNTS } from "./testkit/PerfForkRunIdTurnItemCounts.ts";
 
 const FORK_TABLE = "t3_perf_fork_migrations";
@@ -37,9 +43,7 @@ const FORK_CHAIN: Array<[number, string]> = [
 // Release candidate 1 recorded the fork's chain in upstream's ledger, under upstream's next ids.
 const RC1_IDS: Record<number, number> = { 1: 77, 2: 78 };
 const RC1_RAN_AT = "2026-11-01 00:00:00";
-const upstreamChain = migrationManifest.filter(
-  ([, name]) => !FORK_CHAIN.some(([, forkName]) => forkName === name),
-);
+const upstreamChain = migrationManifest;
 const UPSTREAM_HEAD = Math.max(...upstreamChain.map(([id]) => id));
 // Upstream's last migration when release candidate 1 recorded the fork's at 77 and 78; any later
 // upstream migration runs on a release candidate 1 database.
@@ -47,6 +51,10 @@ const RC1_UPSTREAM_HEAD = 76;
 const upstreamSinceRc1 = upstreamChain.filter(([id]) => id > RC1_UPSTREAM_HEAD);
 // Upstream's last migration in the last fork build before upstream's migration 85.
 const BEFORE_085_UPSTREAM_HEAD = 80;
+// Upstream's last migration in 0.1.9-perf.7, the last fork build before upstream's migration 94.
+const BEFORE_094_UPSTREAM_HEAD = 92;
+const FORK_RAN_AT = "2026-11-15 13:25:00";
+const UPSTREAM_RAN_AT = "2026-11-15 13:20:00";
 
 const ledger = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -54,6 +62,15 @@ const ledger = Effect.gen(function* () {
     SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
   `;
   return rows.map((row) => [row.migration_id, row.name] as const);
+});
+
+const ledgerRuns = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return yield* sql<{
+    readonly migration_id: number;
+    readonly name: string;
+    readonly created_at: string;
+  }>`SELECT migration_id, name, created_at FROM effect_sql_migrations ORDER BY migration_id`;
 });
 
 const forkLedger = Effect.gen(function* () {
@@ -135,7 +152,7 @@ const atRc1 = (forkIds: ReadonlyArray<number>) =>
     const sql = yield* SqlClient.SqlClient;
     yield* runMigrations({ toMigrationInclusive: RC1_UPSTREAM_HEAD });
     for (const statement of PERF_FORK_RUN_ID_TURN_ITEM_COUNTS) yield* sql.unsafe(statement);
-    yield* TurnItemMessageOrdinalIndex;
+    yield* sql.unsafe(PERF_FORK_ORDINAL_INDEX);
     for (const [id, name] of FORK_CHAIN) {
       if (!forkIds.includes(id)) continue;
       yield* sql`
@@ -145,76 +162,22 @@ const atRc1 = (forkIds: ReadonlyArray<number>) =>
     }
   });
 
-// A database as the last fork build before upstream's migration 85 left it: the fork chain
-// recorded, its counts keyed by run_id.
-const beforeUpstream085 = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  yield* runMigrations({ toMigrationInclusive: BEFORE_085_UPSTREAM_HEAD });
-  for (const statement of PERF_FORK_RUN_ID_TURN_ITEM_COUNTS) yield* sql.unsafe(statement);
-  yield* runPerfForkMigrations();
-});
+// A database as a fork build with upstream's chain through `upstreamHead` left it: the fork chain
+// recorded at FORK_RAN_AT, its message-ordinal index and, before upstream's 85, its counts keyed
+// by run_id.
+const atForkBuild = (upstreamHead: number) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: upstreamHead });
+    if (upstreamHead < UPSTREAM_TURN_ITEM_COUNTS_MIGRATION_ID) {
+      for (const statement of PERF_FORK_RUN_ID_TURN_ITEM_COUNTS) yield* sql.unsafe(statement);
+    }
+    yield* sql.unsafe(PERF_FORK_ORDINAL_INDEX);
+    yield* runPerfForkMigrations();
+    yield* sql`UPDATE ${sql(FORK_TABLE)} SET created_at = ${FORK_RAN_AT}`;
+  });
 
-const TURN_ITEMS = "orchestration_v2_projection_turn_items";
-// The fork's objects on the turn-item table, which an upstream rebuild of that table drops. The
-// count triggers on it are upstream's (migration 85): such a rebuild recreates them with its own.
-const ORDINAL_INDEX = "orchestration_v2_projection_turn_items_message_ordinal_idx";
-const FORK_OBJECTS_ON_TURN_ITEMS = [ORDINAL_INDEX];
-
-const forkObjectsOnTurnItems = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  const rows = yield* sql<{ readonly name: string }>`
-    SELECT name FROM sqlite_master
-    WHERE name IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)} AND tbl_name = ${TURN_ITEMS}
-    ORDER BY name
-  `;
-  return rows.map((row) => row.name);
-});
-
-// An upstream rebuild that keeps the old table aside: SQLite moves every trigger and index onto
-// it, under the same names, and upstream then moves its own back to the new table.
-const rebuildTurnItemsKeepingTheOld = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  const [table] = yield* sql<{ readonly sql: string }>`
-    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ${TURN_ITEMS}
-  `;
-  const upstreamDependents = yield* sql<{
-    readonly type: string;
-    readonly name: string;
-    readonly sql: string;
-  }>`
-    SELECT type, name, sql FROM sqlite_master
-    WHERE tbl_name = ${TURN_ITEMS} AND type IN ('index', 'trigger') AND sql IS NOT NULL
-      AND name NOT IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)}
-  `;
-  yield* sql.unsafe(table!.sql.replace(TURN_ITEMS, `${TURN_ITEMS}_next`));
-  yield* sql.unsafe(`INSERT INTO ${TURN_ITEMS}_next SELECT * FROM ${TURN_ITEMS}`);
-  yield* sql.unsafe(`ALTER TABLE ${TURN_ITEMS} RENAME TO ${TURN_ITEMS}_old`);
-  yield* sql.unsafe(`ALTER TABLE ${TURN_ITEMS}_next RENAME TO ${TURN_ITEMS}`);
-  for (const dependent of upstreamDependents) {
-    yield* sql.unsafe(`DROP ${dependent.type.toUpperCase()} main."${dependent.name}"`);
-    yield* sql.unsafe(dependent.sql);
-  }
-});
-
-// An upstream migration that rebuilds the turn-item table (create, copy, drop, rename) and then
-// recreates upstream's own indexes and triggers on it, the count triggers among them; the fork's
-// index goes with the old table.
-const rebuildTurnItems = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  const [table] = yield* sql<{ readonly sql: string }>`
-    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ${TURN_ITEMS}
-  `;
-  const upstreamDependents = yield* sql<{ readonly sql: string }>`
-    SELECT sql FROM sqlite_master
-    WHERE tbl_name = ${TURN_ITEMS} AND type IN ('index', 'trigger') AND sql IS NOT NULL
-      AND name NOT IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)}
-  `;
-  yield* sql.unsafe(table!.sql.replace(TURN_ITEMS, `${TURN_ITEMS}_rebuilt`));
-  yield* sql.unsafe(`INSERT INTO ${TURN_ITEMS}_rebuilt SELECT * FROM ${TURN_ITEMS}`);
-  yield* sql.unsafe(`DROP TABLE ${TURN_ITEMS}`);
-  yield* sql.unsafe(`ALTER TABLE ${TURN_ITEMS}_rebuilt RENAME TO ${TURN_ITEMS}`);
-  for (const dependent of upstreamDependents) yield* sql.unsafe(dependent.sql);
-});
+const beforeUpstream085 = atForkBuild(BEFORE_085_UPSTREAM_HEAD);
 
 const insertMoreTurnItems = (prefix: string) =>
   Effect.gen(function* () {
@@ -247,14 +210,75 @@ const usesTheOrdinalIndex = Effect.gen(function* () {
   );
 });
 
-// Upstream's migration 94 (a62bc8156), which merged the fork's migration 2 word for word.
-const UPSTREAM_094_SQL = `
-    CREATE INDEX IF NOT EXISTS orchestration_v2_projection_turn_items_message_ordinal_idx
-    ON orchestration_v2_projection_turn_items(
-      thread_id, json_extract(payload_json, '$.messageId'), ordinal
-    )
-    WHERE type IN ('user_message', 'assistant_message') AND json_valid(payload_json)
+// Every index over `$.messageId`, on whichever table, its statement normalised.
+const messageOrdinalIndexes = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{
+    readonly name: string;
+    readonly tbl_name: string;
+    readonly sql: string;
+  }>`
+    SELECT name, tbl_name, sql FROM sqlite_master
+    WHERE type = 'index' AND instr(sql, '$.messageId') > 0
+    ORDER BY name
   `;
+  return rows.map((row) => ({ ...row, sql: normalizeSql(row.sql) }));
+});
+
+// The index as upstream's chain alone creates it, through its migration 94.
+const upstream094Index = Effect.gen(function* () {
+  yield* runMigrations({ toMigrationInclusive: 94 });
+  return yield* messageOrdinalIndexes;
+}).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" })));
+
+// Turn items the upgrade migrates: one whose payload is not JSON, and a tool item upstream's
+// migration 95 flags as inline work output.
+const insertUpgradeItems = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* insertTurnItems;
+  for (const [id, type, payloadJson] of [
+    ["c1", "user_message", "{not json"],
+    ["c2", "dynamic_tool", '{"toolName":"htmlRender"}'],
+  ] as const) {
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_turn_items (
+        turn_item_id, thread_id, run_id, ordinal, type, status, updated_at, payload_json
+      ) VALUES (
+        ${id}, 'thread-c', 'run-4', 1, ${type}, 'completed', '2026-11-01T00:00:00.000Z',
+        ${payloadJson}
+      )
+    `;
+  }
+});
+
+// A real case: upstream's 0.1.10-nightly started on 0.1.9-perf.7's database. Its migrator ran 93 and
+// 94, a transaction each, and was killed during 95, whose transaction rolled back.
+const upstreamNightlyKilledIn095 = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const upstreamRun = <E>(migration: string, body: Effect.Effect<void, E, SqlClient.SqlClient>) =>
+    Migrator.make({})({ loader: Migrator.fromRecord({ [migration]: body }) });
+  yield* upstreamRun("93_ProviderTurnAttemptIndex", ProviderTurnAttemptIndex);
+  yield* upstreamRun("94_TurnItemMessageOrdinalIndex", TurnItemMessageOrdinalIndex);
+  const killed = yield* Effect.exit(
+    upstreamRun(
+      "95_TurnItemInlineWorkOutput",
+      TurnItemInlineWorkOutput.pipe(Effect.andThen(Effect.fail("killed"))),
+    ),
+  );
+  assert.isTrue(Exit.isFailure(killed));
+  assert.deepStrictEqual((yield* ledger).slice(-2), [
+    [93, "ProviderTurnAttemptIndex"],
+    [94, "TurnItemMessageOrdinalIndex"],
+  ]);
+  assert.deepStrictEqual(
+    yield* sql`
+      SELECT name FROM pragma_table_info('orchestration_v2_projection_turn_items')
+      WHERE name = 'inline_work_output'
+    `,
+    [],
+  );
+  assert.lengthOf(yield* messageOrdinalIndexes, 1);
+});
 
 const captureWarnings = (warnings: Array<unknown>) =>
   Logger.layer([
@@ -264,11 +288,6 @@ const captureWarnings = (warnings: Array<unknown>) =>
       }
     }),
   ]);
-
-const restoreWarnings = (warnings: ReadonlyArray<unknown>) =>
-  warnings
-    .map((warning) => JSON.stringify(warning))
-    .filter((text) => text.includes("restoring them"));
 
 const freshSchema = Effect.gen(function* () {
   yield* runMigrations();
@@ -388,111 +407,109 @@ describe("performance fork migrations", () => {
   );
 
   it.effect.each([
-    { from: "a fresh database", setup: Effect.void, upgrade: upstreamChain },
+    { from: "0.1.9-perf.7's (upstream 92)", upstreamHead: BEFORE_094_UPSTREAM_HEAD },
+    { from: "0.1.7-perf.6's (upstream 80)", upstreamHead: BEFORE_085_UPSTREAM_HEAD },
+    // The fork's chain recorded before upstream's 77, as on an older database.
+    { from: "an older database's (upstream 76)", upstreamHead: 76 },
     {
-      from: "0.1.7-perf.6's (upstream 80, fork 1 and 2)",
-      setup: beforeUpstream085,
-      upgrade: upstreamChain.filter(([id]) => id > BEFORE_085_UPSTREAM_HEAD),
+      from: "a nightly-migrated database's (nightly ran 93-94)",
+      upstreamHead: BEFORE_094_UPSTREAM_HEAD,
+      upstreamBuild: upstreamNightlyKilledIn095,
     },
   ])(
-    "let upstream's migration 94, the fork's message-ordinal index, run as a no-op on $from",
-    ({ setup, upgrade }) =>
+    "upgrade a database in $from state: upstream's migration 94 keeps the fork's index",
+    ({ upstreamHead, upstreamBuild = Effect.void }) =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
-        yield* setup;
-        assert.deepStrictEqual(yield* runMigrations(), upgrade);
+        const expectedSchema = yield* freshSchema;
+        const expectedIndex = yield* upstream094Index;
+        yield* atForkBuild(upstreamHead);
+        yield* insertUpgradeItems;
+        yield* upstreamBuild;
+        // Earlier starts' time, so a start that rewrites a recorded row shows.
+        yield* sql`UPDATE effect_sql_migrations SET created_at = ${UPSTREAM_RAN_AT}`;
+        const upstreamRan = yield* ledgerRuns;
+        const startHead = upstreamRan.at(-1)!.migration_id;
         const forkRan = yield* forkLedger;
         assert.deepStrictEqual(
-          forkRan.map((row) => [row.migration_id, row.name]),
-          FORK_CHAIN,
+          forkRan.map((row) => [row.migration_id, row.name, row.created_at]),
+          FORK_CHAIN.map(([id, name]) => [id, name, FORK_RAN_AT]),
         );
-        yield* insertTurnItems;
-        yield* insertMoreTurnItems("before-094");
-        const schemaBefore = yield* schema;
 
+        const warnings: Array<unknown> = [];
         assert.deepStrictEqual(
-          yield* Migrator.make({})({
-            loader: Migrator.fromRecord({
-              "94_TurnItemMessageOrdinalIndex": Effect.asVoid(sql.unsafe(UPSTREAM_094_SQL)),
-            }),
-          }),
-          [[94, "TurnItemMessageOrdinalIndex"]],
+          yield* runMigrationChains().pipe(Effect.provide(captureWarnings(warnings))),
+          { upstream: upstreamChain.filter(([id]) => id > startHead), perfFork: [] },
         );
-        assert.deepStrictEqual(yield* schema, schemaBefore);
-        // SQLite keeps the statement without IF NOT EXISTS: the fork's index is 094's own.
-        assert.deepStrictEqual(
-          yield* sql`SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ${ORDINAL_INDEX}`,
-          [
-            {
-              type: "index",
-              tbl_name: TURN_ITEMS,
-              sql: UPSTREAM_094_SQL.trimStart().replace("IF NOT EXISTS ", ""),
-            },
-          ],
+        assert.deepStrictEqual(warnings, []);
+        assert.deepStrictEqual(yield* ledger, upstreamChain);
+        const upgraded = yield* ledgerRuns;
+        assert.deepStrictEqual(upgraded.slice(0, upstreamRan.length), upstreamRan);
+        assert.deepStrictEqual(yield* forkLedger, forkRan);
+        assert.lengthOf(expectedIndex, 1);
+        assert.deepStrictEqual(yield* messageOrdinalIndexes, expectedIndex);
+        assert.deepStrictEqual(yield* schema, expectedSchema);
+        assert.lengthOf(
+          yield* sql`
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'index' AND name = 'orchestration_v2_projection_provider_turns_attempt_idx'
+          `,
+          1,
         );
         assert.deepStrictEqual(
           yield* sql`
-            SELECT name FROM sqlite_master
-            WHERE type = 'index' AND tbl_name = ${TURN_ITEMS} AND instr(sql, '$.messageId') > 0
+            SELECT turn_item_id FROM orchestration_v2_projection_turn_items
+            WHERE inline_work_output = 1
           `,
-          [{ name: ORDINAL_INDEX }],
+          [{ turn_item_id: "c2" }],
         );
+        assert.deepStrictEqual(yield* counts, yield* countedFromItems);
+        assert.deepStrictEqual(yield* sql`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);
         yield* usesTheOrdinalIndex;
+        yield* insertMoreTurnItems("after");
+        assert.deepStrictEqual(yield* counts, yield* countedFromItems);
 
         assert.isFalse(yield* hasPendingMigrations());
-        assert.deepStrictEqual(yield* runMigrations(), []);
-        assert.deepStrictEqual(yield* ledger, [
-          ...upstreamChain,
-          [94, "TurnItemMessageOrdinalIndex"],
-        ]);
+        assert.deepStrictEqual(yield* runMigrationChains(), { upstream: [], perfFork: [] });
+        assert.deepStrictEqual(yield* ledgerRuns, upgraded);
         assert.deepStrictEqual(yield* forkLedger, forkRan);
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect(
-    "re-applies a fork migration whose objects an upstream rebuild of their table dropped",
-    () =>
-      Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        yield* runMigrations();
-        const forkRan = yield* forkLedger;
-        yield* insertTurnItems;
-        const next = UPSTREAM_HEAD + 1;
-        assert.deepStrictEqual(
-          yield* Migrator.make({})({
-            loader: Migrator.fromRecord({ [`${next}_RebuildTurnItems`]: rebuildTurnItems }),
-          }),
-          [[next, "RebuildTurnItems"]],
-        );
-        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, []);
-        yield* insertMoreTurnItems("while-missing");
+  it.effect("leave the message-ordinal index to upstream's migration 94 when it is missing", () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const forkRan = yield* forkLedger;
+      yield* insertTurnItems;
+      yield* dropOrdinalIndex;
+      const schemaWithout = yield* schema;
 
-        const warnings: Array<unknown> = [];
-        assert.deepStrictEqual(
-          yield* runMigrations().pipe(Effect.provide(captureWarnings(warnings))),
-          [],
-        );
-        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
-        assert.deepStrictEqual(yield* forkLedger, forkRan);
-        const [restored, ...more] = restoreWarnings(warnings);
-        assert.deepStrictEqual(more, []);
-        assert.include(restored, "t3_perf_fork_migrations:2_TurnItemMessageOrdinalIndex");
-        for (const missing of FORK_OBJECTS_ON_TURN_ITEMS) {
-          assert.include(restored, missing);
-        }
-        yield* insertMoreTurnItems("after");
-        yield* sql`DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'a1'`;
-        assert.deepStrictEqual(yield* counts, yield* countedFromItems);
-        yield* usesTheOrdinalIndex;
+      assert.isFalse(yield* hasPendingMigrations());
+      const warnings: Array<unknown> = [];
+      assert.deepStrictEqual(
+        yield* runMigrationChains().pipe(Effect.provide(captureWarnings(warnings))),
+        { upstream: [], perfFork: [] },
+      );
+      assert.deepStrictEqual(yield* messageOrdinalIndexes, []);
+      assert.deepStrictEqual(warnings, []);
+      assert.deepStrictEqual(yield* schema, schemaWithout);
+      assert.deepStrictEqual(yield* forkLedger, forkRan);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
 
-        // With every object in place, a start runs no body again and leaves upstream's counts be.
-        yield* insertStrayCount("run_key");
-        const countsWithStray = yield* counts;
-        const quiet: Array<unknown> = [];
-        yield* runMigrations().pipe(Effect.provide(captureWarnings(quiet)));
-        assert.deepStrictEqual(restoreWarnings(quiet), []);
-        assert.deepStrictEqual(yield* counts, countsWithStray);
-      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  it.effect("create no index of their own: upstream's migration 94 creates it, once", () =>
+    Effect.gen(function* () {
+      const expectedIndex = yield* upstream094Index;
+      yield* runMigrations({ toMigrationInclusive: 93 });
+
+      assert.deepStrictEqual(yield* runPerfForkMigrations(), FORK_CHAIN);
+      assert.deepStrictEqual(yield* messageOrdinalIndexes, []);
+      assert.deepStrictEqual(yield* runMigrationChains(), {
+        upstream: upstreamChain.filter(([id]) => id > 93),
+        perfFork: [],
+      });
+      assert.deepStrictEqual(yield* messageOrdinalIndexes, expectedIndex);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
   it.effect("warns about fork migrations that a newer fork build recorded", () =>
@@ -515,139 +532,6 @@ describe("performance fork migrations", () => {
       );
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
-
-  it.effect("restores missing objects once, and warns once, when starts run concurrently", () =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations();
-      yield* insertTurnItems;
-      yield* sql.unsafe(`DROP INDEX ${ORDINAL_INDEX}`);
-      yield* insertMoreTurnItems("while-missing");
-      const warnings: Array<unknown> = [];
-
-      yield* Effect.all([runMigrations(), runMigrations(), runMigrations()], {
-        concurrency: "unbounded",
-      }).pipe(Effect.provide(captureWarnings(warnings)));
-      const restoring = (migration: string) =>
-        warnings.filter((warning) => {
-          const text = JSON.stringify(warning);
-          return text.includes("restoring them") && text.includes(migration);
-        });
-      assert.lengthOf(restoring("t3_perf_fork_migrations:1_ProjectionTurnItemCounts"), 0);
-      assert.lengthOf(restoring("t3_perf_fork_migrations:2_TurnItemMessageOrdinalIndex"), 1);
-      assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
-      assert.deepStrictEqual(yield* counts, yield* countedFromItems);
-    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
-  );
-
-  it.effect("warns only when this start restores the objects, not when another just did", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const filename = path.join(
-        yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-heal-" }),
-        "statev2.sqlite",
-      );
-      const atFile = NodeSqliteClient.layer({ filename });
-      const restore = yield* Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        yield* runMigrations();
-        const created = yield* sql<{ readonly sql: string }>`
-          SELECT sql FROM sqlite_master WHERE name IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)}
-        `;
-        yield* sql.unsafe(`DROP INDEX ${ORDINAL_INDEX}`);
-        yield* insertMoreTurnItems("while-missing");
-        return created.map((row) => row.sql);
-      }).pipe(Effect.provide(atFile));
-
-      // Another start restores the objects right after this start's first check finds them
-      // missing.
-      let restoredElsewhere = false;
-      const anotherStart = Tracer.make({
-        span(options) {
-          const span = new Tracer.NativeSpan(options);
-          if (options.name !== "inspectPerfForkObjects") return span;
-          const end = span.end.bind(span);
-          span.end = (endTime, exit) => {
-            end(endTime, exit);
-            if (restoredElsewhere) return;
-            restoredElsewhere = true;
-            const db = new NodeSqlite.DatabaseSync(filename);
-            try {
-              db.exec("BEGIN IMMEDIATE");
-              for (const statement of restore) db.exec(statement);
-              db.exec("COMMIT");
-            } finally {
-              db.close();
-            }
-          };
-          return span;
-        },
-      });
-      const warnings: Array<unknown> = [];
-
-      yield* Effect.gen(function* () {
-        yield* runMigrations().pipe(
-          Effect.withTracer(anotherStart),
-          Effect.provide(captureWarnings(warnings)),
-        );
-        assert.isTrue(restoredElsewhere);
-        assert.notInclude(JSON.stringify(warnings), "restoring them");
-        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
-      }).pipe(Effect.provide(atFile));
-    }).pipe(Effect.provide(NodeServices.layer)),
-  );
-
-  it.effect("names the fork migration and its missing objects when running it again fails", () =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations();
-      yield* sql.unsafe(`DROP INDEX ${ORDINAL_INDEX}`);
-      // A table under the index's name stops its CREATE INDEX IF NOT EXISTS.
-      yield* sql.unsafe(`CREATE TABLE ${ORDINAL_INDEX} (id INTEGER)`);
-
-      const exit = yield* Effect.exit(runMigrations());
-      assert.isTrue(Exit.isFailure(exit));
-      assert.include(String(exit), "MigrationError");
-      assert.include(String(exit), "t3_perf_fork_migrations:2_TurnItemMessageOrdinalIndex");
-      assert.include(String(exit), ORDINAL_INDEX);
-      assert.deepStrictEqual(yield* forkObjectsOnTurnItems, []);
-
-      // A later start tries again.
-      yield* sql.unsafe(`DROP TABLE ${ORDINAL_INDEX}`);
-      yield* runMigrations();
-      assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
-    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
-  );
-
-  it.effect(
-    "moves the fork's objects back from a turn-item table an upstream rebuild kept aside",
-    () =>
-      Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        yield* runMigrations();
-        yield* insertTurnItems;
-        const next = UPSTREAM_HEAD + 1;
-        yield* Migrator.make({})({
-          loader: Migrator.fromRecord({
-            [`${next}_RebuildTurnItemsKeepingTheOld`]: rebuildTurnItemsKeepingTheOld,
-          }),
-        });
-        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, []);
-        yield* insertMoreTurnItems("while-aside");
-
-        yield* runMigrations();
-        assert.deepStrictEqual(yield* forkObjectsOnTurnItems, FORK_OBJECTS_ON_TURN_ITEMS);
-        assert.deepStrictEqual(
-          yield* sql`SELECT name FROM sqlite_master WHERE tbl_name = ${`${TURN_ITEMS}_old`}
-          AND name IN ${sql.in(FORK_OBJECTS_ON_TURN_ITEMS)}`,
-          [],
-        );
-        yield* insertMoreTurnItems("after");
-        assert.deepStrictEqual(yield* counts, yield* countedFromItems);
-        yield* usesTheOrdinalIndex;
-      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
-  );
 });
 
 const dropOrdinalIndex = Effect.gen(function* () {
@@ -659,7 +543,6 @@ const dropOrdinalIndex = Effect.gen(function* () {
 const upstreamCurrentWithForkWork = [
   { work: "no fork ledger yet", setup: runMigrations({ toPerfForkMigrationInclusive: 0 }) },
   { work: "a fork migration to run", setup: runMigrations({ toPerfForkMigrationInclusive: 1 }) },
-  { work: "a fork index to restore", setup: Effect.andThen(runMigrations(), dropOrdinalIndex) },
 ];
 
 describe("pending migration work", () => {

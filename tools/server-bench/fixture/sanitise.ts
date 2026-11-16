@@ -7,6 +7,7 @@ import * as Console from "effect/Console";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
+import { PULL_REQUEST_WAKE_RETRY_STATUSES } from "../../../apps/server/src/orchestration-v2/ProjectionStore.ts";
 import { type BlankStep, blankTables } from "./blank.ts";
 import { type ContentMode, contentFindings } from "./content.ts";
 import { undecodableRows } from "./decode.ts";
@@ -486,6 +487,19 @@ const settleDeliveries = (db: NodeSqlite.DatabaseSync, now: string) => {
      SET payload_json = json_set(payload_json, '$.completionDelivery.state', 'disposed')
      WHERE json_extract(payload_json, '$.completionDelivery.state') = 'pending'`,
   );
+  // A boot sends again the news of a merged pull request wake whose run ended undelivered (the
+  // server's statuses); with its first pull request alone, no such wake tells several pull requests'.
+  const retryable = `(${PULL_REQUEST_WAKE_RETRY_STATUSES.map((status) => `'${status}'`).join(", ")})`;
+  const pullRequestWakes = changes(
+    `UPDATE orchestration_v2_projection_messages
+     SET payload_json = json_remove(payload_json, '$.notification.source.otherPullRequests')
+     WHERE (run_id IN (SELECT run_id FROM orchestration_v2_projection_runs
+           WHERE status IN ${retryable})
+         OR message_id IN (SELECT json_extract(payload_json, '$.userMessageId')
+           FROM orchestration_v2_projection_runs WHERE status IN ${retryable}))
+       AND json_valid(payload_json)
+       AND json_type(payload_json, '$.notification.source.otherPullRequests') IS NOT NULL`,
+  );
   let results = 0;
   let closed = 0;
   let transfers = 0;
@@ -643,6 +657,7 @@ const settleDeliveries = (db: NodeSqlite.DatabaseSync, now: string) => {
   return {
     delegated,
     deliveries,
+    pullRequestWakes,
     streaming,
     results,
     closed,

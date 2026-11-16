@@ -306,7 +306,7 @@ describe("thread workflows", () => {
   });
 
   it.each(["preparing", "starting", "waiting"] as const)(
-    "defers steering during setup and blocks it while waiting (%s)",
+    "defers steering during setup and starts the message after a waiting run's turn (%s)",
     (status) => {
       const state = deriveThreadQueueWorkflowState({
         thread: { id: "thread", activeProviderThreadId: "provider-thread" },
@@ -328,6 +328,8 @@ describe("thread workflows", () => {
             status: status === "waiting" ? "completed" : "starting",
           },
         ],
+        runtimeRequests: [],
+        turnItems: [],
         providerThreads: [
           {
             id: "provider-thread",
@@ -344,9 +346,67 @@ describe("thread workflows", () => {
         ],
       } as never);
 
-      expect(state.canPromoteToSteer).toBe(status !== "waiting");
+      expect(state.canPromoteToSteer).toBe(true);
+      expect(state.promoteEndsWait).toBe(status === "waiting");
     },
   );
+
+  // The server ends a wait only for the thread's one active run, from its root turn, with no
+  // request open and no Stop; Send now is offered exactly then.
+  it.each([
+    { when: "its turn is over", ends: true },
+    { when: "a request waits on the user", pendingRequest: true, ends: false },
+    { when: "Stop reached the run", stopped: true, ends: false },
+    { when: "another run is active", otherActive: true, ends: false },
+    { when: "a subagent's later turn still runs", childTurnRunning: true, ends: true },
+  ])("offers Send now on a waiting run when $when: $ends", (input) => {
+    const state = deriveThreadQueueWorkflowState({
+      thread: { id: "thread", activeProviderThreadId: "provider-thread" },
+      runs: [
+        ...(input.otherActive === true
+          ? [{ id: "other", status: "running", rootNodeId: "node-other", ordinal: 1 }]
+          : []),
+        {
+          id: "active",
+          status: "waiting",
+          providerThreadId: "provider-thread",
+          rootNodeId: "node-active",
+          activeAttemptId: "attempt-active",
+          ordinal: 2,
+        },
+        { id: "queued", status: "queued", userMessageId: "message", ordinal: 3 },
+      ],
+      messages: [{ id: "message", text: "Queued" }],
+      providerTurns: [
+        { nodeId: "node-active", runAttemptId: "attempt-active", ordinal: 1, status: "completed" },
+        ...(input.childTurnRunning === true
+          ? [
+              {
+                nodeId: "node-child",
+                runAttemptId: "attempt-active",
+                ordinal: 2,
+                status: "running",
+              },
+            ]
+          : []),
+      ],
+      runtimeRequests: input.pendingRequest === true ? [{ status: "pending" }] : [],
+      turnItems: input.stopped === true ? [{ runId: "active", type: "run_interrupt_request" }] : [],
+      providerThreads: [
+        { id: "provider-thread", appThreadId: "thread", providerSessionId: "provider-session" },
+      ],
+      providerSessions: [
+        {
+          id: "provider-session",
+          status: "running",
+          capabilities: capabilities({ queued: true, steer: true }),
+        },
+      ],
+    } as never);
+
+    expect(state.promoteEndsWait).toBe(input.ends);
+    expect(state.canPromoteToSteer).toBe(input.ends);
+  });
 
   it("allows native, portable, and capability-unknown exact-run forks", () => {
     const projectedItem = {

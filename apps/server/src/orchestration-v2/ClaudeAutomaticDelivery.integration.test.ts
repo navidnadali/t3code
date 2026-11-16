@@ -10,10 +10,12 @@ import {
   NodeId,
   ProjectId,
   ProviderInstanceId,
+  RunId,
   ScheduledTaskUpsertInput,
   ThreadId,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -25,6 +27,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -607,6 +610,153 @@ it.effect("applies an effort change to the running Claude query without waiting 
   ),
 );
 
+const renamedClaudeSessionTitles = (options: { readonly renameDuringStartup: boolean }) =>
+  Effect.gen(function* () {
+    const cwd = yield* checkpointWorkspace("claude-live-rename");
+    const sdkMessages = yield* Queue.unbounded<SDKMessage>();
+    const renames: string[] = [];
+    const startupEntered = yield* Deferred.make<void>();
+    const startupReleased = yield* Deferred.make<void>();
+    const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+      instanceId: modelSelection.instanceId,
+      settings,
+      environment: {},
+      attachmentsDir: cwd,
+      fileSystem: yield* FileSystem.FileSystem,
+      path: yield* Path.Path,
+      random: yield* SecureRandom.SecureRandom,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      queryRunner: {
+        allocateSessionId: Effect.succeed(sessionId),
+        open: () =>
+          Effect.succeed({
+            messages: Stream.fromQueue(sdkMessages),
+            offer: () => Effect.void,
+            setModel: () => Effect.void,
+            applyFlagSettings: () => Effect.void,
+            setPermissionMode: () => Effect.void,
+            renameSession: (title) =>
+              Effect.sync(() => {
+                renames.push(title);
+              }),
+            backgroundTasks: () => Effect.succeed(false),
+            mcpServerStatus: Effect.succeed([]),
+            readMcpResource: () => Effect.die("unexpected MCP resource read"),
+            callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            listPermissionRules: Effect.die("unexpected permission rules read"),
+            stopTask: () => Effect.void,
+            interrupt: Effect.die("a rename must not interrupt the turn"),
+            close: Effect.void,
+          }),
+        forkSession: () => Effect.die("unused"),
+        subagentLaunchToolUseId: () => Effect.succeed(null),
+        subagentModel: () => Effect.succeed(null),
+        assertComplete: Effect.void,
+      },
+    });
+    return yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const threadId = ThreadId.make("thread:live-rename");
+      const running = yield* orchestrator.streamDomainEvents.pipe(
+        Stream.filter(
+          (event) => event.type === "provider-turn.updated" && event.payload.status === "running",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create"),
+        threadId,
+        projectId: ProjectId.make("project:live-rename"),
+        title: "Seed title",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: cwd,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("first"),
+        threadId,
+        messageId: MessageId.make("first"),
+        text: "Keep working.",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const rename = orchestrator.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make("rename"),
+        threadId,
+        title: "Renamed title",
+      });
+      if (options.renameDuringStartup) {
+        const starting = yield* worker.drain().pipe(Effect.forkScoped);
+        yield* Deferred.await(startupEntered);
+        yield* rename;
+        yield* Deferred.succeed(startupReleased, undefined);
+        yield* Fiber.join(starting);
+        yield* Fiber.join(running);
+      } else {
+        yield* worker.drain();
+        yield* Fiber.join(running);
+        assert.deepEqual(renames, []);
+        yield* rename;
+      }
+      yield* worker.drain();
+      return renames;
+    }).pipe(
+      Effect.provide(
+        ProviderReplayHarness.layerWithRegistry(
+          { name: "claude-live-rename" },
+          ProviderAdapterRegistry.layerSingle({
+            ...adapter,
+            openSession: (input) =>
+              options.renameDuringStartup
+                ? Deferred.succeed(startupEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(startupReleased)),
+                    Effect.andThen(adapter.openSession(input)),
+                  )
+                : adapter.openSession(input),
+          }),
+          { runEffectWorker: false },
+        ),
+      ),
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        IdAllocator.layer,
+        McpProviderSessions.layer,
+        NodeServices.layer,
+        NodeCrypto.layer,
+      ),
+    ),
+  );
+
+it.effect("renames the running Claude session when the thread is renamed mid-turn", () =>
+  Effect.gen(function* () {
+    assert.deepEqual(yield* renamedClaudeSessionTitles({ renameDuringStartup: false }), [
+      "Renamed title",
+    ]);
+  }),
+);
+
+it.effect("renames the Claude session when the thread is renamed while it starts", () =>
+  Effect.gen(function* () {
+    assert.deepEqual(yield* renamedClaudeSessionTitles({ renameDuringStartup: true }), [
+      "Renamed title",
+    ]);
+  }),
+);
+
 const backgroundTaskStarted = (taskId: string) =>
   frame({
     type: "system",
@@ -886,4 +1036,276 @@ it.effect("offers a continuation for a later wake after a queued continuation is
       ),
     ),
   ),
+);
+
+it.effect(
+  "steers an automation and a cross-thread message into a busy Claude turn 60 to 90 s after each queues, past a pile of completion wakes",
+  () =>
+    Effect.gen(function* () {
+      const cwd = yield* checkpointWorkspace("claude-auto-send-now");
+      const sdkMessages = yield* Queue.unbounded<SDKMessage>();
+      const offers: Array<{ readonly message: SDKUserMessage; readonly at: number }> = [];
+      const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+        instanceId: modelSelection.instanceId,
+        settings,
+        environment: {},
+        attachmentsDir: cwd,
+        fileSystem: yield* FileSystem.FileSystem,
+        path: yield* Path.Path,
+        random: yield* SecureRandom.SecureRandom,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+        queryRunner: {
+          allocateSessionId: Effect.succeed(sessionId),
+          open: () =>
+            Effect.succeed({
+              messages: Stream.fromQueue(sdkMessages),
+              offer: (message) =>
+                Clock.currentTimeMillis.pipe(
+                  Effect.map((at) => {
+                    offers.push({ message, at });
+                  }),
+                ),
+              setModel: () => Effect.void,
+              applyFlagSettings: () => Effect.void,
+              setPermissionMode: () => Effect.void,
+              renameSession: () => Effect.void,
+              backgroundTasks: () => Effect.succeed(false),
+              mcpServerStatus: Effect.succeed([]),
+              readMcpResource: () => Effect.die("unexpected MCP resource read"),
+              callMcpTool: () => Effect.die("unexpected MCP tool call"),
+              listPermissionRules: Effect.die("unexpected permission rules read"),
+              stopTask: () => Effect.void,
+              interrupt: Effect.die("automatic delivery must never interrupt"),
+              close: Effect.void,
+            }),
+          forkSession: () => Effect.die("unused"),
+          subagentLaunchToolUseId: () => Effect.succeed(null),
+          subagentModel: () => Effect.succeed(null),
+          assertComplete: Effect.void,
+        },
+      });
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const threadId = ThreadId.make("thread:claude-auto-send-now");
+        const projectId = ProjectId.make("project:claude-auto-send-now");
+        const watch = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
+          orchestrator.streamDomainEvents.pipe(
+            Stream.filter(predicate),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("create"),
+          threadId,
+          projectId,
+          title: "Busy orchestrator",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: cwd,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const running = yield* watch(
+          (event) => event.type === "provider-turn.updated" && event.payload.status === "running",
+        );
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("first"),
+          threadId,
+          messageId: MessageId.make("first"),
+          text: "Build and check all four tasks.",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* worker.drain();
+        yield* Fiber.join(running);
+        const pending = yield* watch(
+          (event) =>
+            event.type === "turn-item.updated" &&
+            event.payload.nativeItemRef?.nativeId === "status-4",
+        );
+        yield* Queue.offer(sdkMessages, batch);
+        yield* Fiber.join(pending);
+        const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+        const queuedAt = yield* DateTime.now;
+        const wakes = Array.from({ length: 20 }, (_, index) => ({
+          runId: RunId.make(`run:completion-wake-${index}`),
+          messageId: MessageId.make(`completion-wake-${index}`),
+          index,
+        }));
+        yield* (yield* EventSink.EventSinkV2).write({
+          events: wakes.flatMap(({ runId, messageId, index }) => [
+            {
+              id: EventId.make(`wake-run-${index}`),
+              type: "run.created" as const,
+              threadId,
+              runId,
+              occurredAt: queuedAt,
+              payload: {
+                ...parent,
+                id: runId,
+                ordinal: index + 2,
+                userMessageId: messageId,
+                rootNodeId: null,
+                activeAttemptId: null,
+                status: "queued" as const,
+                queuePosition: index + 1,
+                requestedAt: queuedAt,
+                startedAt: null,
+                completedAt: null,
+              },
+            },
+            {
+              id: EventId.make(`wake-message-${index}`),
+              type: "message.updated" as const,
+              threadId,
+              runId,
+              occurredAt: queuedAt,
+              payload: {
+                id: messageId,
+                threadId,
+                runId,
+                nodeId: null,
+                role: "user" as const,
+                text: "Delegated task completed",
+                attachments: [],
+                streaming: false,
+                createdAt: queuedAt,
+                updatedAt: queuedAt,
+                createdBy: "agent" as const,
+                creationSource: "server" as const,
+                delegatedCompletion: {
+                  parentRunId: RunId.make(`run:delegating-${index}`),
+                  generation: 1,
+                  taskIds: [NodeId.make(`task:${index}`)],
+                },
+              },
+            },
+          ]),
+        });
+        yield* Effect.gen(function* () {
+          const service = yield* ScheduledTaskService.ScheduledTaskService;
+          const { task } = yield* service.upsert(
+            yield* decodeScheduledTask({
+              title: "Status check",
+              prompt: "Report the build status.",
+              enabled: true,
+              schedule: { type: "interval", everyMs: 3_600_000 },
+              projectId,
+              threadId,
+              workspaceStrategy: { type: "root" },
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+            }),
+          );
+          const ran = yield* service.runNow({ id: task.id });
+          assert.equal(ran.task.lastRunStatus, "succeeded");
+        }).pipe(
+          Effect.provide(
+            ScheduledTaskService.layer.pipe(
+              Layer.provide(ThreadManagementService.layer),
+              Layer.provide(ServerSettings.layerTest()),
+              Layer.provide(
+                Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+                  ensureTranscript: () =>
+                    Effect.succeed({ importedThreadCount: 0, importedMessageCount: 0 }),
+                }),
+              ),
+              Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+              Layer.provide(ManagedPolicy.layerTest()),
+              Layer.provide(
+                Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+                  namedProjectsRoot: "/projects",
+                  isScratchProject: () => Effect.succeed(false),
+                }),
+              ),
+              Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+              Layer.provide(
+                CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+              ),
+              Layer.provide(
+                Layer.mergeAll(NodeCrypto.layer, Scheduler.layer, SqlitePersistence.layerMemory),
+              ),
+            ),
+          ),
+        );
+        const queued = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(
+          queued.runs.filter((run) => run.status === "queued").map((run) => run.queuePosition),
+          Array.from({ length: 21 }, (_, index) => index + 1),
+        );
+        const steersAfter = Effect.fn("steersAfter")(function* (seconds: number) {
+          for (let step = 0; step < seconds / 5; step++) {
+            yield* TestClock.adjust("5 seconds");
+            yield* worker.drain();
+          }
+          return offers.filter((offer) => offer.message.priority === "now");
+        });
+        const steerText = (offer: (typeof offers)[number]) =>
+          ["Report the build status.", "Peer thread finished the migration."].find((text) =>
+            JSON.stringify(offer.message.message).includes(text),
+          );
+        assert.lengthOf(yield* steersAfter(55), 0);
+        const [automationSteer] = yield* steersAfter(35);
+        assert.equal(steerText(automationSteer!), "Report the build status.");
+        const peerQueuedAt = yield* DateTime.now;
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("peer"),
+          threadId,
+          messageId: MessageId.make("peer"),
+          text: "Peer thread finished the migration.",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          senderThreadId: ThreadId.make("thread:peer"),
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        assert.lengthOf(yield* steersAfter(55), 1);
+        const steers = yield* steersAfter(35);
+        assert.deepEqual(steers.map(steerText), [
+          "Report the build status.",
+          "Peer thread finished the migration.",
+        ]);
+        const sinceQueued = [
+          steers[0]!.at - DateTime.toEpochMillis(queuedAt),
+          steers[1]!.at - DateTime.toEpochMillis(peerQueuedAt),
+        ];
+        for (const delay of sinceQueued) {
+          assert.isAtLeast(delay, 60_000);
+          assert.isAtMost(delay, 90_000);
+        }
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(
+          after.runs.filter((run) => run.status === "queued").map((run) => run.id),
+          wakes.map((wake) => wake.runId),
+        );
+        assert.equal(after.runs[0]?.status, "running");
+      }).pipe(
+        Effect.provide(
+          ProviderReplayHarness.layerWithRegistry(
+            { name: "claude-auto-send-now" },
+            ProviderAdapterRegistry.layerSingle(adapter),
+            { runEffectWorker: false },
+          ),
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
 );

@@ -305,6 +305,8 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   let handed = 0;
   let consuming = false;
   let consumerIdle = false;
+  // Control calls main is waiting on: the consumer may be one of the waiters.
+  let requesting = 0;
   const frames: Array<Uint8Array | ClaudeAgentSdkWorkerRequest> = [];
   let session:
     | ProviderIoSession<
@@ -523,7 +525,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   // Before the consumer's first pull nothing orders a callback, as in-thread.
   const startDue = () => {
     for (let next = due[0]; next !== undefined; next = due[0]) {
-      if (consuming && next.after > handed) return;
+      if (consuming && requesting === 0 && next.after > handed) return;
       due.shift();
       next.start();
     }
@@ -561,7 +563,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
           after: event.after,
           start: () => runCallback(event.id, event.call, event.jsonArgs),
         });
-        if (consumerIdle || !consuming) startDue();
+        if (consumerIdle || !consuming || requesting > 0) startDue();
         return;
       case "callbackAbort":
         callbacks.get(event.id)?.abort();
@@ -625,14 +627,22 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
   })();
 
   // A reply resumes its caller at once, but outputs wake the consumer through the scheduler; yielding
-  // lets the consumer take the frames that came before the reply first, as it would in-thread.
-  const request = <A>(message: ClaudeAgentSdkWorkerRequest): Promise<A> =>
-    released
-      ? Promise.reject(new Error(QUERY_ENDED))
-      : runPromise(workerSession.call(message).pipe(Effect.onExit(() => Effect.yieldNow))).then(
-          (reply) => fromWorkerReply(reply) as A,
-          (error: WorkerSessionError) => Promise.reject(workerCause(error)),
-        );
+  // lets the consumer take the frames that came before the reply first, as it would in-thread. While
+  // a call waits, callbacks start at once, as in-thread: the CLI may need one to answer it.
+  const request = <A>(message: ClaudeAgentSdkWorkerRequest): Promise<A> => {
+    if (released) return Promise.reject(new Error(QUERY_ENDED));
+    requesting += 1;
+    startDue();
+    return runPromise(
+      workerSession.call(message).pipe(
+        Effect.ensuring(Effect.sync(() => (requesting -= 1))),
+        Effect.onExit(() => Effect.yieldNow),
+      ),
+    ).then(
+      (reply) => fromWorkerReply(reply) as A,
+      (error: WorkerSessionError) => Promise.reject(workerCause(error)),
+    );
+  };
   // Like the SDK's: disposing and returning never fail.
   const settle = (message: ClaudeAgentSdkWorkerRequest) =>
     released
@@ -667,8 +677,8 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
 
   // A callback starts once the consumer has handled the messages read before it (the in-thread order
   // when the request comes in its own read), output split there. Invariant: the message consumer must
-  // never wait on a callback's result, or this deadlocks. A cancel that comes before the start leaves
-  // the callback starting with an aborted signal, where in-thread it was running.
+  // never wait on a callback's result outside a control call, or this deadlocks. A cancel that comes
+  // before the start leaves the callback starting with an aborted signal, where in-thread it was running.
   const ordered = Stream.transformPull(workerSession.output, (pull) =>
     Effect.sync(() => {
       let chunk: ReadonlyArray<ClaudeAgentSdkWorkerOutput> = [];

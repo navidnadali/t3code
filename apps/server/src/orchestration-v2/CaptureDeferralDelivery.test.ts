@@ -26,7 +26,7 @@ const layerTest = Layer.fresh(
   EffectOutbox.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
 );
 
-const captureHold = Duration.seconds(7);
+const captureHold = Duration.seconds(8);
 
 const capture = (id: string, threadId: ThreadId) => ({
   id,

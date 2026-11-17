@@ -5,6 +5,7 @@ import {
   OrchestrationV2StoredEvent,
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2Run,
+  type OrchestrationV2RunAttempt,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   type ModelSelection,
@@ -161,28 +162,51 @@ const CONVERSATION_RUN_STATUSES = new Set<OrchestrationV2Run["status"]>([
   "failed",
 ]);
 
-function runsOffNativeBranch(input: {
+/** @internal Exported for tests. */
+export function runsOffNativeBranch(input: {
   readonly projection: Pick<OrchestrationV2ThreadProjection, "runs" | "attempts" | "providerTurns">;
   readonly providerThreadId: ProviderThreadId;
   readonly retainedNativeTurnIds: ReadonlySet<string>;
   readonly reportingRunId: RunId | undefined;
 }): ReadonlyArray<OrchestrationV2Run> {
   const { attempts, providerTurns, runs } = input.projection;
+  const candidates = runs.filter(
+    (run) =>
+      run.providerThreadId === input.providerThreadId &&
+      run.id !== input.reportingRunId &&
+      CONVERSATION_RUN_STATUSES.has(run.status),
+  );
+  if (candidates.length === 0) return [];
+  // A run's native turn is that of the first provider turn its first matching attempt names or tags.
+  const attemptById = new Map<RunAttemptId, OrchestrationV2RunAttempt>();
+  for (const attempt of attempts) {
+    const id = attempt.id;
+    if (!attemptById.has(id)) attemptById.set(id, attempt);
+  }
+  const turnIndexById = new Map<ProviderTurnId, number>();
+  const turnIndexByAttemptId = new Map<RunAttemptId, number>();
+  providerTurns.forEach((turn, index) => {
+    const id = turn.id;
+    const runAttemptId = turn.runAttemptId;
+    if (!turnIndexById.has(id)) turnIndexById.set(id, index);
+    if (runAttemptId !== null && !turnIndexByAttemptId.has(runAttemptId)) {
+      turnIndexByAttemptId.set(runAttemptId, index);
+    }
+  });
   const nativeTurnId = (run: OrchestrationV2Run) => {
-    const attempt = attempts.find((candidate) => candidate.id === run.activeAttemptId);
+    const attempt = run.activeAttemptId === null ? undefined : attemptById.get(run.activeAttemptId);
     if (attempt === undefined) return null;
-    const ref = providerTurns.find(
-      (turn) => turn.id === attempt.providerTurnId || turn.runAttemptId === attempt.id,
-    )?.nativeTurnRef;
+    const byId =
+      attempt.providerTurnId === null ? undefined : turnIndexById.get(attempt.providerTurnId);
+    const byAttempt = turnIndexByAttemptId.get(attempt.id);
+    const index =
+      byId === undefined || byAttempt === undefined
+        ? (byId ?? byAttempt)
+        : Math.min(byId, byAttempt);
+    const ref = index === undefined ? undefined : providerTurns[index]?.nativeTurnRef;
     return ref?.strength === "strong" ? ref.nativeId : null;
   };
-  const settled = runs.flatMap((run) =>
-    run.providerThreadId === input.providerThreadId &&
-    run.id !== input.reportingRunId &&
-    CONVERSATION_RUN_STATUSES.has(run.status)
-      ? [{ run, nativeTurnId: nativeTurnId(run) }]
-      : [],
-  );
+  const settled = candidates.map((run) => ({ run, nativeTurnId: nativeTurnId(run) }));
   const lastRetainedOrdinal = settled.reduce(
     (last, { run, nativeTurnId }) =>
       nativeTurnId !== null && input.retainedNativeTurnIds.has(nativeTurnId)

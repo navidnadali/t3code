@@ -14,7 +14,9 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
+  type OrchestrationV2RunAttempt,
   type OrchestrationV2TurnItem,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -23,6 +25,7 @@ import {
   RunAttemptId,
   RunId,
   RuntimeRequestId,
+  ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -2718,3 +2721,152 @@ it.effect(
       ),
     ),
 );
+
+const branchProviderThreadId = ProviderThreadId.make("provider-thread:branch");
+const branchRun = (
+  ordinal: number,
+  attemptId: string,
+  status: OrchestrationV2Run["status"] = "completed",
+): OrchestrationV2Run => ({
+  id: RunId.make(`run:branch:${ordinal}`),
+  threadId: ThreadId.make("thread:branch"),
+  ordinal,
+  providerInstanceId: modelSelection.instanceId,
+  modelSelection,
+  providerThreadId: branchProviderThreadId,
+  userMessageId: MessageId.make(`message:branch:${ordinal}`),
+  rootNodeId: NodeId.make(`node:branch:${ordinal}`),
+  activeAttemptId: RunAttemptId.make(attemptId),
+  status,
+  requestedAt: DateTime.makeUnsafe(0),
+  startedAt: null,
+  completedAt: null,
+  checkpointId: null,
+  contextHandoffId: null,
+});
+const branchAttempt = (id: string, providerTurnId: string | null): OrchestrationV2RunAttempt => ({
+  id: RunAttemptId.make(id),
+  runId: RunId.make(`run:branch:${id}`),
+  attemptOrdinal: 1,
+  rootNodeId: NodeId.make(`node:branch:${id}`),
+  providerInstanceId: modelSelection.instanceId,
+  providerThreadId: branchProviderThreadId,
+  providerTurnId: providerTurnId === null ? null : ProviderTurnId.make(providerTurnId),
+  reason: "initial",
+  status: "completed",
+  startedAt: null,
+  completedAt: null,
+});
+const branchTurn = (
+  id: string,
+  runAttemptId: string | null,
+  nativeId: string,
+  strength: "strong" | "weak" = "strong",
+): OrchestrationV2ProviderTurn => ({
+  id: ProviderTurnId.make(id),
+  providerThreadId: branchProviderThreadId,
+  nodeId: NodeId.make(`node:branch:${id}`),
+  runAttemptId: runAttemptId === null ? null : RunAttemptId.make(runAttemptId),
+  nativeTurnRef: { driver: CODEX_DRIVER, nativeId, strength },
+  ordinal: 1,
+  status: "completed",
+  startedAt: null,
+  completedAt: null,
+});
+
+/** A copy of `value` whose getters for `keys` count their reads. */
+const countingReads = <T extends object>(
+  value: T,
+  keys: ReadonlyArray<keyof T & string>,
+  reads: { count: number },
+): T =>
+  Object.defineProperties(
+    { ...value },
+    Object.fromEntries(
+      keys.map((key) => [
+        key,
+        {
+          enumerable: true,
+          get: () => {
+            reads.count += 1;
+            return value[key];
+          },
+        },
+      ]),
+    ),
+  );
+
+it("finds a rewind's runs off the native branch in reads linear in runs, attempts and turns", () => {
+  const size = 2_000;
+  const reads = { count: 0 };
+  // Every tenth run has only a weak native turn ref, so it is placed by ordinal.
+  const nativeId = (ordinal: number) => `native:${ordinal}`;
+  const runs = Array.from({ length: size }, (_, index) =>
+    branchRun(index + 1, `attempt:${index + 1}`, index + 1 === size ? "running" : "completed"),
+  );
+  const attempts = runs.map((run) =>
+    countingReads(branchAttempt(`attempt:${run.ordinal}`, `turn:${run.ordinal}`), ["id"], reads),
+  );
+  const providerTurns = runs.map((run) =>
+    countingReads(
+      branchTurn(
+        `turn:${run.ordinal}`,
+        `attempt:${run.ordinal}`,
+        nativeId(run.ordinal),
+        run.ordinal % 10 === 5 ? "weak" : "strong",
+      ),
+      ["id", "runAttemptId"],
+      reads,
+    ),
+  );
+
+  const offBranch = ProviderEventIngestor.runsOffNativeBranch({
+    projection: { runs, attempts, providerTurns },
+    providerThreadId: branchProviderThreadId,
+    retainedNativeTurnIds: new Set(
+      Array.from({ length: size / 2 }, (_, index) => nativeId(index + 1)),
+    ),
+    reportingRunId: runs[size - 1]!.id,
+  });
+
+  assert.deepEqual(
+    offBranch.map((run) => run.ordinal),
+    Array.from({ length: size / 2 - 1 }, (_, index) => size / 2 + 1 + index),
+  );
+  assert.isAtMost(reads.count, 2 * (runs.length + attempts.length + providerTurns.length));
+});
+
+it("places a rewound run by its first attempt and the first provider turn naming either", () => {
+  const offBranch = ProviderEventIngestor.runsOffNativeBranch({
+    projection: {
+      runs: [
+        branchRun(1, "attempt:a"),
+        branchRun(2, "attempt:b"),
+        branchRun(3, "attempt:c"),
+        branchRun(4, "attempt:reporting", "running"),
+      ],
+      attempts: [
+        branchAttempt("attempt:a", "turn:a:named"),
+        branchAttempt("attempt:b", "turn:b:named"),
+        branchAttempt("attempt:a", "turn:a:shadowed"),
+        branchAttempt("attempt:c", "turn:c"),
+      ],
+      providerTurns: [
+        branchTurn("turn:a:shadowed", null, "a:shadowed"),
+        branchTurn("turn:a:tagged", "attempt:a", "a:tagged"),
+        branchTurn("turn:a:named", null, "a:named"),
+        branchTurn("turn:b:named", null, "b:named"),
+        branchTurn("turn:b:tagged", "attempt:b", "b:tagged"),
+        branchTurn("turn:c", "attempt:c", "c"),
+      ],
+    },
+    providerThreadId: branchProviderThreadId,
+    retainedNativeTurnIds: new Set(["a:tagged", "b:named"]),
+    reportingRunId: RunId.make("run:branch:4"),
+  });
+
+  assert.deepEqual(
+    offBranch.map((run) => run.ordinal),
+    [3],
+  );
+});

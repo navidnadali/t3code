@@ -2,6 +2,16 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.9-perf.12 (2026-11-17)
+
+Hotfix: linear id reads for a run's provider turn and a rewind's off-branch runs
+
+Upstream base: 7d32075e3757.
+
+Same upstream main as 0.1.9-perf.10 (2026-11-16); no new migrations.
+
+- A run's provider turn and a rewind's off-branch runs are found in one pass over the turns and attempts instead of one per pair, with the same result for every input. A follow-up on a parent with a long history no longer blocks the event loop on this lookup.
+
 ## v0.1.9-perf.11 (2026-11-17)
 
 Wait and backlog tracing, promoted follow-ups and a fairer effect claim

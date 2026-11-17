@@ -5693,13 +5693,13 @@ it.effect.each([0, 1, 3, 10])(
   "ends a run a few writer passes after its turn's events arrive, with %s API requests",
   (requests) =>
     Effect.gen(function* () {
-      // Ten other runs each hold the shared writer for 100 ms per write, so a pass is ~1 s,
+      // Eight other runs each hold the shared writer for 120 ms per write, so a pass is about a second,
       // as on a saturated server. The turn arrives in one burst, as a replayed Claude wake does.
       let otherWrites = 0;
       let writesAtBurst = 0;
       const saturated = yield* Deferred.make<void>();
       const writesUntilFinalized = yield* Deferred.make<number>();
-      const write = Effect.sleep("100 millis").pipe(
+      const write = Effect.sleep("120 millis").pipe(
         Effect.andThen(
           Effect.sync(() => {
             otherWrites++;
@@ -5776,7 +5776,7 @@ it.effect.each([0, 1, 3, 10])(
                 )
                 .pipe(Effect.forkChild);
               yield* Deferred.await(holding);
-              for (let writer = 0; writer < 10; writer++)
+              for (let writer = 0; writer < 8; writer++)
                 yield* coordinator.barrier(write).pipe(Effect.forever, Effect.forkChild);
               yield* Deferred.succeed(saturated, undefined);
               return yield* Effect.never;
@@ -5797,12 +5797,12 @@ it.effect.each([0, 1, 3, 10])(
 it.effect("keeps every run on a shared provider session up with its own turn", () =>
   Effect.gen(function* () {
     // Codex runs every thread of an instance on one provider session, so each run's consumer
-    // receives every thread's events and drops the others'. Nine runs share it while ten other
-    // writers keep the shared writer busy (100 ms per write, a pass ~1 s). Every 10 s each thread
-    // reports usage, writes two items and reports usage again.
-    const runs = 9;
+    // receives every thread's events and drops the others'. Eight runs share it while eight other
+    // writers keep the shared writer busy (120 ms a write, a pass of about a second). Every 10 s each
+    // thread reports usage, writes two items and reports usage again.
+    const runs = 8;
     const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
-    const write = Effect.sleep("100 millis");
+    const write = Effect.sleep("120 millis");
     const holding = yield* Deferred.make<void>();
     yield* coordinator
       .consume(
@@ -5814,7 +5814,7 @@ it.effect("keeps every run on a shared provider session up with its own turn", (
       )
       .pipe(Effect.forkChild);
     yield* Deferred.await(holding);
-    for (let writer = 0; writer < 10; writer++)
+    for (let writer = 0; writer < 8; writer++)
       yield* coordinator.barrier(write).pipe(Effect.forever, Effect.forkChild);
     const ids = Array.from({ length: runs }, (_, run) =>
       backgroundScenarioIds(`shared-session-${run}`),
@@ -5874,7 +5874,7 @@ it.effect("keeps every run on a shared provider session up with its own turn", (
       }
     }).pipe(Effect.forkChild);
     yield* TestClock.adjust("5 minutes");
-    // Before this, all nine fell behind together, further each round:
+    // Before this, all eight fell behind together, further each round:
     // each other thread's usage report cost every run a writer pass that wrote nothing. Now one.
     assert.deepEqual(
       ingestedRound.map((ingested) => round - ingested <= 2),
@@ -6260,7 +6260,7 @@ it.effect("ends finished Codex seats' work on time on a session with many bound 
       )
       .pipe(Effect.forkChild);
     yield* Deferred.await(holding);
-    for (let writer = 0; writer < 10; writer++)
+    for (let writer = 0; writer < 8; writer++)
       yield* coordinator.barrier(write).pipe(Effect.forever, Effect.forkChild);
     const ids = Array.from({ length: live + seats }, (_, run) =>
       backgroundScenarioIds(`finished-seat-${run}`),

@@ -35,6 +35,7 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import { UsageLimitResetFallback } from "../usage/UsageLimitSources.ts";
 import * as EventSink from "./EventSink.ts";
+import * as IngestLag from "./IngestLag.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -81,7 +82,7 @@ export class ProviderEventPublishError extends Schema.TaggedError<ProviderEventP
 // write is safe. Failing it would fail the run over a brief lock.
 const isLockTimeout = (error: EventSink.EventSinkV2Error) =>
   SqlError.isSqlError(error.cause) && error.cause.reason._tag === "LockTimeoutError";
-const retryLockTimeout = <A, R>(write: Effect.Effect<A, EventSink.EventSinkV2Error, R>) =>
+export const retryLockTimeout = <A, R>(write: Effect.Effect<A, EventSink.EventSinkV2Error, R>) =>
   Effect.retry(write, { while: isLockTimeout, times: 2 });
 
 export const ProviderEventIngestorV2Error = Schema.Union([
@@ -824,6 +825,10 @@ export const layer: Layer.Layer<
           },
           (effect, input) =>
             effect.pipe(
+              // Only a consumer that wrote the event reports its ingest lag.
+              Effect.tap((storedEvents) =>
+                storedEvents.length === 0 ? Effect.void : IngestLag.markPersisted,
+              ),
               Effect.tap((storedEvents) =>
                 Effect.gen(function* () {
                   if (

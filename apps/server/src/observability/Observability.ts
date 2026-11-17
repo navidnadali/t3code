@@ -3,6 +3,7 @@ import * as HttpObservability from "@t3tools/shared/httpObservability";
 import { makeLocalFileTracer, makeTraceSink } from "@t3tools/shared/observability";
 import * as SharedObservability from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -16,9 +17,12 @@ import * as Statement from "effect/sql/Statement";
 import * as ServerConfig from "../config.ts";
 import * as ResourceAttribution from "../resourceTelemetry/ResourceAttribution.ts";
 import * as ServerLogger from "../serverLogger.ts";
+import { DEFAULT_SLOW_SPAN_THRESHOLD_MS } from "../diagnostics/TraceDiagnostics.ts";
 import * as BrowserTraceCollector from "./BrowserTraceCollector.ts";
+import * as CpuProfileMinutes from "./CpuProfileMinutes.ts";
 import * as HeapAttribution from "./HeapAttribution.ts";
 import * as SpanMinutes from "./SpanMinutes.ts";
+import * as WaitMinutes from "./WaitMinutes.ts";
 
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
@@ -65,16 +69,31 @@ export const layer = Layer.unwrap(
                 resource,
               });
 
-        // Without timing every span lasts 0 ms, so a slow SQL span would be summarised too.
+        // Without timing every span lasts 0 ms, so a slow SQL span would be summarised or
+        // sampled out too.
         const sqlMinDurationMs = config.traceTimingEnabled
           ? (config.traceSqlMinDurationMs ?? 0)
           : 0;
+        const sqlSampleEvery = config.traceTimingEnabled ? config.traceSqlSampleEvery : undefined;
         const path = yield* Path.Path;
+        const waits =
+          config.traceSpanMinutes === false ? undefined : WaitMinutes.makeWaitAggregate();
         const spanMinutes =
-          config.traceSpanMinutes === false
+          waits === undefined
             ? undefined
             : yield* SpanMinutes.make(
                 path.join(path.dirname(config.serverTracePath), SpanMinutes.SPAN_MINUTES_FILE_NAME),
+                // The profile switches first: the waits may wait up to 2 s on thread sizes.
+                [
+                  ...(config.traceCpuProfileIntervalMs === undefined
+                    ? []
+                    : [
+                        yield* CpuProfileMinutes.makeSection({
+                          intervalMs: config.traceCpuProfileIntervalMs,
+                        }),
+                      ]),
+                  waits.drain,
+                ],
               ).pipe(
                 Effect.catchCause((cause) =>
                   Effect.logWarning("Span minute log unavailable", cause).pipe(
@@ -90,19 +109,34 @@ export const layer = Layer.unwrap(
           sink,
           ...(delegate ? { delegate } : {}),
           sqlMinDurationMs,
+          ...(sqlSampleEvery === undefined
+            ? {}
+            : {
+                sqlSample: {
+                  every: sqlSampleEvery,
+                  // A slow statement is always written, as the threshold's cap keeps it.
+                  belowMs: DEFAULT_SLOW_SPAN_THRESHOLD_MS,
+                },
+              }),
           ...(spanMinutes ? { onSpanEnd: spanMinutes.record } : {}),
         });
 
-        // Whether a SQL span is fast is known only at its end, so none is measured.
+        // Whether a SQL span is written is known only at its end, so none is measured.
         const heapAttribution = yield* HeapAttribution.make(
           tracer,
-          sqlMinDurationMs > 0 ? { skip: SharedObservability.isSqlSpanName } : {},
+          sqlMinDurationMs > 0 || sqlSampleEvery !== undefined
+            ? { skip: SharedObservability.isSqlSpanName }
+            : {},
         );
         yield* heapAttribution.run;
 
         return Layer.mergeAll(
           Layer.succeed(Tracer.Tracer, heapAttribution.tracer),
           BrowserTraceCollector.layer(sink),
+          // Sites measure waits only while the minute line can carry them.
+          spanMinutes === undefined || waits === undefined
+            ? Layer.empty
+            : Layer.succeed(CurrentWaitObserver, waits.observer),
         );
       }),
     ).pipe(Layer.provide(OtlpExporter.layerFlusher), Layer.provideMerge(layerSerialization));

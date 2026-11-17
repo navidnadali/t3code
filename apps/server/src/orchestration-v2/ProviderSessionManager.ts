@@ -1,5 +1,6 @@
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   isOrchestrationV2WorkActive,
@@ -55,6 +56,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as EventSink from "./EventSink.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
+import * as IngestLag from "./IngestLag.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -443,6 +445,9 @@ export const layerWithOptions = (
       const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
       const agentScope = yield* AgentScope;
+      // Arrivals are stamped only while ingest lag is observed.
+      const waitObserver = yield* CurrentWaitObserver;
+      const ingestClock = yield* Clock.clockWith(Effect.succeed);
       const installationGate = yield* ProviderInstallationGate.ProviderInstallationGate;
       // Labs flag, read live: Codex per turn (its shared session outlives a toggle), Claude per query.
       // Unreadable settings keep it off.
@@ -646,6 +651,12 @@ export const layerWithOptions = (
         Effect.Effect<void>
       >();
 
+      // Events published to each run subscription and not yet taken by its consumer.
+      const subscriptionBacklogs = new WeakMap<
+        Queue.Queue<ProviderSessionEventSignal, Cause.Done>,
+        { events: number }
+      >();
+
       const publishToSubscribers = (
         subscribers: Ref.Ref<
           ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
@@ -653,11 +664,19 @@ export const layerWithOptions = (
         signal: ProviderSessionEventSignal,
       ) =>
         Ref.get(subscribers).pipe(
-          Effect.flatMap((current) =>
-            Effect.forEach(current.values(), (queue) => Queue.offer(queue, signal), {
+          Effect.flatMap((current) => {
+            if (signal.type === "event" && waitObserver !== undefined) {
+              // Every run on a shared session takes every thread's events and drops the others.
+              waitObserver.depth(IngestLag.FANOUT_SITE, current.size);
+              for (const queue of current.values()) {
+                const backlog = subscriptionBacklogs.get(queue);
+                if (backlog !== undefined) backlog.events++;
+              }
+            }
+            return Effect.forEach(current.values(), (queue) => Queue.offer(queue, signal), {
               discard: true,
-            }),
-          ),
+            });
+          }),
         );
 
       const failSubscribers = Effect.fn("ProviderSessionManager.failSubscribers")(function* (
@@ -747,9 +766,9 @@ export const layerWithOptions = (
             } satisfies OrchestrationV2DomainEvent;
           }),
         );
-        if (events.length > 0) {
-          yield* eventSink.write({ events });
-        }
+        if (events.length === 0) return false;
+        yield* eventSink.write({ events });
+        return true;
       });
 
       const writeReleasedSessionEvents = Effect.fn(
@@ -2300,6 +2319,9 @@ export const layerWithOptions = (
           >,
         ): Effect.fn.Return<ProviderAdapter.ProviderAdapterV2EventSubscription> {
           const queue = yield* Queue.unbounded<ProviderSessionEventSignal, Cause.Done>();
+          // Events published here and not yet taken: a pull takes everything queued at once.
+          const backlog = { events: 0 };
+          if (waitObserver !== undefined) subscriptionBacklogs.set(queue, backlog);
           const subscriberId = yield* Ref.getAndUpdate(nextSubscriberId, (value) => value + 1);
           yield* Ref.update(subscribers, (current) => {
             const updated = new Map(current);
@@ -2316,7 +2338,14 @@ export const layerWithOptions = (
           }).pipe(
             Effect.flatMap((removed) =>
               removed
-                ? Queue.clear(queue).pipe(Effect.andThen(Queue.end(queue)), Effect.asVoid)
+                ? Queue.clear(queue).pipe(
+                    Effect.andThen(Queue.end(queue)),
+                    Effect.andThen(
+                      Effect.sync(() => {
+                        backlog.events = 0;
+                      }),
+                    ),
+                  )
                 : Effect.void,
             ),
             // Detached so the consumer's run failure is not ordered behind release cleanup.
@@ -2328,15 +2357,29 @@ export const layerWithOptions = (
               }),
             ),
           );
+          // Everything queued arrives as one chunk, so a consumer that falls behind sees its backlog.
           const events = Stream.fromQueue(queue).pipe(
-            Stream.mapEffect((signal) =>
-              signal.type === "event"
-                ? Effect.succeed(signal.event)
-                : Effect.failCause(signal.cause),
-            ),
+            Stream.chunks,
+            Stream.flatMap((signals) => {
+              const failed = signals.findIndex((signal) => signal.type === "failure");
+              const taken = (failed === -1 ? signals : signals.slice(0, failed)).flatMap(
+                (signal) => (signal.type === "event" ? [signal.event] : []),
+              );
+              // Taken now; a consumer that keeps a backlog of its own counts that one itself.
+              backlog.events = Math.max(0, backlog.events - taken.length);
+              const delivered = Stream.fromIterable(taken);
+              const failure = failed === -1 ? undefined : signals[failed];
+              return failure?.type === "failure"
+                ? Stream.concat(delivered, Stream.failCause(failure.cause))
+                : delivered;
+            }),
             Stream.ensuring(close),
           );
-          return { events, close } satisfies ProviderAdapter.ProviderAdapterV2EventSubscription;
+          return {
+            events,
+            close,
+            pending: () => backlog.events,
+          } satisfies ProviderAdapter.ProviderAdapterV2EventSubscription;
         },
       );
 
@@ -2621,12 +2664,14 @@ export const layerWithOptions = (
           if (current?.runtime !== entry.runtime) {
             return;
           }
-          yield* writeProviderSessionEvents({
+          const written = yield* writeProviderSessionEvents({
             runtime: entry.runtime,
             threadIds: current.attachedThreadIds,
             type: "provider-session.updated",
             payload: event.providerSession,
           });
+          // Runs drop session updates, so their ingest lag ends at this write, if there is one.
+          if (written) yield* IngestLag.reportCommitted(waitObserver, event);
         },
         (effect, entry, _event) =>
           effect.pipe(
@@ -2843,6 +2888,9 @@ export const layerWithOptions = (
             }
             const tracked = retryStalls.track(nativeEvent);
             const event = tracked.event;
+            if (waitObserver !== undefined) {
+              IngestLag.markArrival(event, ingestClock.monotonicTimeNanosUnsafe());
+            }
             const armRetryStall = retryStalls.update(tracked);
             const releaseLiveOutput =
               event.type === "turn_item.updated" &&
@@ -2910,6 +2958,11 @@ export const layerWithOptions = (
                           event,
                         })
                         .pipe(
+                          Effect.tap((stored) =>
+                            stored.length === 0
+                              ? Effect.void
+                              : IngestLag.reportCommitted(waitObserver, event),
+                          ),
                           Effect.mapError(
                             (cause) =>
                               new ProviderAdapter.ProviderAdapterEventStreamError({
@@ -2923,6 +2976,15 @@ export const layerWithOptions = (
                     }).pipe(entry.requestEventPermit.withPermits(1));
                     yield* releaseLiveOutput;
                     return;
+                  }
+                  if (waitObserver !== undefined && event.type === "turn.terminal") {
+                    // The backlog a run's terminal queues behind, in each subscription.
+                    for (const queue of (yield* Ref.get(entry.eventSubscribers)).values()) {
+                      const backlog = subscriptionBacklogs.get(queue);
+                      if (backlog !== undefined) {
+                        waitObserver.depth(IngestLag.TERMINAL_BACKLOG_SITE, backlog.events);
+                      }
+                    }
                   }
                   yield* publishToSubscribers(entry.eventSubscribers, { type: "event", event });
                   yield* releaseLiveOutput;

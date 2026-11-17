@@ -9,6 +9,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2Notification,
 } from "@t3tools/contracts";
@@ -23,6 +24,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -106,6 +108,11 @@ function layerTest(input: {
   readonly dispatched: Queue.Queue<unknown>;
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
   readonly beforeDispatch?: (threadId: ThreadId) => Effect.Effect<void>;
+  /** The events a dispatch commits; none by default. */
+  readonly committed?: (command: unknown) => ReadonlyArray<OrchestrationV2StoredEvent>;
+  readonly runUpdates?: Stream.Stream<OrchestrationV2StoredEvent>;
+  /** The thread's active run as the shell reports it; none by default. */
+  readonly activeRunId?: Ref.Ref<RunId | null>;
 }) {
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     // A wake's dispatch key reads only the thread's lineage; the tests' reads are the deliveries'.
@@ -115,7 +122,16 @@ function layerTest(input: {
       (
         ("threadId" in command ? input.beforeDispatch?.(command.threadId) : undefined) ??
         Effect.void
-      ).pipe(Effect.andThen(Queue.offer(input.dispatched, command)), Effect.as({} as never)),
+      ).pipe(
+        Effect.andThen(Queue.offer(input.dispatched, command)),
+        Effect.as({ sequence: 1, storedEvents: input.committed?.(command) ?? [] }),
+      ),
+    streamStoredEventsFrom: () => input.runUpdates ?? Stream.empty,
+    getThreadShell: () =>
+      Effect.map(
+        input.activeRunId === undefined ? Effect.succeed(null) : Ref.get(input.activeRunId),
+        (activeRunId) => ({ activeRunId }) as never,
+      ),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
     Layer.provide(
@@ -125,7 +141,215 @@ function layerTest(input: {
   return Layer.merge(ProviderContinuationRequests.layer, layerWorker);
 }
 
+const wakeRunId = RunId.make("run-provider-continuation-wake");
+const runEvent = (
+  type: "run.created" | "run.updated",
+  run: { readonly id: RunId; readonly status: string; readonly queueHeld?: boolean },
+  userMessageId?: unknown,
+) =>
+  ({
+    sequence: 2,
+    commandId: null,
+    event: { type, threadId, runId: run.id, payload: { ...run, userMessageId } },
+  }) as unknown as OrchestrationV2StoredEvent;
+
 describe("ProviderContinuationService", () => {
+  // A wake turn's MCP calls wait on the settle, so a queued run settles only once there is a run.
+  it.effect.each([
+    {
+      settledBy: "its run starting",
+      update: runEvent("run.updated", { id: wakeRunId, status: "starting" }),
+    },
+    {
+      settledBy: "its run being held",
+      update: runEvent("run.updated", { id: wakeRunId, status: "queued", queueHeld: true }),
+    },
+    {
+      settledBy: "another run starting first",
+      update: runEvent("run.updated", { id: RunId.make("run-other"), status: "starting" }),
+      activeRun: RunId.make("run-other"),
+    },
+    // A run that ends unstarted: the user cancels the queued item, or its start fails.
+    {
+      settledBy: "its run being cancelled",
+      update: runEvent("run.updated", { id: wakeRunId, status: "cancelled" }),
+    },
+    {
+      settledBy: "its run failing",
+      update: runEvent("run.updated", { id: wakeRunId, status: "failed" }),
+    },
+    { settledBy: "the wait's limit", update: undefined },
+  ] as const)("settles a wake whose run queued on $settledBy", (row) =>
+    Effect.gen(function* () {
+      const { update } = row;
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const runUpdates = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+      const readPast = yield* Deferred.make<void>();
+      const activeRunId = yield* Ref.make<RunId | null>(null);
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer(request());
+        // The watch reads on past the previous run's end and its own queue move only if neither
+        // settled it.
+        const first = yield* Effect.raceFirst(
+          Deferred.await(readPast).pipe(Effect.as("read past")),
+          requests.awaitSettle(0).pipe(Effect.as("settled")),
+        );
+        assert.equal(first, "read past");
+        assert.deepEqual(yield* requests.progress(threadId), { pending: 1, settles: 0 });
+        if ("activeRun" in row) yield* Ref.set(activeRunId, row.activeRun);
+        if (update === undefined)
+          yield* TestClock.adjust(ProviderContinuationRequests.WAKE_RUN_WAIT);
+        else yield* Queue.offer(runUpdates, update);
+        yield* requests.awaitSettle(0);
+        assert.deepEqual(yield* requests.progress(threadId), { pending: 0, settles: 1 });
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(projection),
+            committed: (command) => [
+              runEvent(
+                "run.created",
+                { id: wakeRunId, status: "queued" },
+                (command as { readonly messageId: MessageId }).messageId,
+              ),
+            ],
+            runUpdates: Stream.concat(
+              Stream.make(
+                runEvent("run.updated", { id: parentRunId, status: "completed" }),
+                runEvent("run.updated", { id: wakeRunId, status: "queued" }),
+              ),
+              Stream.concat(
+                Stream.fromEffectDrain(Deferred.succeed(readPast, undefined)),
+                Stream.fromQueue(runUpdates),
+              ),
+            ),
+            activeRunId,
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  // The replay from the dispatch can hold the start of an older run that has already reached its
+  // wait: that start gives the wake's turn no run to act under.
+  it.effect("keeps a wake waiting past the replayed start of a run that has stopped", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const runUpdates = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+      const readPast = yield* Deferred.make<void>();
+      const older = RunId.make("run-older-queued");
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer(request());
+        const first = yield* Effect.raceFirst(
+          Deferred.await(readPast).pipe(Effect.as("read past")),
+          requests.awaitSettle(0).pipe(Effect.as("settled")),
+        );
+        assert.equal(first, "read past");
+        assert.deepEqual(yield* requests.progress(threadId), { pending: 1, settles: 0 });
+        yield* Queue.offer(
+          runUpdates,
+          runEvent("run.updated", { id: wakeRunId, status: "starting" }),
+        );
+        yield* requests.awaitSettle(0);
+        assert.deepEqual(yield* requests.progress(threadId), { pending: 0, settles: 1 });
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(projection),
+            committed: (command) => [
+              runEvent(
+                "run.created",
+                { id: wakeRunId, status: "queued" },
+                (command as { readonly messageId: MessageId }).messageId,
+              ),
+            ],
+            runUpdates: Stream.concat(
+              Stream.make(
+                runEvent("run.updated", { id: older, status: "starting" }),
+                runEvent("run.updated", { id: older, status: "waiting" }),
+              ),
+              Stream.concat(
+                Stream.fromEffectDrain(Deferred.succeed(readPast, undefined)),
+                Stream.fromQueue(runUpdates),
+              ),
+            ),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  // The dispatch can start an older queued run before it queues the wake, so no later update
+  // shows that start; a call already waiting would wait out the limit.
+  it.effect("settles a wake at once when its dispatch left another run active", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const watching = yield* Deferred.make<void>();
+      const activeRunId = yield* Ref.make<RunId | null>(RunId.make("run-promoted-by-the-dispatch"));
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer(request());
+        const first = yield* Effect.raceFirst(
+          requests.awaitSettle(0).pipe(Effect.as("settled")),
+          Deferred.await(watching).pipe(Effect.as("watching")),
+        );
+        assert.equal(first, "settled");
+        assert.deepEqual(yield* requests.progress(threadId), { pending: 0, settles: 1 });
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(projection),
+            committed: (command) => [
+              runEvent(
+                "run.created",
+                { id: wakeRunId, status: "queued" },
+                (command as { readonly messageId: MessageId }).messageId,
+              ),
+            ],
+            runUpdates: Stream.never.pipe(Stream.onStart(Deferred.succeed(watching, undefined))),
+            activeRunId,
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("settles a message_text wake once its dispatch queued the run", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer({ ...request(), delivery: "message_text" });
+        yield* requests.awaitSettle(0);
+        assert.deepEqual(yield* requests.progress(threadId), { pending: 0, settles: 1 });
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(projection),
+            committed: (command) => [
+              runEvent(
+                "run.created",
+                { id: wakeRunId, status: "queued" },
+                (command as { readonly messageId: MessageId }).messageId,
+              ),
+            ],
+            runUpdates: Stream.never,
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
   it.effect("releases run checks waiting on a continuation whose dispatch fails", () =>
     Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();

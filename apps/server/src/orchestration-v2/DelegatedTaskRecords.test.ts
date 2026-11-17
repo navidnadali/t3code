@@ -3,6 +3,7 @@ import {
   EventId,
   MessageId,
   NodeId,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type OrchestrationV2Subagent,
@@ -513,5 +514,252 @@ it.layer(layerTest)("delegated task records", (it) => {
       assert.isAbove(windowedTails, 50);
       assert.isAbove(noteCandidates, 50);
     }),
+  );
+
+  // A follow-up promoted to Steer owns no run of its own that does work: its queued run was
+  // cancelled and its message moved to the run it joined, which another task may own.
+  it.effect.each([
+    "joined run live",
+    "joined run's subagent holds",
+    "joined run restarted",
+    "queued again",
+    "an older queued run of its own",
+  ] as const)(
+    "decides a promoted follow-up as the full read does wherever the window covers it (%s)",
+    (shape) =>
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const start = yield* DateTime.now;
+        const at = (seconds: number) => DateTime.add(start, { seconds });
+        const name = `promoted-${shape.replaceAll(" ", "-").replaceAll("'", "")}`;
+        const threadId = ThreadId.make(`thread:${name}`);
+        const originalTaskId = NodeId.make(`node:${name}:original`);
+        const joinedTaskId = NodeId.make(`node:${name}:joined`);
+        const promotedTaskId = NodeId.make(`node:${name}:promoted`);
+        const runId = (ordinal: number) => RunId.make(`run:${name}:${ordinal}`);
+        const events: Array<Omit<OrchestrationV2DomainEvent, "id">> = [];
+        const run = (
+          ordinal: number,
+          status: OrchestrationV2Run["status"],
+          fields: Partial<OrchestrationV2Run> = {},
+        ) =>
+          events.push({
+            type: "run.updated",
+            threadId,
+            runId: runId(ordinal),
+            occurredAt: start,
+            payload: {
+              id: runId(ordinal),
+              threadId,
+              ordinal,
+              providerInstanceId: instanceId,
+              modelSelection,
+              providerThreadId: null,
+              userMessageId: MessageId.make(`message:${name}:${ordinal}`),
+              rootNodeId: null,
+              activeAttemptId: null,
+              status,
+              requestedAt: at(ordinal),
+              startedAt: status === "queued" ? null : at(ordinal),
+              completedAt: UNFINISHED.includes(status) ? null : at(ordinal + 1),
+              checkpointId: null,
+              contextHandoffId: null,
+              ...fields,
+            },
+          });
+        const message = (
+          ordinal: number,
+          onRun: number,
+          fields: Partial<OrchestrationV2ConversationMessage> = {},
+        ) =>
+          events.push({
+            type: "message.updated",
+            threadId,
+            runId: runId(onRun),
+            occurredAt: start,
+            payload: {
+              id: MessageId.make(`message:${name}:${ordinal}`),
+              threadId,
+              runId: runId(onRun),
+              nodeId: null,
+              role: "user",
+              text: `Message ${ordinal}`,
+              attachments: [],
+              streaming: false,
+              createdBy: "agent",
+              creationSource: "mcp",
+              createdAt: at(ordinal),
+              updatedAt: at(ordinal),
+              ...fields,
+            },
+          });
+        events.push({
+          type: "thread.created",
+          threadId,
+          occurredAt: start,
+          payload: {
+            createdBy: "agent",
+            creationSource: "server",
+            id: threadId,
+            projectId: ProjectId.make(`project:${name}`),
+            title: name,
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: {
+              parentThreadId: ThreadId.make(`thread:${name}:parent`),
+              relationshipToParent: "subagent",
+              rootThreadId: ThreadId.make(`thread:${name}:parent`),
+            },
+            forkedFrom: { type: "node", nodeId: originalTaskId },
+            createdAt: start,
+            updatedAt: start,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        });
+        // The original task's run, then the follow-up whose turn the promoted one joined.
+        run(1, "completed");
+        message(1, 1);
+        let next = 4;
+        if (shape === "an older queued run of its own") {
+          // The task's own turn queued two messages to itself. Another task's run was moved ahead
+          // of them, and the newer one was sent into that run.
+          run(2, "completed", { delegatedTaskId: promotedTaskId });
+          message(2, 2);
+          run(3, "queued", { delegatedTaskId: promotedTaskId });
+          message(3, 3);
+          run(4, "cancelled", { delegatedTaskId: promotedTaskId, startedAt: null });
+          message(4, 5, { promotedTaskId });
+          run(5, "running", { delegatedTaskId: joinedTaskId });
+          message(5, 5);
+          next = 6;
+        } else {
+          run(2, shape === "joined run live" ? "running" : "completed", {
+            delegatedTaskId: joinedTaskId,
+            ...(shape === "joined run restarted" ? { status: "cancelled" } : {}),
+          });
+          message(2, 2);
+          // The promoted follow-up: cancelled before it started, its message steered into run 2.
+          run(3, "cancelled", { delegatedTaskId: promotedTaskId, startedAt: null });
+          message(3, 2, { promotedTaskId });
+        }
+        if (shape === "joined run restarted") {
+          run(next, "running", {
+            delegatedTaskId: joinedTaskId,
+            restartContinuationOfRunId: runId(2),
+          });
+          message(next, next);
+          next += 1;
+        }
+        if (shape === "queued again") {
+          // The steer missed its turn: the message queues again as the same follow-up.
+          run(next, "queued", {
+            delegatedTaskId: promotedTaskId,
+            userMessageId: MessageId.make(`message:${name}:3`),
+            steerFollowUpOfRunId: runId(2),
+          });
+          message(3, next);
+          next += 1;
+        }
+        if (shape === "joined run's subagent holds")
+          events.push({
+            type: "subagent.updated",
+            threadId,
+            nodeId: NodeId.make(`node:${name}:subagent`),
+            occurredAt: start,
+            payload: {
+              id: NodeId.make(`node:${name}:subagent`),
+              threadId,
+              runId: runId(2),
+              parentNodeId: NodeId.make(`node:${name}:root`),
+              origin: "app_owned",
+              createdBy: "agent",
+              driver,
+              providerInstanceId: instanceId,
+              providerThreadId: null,
+              childThreadId: ThreadId.make(`thread:${name}:grandchild`),
+              nativeTaskRef: null,
+              prompt: "Sub-work",
+              title: null,
+              model: null,
+              status: "running",
+              result: null,
+              startedAt: start,
+              completedAt: null,
+              updatedAt: start,
+            },
+          });
+        // Monitor wakes since, which no task owns; queued behind a live run.
+        for (const ordinal of Array.from({ length: 20 }, (_, index) => next + index)) {
+          run(ordinal, shape === "an older queued run of its own" ? "queued" : "completed");
+          message(ordinal, ordinal, {
+            createdBy: "agent",
+            creationSource: "server",
+            notification: {
+              source: { kind: "monitor" },
+              outcome: "updated",
+              summary: "Monitor output",
+            },
+          });
+        }
+        for (const [index, event] of events.entries()) {
+          yield* store.apply({
+            ...event,
+            id: EventId.make(`event:${name}:${index}`),
+          } as OrchestrationV2DomainEvent);
+        }
+        const full = yield* store.getThreadRecords(
+          threadId,
+          ["runs", "messages", "subagents", "providerThreads"],
+          { messageRoles: ["user"] },
+        );
+        const fullDecision = (taskId: NodeId) =>
+          taskDecisions(full, taskId, originalTaskId, undefined, new Set());
+        // The promoted task works where its message went.
+        assert.equal(
+          fullDecision(promotedTaskId).childRun,
+          {
+            "joined run live": runId(2),
+            "joined run's subagent holds": runId(2),
+            "joined run restarted": runId(4),
+            "queued again": runId(4),
+            "an older queued run of its own": runId(5),
+          }[shape],
+        );
+        assert.equal(
+          fullDecision(promotedTaskId).awaitsSubagents,
+          shape === "joined run's subagent holds",
+        );
+        let covered = 0;
+        for (const runWindow of [1, 2, 3, 6, 16, 64]) {
+          const read = yield* store.getDelegatedTaskRecords(threadId, runWindow);
+          for (const taskId of [joinedTaskId, promotedTaskId]) {
+            if (
+              !delegatedTaskReadCovers(read, {
+                originalTaskId,
+                resultRun: undefined,
+                stoppedResultRun: undefined,
+                tasks: [{ id: taskId }],
+              })
+            )
+              continue;
+            if (taskId === promotedTaskId) covered += 1;
+            assert.deepEqual(
+              taskDecisions(read.records, taskId, originalTaskId, undefined, new Set()),
+              fullDecision(taskId),
+              `window ${runWindow}, task ${taskId}`,
+            );
+          }
+        }
+        assert.isAbove(covered, 0);
+      }),
   );
 });

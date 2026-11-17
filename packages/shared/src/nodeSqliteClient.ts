@@ -27,6 +27,8 @@ import type { Borrower, Connection } from "effect/sql/SqlConnection";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import * as Statement from "effect/sql/Statement";
 
+import { CurrentWaitObserver } from "./WaitObserver.ts";
+
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
 
 export interface SqliteClientConfig {
@@ -1305,6 +1307,22 @@ const make = Effect.fn("makeWithDatabase")(function* (
       );
     });
 
+  // The wait observer hears of every acquisition, traced or not.
+  const observeWait = (
+    fiber: Fiber.Fiber<unknown, unknown>,
+    target: { readonly name: Acquired["connection"] },
+    clock: Clock.Clock,
+    start: bigint,
+    ownerAtWaitStart: ConnectionOwner | undefined,
+  ) =>
+    fiber
+      .getRef(CurrentWaitObserver)
+      ?.wait(
+        target.name === "writer" ? "sqlite.writer" : "sqlite.reader",
+        Number(clock.monotonicTimeNanosUnsafe() - start),
+        ownerAtWaitStart?.name,
+      );
+
   const acquired = (
     target: { readonly name: Acquired["connection"] },
     clock: Clock.Clock,
@@ -1340,6 +1358,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const owner = target.name === "writer" ? connectionOwner(fiber) : undefined;
       const useConnection = Effect.suspend(() => {
         if (target.name === "writer") activeWriter = owner;
+        observeWait(fiber, target, clock, start, ownerAtWaitStart);
         if (
           fiber.getRef(References.TracerEnabled) &&
           fiber.getRef(Statement.SpanPropagationEnabled)
@@ -1375,6 +1394,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const owner = target.name === "writer" ? connectionOwner(fiber) : undefined;
         const acquire = Effect.tap(restore(target.lock.take(1)), () => {
           if (target.name === "writer") activeWriter = owner;
+          observeWait(fiber, target, clock, start, ownerAtWaitStart);
           if (pending !== undefined) {
             pending.acquired = acquired(target, clock, start);
             pending.ownerAtWaitStart = ownerAtWaitStart;

@@ -137,7 +137,15 @@ const EnvServerConfig = Config.all({
     Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: DEFAULT_SLOW_SPAN_THRESHOLD_MS })),
     "T3CODE_TRACE_SQL_MIN_DURATION_MS",
   ).pipe(Config.withDefault(0)),
+  traceSqlSampleEvery: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 10_000 })),
+    "T3CODE_TRACE_SQL_SAMPLE_EVERY",
+  ).pipe(Config.withDefault(1)),
   traceSpanMinutes: Config.Boolean("T3CODE_TRACE_SPAN_MINUTES").pipe(Config.withDefault(true)),
+  traceCpuProfileIntervalMs: Config.schema(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1_000 })),
+    "T3CODE_TRACE_CPU_PROFILE_INTERVAL_MS",
+  ).pipe(Config.withDefault(0)),
   otlpTracesUrl: Config.String("T3CODE_OTLP_TRACES_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -560,7 +568,11 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     traceMaxBytes: env.traceMaxBytes,
     traceMaxFiles: env.traceMaxFiles,
     ...(env.traceSqlMinDurationMs > 0 ? { traceSqlMinDurationMs: env.traceSqlMinDurationMs } : {}),
+    ...(env.traceSqlSampleEvery > 1 ? { traceSqlSampleEvery: env.traceSqlSampleEvery } : {}),
     ...(env.traceSpanMinutes ? {} : { traceSpanMinutes: false }),
+    ...(env.traceCpuProfileIntervalMs > 0
+      ? { traceCpuProfileIntervalMs: env.traceCpuProfileIntervalMs }
+      : {}),
     otlpTracesUrl: traces?.url,
     otlpMetricsUrl: metrics?.url,
     otlpLogsUrl: logs?.url,

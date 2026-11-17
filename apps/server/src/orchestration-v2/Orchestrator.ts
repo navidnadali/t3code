@@ -146,6 +146,7 @@ import {
   continuationStartRetryDelayMs,
   delegatedTaskAwaitsWork,
   delegatedTaskChildRun,
+  delegatedTaskJoinedRuns,
   delegatedTaskReadCovers,
   delegatedTaskResultRun,
   delegatedTaskRuns,
@@ -222,6 +223,7 @@ import {
 import { isHiddenWake, nextQueuedRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import {
   type CompletionWakeOwnership,
+  completionWakeOwnerKeys,
   completionWakeOwnership,
   completionWakeParts,
   withCompletionWakePart,
@@ -1027,6 +1029,21 @@ function delegatedTaskTerminalStatus(
   }
 }
 
+/**
+ * The run cancelling a follow-up task marks: its latest run, or for a follow-up promoted to
+ * Steer the run it settles from, which the promotion's cancelled run is not.
+ */
+function delegatedFollowUpRun(
+  child: Parameters<typeof delegatedTaskRuns>[0],
+  taskId: NodeId,
+): OrchestrationV2Run | undefined {
+  if (delegatedTaskJoinedRuns(child, taskId).length > 0)
+    return delegatedTaskResultRun(delegatedTaskRuns(child, taskId));
+  return child.runs
+    .filter((run) => run.delegatedTaskId === taskId)
+    .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+}
+
 /** The interrupted or cancelled result run whose open questions finalizing a child dismisses. */
 function delegatedTaskStoppedResultRun(
   progress: ReturnType<typeof delegatedTaskProgress>,
@@ -1095,6 +1112,7 @@ type MergedSteerMessage = Pick<
   | "senderThreadId"
   | "linkedSender"
   | "idleCompaction"
+  | "promotedTaskId"
 > & { readonly messageId: MessageId };
 
 function queuedRunModelSelection(
@@ -1931,7 +1949,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
-  const messageIntake = yield* KeyedLock.make<ThreadId>();
+  const messageIntake = yield* KeyedLock.make<ThreadId>({
+    site: ThreadCommandExecutor.MESSAGE_INTAKE_SITE,
+    rankKeys: true,
+  });
   // Read once: the policy is fixed for the server's life, and dispatch takes it as an input.
   const { managedPolicy } = serverSettings;
   const runtimeModeCeiling: RuntimeModeCeiling | undefined =
@@ -3011,11 +3032,37 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       events.push(wakeMessageUpdated(run, { ...merged, updatedAt: now }, now));
     } else {
       const own = currentCompletionWakeParts(projection.runs, message);
-      if (own.length === 0 || isDelegatedAppThread(projection.thread)) return false;
+      if (own.length === 0 || others.length === 0) return false;
+      const candidates = others.map((other) => ({
+        other,
+        parts: currentCompletionWakeParts(projection.runs, other.message),
+      }));
+      // A delegated thread's follow-up task reads the wakes for its own runs as its result
+      // (delegatedTaskRuns), so a wake there takes in only wakes for the same tasks.
+      const ownerKey = isDelegatedAppThread(projection.thread)
+        ? completionWakeOwnerKeys(
+            yield* projectionStore
+              .getCompletionWakeLineage(
+                run.threadId,
+                [...own, ...candidates.flatMap(({ parts }) => parts)].map(
+                  ({ parentRun }) => parentRun.id,
+                ),
+              )
+              .pipe(
+                Effect.mapError(
+                  (cause) => new OrchestratorProjectionError({ threadId: run.threadId, cause }),
+                ),
+              ),
+          )
+        : undefined;
+      const keyOf = (parts: ReadonlyArray<{ readonly parentRun: OrchestrationV2Run }>) =>
+        ownerKey?.(parts.map(({ parentRun }) => parentRun.id));
+      const ownKey = keyOf(own);
       const taken = [...own];
       const carried = () => taken.reduce((count, { part }) => count + part.taskIds.length, 0);
-      for (const other of others) {
-        const parts = currentCompletionWakeParts(projection.runs, other.message);
+      for (const { other, parts } of candidates) {
+        // One that carries nothing any more is only cancelled, whichever task it was for.
+        if (parts.length > 0 && keyOf(parts) !== ownKey) continue;
         const items = parts.reduce((count, { part }) => count + part.taskIds.length, 0);
         if (carried() + items > MAX_MERGED_WAKE_ITEMS) break;
         taken.push(...parts);
@@ -6778,6 +6825,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly senderThreadId?: OrchestrationV2ConversationMessage["senderThreadId"];
     readonly linkedSender?: OrchestrationV2ConversationMessage["linkedSender"];
     readonly idleCompaction?: OrchestrationV2ConversationMessage["idleCompaction"];
+    readonly promotedTaskId?: OrchestrationV2ConversationMessage["promotedTaskId"];
     readonly delegatedCompletion?: OrchestrationV2ConversationMessage["delegatedCompletion"];
     readonly notification?: OrchestrationV2ConversationMessage["notification"];
     readonly forceRestart: boolean;
@@ -6942,6 +6990,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(fields.senderThreadId === undefined ? {} : { senderThreadId: fields.senderThreadId }),
           ...(fields.linkedSender === undefined ? {} : { linkedSender: fields.linkedSender }),
           ...(fields.idleCompaction === undefined ? {} : { idleCompaction: fields.idleCompaction }),
+          ...(fields.promotedTaskId === undefined ? {} : { promotedTaskId: fields.promotedTaskId }),
           id: fields.messageId,
           threadId: input.command.threadId,
           runId: messageInput.runId,
@@ -7611,19 +7660,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (run) => run.id === message.delegatedCompletion?.parentRunId,
     );
     const delivery = parentRun?.delegatedCompletion?.delivery;
-    // A delegated thread's follow-up task owns the wakes of its own runs; merging would blur that.
-    if (
-      parentRun === undefined ||
-      delivery == null ||
-      input.delegatedCompletionOnly === undefined ||
-      isDelegatedAppThread(projection.thread)
-    )
+    if (parentRun === undefined || delivery == null || input.delegatedCompletionOnly === undefined)
       return false;
     const ownership = target.message.delegatedCompletion!;
+    const targetParentRunIds = completionWakeParts(ownership).map((part) => part.parentRunId);
     const { runs: owners } = yield* projectionStore
-      .getThreadRecords(command.threadId, ["runs"], {
-        runIds: completionWakeParts(ownership).map((part) => part.parentRunId),
-      })
+      .getThreadRecords(command.threadId, ["runs"], { runIds: targetParentRunIds })
       .pipe(mapDispatchError(command));
     if (
       !currentCompletionWakeParts(owners, target.message).some(
@@ -7631,6 +7673,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       )
     )
       return false;
+    // A delegated thread's follow-up task reads the wakes for its own runs as its result
+    // (delegatedTaskRuns), so a wake there joins only one for the same tasks.
+    if (isDelegatedAppThread(projection.thread)) {
+      const ownerKey = completionWakeOwnerKeys(
+        yield* projectionStore
+          .getCompletionWakeLineage(command.threadId, [parentRun.id, ...targetParentRunIds])
+          .pipe(mapDispatchError(command)),
+      );
+      if (ownerKey([parentRun.id]) !== ownerKey(targetParentRunIds)) return false;
+    }
     const joined = withCompletionWakePart(ownership, {
       parentRunId: parentRun.id,
       generation: delivery.generation,
@@ -7659,10 +7711,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     let projection = dispatchRead.projection;
     if (command.steerFollowUpOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.steerFollowUpOfRunId);
-      // Only a declined steer's follow-up carries an ordinal; the fork's tracked delivery also names
-      // the steered run on follow-ups that start at once or must survive Stop.
-      const declined = command.steerFollowUpAfterRunOrdinal !== undefined;
+      // The fork's tracked delivery also names the steered run on follow-ups that start at once or
+      // must survive Stop; only a declined steer's follow-up is dropped by Stop.
+      const declined = command.steerDeclined === true;
+      // A promoted message whose steer had not landed when its task was cancelled went with the
+      // task; it is not queued again. A task that ended some other way, or a message promoted
+      // after the cancel, keeps it: someone sent it on purpose.
+      const promotedTaskId = projection.messages.find(
+        (message) => message.id === command.messageId,
+      )?.promotedTaskId;
+      const parentThreadId = projection.thread.lineage.parentThreadId;
+      const promotedTaskCancelled =
+        promotedTaskId !== undefined &&
+        parentThreadId !== null &&
+        (yield* projectionStore
+          .getThreadRecords(parentThreadId, ["subagents"], { subagentIds: [promotedTaskId] })
+          .pipe(mapDispatchError(command))).subagents.some(
+          (task) =>
+            task.id === promotedTaskId &&
+            task.cancelledSteerMessageIds?.includes(command.messageId) === true,
+        );
       if (
+        promotedTaskCancelled ||
         source === undefined ||
         (declined && command.dispatchMode.type !== "queue_after_active") ||
         !projection.messages.some(
@@ -10720,6 +10790,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (event.type === "run-attempt.created" && event.payload.runId === message.runId),
     );
     if (!startsAttempt) return;
+    const pendingRun = pending
+      .flatMap((event) =>
+        (event.type === "run.created" || event.type === "run.updated") &&
+        event.payload.id === message.runId
+          ? [event.payload]
+          : [],
+      )
+      .at(-1);
+    // A promoted follow-up's steer that missed its turn queues the message again. It stays that
+    // follow-up, whoever sent it and whatever task the running turn continues, so the parent
+    // hears about the message once.
+    if (pendingRun !== undefined && command.steerFollowUpOfRunId !== undefined) {
+      const promotedTaskId = (yield* projectionStore
+        .getThreadRecords(command.threadId, ["messages"], { messageIds: [command.messageId] })
+        .pipe(mapDispatchError(command))).messages.find(
+        (stored) => stored.id === command.messageId,
+      )?.promotedTaskId;
+      if (promotedTaskId !== undefined) {
+        if (pendingRun.delegatedTaskId !== promotedTaskId)
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "run.updated",
+            threadId: command.threadId,
+            runId: pendingRun.id,
+            occurredAt: message.createdAt,
+            payload: { ...pendingRun, delegatedTaskId: promotedTaskId },
+          });
+        return;
+      }
+    }
     const child = yield* projectionStore.getThread(command.threadId);
     const parentThreadId = child.lineage.parentThreadId;
     // A send with no sender thread comes from a client acting for the owner, like a user send.
@@ -10734,14 +10836,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     )
       return;
     const run =
-      pending
-        .flatMap((event) =>
-          (event.type === "run.created" || event.type === "run.updated") &&
-          event.payload.id === message.runId
-            ? [event.payload]
-            : [],
-        )
-        .at(-1) ??
+      pendingRun ??
       (yield* projectionStore.getThreadRecords(command.threadId, ["runs"])).runs.find(
         (row) => row.id === message.runId,
       );
@@ -10814,6 +10909,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       status: run.status === "queued" ? (run.queueHeld === true ? "idle" : "pending") : "running",
       progress: undefined,
       cancelledRunId: undefined,
+      resultRunId: undefined,
       result: null,
       startedAt: now,
       completedAt: null,
@@ -12700,12 +12796,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ...(queuedMessage.idleCompaction === undefined
         ? {}
         : { idleCompaction: queuedMessage.idleCompaction }),
+      // A follow-up task's message keeps its task in the run it joins.
+      ...(queuedRun.delegatedTaskId === undefined
+        ? {}
+        : { promotedTaskId: queuedRun.delegatedTaskId }),
       forceRestart: false,
       ...(automaticDelivery ? { automaticDelivery } : {}),
       ...(merged.length === 0
         ? {}
         : {
-            mergedMessages: merged.map(({ message }) => ({
+            mergedMessages: merged.map(({ run, message }) => ({
               messageId: message.id,
               text: message.text,
               attachments: message.attachments,
@@ -12722,6 +12822,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ...(message.idleCompaction === undefined
                 ? {}
                 : { idleCompaction: message.idleCompaction }),
+              ...(run.delegatedTaskId === undefined ? {} : { promotedTaskId: run.delegatedTaskId }),
             })),
           }),
     });
@@ -15558,6 +15659,53 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
 
+  // A turn can end before the steer carrying a promoted follow-up's message reaches it. The task
+  // waits for that steer, and finalizing runs again once it settles.
+  const promotedSteerSettles = yield* FiberMap.make<string>();
+  /**
+   * The steers still to land that carry a message promoted for this task, one entry per message.
+   * The outbox and the messages are read whole, so a windowed read of the child cannot miss one.
+   */
+  const undeliveredPromotedSteers = Effect.fnUntraced(function* (
+    childThreadId: ThreadId,
+    taskId: NodeId,
+  ) {
+    const steers = yield* effectOutbox.undeliveredSteers({ threadId: childThreadId });
+    if (steers.length === 0) return [];
+    const { messages } = yield* projectionStore.getThreadRecords(childThreadId, ["messages"], {
+      messageIds: [...new Set(steers.map((steer) => steer.messageId))],
+    });
+    const promoted = new Set(
+      messages.flatMap((message) => (message.promotedTaskId === taskId ? [message.id] : [])),
+    );
+    return steers.filter((steer) => promoted.has(steer.messageId));
+  });
+
+  const finalizeOnceSteerSettles = (
+    childThreadId: ThreadId,
+    parentThreadId: ThreadId,
+    effectId: string,
+  ): Effect.Effect<void> =>
+    FiberMap.run(
+      promotedSteerSettles,
+      effectId,
+      effectOutbox.awaitSettled(effectId).pipe(
+        Effect.andThen(
+          Effect.suspend(() =>
+            threadDispatch.withLock(parentThreadId, finalizeAppOwnedSubagent(childThreadId)),
+          ),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to finalize a promoted follow-up after its steer", {
+            childThreadId,
+            effectId,
+            cause,
+          }),
+        ),
+      ),
+      { onlyIfMissing: true },
+    ).pipe(Effect.asVoid);
+
   // A note that a restart cut only unawaited work does not hold the result of the run it follows.
   // Only its attempt's provider turn can tell, so only a pending one that may be such a note reads it.
   const holdsForRestartContinuation = Effect.fnUntraced(function* (
@@ -15849,10 +15997,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         options.resultRun,
       );
       if (childRun === undefined) return;
+      // The result comes from a run the task shares: one its promoted message joined, or an
+      // untagged wake. That run's own task may settle from it too.
+      const steered = taskRuns.length > 0 && childRun.delegatedTaskId !== options.task.id;
+      const joinedRuns = delegatedTaskJoinedRuns(childControls, options.task.id);
+      const joined = joinedRuns.some((run) => run.id === childRun.id);
       let outcome = runOutcome(childRun);
       let terminalStatus = delegatedTaskTerminalStatus(outcome);
       if (terminalStatus === null) {
-        if (childRun.delegatedTaskId === undefined || childRun.id !== options.syncRunId) return;
+        // Promotion cancels the task's queued run; the task now shows the run it joined.
+        if (
+          (childRun.delegatedTaskId === undefined || childRun.id !== options.syncRunId) &&
+          !(joined && taskRuns.some((run) => run.id === options.syncRunId))
+        )
+          return;
         const task = options.task;
         const status: OrchestrationV2Subagent["status"] =
           childRun.status === "queued"
@@ -15918,6 +16076,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         )
       )
         return;
+      // Whichever of its runs it would settle from, a task waits for its messages' steers.
+      const undelivered = yield* undeliveredPromotedSteers(childThreadId, options.task.id);
+      if (undelivered.length > 0) {
+        for (const effectId of new Set(undelivered.map((steer) => steer.effectId))) {
+          yield* finalizeOnceSteerSettles(
+            childThreadId,
+            childControls.thread.lineage.parentThreadId,
+            effectId,
+          );
+        }
+        return;
+      }
       if (
         yield* childAwaitsRestartContinuation(
           childThreadId,
@@ -15987,24 +16157,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (task === undefined) {
         return;
       }
-      // A cancelled task's completed run ends it interrupted.
-      const cancelled = task.cancelledRunId === childRun.id;
+      // A cancelled task's completed run ends it interrupted. Until it settles, whichever of its
+      // runs it settles from is the cancelled one: the Stop can cancel the run the marker named
+      // before that run starts.
+      const cancelled =
+        task.cancelledRunId !== undefined &&
+        (task.result === null || task.cancelledRunId === childRun.id);
       if (cancelled && terminalStatus === "completed") outcome = terminalStatus = "interrupted";
       // Every result the child sent is among its own transfers, far fewer than the parent's.
       const childTransfers = yield* projectionStore.getThreadRecords(childThreadId, [
         "contextTransfers",
       ]);
-      const existingResultTransfer = childTransfers.contextTransfers.find(
+      const resultTransfers = childTransfers.contextTransfers.filter(
         (transfer) =>
           transfer.type === "subagent_result" &&
           transfer.sourceThreadId === childThreadId &&
-          transfer.targetThreadId === parentThreadId &&
-          (transfer.sourcePoint.runId === childRun.id ||
-            (options.task.id === forkedFrom.nodeId && transfer.sourcePoint.runId === undefined)),
+          transfer.targetThreadId === parentThreadId,
       );
-      if (existingResultTransfer !== undefined) {
+      const existingResultTransfer = resultTransfers.find(
+        (transfer) => transfer.sourcePoint.runId === childRun.id,
+      );
+      // Several tasks can settle from one run (a promoted follow-up and the run's own task). Each
+      // settles once; the first to settle publishes the run's transfer and the others share it.
+      if (
+        (options.task.id === forkedFrom.nodeId &&
+          resultTransfers.some((transfer) => transfer.sourcePoint.runId === undefined)) ||
+        (task.result !== null && (steered || existingResultTransfer !== undefined))
+      ) {
         return;
       }
+      const sharesResultTransfer = existingResultTransfer !== undefined;
 
       const now = yield* DateTime.now;
       const result = subagentResultForRun(childProjection, { ...childRun, status: outcome });
@@ -16019,6 +16201,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const updatedTask: OrchestrationV2Subagent = {
         ...task,
         providerThreadId: childRun.providerThreadId,
+        resultRunId: childRun.id,
         status: terminalStatus,
         result: result.text,
         completedAt: now,
@@ -16119,14 +16302,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 },
               },
             ]),
-        {
-          type: "context-transfer.created",
-          threadId: parentThreadId,
-          ...(parentRun === undefined ? {} : { runId: parentRun.id }),
-          providerInstanceId: childRun.providerInstanceId,
-          occurredAt: now,
-          payload: resultTransfer,
-        },
+        ...(sharesResultTransfer
+          ? []
+          : [
+              {
+                type: "context-transfer.created" as const,
+                threadId: parentThreadId,
+                ...(parentRun === undefined ? {} : { runId: parentRun.id }),
+                providerInstanceId: childRun.providerInstanceId,
+                occurredAt: now,
+                payload: resultTransfer,
+              },
+            ]),
       ];
       yield* writeSystemEvents(completionEvents, [], { updateDelegatedCompletionOnly: true });
       yield* releaseFinishedDelegateSessions(childThreadId, childRun.id);
@@ -17704,12 +17891,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       handle: (item: A) => Effect.Effect<void>,
       threadOf: (item: A) => ThreadId,
       byFamily: boolean,
+      name: string,
     ) =>
     <E, R>(stream: Stream.Stream<A, E, R>) =>
       Effect.gen(function* () {
         const reactor = yield* makeKeyedReactor<ThreadId, A>({
           concurrency: REACTION_CONCURRENCY,
           handle,
+          name,
         });
         // A thread's events wait here, in order, while its family is looked up.
         const waiting = new Map<ThreadId, Array<A>>();
@@ -17787,6 +17976,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ({ stored, reaction }) => handleRunUpdate(stored, reaction),
         ({ stored }) => stored.event.threadId,
         true,
+        "Orchestrator.runUpdateReactions",
       ),
       Effect.forkScoped,
     );
@@ -17997,6 +18187,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
         (stored: OrchestrationV2StoredEvent) => stored.event.threadId,
         false,
+        "Orchestrator.deferredSteerReactions",
       ),
       Effect.forkScoped,
     );
@@ -18042,6 +18233,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       (stored) => stored.event.threadId,
       true,
+      "Orchestrator.childWorkReactions",
     ),
     Effect.forkScoped,
   );
@@ -18258,7 +18450,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         if (
           run === undefined ||
           delegatedTaskTerminalStatus(run.status) === null ||
-          delegatedTaskAwaitsWork(runs, child)
+          delegatedTaskAwaitsWork(runs, child) ||
+          (yield* undeliveredPromotedSteers(childThreadId, taskId)).length > 0
         )
           return true;
         return yield* childAwaitsRestartContinuation(childThreadId, runs, run);
@@ -18313,11 +18506,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ["subagents"],
             { subagentChildThreadIds: [threadId] },
           );
-          // A settled task's result was delivered already: its run's wake is not this capture's.
+          // Only an app-owned task joins its run's cohort, and a settled one's result was delivered.
           const parentRunIds = new Set(
             subagents.flatMap((task) => {
               const state = task.completionDelivery?.state;
-              return task.childThreadId === threadId &&
+              return task.origin === "app_owned" &&
+                task.childThreadId === threadId &&
                 task.runId !== null &&
                 (task.result === null ||
                   (state !== "delivered" && state !== "acknowledged" && state !== "disposed"))
@@ -18366,16 +18560,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             { messageRoles: ["user"] },
           )
           .pipe(mapDispatchError(command));
-        const followUpRun = child.runs
-          .filter((run) => run.delegatedTaskId === input.taskId)
-          .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+        const followUpRun = delegatedFollowUpRun(child, input.taskId);
         const unsettled =
           followUpRun === undefined
             ? child.thread.forkedFrom?.type === "node" &&
               child.thread.forkedFrom.nodeId === input.taskId &&
               progressAfterTurn(child).state !== "result_available"
             : delegatedTaskTerminalStatus(runOutcome(followUpRun)) === null ||
-              delegatedTaskAwaitsWork(delegatedTaskRuns(child, input.taskId), child);
+              delegatedTaskAwaitsWork(delegatedTaskRuns(child, input.taskId), child) ||
+              // Its turn ended before the steer carrying its message ran.
+              (yield* undeliveredPromotedSteers(command.threadId, input.taskId).pipe(
+                mapDispatchError(command),
+              )).length > 0;
         yield* threadDispatch.withLock(
           command.threadId,
           Effect.gen(function* () {
@@ -18392,9 +18588,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 { messageRoles: ["user"] },
               )
               .pipe(mapDispatchError(command));
-            const followUpRun = child.runs
-              .filter((run) => run.delegatedTaskId === input.taskId)
-              .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+            const followUpRun = delegatedFollowUpRun(child, input.taskId);
             const monitorRunIds = new Set(
               child.messages
                 .filter((message) => message.notification?.source.kind === "monitor")
@@ -18404,10 +18598,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .filter((run) => isLiveRun(run) && !monitorRunIds.has(run.id))
               .toSorted((a, b) => b.ordinal - a.ordinal)[0];
             const cancelledRun = followUpRun ?? activeRun ?? progressAfterTurn(child).resultRun;
+            // The task's messages sent into a turn whose steers have not landed go with it,
+            // whichever turn they were sent into; one promoted after this commit does not.
+            const cancelledSteerMessageIds = [
+              ...new Set(
+                (yield* undeliveredPromotedSteers(command.threadId, input.taskId).pipe(
+                  mapDispatchError(command),
+                )).map((steer) => steer.messageId),
+              ),
+            ];
             const now = yield* DateTime.now;
             const cancelledTask =
               task !== undefined && unsettled && cancelledRun !== undefined
-                ? { ...task, cancelledRunId: cancelledRun.id, updatedAt: now }
+                ? {
+                    ...task,
+                    cancelledRunId: cancelledRun.id,
+                    ...(cancelledSteerMessageIds.length === 0 ? {} : { cancelledSteerMessageIds }),
+                    updatedAt: now,
+                  }
                 : undefined;
             // The marker, Stop receipt and interrupt outbox commit together under both locks.
             yield* dispatchWithReceiptEffect(command, [], cancelledTask);

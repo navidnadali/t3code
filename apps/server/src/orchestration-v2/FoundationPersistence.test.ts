@@ -1,3 +1,4 @@
+import * as NodeSqlite from "node:sqlite";
 import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -594,7 +595,7 @@ it.effect.each(
                     )
                 : Effect.void,
             Effect.succeed(false),
-            Effect.succeed(true),
+            () => Effect.succeed(true),
           )
           .pipe(Effect.exit, Effect.forkScoped({ startImmediately: true })),
       );
@@ -647,6 +648,142 @@ it.effect.each(
       Effect.provide(Layer.fresh(layerTest)),
       Effect.withTracer(tracer),
       Effect.withTracerEnabled(true),
+      Effect.provideService(
+        ConfigProvider.ConfigProvider,
+        ConfigProvider.fromUnknown({ T3CODE_PROVIDER_COMMIT_BATCHING: true }),
+      ),
+    );
+  },
+);
+
+it.effect(
+  "commits exactly what it acknowledges, in order, when consumers hand a backlog over at once and one fails",
+  () => {
+    const streams = 10;
+    // The first consumer fails, so a batch's tail belongs to consumers that succeed.
+    const failedIndex = 0;
+    const jobError = { _tag: "InvalidUpdate" } as const;
+    return Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const store = yield* EventStore.EventStoreV2;
+      const now = yield* DateTime.now;
+      const threads = Array.from({ length: streams + 1 }, (_, index) =>
+        makeThread(ThreadId.make(`handover:${index}`), now),
+      );
+      yield* sink.write({
+        events: threads.map((thread, index) =>
+          threadCreatedEvent({ id: `handover-created:${index}`, thread, now }),
+        ),
+      });
+      const highWater = yield* sink.latestSequence();
+      const publications = yield* Queue.unbounded<EventId>();
+      yield* sink.stream({ afterSequence: highWater }).pipe(
+        Stream.runForEach((stored) => Queue.offer(publications, stored.event.id)),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const message = (index: number, step: number, streaming: boolean) => ({
+        type: "message.updated" as const,
+        driver: ProviderDriverKind.make("codex"),
+        message: {
+          id: MessageId.make(`handover-message:${index}:${step}`),
+          threadId: threads[index]!.id,
+          runId: null,
+          nodeId: null,
+          createdBy: "agent" as const,
+          creationSource: "provider" as const,
+          role: "assistant" as const,
+          text: `${index}:${step}`,
+          streaming,
+          attachments: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      // Three snapshots, then a final message, which is not batched: a control after them.
+      const handedOver = (index: number) => [
+        message(index, 0, true),
+        message(index, 1, true),
+        message(index, 2, true),
+        message(index, 3, false),
+      ];
+      const eventId = (text: string) => `handover-event:${text}`;
+      const blocking = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const consume = (index: number, events: ReadonlyArray<ReturnType<typeof message>>) =>
+        sink
+          .consumeProviderEvents(
+            Stream.fromIterable(events),
+            (raw) =>
+              Effect.gen(function* () {
+                if (index === streams) {
+                  yield* Deferred.succeed(blocking, undefined);
+                  yield* Deferred.await(release);
+                }
+                yield* sink.write({
+                  events: [
+                    {
+                      id: EventId.make(eventId(raw.message.text)),
+                      threadId: raw.message.threadId,
+                      occurredAt: now,
+                      type: "message.updated",
+                      payload: raw.message,
+                    },
+                  ],
+                });
+                if (index === failedIndex && raw.message.text.endsWith(":1"))
+                  return yield* Effect.fail(jobError);
+              }),
+            Effect.succeed(false),
+            (raw) => Effect.succeed(raw.message.streaming),
+          )
+          .pipe(Effect.exit, Effect.forkScoped({ startImmediately: true }));
+      // Another run's snapshot holds the shared writer, so the backlogs queue behind it.
+      const blocker = yield* consume(streams, [message(streams, 0, true)]);
+      yield* Deferred.await(blocking);
+      const consumers = yield* Effect.forEach(
+        Array.from({ length: streams }, (_, index) => index),
+        (index) => consume(index, handedOver(index)),
+      );
+      yield* TestClock.adjust(0);
+      yield* Deferred.succeed(release, undefined);
+      assert.isTrue(Exit.isSuccess(yield* Fiber.join(blocker)));
+      const exits = yield* Effect.forEach(consumers, Fiber.join);
+      // A consumer that ended cleanly had everything acknowledged; the failed one only what came
+      // before its failure, which rolled back alone and cancelled the rest.
+      const acknowledged = new Map<number, Array<string>>();
+      exits.forEach((exit, index) => {
+        if (index === failedIndex) {
+          assert.isTrue(Exit.isFailure(exit) && Cause.squash(exit.cause) === jobError);
+          acknowledged.set(index, [eventId(`${index}:0`)]);
+        } else {
+          assert.isTrue(Exit.isSuccess(exit));
+          acknowledged.set(
+            index,
+            handedOver(index).map((event) => eventId(event.message.text)),
+          );
+        }
+      });
+      yield* TestClock.adjust(0);
+      const persisted = Array.from(
+        yield* store.read({ afterSequence: highWater }).pipe(Stream.runCollect),
+        (stored) => String(stored.event.id),
+      );
+      for (let index = 0; index < streams; index++) {
+        // (ii) Nothing acknowledged is missing and nothing unacknowledged is kept; (iii) each
+        // consumer's events commit in the order the provider sent them, the final after its steps.
+        assert.deepEqual(
+          persisted.filter((id) => id.startsWith(eventId(`${index}:`))),
+          acknowledged.get(index),
+        );
+      }
+      assert.deepEqual(
+        Array.from(yield* Queue.takeN(publications, persisted.length), String),
+        persisted,
+      );
+      assert.equal(yield* Queue.size(publications), 0);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.fresh(layerTest)),
       Effect.provideService(
         ConfigProvider.ConfigProvider,
         ConfigProvider.fromUnknown({ T3CODE_PROVIDER_COMMIT_BATCHING: true }),
@@ -3089,6 +3226,115 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
         effectTypes: ["terminal.cleanup"],
         reason: "Test cleanup.",
       });
+    }),
+  );
+
+  it.effect("claims at the same cost whatever backlog of captures waits", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const sql = yield* SqlClient.SqlClient;
+      yield* TestClock.adjust("1 hour");
+      const claims: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+      const observe: Statement.Transformer = (statement) => {
+        const [query, params] = statement.compile();
+        if (query.includes("UPDATE orchestration_v2_effect_outbox") && query.includes("RETURNING"))
+          claims.push([query, params]);
+        return Effect.succeed(statement);
+      };
+      yield* outbox
+        .claimNext({ workerId: "claim-cost-worker" })
+        .pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+      const [claimQuery, claimParams] = claims[0]!;
+      const schema = yield* sql<{ readonly sql: string }>`
+        SELECT sql FROM sqlite_master
+        WHERE type IN ('table', 'index') AND sql IS NOT NULL
+          AND tbl_name IN (
+            'orchestration_v2_effect_outbox',
+            'orchestration_v2_projection_runs',
+            'orchestration_v2_projection_threads'
+          )
+      `;
+      // The claim runs on the writer for every worker poll: it takes the oldest claimable effect
+      // and costs the same whatever backlog waits behind it, delegated or idle top-level captures,
+      // due later or tied at one timestamp.
+      type Backlog =
+        | "delegated"
+        | "head-then-delegated"
+        | "head-then-later"
+        | "head-then-tied"
+        | "idle"
+        | "idle-then-start";
+      const claimSteps = (pending: number, backlog: Backlog) => {
+        const db = new NodeSqlite.DatabaseSync(":memory:");
+        try {
+          for (const { sql: ddl } of schema) db.exec(ddl);
+          const thread = db.prepare(`
+            INSERT INTO orchestration_v2_projection_threads (
+              thread_id, project_id, title, default_provider, provider_instance_id, runtime_mode,
+              interaction_mode, created_at, updated_at, payload_json
+            ) VALUES (?, 'project', 'title', 'codex', 'codex', 'full-access', 'default', ?, ?, ?)
+          `);
+          const effect = db.prepare(`
+            INSERT INTO orchestration_v2_effect_outbox (
+              effect_id, command_id, thread_id, effect_type, payload_json, status, attempt_count,
+              available_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, '{}', 'pending', 0, ?, ?, ?)
+          `);
+          const topLevel = { parentThreadId: null, relationshipToParent: null };
+          const subagent = { parentThreadId: "parent", relationshipToParent: "subagent" };
+          for (let index = 0; index <= pending; index++) {
+            const threadId = `thread:claim-cost:${index}`;
+            const at = DateTime.formatIso(
+              DateTime.makeUnsafe(
+                backlog === "head-then-later" && index > 2
+                  ? 200_000 + index
+                  : backlog === "head-then-tied"
+                    ? Math.min(index, 2)
+                    : index,
+              ),
+            );
+            const last = index === pending;
+            if (last && backlog !== "idle-then-start") break;
+            const lineage =
+              backlog === "idle" || backlog === "idle-then-start" || index === 0
+                ? backlog === "delegated"
+                  ? subagent
+                  : topLevel
+                : subagent;
+            thread.run(threadId, at, at, JSON.stringify({ lineage }));
+            effect.run(
+              `effect:claim-cost:${index}`,
+              `command:${index}`,
+              threadId,
+              last ? "provider-turn.start" : "checkpoint.capture",
+              at,
+              at,
+              at,
+            );
+          }
+          const claim = db.prepare(claimQuery);
+          claim.all(...(claimParams as Array<NodeSqlite.SQLInputValue>));
+          return claim.stat("vmStep");
+        } finally {
+          db.close();
+        }
+      };
+      for (const backlog of [
+        "delegated",
+        "head-then-delegated",
+        "head-then-later",
+        "head-then-tied",
+        "idle",
+        "idle-then-start",
+      ] as const) {
+        const atTwoHundred = claimSteps(200, backlog);
+        const atTwoThousand = claimSteps(2_000, backlog);
+        assert.isAtMost(
+          atTwoThousand,
+          atTwoHundred * 1.1,
+          `a claim (${backlog}) took ${atTwoThousand} VM steps at 2,000 pending against ${atTwoHundred} at 200`,
+        );
+      }
     }),
   );
 

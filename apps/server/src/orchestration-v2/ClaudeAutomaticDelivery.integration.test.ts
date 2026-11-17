@@ -1309,3 +1309,222 @@ it.effect(
       ),
     ),
 );
+
+const scheduleWakeup = (scheduledFor: number) => [
+  frame({
+    type: "assistant",
+    uuid: "schedule-wakeup",
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: {
+      id: "msg-schedule-wakeup",
+      role: "assistant",
+      type: "message",
+      model: modelSelection.model,
+      content: [
+        {
+          type: "tool_use",
+          id: "wakeup",
+          name: "ScheduleWakeup",
+          input: { delaySeconds: 60, prompt: "Check the build.", reason: "build" },
+        },
+      ],
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  }),
+  frame({
+    type: "user",
+    uuid: "schedule-wakeup-result",
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "wakeup", content: "Scheduled." }],
+    },
+    tool_use_result: { scheduledFor, clampedDelaySeconds: 60, wasClamped: false },
+  }),
+];
+
+const scheduledWakeup = "claude-scheduled-wakeup";
+
+// The same model and policy let the session manager reuse the loaded thread without resumeThread,
+// so the follow-up's turn start writes the stored roster until Claude's turn start replaces it.
+it.effect.each([
+  // Claude's background-work probe leaves a pending wakeup out.
+  { case: "keeps a pending ScheduleWakeup's hold", firstTurn: "wakeup", stored: undefined },
+  {
+    case: "restores a pending ScheduleWakeup's hold its stored roster lost",
+    firstTurn: "wakeup",
+    stored: [],
+  },
+  {
+    case: "drops a background task that ended within the last turn",
+    firstTurn: "build",
+    stored: [{ taskId: "build", kind: "background_task", description: "Background build" }],
+  },
+] as const)("a follow-up's turn start on a live Claude session $case", ({ firstTurn, stored }) =>
+  Effect.gen(function* () {
+    const name = `claude-follow-up-roster-${firstTurn}-${stored?.length ?? "none"}`;
+    const cwd = yield* checkpointWorkspace(name);
+    const sdkMessages = yield* Queue.unbounded<SDKMessage>();
+    const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+      instanceId: modelSelection.instanceId,
+      settings,
+      environment: {},
+      attachmentsDir: cwd,
+      fileSystem: yield* FileSystem.FileSystem,
+      path: yield* Path.Path,
+      random: yield* SecureRandom.SecureRandom,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      queryRunner: {
+        allocateSessionId: Effect.succeed(sessionId),
+        open: () =>
+          Effect.succeed({
+            messages: Stream.fromQueue(sdkMessages),
+            offer: () => Effect.void,
+            setModel: () => Effect.void,
+            applyFlagSettings: () => Effect.void,
+            setPermissionMode: () => Effect.void,
+            renameSession: () => Effect.void,
+            backgroundTasks: () => Effect.succeed(false),
+            mcpServerStatus: Effect.succeed([]),
+            readMcpResource: () => Effect.die("unexpected MCP resource read"),
+            callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            listPermissionRules: Effect.die("unexpected permission rules read"),
+            stopTask: () => Effect.void,
+            interrupt: Effect.void,
+            close: Effect.void,
+          }),
+        forkSession: () => Effect.die("unused"),
+        subagentLaunchToolUseId: () => Effect.succeed(null),
+        subagentModel: () => Effect.succeed(null),
+        assertComplete: Effect.void,
+      },
+    });
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make(`thread:${name}`);
+      const watch = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
+        orchestrator.streamDomainEvents.pipe(
+          Stream.filter(predicate),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+      const runUpdated = (id: string, status: string) =>
+        watch(
+          (event) =>
+            event.type === "run.updated" &&
+            event.payload.userMessageId === id &&
+            event.payload.status === status,
+        );
+      // Claude's startTurn publishes its roster before it reports the turn running, in one
+      // ordered stream; the run's own running status commits before startTurn is called.
+      const turnRunning = (id: string) => {
+        let attemptId: string | null = null;
+        return watch((event) => {
+          if (event.type === "run.updated" && event.payload.userMessageId === id) {
+            attemptId = event.payload.activeAttemptId;
+          }
+          return (
+            event.type === "provider-turn.updated" &&
+            event.payload.status === "running" &&
+            attemptId !== null &&
+            event.payload.runAttemptId === attemptId
+          );
+        });
+      };
+      const send = Effect.fnUntraced(function* (id: string) {
+        const running = yield* turnRunning(id);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(id),
+          threadId,
+          messageId: MessageId.make(id),
+          text: "Check the build in a minute.",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* worker.drain();
+        yield* Fiber.join(running);
+      });
+      const storedTaskIds = Effect.map(orchestrator.getThreadProjection(threadId), (projection) =>
+        (projection.providerThreads[0]?.pendingBackgroundTasks ?? []).map((task) => task.taskId),
+      );
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create"),
+        threadId,
+        projectId: ProjectId.make(`project:${name}`),
+        title: "Follow-up roster",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: cwd,
+        createdBy: "user",
+        creationSource: "web",
+      });
+
+      yield* send("first");
+      const waiting = yield* runUpdated("first", "waiting");
+      const frames =
+        firstTurn === "wakeup"
+          ? scheduleWakeup(DateTime.toEpochMillis(yield* DateTime.now) + 60_000)
+          : [backgroundTaskStarted("build"), backgroundTaskNotification("build")];
+      for (const message of [...frames, result("first-result", false)])
+        yield* Queue.offer(sdkMessages, message);
+      yield* Fiber.join(waiting);
+      yield* worker.drain();
+      const live = firstTurn === "wakeup" ? [scheduledWakeup] : [];
+      assert.deepEqual(yield* storedTaskIds, live);
+      if (stored !== undefined) {
+        // The roster a lost snapshot leaves: a run's late snapshot is dropped once another run
+        // claims the thread.
+        const [providerThread] = (yield* orchestrator.getThreadProjection(threadId))
+          .providerThreads;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`lost-roster:${name}`),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload: { ...providerThread!, pendingBackgroundTasks: stored },
+            },
+          ],
+        });
+        assert.deepEqual(
+          yield* storedTaskIds,
+          stored.map((task) => task.taskId),
+        );
+      }
+
+      yield* send("second");
+      assert.deepEqual(yield* storedTaskIds, live, "the turn start must write Claude's roster");
+    }).pipe(
+      Effect.provide(
+        ProviderReplayHarness.layerWithRegistry(
+          { name },
+          ProviderAdapterRegistry.layerSingle(adapter),
+          { runEffectWorker: false },
+        ),
+      ),
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        IdAllocator.layer,
+        McpProviderSessions.layer,
+        NodeServices.layer,
+        NodeCrypto.layer,
+      ),
+    ),
+  ),
+);

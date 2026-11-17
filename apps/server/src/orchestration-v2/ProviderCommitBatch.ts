@@ -1,3 +1,4 @@
+import { CurrentWaitObserver, operationName } from "@t3tools/shared/WaitObserver";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
@@ -9,6 +10,8 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import * as IngestLag from "./IngestLag.ts";
+
 const MAX_EVENTS = 64;
 const MAX_BYTES = 1024 * 1024;
 const encodeQueue = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -18,7 +21,8 @@ export const enabled = Config.Boolean("T3CODE_PROVIDER_COMMIT_BATCHING").pipe(
   Effect.orDie,
 );
 
-const isSnapshot = (event: { readonly type: string }) =>
+/** Provider snapshots, which a consumer batches unless it says otherwise. */
+export const isSnapshot = (event: { readonly type: string }) =>
   event.type === "node.updated" ||
   event.type === "message.updated" ||
   event.type === "turn_item.updated" ||
@@ -29,9 +33,20 @@ export class CommitBatchError extends Schema.TaggedError<CommitBatchError>()("Co
 }) {}
 export const isCommitBatchError = Schema.is(CommitBatchError);
 
+const WAIT_SITE = "ProviderCommitBatch.queue";
+const BATCH_SITE = "ProviderCommitBatch.batch";
+
+/** A provider snapshot a consumer batched, or a write's barrier: a command's or a control's. */
+type JobKind = "snapshot" | "barrier";
+
 interface Job {
   readonly owner: { active: boolean };
+  readonly kind: JobKind;
   readonly queuedAt: number;
+  readonly queuedNs: bigint;
+  /** The caller's operation, and the job flushing when this one queued; only while observed. */
+  readonly operation: string | undefined;
+  readonly queuedBehind: string | undefined;
   readonly snapshot: boolean;
   readonly bytes: number;
   readonly execute: Effect.Effect<void, CommitBatchError>;
@@ -91,6 +106,13 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
 ) {
   const queue = yield* Queue.bounded<Job>(MAX_EVENTS);
   const pending = new Set<Job>();
+  const observer = yield* CurrentWaitObserver;
+  // The operation of the batch the worker is flushing, named to the jobs that queue behind it.
+  let flushing: string | undefined;
+  if (enabled && observer !== undefined) {
+    const unregister = observer.register("ProviderCommitBatch.depth", "gauge", () => pending.size);
+    yield* Effect.addFinalizer(() => Effect.sync(unregister));
+  }
   let closed = false;
   const shutdown = Effect.gen(function* () {
     closed = true;
@@ -102,16 +124,22 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
   const enqueue = Effect.fnUntraced(function* <A, E, R>(
     effect: Effect.Effect<A, E, R>,
     token: { active: boolean },
-    snapshot: boolean,
+    kind: JobKind,
     bytes: number,
   ) {
+    const snapshot = kind === "snapshot";
     const caller = yield* Effect.context<R>();
     const reply = yield* Deferred.make<A, E | CommitBatchError>();
     let ownFailure: Cause.Cause<E> | undefined;
     let result: A;
+    observer?.depth(WAIT_SITE, pending.size);
     const job: Job = {
       owner: token,
+      kind,
       queuedAt: yield* Clock.currentTimeMillis,
+      queuedNs: observer === undefined ? 0n : yield* Clock.monotonicTimeNanos,
+      operation: observer === undefined ? undefined : (operationName(caller) ?? "(untraced)"),
+      queuedBehind: flushing,
       snapshot,
       bytes,
       execute: effect.pipe(
@@ -166,6 +194,16 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
             const jobs = batch.events.filter((job) => job.owner.active);
             for (const job of batch.events) if (!job.owner.active) yield* job.cancel;
             if (jobs.length === 0) return;
+            if (observer !== undefined) {
+              const flushNs = yield* Clock.monotonicTimeNanos;
+              for (const job of jobs) {
+                const waitNs = Number(flushNs - job.queuedNs);
+                observer.wait(WAIT_SITE, waitNs, job.queuedBehind);
+                observer.wait(`${WAIT_SITE}.${job.kind}`, waitNs, undefined);
+              }
+              observer.depth(BATCH_SITE, jobs.length);
+              flushing = jobs[0]!.operation;
+            }
             yield* Effect.annotateCurrentSpan({
               "orchestration_v2.work_item_count": jobs.length,
               "orchestration_v2.consumer_count": new Set(jobs.map((job) => job.owner)).size,
@@ -208,7 +246,14 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
               );
             }
           }),
-        ).pipe(Effect.withSpan("orchestrationV2.ProviderCommitBatch.flush")),
+        ).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              flushing = undefined;
+            }),
+          ),
+          Effect.withSpan("orchestrationV2.ProviderCommitBatch.flush"),
+        ),
       ),
       Effect.ensuring(shutdown),
       Effect.forkScoped,
@@ -216,10 +261,15 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
   }
   const barrier = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
     if (closed) return yield* Effect.interrupt;
-    if (!enabled || pending.size === 0 || (yield* CurrentWorker) === (yield* Effect.fiberId))
+    if (!enabled || (yield* CurrentWorker) === (yield* Effect.fiberId)) return yield* effect;
+    if (pending.size === 0) {
+      observer?.depth(WAIT_SITE, 0);
+      observer?.wait(WAIT_SITE, 0, undefined);
+      observer?.wait(`${WAIT_SITE}.barrier`, 0, undefined);
       return yield* effect;
+    }
     const token = { active: true };
-    return yield* enqueue(Effect.exit(effect), token, false, 0).pipe(
+    return yield* enqueue(Effect.exit(effect), token, "barrier", 0).pipe(
       Effect.flatten,
       Effect.orDie,
       Effect.flatten,
@@ -234,11 +284,21 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
     source: Stream.Stream<A, E, R>,
     process: (event: A) => Effect.Effect<void, E2, R2>,
     after: Effect.Effect<boolean, E2, R2>,
-    canBatch: Effect.Effect<boolean, never, R2> = Effect.succeed(true),
+    canBatch: (event: A) => Effect.Effect<boolean, never, R2> = (event) =>
+      Effect.succeed(isSnapshot(event)),
   ) {
     if (!enabled)
       return yield* source.pipe(
-        Stream.mapEffect((event) => process(event).pipe(Effect.andThen(after))),
+        Stream.mapEffect((event) => {
+          const ingest = { persisted: false };
+          return process(event).pipe(
+            Effect.provideService(IngestLag.CurrentIngest, ingest),
+            Effect.tap(() =>
+              ingest.persisted ? IngestLag.reportCommitted(observer, event) : Effect.void,
+            ),
+            Effect.andThen(after),
+          );
+        }),
         Stream.takeUntil(Boolean),
         Stream.runDrain,
       );
@@ -257,26 +317,34 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
           const event = signal._tag === "Event" ? signal.event : undefined;
           // EOF only acknowledges prior work; it can share a commit with other consumers.
           const snapshot =
-            signal._tag === "End" ||
-            (event !== undefined && isSnapshot(event) && (yield* canBatch));
+            signal._tag === "End" || (event !== undefined && (yield* canBatch(event)));
           const bytes =
             snapshot && event !== undefined ? Buffer.byteLength(yield* encodeQueue(event)) : 0;
+          const ingest = { persisted: false };
           const work: Effect.Effect<boolean, E | E2, R2> =
             signal._tag === "Failure"
               ? Effect.failCause(signal.cause)
               : event === undefined
                 ? Effect.succeed(true)
-                : process(event).pipe(Effect.as(false));
-          const reply = snapshot
-            ? yield* enqueue(work, token, true, bytes)
-            : (yield* enqueue(Effect.void, token, false, 0)).pipe(Effect.andThen(work));
+                : process(event).pipe(
+                    Effect.provideService(IngestLag.CurrentIngest, ingest),
+                    Effect.as(false),
+                  );
+          // A control runs after the replies before it settle, so only its own writes queue.
+          const reply = snapshot ? yield* enqueue(work, token, "snapshot", bytes) : work;
           if (!snapshot) resume = Deferred.await(processed);
-          return { reply, processed, check: !snapshot };
+          return { reply, processed, check: !snapshot, event, ingest };
         }),
       ),
       Stream.buffer({ capacity: MAX_EVENTS }),
-      Stream.mapEffect(({ reply, processed, check }) =>
+      Stream.mapEffect(({ reply, processed, check, event, ingest }) =>
         reply.pipe(
+          // The reply settles once the event's writes commit.
+          Effect.tap(() =>
+            event === undefined || !ingest.persisted
+              ? Effect.void
+              : IngestLag.reportCommitted(observer, event),
+          ),
           Effect.flatMap((end) =>
             end ? Effect.succeed(true) : check ? after : Effect.succeed(false),
           ),

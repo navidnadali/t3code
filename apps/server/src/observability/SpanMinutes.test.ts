@@ -1,4 +1,5 @@
-// @effect-diagnostics nodeBuiltinImport:off - the test gunzips archives the way a reader would.
+// @effect-diagnostics nodeBuiltinImport:off - the test gunzips archives the way a reader would, and names GC kinds as perf_hooks does.
+import * as NodePerfHooks from "node:perf_hooks";
 import * as NodeZlib from "node:zlib";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -21,6 +22,7 @@ import * as ServerConfig from "../config.ts";
 import * as ResourceAttribution from "../resourceTelemetry/ResourceAttribution.ts";
 import * as Observability from "./Observability.ts";
 import * as SpanMinutes from "./SpanMinutes.ts";
+import * as WaitMinutes from "./WaitMinutes.ts";
 
 const nanos = (ms: number) => BigInt(Math.round(ms * 1_000_000));
 
@@ -49,6 +51,7 @@ describe("SpanMinutes", () => {
     for (let index = 0; index < 990; index++) aggregate.record("sqlite", nanos(5), nanos(5.05));
     for (let index = 0; index < 10; index++) aggregate.record("sqlite", 0n, nanos(5_000));
     aggregate.record("Orchestrator.dispatch", 0n, nanos(351.5));
+    for (let index = 1; index <= 9; index++) aggregate.record("tick.few", 0n, nanos(index));
     aggregate.record("server.subscription", 0n, nanos(2 * 60 * 60_000));
     aggregate.record("untimed", 0n, 0n);
     for (let index = 0; index < 1_000; index++) aggregate.record("sqlite.cached", 0n, 14_000n);
@@ -56,12 +59,13 @@ describe("SpanMinutes", () => {
     for (let index = 0; index < 950; index++) aggregate.record("Codec.decode", 0n, 1_000n);
     for (let index = 0; index < 50; index++) aggregate.record("Codec.decode", 0n, nanos(1));
 
-    const stats = aggregate.drain();
+    const { spans: stats, spanPercentiles } = aggregate.drain();
     // Exact count, total and max; the p95 within 1/16 of the nearest-rank one (the 950th of 1,000).
     const expected: Record<string, SpanMinutes.SpanStat> = {
       "ProjectionStore.getThread": [1_000, 185_185, 370, 351.5],
       sqlite: [1_000, 50_050, 5_000, 0.05],
       "Orchestrator.dispatch": [1, 351.5, 351.5, 351.5],
+      "tick.few": [9, 45, 9, 9],
       "server.subscription": [1, 7_200_000, 7_200_000, 7_200_000],
       untimed: [1, 0, 0, 0],
       "sqlite.cached": [1_000, 14, 0.014, 0.014],
@@ -76,7 +80,21 @@ describe("SpanMinutes", () => {
     }
     // Up to 19 spans the p95 is the slowest one, so it is exact.
     assert.strictEqual(stats["Orchestrator.dispatch"]![3], 351.5);
-    assert.deepStrictEqual(aggregate.drain(), {});
+    // Nearest-rank p50, p90 and p99 within 1/16. Under ten spans the p90 and p99 are the max, so
+    // a name with fewer has none.
+    const expectedPercentiles: Record<string, SpanMinutes.SpanPercentiles> = {
+      "ProjectionStore.getThread": [185, 333, 366.3],
+      sqlite: [0.05, 0.05, 0.05],
+      "sqlite.cached": [0.014, 0.014, 0.014],
+      "Codec.decode": [0.001, 0.001, 1],
+    };
+    assert.deepStrictEqual(Object.keys(spanPercentiles), Object.keys(expectedPercentiles));
+    for (const [name, percentiles] of Object.entries(expectedPercentiles)) {
+      percentiles.forEach((expectedMs, index) =>
+        assert.closeTo(spanPercentiles[name]![index]!, expectedMs, expectedMs / 16, name),
+      );
+    }
+    assert.deepStrictEqual(aggregate.drain(), { spans: {}, spanPercentiles: {} });
   });
 
   it("folds names past the cap into one entry and drops names idle for a minute", () => {
@@ -86,7 +104,7 @@ describe("SpanMinutes", () => {
     for (let index = 0; index < SpanMinutes.MAX_SPAN_NAMES + 4; index++) {
       aggregate.record(`span-${index}`, 0n, nanos(2));
     }
-    const first = aggregate.drain();
+    const first = aggregate.drain().spans;
     assert.strictEqual(Object.keys(first).length, SpanMinutes.MAX_SPAN_NAMES + 1);
     assert.deepStrictEqual(
       first[longName.slice(0, SpanMinutes.MAX_SPAN_NAME_LENGTH)],
@@ -95,13 +113,31 @@ describe("SpanMinutes", () => {
     assert.deepStrictEqual(first[SpanMinutes.OTHER_SPAN_NAME], [5, 10, 2, 2]);
 
     aggregate.record("span-0", 0n, nanos(2));
-    assert.deepStrictEqual(Object.keys(aggregate.drain()), ["span-0"]);
+    assert.deepStrictEqual(Object.keys(aggregate.drain().spans), ["span-0"]);
     for (let index = 1; index < SpanMinutes.MAX_SPAN_NAMES; index++) {
       aggregate.record(`fresh-${index}`, 0n, nanos(3));
     }
-    const third = aggregate.drain();
+    const third = aggregate.drain().spans;
     assert.strictEqual(Object.keys(third).length, SpanMinutes.MAX_SPAN_NAMES - 1);
     assert.isUndefined(third[SpanMinutes.OTHER_SPAN_NAME]);
+  });
+
+  it("counts garbage collections per kind with their total and longest pause", () => {
+    const gc = SpanMinutes.makeGcAggregate();
+    const { NODE_PERFORMANCE_GC_MINOR, NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_WEAKCB } =
+      NodePerfHooks.constants;
+    for (const durationMs of [0.4, 1.2, 0.9]) gc.record(NODE_PERFORMANCE_GC_MINOR, durationMs);
+    gc.record(NODE_PERFORMANCE_GC_MAJOR, 210.25);
+    gc.record(NODE_PERFORMANCE_GC_WEAKCB, 0.01);
+    // A kind Node adds later still counts.
+    gc.record(64, 3);
+    assert.deepStrictEqual(gc.drain(), {
+      minor: [3, 2.5, 1.2],
+      major: [1, 210.3, 210.3],
+      weakcb: [1, 0.01, 0.01],
+      other: [1, 3, 3],
+    });
+    assert.deepStrictEqual(gc.drain(), {});
   });
 
   it.effect(
@@ -114,11 +150,13 @@ describe("SpanMinutes", () => {
           "/home/someone/private-repo",
           "thread-7f3a9c",
         ];
+        const waits = WaitMinutes.makeWaitAggregate();
         yield* Effect.scoped(
           Effect.gen(function* () {
             const minutes = yield* SpanMinutes.makeWith({
               sampler: Effect.succeed(Effect.succeed(readings)),
               append: (line) => Queue.offer(lines, line).pipe(Effect.asVoid),
+              sections: [waits.drain],
             });
             const tracer = yield* makeLocalFileTracer({
               filePath: "unused",
@@ -160,6 +198,12 @@ describe("SpanMinutes", () => {
             runSpan("ProviderIo.decode", 3_000, 0.5, { sampled: false });
             // Counted by the SQL summary instead of written.
             runSpan("sqlite", 4_000, 0.25);
+            waits.observer.wait(
+              "ThreadCommandExecutor.lock",
+              1_500_000,
+              "Probe.holder",
+              secrets[2],
+            );
             yield* TestClock.adjust("1 minute");
             const first = yield* Queue.take(lines);
             for (const secret of secrets) expect(first).not.toContain(secret);
@@ -173,6 +217,26 @@ describe("SpanMinutes", () => {
                 sqlite: [1, 0.25, 0.25, 0.25],
               },
               ...readings,
+              // Two spans: their p90 and p99 would be the max.
+              spanPercentiles: {},
+              waits: {
+                "ThreadCommandExecutor.lock": {
+                  n: 1,
+                  totalMs: 1.5,
+                  maxMs: 1.5,
+                  p50Ms: 1.5,
+                  p90Ms: 1.5,
+                  p99Ms: 1.5,
+                  holders: { "Probe.holder": [1, 1.5] },
+                },
+              },
+              gauges: {},
+              threads: {
+                "ThreadCommandExecutor.lock": {
+                  byWait: [{ waitMs: 1.5, holdMs: 0, n: 1 }],
+                  byHold: [],
+                },
+              },
             });
 
             runSpan("Orchestrator.dispatch", 61_000, 5);
@@ -185,10 +249,22 @@ describe("SpanMinutes", () => {
           pid: process.pid,
           spans: { "Orchestrator.dispatch": [1, 5, 5, 5] },
           ...readings,
+          spanPercentiles: {},
+          waits: {},
+          gauges: {},
+          threads: {},
         });
         assert.strictEqual(yield* Queue.size(lines), 0);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it("keeps at least five days of 48 KB minute lines, by default", () => {
+    const { maxBytes, maxArchives, maxArchiveBytes } = SpanMinutes.SPAN_MINUTE_LOG_LIMITS;
+    // A 48 KB minute line with every field, gzipped 4 to 1.
+    const linesPerFile = Math.floor(maxBytes / 48_000);
+    const archives = Math.min(maxArchives, Math.floor(maxArchiveBytes / (maxBytes / 4)));
+    assert.isAtLeast((archives * linesPerFile) / (24 * 60), 5);
+  });
 
   it.effect("gzips each closed file and keeps only the newest archives within both caps", () =>
     Effect.gen(function* () {
@@ -301,11 +377,51 @@ describe("SpanMinutes", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("writes every SQL statement when timing is off, whatever the sample rate", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-trace-sql-sample-" });
+      const config = yield* ServerConfig.ServerConfig.pipe(
+        Effect.provide(ServerConfig.layerTest(baseDir, baseDir)),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(
+            Observability.layer.pipe(
+              Layer.provide(
+                Layer.succeed(ServerConfig.ServerConfig, {
+                  ...config,
+                  traceTimingEnabled: false,
+                  traceSqlSampleEvery: 2,
+                }),
+              ),
+              Layer.provide(ResourceAttribution.layer),
+              Layer.provide(FetchHttpClient.layer),
+            ),
+          );
+          for (let index = 0; index < 4; index++) {
+            yield* Effect.void.pipe(Effect.withSpan("sqlite"), Effect.provideContext(context));
+          }
+        }),
+      );
+      // Untimed, every statement lasts 0 ms, so none can be told from a slow one.
+      const written = (yield* fs.readFileString(config.serverTracePath))
+        .trim()
+        .split("\n")
+        .map((line) => decodeLine(line) as { readonly type: string; readonly name: string })
+        .filter((record) => record.name === "sqlite");
+      assert.deepStrictEqual(
+        written.map((record) => record.type),
+        ["effect-span", "effect-span", "effect-span", "effect-span"],
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("writes span minutes beside the trace file unless the knob turns them off", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      for (const traceSpanMinutes of [undefined, false]) {
+      for (const traceSpanMinutes of [undefined, false, "cpu"] as const) {
         const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-span-minutes-knob-" });
         const config = yield* ServerConfig.ServerConfig.pipe(
           Effect.provide(ServerConfig.layerTest(baseDir, baseDir)),
@@ -317,7 +433,8 @@ describe("SpanMinutes", () => {
                 Layer.provide(
                   Layer.succeed(ServerConfig.ServerConfig, {
                     ...config,
-                    ...(traceSpanMinutes === undefined ? {} : { traceSpanMinutes }),
+                    ...(traceSpanMinutes === false ? { traceSpanMinutes } : {}),
+                    ...(traceSpanMinutes === "cpu" ? { traceCpuProfileIntervalMs: 1 } : {}),
                   }),
                 ),
                 Layer.provide(ResourceAttribution.layer),
@@ -337,6 +454,10 @@ describe("SpanMinutes", () => {
         } else {
           const line = decodeLine(Option.getOrThrow(written)) as SpanMinutes.SpanMinuteLine;
           assert.strictEqual(line.spans["Probe.run"]?.[0], 1);
+          // The server's line also carries its waits and garbage collections, and a CPU
+          // profile only when asked for one.
+          assert.containsAllKeys(line, ["waits", "gauges", "threads", "gc"]);
+          assert.strictEqual("cpuProfile" in line, traceSpanMinutes === "cpu");
         }
       }
     }).pipe(Effect.provide(NodeServices.layer)),

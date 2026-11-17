@@ -224,12 +224,41 @@ export function cancelledBeforeStart(
   return run.status === "cancelled" && neverStarted(run);
 }
 
-/** A follow-up task's runs: those tagged with it, and the untagged wakes for subagents they started. */
+/**
+ * The runs a follow-up promoted to Steer works in: each run holding a message one of its queued
+ * runs was sent into a running turn as, and that run's restart continuations. The mark is on the
+ * message, which every read of the run holds, so a windowed read decides as the full read does.
+ */
+export function delegatedTaskJoinedRuns(
+  projection: Parameters<typeof delegatedTaskRuns>[0],
+  taskId: NodeId,
+): ReadonlyArray<OrchestrationV2Run> {
+  const joinedRunIds = new Set<string | null>(
+    projection.messages.flatMap((message) =>
+      message.promotedTaskId === taskId ? [message.runId] : [],
+    ),
+  );
+  if (joinedRunIds.size === 0) return [];
+  const chain = projection.runs.filter((run) => joinedRunIds.has(run.id));
+  for (let index = 0; index < chain.length; index += 1) {
+    for (const run of projection.runs) {
+      if (run.restartContinuationOfRunId === chain[index]!.id && !chain.includes(run))
+        chain.push(run);
+    }
+  }
+  return chain;
+}
+
+/**
+ * A follow-up task's runs: those tagged with it, the runs its promoted message joined, and the
+ * untagged wakes for subagents they started. A merged wake carries several parent runs' results,
+ * all for the same tasks; any of them links it.
+ */
 export function delegatedTaskRuns(
   projection: {
     readonly runs: ReadonlyArray<OrchestrationV2Run>;
     readonly messages: ReadonlyArray<
-      Pick<OrchestrationV2ConversationMessage, "runId" | "delegatedCompletion">
+      Pick<OrchestrationV2ConversationMessage, "runId" | "delegatedCompletion" | "promotedTaskId">
     >;
   },
   taskId: NodeId,
@@ -237,6 +266,7 @@ export function delegatedTaskRuns(
   const owned = new Set(
     projection.runs.filter((run) => run.delegatedTaskId === taskId).map((run) => run.id),
   );
+  for (const run of delegatedTaskJoinedRuns(projection, taskId)) owned.add(run.id);
   const untagged = new Set(
     projection.runs.filter((run) => run.delegatedTaskId === undefined).map((run) => run.id),
   );
@@ -248,7 +278,10 @@ export function delegatedTaskRuns(
         !untagged.has(runId) ||
         owned.has(runId) ||
         delegatedCompletion === undefined ||
-        !owned.has(delegatedCompletion.parentRunId)
+        !(
+          owned.has(delegatedCompletion.parentRunId) ||
+          (delegatedCompletion.merged ?? []).some((part) => owned.has(part.parentRunId))
+        )
       )
         continue;
       owned.add(runId);

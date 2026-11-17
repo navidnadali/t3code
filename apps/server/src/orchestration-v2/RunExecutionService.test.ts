@@ -57,6 +57,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
 import * as ProjectEnrichment from "../project/ProjectEnrichmentService.ts";
@@ -64,6 +65,8 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as VcsStatusBroadcaster from "../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
+import { recordingWaitObserver } from "../observability/WaitObserver.testkit.ts";
+import * as IngestLag from "./IngestLag.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -77,6 +80,9 @@ const mockEventSink = (implementation: Partial<EventSink.EventSinkV2["Service"]>
         Stream.takeUntil(Boolean),
         Stream.runDrain,
       ),
+    // The newer run that claimed a provider thread has attached.
+    writeProviderThreadRosterIfUnattached: () =>
+      Effect.succeed({ unattached: false, storedEvents: [] }),
     ...implementation,
   });
 
@@ -201,6 +207,180 @@ it.effect("routes shared-runtime events only to their owning root run", () =>
     );
   }),
 );
+
+it("drops only another run's root work on threads the run does not own", () => {
+  const identity: RunExecutionService.ProviderEventRouteIdentity = {
+    threadId: ThreadId.make("thread:drop:self"),
+    runId: RunId.make("run:drop:self"),
+    attemptId: RunAttemptId.make("attempt:drop:self"),
+    providerThreadId: ProviderThreadId.make("provider-thread:drop:self"),
+  };
+  const other = {
+    threadId: ThreadId.make("thread:drop:other"),
+    runId: RunId.make("run:drop:other"),
+    attemptId: RunAttemptId.make("attempt:drop:other"),
+    providerThreadId: ProviderThreadId.make("provider-thread:drop:other"),
+  };
+  const ownedChild = ThreadId.make("thread:drop:owned-child");
+  const ownedChildProviderThread = ProviderThreadId.make("provider-thread:drop:owned-child");
+  const state = {
+    ...RunExecutionService.makeProviderEventRoutingState({ identity, providerTurnId: null }),
+    ownedThreadIds: new Set([identity.threadId, ownedChild]),
+    ownedProviderThreadIds: new Set([identity.providerThreadId, ownedChildProviderThread]),
+  };
+  const event = (value: unknown) => value as ProviderAdapter.ProviderAdapterV2Event;
+  const item = (threadId: ThreadId, runId: RunId | null) =>
+    event({
+      type: "turn_item.updated",
+      driver,
+      turnItem: { id: TurnItemId.make("turn-item:drop"), threadId, runId, type: "dynamic_tool" },
+    });
+  const turn = (input: {
+    readonly threadId?: ThreadId;
+    readonly attemptId: RunAttemptId | null;
+    readonly providerThreadId: ProviderThreadId;
+  }) =>
+    event({
+      type: "provider_turn.updated",
+      driver,
+      ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+      providerTurn: {
+        id: ProviderTurnId.make("provider-turn:drop"),
+        providerThreadId: input.providerThreadId,
+        runAttemptId: input.attemptId,
+        status: "running",
+      },
+    });
+  const cases: ReadonlyArray<readonly [string, ProviderAdapter.ProviderAdapterV2Event, boolean]> = [
+    ["another run's item", item(other.threadId, other.runId), true],
+    [
+      "another run's node",
+      event({
+        type: "node.updated",
+        driver,
+        node: { threadId: other.threadId, runId: other.runId },
+      }),
+      true,
+    ],
+    [
+      "another run's message",
+      event({
+        type: "message.updated",
+        driver,
+        message: { threadId: other.threadId, runId: other.runId },
+      }),
+      true,
+    ],
+    [
+      "another run's plan",
+      event({
+        type: "plan.updated",
+        driver,
+        plan: { threadId: other.threadId, runId: other.runId },
+      }),
+      true,
+    ],
+    ["another run's usage report", turn({ ...other, attemptId: other.attemptId }), true],
+    // Routing can still own these, so they stay.
+    ["another run's item on this run's thread", item(identity.threadId, other.runId), false],
+    ["another run's item on an owned child", item(ownedChild, other.runId), false],
+    ["a runless child item", item(other.threadId, null), false],
+    [
+      "a usage report without its thread",
+      turn({ attemptId: other.attemptId, providerThreadId: other.providerThreadId }),
+      false,
+    ],
+    [
+      "a usage report on an owned provider thread",
+      turn({
+        threadId: other.threadId,
+        attemptId: other.attemptId,
+        providerThreadId: ownedChildProviderThread,
+      }),
+      false,
+    ],
+    [
+      "a child turn without an attempt",
+      turn({ threadId: other.threadId, attemptId: null, providerThreadId: other.providerThreadId }),
+      false,
+    ],
+    // Controls always stay: rosters, steers, children and terminals.
+    [
+      "another run's roster",
+      event({
+        type: "provider_thread.updated",
+        driver,
+        providerThread: { id: other.providerThreadId, appThreadId: other.threadId },
+      }),
+      false,
+    ],
+    ["another run's steer", event({ type: "steer.updated", driver, runId: other.runId }), false],
+    [
+      "another run's subagent",
+      event({
+        type: "subagent.updated",
+        driver,
+        subagent: { threadId: other.threadId, runId: other.runId, childThreadId: null },
+      }),
+      false,
+    ],
+    [
+      "another run's terminal",
+      event({
+        type: "turn.terminal",
+        driver,
+        providerThreadId: other.providerThreadId,
+        providerTurnId: ProviderTurnId.make("provider-turn:drop"),
+      }),
+      false,
+    ],
+    ["this run's item", item(identity.threadId, identity.runId), false],
+  ];
+  for (const [name, candidate, dropped] of cases) {
+    assert.strictEqual(
+      RunExecutionService.isAnotherRunsProviderEvent(candidate, identity, state),
+      dropped,
+      name,
+    );
+    // A dropped event is one routing rejects.
+    if (dropped)
+      assert.isFalse(RunExecutionService.routeProviderEvent(candidate, identity, state)[0], name);
+  }
+
+  // Drops wait while an event that may give the run a thread or provider thread is queued.
+  const node = (threadId: ThreadId, runId: RunId | null, providerThreadId: ProviderThreadId) =>
+    event({ type: "node.updated", driver, node: { threadId, runId, providerThreadId } });
+  const extending: ReadonlyArray<
+    readonly [string, ProviderAdapter.ProviderAdapterV2Event, boolean]
+  > = [
+    ["a child's creation", event({ type: "app_thread.created", driver }), true],
+    ["a subagent", event({ type: "subagent.updated", driver }), true],
+    ["a roster", event({ type: "provider_thread.updated", driver }), true],
+    [
+      "an owned child's node on a new provider thread",
+      node(ownedChild, null, ProviderThreadId.make("provider-thread:drop:new")),
+      true,
+    ],
+    [
+      "an owned child's node on its known provider thread",
+      node(ownedChild, null, ownedChildProviderThread),
+      false,
+    ],
+    [
+      "this run's root node",
+      node(identity.threadId, identity.runId, identity.providerThreadId),
+      false,
+    ],
+    ["another run's node", node(other.threadId, other.runId, other.providerThreadId), false],
+    ["an item", item(ownedChild, null), false],
+  ];
+  for (const [name, candidate, extendsOwnership] of extending)
+    assert.strictEqual(
+      RunExecutionService.mayExtendRunOwnership(candidate, identity, state),
+      extendsOwnership,
+      name,
+    );
+});
 
 it("routes only enrolled workflow members after the root turn ends", () => {
   const threadId = ThreadId.make("thread:late-child");
@@ -2136,6 +2316,120 @@ it.effect("drains queued child output after the root loses provider-thread owner
   }),
 );
 
+// A newer run claims the provider thread when it is queued and ingests only from its turn start.
+it.effect.each([
+  {
+    claimant: "has not attached, until its work settles",
+    unattached: true,
+    ingested: [true, true, false],
+  },
+  { claimant: "has attached, no further", unattached: false, ingested: [true, true] },
+] as const)(
+  "after its terminal, a run follows root snapshots while the run that claimed its thread $claimant",
+  ({ unattached, ingested }) =>
+    Effect.gen(function* () {
+      const snapshots: Array<boolean | undefined> = [];
+      yield* runBackgroundItemScenario(
+        `claimant-${unattached ? "unattached" : "attached"}`,
+        (ids) => {
+          const snapshot = (pendingBackgroundWork: boolean) => ({
+            type: "provider_thread.updated" as const,
+            driver,
+            providerThread: {
+              id: ids.providerThreadId,
+              driver,
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              providerSessionId: null,
+              appThreadId: ids.threadId,
+              ownerNodeId: null,
+              nativeThreadRef: null,
+              nativeConversationHeadRef: null,
+              status: "idle",
+              firstRunOrdinal: 1,
+              lastRunOrdinal: 1,
+              handoffIds: [],
+              forkedFrom: null,
+              pendingBackgroundTasks: [],
+              createdAt: DateTime.makeUnsafe(0),
+              updatedAt: DateTime.makeUnsafe(0),
+            } satisfies OrchestrationV2ProviderThread,
+            pendingBackgroundWork,
+          });
+          return [
+            snapshot(true),
+            rootTerminalEvent(ids, "completed"),
+            snapshot(true),
+            snapshot(false),
+            snapshot(true),
+          ];
+        },
+        {
+          keepEventStreamOpen: true,
+          providerThreadOwnerLost: true,
+          claimantUnattached: unattached,
+          onIngest: (event) =>
+            Effect.sync(() => {
+              if (event.type === "provider_thread.updated") {
+                snapshots.push(event.pendingBackgroundWork);
+              }
+            }),
+        },
+      );
+      assert.deepEqual(snapshots, [...ingested]);
+    }),
+);
+
+it.effect("reports the ingest lag of roster corrections written for an unattached claimant", () => {
+  const { observer, reports } = recordingWaitObserver();
+  return Effect.gen(function* () {
+    yield* runBackgroundItemScenario(
+      "claimant-roster-lag",
+      (ids) => {
+        const snapshot = (pendingBackgroundWork: boolean) => ({
+          type: "provider_thread.updated" as const,
+          driver,
+          providerThread: {
+            id: ids.providerThreadId,
+            driver,
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            providerSessionId: null,
+            appThreadId: ids.threadId,
+            ownerNodeId: null,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            status: "idle",
+            firstRunOrdinal: 1,
+            lastRunOrdinal: 1,
+            handoffIds: [],
+            forkedFrom: null,
+            pendingBackgroundTasks: [],
+            createdAt: DateTime.makeUnsafe(0),
+            updatedAt: DateTime.makeUnsafe(0),
+          } satisfies OrchestrationV2ProviderThread,
+          pendingBackgroundWork,
+        });
+        // After the terminal the run's own writes refuse; the roster correction writes instead.
+        const corrections = [snapshot(true), snapshot(false)];
+        for (const event of corrections) IngestLag.markArrival(event, 0n);
+        return [snapshot(true), rootTerminalEvent(ids, "completed"), ...corrections];
+      },
+      {
+        batched: true,
+        keepEventStreamOpen: true,
+        providerThreadOwnerLost: true,
+        claimantUnattached: true,
+        rosterCorrected: true,
+      },
+    );
+    assert.deepEqual(
+      reports("wait")
+        .map(([site]) => String(site))
+        .filter((site) => site.startsWith("ProviderIngest.lag.")),
+      ["ProviderIngest.lag.lifecycle", "ProviderIngest.lag.lifecycle"],
+    );
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});
+
 it.effect("keeps ingesting until queued background work clears after the probe goes idle", () =>
   Effect.gen(function* () {
     // The adapter's probe runs ahead of its event queue, so only the queued update may release.
@@ -2203,6 +2497,44 @@ it.effect("keeps ingesting until queued background work clears after the probe g
     );
   }),
 );
+
+it.effect("reports a written message's and its run's terminal's ingest lag", () => {
+  const { observer, reports } = recordingWaitObserver();
+  return Effect.gen(function* () {
+    yield* runBackgroundItemScenario(
+      "ingest-lag",
+      (ids) => {
+        const events = [
+          streamedMessageEvent({
+            id: "message:ingest-lag",
+            threadId: ids.threadId,
+            runId: ids.runId,
+            role: "assistant",
+            text: "Done.",
+            streaming: false,
+          }),
+          rootTerminalEvent(ids, "completed"),
+        ];
+        // As the session manager stamps each event it takes from the adapter.
+        for (const event of events) IngestLag.markArrival(event, 0n);
+        return events;
+      },
+      {
+        batched: true,
+        // The ingestor marks what it writes; a message write stands in for it here.
+        onIngest: (event) =>
+          event.type === "message.updated" ? IngestLag.markPersisted : Effect.void,
+      },
+    );
+    // A terminal writes its run's final events itself, not through the ingestor.
+    assert.sameMembers(
+      reports("wait")
+        .map(([site]) => String(site))
+        .filter((site) => site.startsWith("ProviderIngest.lag.")),
+      ["ProviderIngest.lag.delta", "ProviderIngest.lag.lifecycle"],
+    );
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});
 
 it.effect("keeps ingesting while the last stored root snapshot reports pending work", () =>
   Effect.gen(function* () {
@@ -4881,12 +5213,27 @@ function runBackgroundItemScenario(
     readonly onEventsConsumed?: Effect.Effect<void>;
     // Owner-gated root snapshots store nothing, as after a newer run claims the thread.
     readonly providerThreadOwnerLost?: boolean;
+    // That newer run has not attached yet, so this run's root snapshots still set the roster.
+    readonly claimantUnattached?: boolean;
+    // The unattached claimant's stored roster differs, so the correction writes it.
+    readonly rosterCorrected?: boolean;
     readonly afterEvents?: (
       activity: PreviewAgentActivity.PreviewAgentActivity["Service"],
     ) => Effect.Effect<void>;
     readonly onFinalized?: (
       events: ReadonlyArray<OrchestrationV2DomainEvent>,
     ) => Effect.Effect<void>;
+    readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
+    // A commit coordinator shared with other runs, instead of the run's own.
+    readonly coordinator?: Effect.Success<ReturnType<typeof ProviderCommitBatch.make>>;
+    // Other runs on the shared writer, for the run's whole life (needs `batched`).
+    readonly otherWriters?: (
+      coordinator: Effect.Success<ReturnType<typeof ProviderCommitBatch.make>>,
+    ) => Effect.Effect<void>;
+    // Sees each held text's display-position reservation.
+    readonly onPositionReserved?: (turnItemId: TurnItemId) => Effect.Effect<void>;
+    // Sees the size of each chunk ingestion hands to the commit coordinator (needs `batched`).
+    readonly onIngestionChunk?: (size: number) => Effect.Effect<void>;
   },
 ) {
   return Effect.gen(function* () {
@@ -4899,7 +5246,8 @@ function runBackgroundItemScenario(
     );
     let inSharedCommit = false;
     const coordinator =
-      options?.batched === true
+      options?.coordinator ??
+      (options?.batched === true
         ? yield* ProviderCommitBatch.make(
             (work) =>
               Effect.suspend(() => {
@@ -4914,16 +5262,39 @@ function runBackgroundItemScenario(
               ),
             true,
           )
-        : undefined;
+        : undefined);
+    if (coordinator !== undefined && options?.otherWriters !== undefined)
+      yield* options.otherWriters(coordinator).pipe(Effect.forkChild({ startImmediately: true }));
     const layerTest = RunExecutionService.layer.pipe(
       Layer.provide(
         Layer.mergeAll(
           McpAppModelContext.layerEmpty,
           Layer.succeed(PreviewAgentActivity.PreviewAgentActivity, previewActivity),
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
-          layerTurnItemPositionsTest,
+          options?.onPositionReserved === undefined
+            ? layerTurnItemPositionsTest
+            : Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+                allocate: ({ turnItemId }) =>
+                  options.onPositionReserved!(turnItemId).pipe(Effect.as(1)),
+              }),
           mockEventSink({
-            ...(coordinator === undefined ? {} : { consumeProviderEvents: coordinator.consume }),
+            ...(coordinator === undefined
+              ? {}
+              : {
+                  consumeProviderEvents: (source, process, after, canBatch) =>
+                    coordinator.consume(
+                      options?.onIngestionChunk === undefined
+                        ? source
+                        : source.pipe(
+                            Stream.mapArrayEffect((chunk) =>
+                              options.onIngestionChunk!(chunk.length).pipe(Effect.as(chunk)),
+                            ),
+                          ),
+                      process,
+                      after,
+                      canBatch,
+                    ),
+                }),
             write: () => Effect.succeed([]),
             writeWithEffects: (input) =>
               Effect.gen(function* () {
@@ -4938,6 +5309,16 @@ function runBackgroundItemScenario(
                 return [];
               }),
             writeIfRunCurrent: () => Effect.succeed({ committed: true, storedEvents: [] }),
+            ...(options?.claimantUnattached === true
+              ? {
+                  writeProviderThreadRosterIfUnattached: () =>
+                    Effect.succeed({
+                      unattached: true,
+                      storedEvents:
+                        options.rosterCorrected === true ? [{} as OrchestrationV2StoredEvent] : [],
+                    }),
+                }
+              : {}),
           }),
           IdAllocator.layer,
           ThreadCommandExecutor.layer,
@@ -5029,6 +5410,9 @@ function runBackgroundItemScenario(
           providerTurnId: ids.rootProviderTurnId,
         } as OrchestrationV2RunAttempt,
         attemptId: ids.attemptId,
+        ...(options?.shouldStartProviderTurn === undefined
+          ? {}
+          : { shouldStartProviderTurn: options.shouldStartProviderTurn }),
         ...(options?.loadInheritedBackgroundTurnItems === undefined
           ? {}
           : {
@@ -5254,6 +5638,1073 @@ it.effect.each([
       `message.updated:final:"First.\\n\\nWaiting on the build.\\n\\nRunning tests passed." in commit`,
       `turn_item.updated:final:"First.\\n\\nWaiting on the build.\\n\\nRunning tests passed." in commit`,
     ]);
+  }),
+);
+
+it.effect("commits a running turn's usage reports with the snapshots around them", () =>
+  Effect.gen(function* () {
+    const ingested: Array<string> = [];
+    const rootTurn = (
+      ids: BackgroundScenarioIds,
+      status: "running" | "completed",
+    ): ProviderAdapter.ProviderAdapterV2Event =>
+      ({
+        type: "provider_turn.updated",
+        driver,
+        providerTurn: {
+          id: ids.rootProviderTurnId,
+          providerThreadId: ids.providerThreadId,
+          nodeId: ids.rootNodeId,
+          runAttemptId: ids.attemptId,
+          status,
+        },
+      }) as ProviderAdapter.ProviderAdapterV2Event;
+    yield* runBackgroundItemScenario(
+      "usage-reports-batch",
+      (ids) => [
+        rootTurn(ids, "running"),
+        backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 1),
+        rootTurn(ids, "running"),
+        backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 2),
+        rootTurn(ids, "running"),
+        rootTurn(ids, "completed"),
+        rootTerminalEvent(ids, "completed"),
+      ],
+      {
+        batched: true,
+        shouldStartProviderTurn: () => Effect.succeed(true),
+        onIngest: (event, write) =>
+          Effect.sync(() => {
+            if (event.type === "provider_turn.updated")
+              ingested.push(
+                `${event.providerTurn.status}${write.inSharedCommit ? " in commit" : ""}`,
+              );
+          }),
+      },
+    );
+    // A Claude turn reports usage about twice per API request; each report ran alone and held
+    // the run's later items behind a full pass of the shared writer. The first report rechecks
+    // ownership under the thread lock, and a settled turn's report ends the turn, so both stay alone.
+    assert.deepEqual(ingested, ["running", "running in commit", "running in commit", "completed"]);
+  }),
+);
+
+it.effect.each([0, 1, 3, 10])(
+  "ends a run a few writer passes after its turn's events arrive, with %s API requests",
+  (requests) =>
+    Effect.gen(function* () {
+      // Ten other runs each hold the shared writer for 100 ms per write, so a pass is ~1 s,
+      // as on a saturated server. The turn arrives in one burst, as a replayed Claude wake does.
+      let otherWrites = 0;
+      let writesAtBurst = 0;
+      const saturated = yield* Deferred.make<void>();
+      const writesUntilFinalized = yield* Deferred.make<number>();
+      const write = Effect.sleep("100 millis").pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            otherWrites++;
+          }),
+        ),
+      );
+      const rootTurn = (
+        ids: BackgroundScenarioIds,
+        status: "running" | "completed",
+      ): ProviderAdapter.ProviderAdapterV2Event =>
+        ({
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: {
+            id: ids.rootProviderTurnId,
+            providerThreadId: ids.providerThreadId,
+            nodeId: ids.rootNodeId,
+            runAttemptId: ids.attemptId,
+            status,
+          },
+        }) as ProviderAdapter.ProviderAdapterV2Event;
+      yield* runBackgroundItemScenario(
+        `run-end-passes-${requests}`,
+        (ids) =>
+          Stream.fromEffect(
+            Deferred.await(saturated).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  writesAtBurst = otherWrites;
+                }),
+              ),
+            ),
+          ).pipe(
+            Stream.drain,
+            Stream.concat(
+              Stream.fromIterable([
+                rootTurn(ids, "running"),
+                // Claude reports usage at each API request's start and end, around its items.
+                ...Array.from({ length: requests }, (_, request) => [
+                  rootTurn(ids, "running"),
+                  backgroundTurnItemEvent(ids, "dynamic_tool", "running", request * 10 + 1),
+                  rootTurn(ids, "running"),
+                  backgroundTurnItemEvent(ids, "dynamic_tool", "completed", request * 10 + 2),
+                ]).flat(),
+                rootTurn(ids, "completed"),
+                {
+                  type: "provider_thread.updated",
+                  driver,
+                  providerThread: { id: ids.providerThreadId, driver, status: "active" },
+                } as ProviderAdapter.ProviderAdapterV2Event,
+                rootTerminalEvent(ids, "completed"),
+              ]),
+            ),
+          ),
+        {
+          batched: true,
+          shouldStartProviderTurn: () => Effect.succeed(true),
+          otherWriters: (coordinator) =>
+            Effect.gen(function* () {
+              // Writers queue only behind work in flight, so one snapshot holds the writer first.
+              const holding = yield* Deferred.make<void>();
+              yield* coordinator
+                .consume(
+                  Stream.make(
+                    backgroundTurnItemEvent(
+                      backgroundScenarioIds("other"),
+                      "dynamic_tool",
+                      "running",
+                      1,
+                    ),
+                  ),
+                  () => Deferred.succeed(holding, undefined).pipe(Effect.andThen(write)),
+                  Effect.succeed(false),
+                )
+                .pipe(Effect.forkChild);
+              yield* Deferred.await(holding);
+              for (let writer = 0; writer < 10; writer++)
+                yield* coordinator.barrier(write).pipe(Effect.forever, Effect.forkChild);
+              yield* Deferred.succeed(saturated, undefined);
+              return yield* Effect.never;
+            }),
+          onFinalized: () =>
+            Deferred.succeed(writesUntilFinalized, otherWrites - writesAtBurst).pipe(Effect.asVoid),
+        },
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(saturated);
+      yield* TestClock.adjust("2 minutes");
+      // Each item outside a batch queued twice, and each usage report held the run's later items
+      // behind a pass, so the writes ahead of the finalize grew with the requests. Now they stay
+      // flat, whatever the turn's length.
+      assert.isAtMost(yield* Deferred.await(writesUntilFinalized), 55);
+    }),
+);
+
+it.effect("keeps every run on a shared provider session up with its own turn", () =>
+  Effect.gen(function* () {
+    // Codex runs every thread of an instance on one provider session, so each run's consumer
+    // receives every thread's events and drops the others'. Nine runs share it while ten other
+    // writers keep the shared writer busy (100 ms per write, a pass ~1 s). Every 10 s each thread
+    // reports usage, writes two items and reports usage again.
+    const runs = 9;
+    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const write = Effect.sleep("100 millis");
+    const holding = yield* Deferred.make<void>();
+    yield* coordinator
+      .consume(
+        Stream.make(
+          backgroundTurnItemEvent(backgroundScenarioIds("other"), "dynamic_tool", "running", 1),
+        ),
+        () => Deferred.succeed(holding, undefined).pipe(Effect.andThen(write)),
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(holding);
+    for (let writer = 0; writer < 10; writer++)
+      yield* coordinator.barrier(write).pipe(Effect.forever, Effect.forkChild);
+    const ids = Array.from({ length: runs }, (_, run) =>
+      backgroundScenarioIds(`shared-session-${run}`),
+    );
+    const rootTurn = (
+      own: BackgroundScenarioIds,
+      status: "running" | "completed",
+    ): ProviderAdapter.ProviderAdapterV2Event =>
+      ({
+        type: "provider_turn.updated",
+        driver,
+        providerTurn: {
+          id: own.rootProviderTurnId,
+          providerThreadId: own.providerThreadId,
+          nodeId: own.rootNodeId,
+          runAttemptId: own.attemptId,
+          status,
+        },
+      }) as ProviderAdapter.ProviderAdapterV2Event;
+    const subscriptions = yield* Effect.forEach(ids, () =>
+      Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>(),
+    );
+    // The last round of its own items each run has ingested.
+    const ingestedRound = Array.from({ length: runs }, () => 0);
+    for (let run = 0; run < runs; run++) {
+      yield* Queue.offer(subscriptions[run]!, rootTurn(ids[run]!, "running"));
+      yield* runBackgroundItemScenario(
+        `shared-session-${run}`,
+        () => Stream.fromQueue(subscriptions[run]!),
+        {
+          coordinator,
+          shouldStartProviderTurn: () => Effect.succeed(true),
+          onIngest: (event) =>
+            Effect.sync(() => {
+              if (event.type === "turn_item.updated")
+                ingestedRound[run] = Math.max(
+                  ingestedRound[run]!,
+                  Math.floor(event.turnItem.ordinal / 10),
+                );
+            }),
+        },
+      ).pipe(Effect.forkChild);
+    }
+    let round = 0;
+    yield* Effect.gen(function* () {
+      for (;;) {
+        yield* Effect.sleep("10 seconds");
+        round++;
+        for (const own of ids)
+          for (const event of [
+            rootTurn(own, "running"),
+            backgroundTurnItemEvent(own, "dynamic_tool", "running", round * 10 + 1),
+            backgroundTurnItemEvent(own, "dynamic_tool", "completed", round * 10 + 2),
+            rootTurn(own, "running"),
+          ])
+            for (const subscription of subscriptions) yield* Queue.offer(subscription, event);
+      }
+    }).pipe(Effect.forkChild);
+    yield* TestClock.adjust("5 minutes");
+    // Before this, all nine fell behind together, further each round:
+    // each other thread's usage report cost every run a writer pass that wrote nothing. Now one.
+    assert.deepEqual(
+      ingestedRound.map((ingested) => round - ingested <= 2),
+      ingestedRound.map(() => true),
+    );
+  }),
+);
+
+it.effect.each([{ anotherRun: false }, { anotherRun: true }])(
+  "ingests a backlog's newest streamed text once, keeping finals and every other event in order (another run streaming: $anotherRun)",
+  ({ anotherRun }) =>
+    Effect.gen(function* () {
+      const key = "streamed-backlog";
+      const ids = backgroundScenarioIds(key);
+      const now = yield* DateTime.now;
+      const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const ingested = yield* Ref.make<ReadonlyArray<string>>([]);
+      const firstDelivered = yield* Deferred.make<void>();
+      const blockerStarted = yield* Deferred.make<void>();
+      const releaseBlocker = yield* Deferred.make<void>();
+      const assistantText = (text: string, streaming: boolean) =>
+        [
+          {
+            type: "message.updated",
+            driver,
+            message: {
+              createdBy: "agent",
+              creationSource: "provider",
+              id: MessageId.make(`message:${key}`),
+              threadId: ids.threadId,
+              runId: ids.runId,
+              nodeId: ids.rootNodeId,
+              role: "assistant",
+              text,
+              attachments: [],
+              streaming,
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+          {
+            type: "turn_item.updated",
+            driver,
+            turnItem: {
+              ...makeLinkedChildTurnItemFixture({ ids, driver, type: "assistant_message" }),
+              id: ids.itemId,
+              threadId: ids.threadId,
+              runId: ids.runId,
+              nodeId: ids.rootNodeId,
+              providerTurnId: ids.rootProviderTurnId,
+              text,
+              streaming,
+            },
+          },
+        ] as ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>;
+      const rootTurn = (status: "running" | "completed") =>
+        ({
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: {
+            id: ids.rootProviderTurnId,
+            providerThreadId: ids.providerThreadId,
+            nodeId: ids.rootNodeId,
+            runAttemptId: ids.attemptId,
+            status,
+          },
+        }) as ProviderAdapter.ProviderAdapterV2Event;
+      const toolItemId = TurnItemId.make(`turn-item:${key}:tool`);
+      // On a shared session another run's text arrives between every event of this run's.
+      const other = backgroundScenarioIds(`${key}:another-run`);
+      const withAnotherRun = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+        anotherRun
+          ? events.flatMap((event) => [
+              {
+                type: "node.updated",
+                driver,
+                node: {
+                  id: other.rootNodeId,
+                  threadId: other.threadId,
+                  runId: other.runId,
+                  kind: "assistant_message",
+                  status: "running",
+                  providerThreadId: other.providerThreadId,
+                },
+              } as ProviderAdapter.ProviderAdapterV2Event,
+              event,
+            ])
+          : events;
+      const scenario = yield* runBackgroundItemScenario(
+        key,
+        () => Stream.fromQueue(providerEvents),
+        {
+          batched: true,
+          onIngest: (event, write) =>
+            Effect.gen(function* () {
+              const commit = write.inSharedCommit ? " in commit" : "";
+              if (event.type === "provider_thread.updated") {
+                yield* Ref.update(ingested, (current) => [...current, `provider_thread${commit}`]);
+                yield* Deferred.succeed(blockerStarted, undefined);
+                return yield* Deferred.await(releaseBlocker);
+              }
+              if (
+                event.type === "message.updated" ||
+                (event.type === "turn_item.updated" && event.turnItem.type === "assistant_message")
+              ) {
+                const message = event.type === "message.updated" ? event.message : event.turnItem;
+                const text = "text" in message ? message.text : "";
+                const streaming = "streaming" in message && message.streaming;
+                yield* Ref.update(ingested, (current) => [
+                  ...current,
+                  `${event.type}:${streaming ? "streaming" : "final"}:${JSON.stringify(text)}${commit}`,
+                ]);
+                if (event.type === "turn_item.updated")
+                  yield* Deferred.succeed(firstDelivered, undefined);
+                return;
+              }
+              yield* Ref.update(ingested, (current) => [
+                ...current,
+                `${
+                  event.type === "turn_item.updated"
+                    ? `tool:${event.turnItem.status}`
+                    : event.type === "provider_turn.updated"
+                      ? `provider_turn:${event.providerTurn.status}`
+                      : event.type
+                }${commit}`,
+              ]);
+            }),
+        },
+      ).pipe(Effect.forkChild);
+
+      yield* Queue.offerAll(providerEvents, assistantText("First.\n\n", true));
+      yield* Deferred.await(firstDelivered);
+      yield* Queue.offer(providerEvents, {
+        type: "provider_thread.updated",
+        driver,
+        providerThread: { id: ids.providerThreadId, driver, status: "active" },
+      } as ProviderAdapter.ProviderAdapterV2Event);
+      yield* Deferred.await(blockerStarted);
+      // While a write holds ingestion, the provider streams on: two steps of text, a usage report
+      // and a tool call, two more steps, the tool's result, then the final text and the turn's end.
+      yield* Queue.offerAll(
+        providerEvents,
+        withAnotherRun([
+          ...assistantText("First.\n\nSecond.\n\n", true),
+          ...assistantText("First.\n\nSecond.\n\nThird.\n\n", true),
+          rootTurn("running"),
+          backgroundTurnItemEvent(ids, "dynamic_tool", "running", 2, toolItemId),
+          ...assistantText("First.\n\nSecond.\n\nThird.\n\nFourth.\n\n", true),
+          ...assistantText("First.\n\nSecond.\n\nThird.\n\nFourth.\n\nFifth.\n\n", true),
+          backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 2, toolItemId),
+          ...assistantText("First.\n\nSecond.\n\nThird.\n\nFourth.\n\nFifth.", false),
+          rootTurn("completed"),
+          rootTerminalEvent(ids, "completed"),
+        ]),
+      );
+      // The write holds ingestion for a second, so the next text is shown as soon as it resumes.
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.succeed(releaseBlocker, undefined);
+      yield* Fiber.join(scenario);
+
+      // Text that a newer snapshot superseded before another kind of event arrived is never
+      // ingested; every other event is, once and in order.
+      assert.deepEqual(yield* Ref.get(ingested), [
+        'message.updated:streaming:"First.\\n\\n" in commit',
+        'turn_item.updated:streaming:"First.\\n\\n" in commit',
+        "provider_thread",
+        'message.updated:streaming:"First.\\n\\nSecond.\\n\\nThird.\\n\\n" in commit',
+        'turn_item.updated:streaming:"First.\\n\\nSecond.\\n\\nThird.\\n\\n" in commit',
+        "provider_turn:running in commit",
+        "tool:running in commit",
+        "tool:completed in commit",
+        'message.updated:final:"First.\\n\\nSecond.\\n\\nThird.\\n\\nFourth.\\n\\nFifth." in commit',
+        'turn_item.updated:final:"First.\\n\\nSecond.\\n\\nThird.\\n\\nFourth.\\n\\nFifth." in commit',
+        "provider_turn:completed",
+        "turn.terminal",
+      ]);
+    }),
+);
+
+it.effect("hands a backlog to the commit path in one chunk, not one per event", () =>
+  Effect.gen(function* () {
+    const key = "backlog-handover";
+    const ids = backgroundScenarioIds(key);
+    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    const chunks = yield* Ref.make<ReadonlyArray<number>>([]);
+    const blockerStarted = yield* Deferred.make<void>();
+    const releaseBlocker = yield* Deferred.make<void>();
+    const scenario = yield* runBackgroundItemScenario(key, () => Stream.fromQueue(providerEvents), {
+      batched: true,
+      onIngest: (event) =>
+        event.type === "provider_thread.updated"
+          ? Deferred.succeed(blockerStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseBlocker)),
+            )
+          : Effect.void,
+      onIngestionChunk: (size) => Ref.update(chunks, (current) => [...current, size]),
+    }).pipe(Effect.forkChild);
+
+    yield* Queue.offer(providerEvents, {
+      type: "provider_thread.updated",
+      driver,
+      providerThread: { id: ids.providerThreadId, driver, status: "active" },
+    } as ProviderAdapter.ProviderAdapterV2Event);
+    yield* Deferred.await(blockerStarted);
+    // Twenty tool calls, none superseding another, and the turn's end arrive behind the write.
+    const backlog = Array.from({ length: 20 }, (_, index) =>
+      backgroundTurnItemEvent(
+        ids,
+        "dynamic_tool",
+        "completed",
+        index + 1,
+        TurnItemId.make(`turn-item:${key}:${index}`),
+      ),
+    );
+    yield* Queue.offerAll(providerEvents, [...backlog, rootTerminalEvent(ids, "completed")]);
+    yield* Deferred.succeed(releaseBlocker, undefined);
+    yield* Fiber.join(scenario);
+
+    // Each chunk costs a pass through the merge with idle-flush ticks and through the commit
+    // path's stages, so a backlog handed over an event at a time costs that many passes.
+    assert.deepEqual(yield* Ref.get(chunks), [1, backlog.length + 1]);
+  }),
+);
+
+it.effect(
+  "takes what arrived during a write as one batch, so a later text step replaces an earlier one",
+  () =>
+    Effect.gen(function* () {
+      const key = "busy-batch";
+      const ids = backgroundScenarioIds(key);
+      const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const ingested = yield* Ref.make<ReadonlyArray<string>>([]);
+      const blockerStarted = yield* Deferred.make<void>();
+      const releaseBlocker = yield* Deferred.make<void>();
+      const text = (value: string, streaming: boolean) =>
+        ({
+          type: "turn_item.updated",
+          driver,
+          turnItem: {
+            ...makeLinkedChildTurnItemFixture({ ids, driver, type: "assistant_message" }),
+            id: ids.itemId,
+            threadId: ids.threadId,
+            runId: ids.runId,
+            nodeId: ids.rootNodeId,
+            providerTurnId: ids.rootProviderTurnId,
+            text: value,
+            streaming,
+            status: streaming ? "running" : "completed",
+          },
+        }) as ProviderAdapter.ProviderAdapterV2Event;
+      const scenario = yield* runBackgroundItemScenario(
+        key,
+        () => Stream.fromQueue(providerEvents),
+        {
+          batched: true,
+          onIngest: (event) => {
+            if (event.type === "provider_thread.updated")
+              return Deferred.succeed(blockerStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseBlocker)),
+              );
+            if (event.type !== "turn_item.updated") return Effect.void;
+            const item = event.turnItem;
+            if (item.type !== "assistant_message") return Effect.void;
+            return Ref.update(ingested, (current) => [
+              ...current,
+              `${item.streaming ? "streaming" : "final"}:${JSON.stringify(item.text)}`,
+            ]);
+          },
+        },
+      ).pipe(Effect.forkChild);
+
+      yield* Queue.offer(providerEvents, {
+        type: "provider_thread.updated",
+        driver,
+        providerThread: { id: ids.providerThreadId, driver, status: "active" },
+      } as ProviderAdapter.ProviderAdapterV2Event);
+      yield* Deferred.await(blockerStarted);
+      // While the write holds ingestion, the text streams one step, then another.
+      yield* Queue.offer(providerEvents, text("One.\n\n", true));
+      yield* TestClock.adjust(0);
+      yield* Queue.offerAll(providerEvents, [
+        text("One.\n\nTwo.\n\n", true),
+        text("One.\n\nTwo.\n\nThree.", false),
+        rootTerminalEvent(ids, "completed"),
+      ]);
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.succeed(releaseBlocker, undefined);
+      yield* Fiber.join(scenario);
+
+      // Taking the first step while the write still ran would commit it on its own.
+      assert.deepEqual(yield* Ref.get(ingested), [
+        'streaming:"One.\\n\\nTwo.\\n\\n"',
+        'final:"One.\\n\\nTwo.\\n\\nThree."',
+      ]);
+    }),
+);
+
+it.effect("keeps interleaved streamed texts in the order they first appeared", () =>
+  Effect.gen(function* () {
+    const key = "streamed-backlog-order";
+    const ids = backgroundScenarioIds(key);
+    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    // A text takes its position at its first reservation (held) or write (shown).
+    const positions = yield* Ref.make<ReadonlyArray<string>>([]);
+    const place = (turnItemId: string) =>
+      Ref.update(positions, (current) =>
+        current.includes(turnItemId) ? current : [...current, turnItemId],
+      );
+    const blockerStarted = yield* Deferred.make<void>();
+    const releaseBlocker = yield* Deferred.make<void>();
+    const first = TurnItemId.make(`turn-item:${key}:first`);
+    const second = TurnItemId.make(`turn-item:${key}:second`);
+    const text = (id: TurnItemId, value: string, streaming: boolean) =>
+      ({
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          ...makeLinkedChildTurnItemFixture({ ids, driver, type: "assistant_message" }),
+          id,
+          threadId: ids.threadId,
+          runId: ids.runId,
+          nodeId: ids.rootNodeId,
+          providerTurnId: ids.rootProviderTurnId,
+          text: value,
+          streaming,
+          status: streaming ? "running" : "completed",
+        },
+      }) as ProviderAdapter.ProviderAdapterV2Event;
+    const scenario = yield* runBackgroundItemScenario(key, () => Stream.fromQueue(providerEvents), {
+      batched: true,
+      onIngest: (event) =>
+        event.type === "provider_thread.updated"
+          ? Deferred.succeed(blockerStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseBlocker)),
+            )
+          : event.type === "turn_item.updated"
+            ? place(event.turnItem.id)
+            : Effect.void,
+      onPositionReserved: place,
+    }).pipe(Effect.forkChild);
+
+    yield* Queue.offer(providerEvents, {
+      type: "provider_thread.updated",
+      driver,
+      providerThread: { id: ids.providerThreadId, driver, status: "active" },
+    } as ProviderAdapter.ProviderAdapterV2Event);
+    yield* Deferred.await(blockerStarted);
+    // Behind the write, the first text streams, a second text starts, then the first streams on.
+    yield* Queue.offerAll(providerEvents, [
+      text(first, "First text", true),
+      text(second, "Second text", true),
+      text(first, "First text, more", true),
+      text(first, "First text, more.", false),
+      text(second, "Second text.", false),
+      rootTerminalEvent(ids, "completed"),
+    ]);
+    yield* Deferred.succeed(releaseBlocker, undefined);
+    yield* Fiber.join(scenario);
+
+    // Coalescing the first text's steps must not move it behind the second.
+    assert.deepEqual(yield* Ref.get(positions), [first, second]);
+  }),
+);
+
+it.effect("ends finished Codex seats' work on time on a session with many bound threads", () =>
+  Effect.gen(function* () {
+    // Only run consumers subscribe and Codex reports only turns it tracks, so a bound thread without
+    // a run costs nothing. A finished run keeps its consumer while work it started runs on (a
+    // seat's follower), and that consumer gets every event of the session. Bound threads: a few live
+    // runs, many recently finished seats, the rest with no consumer.
+    const live = 3;
+    const seats = 24;
+    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const write = Effect.sleep("90 millis");
+    const holding = yield* Deferred.make<void>();
+    yield* coordinator
+      .consume(
+        Stream.make(
+          backgroundTurnItemEvent(backgroundScenarioIds("other"), "dynamic_tool", "running", 1),
+        ),
+        () => Deferred.succeed(holding, undefined).pipe(Effect.andThen(write)),
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(holding);
+    for (let writer = 0; writer < 10; writer++)
+      yield* coordinator.barrier(write).pipe(Effect.forever, Effect.forkChild);
+    const ids = Array.from({ length: live + seats }, (_, run) =>
+      backgroundScenarioIds(`finished-seat-${run}`),
+    );
+    const rootTurn = (
+      own: BackgroundScenarioIds,
+      status: "running" | "completed",
+    ): ProviderAdapter.ProviderAdapterV2Event =>
+      ({
+        type: "provider_turn.updated",
+        driver,
+        providerTurn: {
+          id: own.rootProviderTurnId,
+          providerThreadId: own.providerThreadId,
+          nodeId: own.rootNodeId,
+          runAttemptId: own.attemptId,
+          status,
+        },
+      }) as ProviderAdapter.ProviderAdapterV2Event;
+    // One 50 ms flush of streamed Codex text: the message's node and its streaming turn item.
+    const textFlush = (
+      own: BackgroundScenarioIds,
+      round: number,
+      flush: number,
+    ): ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event> => {
+      const nodeId = NodeId.make(`${own.rootNodeId}:text:${round}`);
+      const itemId = TurnItemId.make(`${own.itemId}:text:${round}`);
+      return [
+        {
+          type: "node.updated",
+          driver,
+          node: {
+            id: nodeId,
+            threadId: own.threadId,
+            runId: own.runId,
+            kind: "assistant_message",
+            status: "running",
+            providerThreadId: own.providerThreadId,
+          },
+        } as ProviderAdapter.ProviderAdapterV2Event,
+        {
+          type: "turn_item.updated",
+          driver,
+          turnItem: {
+            id: itemId,
+            threadId: own.threadId,
+            runId: own.runId,
+            nodeId,
+            providerTurnId: own.rootProviderTurnId,
+            ordinal: round * 100 + 50,
+            type: "assistant_message",
+            status: "running",
+            messageId: MessageId.make(`${itemId}:message`),
+            text: "word ".repeat(flush + 1),
+            streaming: true,
+          },
+        } as ProviderAdapter.ProviderAdapterV2Event,
+      ];
+    };
+    const follower = (own: BackgroundScenarioIds, status: "running" | "completed") =>
+      backgroundTurnItemEvent(
+        own,
+        "dynamic_tool",
+        status,
+        status === "running" ? 1 : 2,
+        TurnItemId.make(`${own.itemId}:follower`),
+      );
+    const subscriptions = yield* Effect.forEach(ids, () =>
+      Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>(),
+    );
+    // Live runs: the last round of their own items ingested. Seats: whether the follower's
+    // completion was ingested.
+    const ingestedRound = ids.map(() => 0);
+    const followerEnded = ids.map(() => false);
+    for (let run = 0; run < ids.length; run++) {
+      const own = ids[run]!;
+      for (const event of run < live
+        ? [rootTurn(own, "running")]
+        : [
+            rootTurn(own, "running"),
+            follower(own, "running"),
+            rootTurn(own, "completed"),
+            rootTerminalEvent(own, "completed"),
+          ])
+        yield* Queue.offer(subscriptions[run]!, event);
+      yield* runBackgroundItemScenario(
+        `finished-seat-${run}`,
+        () => Stream.fromQueue(subscriptions[run]!),
+        {
+          coordinator,
+          shouldStartProviderTurn: () => Effect.succeed(true),
+          onIngest: (event) =>
+            Effect.sync(() => {
+              if (event.type !== "turn_item.updated" || event.turnItem.threadId !== own.threadId)
+                return;
+              if (run >= live) followerEnded[run] = event.turnItem.status === "completed";
+              else
+                ingestedRound[run] = Math.max(
+                  ingestedRound[run]!,
+                  Math.floor(event.turnItem.ordinal / 100),
+                );
+            }),
+        },
+      ).pipe(Effect.forkChild);
+    }
+    let round = 0;
+    const offerAll = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+      Effect.forEach(subscriptions, (subscription) => Queue.offer(subscription, event), {
+        discard: true,
+      });
+    yield* Effect.gen(function* () {
+      for (;;) {
+        yield* Effect.sleep("10 seconds");
+        round++;
+        // A live run reports usage, streams a second of text (Codex sends a node and a turn item
+        // every 50 ms) and runs a tool. A finished seat sends nothing until its follower ends.
+        for (const own of ids.slice(0, live))
+          for (const event of [
+            rootTurn(own, "running"),
+            ...Array.from({ length: 20 }, (_, flush) => textFlush(own, round, flush)).flat(),
+            backgroundTurnItemEvent(own, "dynamic_tool", "running", round * 100 + 1),
+            backgroundTurnItemEvent(own, "dynamic_tool", "completed", round * 100 + 2),
+          ])
+            yield* offerAll(event);
+      }
+    }).pipe(Effect.forkChild);
+    yield* TestClock.adjust("5 minutes");
+    for (const own of ids.slice(live)) yield* offerAll(follower(own, "completed"));
+    yield* TestClock.adjust("20 seconds");
+    // Before this, the live runs kept up but no seat had ingested its follower's end: past its root
+    // terminal a consumer ran every event of the session alone and was minutes behind.
+    assert.deepEqual(
+      ids.map((_, run) => (run < live ? round - ingestedRound[run]! <= 2 : followerEnded[run])),
+      ids.map(() => true),
+      `live runs' rounds behind: ${ingestedRound
+        .slice(0, live)
+        .map((ingested) => round - ingested)
+        .join(
+          ", ",
+        )}; seats whose follower end was ingested: ${followerEnded.slice(live).filter(Boolean).length} of ${seats}`,
+    );
+  }),
+);
+
+it.effect.each([
+  // A slow writer pass: each lagging consumer, behind throughout, runs every usage report on the session
+  // alone.
+  { live: 6, writeMs: 350 },
+  // Many bound threads with events, on a faster writer pass.
+  { live: 15, writeMs: 120 },
+])(
+  "keeps $live live runs on a shared provider session up with a busy session's event mix ($writeMs ms writes)",
+  ({ live, writeMs }) =>
+    Effect.gen(function* () {
+      // A busy session's mix, as one shared Codex session sends it.
+      // Every 10 s each live run reports usage once, writes six turn
+      // items (three tool calls) and three node snapshots. The other bound threads have no
+      // consumer and send nothing.
+      const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+      const write = Effect.sleep(Duration.millis(writeMs));
+      const holding = yield* Deferred.make<void>();
+      yield* coordinator
+        .consume(
+          Stream.make(
+            backgroundTurnItemEvent(backgroundScenarioIds("other"), "dynamic_tool", "running", 1),
+          ),
+          () => Deferred.succeed(holding, undefined).pipe(Effect.andThen(write)),
+          Effect.succeed(false),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(holding);
+      for (let writer = 0; writer < 10; writer++)
+        yield* coordinator.barrier(write).pipe(Effect.forever, Effect.forkChild);
+      const ids = Array.from({ length: live }, (_, run) =>
+        backgroundScenarioIds(`busy-mix-${live}-${run}`),
+      );
+      const rootTurn = (own: BackgroundScenarioIds): ProviderAdapter.ProviderAdapterV2Event =>
+        ({
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: {
+            id: own.rootProviderTurnId,
+            providerThreadId: own.providerThreadId,
+            nodeId: own.rootNodeId,
+            runAttemptId: own.attemptId,
+            status: "running",
+          },
+        }) as ProviderAdapter.ProviderAdapterV2Event;
+      const rootNode = (own: BackgroundScenarioIds): ProviderAdapter.ProviderAdapterV2Event =>
+        ({
+          type: "node.updated",
+          driver,
+          node: {
+            id: own.rootNodeId,
+            threadId: own.threadId,
+            runId: own.runId,
+            kind: "root_turn",
+            status: "running",
+            providerThreadId: own.providerThreadId,
+          },
+        }) as ProviderAdapter.ProviderAdapterV2Event;
+      const subscriptions = yield* Effect.forEach(ids, () =>
+        Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>(),
+      );
+      // The last round of its own items each run has ingested.
+      const ingestedRound = ids.map(() => 0);
+      for (let run = 0; run < live; run++) {
+        const own = ids[run]!;
+        yield* Queue.offer(subscriptions[run]!, rootTurn(own));
+        yield* runBackgroundItemScenario(
+          `busy-mix-${live}-${run}`,
+          () => Stream.fromQueue(subscriptions[run]!),
+          {
+            coordinator,
+            shouldStartProviderTurn: () => Effect.succeed(true),
+            onIngest: (event) =>
+              Effect.sync(() => {
+                if (event.type === "turn_item.updated" && event.turnItem.threadId === own.threadId)
+                  ingestedRound[run] = Math.max(
+                    ingestedRound[run]!,
+                    Math.floor(event.turnItem.ordinal / 100),
+                  );
+              }),
+          },
+        ).pipe(Effect.forkChild);
+      }
+      let round = 0;
+      yield* Effect.gen(function* () {
+        for (;;) {
+          yield* Effect.sleep("10 seconds");
+          round++;
+          for (const own of ids) {
+            const events = [
+              rootTurn(own),
+              ...Array.from({ length: 3 }, () => rootNode(own)),
+              ...[0, 1, 2].flatMap((tool) => {
+                const itemId = TurnItemId.make(`${own.itemId}:${tool}`);
+                return [
+                  backgroundTurnItemEvent(
+                    own,
+                    "dynamic_tool",
+                    "running",
+                    round * 100 + 2 * tool + 1,
+                    itemId,
+                  ),
+                  backgroundTurnItemEvent(
+                    own,
+                    "dynamic_tool",
+                    "completed",
+                    round * 100 + 2 * tool + 2,
+                    itemId,
+                  ),
+                ];
+              }),
+            ];
+            for (const event of events)
+              for (const subscription of subscriptions) yield* Queue.offer(subscription, event);
+          }
+        }
+      }).pipe(Effect.forkChild);
+      yield* TestClock.adjust("5 minutes");
+      // Before this the runs fell many rounds behind, and an earlier fix only moved which ones:
+      // each run still queued every other run's snapshots, jobs that grow as the runs squared.
+      const behind = ingestedRound.map((ingested) => round - ingested);
+      assert.deepEqual(
+        behind.map((rounds) => rounds <= 2),
+        behind.map(() => true),
+        `rounds behind: ${behind.join(", ")}`,
+      );
+    }),
+);
+
+it.effect("keeps another run's event on a child the run gains in the same backlog", () => {
+  const recording = recordingWaitObserver();
+  // The run outlives the service's scope in this harness, so keep the counter's reader.
+  let dropped: (() => number) | undefined;
+  const observer: typeof recording.observer = {
+    ...recording.observer,
+    register: (name, kind, read) => {
+      if (name === IngestLag.FANOUT_DROPPED_SITE) dropped = read;
+      return recording.observer.register(name, kind, read);
+    },
+  };
+  return Effect.gen(function* () {
+    // Routing gains the child only when it takes the child's creation, so another run's event
+    // queued behind it must not be dropped as unowned. Later, that run's own work is dropped.
+    const key = "gained-child";
+    const other = backgroundScenarioIds(`${key}:other`);
+    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    const ingested: Array<string> = [];
+    const childIngested = yield* Deferred.make<void>();
+    const ids = backgroundScenarioIds(key);
+    const scenario = yield* runBackgroundItemScenario(key, () => Stream.fromQueue(providerEvents), {
+      batched: true,
+      onIngest: (event) =>
+        event.type === "turn_item.updated"
+          ? Effect.sync(() =>
+              ingested.push(`${event.turnItem.threadId}:${event.turnItem.runId}`),
+            ).pipe(
+              Effect.andThen(
+                event.turnItem.threadId === ids.childThreadId
+                  ? Deferred.succeed(childIngested, undefined)
+                  : Effect.void,
+              ),
+            )
+          : Effect.void,
+    }).pipe(Effect.forkChild);
+    yield* Queue.offerAll(providerEvents, [
+      childThreadCreatedEvent(ids),
+      {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          ...makeLinkedChildTurnItemFixture({ ids, driver, type: "command_execution" }),
+          runId: other.runId,
+          status: "completed",
+        },
+      } as ProviderAdapter.ProviderAdapterV2Event,
+    ]);
+    yield* Deferred.await(childIngested);
+    const othersWork = [
+      backgroundTurnItemEvent(other, "dynamic_tool", "running", 1),
+      backgroundTurnItemEvent(other, "dynamic_tool", "completed", 2),
+    ];
+    // As the session manager stamps each event it takes from the adapter.
+    for (const event of othersWork) IngestLag.markArrival(event, 0n);
+    yield* Queue.offerAll(providerEvents, [...othersWork, rootTerminalEvent(ids, "completed")]);
+    yield* Fiber.join(scenario);
+
+    assert.deepEqual(ingested, [`${ids.childThreadId}:${other.runId}`]);
+    // Dropped events are counted, and are neither backlog nor lag.
+    assert.strictEqual(dropped?.(), 2);
+    assert.isFalse(
+      recording.reports("wait").some(([site]) => String(site).startsWith("ProviderIngest.lag.")),
+      "a dropped event reports no ingest lag",
+    );
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});
+
+it.effect("drops another run's work again after a child's coalesced snapshots", () => {
+  const recording = recordingWaitObserver();
+  let dropped: (() => number) | undefined;
+  const observer: typeof recording.observer = {
+    ...recording.observer,
+    register: (name, kind, read) => {
+      if (name === IngestLag.FANOUT_DROPPED_SITE) dropped = read;
+      return recording.observer.register(name, kind, read);
+    },
+  };
+  return Effect.gen(function* () {
+    // A child's streamed text on a new provider thread holds drops until routing takes it. The
+    // mailbox keeps only its newest step, and the steps it replaced must release the hold too.
+    const key = "coalesced-child";
+    const ids = backgroundScenarioIds(key);
+    const other = backgroundScenarioIds(`${key}:other`);
+    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    const blockerStarted = yield* Deferred.make<void>();
+    const releaseBlocker = yield* Deferred.make<void>();
+    const markerIngested = yield* Deferred.make<void>();
+    const scenario = yield* runBackgroundItemScenario(key, () => Stream.fromQueue(providerEvents), {
+      batched: true,
+      onIngest: (event) =>
+        event.type === "provider_thread.updated"
+          ? Deferred.succeed(blockerStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseBlocker)),
+            )
+          : event.type === "turn_item.updated" && event.turnItem.threadId === ids.threadId
+            ? Deferred.succeed(markerIngested, undefined)
+            : Effect.void,
+    }).pipe(Effect.forkChild);
+    const childText = () =>
+      ({
+        type: "node.updated",
+        driver,
+        node: {
+          id: NodeId.make(`node:${key}:child-text`),
+          threadId: ids.childThreadId,
+          runId: null,
+          kind: "assistant_message",
+          status: "running",
+          providerThreadId: ProviderThreadId.make(`provider-thread:${key}:child`),
+        },
+      }) as ProviderAdapter.ProviderAdapterV2Event;
+    yield* Queue.offerAll(providerEvents, [
+      childThreadCreatedEvent(ids),
+      {
+        type: "provider_thread.updated",
+        driver,
+        providerThread: { id: ids.providerThreadId, driver, status: "active" },
+      } as ProviderAdapter.ProviderAdapterV2Event,
+    ]);
+    yield* Deferred.await(blockerStarted);
+    // Behind the write, the child streams three steps, which the mailbox takes in one pass, then
+    // this run's tool reports; once it is ingested, routing has taken the child's text.
+    yield* Queue.offerAll(providerEvents, [
+      childText(),
+      childText(),
+      childText(),
+      backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 1),
+    ]);
+    yield* Deferred.succeed(releaseBlocker, undefined);
+    yield* Deferred.await(markerIngested);
+    yield* Queue.offerAll(providerEvents, [
+      backgroundTurnItemEvent(other, "dynamic_tool", "running", 1),
+      backgroundTurnItemEvent(other, "dynamic_tool", "completed", 2),
+      rootTerminalEvent(ids, "completed"),
+    ]);
+    yield* Fiber.join(scenario);
+
+    assert.strictEqual(dropped?.(), 2);
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});
+
+it.effect("ends a finished run's ingestion when its work ends while only another run streams", () =>
+  Effect.gen(function* () {
+    // A run past its root terminal stays for background work it can only probe. Another run's
+    // events are dropped, yet each pass that drops some still asks whether ingestion can stop.
+    const key = "probe-stop";
+    const other = backgroundScenarioIds(`${key}:other`);
+    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    const pending = yield* Ref.make(true);
+    const finalized = yield* Ref.make(false);
+    const probedAfterTerminal = yield* Deferred.make<void>();
+    const scenario = yield* runBackgroundItemScenario(key, () => Stream.fromQueue(providerEvents), {
+      batched: true,
+      hasPendingBackgroundWorkForThread: () =>
+        Effect.gen(function* () {
+          if (yield* Ref.get(finalized)) yield* Deferred.succeed(probedAfterTerminal, undefined);
+          return yield* Ref.get(pending);
+        }),
+      onFinalized: () => Ref.set(finalized, true),
+    }).pipe(Effect.forkChild);
+    const ids = backgroundScenarioIds(key);
+    yield* Queue.offer(providerEvents, rootTerminalEvent(ids, "completed"));
+    yield* Deferred.await(probedAfterTerminal);
+    yield* TestClock.adjust("1 second");
+    assert.isUndefined(scenario.pollUnsafe(), "pending work holds ingestion open");
+    // The work ends without an event of this run's.
+    yield* Ref.set(pending, false);
+    yield* Queue.offer(
+      providerEvents,
+      backgroundTurnItemEvent(other, "dynamic_tool", "running", 1),
+    );
+    yield* Fiber.join(scenario);
   }),
 );
 

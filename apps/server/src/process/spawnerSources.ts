@@ -30,7 +30,7 @@ const start = (message) => {
     post({ t: "throw", id, error: errorFields(error) });
     return;
   }
-  const entry = { child, detached: message.options.detached === true, inflight: [0, 0], paused: [false, false] };
+  const entry = { child, detached: message.options.detached === true, inflight: [0, 0], paused: [false, false], stdinPending: new Set() };
   children.set(id, entry);
   if (child.pid !== undefined) started(id, child.pid);
   child.on("spawn", () => post({ t: "spawn", id, pid: child.pid }));
@@ -38,6 +38,9 @@ const start = (message) => {
   child.on("exit", (code, signal) => post({ t: "exit", id, code, signal }));
   child.on("close", () => {
     children.delete(id);
+    // A closed child takes no more stdin: answer every write and end its stdin left unanswered.
+    for (const seq of entry.stdinPending) post({ t: "stdin-done", id, seq, error: destroyedStdin });
+    entry.stdinPending.clear();
     post({ t: "close", id });
   });
   child.stdin.on("error", (error) => post({ t: "stdin-error", id, error: errorFields(error) }));
@@ -58,6 +61,13 @@ const start = (message) => {
   });
 };
 const destroyedStdin = { name: "Error", message: "Cannot call write after a stream was destroyed", code: "ERR_STREAM_DESTROYED" };
+const answerStdin = (entry, message) => {
+  entry.stdinPending.add(message.seq);
+  return (error) => {
+    if (!entry.stdinPending.delete(message.seq)) return;
+    post({ t: "stdin-done", id: message.id, seq: message.seq, error: error ? errorFields(error) : undefined });
+  };
+};
 const onMessage = (message) => {
   const entry = children.get(message.id);
   switch (message.t) {
@@ -73,15 +83,16 @@ const onMessage = (message) => {
       return;
     case "stdin":
       if (entry === undefined) return post({ t: "stdin-done", id: message.id, seq: message.seq, error: destroyedStdin });
-      entry.child.stdin.write(message.chunk, (error) =>
-        post({ t: "stdin-done", id: message.id, seq: message.seq, error: error ? errorFields(error) : undefined }),
-      );
+      entry.child.stdin.write(message.chunk, answerStdin(entry, message));
       return;
     case "stdin-end":
       if (entry === undefined) return post({ t: "stdin-done", id: message.id, seq: message.seq, error: destroyedStdin });
-      entry.child.stdin.end((error) =>
-        post({ t: "stdin-done", id: message.id, seq: message.seq, error: error ? errorFields(error) : undefined }),
-      );
+      // Node never calls end's callback on a stdin its exited child destroyed without an error.
+      if (entry.child.stdin.destroyed) {
+        const error = entry.child.stdin.errored;
+        return post({ t: "stdin-done", id: message.id, seq: message.seq, error: error ? errorFields(error) : destroyedStdin });
+      }
+      entry.child.stdin.end(answerStdin(entry, message));
       return;
     case "stdin-destroy":
       if (entry !== undefined) entry.child.stdin.destroy();

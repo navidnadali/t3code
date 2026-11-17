@@ -26,6 +26,20 @@ import type * as Tracer from "effect/Tracer";
 import { vi } from "vite-plus/test";
 
 import * as SqliteClient from "./nodeSqliteClient.ts";
+import { CurrentWaitObserver, type WaitObserver } from "./WaitObserver.ts";
+
+const recordingObserver = () => {
+  const waits: Array<ReadonlyArray<unknown>> = [];
+  const observer: WaitObserver = {
+    wait: (...args) => void waits.push(args),
+    hold: () => {},
+    depth: () => {},
+    register: () => () => {},
+    registerKeyed: () => () => {},
+    sizeKeys: () => () => {},
+  };
+  return { waits, observer };
+};
 
 const startedWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
 const workerExits = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, Promise<void>>());
@@ -134,16 +148,21 @@ layer("NodeSqliteClient", (it) => {
       const waitingSpan = yield* Deferred.make<Tracer.Span>();
       const observeWaiter: Statement.Transformer = (statement, _sql, _fiber, span) =>
         Deferred.succeed(waitingSpan, span).pipe(Effect.as(statement));
+      const { waits, observer } = recordingObserver();
       const waiter = yield* sql`SELECT 1`.pipe(
         Effect.provideService(Statement.CurrentTransformer, observeWaiter),
         Effect.provideService(Statement.SpanPropagationEnabled, true),
+        Effect.provideService(CurrentWaitObserver, observer),
         (effect) => Effect.forkChild(effect, { startImmediately: true }),
       );
       const span = yield* Deferred.await(waitingSpan);
+      yield* TestClock.adjust("1 second");
       yield* Deferred.succeed(release, undefined);
       yield* Fiber.join(holder);
       yield* Fiber.join(waiter);
 
+      // The wait observer hears of the wait with the writer's holder at its start.
+      assert.deepStrictEqual(waits, [["sqlite.writer", 1e9, "test.writerHolder"]]);
       assert.equal(span.attributes.get("db.lock_owner_at_start.name"), "test.writerHolder");
       assert.typeOf(span.attributes.get("db.lock_owner_at_start.fiber_id"), "number");
       assert.typeOf(span.attributes.get("db.lock_owner_at_start.trace_id"), "string");
@@ -535,9 +554,11 @@ it.effect("gives a queued read the first reader that frees up", () =>
       const queuedSpan = yield* Deferred.make<Tracer.Span>();
       const observeQueued: Statement.Transformer = (statement, _sql, _fiber, span) =>
         Deferred.succeed(queuedSpan, span).pipe(Effect.as(statement));
+      const { waits, observer } = recordingObserver();
       const queued = yield* countEntries(sql).pipe(
         Effect.provideService(Statement.CurrentTransformer, observeQueued),
         Effect.provideService(Statement.SpanPropagationEnabled, true),
+        Effect.provideService(CurrentWaitObserver, observer),
         SqliteClient.readOnly,
         (effect) => Effect.forkChild(effect, { startImmediately: true }),
       );
@@ -569,6 +590,7 @@ it.effect("gives a queued read the first reader that frees up", () =>
       // Pinned to the first reader it saw, this read would wait for that reader's transaction.
       assert.equal(yield* Fiber.join(queued), 1);
       assert.equal((yield* Deferred.await(queuedSpan)).attributes.get("db.lock_wait_ms"), 1000);
+      assert.deepStrictEqual(waits, [["sqlite.reader", 1e9, undefined]]);
       for (const { fiber, release } of [holders[0]!, holders[2]!, holders[3]!]) {
         yield* Deferred.succeed(release, undefined);
         yield* Fiber.join(fiber);

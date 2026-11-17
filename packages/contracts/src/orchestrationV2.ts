@@ -948,6 +948,10 @@ export const OrchestrationV2Subagent = Schema.Struct({
   completionDelivery: Schema.optional(OrchestrationV2DelegatedCompletionTaskDelivery),
   // The run whose unfinished task was cancelled, committed with its Stop.
   cancelledRunId: Schema.optional(RunId),
+  /** Its promoted messages whose steers had not landed then; they went with the task. */
+  cancelledSteerMessageIds: Schema.optional(Schema.Array(MessageId)),
+  /** The child run a delegated task settled from. Tasks can share one, and its result transfer. */
+  resultRunId: Schema.optional(RunId),
   status: Schema.Literals([
     "idle",
     "pending",
@@ -1407,6 +1411,11 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
    * the workflow's opening instead and keep the script behind a disclosure.
    */
   workflowScript: Schema.optional(Schema.Boolean),
+  /**
+   * The delegated follow-up task whose queued run was sent into a running turn as this message.
+   * The task then works in the run that holds the message.
+   */
+  promotedTaskId: Schema.optional(NodeId),
   id: MessageId,
   threadId: ThreadId,
   runId: Schema.NullOr(RunId),
@@ -3429,7 +3438,10 @@ export const OrchestrationV2Command = Schema.Union([
     manualContinuationOfRunId: Schema.optional(RunId),
     /** Requeues an accepted steer that could not be delivered; preserves Stop and queue holds. */
     steerFollowUpOfRunId: Schema.optional(RunId),
+    /** The follow-up queues behind the runs there were when the steer was sent. */
     steerFollowUpAfterRunOrdinal: Schema.optional(NonNegativeInt),
+    /** The provider declined the steer: its follow-up must queue, and Stop drops it. */
+    steerDeclined: Schema.optional(Schema.Literal(true)),
     usageLimitRecoveryRequestId: Schema.optional(CommandId),
     deliveryIntent: Schema.optional(Schema.Literals(["auto", "steer", "restart"])),
     delegatedCompletion: Schema.optional(

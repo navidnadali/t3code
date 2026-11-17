@@ -343,6 +343,93 @@ describe("observability", () => {
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("writes one in N plain statement spans when sampling and counts the rest", () =>
+    Effect.gen(function* () {
+      const written: Array<TraceRecord> = [];
+      const sink: TraceSink = {
+        filePath: "unused",
+        push: (record) => {
+          written.push(record);
+        },
+        flush: Effect.void,
+        flushSync: () => {},
+        close: () => Effect.void,
+      };
+      const nanos = (ms: number) => BigInt(Math.round(ms * 1_000_000));
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const tracer = yield* makeLocalFileTracer({
+            filePath: "unused",
+            maxBytes: 1024,
+            maxFiles: 1,
+            batchWindowMs: 10_000,
+            sink,
+            sqlSample: { every: 3, belowMs: 1_000 },
+          });
+          const runSpan = (
+            name: string,
+            startMs: number,
+            durationMs: number,
+            options: {
+              readonly exit?: Exit.Exit<unknown, unknown>;
+              readonly lockWaitMs?: number;
+            } = {},
+          ) => {
+            const span = tracer.span({
+              name,
+              parent: Option.none(),
+              annotations: Context.empty(),
+              links: [],
+              startTime: nanos(startMs),
+              kind: "client",
+              root: false,
+              sampled: true,
+            });
+            if (options.lockWaitMs !== undefined)
+              span.attribute("db.lock_wait_ms", options.lockWaitMs);
+            span.end(nanos(startMs + durationMs), options.exit ?? Exit.void);
+          };
+          for (let index = 0; index < 7; index++) runSpan("sqlite", index * 10, 1 + index);
+          // Failed, lock-waited and slow statements, and transactions, are always written.
+          runSpan("sqlite", 100, 1, { exit: Exit.fail("SQLITE_BUSY") });
+          runSpan("sqlite", 110, 1, { lockWaitMs: 5 });
+          runSpan("sqlite", 120, 1_000);
+          runSpan("sql.transaction", 130, 1);
+          assert.deepStrictEqual(
+            written
+              .splice(0)
+              .map((record) => [record.name, "durationMs" in record ? record.durationMs : 0]),
+            [
+              ["sqlite", 1],
+              ["sqlite", 4],
+              ["sqlite", 7],
+              ["sqlite", 1],
+              ["sqlite", 1],
+              ["sqlite", 1_000],
+              ["sql.transaction", 1],
+            ],
+          );
+          yield* TestClock.adjust("1 minute");
+          assert.deepStrictEqual(written.splice(0), [
+            {
+              type: "span-summary",
+              name: "sqlite",
+              thresholdMs: 0,
+              sampleEvery: 3,
+              // Statements this fast were sampled; slower ones are always written.
+              sampleBelowMs: 1_000,
+              count: 4,
+              totalDurationMs: 2 + 3 + 5 + 6,
+              maxDurationMs: 6,
+              startTimeUnixNano: String(nanos(10)),
+              endTimeUnixNano: String(nanos(56)),
+            },
+          ]);
+        }),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it("normalizes circular arrays, maps, and sets without recursing forever", () => {
     const array: Array<unknown> = ["alpha"];
     array.push(array);

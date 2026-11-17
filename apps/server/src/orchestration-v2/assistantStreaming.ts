@@ -138,6 +138,76 @@ function streamedMessage(event: ProviderAdapter.ProviderAdapterV2Event): Streame
   return null;
 }
 
+/** The filter's key for a snapshot of streamed text, and whether that snapshot is still streaming. */
+function streamedSnapshot(
+  event: ProviderAdapter.ProviderAdapterV2Event,
+): { readonly key: string; readonly streaming: boolean } | null {
+  if (event.type === "node.updated" && event.node.kind === "assistant_message")
+    return { key: `${event.type}:${event.node.id}`, streaming: event.node.status === "running" };
+  const message = streamedMessage(event);
+  return message === null
+    ? null
+    : { key: `${event.type}:${message.id}`, streaming: message.streaming };
+}
+
+/**
+ * A run's provider events between the subscription and ingestion. A newer streaming snapshot of
+ * assistant text replaces the item's waiting one in place unless an event of another kind arrived
+ * between them, so a backlog commits its newest text once and each item keeps its place.
+ */
+export function makeIngestionMailbox() {
+  let entries: Array<{
+    readonly event: ProviderAdapter.ProviderAdapterV2Event;
+    readonly key: string | null;
+  }> = [];
+  // Streaming snapshots waiting since the last event of another kind, by key.
+  const open = new Map<string, number>();
+  const waiting = new Map<string, number>();
+  let unsettled = 0;
+  return {
+    /** Queues `event`; returns the waiting snapshot it replaced in place, which is gone. */
+    offer(
+      event: ProviderAdapter.ProviderAdapterV2Event,
+    ): ProviderAdapter.ProviderAdapterV2Event | undefined {
+      const snapshot = streamedSnapshot(event);
+      if (snapshot?.streaming === true) {
+        const waitingAt = open.get(snapshot.key);
+        // Text takes its display position when first ingested, so the newer step keeps the place.
+        if (waitingAt !== undefined) {
+          const replaced = entries[waitingAt]!.event;
+          entries[waitingAt] = { event, key: snapshot.key };
+          return replaced;
+        }
+        open.set(snapshot.key, entries.length);
+      } else open.clear();
+      if (snapshot !== null) waiting.set(snapshot.key, (waiting.get(snapshot.key) ?? 0) + 1);
+      entries.push({ event, key: snapshot?.key ?? null });
+      unsettled++;
+      return undefined;
+    },
+    /** Takes everything queued, in order; a later snapshot no longer replaces what was taken. */
+    takeAll(): ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event> {
+      const taken = entries.map((entry) => entry.event);
+      entries = [];
+      open.clear();
+      return taken;
+    },
+    /** Marks a taken event as ingested; until then it is backlog, and its text counts as waiting. */
+    settle(event: ProviderAdapter.ProviderAdapterV2Event): void {
+      unsettled = Math.max(0, unsettled - 1);
+      const snapshot = streamedSnapshot(event);
+      if (snapshot === null) return;
+      const count = (waiting.get(snapshot.key) ?? 0) - 1;
+      if (count > 0) waiting.set(snapshot.key, count);
+      else waiting.delete(snapshot.key);
+    },
+    /** Whether a newer snapshot of the text the filter tracks under `key` is not ingested yet. */
+    isWaiting: (key: string): boolean => waiting.has(key),
+    /** Events offered and not ingested yet; a coalesced snapshot is gone, not pending. */
+    pending: (): number => unsettled,
+  };
+}
+
 function withText(
   event: ProviderAdapter.ProviderAdapterV2Event,
   text: string,
@@ -218,7 +288,10 @@ export function makeAssistantStreamingFilter(
     },
     nextIdleFlushAt: (): number | null => nextDueAt,
     /** Returns the held snapshots due by `now` and counts them as delivered. */
-    takeIdleFlushes(now: number): ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event> {
+    takeIdleFlushes(
+      now: number,
+      superseded: (key: string) => boolean = () => false,
+    ): ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event> {
       const due: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
       nextDueAt = null;
       for (const [key, current] of tracks) {
@@ -226,6 +299,11 @@ export function makeAssistantStreamingFilter(
         if (event === null) continue;
         if (current.dueAt > now) {
           if (nextDueAt === null || current.dueAt < nextDueAt) nextDueAt = current.dueAt;
+          continue;
+        }
+        // A newer snapshot waits for ingestion and decides what to show; the held one is stale.
+        if (superseded(key)) {
+          tracks.set(key, { ...current, held: null });
           continue;
         }
         due.push(event);

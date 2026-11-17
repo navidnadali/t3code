@@ -2,6 +2,7 @@
 import * as NodePerfHooks from "node:perf_hooks";
 
 import { CommandId, type RunId } from "@t3tools/contracts";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -384,9 +385,11 @@ export const layerExecutor: Layer.Layer<
                         : `command:steer-follow-up:${effect.id}:${messageId}`,
                     ),
                     steerFollowUpOfRunId: run.id,
-                    ...(steerDeclined && request.steerFollowUpAfterRunOrdinal !== undefined
-                      ? { steerFollowUpAfterRunOrdinal: request.steerFollowUpAfterRunOrdinal }
-                      : {}),
+                    // Behind what was queued before the steer went, ahead of what came after it.
+                    ...(request.steerFollowUpAfterRunOrdinal === undefined
+                      ? {}
+                      : { steerFollowUpAfterRunOrdinal: request.steerFollowUpAfterRunOrdinal }),
+                    ...(steerDeclined ? { steerDeclined: true as const } : {}),
                     threadId: effect.threadId,
                     messageId: message.id,
                     text: message.text,
@@ -863,6 +866,7 @@ export const layerWithOptions = (
     Effect.gen(function* () {
       const outbox = yield* EffectOutbox.EffectOutboxV2;
       const executor = yield* OrchestrationEffectExecutorV2;
+      const waitObserver = yield* CurrentWaitObserver;
       const workerId = options.workerId ?? `orchestration-v2:${process.pid}`;
       const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
       const wasCancelled = (effectId: string) =>
@@ -973,6 +977,7 @@ export const layerWithOptions = (
             DateTime.toEpochMillis(DateTime.makeUnsafe(effect.availableAt)),
           );
           const queueWaitMs = Math.max(0, claimedAt - eligibleAt);
+          waitObserver?.wait(`EffectOutbox.${effect.request.type}`, queueWaitMs * 1e6, undefined);
           yield* Metric.update(
             Metric.withAttributes(
               orchestrationEffectQueueWait,

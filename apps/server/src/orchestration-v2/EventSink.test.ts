@@ -4,10 +4,14 @@ import {
   EventId,
   MessageId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
+  ProviderThreadId,
   RunId,
   ThreadId,
   type OrchestrationV2AppThread,
+  type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -254,4 +258,178 @@ it.effect("a stream of several event types gets only those types, in commit orde
       sequences,
     );
   }).pipe(Effect.provide(layer)),
+);
+
+// A newer run claims a provider thread when it is queued but attaches only at its turn start.
+// Until then an older run's snapshots may set the thread's background roster, and nothing else.
+it.effect(
+  "an older run's snapshot sets only the roster of a provider thread not yet attached",
+  () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const later = DateTime.add(now, { seconds: 1 });
+      const threadId = ThreadId.make("roster-merge");
+      const driver = ProviderDriverKind.make("claudeAgent");
+      const providerInstanceId = ProviderInstanceId.make("claude");
+      const task = (taskId: string) => ({
+        taskId,
+        kind: "subagent" as const,
+        description: taskId,
+        providerInstanceId,
+      });
+      const claimed: OrchestrationV2ProviderThread = {
+        id: ProviderThreadId.make("provider-thread:roster-merge"),
+        driver,
+        providerInstanceId,
+        providerSessionId: ProviderSessionId.make("session:claimant"),
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: { driver, nativeId: "native:roster-merge", strength: "strong" },
+        nativeConversationHeadRef: null,
+        // A send to an idle thread claims the row as it stands; a queue start sets not_loaded.
+        status: "idle",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 2,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: [task("helper")],
+        contextUsage: null,
+        nativeMetadata: null,
+        goal: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      let eventCount = 0;
+      const providerThreadEvent = (payload: OrchestrationV2ProviderThread) => ({
+        id: EventId.make(`roster-merge:${++eventCount}`),
+        type: "provider-thread.updated" as const,
+        threadId,
+        occurredAt: later,
+        payload,
+      });
+      const stored = projections
+        .getThreadRecords(threadId, ["providerThreads"])
+        .pipe(Effect.map(({ providerThreads }) => providerThreads[0]));
+      const merge = (afterRunOrdinal: number, payload: OrchestrationV2ProviderThread) =>
+        sink.writeProviderThreadRosterIfUnattached({
+          afterRunOrdinal,
+          event: providerThreadEvent(payload),
+        });
+      const thread: OrchestrationV2AppThread = {
+        id: threadId,
+        projectId: ProjectId.make("project"),
+        title: "Roster merge",
+        createdBy: "user",
+        creationSource: "web",
+        providerInstanceId,
+        modelSelection: { instanceId: providerInstanceId, model: "claude-opus-4-6" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: null,
+        lineage: { rootThreadId: threadId, parentThreadId: null, relationshipToParent: null },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        deletedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        snoozedUntil: null,
+        snoozedAt: null,
+        lastVisitedAt: null,
+      };
+      const claimant: OrchestrationV2Run = {
+        id: RunId.make("roster-merge:2"),
+        threadId,
+        ordinal: 2,
+        providerInstanceId,
+        modelSelection: thread.modelSelection,
+        providerThreadId: claimed.id,
+        userMessageId: MessageId.make("roster-merge:2"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "starting",
+        queuePosition: null,
+        requestedAt: now,
+        startedAt: null,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("roster-merge:thread"),
+            type: "thread.created",
+            threadId,
+            occurredAt: now,
+            payload: thread,
+          },
+          {
+            id: EventId.make("roster-merge:claimant"),
+            type: "run.created",
+            threadId,
+            occurredAt: now,
+            payload: claimant,
+          },
+          providerThreadEvent(claimed),
+        ],
+      });
+
+      // Run 1 reports its own session, ordinal, status and goal; only its roster lands.
+      const finished: OrchestrationV2ProviderThread = {
+        ...claimed,
+        providerSessionId: ProviderSessionId.make("session:run-1"),
+        status: "idle",
+        lastRunOrdinal: 1,
+        pendingBackgroundTasks: [],
+        goal: { objective: "Finish the review", status: "active" },
+      };
+      const merged = yield* merge(1, finished);
+      assert.isTrue(merged.unattached);
+      assert.lengthOf(merged.storedEvents, 1);
+      assert.deepEqual(yield* stored, { ...claimed, pendingBackgroundTasks: [], updatedAt: later });
+
+      // The same snapshot again lands nothing more.
+      const sequence = yield* sink.latestSequence();
+      const repeated = yield* merge(1, finished);
+      assert.isTrue(repeated.unattached);
+      assert.deepEqual(repeated.storedEvents, []);
+      assert.equal(yield* sink.latestSequence(), sequence);
+
+      // Only a run older than the claimant carries its roster.
+      const notOlder = yield* merge(2, { ...finished, pendingBackgroundTasks: [task("stale")] });
+      assert.isFalse(notOlder.unattached);
+      assert.deepEqual(notOlder.storedEvents, []);
+
+      // Once the claimant's turn started, no older snapshot lands, whatever roster it reports.
+      const attached: OrchestrationV2ProviderThread = {
+        ...claimed,
+        status: "active",
+        pendingBackgroundTasks: [task("next")],
+        updatedAt: later,
+      };
+      yield* sink.write({
+        events: [
+          providerThreadEvent(attached),
+          {
+            id: EventId.make("roster-merge:claimant:running"),
+            type: "run.updated",
+            threadId,
+            occurredAt: later,
+            payload: { ...claimant, status: "running", startedAt: later },
+          },
+        ],
+      });
+      for (const pendingBackgroundTasks of [[], [task("helper")]]) {
+        const refused = yield* merge(1, { ...finished, pendingBackgroundTasks });
+        assert.isFalse(refused.unattached);
+        assert.deepEqual(refused.storedEvents, []);
+      }
+      assert.deepEqual(yield* stored, attached);
+    }).pipe(Effect.provide(layer)),
 );

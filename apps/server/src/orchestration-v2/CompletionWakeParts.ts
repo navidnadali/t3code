@@ -68,3 +68,92 @@ export function withoutCompletionWakePart(
     completionWakeParts(ownership).filter((part) => part.parentRunId !== parentRunId),
   );
 }
+
+/** A run's place in the chain that attributes completion wakes to a delegated thread's tasks. */
+export interface CompletionWakeLineage {
+  readonly runId: RunId;
+  readonly delegatedTaskId: NodeId | null;
+  /** For an untagged run, the parent runs of every completion wake it ran. */
+  readonly parentRunIds: ReadonlyArray<RunId>;
+  readonly restartContinuationOfRunId?: RunId;
+  /** The follow-ups promoted to Steer into this run, whose tasks it works for too. */
+  readonly promotedTaskIds?: ReadonlyArray<NodeId>;
+}
+
+/**
+ * Keys the follow-up tasks a wake for these parent runs counts for, as `delegatedTaskRuns` links
+ * them; empty is the original task. Delegated threads merge only wakes with equal keys, so each
+ * task still reads the wake that carried its own results.
+ */
+export function completionWakeOwnerKeys(
+  lineage: ReadonlyArray<CompletionWakeLineage>,
+): (parentRunIds: ReadonlyArray<RunId>) => string {
+  const rows = new Map(lineage.map((row) => [row.runId, row]));
+  // A follow-up promoted into a run owns it and that run's restart continuations.
+  const promotedInto = (runId: RunId): ReadonlyArray<NodeId> => {
+    const taskIds: Array<NodeId> = [];
+    const seen = new Set<RunId>();
+    for (
+      let row = rows.get(runId);
+      row !== undefined && !seen.has(row.runId);
+      row =
+        row.restartContinuationOfRunId === undefined
+          ? undefined
+          : rows.get(row.restartContinuationOfRunId)
+    ) {
+      seen.add(row.runId);
+      taskIds.push(...(row.promotedTaskIds ?? []));
+    }
+    return taskIds;
+  };
+  const owners = new Map<RunId, ReadonlySet<NodeId>>();
+  // Iterative: a seat's chain runs hundreds of wakes deep.
+  const ownersOf = (start: RunId): ReadonlySet<NodeId> => {
+    const stack: Array<{ readonly runId: RunId; expanded: boolean }> = [
+      { runId: start, expanded: false },
+    ];
+    const onPath = new Set<RunId>();
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]!;
+      if (owners.has(top.runId)) {
+        stack.pop();
+        continue;
+      }
+      const row = rows.get(top.runId);
+      if (row === undefined || row.delegatedTaskId !== null) {
+        owners.set(
+          top.runId,
+          new Set([
+            ...(row?.delegatedTaskId == null ? [] : [row.delegatedTaskId]),
+            ...promotedInto(top.runId),
+          ]),
+        );
+        stack.pop();
+        continue;
+      }
+      if (!top.expanded) {
+        top.expanded = true;
+        onPath.add(top.runId);
+        for (const parentRunId of row.parentRunIds) {
+          if (!owners.has(parentRunId) && !onPath.has(parentRunId))
+            stack.push({ runId: parentRunId, expanded: false });
+        }
+        continue;
+      }
+      owners.set(
+        top.runId,
+        new Set([
+          ...row.parentRunIds.flatMap((parentRunId) => [...(owners.get(parentRunId) ?? [])]),
+          ...promotedInto(top.runId),
+        ]),
+      );
+      onPath.delete(top.runId);
+      stack.pop();
+    }
+    return owners.get(start)!;
+  };
+  return (parentRunIds) =>
+    JSON.stringify(
+      Array.from(new Set(parentRunIds.flatMap((runId) => [...ownersOf(runId)]))).toSorted(),
+    );
+}

@@ -32,7 +32,9 @@ import * as Ref from "effect/Ref";
 import * as SqlError from "effect/sql/SqlError";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 
+import { recordingWaitObserver } from "../observability/WaitObserver.testkit.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as EffectAdmission from "./EffectAdmission.ts";
 import * as CheckpointService from "./CheckpointService.ts";
@@ -456,12 +458,14 @@ it.effect("a declined steer's follow-up keeps its queue place and model when it 
       return {
         dispatchMode: dispatch.dispatchMode.type,
         steerFollowUpAfterRunOrdinal: dispatch.steerFollowUpAfterRunOrdinal,
+        steerDeclined: dispatch.steerDeclined,
         modelSelection: dispatch.modelSelection,
       };
     });
     assert.deepEqual(first, {
       dispatchMode: "queue_after_active",
       steerFollowUpAfterRunOrdinal: 3,
+      steerDeclined: true,
       modelSelection,
     });
     assert.deepEqual(retried, first);
@@ -1056,6 +1060,43 @@ it.effect("claims only ungated effects once the admission slots are taken", () =
     });
   }),
 );
+
+it.effect("reports each claimed effect's wait in the outbox by type to the wait observer", () => {
+  const { observer, reports } = recordingWaitObserver();
+  return Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const workerId = "worker-queue-wait";
+    const pending = [
+      admissionEffect(1, now, workerId, {
+        type: "provider-turn.interrupt",
+        providerSessionId: oldSessionId,
+        providerThreadId,
+        providerTurnId,
+      }),
+    ];
+    const layerOutbox = mockNormalOutbox({
+      claimNext: () => Effect.sync(() => Option.fromNullishOr(pending.shift())),
+      get: () => Effect.succeedNone,
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      succeed: () => Effect.succeed(true),
+    });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({ execute: () => Effect.void }),
+    );
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.provide(
+        EffectWorker.layerWithOptions({ workerId }).pipe(
+          Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+        ),
+      ),
+    );
+    yield* TestClock.adjust("2500 millis");
+    assert.isTrue(yield* worker.runOnce());
+    assert.deepEqual(reports("wait"), [["EffectOutbox.provider-turn.interrupt", 2.5e9, undefined]]);
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});
 
 const saturatedDaemon = (options: {
   readonly wakeUpsDelivered: boolean;

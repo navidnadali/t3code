@@ -7,6 +7,7 @@ import {
   NodeId,
   ORCHESTRATOR_MCP_RUNNING_TASK_NEXT,
   TurnItemId,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2Run,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
@@ -104,6 +105,7 @@ import type {
 } from "../orchestration-v2/ProjectionStore.ts";
 import {
   delegatedTaskAwaitsWork,
+  delegatedTaskJoinedRuns,
   delegatedTaskResultRun,
   delegatedTaskRuns,
   runOutcome,
@@ -573,16 +575,19 @@ function endsTaskWait(result: OrchestratorMcpDelegateTaskResult): boolean {
 const isApprovalRequestKind = Schema.is(ProviderRequestKind);
 
 function pendingTaskApproval(
-  child: Pick<OrchestrationV2ThreadProjection, "runs" | "nodes" | "runtimeRequests">,
+  child: Pick<OrchestrationV2ThreadProjection, "runs" | "messages" | "nodes" | "runtimeRequests">,
   taskId: NodeId,
   originalRun: OrchestrationV2Run | undefined,
 ) {
+  // A follow-up waits on approvals in all of its runs: those tagged with it, those its promoted
+  // messages joined, and the untagged wakes for subagents they started.
+  const followupRunIds = new Set(delegatedTaskRuns(child, taskId).map((run) => run.id));
   const taskRunIds = new Set(
     child.runs
       .filter(
         (run) =>
           !ThreadManagementService.isTerminalRunStatus(run.status) &&
-          (run.delegatedTaskId === taskId ||
+          (followupRunIds.has(run.id) ||
             // Legacy tasks own only their original run, not later turns in the child thread.
             (run.delegatedTaskId === undefined && run.id === originalRun?.id)),
       )
@@ -609,25 +614,29 @@ function pendingTaskApproval(
   return approval;
 }
 
-/** Every task `directAppOwnedChildTasks` can return, so callers load only those. */
+/** Every task whose result can be on a page of these runs, so callers load only those. */
 function directChildTaskIds(
   target: Pick<OrchestrationV2ThreadProjection, "thread" | "runs">,
-  returnedRunIds: ReadonlySet<RunId | null>,
+  runIds: ReadonlySet<RunId | null>,
+  joinedMessages: ReadonlyArray<Pick<OrchestrationV2ConversationMessage, "promotedTaskId">>,
 ): ReadonlyArray<NodeId> {
   const ids = new Set<NodeId>();
   if (target.thread.forkedFrom?.type === "node") ids.add(target.thread.forkedFrom.nodeId);
   for (const run of target.runs) {
-    if (returnedRunIds.has(run.id) && run.delegatedTaskId !== undefined) {
+    if (runIds.has(run.id) && run.delegatedTaskId !== undefined) {
       ids.add(run.delegatedTaskId);
     }
+  }
+  // A follow-up promoted to Steer works in the run its message joined.
+  for (const message of joinedMessages) {
+    if (message.promotedTaskId !== undefined) ids.add(message.promotedTaskId);
   }
   return [...ids];
 }
 
 function directAppOwnedChildTasks(
   parent: Pick<OrchestrationV2ThreadProjection, "thread" | "subagents">,
-  target: Pick<OrchestrationV2ThreadProjection, "thread" | "runs">,
-  returnedRunIds: ReadonlySet<RunId | null>,
+  target: Pick<OrchestrationV2ThreadProjection, "thread">,
 ): ReadonlyArray<OrchestrationV2Subagent> {
   if (
     target.thread.lineage.parentThreadId !== parent.thread.id ||
@@ -635,23 +644,10 @@ function directAppOwnedChildTasks(
   ) {
     return [];
   }
-  const original = parent.subagents.find(
+  return parent.subagents.filter(
     (task) =>
       task.origin === "app_owned" &&
       task.threadId === parent.thread.id &&
-      task.id ===
-        (target.thread.forkedFrom?.type === "node" ? target.thread.forkedFrom.nodeId : undefined) &&
-      task.childThreadId === target.thread.id,
-  );
-  const taskIds = new Set(
-    target.runs
-      .filter((run) => returnedRunIds.has(run.id))
-      .map((run) => run.delegatedTaskId ?? original?.id),
-  );
-  return parent.subagents.filter(
-    (task) =>
-      taskIds.has(task.id) &&
-      task.origin === "app_owned" &&
       task.childThreadId === target.thread.id,
   );
 }
@@ -659,9 +655,32 @@ function directAppOwnedChildTasks(
 // The child's transfers include the results it sent, so the parent's transfers are never read.
 function taskResultTransfer(
   parentThreadId: ThreadId,
-  child: Pick<OrchestrationV2ThreadProjection, "runs" | "contextTransfers">,
+  child: Pick<OrchestrationV2ThreadProjection, "runs" | "messages" | "contextTransfers">,
   task: OrchestrationV2Subagent,
 ) {
+  const resultTransfers = child.contextTransfers.filter(
+    (transfer) =>
+      transfer.type === "subagent_result" &&
+      transfer.sourceThreadId === task.childThreadId &&
+      transfer.targetThreadId === parentThreadId,
+  );
+  // A settled task names its result run, whose transfer it may share with other tasks.
+  if (task.result !== null && task.resultRunId !== undefined)
+    return resultTransfers.find((transfer) => transfer.sourcePoint.runId === task.resultRunId);
+  // A follow-up's result is its result run's. Several tasks can share a run's transfer, so one
+  // published for another of its runs is not this task's result.
+  const taskRuns = delegatedTaskRuns(child, task.id);
+  if (taskRuns.length > 0) {
+    const resultRun = delegatedTaskResultRun(taskRuns);
+    return (
+      resultTransfers.find((transfer) => transfer.sourcePoint.runId === resultRun?.id) ??
+      taskRuns
+        .toSorted((left, right) => right.ordinal - left.ordinal)
+        .flatMap((run) =>
+          resultTransfers.filter((transfer) => transfer.sourcePoint.runId === run.id),
+        )[0]
+    );
+  }
   const originalRun = delegatedTaskRun(child, task);
   const resultRunIds = new Set(
     child.runs
@@ -673,34 +692,24 @@ function taskResultTransfer(
       .map((run) => run.id),
   );
   if (originalRun !== undefined) resultRunIds.add(originalRun.id);
-  return child.contextTransfers.find(
+  return resultTransfers.find(
     (transfer) =>
-      transfer.type === "subagent_result" &&
-      transfer.sourceThreadId === task.childThreadId &&
-      transfer.targetThreadId === parentThreadId &&
-      ((transfer.sourcePoint.runId !== undefined && resultRunIds.has(transfer.sourcePoint.runId)) ||
-        (transfer.sourcePoint.runId === undefined && originalRun?.delegatedTaskId === undefined)),
+      (transfer.sourcePoint.runId !== undefined && resultRunIds.has(transfer.sourcePoint.runId)) ||
+      (transfer.sourcePoint.runId === undefined && originalRun?.delegatedTaskId === undefined),
   );
 }
 
 function pageIncludesTerminalTaskResult(input: {
-  readonly parentThreadId: ThreadId;
   readonly items: ReadonlyArray<OrchestratorMcpThreadTimelineItem>;
-  readonly task: OrchestrationV2Subagent;
+  readonly run: OrchestrationV2Run;
   readonly target: Pick<
     OrchestrationV2ThreadProjection,
-    "thread" | "runs" | "contextTransfers" | "messages" | "turnItems" | "providerTurns"
+    "thread" | "messages" | "turnItems" | "providerTurns"
   >;
 }): boolean {
-  const transfer = taskResultTransfer(input.parentThreadId, input.target, input.task);
-  if (transfer === undefined) return false;
-  const run =
-    transfer.sourcePoint.runId === undefined
-      ? delegatedTaskRun(input.target, input.task)
-      : input.target.runs.find((run) => run.id === transfer.sourcePoint.runId);
-  if (run === undefined || !isTerminalTaskStatus(taskStatusForRun(run))) return false;
+  if (!isTerminalTaskStatus(taskStatusForRun(input.run))) return false;
 
-  const result = subagentResultForRun(input.target, run);
+  const result = subagentResultForRun(input.target, input.run);
   if (result.messageId === null && result.turnItemId === null) return false;
 
   return input.items.some((item) => {
@@ -1697,6 +1706,8 @@ const make = Effect.gen(function* () {
     waitTimedOut = false,
     acknowledgeTerminal = false,
     acknowledgementOperation = "task-status-acknowledge",
+    /** The run whose answer a page showed; it acknowledges only the task that settles from it. */
+    pageResultRunId?: RunId,
   ): Effect.fn.Return<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure> {
     yield* requireCapability(scope);
     const task = (yield* loadTasks(scope.thread.threadId, [taskId])).find(
@@ -1878,11 +1889,18 @@ const make = Effect.gen(function* () {
       endsTaskWait(result) || task.completionDelivery?.state === "disposed"
         ? result
         : { ...result, next: ORCHESTRATOR_MCP_RUNNING_TASK_NEXT };
+    // The run the task settled from, or settles from now. A page read while the task's settlement
+    // waits can find the task through another of its runs.
+    const currentResultRunId =
+      task.result !== null
+        ? (task.resultRunId ?? resultTransfer?.sourcePoint.runId)
+        : taskResultRun?.id;
     if (
       acknowledgeTerminal &&
       isTerminalTaskStatus(status) &&
       task.completionDelivery?.state !== "acknowledged" &&
-      task.completionDelivery?.state !== "disposed"
+      task.completionDelivery?.state !== "disposed" &&
+      (pageResultRunId === undefined || pageResultRunId === currentResultRunId)
     ) {
       const parentProjection = yield* loadCallerRecords(scope.thread.threadId, ["runs"]);
       const observingRun = ThreadManagementService.latestActiveRun({
@@ -3016,7 +3034,9 @@ const make = Effect.gen(function* () {
           status: cancelled ? "cancelled" : current.status,
         } satisfies OrchestratorMcpTaskCancelResult;
       }
-      const child = yield* loadThreadRecords(childThreadId, ["runs"]);
+      const child = yield* loadThreadRecords(childThreadId, ["runs", "messages"], {
+        messageRoles: ["user"],
+      });
       if (
         current.workState !== "waiting_for_children" &&
         ThreadManagementService.latestActiveRun(child) === undefined &&
@@ -3024,7 +3044,10 @@ const make = Effect.gen(function* () {
           (run) =>
             run.status === "queued" &&
             (run.delegatedTaskId === input.taskId || run.id === current.childRunId),
-        )
+        ) &&
+        // A follow-up promoted to Steer can still wait on the steer carrying its message after the
+        // run it joined ended; cancelling it marks that run.
+        delegatedTaskJoinedRuns(child, input.taskId).length === 0
       ) {
         if (yield* cancelOrphan) return { taskId: input.taskId, status: "cancelled" };
         return yield* failure(
@@ -3386,6 +3409,44 @@ const make = Effect.gen(function* () {
       const returnedRunIds = new Set(
         page.filter((row) => row.sourceThreadId === target.thread.id).map((row) => row.item.runId),
       );
+      // A page can show a task's result without the runs that make it the task's: promotion
+      // moves a queued follow-up's message into the run it joined, and a restart continuation
+      // or a wake for a subagent a run started settles that run's tasks. Each page run's restart
+      // ancestors and wake parent runs are read too, transitively.
+      const pageRunIds = new Set<RunId>();
+      const addWithRestartAncestors = (runId: RunId | null) => {
+        for (
+          let run = target.runs.find((candidate) => candidate.id === runId);
+          run !== undefined && !pageRunIds.has(run.id);
+          run = target.runs.find((candidate) => candidate.id === run?.restartContinuationOfRunId)
+        )
+          pageRunIds.add(run.id);
+      };
+      for (const runId of returnedRunIds) addWithRestartAncestors(runId);
+      const joinedMessages: Array<OrchestrationV2ConversationMessage> = [];
+      if (
+        parent !== undefined &&
+        target.thread.lineage.parentThreadId === parent.thread.id &&
+        target.thread.lineage.relationshipToParent === "subagent"
+      ) {
+        for (let unread = [...pageRunIds]; unread.length > 0;) {
+          const { messages } = yield* threadManagement
+            .getThreadRecords(target.thread.id, ["messages"], {
+              messageRunIds: unread,
+              messageRoles: ["user"],
+            })
+            .pipe(Effect.mapError(threadManagementFailure));
+          joinedMessages.push(...messages);
+          const read = new Set(pageRunIds);
+          for (const { delegatedCompletion } of messages) {
+            if (delegatedCompletion === undefined) continue;
+            addWithRestartAncestors(delegatedCompletion.parentRunId);
+            for (const part of delegatedCompletion.merged ?? [])
+              addWithRestartAncestors(part.parentRunId);
+          }
+          unread = [...pageRunIds].filter((runId) => !read.has(runId));
+        }
+      }
       const tasks =
         parent === undefined
           ? []
@@ -3394,19 +3455,24 @@ const make = Effect.gen(function* () {
                 thread: parent.thread,
                 subagents: yield* loadTasks(
                   parent.thread.id,
-                  directChildTaskIds(target, returnedRunIds),
+                  directChildTaskIds(target, pageRunIds, joinedMessages),
                 ),
               },
               target,
-              returnedRunIds,
             );
       // A read past the end of an item's text shows the agent nothing to acknowledge.
       const readPastEnd = (input.textOffset ?? 0) > 0 && items.every((item) => !item.text);
       if (parent !== undefined && scope.thread !== undefined && tasks.length > 0 && !readPastEnd) {
+        const taskTarget = { ...target, messages: joinedMessages };
         for (const task of tasks) {
-          const transfer = taskResultTransfer(parent.thread.id, target, task);
-          const resultRunId = transfer?.sourcePoint.runId ?? delegatedTaskRun(target, task)?.id;
-          const resultRunIds = resultRunId === undefined ? [] : [resultRunId];
+          const transfer = taskResultTransfer(parent.thread.id, taskTarget, task);
+          if (transfer === undefined) continue;
+          const run =
+            transfer.sourcePoint.runId === undefined
+              ? delegatedTaskRun(target, task)
+              : target.runs.find((candidate) => candidate.id === transfer.sourcePoint.runId);
+          if (run === undefined || !returnedRunIds.has(run.id)) continue;
+          const resultRunIds = [run.id];
           const resultRecords = yield* threadManagement
             .getThreadRecords(target.thread.id, ["messages", "turnItems"], {
               messageRoles: ["assistant"],
@@ -3417,9 +3483,8 @@ const make = Effect.gen(function* () {
             .pipe(Effect.mapError(threadManagementFailure));
           if (
             pageIncludesTerminalTaskResult({
-              parentThreadId: parent.thread.id,
               items,
-              task,
+              run,
               target: { ...target, ...resultRecords },
             })
           ) {
@@ -3429,6 +3494,7 @@ const make = Effect.gen(function* () {
               false,
               true,
               "thread-read-acknowledge",
+              transfer.sourcePoint.runId,
             );
           }
         }

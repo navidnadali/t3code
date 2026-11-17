@@ -6,6 +6,7 @@ import * as Stream from "effect/Stream";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
 import { MAX_VISIBLE_STARTS_AHEAD_OF_WAKE } from "./QueuedRunOrder.ts";
+import type { CompletionWakeLineage } from "./CompletionWakeParts.ts";
 import { unsentManualContinuationSource } from "./manualContinuation.ts";
 import type {
   OrchestrationV2ThreadLinkMetadata,
@@ -690,6 +691,15 @@ export interface ProjectionStoreV2Shape {
     threadId: ThreadId,
     input: QueuedRunRecordsInput,
   ) => Effect.Effect<ProjectionRecords<MessageDispatchRecordField>, ProjectionStoreV2Error>;
+  /**
+   * The runs `runIds` reach through the completion wakes that make a follow-up task's runs (see
+   * `delegatedTaskRuns`): each with its follow-up task, or for an untagged run the parent runs of
+   * every completion wake it ran. Tagged runs end the walk.
+   */
+  readonly getCompletionWakeLineage: (
+    threadId: ThreadId,
+    runIds: ReadonlyArray<RunId>,
+  ) => Effect.Effect<ReadonlyArray<CompletionWakeLineage>, ProjectionStoreV2Error>;
   /** Whether a restart continuation of one of the thread's runs is still to run. */
   readonly hasPendingRestartContinuation: (
     threadId: ThreadId,
@@ -1526,7 +1536,7 @@ const decodeSubagentPayload = Schema.decodeUnknownEffect(
 const decodeProviderSessionPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderSessionJsonSchema),
 );
-const decodeProviderThreadPayload = Schema.decodeUnknownEffect(
+export const decodeProviderThreadPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderThreadJsonSchema),
 );
 const decodeProviderTurnPayload = Schema.decodeUnknownEffect(
@@ -7746,6 +7756,87 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         sql.withTransaction(effect).pipe(Effect.mapError(controlReadError(threadId))),
     );
 
+    // Each run once, by primary key and the messages' run index, however long the chain: a seat's
+    // wakes chain through every turn that delegated again, so the chain can run long.
+    const getCompletionWakeLineage: ProjectionStoreV2Shape["getCompletionWakeLineage"] = (
+      threadId,
+      runIds,
+    ) =>
+      sql<{
+        readonly run_id: RunId;
+        readonly delegated_task_id: NodeId | null;
+        readonly parent_run_ids: string | null;
+        readonly restart_of: RunId | null;
+        readonly promoted_task_ids: string | null;
+      }>`
+        WITH RECURSIVE lineage(run_id) AS (
+          SELECT value FROM json_each(${encodeIdList(runIds)})
+          UNION
+          SELECT part.value FROM lineage
+          CROSS JOIN orchestration_v2_projection_runs AS run ON run.run_id = lineage.run_id
+          CROSS JOIN orchestration_v2_projection_messages AS message
+            INDEXED BY orchestration_v2_projection_messages_run_idx
+            ON message.run_id = lineage.run_id
+          CROSS JOIN json_tree(message.payload_json, '$.delegatedCompletion') AS part
+          WHERE run.thread_id = ${threadId}
+            AND json_extract(run.payload_json, '$.delegatedTaskId') IS NULL
+            AND message.thread_id = ${threadId} AND message.role = 'user'
+            AND json_type(message.payload_json, '$.delegatedCompletion') = 'object'
+            AND part.key = 'parentRunId'
+          UNION
+          -- A restart continuation works for the follow-ups promoted into the run it continues.
+          SELECT json_extract(run.payload_json, '$.restartContinuationOfRunId') FROM lineage
+          CROSS JOIN orchestration_v2_projection_runs AS run ON run.run_id = lineage.run_id
+          WHERE run.thread_id = ${threadId}
+            AND json_extract(run.payload_json, '$.restartContinuationOfRunId') IS NOT NULL
+        )
+        SELECT lineage.run_id,
+          json_extract(run.payload_json, '$.delegatedTaskId') AS delegated_task_id,
+          json_extract(run.payload_json, '$.restartContinuationOfRunId') AS restart_of,
+          (
+            SELECT json_group_array(DISTINCT json_extract(message.payload_json, '$.promotedTaskId'))
+            FROM orchestration_v2_projection_messages AS message
+              INDEXED BY orchestration_v2_projection_messages_run_idx
+            WHERE message.run_id = lineage.run_id AND message.thread_id = ${threadId}
+              AND message.role = 'user'
+              AND json_extract(message.payload_json, '$.promotedTaskId') IS NOT NULL
+          ) AS promoted_task_ids,
+          (
+            SELECT json_group_array(part.value)
+            FROM orchestration_v2_projection_messages AS message
+              INDEXED BY orchestration_v2_projection_messages_run_idx
+            CROSS JOIN json_tree(message.payload_json, '$.delegatedCompletion') AS part
+            WHERE message.run_id = lineage.run_id AND message.thread_id = ${threadId}
+              AND message.role = 'user'
+              AND json_type(message.payload_json, '$.delegatedCompletion') = 'object'
+              AND part.key = 'parentRunId'
+          ) AS parent_run_ids
+        FROM lineage
+        CROSS JOIN orchestration_v2_projection_runs AS run ON run.run_id = lineage.run_id
+        WHERE run.thread_id = ${threadId}
+      `.pipe(
+        Effect.map((rows) =>
+          rows.map((row): CompletionWakeLineage => {
+            const delegatedTaskId = row.delegated_task_id ?? null;
+            const promotedTaskIds =
+              row.promoted_task_ids === null
+                ? []
+                : (JSON.parse(row.promoted_task_ids) as Array<NodeId>);
+            return {
+              runId: row.run_id,
+              delegatedTaskId,
+              parentRunIds:
+                delegatedTaskId !== null || row.parent_run_ids === null
+                  ? []
+                  : (JSON.parse(row.parent_run_ids) as Array<RunId>),
+              ...(row.restart_of === null ? {} : { restartContinuationOfRunId: row.restart_of }),
+              ...(promotedTaskIds.length === 0 ? {} : { promotedTaskIds }),
+            };
+          }),
+        ),
+        Effect.mapError(controlReadError(threadId)),
+      );
+
     const hasPendingRestartContinuation: ProjectionStoreV2Shape["hasPendingRestartContinuation"] = (
       threadId,
     ) =>
@@ -10761,6 +10852,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getMessageDispatchRecords: historyOnReader(getMessageDispatchRecords),
       getDelegatedTaskRecords: historyOnReader(getDelegatedTaskRecords),
       getQueuedRunRecords: historyOnReader(getQueuedRunRecords),
+      getCompletionWakeLineage: readOnReader(getCompletionWakeLineage),
       hasPendingRestartContinuation: readOnReader(hasPendingRestartContinuation),
       hasRunPromptAfter: readOnReader(hasRunPromptAfter),
       getRunsLatestFirst: historyOnReader(getRunsLatestFirst),

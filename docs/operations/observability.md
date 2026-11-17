@@ -93,7 +93,14 @@ these counts to the span counts; a percentile that falls among them prints as `<
 threshold. A crash or kill loses up to a minute of these counts; slow, failed, and lock-waited
 spans are still written as they end.
 
-With the filter on:
+`T3CODE_TRACE_SQL_SAMPLE_EVERY=N` (default `1`, every span) keeps one in N of the `sqlite`
+statement spans that the rule above would count, but that ran for anything under the 1 s
+Diagnostics cutoff, so the file reaches further back. Transactions are never sampled. The rest
+count in a `span-summary` record with `sampleEvery: N` and `sampleBelowMs`, the cutoff.
+`t3 trace summary` counts them, and its percentiles let each written statement that could have
+been sampled stand for its share of them; slow, failed and lock-waited ones stand for themselves.
+
+With either on:
 
 - A written span can name a counted span as its `parentSpanId`, for example a span inside a fast
   transaction. Treat a parent that is missing from the file as a counted SQL span.
@@ -133,13 +140,67 @@ SQL spans that `T3CODE_TRACE_SQL_MIN_DURATION_MS` only counts.
 - `spans`: `[count, totalMs, maxMs, p95Ms]` per span name. The p95 is within about 6% of the exact
   value, and exact up to 19 spans. Names only: no attributes, events, ids or messages. Past 2,000
   names in a minute the rest count under `(other)`.
+- `spanPercentiles`: `[p50Ms, p90Ms, p99Ms]` per span name that ended ten times or more, from the
+  same histogram (below that the p90 and p99 are the max). It is a separate field so readers of the
+  four-field tuple keep working.
 - `loop`: event loop delay p50, p99 and max beyond a 20 ms timer, and the share of the minute the
   loop was busy (`utilization`).
 - `cpu`: user and system CPU time of the whole process, worker threads included, in ms.
 - `memory`: resident memory, and JavaScript heap used and allocated, in bytes.
+- `waits`: per site, the waits that ended in the minute: `n`, `totalMs`, `maxMs`, `p50Ms`, `p90Ms`,
+  `p99Ms`. Where a site knows them, `holders` (what held the resource when the wait began),
+  `waiters` (the operation that waited) and `outcomes` give `[n, totalMs]` for the top five, with
+  the rest under `(other)`, and `depth` is `[p50, p90, max]` of the queue length arrivals found.
+  An uncontended acquisition counts as a zero wait. The sites:
+  - `ThreadCommandExecutor.lock` and `Orchestrator.messageIntake`, the per-thread command lock
+    and the message intake lock. A holder is the span that took the lock.
+  - `ProviderCommitBatch.queue`, from a write joining the provider commit queue to its batch's
+    flush, with `.snapshot` (a provider snapshot batched with others) and `.barrier` (any other
+    write, a provider control's included) by kind. A holder is the operation of the batch
+    flushing when it joined. `ProviderCommitBatch.batch` has only `depth`: writes per commit.
+  - The reaction pools by name (`Orchestrator.runUpdateReactions`, `.deferredSteerReactions`,
+    `.childWorkReactions`, `ProviderContinuationService.wakes`, `.completions`), from offer to
+    handling; the holder is `(key busy)` or `(pool full)`.
+  - `EffectOutbox.<effect type>`, from an effect becoming due to its claim.
+  - `sqlite.writer` and `sqlite.reader`, connection waits; a writer's holder is its owner's span.
+  - `ProviderIngest.lag.<class>` (`delta`, `lifecycle`, `subagent`, `other`): from the server
+    taking a provider event to its writes committing. `ProviderIngest.fanout` has only `depth`:
+    the run subscriptions each event went to, as every run on a shared session takes every
+    thread's events. `ProviderIngest.lagFromAdapter.<class>`
+    runs from the adapter's own stamp instead (`updatedAt` of a message, turn item, subagent,
+    provider thread or session; `createdAt` of a runtime request), so the difference is the time
+    before the server took it, the adapter's queue included. Turn, node and plan updates,
+    terminals and work notices carry no stamp. `ProviderIngest.terminalBacklog` has only
+    `depth`: what each run's subscription held ahead of a turn terminal.
+  - `McpToolAccess.wakeRunWait`, an MCP call from a wake turn waiting for its run, only when
+    there was one to wait for, with `outcomes` `became-active`, `timed-out`, `refused-dead-run`
+    or `other`.
+- `gauges`: read at the minute's end. `ProviderCommitBatch.depth`, each reaction pool's
+  `.pendingKeys`, and `ProviderIngest.backlog` (events published to runs and not taken yet) as
+  they stand; `EffectAdmission.closedMs` (the gate held gated effects back) and
+  `EffectAdmission.saturatedMs` (it ran at the saturated allowance) as the minute's share;
+  `ProviderIngest.fanout.dropped` (events runs dropped before ingestion because another run on
+  their shared provider session owns them, so never backlog or lag) as the minute's increase.
+- `threads`: the five threads with the most wait (`byWait`) and hold (`byHold`) at each thread
+  lock, and the most backlog (`byDepth`) at `ProviderIngest.backlog`, as anonymous ranks: no id,
+  no title, nothing kept past the minute. Each rank has `waitMs`, `holdMs` and `n`, or `depth`,
+  and `runs` and `subagents`, the thread's run and subagent-row counts as decade floors (0, 1,
+  10, 100 ...). A hold counts in the minute it ends.
+- `gc`: `[count, totalMs, maxMs]` per garbage collection kind that ran (`minor`, `major`,
+  `incremental`, `weakcb`).
+- `cpuProfile`, only with `T3CODE_TRACE_CPU_PROFILE_INTERVAL_MS`: the minute's `samples`,
+  `sampledMs`, the top 25 functions by self time as `[name, selfMs]` (function, file without its
+  directory, line) and the rest as `otherMs`. An in-process inspector session samples the main
+  thread; it opens no port and needs no signal. Two profiles overlap at each minute's end, as
+  restarting one makes V8 walk the whole heap again (seconds on a large heap). The first start
+  logs the code already compiled, so set it before the heap grows. Sampling keeps the event loop
+out of idle: at 10 ms it adds noticeably to event loop utilization under load, with little
+extra CPU; a 50 ms or 100 ms interval costs much less.
+Profile at 10 ms only for a short, deliberate window; for longer ones use 100 ms.
 
-At 4 MiB the file is gzipped to `server.span-minutes.ndjson.<UTC close time>.gz`. The newest 48
-archives are kept, at most 48 MiB together: several days on a busy server, more on a quieter one. To list the five span names with the most time each minute:
+At 4 MiB the file is gzipped to `server.span-minutes.ndjson.<UTC close time>.gz`. The newest 96
+archives are kept, at most 96 MiB together: several days on a busy server, more on a quieter one.
+To list the five span names with the most time each minute:
 
 ```bash
 cd ~/.t3/userdata/logs
@@ -699,9 +760,11 @@ Use traces when the question is:
 ### "Why were an agent's T3 tool calls refused while it kept working?"
 
 When a background task ends, Claude starts a wake turn on its own. T3 shows that turn only once
-its continuation run is dispatched. Until then, a run-scoped T3 tool call from the turn waits, for
-at most a minute, for that run; one that still finds no run fails with `parent_not_active`. These lines are at Warn and carry ids only, so a server logging at Warn keeps
-them. Each wake line is written at most once a minute per thread and decision; `suppressed`
+its continuation run starts, which a busy thread can queue behind its previous run. Until a run
+starts on the thread, its own or one ahead of it, a run-scoped T3 tool call from the turn waits, for
+at most ten minutes; one that still finds no run fails with `parent_not_active`. A continuation that
+Stop cancels or holds ends the wait at once. These lines are at Warn and carry ids only, so a
+server logging at Warn keeps them. Each wake line is written at most once a minute per thread and decision; `suppressed`
 counts the ones skipped since the last.
 
 - `orchestration-v2.claude-wake-turn-detected`: a wake turn began and its continuation was offered.
@@ -718,8 +781,8 @@ counts the ones skipped since the last.
   provider instance of its credential and of the thread, the thread's active run and whether it is
   archived.
 - `orchestrator-mcp.wake-run-wait-timed-out`: a call from a thread with no run waited the most it
-  may, a minute, for that thread's pending continuations (`pending`) to open a run, then went on to
-  its run check.
+  may, ten minutes, for that thread's pending continuations (`pending`) to start a run, then went on
+  to its run check.
 
 A refusal between a thread's `claude-wake-turn-detected` and its `continuation-started` came from
 the wake turn.
@@ -871,7 +934,12 @@ Local trace file:
 - `T3CODE_TRACE_SQL_MIN_DURATION_MS`: count successful SQL spans shorter than this many
   milliseconds instead of writing them, default `0` (write all), at most `1000`, the Diagnostics
   slow-span cutoff. See [Fast SQL spans](#fast-sql-spans).
+- `T3CODE_TRACE_SQL_SAMPLE_EVERY`: keep one in N plain SQL statement spans, default `1` (all), at
+  most `10000`. See [Fast SQL spans](#fast-sql-spans).
 - `T3CODE_TRACE_SPAN_MINUTES`: write the per-minute span aggregate, default `true`. See
+  [Span minutes](#span-minutes).
+- `T3CODE_TRACE_CPU_PROFILE_INTERVAL_MS`: add a CPU profile sampled at this interval to each span
+  minute, `1` to `1000`; unset or `0` profiles nothing. It costs event loop utilization; see
   [Span minutes](#span-minutes).
 
 OTLP export:

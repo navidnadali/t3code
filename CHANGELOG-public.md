@@ -2,6 +2,22 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.9-perf.11 (2026-11-17)
+
+Wait and backlog tracing, promoted follow-ups and a fairer effect claim
+
+Upstream base: 7d32075e3757.
+
+Same upstream main as 0.1.9-perf.10 (2026-11-16); no new migrations.
+
+- Tracing: span minutes carry p50, p90 and p99 per span name (for names that ended ten times or more), the waits at shared resources (keyed locks, SQLite connections, the commit queue, reactors, the effect outbox and the admission gate), provider ingest lag, backlog and batch sizes, garbage collections per kind and each provider event's subscription fan-out. A sampled CPU profile and one in N plain SQL statement spans are behind knobs. Span-minute archives keep six days.
+- Ingestion: a run hands its ingestion mailbox's whole backlog over in one chunk and refills it only once that is ingested; a backlog of streamed text commits only its newest snapshot; a running turn's usage reports share the snapshot commit; a provider control waits only for its own writes; a run drops another run's provider events before its commit path.
+- Effect claim: the oldest effect is taken unless a capture nobody waits on heads the queue, and a claim looks at most 64 pending effects past a deferred capture. A turn start passes checkpoint captures nobody waits on, for two minutes at most.
+- Follow-ups promoted to Steer settle with the turn they join, keep their task through self-sends, cancels and shared results, and can be cancelled while held; a cancel drops their undelivered steers. A missed steer's follow-up ends a wait at once and keeps its place in the queue.
+- Wakes: a wake turn's MCP calls wait up to ten minutes for its queued run to start; a seat's completion wakes for the same task merge into one; a wake's watch sees a run its dispatch already started.
+- Claude: a turn start publishes and resumes with the background roster Claude reports now, and an older run's roster lands until the run that claimed the thread starts.
+- A spawned child that exited without reading its stdin no longer leaves the write waiting.
+
 ## v0.1.9-perf.10 (2026-11-17)
 
 Upstream main of 2026-11-16 and run fixes

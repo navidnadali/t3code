@@ -2,9 +2,11 @@ import {
   CommandId,
   type MessageId,
   type OrchestrationV2ThreadProjection,
+  type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -55,6 +57,21 @@ function currentDelegatedCompletionDelivery(
     return undefined;
   }
   return delivery;
+}
+
+/** The run a continuation's dispatch created for its message. */
+function createdRun(dispatched: Orchestrator.OrchestratorV2DispatchResult, messageId: MessageId) {
+  return dispatched.storedEvents.flatMap(({ event }) =>
+    event.type === "run.created" && event.payload.userMessageId === messageId
+      ? [event.payload]
+      : [],
+  )[0];
+}
+
+/** A provider's wake whose run waits in the thread's queue, as of the dispatch's sequence. */
+interface QueuedWake {
+  readonly runId: RunId;
+  readonly afterSequence: number;
 }
 
 function delegatedCompletionRetryKey(
@@ -135,11 +152,7 @@ export const layer = Layer.effectDiscard(
       ) {
         const onRunEndedWithoutStarting = request.onRunEndedWithoutStarting;
         if (onRunEndedWithoutStarting === undefined) return;
-        const runId = dispatched.storedEvents.flatMap(({ event }) =>
-          event.type === "run.created" && event.payload.userMessageId === messageId
-            ? [event.payload.id]
-            : [],
-        )[0];
+        const runId = createdRun(dispatched, messageId)?.id;
         if (runId === undefined) return;
         yield* threads
           .streamStoredEventsFrom({
@@ -173,6 +186,49 @@ export const layer = Layer.effectDiscard(
           );
       },
     );
+
+    // The wake's turn already runs in the provider and its MCP calls wait for a run to act under:
+    // its own once started, or another that started ahead of it. A held or ended one never starts.
+    const untilWakeHasRun = Effect.fn("ProviderContinuationService.untilWakeHasRun")(function* (
+      request: ProviderContinuationRequests.ProviderContinuationRequest,
+      wake: QueuedWake,
+    ) {
+      const threadHasActiveRun = threads.getThreadShell(request.threadId).pipe(
+        Effect.map((shell) => shell?.activeRunId != null),
+        Effect.orElseSucceed(() => false),
+      );
+      // The dispatch can start an older queued run before it queues the wake; no later update shows it.
+      if (yield* threadHasActiveRun) return;
+      yield* threads
+        .streamStoredEventsFrom({
+          threadId: request.threadId,
+          afterSequence: wake.afterSequence,
+          eventType: "run.updated",
+        })
+        .pipe(
+          Stream.filterEffect(({ event }) =>
+            event.type !== "run.updated"
+              ? Effect.succeed(false)
+              : event.payload.id === wake.runId
+                ? Effect.succeed(
+                    event.payload.status !== "queued" || event.payload.queueHeld === true,
+                  )
+                : // A replayed start can belong to a run that has already stopped again.
+                  event.payload.status === "preparing" || event.payload.status === "starting"
+                  ? threadHasActiveRun
+                  : Effect.succeed(false),
+          ),
+          Stream.runHead,
+          Effect.timeoutOption(ProviderContinuationRequests.WAKE_RUN_WAIT),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("orchestration-v2.provider-continuation.wake-run-watch-failed", {
+              threadId: request.threadId,
+              providerThreadId: request.providerThreadId,
+              cause,
+            }),
+          ),
+        );
+    });
 
     const dispatchContinuation = Effect.fn("ProviderContinuationService.dispatchContinuation")(
       function* (request: ProviderContinuationRequests.ProviderContinuationRequest) {
@@ -296,7 +352,18 @@ export const layer = Layer.effectDiscard(
             // Only buffered wakes use creationSource "provider"; Claude would drain an empty buffer instead of prompting message_text.
             creationSource: request.delivery === "message_text" ? "server" : "provider",
           })
-          .pipe(Effect.tap((dispatched) => releaseIfNeverStarted(request, messageId, dispatched)));
+          .pipe(
+            Effect.tap((dispatched) => releaseIfNeverStarted(request, messageId, dispatched)),
+            Effect.map((dispatched): QueuedWake | undefined => {
+              const run = createdRun(dispatched, messageId);
+              // A message_text wake has no provider turn yet; T3 prompts it when the run starts.
+              return request.delivery === "message_text" ||
+                run?.status !== "queued" ||
+                run.queueHeld === true
+                ? undefined
+                : { runId: run.id, afterSequence: dispatched.sequence };
+            }),
+          );
         // Catch after dispatchIfCurrent so adapters see raw failures first; clearIfCurrent is idempotent and covers others.
         const logInstanceDisabled = (
           error: ThreadManagementService.ThreadManagementProviderInstanceDisabledError,
@@ -312,16 +379,18 @@ export const layer = Layer.effectDiscard(
             ),
           );
         if (request.dispatchIfCurrent === undefined) {
-          yield* dispatch.pipe(
+          return yield* dispatch.pipe(
             Effect.catchTags({
-              ThreadManagementProviderInstanceDisabledError: logInstanceDisabled,
+              ThreadManagementProviderInstanceDisabledError: (error) =>
+                logInstanceDisabled(error).pipe(Effect.as(undefined)),
             }),
           );
-          return;
         }
-        yield* request.dispatchIfCurrent(dispatch).pipe(
+        return yield* request.dispatchIfCurrent(dispatch).pipe(
+          Effect.map(Option.getOrUndefined),
           Effect.catchTags({
-            ThreadManagementProviderInstanceDisabledError: logInstanceDisabled,
+            ThreadManagementProviderInstanceDisabledError: (error) =>
+              logInstanceDisabled(error).pipe(Effect.as(undefined)),
           }),
         );
       },
@@ -386,7 +455,16 @@ export const layer = Layer.effectDiscard(
           }),
         ),
         // MCP calls from a wake turn wait for this; a retry is offered, and settled, anew.
-        Effect.ensuring(requests.settle(request.threadId)),
+        Effect.onExit((exit) => {
+          const settle = requests.settle(request.threadId);
+          return Exit.isSuccess(exit) && exit.value !== undefined
+            ? untilWakeHasRun(request, exit.value).pipe(
+                Effect.ensuring(settle),
+                Effect.forkIn(scope),
+                Effect.asVoid,
+              )
+            : settle;
+        }),
         Scope.provide(scope),
       );
     // A dispatch can wait minutes for a lock, so each key dispatches in order, many keys at once.
@@ -395,11 +473,19 @@ export const layer = Layer.effectDiscard(
     const wakes = yield* makeKeyedReactor<
       ThreadId,
       ProviderContinuationRequests.ProviderContinuationRequest
-    >({ concurrency: WAKE_DISPATCH_CONCURRENCY, handle });
+    >({
+      concurrency: WAKE_DISPATCH_CONCURRENCY,
+      handle,
+      name: "ProviderContinuationService.wakes",
+    });
     const completions = yield* makeKeyedReactor<
       ThreadId,
       ProviderContinuationRequests.ProviderContinuationRequest
-    >({ concurrency: COMPLETION_DISPATCH_CONCURRENCY, handle });
+    >({
+      concurrency: COMPLETION_DISPATCH_CONCURRENCY,
+      handle,
+      name: "ProviderContinuationService.completions",
+    });
 
     // A thread's wakes wait here, in order, while its family is read, off the intake.
     const waitingForFamily = new Map<

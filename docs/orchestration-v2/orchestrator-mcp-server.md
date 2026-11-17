@@ -271,7 +271,9 @@ across retries of that round.
 A follow-up that needs the same child's conversation goes through `t3_thread_send`
 on its `childThreadId`. After the original task completes, that follow-up runs as a
 fresh task in the child thread; it does not reopen the completed task or change its
-published result.
+published result. A queued follow-up sent into the child's running turn instead (Send
+now, or automatically after 60 s) keeps its task: the task follows that turn and
+settles once, with that turn's result.
 
 Delegation requires an active parent run owned by the MCP credential's
 provider session. The request becomes the V2 command
@@ -319,8 +321,9 @@ ends, a completed result settles as `interrupted` and a failed one stays `failed
 terminal task returns its existing status, and its child thread still stops,
 including later runs and watch wakes. In both cases, a follow-up that lost its child
 run but still shows as running on the parent is cancelled there and reported as
-`cancelled`. Published task results remain available. It accepts an
-optional cancellation reason.
+`cancelled`. A message of the task sent into a turn whose steer has not landed when the
+task is cancelled goes with the task and is not queued again. Published task results
+remain available. It accepts an optional cancellation reason.
 
 ### `create_threads`
 

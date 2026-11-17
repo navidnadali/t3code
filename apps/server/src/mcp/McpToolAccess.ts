@@ -7,6 +7,8 @@ import {
   type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -116,8 +118,9 @@ export class Declaration<out Handler> {
 }
 
 /**
- * A provider-started wake turn calls tools before its continuation dispatch commits the run.
- * Wait for that dispatch before the caller is read. Never under a thread lock: the dispatch takes it.
+ * A provider-started wake turn calls tools before its continuation run is active: the dispatch may
+ * not have committed it, or it waits in the queue. Wait for it before the caller is read. Never
+ * under a thread lock: the dispatch and the run's start take it.
  */
 const awaitPendingWakeRun = Effect.fn("McpToolAccess.awaitPendingWakeRun")(function* () {
   const scope = yield* McpInvocationContext.McpInvocationContext;
@@ -132,11 +135,20 @@ const awaitPendingWakeRun = Effect.fn("McpToolAccess.awaitPendingWakeRun")(funct
       if (pending === 0) return;
       // A run commits before its continuation settles, so a run missing here has not settled yet.
       const shell = yield* threads.getThreadShell(threadId).pipe(Effect.orElseSucceed(() => null));
-      if (shell === null || shell.activeRunId !== null) return;
+      // An archived or deleted thread starts no run.
+      if (
+        shell === null ||
+        shell.activeRunId !== null ||
+        shell.archivedAt !== null ||
+        shell.deletedAt !== null
+      )
+        return;
       yield* continuations.awaitSettle(settles);
     }
   });
-  const waited = yield* waitForRun.pipe(Effect.timeoutOption("60 seconds"));
+  const waited = yield* waitForRun.pipe(
+    Effect.timeoutOption(ProviderContinuationRequests.WAKE_RUN_WAIT),
+  );
   if (Option.isNone(waited)) {
     yield* Effect.logWarning("orchestrator-mcp.wake-run-wait-timed-out", {
       threadId,
@@ -145,14 +157,47 @@ const awaitPendingWakeRun = Effect.fn("McpToolAccess.awaitPendingWakeRun")(funct
   }
 });
 
+const WAKE_RUN_WAIT_SITE = "McpToolAccess.wakeRunWait";
+
+/**
+ * The wake-run wait, measured for span minutes when it waits at all, with how it ended as read
+ * afterwards: the run became active, the wait timed out, or the run will not come.
+ */
+const observedWakeRunWait = Effect.fnUntraced(function* () {
+  const observer = yield* CurrentWaitObserver;
+  const scope = yield* McpInvocationContext.McpInvocationContext;
+  if (observer === undefined || scope.thread === undefined) return yield* awaitPendingWakeRun();
+  const { threadId } = scope.thread;
+  const continuations = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+  if ((yield* continuations.progress(threadId)).pending === 0) return yield* awaitPendingWakeRun();
+  const startedNs = yield* Clock.monotonicTimeNanos;
+  yield* awaitPendingWakeRun();
+  const waitedNs = Number((yield* Clock.monotonicTimeNanos) - startedNs);
+  const threads = yield* ThreadManagement.ThreadManagementService;
+  const shell = yield* threads.getThreadShell(threadId).pipe(Effect.option);
+  const pending = (yield* continuations.progress(threadId)).pending;
+  const outcome = Option.match(shell, {
+    onNone: () => "other",
+    onSome: (current) =>
+      current === null || current.archivedAt !== null || current.deletedAt !== null
+        ? "refused-dead-run"
+        : current.activeRunId !== null
+          ? "became-active"
+          : pending > 0
+            ? "timed-out"
+            : "refused-dead-run",
+  });
+  observer.wait(WAKE_RUN_WAIT_SITE, waitedNs, undefined, undefined, undefined, outcome);
+});
+
 /** Declares a tool that checks its caller's run, which a wake turn may not have committed yet. */
 const declareLive = <P, A, E, R>(
   handle: (params: P) => Effect.Effect<A, E, R>,
   remote: RemoteCheck<P> | undefined,
 ) =>
   declare(
-    (params: P) => awaitPendingWakeRun().pipe(Effect.andThen(() => handle(params))),
-    remote && ((params: P) => awaitPendingWakeRun().pipe(Effect.andThen(() => remote(params)))),
+    (params: P) => observedWakeRunWait().pipe(Effect.andThen(() => handle(params))),
+    remote && ((params: P) => observedWakeRunWait().pipe(Effect.andThen(() => remote(params)))),
   );
 
 const refuseReadOnlyClient = McpInvocationContext.McpInvocationContext.pipe(

@@ -6,8 +6,23 @@ import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as KeyedLock from "./KeyedLock.ts";
+import { CurrentWaitObserver, type WaitObserver } from "./WaitObserver.ts";
+
+const recordingObserver = () => {
+  const calls: Array<ReadonlyArray<unknown>> = [];
+  const observer: WaitObserver = {
+    wait: (...args) => void calls.push(["wait", ...args]),
+    hold: (...args) => void calls.push(["hold", ...args]),
+    depth: (...args) => void calls.push(["depth", ...args]),
+    register: () => () => {},
+    registerKeyed: () => () => {},
+    sizeKeys: () => () => {},
+  };
+  return { calls, observer };
+};
 
 describe("KeyedLock", () => {
   it.effect("runs one holder of a key at a time, waiters in the order they queued", () =>
@@ -93,6 +108,68 @@ describe("KeyedLock", () => {
       assert.deepStrictEqual(yield* lock.activeKeys, []);
     }),
   );
+
+  it.effect("reports each acquisition's wait with the holder's operation, and keyed holds", () => {
+    const { calls, observer } = recordingObserver();
+    return Effect.gen(function* () {
+      const lock = yield* KeyedLock.make<string>({ site: "Probe.lock", rankKeys: true });
+      const unnamed = yield* KeyedLock.make<string>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+
+      const holder = yield* lock
+        .withLock(
+          "key",
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.withSpan("Holder.run"), Effect.forkChild);
+      yield* Deferred.await(entered);
+      // A waiter that gives up reports nothing.
+      const abandoned = yield* lock.withLock("key", Effect.void).pipe(Effect.forkChild);
+      const waiter = yield* lock
+        .withLock("key", Effect.void)
+        .pipe(Effect.withSpan("Waiter.run"), Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(abandoned);
+      yield* TestClock.adjust("2 seconds");
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.joinAll([holder, waiter]);
+      yield* unnamed.withLock("key", Effect.void);
+
+      // A wait behind a holder also names its waiter's operation.
+      assert.deepStrictEqual(calls, [
+        ["wait", "Probe.lock", 0, undefined, "key", undefined],
+        ["hold", "Probe.lock", "key", 2e9],
+        ["wait", "Probe.lock", 2e9, "Holder.run", "key", "Waiter.run"],
+        ["hold", "Probe.lock", "key", 0],
+      ]);
+    }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+  });
+
+  it.effect("reports a reused lock effect's hold only for a run that took the key", () => {
+    const { calls, observer } = recordingObserver();
+    return Effect.gen(function* () {
+      const lock = yield* KeyedLock.make<string>({ site: "Probe.lock", rankKeys: true });
+      const locked = lock.withLock("key", Effect.void);
+      yield* locked;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* lock
+        .withLock(
+          "key",
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      // The same effect run again gives up before it takes the key.
+      const abandoned = yield* locked.pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(abandoned);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      assert.strictEqual(calls.filter(([kind]) => kind === "hold").length, 2);
+    }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+  });
 
   it.effect("runner keeps each key's effects in run order and never holds up another key", () =>
     Effect.gen(function* () {

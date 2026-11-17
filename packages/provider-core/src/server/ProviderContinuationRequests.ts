@@ -7,6 +7,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -36,11 +37,22 @@ export interface ProviderContinuationRequest {
   readonly onRunEndedWithoutStarting?: () => Effect.Effect<void>;
 }
 
+/**
+ * How long a provider's wake turn waits for a run to act under: each of its MCP calls at most this
+ * long, and its continuation keeps them waiting at most this long after it queued its run. A wait
+ * that cannot end in a run ends at once, so this only bounds a slow start: on a busy server the
+ * dispatch and the start each wait minutes on thread locks. Claude allows T3 tools 65 minutes.
+ */
+export const WAKE_RUN_WAIT = Duration.minutes(10);
+
 /** The default drops requests; share the live layer with the worker that drains them. */
 export class ProviderContinuationRequests extends Context.Reference<{
   readonly offer: (request: ProviderContinuationRequest) => Effect.Effect<void>;
   readonly take: Effect.Effect<ProviderContinuationRequest>;
-  /** The taker calls this once per request when its dispatch has finished, either way. */
+  /**
+   * The taker calls this once per request, when its dispatch has finished, either way, and a run
+   * it queued for a provider's wake turn has started, will not, or another run started first.
+   */
   readonly settle: (threadId: ThreadId) => Effect.Effect<void>;
   /** The thread's offered, unsettled requests, and how many requests have settled in all. */
   readonly progress: (

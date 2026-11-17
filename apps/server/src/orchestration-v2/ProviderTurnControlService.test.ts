@@ -254,6 +254,7 @@ it.effect(
           getMessageDispatchRecords: () => Effect.die("unused getMessageDispatchRecords"),
           getDelegatedTaskRecords: () => Effect.die("unused getDelegatedTaskRecords"),
           getQueuedRunRecords: () => Effect.die("unused getQueuedRunRecords"),
+          getCompletionWakeLineage: () => Effect.die("unused getCompletionWakeLineage"),
           hasPendingRestartContinuation: () => Effect.die("unused hasPendingRestartContinuation"),
           hasRunPromptAfter: () => Effect.die("unused hasRunPromptAfter"),
           getRunsLatestFirst: () => Effect.die("unused getRunsLatestFirst"),

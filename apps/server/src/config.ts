@@ -71,8 +71,12 @@ export class ServerConfig extends Context.Service<
     readonly traceMaxBytes: number;
     readonly traceMaxFiles: number;
     readonly traceSqlMinDurationMs?: number | undefined;
+    /** Above 1, keeps one in this many plain SQL statement spans in the trace file. */
+    readonly traceSqlSampleEvery?: number | undefined;
     /** Unset or true writes the per-minute span aggregate beside the trace file. */
     readonly traceSpanMinutes?: boolean | undefined;
+    /** Adds a CPU profile sampled at this interval to each span minute; unset profiles nothing. */
+    readonly traceCpuProfileIntervalMs?: number | undefined;
     readonly otlpTracesUrl: string | undefined;
     readonly otlpMetricsUrl: string | undefined;
     readonly otlpLogsUrl: string | undefined;

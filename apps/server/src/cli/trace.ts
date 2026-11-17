@@ -1,4 +1,5 @@
 import { PositiveInt } from "@t3tools/contracts";
+import { SQL_LOCK_WAIT_FLOOR_MS } from "@t3tools/shared/observability";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Console from "effect/Console";
@@ -30,7 +31,10 @@ const decodeTraceSpanLine = Schema.decodeUnknownOption(
         }),
       ),
       attributes: Schema.optional(
-        Schema.Struct({ "effect.fiber.interrupted": Schema.optional(Schema.Unknown) }),
+        Schema.Struct({
+          "effect.fiber.interrupted": Schema.optional(Schema.Unknown),
+          "db.lock_wait_ms": Schema.optional(Schema.Unknown),
+        }),
       ),
     }),
   ),
@@ -42,6 +46,8 @@ const decodeSpanSummaryLine = Schema.decodeUnknownOption(
       type: Schema.Literal("span-summary"),
       name: Schema.String,
       thresholdMs: Schema.Finite,
+      sampleEvery: Schema.optional(Schema.Int),
+      sampleBelowMs: Schema.optional(Schema.Finite),
       count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
       maxDurationMs: Schema.Finite,
       startTimeUnixNano: Schema.FiniteFromString,
@@ -51,18 +57,24 @@ const decodeSpanSummaryLine = Schema.decodeUnknownOption(
 );
 
 /** A percentile that falls among summarised spans is known only to be under their threshold. */
-type TraceLatency = number | { readonly underMs: number };
+/** `null` when the window wrote no span to rank, as when sampling left all of them out. */
+type TraceLatency = number | { readonly underMs: number } | null;
 
 export function makeTraceSpanSummary(sinceMs = -Infinity) {
   const byName = new Map<
     string,
     {
-      durations: number[];
+      /** Each written span's duration, and whether it could have been sampled out. */
+      written: Array<{ readonly ms: number; readonly plain: boolean }>;
       interrupted: number;
       failures: number;
       summarised: number;
       summarisedMaxMs: number;
       summarisedUnderMs: number;
+      /** Left out by sampling, like the written spans: counted, not ranked. */
+      sampledOut: number;
+      /** Statements at least this slow were always written, so they stand for no sampled one. */
+      sampleBelowMs: number;
     }
   >();
   let spanCount = 0;
@@ -88,12 +100,14 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
     firstEndMs = Math.min(firstEndMs, Option.isSome(DateTime.make(startMs)) ? startMs : endMs);
     lastEndMs = Math.max(lastEndMs, endMs);
     const stats = byName.get(name) ?? {
-      durations: [],
+      written: [],
       interrupted: 0,
       failures: 0,
       summarised: 0,
       summarisedMaxMs: -Infinity,
       summarisedUnderMs: 0,
+      sampledOut: 0,
+      sampleBelowMs: Infinity,
     };
     byName.set(name, stats);
     return stats;
@@ -111,8 +125,16 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
       const stats = statsInWindow(summary.name, summary.endTimeUnixNano, summary.startTimeUnixNano);
       if (stats === undefined) return;
       spanCount += summary.count;
-      stats.summarised += summary.count;
       stats.summarisedMaxMs = Math.max(stats.summarisedMaxMs, summary.maxDurationMs);
+      if (summary.sampleEvery !== undefined) {
+        stats.sampledOut += summary.count;
+        // Older records do not say: then every plain written statement stands for them.
+        if (summary.sampleBelowMs !== undefined) {
+          stats.sampleBelowMs = Math.min(stats.sampleBelowMs, summary.sampleBelowMs);
+        }
+        return;
+      }
+      stats.summarised += summary.count;
       stats.summarisedUnderMs = Math.max(stats.summarisedUnderMs, summary.thresholdMs);
       return;
     }
@@ -120,7 +142,17 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
     if (stats === undefined) return;
 
     spanCount += 1;
-    stats.durations.push(span.durationMs);
+    const lockWaitMs = span.attributes?.["db.lock_wait_ms"];
+    const failed = span.exit?._tag === "Failure" || span.status?.code === "2";
+    stats.written.push({
+      ms: span.durationMs,
+      // As the tracer samples: succeeded and waited for no connection.
+      plain:
+        !failed &&
+        span.exit?._tag !== "Interrupted" &&
+        (lockWaitMs === undefined ||
+          (typeof lockWaitMs === "number" && lockWaitMs < SQL_LOCK_WAIT_FLOOR_MS)),
+    });
     if (
       span.exit?._tag === "Interrupted" ||
       span.attributes?.["effect.fiber.interrupted"] === true ||
@@ -128,22 +160,50 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
     ) {
       stats.interrupted += 1;
     }
-    if (span.exit?._tag === "Failure" || span.status?.code === "2") stats.failures += 1;
+    if (failed) stats.failures += 1;
   };
 
   const finish = () => {
     const minutes = (lastEndMs - firstEndMs) / 60_000;
     const spans = [...byName]
       .map(([name, stats]) => {
-        const { durations, interrupted, failures, summarised } = stats;
-        const sorted = durations.toSorted((left, right) => left - right);
-        const count = sorted.length + summarised;
+        const { written, interrupted, failures, summarised, sampledOut, sampleBelowMs } = stats;
+        const sorted = written.toSorted((left, right) => left.ms - right.ms);
+        const count = sorted.length + summarised + sampledOut;
+        // A written statement that could have been sampled out stands for its share of the
+        // sampled-out ones; one always written (slow, failed or lock-waited) stands for itself.
+        const eligible = (entry: { readonly ms: number; readonly plain: boolean }) =>
+          entry.plain && entry.ms < sampleBelowMs;
+        const eligibleCount = sampledOut === 0 ? 0 : sorted.filter(eligible).length;
+        const sampledWeight =
+          eligibleCount === 0 ? 1 : (eligibleCount + sampledOut) / eligibleCount;
         // Summarised spans sort before every written span at or above their threshold.
         const percentile = (p: number): TraceLatency => {
-          const written = sorted[Math.ceil(p * count) - 1 - summarised];
-          return summarised > 0 && (written === undefined || written < stats.summarisedUnderMs)
+          if (sorted.length === 0 && summarised === 0) return null;
+          const beyond = Math.ceil(p * count) - summarised;
+          if (beyond <= 0) return { underMs: stats.summarisedUnderMs };
+          if (sorted.length === 0) return null;
+          // With no written statement to stand for the sampled-out ones, they fill the ranks below
+          // the cutoff in unknown order; only the always-written statements above it are known.
+          if (sampledOut > 0 && eligibleCount === 0) {
+            if (!Number.isFinite(sampleBelowMs)) return null;
+            const below = sorted.filter((entry) => entry.ms < sampleBelowMs).length;
+            const above = beyond - below - sampledOut;
+            if (above <= 0) return null;
+            return sorted[below + above - 1]!.ms;
+          }
+          let ranked = 0;
+          let value = sorted.at(-1)!.ms;
+          for (const entry of sorted) {
+            ranked += sampledOut > 0 && eligible(entry) ? sampledWeight : 1;
+            if (ranked >= beyond - 1e-9) {
+              value = entry.ms;
+              break;
+            }
+          }
+          return summarised > 0 && value < stats.summarisedUnderMs
             ? { underMs: stats.summarisedUnderMs }
-            : written!;
+            : value;
         };
         return {
           name,
@@ -151,7 +211,7 @@ export function makeTraceSpanSummary(sinceMs = -Infinity) {
           perMinute: minutes > 0 ? count / minutes : undefined,
           p50Ms: percentile(0.5),
           p90Ms: percentile(0.9),
-          maxMs: Math.max(sorted.at(-1) ?? -Infinity, stats.summarisedMaxMs),
+          maxMs: Math.max(sorted.at(-1)?.ms ?? -Infinity, stats.summarisedMaxMs),
           interrupted,
           failures,
         };
@@ -168,7 +228,11 @@ const formatMs = (ms: number) =>
   Math.round(ms) < 1_000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 100) / 10}s`;
 
 const formatLatency = (latency: TraceLatency) =>
-  typeof latency === "number" ? formatMs(latency) : `<${latency.underMs}ms`;
+  latency === null
+    ? "-"
+    : typeof latency === "number"
+      ? formatMs(latency)
+      : `<${latency.underMs}ms`;
 
 export function formatTraceSummary(
   summary: ReturnType<ReturnType<typeof makeTraceSpanSummary>["finish"]>,

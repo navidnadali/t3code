@@ -2,7 +2,11 @@ import { MessageId, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as DateTime from "effect/DateTime";
 import { assert, describe, expect, it, vi } from "vite-plus/test";
-import { makeAssistantStreamingFilter, splitBufferedAssistantText } from "./assistantStreaming.ts";
+import {
+  makeAssistantStreamingFilter,
+  makeIngestionMailbox,
+  splitBufferedAssistantText,
+} from "./assistantStreaming.ts";
 
 describe("V2 assistant streaming", () => {
   it("keeps code fences intact", () => {
@@ -37,8 +41,12 @@ type Step =
   | { readonly at: number; readonly text: string; readonly shows: string | null }
   | { readonly at: number; readonly final: string }
   | { readonly id: string; readonly at: number; readonly text: string; readonly shows: string }
-  // Held snapshots due by `idle` ms, delivered whole.
-  | { readonly idle: number; readonly shows: ReadonlyArray<string> }
+  // Held snapshots due by `idle` ms, delivered whole unless a newer snapshot of theirs still waits.
+  | {
+      readonly idle: number;
+      readonly waiting?: ReadonlyArray<string>;
+      readonly shows: ReadonlyArray<string>;
+    }
   | { readonly dueAt: number | null };
 
 const createdAt = DateTime.makeUnsafe(0);
@@ -152,6 +160,15 @@ it.each<{ readonly name: string; readonly mode?: "turn"; readonly steps: Readonl
     ],
   },
   {
+    name: "text whose newer snapshot still waits for ingestion",
+    steps: [
+      { at: 0, text: "A\n\nB", shows: "A\n\n" },
+      { idle: 800, waiting: ["m"], shows: [] },
+      { dueAt: null },
+      { at: 900, text: "A\n\nB more.\n\nC", shows: "A\n\nB more.\n\n" },
+    ],
+  },
+  {
     name: "empty text",
     steps: [{ at: 0, text: "", shows: null }, { dueAt: null }],
   },
@@ -194,7 +211,14 @@ it.each<{ readonly name: string; readonly mode?: "turn"; readonly steps: Readonl
   for (const step of steps) {
     if ("dueAt" in step) assert.equal(filter.nextIdleFlushAt(), step.dueAt);
     else if ("idle" in step)
-      assert.deepEqual(filter.takeIdleFlushes(step.idle).map(shown), [...step.shows]);
+      assert.deepEqual(
+        filter
+          .takeIdleFlushes(step.idle, (key) =>
+            (step.waiting ?? []).some((id) => key === `message.updated:${id}`),
+          )
+          .map(shown),
+        [...step.shows],
+      );
     else if ("final" in step)
       assert.equal(shown(filter.filter(snapshot("m", step.final, false), step.at)), step.final);
     else
@@ -222,4 +246,25 @@ it("scans each streamed line once while a long code fence is still open", () => 
   }
   text += "```\n";
   assert.equal(shown(filter.filter(snapshot("m", text, true), lineCount * 400)), text);
+});
+
+it("counts what the ingestion mailbox holds until it is ingested, a coalesced snapshot once", () => {
+  const mailbox = makeIngestionMailbox();
+  const first = snapshot("message:a", "one", true);
+  expect(mailbox.offer(first)).toBeUndefined();
+  // The newer step of the same text takes the older one's place; it is not pending twice, and
+  // the offer hands back the step it replaced, which will never be taken.
+  const newer = snapshot("message:a", "one two", true);
+  expect(mailbox.offer(newer)).toBe(first);
+  const done = snapshot("message:b", "done", false);
+  expect(mailbox.offer(done)).toBeUndefined();
+  expect(mailbox.pending()).toBe(2);
+  expect(mailbox.takeAll()).toEqual([newer, done]);
+  expect(mailbox.takeAll()).toEqual([]);
+  // Taken but not ingested yet: still the run's backlog.
+  expect(mailbox.pending()).toBe(2);
+  mailbox.settle(newer);
+  expect(mailbox.pending()).toBe(1);
+  mailbox.settle(done);
+  expect(mailbox.pending()).toBe(0);
 });

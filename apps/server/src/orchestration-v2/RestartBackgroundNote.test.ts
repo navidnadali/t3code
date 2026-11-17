@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   MessageId,
+  NodeId,
   ProviderThreadId,
   RunAttemptId,
   RunId,
@@ -11,6 +12,7 @@ import * as DateTime from "effect/DateTime";
 import {
   cancelledRosterTaskWork,
   cancelledTurnItemWork,
+  delegatedTaskRuns,
   isAwaitedWork,
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
@@ -252,5 +254,37 @@ it("counts a prompted mid-turn or chained continuation as delivering the note", 
       attempts,
     }),
     [],
+  );
+});
+
+it("counts a merged completion wake for the task of any parent run it carries", () => {
+  const taskId = NodeId.make("node:follow-up");
+  const owned = run(1, claudeThread, { delegatedTaskId: taskId });
+  // The wake's first part is a run this read leaves out of the task (its own chain is elsewhere).
+  const elsewhere = run(2, claudeThread);
+  const wake = run(3, claudeThread);
+  const later = run(4, claudeThread);
+  const part = (parentRunId: RunId, task: string) => ({
+    parentRunId,
+    generation: 1,
+    taskIds: [NodeId.make(task)],
+  });
+  const runs = [owned, elsewhere, wake, later];
+  const messages = [
+    {
+      runId: wake.id,
+      delegatedCompletion: {
+        ...part(elsewhere.id, "node:a"),
+        taskIds: [NodeId.make("node:a"), NodeId.make("node:b")],
+        merged: [part(owned.id, "node:b")],
+      },
+    },
+    // The next generation's wake, for results the merged wake's turn delegated.
+    { runId: later.id, delegatedCompletion: part(wake.id, "node:c") },
+  ];
+
+  assert.deepEqual(
+    delegatedTaskRuns({ runs, messages }, taskId).map((source) => source.id),
+    [owned.id, wake.id, later.id],
   );
 });

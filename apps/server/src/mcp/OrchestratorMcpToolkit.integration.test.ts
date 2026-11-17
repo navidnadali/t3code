@@ -30,6 +30,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -39,6 +40,7 @@ import { McpSchema, McpServer } from "effect/ai";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { CodexOrchestratorReplayHarness } from "../orchestration-v2/Adapters/CodexAdapterV2.testkit.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
+import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -854,6 +856,8 @@ describe("orchestrator MCP toolkit in a provider wake turn", () => {
   const makeWakeEnvironment = Effect.fn("makeWakeEnvironment")(function* (
     name: string,
     holdDispatch?: Effect.Effect<void>,
+    /** What the session answers when asked whether a thread's background work still runs. */
+    backgroundWork?: Ref.Ref<boolean>,
   ) {
     const cwd = yield* checkpointWorkspace(name);
     const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
@@ -915,6 +919,9 @@ describe("orchestrator MCP toolkit in a provider wake turn", () => {
               lastError: null,
             },
             events: Stream.fromQueue(events),
+            ...(backgroundWork === undefined
+              ? {}
+              : { hasPendingBackgroundWorkForThread: () => Ref.get(backgroundWork) }),
             ensureThread: ({ threadId: appThreadId }) =>
               Effect.succeed({
                 id: ProviderThreadId.make(`provider-thread:${appThreadId}`),
@@ -1241,10 +1248,10 @@ describe("orchestrator MCP toolkit in a provider wake turn", () => {
   );
 
   // Seen in practice: a seat's wake takes its parent's lock before its run is created, and that lock was held
-  // for minutes. The call waits at most a minute; past that it is refused as before.
+  // for minutes. The call waits at most ten minutes; past that it is refused as before.
   it.effect.each([
-    { heldSeconds: 59, outcome: "joins the run" },
-    { heldSeconds: 61, outcome: "is refused" },
+    { heldSeconds: 599, outcome: "joins the run" },
+    { heldSeconds: 601, outcome: "is refused" },
   ] as const)(
     "a seat's delegate_task while its wake waits $heldSeconds s behind its parent's lock $outcome",
     ({ heldSeconds }) =>
@@ -1284,7 +1291,7 @@ describe("orchestrator MCP toolkit in a provider wake turn", () => {
             );
             yield* Deferred.await(callerRead);
             yield* TestClock.adjust(`${heldSeconds} seconds`);
-            if (heldSeconds < 60) {
+            if (heldSeconds < 600) {
               expect(delegated.pollUnsafe()).toBeUndefined();
               yield* Deferred.succeed(releaseParent, undefined);
               const result = yield* Fiber.join(delegated);
@@ -1361,6 +1368,341 @@ describe("orchestrator MCP toolkit in a provider wake turn", () => {
           const wake = (yield* orchestrator.getThreadProjection(seat)).runs.at(-1);
           expect(wake?.status).toBe("queued");
           expect(wake?.queueHeld).toBe(true);
+        }).pipe(Effect.provide(environment.layer));
+      }),
+    ),
+  );
+
+  /**
+   * The wake's continuation queues behind the previous run, which waits for a checkpoint
+   * capture that is already running, so no wait ends early. The wake turn then calls a tool.
+   */
+  const wakeQueuedBehindRunningCapture = (environment: WakeEnvironment, clientRequestId: string) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const continuations = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      yield* createThread(threadId, environment.cwd);
+      yield* startTurn(threadId, "Run the build in the background.");
+      const turn = environment.started.findLast((candidate) => candidate.threadId === threadId)!;
+      const waiting = yield* watch(
+        (event) =>
+          event.type === "run.updated" &&
+          event.payload.id === turn.runId &&
+          event.payload.status === "waiting",
+      );
+      yield* environment.endTurn(turn, "completed");
+      yield* Fiber.join(waiting);
+      const capture = Option.getOrThrow(yield* outbox.claimNext({ workerId: "capture" }));
+      expect(capture.id).toBe(`effect:checkpoint.capture:${turn.runId}`);
+
+      // The background command finished and Claude started a wake turn on its own.
+      const wakeQueued = yield* watch(
+        (event) =>
+          event.type === "run.created" &&
+          event.threadId === threadId &&
+          event.payload.status === "queued",
+      );
+      yield* continuations.offer({
+        threadId,
+        providerThreadId: turn.providerThread.id,
+        driver,
+        detail: null,
+      });
+      yield* Fiber.join(wakeQueued);
+      const callerRead = yield* Deferred.make<void>();
+      const delegated = yield* callAs(
+        invocationFor(threadId),
+        "delegate_task",
+        { task: "Review the build output.", mode: "async", clientRequestId },
+        callerRead,
+      );
+      yield* Deferred.await(callerRead);
+      // The capture finishes; the run ends and the queue starts its next run.
+      const finishCapture = Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* outbox.retry({
+          effectId: capture.id,
+          workerId: "capture",
+          error: "released by the test",
+          delayMs: 0,
+        });
+        yield* worker.drain();
+      });
+      return { turn, delegated, finishCapture };
+    });
+
+  /** The run a delegate_task result's task belongs to; the call's wait ended for nothing else. */
+  const delegatedRunId = (result: {
+    readonly isError?: boolean | undefined;
+    readonly content: ReadonlyArray<unknown>;
+    readonly structuredContent?: unknown;
+  }) =>
+    Effect.gen(function* () {
+      expect(result.isError, JSON.stringify(result.content)).not.toBe(true);
+      const { taskId } = yield* decodeDelegateTaskResult(result.structuredContent).pipe(
+        Effect.orDie,
+      );
+      const continuations = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      expect((yield* continuations.progress(threadId)).pending).toBe(0);
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      return after.subagents.find((subagent) => subagent.id === taskId)?.runId;
+    });
+
+  it.effect("delegate_task waits for a wake run queued behind a running checkpoint capture", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const environment = yield* makeWakeEnvironment("mcp-wake-queued");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const { turn, delegated, finishCapture } = yield* wakeQueuedBehindRunningCapture(
+            environment,
+            "wake-queued",
+          );
+          yield* finishCapture;
+          const runId = yield* delegatedRunId(yield* Fiber.join(delegated));
+          const wakeRun = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.ordinal > turn.runOrdinal,
+          );
+          expect(wakeRun).toBeDefined();
+          expect(runId).toBe(wakeRun!.id);
+        }).pipe(Effect.provide(environment.layer));
+      }),
+    ),
+  );
+
+  // Claude runs one root turn at a time, so the run that starts first takes in the wake's turn.
+  it.effect("delegate_task in a queued wake acts under a user's run that starts ahead of it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const environment = yield* makeWakeEnvironment("mcp-wake-queued-behind-user");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const { delegated, finishCapture } = yield* wakeQueuedBehindRunningCapture(
+            environment,
+            "wake-queued-behind-user",
+          );
+          const messageId = MessageId.make("message:wake-queued-behind-user");
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("send:wake-queued-behind-user"),
+            threadId,
+            messageId,
+            text: "Also check the logs.",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* finishCapture;
+          const runId = yield* delegatedRunId(yield* Fiber.join(delegated));
+          const runs = (yield* orchestrator.getThreadProjection(threadId)).runs;
+          expect(runId).toBe(runs.find((run) => run.userMessageId === messageId)?.id);
+          expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
+        }).pipe(Effect.provide(environment.layer));
+      }),
+    ),
+  );
+
+  // Stop cancels a queued buffered wake, whose output the CLI no longer produces.
+  it.effect("a wake turn's call waiting for its queued run is refused once Stop cancels it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const environment = yield* makeWakeEnvironment("mcp-wake-queued-stopped");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const continuations = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          const { turn, delegated } = yield* wakeQueuedBehindRunningCapture(
+            environment,
+            "wake-queued-stopped",
+          );
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make("stop:wake-queued"),
+            threadId,
+          });
+          expect(failureCode(yield* Fiber.join(delegated))).toBe("parent_not_active");
+          expect((yield* continuations.progress(threadId)).pending).toBe(0);
+          const wakes = (yield* orchestrator.getThreadProjection(threadId)).runs.filter(
+            (run) => run.ordinal > turn.runOrdinal,
+          );
+          expect(wakes.map((run) => run.status)).toEqual(["cancelled"]);
+        }).pipe(Effect.provide(environment.layer));
+      }),
+    ),
+  );
+
+  // A parent sends to its seat while the seat's background subagent still runs. The send's
+  // run takes the provider thread as it starts, before its own turn ingests anything; the
+  // subagent's end must still finish the seat's task and reach the parent. Ending the seat's
+  // checkpoint wait for the send only widens that window.
+  it.effect.each([
+    { when: "a send ended its wait", captureFirst: false, probe: true },
+    { when: "a send started after its capture", captureFirst: true, probe: true },
+    // A Muse workflow or an ACP agent has no live probe; only its snapshots report that work.
+    { when: "a send ended its wait, with no live probe", captureFirst: false, probe: false },
+    {
+      when: "a send started after its capture, with no live probe",
+      captureFirst: true,
+      probe: false,
+    },
+    // A user's queued message can end a stranded child's wait too.
+    { when: "a user's message ended its wait", captureFirst: false, probe: true, user: true },
+    {
+      when: "a user's message ended its wait, with no live probe",
+      captureFirst: false,
+      probe: false,
+      user: true,
+    },
+  ] as const)("a seat's task finishes when its background work ends after $when", (row) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { captureFirst, probe } = row;
+        const user = "user" in row;
+        const backgroundWork = yield* Ref.make(false);
+        const environment = yield* makeWakeEnvironment(
+          `mcp-seat-background-after-send-${captureFirst}${probe ? "" : "-no-probe"}${
+            user ? "-user" : ""
+          }`,
+          undefined,
+          probe ? backgroundWork : undefined,
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          yield* createThread(threadId, environment.cwd);
+          yield* startTurn(threadId, "Seat a reviewer.");
+          const parentRun = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+          const seatRunning = yield* watch(
+            (event) =>
+              event.type === "provider-turn.updated" &&
+              event.threadId !== threadId &&
+              event.payload.status === "running",
+          );
+          const delegated = yield* orchestrator.dispatch({
+            type: "delegated_task.request",
+            commandId: CommandId.make("delegate:seat-background"),
+            parentThreadId: threadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            task: "Review the change with a background helper.",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            completionWake: "always",
+            createdBy: "agent",
+            creationSource: "mcp",
+          });
+          const task = delegated.storedEvents.flatMap(({ event }) =>
+            event.type === "subagent.updated" && event.payload.childThreadId !== null
+              ? [event.payload]
+              : [],
+          )[0]!;
+          const seat = task.childThreadId!;
+          yield* worker.drain();
+          yield* Fiber.join(seatRunning);
+          const seatTurn = environment.started.findLast((turn) => turn.threadId === seat)!;
+          const seatProviderThread = Effect.map(
+            orchestrator.getThreadProjection(seat),
+            ({ providerThreads }) =>
+              providerThreads.find((candidate) => candidate.id === seatTurn.providerThread.id)!,
+          );
+
+          // The seat starts a background subagent, then ends its turn.
+          const helper = {
+            taskId: "task:seat-helper",
+            kind: "subagent" as const,
+            description: "Background helper",
+            providerInstanceId: instanceId,
+          };
+          const reported = yield* watch(
+            (event) =>
+              event.type === "provider-thread.updated" &&
+              event.threadId === seat &&
+              (event.payload.pendingBackgroundTasks?.length ?? 0) > 0,
+          );
+          yield* Ref.set(backgroundWork, true);
+          yield* Queue.offer(environment.events, {
+            type: "provider_thread.updated",
+            driver,
+            providerThread: {
+              ...(yield* seatProviderThread),
+              status: "active",
+              pendingBackgroundTasks: [helper],
+            },
+            pendingBackgroundWork: true,
+          });
+          yield* Fiber.join(reported);
+          const seatWaiting = yield* watch(
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.id === seatTurn.runId &&
+              event.payload.status === "waiting",
+          );
+          yield* environment.endTurn(seatTurn, "completed");
+          yield* Fiber.join(seatWaiting);
+
+          if (captureFirst) {
+            const captured = yield* watch(
+              (event) =>
+                event.type === "run.updated" &&
+                event.payload.id === seatTurn.runId &&
+                event.payload.status === "completed",
+            );
+            yield* worker.drain();
+            yield* Fiber.join(captured);
+          }
+          // The parent sends the seat a follow-up.
+          const messageId = MessageId.make("message:seat-follow-up");
+          const followUpStarting = yield* watch(
+            (event) =>
+              (event.type === "run.updated" || event.type === "run.created") &&
+              event.payload.userMessageId === messageId &&
+              event.payload.status === "starting",
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("send:seat-follow-up"),
+            threadId: seat,
+            messageId,
+            text: "Also check the migration.",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            ...(user
+              ? ({ deliveryIntent: "auto", createdBy: "user", creationSource: "web" } as const)
+              : ({ createdBy: "agent", creationSource: "mcp", senderThreadId: threadId } as const)),
+          });
+          yield* Fiber.join(followUpStarting);
+
+          // The helper finishes, then the follow-up's turn runs and ends.
+          yield* Ref.set(backgroundWork, false);
+          yield* Queue.offer(environment.events, {
+            type: "provider_thread.updated",
+            driver,
+            providerThread: {
+              ...(yield* seatProviderThread),
+              status: "idle",
+              pendingBackgroundTasks: [],
+            },
+            pendingBackgroundWork: false,
+          });
+          const followUpRunning = yield* watch(
+            (event) =>
+              event.type === "provider-turn.updated" &&
+              event.threadId === seat &&
+              event.payload.runAttemptId !== seatTurn.attemptId &&
+              event.payload.status === "running",
+          );
+          yield* worker.drain();
+          yield* Fiber.join(followUpRunning);
+          yield* finishLatestTurn(environment, seat);
+
+          const parentTask = (yield* orchestrator.getThreadProjection(threadId)).subagents.find(
+            (candidate) => candidate.id === task.id,
+          );
+          // A finished helper left in the roster holds the task at waiting_for_children.
+          expect(parentTask?.status).toBe("completed");
+          expect((yield* seatProviderThread).pendingBackgroundTasks ?? []).toEqual([]);
         }).pipe(Effect.provide(environment.layer));
       }),
     ),

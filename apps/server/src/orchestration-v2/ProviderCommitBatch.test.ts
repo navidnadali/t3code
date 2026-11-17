@@ -3,6 +3,7 @@ import { MessageId, ProviderDriverKind, ProviderTurnId, ThreadId } from "@t3tool
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -11,6 +12,10 @@ import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
+
+import { recordingWaitObserver } from "../observability/WaitObserver.testkit.ts";
+import * as IngestLag from "./IngestLag.ts";
 import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 
 const driver = ProviderDriverKind.make("codex");
@@ -254,6 +259,36 @@ it.effect("does not hold the shared worker while one consumer checks background 
   }),
 );
 
+it.effect("runs a control without queueing behind another consumer's commit", () =>
+  Effect.gen(function* () {
+    const committing = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const busy = yield* coordinator
+      .consume(
+        Stream.make(event(1)),
+        () => Deferred.succeed(committing, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Deferred.await(committing);
+    // A run's turn ends with controls in a row; each waited a full queue pass that wrote nothing.
+    const handled = yield* Deferred.make<void>();
+    const consumer = yield* coordinator
+      .consume(
+        Stream.make(control),
+        () => Deferred.succeed(handled, undefined),
+        Effect.succeed(true),
+      )
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* TestClock.adjust(0);
+    assert.isTrue(yield* Deferred.isDone(handled));
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(consumer);
+    yield* Fiber.join(busy);
+  }),
+);
+
 it.effect.each(["job", "commit"] as const)(
   "isolates a %s failure at its transaction boundary",
   (mode) =>
@@ -470,3 +505,167 @@ it.effect("settles calls made after the coordinator's scope closes", () =>
     assert.isTrue(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause));
   }),
 );
+
+it.effect("reports each job's wait before its flush, the job flushing and the depth found", () => {
+  const { observer, readers, reports } = recordingWaitObserver();
+  return Effect.gen(function* () {
+    const committing = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let commits = 0;
+    const coordinator = yield* ProviderCommitBatch.make(
+      (work) =>
+        commits++ === 0
+          ? Deferred.succeed(committing, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(work),
+            )
+          : work,
+      true,
+    );
+    const input = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    yield* coordinator
+      .consume(Stream.fromQueue(input), () => Effect.void, Effect.succeed(false))
+      .pipe(Effect.withSpan("Probe.consume"), Effect.forkScoped);
+    yield* Queue.offer(input, event(1));
+    yield* Deferred.await(committing);
+    const command = yield* coordinator
+      .barrier(Effect.void)
+      .pipe(Effect.withSpan("Probe.command"), Effect.forkScoped);
+    yield* Effect.yieldNow;
+    assert.equal(readers.get("ProviderCommitBatch.depth")?.(), 2);
+    yield* TestClock.adjust("1 second");
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(command);
+    // With nothing queued, a barrier commits at once.
+    yield* coordinator.barrier(Effect.void);
+
+    assert.deepEqual(
+      reports("depth").filter(([site]) => site === "ProviderCommitBatch.queue"),
+      [
+        ["ProviderCommitBatch.queue", 0],
+        ["ProviderCommitBatch.queue", 1],
+        ["ProviderCommitBatch.queue", 0],
+      ],
+    );
+    // Each wait also counts under its kind of job: a provider snapshot or a barrier.
+    assert.deepEqual(reports("wait"), [
+      ["ProviderCommitBatch.queue", 0, undefined],
+      ["ProviderCommitBatch.queue.snapshot", 0, undefined],
+      ["ProviderCommitBatch.queue", 1e9, "Probe.consume"],
+      ["ProviderCommitBatch.queue.barrier", 1e9, undefined],
+      ["ProviderCommitBatch.queue", 0, undefined],
+      ["ProviderCommitBatch.queue.barrier", 0, undefined],
+    ]);
+    assert.equal(readers.get("ProviderCommitBatch.depth")?.(), 0);
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});
+
+it.effect(
+  "reports each stamped event's ingest lag from its arrival to its commit, by class",
+  () => {
+    const { observer, reports } = recordingWaitObserver();
+    return Effect.gen(function* () {
+      const committing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let commits = 0;
+      const coordinator = yield* ProviderCommitBatch.make(
+        (work) =>
+          commits++ === 0
+            ? Deferred.succeed(committing, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(work),
+              )
+            : work,
+        true,
+      );
+      const base = event(1);
+      // The adapter stamped this snapshot when the test clock started.
+      const delta: ProviderAdapter.ProviderAdapterV2Event =
+        base.type === "message.updated"
+          ? { ...base, message: { ...base.message, updatedAt: DateTime.makeUnsafe(0) } }
+          : base;
+      const unstamped = event(2);
+      const lifecycle: ProviderAdapter.ProviderAdapterV2Event = { ...control };
+      const input = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const done = yield* Deferred.make<void>();
+      yield* coordinator
+        .consume(
+          Stream.fromQueue(input),
+          (raw) =>
+            IngestLag.markPersisted.pipe(
+              Effect.andThen(raw === lifecycle ? Deferred.succeed(done, undefined) : Effect.void),
+            ),
+          Effect.succeed(false),
+        )
+        .pipe(Effect.forkScoped);
+      IngestLag.markArrival(delta, yield* Clock.monotonicTimeNanos);
+      yield* Queue.offer(input, delta);
+      yield* Deferred.await(committing);
+      yield* TestClock.adjust("2 seconds");
+      IngestLag.markArrival(lifecycle, yield* Clock.monotonicTimeNanos);
+      yield* Queue.offer(input, unstamped);
+      yield* Queue.offer(input, lifecycle);
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(done);
+
+      assert.deepEqual(
+        reports("wait").filter(([site]) => String(site).startsWith("ProviderIngest.")),
+        [
+          ["ProviderIngest.lag.delta", 3e9, undefined],
+          // From the adapter's own stamp, where the event carries one.
+          ["ProviderIngest.lagFromAdapter.delta", 3e9, undefined],
+          ["ProviderIngest.lag.lifecycle", 1e9, undefined],
+        ],
+      );
+      // Events per commit, as the length of each flushed batch. The control takes no commit of
+      // its own: it writes nothing here.
+      assert.deepEqual(
+        reports("depth").filter(([site]) => site === "ProviderCommitBatch.batch"),
+        [
+          ["ProviderCommitBatch.batch", 1],
+          ["ProviderCommitBatch.batch", 1],
+        ],
+      );
+    }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+  },
+);
+
+it.effect("reports ingest lag with batching off too", () => {
+  const { observer, reports } = recordingWaitObserver();
+  return Effect.gen(function* () {
+    const coordinator = yield* ProviderCommitBatch.make((work) => work, false);
+    const raw = event(1);
+    IngestLag.markArrival(raw, yield* Clock.monotonicTimeNanos);
+    yield* coordinator.consume(
+      Stream.make(raw),
+      () => IngestLag.markPersisted.pipe(Effect.andThen(TestClock.adjust("1 second"))),
+      Effect.succeed(true),
+    );
+    assert.deepEqual(
+      reports("wait").filter(([site]) => String(site).startsWith("ProviderIngest.lag.")),
+      [["ProviderIngest.lag.delta", 1e9, undefined]],
+    );
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});
+
+it.effect("reports ingest lag only from a consumer that persisted the event", () => {
+  const { observer, reports } = recordingWaitObserver();
+  return Effect.gen(function* () {
+    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const shared = event(1);
+    IngestLag.markArrival(shared, yield* Clock.monotonicTimeNanos);
+    // A shared session hands the event to every run; only its owner writes it.
+    yield* coordinator.consume(Stream.make(shared), () => Effect.void, Effect.succeed(true));
+    yield* TestClock.adjust("2 seconds");
+    yield* coordinator.consume(
+      Stream.make(shared),
+      () => IngestLag.markPersisted,
+      Effect.succeed(true),
+    );
+    assert.deepEqual(
+      reports("wait").filter(([site]) => String(site).startsWith("ProviderIngest.lag.")),
+      [["ProviderIngest.lag.delta", 2e9, undefined]],
+    );
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});

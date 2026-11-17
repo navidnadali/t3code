@@ -260,6 +260,57 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect("reads a SQL statement sample rate, writing every statement unless set", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-trace-sample-" })),
+      );
+      const resolveEvery = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.traceSqlSampleEvery),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveEvery({})).toBeUndefined();
+      expect(yield* resolveEvery({ T3CODE_TRACE_SQL_SAMPLE_EVERY: "1" })).toBeUndefined();
+      expect(yield* resolveEvery({ T3CODE_TRACE_SQL_SAMPLE_EVERY: "20" })).toBe(20);
+      for (const value of ["0", "2.5", "10001"]) {
+        const error = yield* resolveEvery({ T3CODE_TRACE_SQL_SAMPLE_EVERY: value }).pipe(
+          Effect.flip,
+        );
+        expect(String(error)).toMatch(/at \["T3CODE_TRACE_SQL_SAMPLE_EVERY"\]/);
+      }
+    }),
+  );
+
+  it.effect("reads a CPU profile interval in whole milliseconds, off unless set", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-trace-cpu-" })),
+      );
+      const resolveInterval = (env: Record<string, string>) =>
+        resolveServerConfig(minimalDesktopFlags(baseDir), Option.none()).pipe(
+          Effect.map((config) => config.traceCpuProfileIntervalMs),
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect(yield* resolveInterval({})).toBeUndefined();
+      expect(yield* resolveInterval({ T3CODE_TRACE_CPU_PROFILE_INTERVAL_MS: "0" })).toBeUndefined();
+      expect(yield* resolveInterval({ T3CODE_TRACE_CPU_PROFILE_INTERVAL_MS: "10" })).toBe(10);
+      expect(yield* resolveInterval({ T3CODE_TRACE_CPU_PROFILE_INTERVAL_MS: "1000" })).toBe(1_000);
+      for (const value of ["-1", "2.5", "10ms", "1001"]) {
+        const error = yield* resolveInterval({ T3CODE_TRACE_CPU_PROFILE_INTERVAL_MS: value }).pipe(
+          Effect.flip,
+        );
+        expect(String(error)).toMatch(/at \["T3CODE_TRACE_CPU_PROFILE_INTERVAL_MS"\]/);
+      }
+    }),
+  );
+
   it.effect("names the pair command for the refused server's home", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

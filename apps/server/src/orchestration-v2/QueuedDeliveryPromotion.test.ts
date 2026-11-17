@@ -571,6 +571,38 @@ it.effect.each(["user", "automation", "cross-thread"] as const)(
     }),
 );
 
+// A steer that missed its turn was sent to be delivered now; the wait it ends takes no grace.
+it.effect.each([
+  { name: "this run", missed: "run:active" },
+  { name: "an earlier run", missed: "run:old" },
+] as const)(
+  "ends the wait of a run whose turn is over at once for a steer that missed $name",
+  ({ missed }) =>
+    Effect.gen(function* () {
+      const start = yield* DateTime.now;
+      const followUp = {
+        name: "follow-up",
+        origin: "follow-up" as const,
+        run: { steerFollowUpOfRunId: RunId.make(missed) },
+      };
+      const scenario: Scenario = { active: "waiting", turnStatus: "completed", queued: [followUp] };
+      assert.deepEqual(yield* decide(scenario, start), {
+        queuedRunId: RunId.make("run:follow-up"),
+        targetRunId: RunId.make("run:active"),
+        commandId: "command:auto-send-now:run:follow-up:run:active:wait",
+      } as never);
+      assert.isNull(yield* decide({ ...scenario, stopReached: true }, start));
+      assert.isNull(yield* decide({ ...scenario, pendingRequest: true }, start));
+      assert.isNull(yield* decide({ ...scenario, otherActive: true }, start));
+      assert.isNull(
+        yield* decide(
+          { ...scenario, queued: [{ ...followUp, run: { ...followUp.run, queueHeld: true } }] },
+          start,
+        ),
+      );
+    }),
+);
+
 // A finished compaction or sign-out waits for its checkpoint like any other turn.
 it.effect.each(["/compact", "/logout"])(
   "ends the wait of a %s run whose turn is over after 60 s",

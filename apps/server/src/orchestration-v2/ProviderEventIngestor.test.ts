@@ -47,6 +47,7 @@ import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as IngestLag from "./IngestLag.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -419,27 +420,36 @@ it.effect("records accepted billed turn usage once without billing the context w
       },
       event: { type: "provider_turn.updated" as const, driver: CODEX_DRIVER, providerTurn },
     };
+    // Only an ingestion that writes marks its event persisted, so only it reports ingest lag.
+    const written = { persisted: false };
+    yield* ingestor
+      .ingestNormalized(input)
+      .pipe(Effect.provideService(IngestLag.CurrentIngest, written));
+    assert.isTrue(written.persisted);
     yield* ingestor.ingestNormalized(input);
-    yield* ingestor.ingestNormalized(input);
-    const ignored = yield* ingestor.ingestNormalized({
-      ...input,
-      event: {
-        ...input.event,
-        providerTurn: {
-          ...providerTurn,
-          id: idAllocator.derive.providerTurn({
-            driver: CODEX_DRIVER,
-            nativeTurnId: "stale-billing-turn",
-          }),
+    const skipped = { persisted: false };
+    const ignored = yield* ingestor
+      .ingestNormalized({
+        ...input,
+        event: {
+          ...input.event,
+          providerTurn: {
+            ...providerTurn,
+            id: idAllocator.derive.providerTurn({
+              driver: CODEX_DRIVER,
+              nativeTurnId: "stale-billing-turn",
+            }),
+          },
         },
-      },
-      writeIfRunCurrent: {
-        runId: RunId.make("missing-run"),
-        activeAttemptId: RunAttemptId.make("stale-attempt"),
-        expectedStatus: "running",
-      },
-    });
+        writeIfRunCurrent: {
+          runId: RunId.make("missing-run"),
+          activeAttemptId: RunAttemptId.make("stale-attempt"),
+          expectedStatus: "running",
+        },
+      })
+      .pipe(Effect.provideService(IngestLag.CurrentIngest, skipped));
     assert.isEmpty(ignored);
+    assert.isFalse(skipped.persisted);
     assert.lengthOf(recorded, 1);
     assert.deepEqual(recorded[0], {
       driver: CODEX_DRIVER,

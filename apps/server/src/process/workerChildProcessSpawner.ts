@@ -791,9 +791,14 @@ export const makeRemoteHost = (options: {
       case "exit":
         completeExit(entry, message.code, message.signal);
         return;
-      case "close":
+      case "close": {
+        // A closed child takes no more stdin: what the spawner left unanswered never will be.
+        const stdinCallbacks = [...entry.stdinCallbacks.values()];
+        entry.stdinCallbacks.clear();
         remove(entry);
+        for (const callback of stdinCallbacks) callback(reviveError(DESTROYED_STDIN));
         return;
+      }
       case "data": {
         const stream = message.s === 0 ? child.stdout : child.stderr;
         if (stream.destroyed) return;

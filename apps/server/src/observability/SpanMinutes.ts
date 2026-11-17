@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - node:perf_hooks has the event loop delay histogram; node:zlib gzips on libuv's thread pool.
+// @effect-diagnostics nodeBuiltinImport:off - node:perf_hooks has the event loop delay histogram and GC entries; node:zlib gzips on libuv's thread pool.
 import * as NodePerfHooks from "node:perf_hooks";
 import * as NodeZlib from "node:zlib";
 
@@ -18,11 +18,14 @@ import * as Tracer from "effect/Tracer";
 export const SPAN_MINUTES_FILE_NAME = "server.span-minutes.ndjson";
 
 const MINUTE_MS = 60_000;
-// A busy server ends a few hundred span names a minute, a line of tens of KB: a 4 MiB file then
-// closes every few hours and gzips to well under its size, so 48 archives hold several days. The byte cap bounds the disk for any names.
-const ACTIVE_MAX_BYTES = 4 * 1024 * 1024;
-const MAX_ARCHIVES = 48;
-const MAX_ARCHIVE_BYTES = 48 * 1024 * 1024;
+// A busy server's minute line, with the waits, runs to tens of KB: a 4 MiB file closes every
+// hour or two and gzips several times smaller, so 96 archives hold days of minutes. The byte cap
+// bounds the disk for any names.
+export const SPAN_MINUTE_LOG_LIMITS = {
+  maxBytes: 4 * 1024 * 1024,
+  maxArchives: 96,
+  maxArchiveBytes: 96 * 1024 * 1024,
+} as const;
 
 // Span names come from code; these caps bound a line should a name ever carry data.
 export const MAX_SPAN_NAMES = 2_000;
@@ -58,35 +61,76 @@ const bucketOf = (ns: number) => {
   );
 };
 
+// The first buckets hold one whole number each, so they are exact: a zero wait reads as zero.
 const bucketMidpointNs = (bucket: number) => {
-  if (bucket < SUB_BUCKETS) return bucket + 0.5;
+  if (bucket < SUB_BUCKETS) return bucket;
   const width = POWERS_OF_TWO[(bucket >>> SUB_BUCKET_BITS) - 1]!;
   return (SUB_BUCKETS + (bucket & (SUB_BUCKETS - 1))) * width + width / 2;
 };
 
 // Four significant digits below a second, whole ms above: finer than a p95 bucket's 1/16.
-const roundMs = (ms: number) => (ms >= 1000 ? Math.round(ms) : Number(ms.toPrecision(4)));
+export const roundMs = (ms: number) => (ms >= 1000 ? Math.round(ms) : Number(ms.toPrecision(4)));
 
-interface Tally {
+/** A count, total, max and log-linear histogram of whole numbers: nanoseconds, or a queue length. */
+export interface Tally {
   count: number;
   totalNs: number;
   maxNs: number;
   readonly buckets: Uint32Array;
 }
 
+export const makeTally = (): Tally => ({
+  count: 0,
+  totalNs: 0,
+  maxNs: 0,
+  buckets: new Uint32Array(BUCKET_COUNT),
+});
+
+export const addToTally = (tally: Tally, ns: number): void => {
+  tally.count++;
+  tally.totalNs += ns;
+  if (ns > tally.maxNs) tally.maxNs = ns;
+  tally.buckets[ns < HISTOGRAM_LIMIT_NS ? bucketOf(ns) : BUCKET_COUNT - 1]!++;
+};
+
+export const resetTally = (tally: Tally): void => {
+  tally.count = 0;
+  tally.totalNs = 0;
+  tally.maxNs = 0;
+  tally.buckets.fill(0);
+};
+
+/**
+ * Nearest rank for ascending quantiles in one pass, in the tally's unit. A rank equal to the count
+ * is the largest value, known exactly (the p95 up to 19 values), as is anything in the last bucket.
+ */
+export const tallyPercentiles = (tally: Tally, quantiles: ReadonlyArray<number>): Array<number> => {
+  const values: Array<number> = [];
+  let seen = 0;
+  let bucket = 0;
+  for (const quantile of quantiles) {
+    const rank = Math.ceil(tally.count * quantile);
+    while (rank < tally.count && seen < rank && bucket < BUCKET_COUNT - 1) {
+      seen += tally.buckets[bucket++]!;
+    }
+    values.push(
+      rank < tally.count && seen >= rank
+        ? Math.min(bucketMidpointNs(bucket - 1), tally.maxNs)
+        : tally.maxNs,
+    );
+  }
+  return values;
+};
+
 /** Count, then total, max and p95 duration in ms. */
 export type SpanStat = readonly [count: number, totalMs: number, maxMs: number, p95Ms: number];
 
-// Nearest rank: up to 19 spans that is the slowest, known exactly, as is anything in the last bucket.
-const p95Ms = (tally: Tally) => {
-  const rank = Math.ceil(tally.count * 0.95);
-  let seen = 0;
-  for (let bucket = 0; rank < tally.count && bucket < BUCKET_COUNT - 1; bucket++) {
-    seen += tally.buckets[bucket]!;
-    if (seen >= rank) return Math.min(bucketMidpointNs(bucket), tally.maxNs) / 1e6;
-  }
-  return tally.maxNs / 1e6;
-};
+/** p50, p90 and p99 duration in ms, apart from `SpanStat` so its readers keep four fields. */
+export type SpanPercentiles = readonly [p50Ms: number, p90Ms: number, p99Ms: number];
+
+const SPAN_QUANTILES = [0.5, 0.9, 0.95, 0.99];
+// Under ten spans the nearest-rank p90 and p99 are the max; leaving them out keeps the line short.
+const PERCENTILES_FROM = 10;
 
 export const makeSpanAggregate = () => {
   const tallies = new Map<string, Tally>();
@@ -95,47 +139,37 @@ export const makeSpanAggregate = () => {
     const existing = tallies.get(key);
     if (existing !== undefined) return existing;
     const target = tallies.size < MAX_SPAN_NAMES ? key : OTHER_SPAN_NAME;
-    const tally = tallies.get(target) ?? {
-      count: 0,
-      totalNs: 0,
-      maxNs: 0,
-      buckets: new Uint32Array(BUCKET_COUNT),
-    };
+    const tally = tallies.get(target) ?? makeTally();
     tallies.set(target, tally);
     return tally;
   };
   return {
     record(name: string, startTime: bigint, endTime: bigint): void {
-      const durationNs = Math.max(0, Number(endTime - startTime));
-      const tally = tallies.get(name) ?? addTally(name);
-      tally.count++;
-      tally.totalNs += durationNs;
-      if (durationNs > tally.maxNs) tally.maxNs = durationNs;
-      tally.buckets[durationNs < HISTOGRAM_LIMIT_NS ? bucketOf(durationNs) : BUCKET_COUNT - 1]!++;
+      addToTally(tallies.get(name) ?? addTally(name), Math.max(0, Number(endTime - startTime)));
     },
-    /** Returns the minute's stats and starts the next minute; names idle for a minute are dropped. */
-    drain(): Record<string, SpanStat> {
-      const stats: Array<readonly [string, SpanStat]> = [];
+    /**
+     * Returns the minute's stats and starts the next minute; names idle for a minute are dropped.
+     * Only names ended ten times or more have percentiles.
+     */
+    drain(): {
+      readonly spans: Record<string, SpanStat>;
+      readonly spanPercentiles: Record<string, SpanPercentiles>;
+    } {
+      const spans: Record<string, SpanStat> = {};
+      const spanPercentiles: Record<string, SpanPercentiles> = {};
       for (const [name, tally] of tallies) {
         if (tally.count === 0) {
           tallies.delete(name);
           continue;
         }
-        stats.push([
-          name,
-          [
-            tally.count,
-            roundMs(tally.totalNs / 1e6),
-            roundMs(tally.maxNs / 1e6),
-            roundMs(p95Ms(tally)),
-          ],
-        ]);
-        tally.count = 0;
-        tally.totalNs = 0;
-        tally.maxNs = 0;
-        tally.buckets.fill(0);
+        const [p50 = 0, p90 = 0, p95 = 0, p99 = 0] = tallyPercentiles(tally, SPAN_QUANTILES).map(
+          (ns) => roundMs(ns / 1e6),
+        );
+        spans[name] = [tally.count, roundMs(tally.totalNs / 1e6), roundMs(tally.maxNs / 1e6), p95];
+        if (tally.count >= PERCENTILES_FROM) spanPercentiles[name] = [p50, p90, p99];
+        resetTally(tally);
       }
-      return Object.fromEntries(stats);
+      return { spans, spanPercentiles };
     },
   };
 };
@@ -205,6 +239,66 @@ const nodeSampler: Effect.Effect<Effect.Effect<ProcessReadings>, never, Scope.Sc
     });
   },
 );
+
+const GC_KIND_NAMES: ReadonlyMap<number, string> = new Map([
+  [NodePerfHooks.constants.NODE_PERFORMANCE_GC_MINOR, "minor"],
+  [NodePerfHooks.constants.NODE_PERFORMANCE_GC_MAJOR, "major"],
+  [NodePerfHooks.constants.NODE_PERFORMANCE_GC_INCREMENTAL, "incremental"],
+  [NodePerfHooks.constants.NODE_PERFORMANCE_GC_WEAKCB, "weakcb"],
+]);
+
+/** Count, then total and longest pause in ms. */
+export type GcStat = readonly [count: number, totalMs: number, maxMs: number];
+
+export const makeGcAggregate = () => {
+  const kinds = new Map<string, { count: number; totalMs: number; maxMs: number }>();
+  return {
+    record(kind: number, durationMs: number): void {
+      const name = GC_KIND_NAMES.get(kind) ?? "other";
+      const stat = kinds.get(name) ?? { count: 0, totalMs: 0, maxMs: 0 };
+      stat.count++;
+      stat.totalMs += durationMs;
+      if (durationMs > stat.maxMs) stat.maxMs = durationMs;
+      kinds.set(name, stat);
+    },
+    drain(): Record<string, GcStat> {
+      const drained = Object.fromEntries(
+        Array.from(kinds, ([name, stat]) => [
+          name,
+          [stat.count, roundMs(stat.totalMs), roundMs(stat.maxMs)] as const,
+        ]),
+      );
+      kinds.clear();
+      return drained;
+    },
+  };
+};
+
+/** The process's garbage collections each minute, from perf_hooks' gc entries. */
+const nodeGcSection: Effect.Effect<
+  Effect.Effect<{ readonly gc: Record<string, GcStat> }>,
+  never,
+  Scope.Scope
+> = Effect.gen(function* () {
+  const gc = makeGcAggregate();
+  yield* Effect.acquireRelease(
+    Effect.sync(() => {
+      const observer = new NodePerfHooks.PerformanceObserver((entries) => {
+        for (const entry of entries.getEntries()) {
+          // `detail.kind` is the GC type; this @types/node leaves `detail` off PerformanceEntry.
+          const detail: unknown = Reflect.get(entry, "detail");
+          const kind: unknown =
+            typeof detail === "object" && detail !== null ? Reflect.get(detail, "kind") : undefined;
+          gc.record(typeof kind === "number" ? kind : -1, entry.duration);
+        }
+      });
+      observer.observe({ entryTypes: ["gc"] });
+      return observer;
+    }),
+    (observer) => Effect.sync(() => observer.disconnect()),
+  );
+  return Effect.sync(() => ({ gc: gc.drain() }));
+});
 
 export interface SpanMinuteLogOptions {
   readonly filePath: string;
@@ -337,6 +431,9 @@ export interface SpanMinuteLine extends ProcessReadings {
   readonly end: string;
   readonly pid: number;
   readonly spans: Record<string, SpanStat>;
+  readonly spanPercentiles: Record<string, SpanPercentiles>;
+  /** Fields from the line's other sources, such as waits; each adds its own. */
+  readonly [section: string]: unknown;
 }
 
 const quiet = <A, E>(effect: Effect.Effect<A, E>) =>
@@ -354,6 +451,8 @@ const encodeLine = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unkno
 export const makeWith = Effect.fnUntraced(function* (options: {
   readonly sampler: Effect.Effect<Effect.Effect<ProcessReadings>, never, Scope.Scope>;
   readonly append: (line: string) => Effect.Effect<void, PlatformError>;
+  /** Drained into each line after the span fields, in order. */
+  readonly sections?: ReadonlyArray<Effect.Effect<object>>;
 }) {
   const aggregate = makeSpanAggregate();
   const sample = yield* options.sampler;
@@ -361,12 +460,15 @@ export const makeWith = Effect.fnUntraced(function* (options: {
   let failing = false;
   const flush = Effect.gen(function* () {
     const end = yield* Clock.currentTimeMillis;
+    const { spans, spanPercentiles } = aggregate.drain();
     const line: SpanMinuteLine = {
       start: isoTime(windowStart),
       end: isoTime(end),
       pid: process.pid,
-      spans: aggregate.drain(),
+      spans,
       ...(yield* sample),
+      spanPercentiles,
+      ...Object.assign({}, ...(yield* Effect.all(options.sections ?? []))),
     };
     windowStart = end;
     yield* encodeLine(line).pipe(
@@ -399,12 +501,14 @@ export const makeWith = Effect.fnUntraced(function* (options: {
   return { record: aggregate.record };
 });
 
-export const make = Effect.fnUntraced(function* (filePath: string) {
-  const log = yield* makeSpanMinuteLog({
-    filePath,
-    maxBytes: ACTIVE_MAX_BYTES,
-    maxArchives: MAX_ARCHIVES,
-    maxArchiveBytes: MAX_ARCHIVE_BYTES,
+export const make = Effect.fnUntraced(function* (
+  filePath: string,
+  sections: ReadonlyArray<Effect.Effect<object>> = [],
+) {
+  const log = yield* makeSpanMinuteLog({ filePath, ...SPAN_MINUTE_LOG_LIMITS });
+  return yield* makeWith({
+    sampler: nodeSampler,
+    append: log.append,
+    sections: [yield* nodeGcSection, ...sections],
   });
-  return yield* makeWith({ sampler: nodeSampler, append: log.append });
 });

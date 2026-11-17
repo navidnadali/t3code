@@ -3,6 +3,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
+import * as NodeWorkerThreads from "node:worker_threads";
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -17,6 +18,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
@@ -240,6 +242,107 @@ const manualTimers = Effect.gen(function* () {
   };
 });
 
+// The spawner answers each stdin write and end; a child that closed can take none of them.
+it.live("answers a closed child's unanswered stdin end and lets go of its transport", () =>
+  Effect.gen(function* () {
+    const posted: Array<{ readonly t: string; readonly seq?: number }> = [];
+    const endPosted = Deferred.makeUnsafe<void>();
+    let events: { readonly onMessage: (message: unknown) => void } | undefined;
+    let referenced = false;
+    const host = WorkerChildProcessSpawner.makeRemoteHost({
+      open: (transportEvents) => {
+        events = transportEvents;
+        return {
+          post: (message) => {
+            posted.push(message as { t: string; seq?: number });
+            if ((message as { t: string }).t === "stdin-end")
+              Deferred.doneUnsafe(endPosted, Exit.void);
+          },
+          ref: () => void (referenced = true),
+          unref: () => void (referenced = false),
+          terminate: async () => {},
+        };
+      },
+      windowBytes: 65_536,
+      stoppedMessage: "stopped",
+      closedMessage: "closed",
+      restarts: 1,
+    });
+    const child = host.spawn(
+      "git",
+      [],
+      {},
+      { onSpawn: () => {}, onError: () => {}, onThrow: () => {} },
+    );
+    events!.onMessage({ t: "spawn", id: child.id, pid: 2 ** 30 });
+    const ended = Deferred.makeUnsafe<string>();
+    child.stdin.end(Buffer.from("paths\0"), (error?: Error | null) =>
+      Deferred.doneUnsafe(ended, Exit.succeed(error ? error.message : "finished")),
+    );
+    const write = posted.find((message) => message.t === "stdin")!;
+    events!.onMessage({ t: "stdin-done", id: child.id, seq: write.seq });
+    // The child exits before the spawner answers the end, then closes.
+    yield* Deferred.await(endPosted);
+    expect(posted.map((message) => message.t)).toEqual(["spawn", "stdin", "stdin-end"]);
+    events!.onMessage({ t: "exit", id: child.id, code: 128, signal: null });
+    events!.onMessage({ t: "close", id: child.id });
+    const end = yield* Deferred.await(ended).pipe(Effect.timeoutOption("100 millis"));
+    expect({ end: Option.getOrElse(end, () => "unanswered"), referenced }).toEqual({
+      end: "Cannot call write after a stream was destroyed",
+      referenced: false,
+    });
+  }),
+);
+
+// The host sends an end only once its writes are answered; the protocol takes one at any time.
+it.live.skipIf(!workerPlatform)(
+  "answers a stdin end sent while a write waits on a full pipe, once each, when the child exits",
+  () =>
+    Effect.gen(function* () {
+      const replies: Array<{
+        readonly t: string;
+        readonly seq?: number;
+        readonly error?: unknown;
+      }> = [];
+      const closed = Deferred.makeUnsafe<void>();
+      const worker = yield* Effect.acquireRelease(
+        Effect.sync(
+          () =>
+            new NodeWorkerThreads.Worker(WorkerChildProcessSpawner.spawnWorkerSource, {
+              eval: true,
+              workerData: { windowBytes: 65_536 },
+            }),
+        ),
+        (worker) => Effect.promise(() => worker.terminate()),
+      );
+      worker.on("message", (message: { readonly t: string; readonly seq?: number }) => {
+        replies.push(message);
+        if (message.t === "close") Deferred.doneUnsafe(closed, Exit.void);
+      });
+      worker.postMessage(
+        {
+          t: "spawn",
+          id: 1,
+          command: process.execPath,
+          args: ["-e", "setTimeout(() => process.exit(3), 200)"],
+          options: {},
+        },
+        [],
+      );
+      worker.postMessage({ t: "stdin", id: 1, seq: 1, chunk: new Uint8Array(4 * 1024 * 1024) }, []);
+      worker.postMessage({ t: "stdin-end", id: 1, seq: 2 }, []);
+      yield* Deferred.await(closed);
+      expect(
+        replies
+          .filter((message) => message.t === "stdin-done")
+          .map((message) => ({ seq: message.seq, failed: message.error !== undefined })),
+      ).toEqual([
+        { seq: 1, failed: true },
+        { seq: 2, failed: true },
+      ]);
+    }).pipe(Effect.scoped),
+);
+
 describe("WorkerChildProcessSpawner", () => {
   for (const remote of remotes) {
     it.live.skipIf(!workerPlatform)(
@@ -452,6 +555,56 @@ describe("WorkerChildProcessSpawner", () => {
           Effect.scoped,
           Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
         ),
+    );
+
+    // A child that exits without reading its stdin destroys it; its writes and its end still end.
+    it.live.skipIf(!workerPlatform)(
+      `${remote.name}: answers the stdin of a child that exits without reading it, like the Node spawner`,
+      () =>
+        Effect.gen(function* () {
+          const nodeSpawner = yield* ChildProcessSpawner;
+          const remoteSpawner = yield* remote.make(nodeSpawner);
+          // Exits without reading stdin while a descendant holds its output open for a while, so
+          // the child has exited but not closed when a late end of its stdin arrives.
+          const exitsWithOutputOpen = `require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 1500)"], { stdio: ["ignore", "inherit", "inherit"] }).unref(); setTimeout(() => process.exit(3), 200)`;
+          const stdinOutcome = (
+            spawner: ChildProcessSpawner["Service"],
+            bytes: number,
+            endAfterExit: boolean,
+          ) =>
+            Effect.gen(function* () {
+              const handle = yield* spawner.spawn(node(exitsWithOutputOpen));
+              const input = Stream.make(new Uint8Array(bytes)).pipe(
+                Stream.concat(
+                  endAfterExit
+                    ? Stream.fromEffect(Effect.exit(handle.exitCode)).pipe(Stream.drain)
+                    : Stream.empty,
+                ),
+              );
+              const written = yield* Stream.run(input, handle.stdin).pipe(
+                Effect.exit,
+                Effect.timeoutOption("5 seconds"),
+              );
+              return { answered: Option.isSome(written), exitCode: yield* handle.exitCode };
+            }).pipe(Effect.scoped);
+          const cases = [
+            // The write lands; the end comes after the exit destroyed stdin, with no error.
+            [16, true],
+            // The write waits on a full pipe and fails when the child exits, before any end.
+            [4 * 1024 * 1024, true],
+            [4 * 1024 * 1024, false],
+          ] as const;
+          for (const [bytes, endAfterExit] of cases) {
+            expect(yield* stdinOutcome(remoteSpawner, bytes, endAfterExit)).toEqual({
+              answered: true,
+              exitCode: 3,
+            });
+            expect(yield* stdinOutcome(nodeSpawner, bytes, endAfterExit)).toEqual({
+              answered: true,
+              exitCode: 3,
+            });
+          }
+        }).pipe(Effect.scoped, Effect.provide(serverPlatform)),
     );
 
     // The shell joins its words into one script, so a separate argument would run as shell code.

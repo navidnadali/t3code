@@ -61,6 +61,7 @@ import {
   THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
   THREAD_HISTORY_TURN_SNAPSHOT_ROW_LIMIT,
 } from "./threadHistoryPaging.ts";
+import { completionWakeOwnerKeys } from "./CompletionWakeParts.ts";
 import { buildBoundedThreadStreamSnapshot } from "./ThreadStream.ts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
 
@@ -2698,6 +2699,210 @@ const queryPlan = Effect.fn("queryPlan")(function* (statement: string | undefine
   return rows.map((row) => row.detail);
 });
 
+// A seat's wakes chain through every turn that delegated again; the lineage read walks that chain
+// up to the tagged runs, through merged parts and steered wakes, one indexed lookup a run.
+const completionWakeLineageWalksTheChain = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = ThreadId.make("thread:wake-lineage");
+  const otherThreadId = ThreadId.make("thread:wake-lineage-other");
+  const now = recordsAt(1);
+  const runId = (name: string) => RunId.make(`run:wake-lineage:${name}`);
+  const followUp = NodeId.make("node:wake-lineage:follow-up");
+  yield* store.apply(recordsThreadCreated(threadId));
+  yield* store.apply(recordsThreadCreated(otherThreadId));
+  const run = (owner: ThreadId, name: string, ordinal: number, delegatedTaskId?: NodeId) =>
+    store.apply({
+      id: EventId.make(`event:wake-lineage:run:${name}`),
+      type: "run.updated",
+      threadId: owner,
+      runId: runId(name),
+      providerInstanceId,
+      occurredAt: now,
+      payload: {
+        id: runId(name),
+        threadId: owner,
+        ordinal,
+        providerInstanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make(`message:wake-lineage:${name}`),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "completed",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        checkpointId: null,
+        contextHandoffId: null,
+        ...(delegatedTaskId === undefined ? {} : { delegatedTaskId }),
+      },
+    });
+  const wake = (
+    name: string,
+    on: string,
+    parents: ReadonlyArray<string>,
+    role: "user" | "assistant" = "user",
+  ) => {
+    const [primary, ...merged] = parents.map((parent) => ({
+      parentRunId: runId(parent),
+      generation: 1,
+      taskIds: [NodeId.make(`node:wake-lineage:${name}:${parent}`)],
+    }));
+    return store.apply({
+      id: EventId.make(`event:wake-lineage:message:${name}`),
+      type: "message.updated",
+      threadId,
+      runId: runId(on),
+      occurredAt: now,
+      payload: {
+        id: MessageId.make(`message:wake-lineage:${name}`),
+        threadId,
+        runId: runId(on),
+        nodeId: null,
+        role,
+        text: "Delegated task completed",
+        attachments: [],
+        streaming: false,
+        createdBy: "agent",
+        creationSource: "server",
+        createdAt: now,
+        updatedAt: now,
+        delegatedCompletion: {
+          ...primary!,
+          taskIds: [primary!, ...merged].flatMap((part) => part.taskIds),
+          ...(merged.length === 0 ? {} : { merged }),
+        },
+      },
+    });
+  };
+  // before -> tagged (follow-up) -> merged (with root) -> latest, which a steer also linked to
+  // steered; elsewhere is another thread's run, and an assistant row never links.
+  yield* run(threadId, "before", 1);
+  yield* run(threadId, "tagged", 2, followUp);
+  yield* run(threadId, "root", 3);
+  yield* run(threadId, "merged", 4);
+  yield* run(threadId, "steered", 5);
+  yield* run(threadId, "latest", 6);
+  yield* run(otherThreadId, "elsewhere", 1);
+  yield* wake("tagged", "tagged", ["before"]);
+  yield* wake("merged", "merged", ["tagged", "root"]);
+  yield* wake("latest", "latest", ["merged"]);
+  yield* wake("steer", "latest", ["steered", "elsewhere"]);
+  yield* wake("reply", "root", ["before"], "assistant");
+
+  const { statements, tracer } = traceSqlStatements();
+  const lineage = yield* store
+    .getCompletionWakeLineage(threadId, [runId("latest")])
+    .pipe(Effect.withTracer(tracer));
+  assert.deepEqual(
+    lineage
+      .map((row) => ({ ...row, parentRunIds: row.parentRunIds.toSorted() }))
+      .toSorted((left, right) => left.runId.localeCompare(right.runId)),
+    [
+      {
+        runId: runId("latest"),
+        delegatedTaskId: null,
+        parentRunIds: ["elsewhere", "merged", "steered"].map(runId),
+      },
+      {
+        runId: runId("merged"),
+        delegatedTaskId: null,
+        parentRunIds: [runId("root"), runId("tagged")],
+      },
+      { runId: runId("root"), delegatedTaskId: null, parentRunIds: [] },
+      { runId: runId("steered"), delegatedTaskId: null, parentRunIds: [] },
+      { runId: runId("tagged"), delegatedTaskId: followUp, parentRunIds: [] },
+    ].toSorted((left, right) => left.runId.localeCompare(right.runId)),
+  );
+  assert.deepEqual(yield* store.getCompletionWakeLineage(threadId, []), []);
+  const plan = yield* queryPlan(
+    statements.find((statement) => statement.includes("WITH RECURSIVE lineage")),
+  );
+  // Every run and message is found by key, never by walking the thread's rows.
+  assert.isFalse(
+    plan.some((detail) => /^SCAN (run|message)\b/.test(detail)),
+    plan.join("\n"),
+  );
+  assert.isTrue(
+    plan.some((detail) => detail.includes("orchestration_v2_projection_messages_run_idx")),
+    plan.join("\n"),
+  );
+});
+
+// delegatedTaskRuns gives a follow-up promoted to Steer the run its message joined and that run's
+// restart continuations, so a wake for those runs counts for it too and keeps apart from the
+// joined run's own task's other wakes.
+const completionWakeKeysCountPromotedTasks = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = ThreadId.make("thread:wake-promoted");
+  const now = recordsAt(1);
+  const runId = (name: string) => RunId.make(`run:wake-promoted:${name}`);
+  const joinedTask = NodeId.make("node:wake-promoted:joined-task");
+  const promotedTask = NodeId.make("node:wake-promoted:promoted-task");
+  yield* store.apply(recordsThreadCreated(threadId));
+  const run = (name: string, ordinal: number, fields: Record<string, unknown> = {}) =>
+    store.apply({
+      id: EventId.make(`event:wake-promoted:run:${name}`),
+      type: "run.updated",
+      threadId,
+      runId: runId(name),
+      providerInstanceId,
+      occurredAt: now,
+      payload: {
+        id: runId(name),
+        threadId,
+        ordinal,
+        providerInstanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make(`message:wake-promoted:${name}`),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "completed",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        checkpointId: null,
+        contextHandoffId: null,
+        delegatedTaskId: joinedTask,
+        ...fields,
+      },
+    });
+  yield* run("other", 1);
+  yield* run("joined", 2);
+  yield* run("continued", 3, { restartContinuationOfRunId: runId("joined") });
+  // The promoted follow-up's message, sent into the joined run.
+  yield* store.apply({
+    id: EventId.make("event:wake-promoted:message:promoted"),
+    type: "message.updated",
+    threadId,
+    runId: runId("joined"),
+    occurredAt: now,
+    payload: {
+      id: MessageId.make("message:wake-promoted:promoted"),
+      threadId,
+      runId: runId("joined"),
+      nodeId: null,
+      role: "user",
+      text: "Also check this.",
+      attachments: [],
+      streaming: false,
+      createdBy: "agent",
+      creationSource: "mcp",
+      createdAt: now,
+      updatedAt: now,
+      promotedTaskId: promotedTask,
+    },
+  });
+  const ownerKey = completionWakeOwnerKeys(
+    yield* store.getCompletionWakeLineage(threadId, ["other", "joined", "continued"].map(runId)),
+  );
+  const both = JSON.stringify([joinedTask, promotedTask].toSorted());
+  assert.equal(ownerKey([runId("joined")]), both);
+  assert.equal(ownerKey([runId("continued")]), both);
+  assert.equal(ownerKey([runId("other")]), JSON.stringify([joinedTask]));
+});
+
 // SQLite's plan wording changes between versions, so only the index search, the keys it seeks
 // and the absence of a temporary B-tree are pinned.
 const assertReadsThroughMessageOrdinalIndex = Effect.fn("assertReadsThroughMessageOrdinalIndex")(
@@ -4308,6 +4513,14 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
   it.effect("record reads select subagents by id", () => subagentRecordsSelectById);
+  it.effect(
+    "reads a completion wake's lineage up to the tagged runs",
+    () => completionWakeLineageWalksTheChain,
+  );
+  it.effect(
+    "keys a wake for a run a promoted follow-up joined to that follow-up too",
+    () => completionWakeKeysCountPromotedTasks,
+  );
   it.effect(
     "command reads skip finished leaf nodes of finished runs",
     () => commandReadsSkipSettledLeafNodes,

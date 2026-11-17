@@ -129,6 +129,10 @@ export interface SpanSummaryTraceRecord {
   readonly type: "span-summary";
   readonly name: string;
   readonly thresholdMs: number;
+  /** Set when these spans were left out by sampling, one in this many written. */
+  readonly sampleEvery?: number;
+  /** With `sampleEvery`: statements this slow or slower were always written, never sampled. */
+  readonly sampleBelowMs?: number;
   readonly count: number;
   readonly totalDurationMs: number;
   readonly maxDurationMs: number;
@@ -197,6 +201,11 @@ export interface LocalFileTracerOptions extends TraceSinkOptions {
   readonly sink?: TraceSink;
   /** Above 0, fast successful SQL spans are summarised per name instead of written. */
   readonly sqlMinDurationMs?: number;
+  /**
+   * With `every` above 1, writes one in `every` successful `sqlite` statement spans shorter than
+   * `belowMs` that waited for no lock and logged nothing; the rest are summarised.
+   */
+  readonly sqlSample?: { readonly every: number; readonly belowMs: number };
   /** Sees every span as it ends, sampled or not, before the SQL summary. Runs per span: keep it O(1). */
   readonly onSpanEnd?: (name: string, startTime: bigint, endTime: bigint) => void;
 }
@@ -430,7 +439,7 @@ const SQL_SPAN_NAMES: ReadonlySet<string> = new Set(["sqlite", "sql.transaction"
 export const isSqlSpanName = (name: string): boolean => SQL_SPAN_NAMES.has(name);
 
 // Taking a free connection measures up to tens of microseconds; a longer wait means the span queued.
-const SQL_LOCK_WAIT_FLOOR_MS = 0.1;
+export const SQL_LOCK_WAIT_FLOOR_MS = 0.1;
 const SQL_SPAN_SUMMARY_INTERVAL = "1 minute";
 
 interface SpanTally {
@@ -441,16 +450,25 @@ interface SpanTally {
   endTime: bigint;
 }
 
-function makeSqlSpanSummary(thresholdMs: number) {
+// Sampled-out statements are tallied apart from the ones below the threshold.
+const SAMPLED_KEY = "sqlite\u0000sampled";
+
+function makeSqlSpanSummary(thresholdMs: number, sample?: LocalFileTracerOptions["sqlSample"]) {
   const tallies = new Map<string, SpanTally>();
+  let statements = 0;
   return {
-    /** False when the span must be written: slow, failed, lock-waited, or carrying a log. */
+    /** False when the span must be written: slow, failed, lock-waited, carrying a log, or sampled. */
     summarise(span: SerializableSpan): boolean {
       if (!SQL_SPAN_NAMES.has(span.name) || span.status._tag !== "Ended") return false;
       const { startTime, endTime, exit } = span.status;
       if (!ExitRuntime.isSuccess(exit)) return false;
       const durationMs = Number(endTime - startTime) / 1_000_000;
-      if (durationMs >= thresholdMs) return false;
+      const sampled =
+        durationMs >= thresholdMs &&
+        sample !== undefined &&
+        span.name === "sqlite" &&
+        durationMs < sample.belowMs;
+      if (durationMs >= thresholdMs && !sampled) return false;
       const lockWaitMs = span.attributes.get("db.lock_wait_ms");
       if (
         lockWaitMs !== undefined &&
@@ -461,9 +479,11 @@ function makeSqlSpanSummary(thresholdMs: number) {
       if (span.events.some(([, , attributes]) => attributes["effect.logLevel"] !== undefined)) {
         return false;
       }
-      const tally = tallies.get(span.name);
+      if (sampled && statements++ % sample.every === 0) return false;
+      const key = sampled ? SAMPLED_KEY : span.name;
+      const tally = tallies.get(key);
       if (tally === undefined) {
-        tallies.set(span.name, {
+        tallies.set(key, {
           count: 1,
           totalDurationMs: durationMs,
           maxDurationMs: durationMs,
@@ -480,10 +500,13 @@ function makeSqlSpanSummary(thresholdMs: number) {
       return true;
     },
     drain(): Array<SpanSummaryTraceRecord> {
-      const records = Array.from(tallies, ([name, tally]): SpanSummaryTraceRecord => ({
+      const records = Array.from(tallies, ([key, tally]): SpanSummaryTraceRecord => ({
         type: "span-summary",
-        name,
+        name: key === SAMPLED_KEY ? "sqlite" : key,
         thresholdMs,
+        ...(key === SAMPLED_KEY && sample !== undefined
+          ? { sampleEvery: sample.every, sampleBelowMs: sample.belowMs }
+          : {}),
         count: tally.count,
         totalDurationMs: tally.totalDurationMs,
         maxDurationMs: tally.maxDurationMs,
@@ -779,9 +802,12 @@ export const makeLocalFileTracer = Effect.fn("makeLocalFileTracer")(function* (
       span: (spanOptions) => new Tracer.NativeSpan(spanOptions),
     });
 
+  const sqlSample =
+    options.sqlSample !== undefined && options.sqlSample.every > 1 ? options.sqlSample : undefined;
   const sqlSummary =
-    options.sqlMinDurationMs !== undefined && options.sqlMinDurationMs > 0
-      ? makeSqlSpanSummary(options.sqlMinDurationMs)
+    (options.sqlMinDurationMs !== undefined && options.sqlMinDurationMs > 0) ||
+    sqlSample !== undefined
+      ? makeSqlSpanSummary(options.sqlMinDurationMs ?? 0, sqlSample)
       : undefined;
   if (sqlSummary !== undefined) {
     const writeSummary = Effect.sync(() => {

@@ -3954,6 +3954,25 @@ function claudePendingBackgroundTasksFromRoster(
   );
 }
 
+// The fields that decide holds and wakes; descriptions refresh with the next roster update.
+function sameClaudeRosterHolds(
+  left: ReadonlyArray<OrchestrationV2PendingBackgroundTask>,
+  right: ReadonlyArray<OrchestrationV2PendingBackgroundTask>,
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((task, index) => {
+      const other = right[index];
+      return (
+        other !== undefined &&
+        task.taskId === other.taskId &&
+        task.kind === other.kind &&
+        (task.awaited === true) === (other.awaited === true)
+      );
+    })
+  );
+}
+
 function parseClaudeBackgroundTaskEntry(
   entry: unknown,
   monitorTasks: ReadonlyMap<string, unknown>,
@@ -6837,29 +6856,43 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           return tasks;
         });
 
+        // Untraced like owedWakeTasksForNativeThread, for the same streamed roster updates.
+        const publishedRosterForNativeThread = Effect.fnUntraced(function* (
+          nativeThreadId: string,
+        ) {
+          const roster = rosterForNativeThread(
+            yield* Ref.get(pendingBackgroundTasksByNativeThread),
+            nativeThreadId,
+          );
+          const awaitedTaskIds = taskIdSetForNativeThread(
+            yield* Ref.get(awaitedBackgroundTasksByNativeThread),
+            nativeThreadId,
+          );
+          const owedWakeTasks = yield* owedWakeTasksForNativeThread(nativeThreadId);
+          return {
+            roster,
+            owedWakeTasks,
+            pendingBackgroundTasks: [
+              ...publishedPendingBackgroundTasks(nativeThreadId, roster, awaitedTaskIds),
+              ...owedWakeTasks,
+            ],
+          };
+        });
+
         const emitProviderThreadRoster = Effect.fnUntraced(function* (input: {
           readonly nativeThreadId: string;
           readonly providerThread: OrchestrationV2ProviderThread;
           readonly status?: OrchestrationV2ProviderThread["status"];
         }) {
-          const roster = rosterForNativeThread(
-            yield* Ref.get(pendingBackgroundTasksByNativeThread),
+          const { owedWakeTasks, pendingBackgroundTasks } = yield* publishedRosterForNativeThread(
             input.nativeThreadId,
           );
-          const awaitedTaskIds = taskIdSetForNativeThread(
-            yield* Ref.get(awaitedBackgroundTasksByNativeThread),
-            input.nativeThreadId,
-          );
-          const owedWakeTasks = yield* owedWakeTasksForNativeThread(input.nativeThreadId);
           const now = yield* DateTime.now;
           const providerThread: OrchestrationV2ProviderThread = {
             ...input.providerThread,
             providerSessionId: session.id,
             ...(input.status === undefined ? {} : { status: input.status }),
-            pendingBackgroundTasks: [
-              ...publishedPendingBackgroundTasks(input.nativeThreadId, roster, awaitedTaskIds),
-              ...owedWakeTasks,
-            ],
+            pendingBackgroundTasks,
             ...(goalsByNativeThread.has(input.nativeThreadId)
               ? { goal: goalsByNativeThread.get(input.nativeThreadId) ?? null }
               : {}),
@@ -9676,24 +9709,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     );
                   }
                 }
-                const roster =
+                const { roster, owedWakeTasks, pendingBackgroundTasks } =
                   nativeThreadId === null
-                    ? new Map<string, OrchestrationV2PendingBackgroundTask>()
-                    : rosterForNativeThread(
-                        yield* Ref.get(pendingBackgroundTasksByNativeThread),
-                        nativeThreadId,
-                      );
-                const awaitedTaskIds =
-                  nativeThreadId === null
-                    ? new Set<string>()
-                    : taskIdSetForNativeThread(
-                        yield* Ref.get(awaitedBackgroundTasksByNativeThread),
-                        nativeThreadId,
-                      );
-                const owedWakeTasks =
-                  nativeThreadId === null
-                    ? []
-                    : yield* owedWakeTasksForNativeThread(nativeThreadId);
+                    ? {
+                        roster: new Map<string, OrchestrationV2PendingBackgroundTask>(),
+                        owedWakeTasks: [],
+                        pendingBackgroundTasks: [],
+                      }
+                    : yield* publishedRosterForNativeThread(nativeThreadId);
                 // A stopped turn that wrote to the transcript moved past the pinned head.
                 const clearConversationHead =
                   (input.status === "completed" || input.context.nativeMessageCursor !== null) &&
@@ -9732,10 +9755,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     input.context.input.providerThread.firstRunOrdinal ??
                     input.context.input.runOrdinal,
                   lastRunOrdinal: input.context.input.runOrdinal,
-                  pendingBackgroundTasks: [
-                    ...publishedPendingBackgroundTasks(nativeThreadId, roster, awaitedTaskIds),
-                    ...owedWakeTasks,
-                  ],
+                  pendingBackgroundTasks,
                   status: input.status === "completed" ? "active" : "idle",
                   updatedAt: input.completedAt,
                 };
@@ -13279,6 +13299,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             );
             if (!goalsByNativeThread.has(nativeThreadId)) {
               goalsByNativeThread.set(nativeThreadId, turnInput.providerThread.goal ?? null);
+            }
+            // A run claims the thread before its turn ingests, and a cached resume keeps its stored
+            // roster, so a change in between is missing; the live query's roster replaces it.
+            const liveQuery = yield* Ref.get(queryContext);
+            if (
+              liveQuery !== null &&
+              liveQuery.nativeThreadId === nativeThreadId &&
+              !liveQuery.stopping &&
+              !sameClaudeRosterHolds(
+                turnInput.providerThread.pendingBackgroundTasks ?? [],
+                (yield* publishedRosterForNativeThread(nativeThreadId)).pendingBackgroundTasks,
+              )
+            ) {
+              yield* emitProviderThreadRoster({
+                nativeThreadId,
+                providerThread: turnInput.providerThread,
+              });
             }
             if (!pdfBudgets.has(nativeThreadId)) {
               // Older sessions did not record retained attachments. Keep their

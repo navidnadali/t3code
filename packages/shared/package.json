@@ -131,6 +131,10 @@
       "types": "./src/KeyedLock.ts",
       "import": "./src/KeyedLock.ts"
     },
+    "./WaitObserver": {
+      "types": "./src/WaitObserver.ts",
+      "import": "./src/WaitObserver.ts"
+    },
     "./schemaJson": {
       "types": "./src/schemaJson.ts",
       "import": "./src/schemaJson.ts"

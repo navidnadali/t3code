@@ -1,8 +1,11 @@
 import { assert, it } from "@effect/vitest";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Ref from "effect/Ref";
+import * as TestClock from "effect/testing/TestClock";
 
+import { recordingWaitObserver } from "../observability/WaitObserver.testkit.ts";
 import { makeKeyedReactor } from "./KeyedReactor.ts";
 
 interface Item {
@@ -123,3 +126,40 @@ it.effect("keeps reacting after an item fails or dies", () =>
     assert.equal(yield* reactor.pendingKeys, 0);
   }),
 );
+
+it.effect("reports each item's wait, whether its key or the pool held it, and pending keys", () => {
+  const { observer, readers, reports } = recordingWaitObserver();
+  return Effect.gen(function* () {
+    const release = yield* Deferred.make<void>();
+    const started = yield* Deferred.make<void>();
+    const reactor = yield* makeKeyedReactor<string, Item>({
+      name: "Probe.reactor",
+      concurrency: 1,
+      handle: (item) =>
+        item.key === "a" && item.value === 1
+          ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          : Effect.void,
+    });
+    yield* reactor.offer("a", { key: "a", value: 1 });
+    yield* Deferred.await(started);
+    yield* reactor.offer("a", { key: "a", value: 2 });
+    yield* reactor.offer("b", { key: "b", value: 1 });
+    assert.equal(readers.get("Probe.reactor.pendingKeys")?.(), 2);
+    yield* TestClock.adjust("1 second");
+    yield* Deferred.succeed(release, undefined);
+    yield* reactor.whenIdle;
+
+    // The first item found the reactor idle; then a's second queued behind a, and b behind the pool.
+    assert.deepEqual(reports("depth"), [
+      ["Probe.reactor", 0],
+      ["Probe.reactor", 1],
+      ["Probe.reactor", 1],
+    ]);
+    assert.deepEqual(reports("wait"), [
+      ["Probe.reactor", 0, undefined],
+      ["Probe.reactor", 1e9, "(pool full)"],
+      ["Probe.reactor", 1e9, "(key busy)"],
+    ]);
+    assert.equal(readers.get("Probe.reactor.pendingKeys")?.(), 0);
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});

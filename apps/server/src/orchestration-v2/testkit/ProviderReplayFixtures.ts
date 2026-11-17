@@ -28,6 +28,7 @@ import {
   type OrchestratorV2ProviderReplayHarness,
 } from "./ProviderReplayHarness.ts";
 import { materializeReplayTranscriptRuntimeInstructions } from "./ReplayRuntimeInstructions.ts";
+import type * as ProjectionStore from "../ProjectionStore.ts";
 import { encodeThreadSnapshotBody } from "../threadSnapshotBody.ts";
 import { projectThreadProjectionForWire } from "../WireProjection.ts";
 
@@ -121,6 +122,10 @@ export interface ReplayFixtureRun<
   WorkspaceError = never,
 > extends ReplayFixtureCase {
   readonly harness: OrchestratorV2ProviderReplayHarness<Transcript, Error>;
+  /** Wraps the projection store, e.g. to see which transaction applies each event. */
+  readonly wrapProjectionStore?: (
+    store: ProjectionStore.ProjectionStoreV2Shape,
+  ) => ProjectionStore.ProjectionStoreV2Shape;
   /** Rewrites recorded workspace paths to the replay workspace, for drivers that record them. */
   readonly materializeWorkspace?: (
     transcript: ProviderReplayTranscript,
@@ -164,11 +169,12 @@ const runFixtureProvider = Effect.fn("runOrchestratorReplayFixture")(function* <
     },
   };
 
-  const result = yield* runOrchestratorV2ProviderReplayScenario(
-    scenario,
-    input.harness,
-    input.driver.runContinuationWorker === true ? { runContinuationWorker: true } : {},
-  ).pipe(provideDeterministicTestRuntime);
+  const result = yield* runOrchestratorV2ProviderReplayScenario(scenario, input.harness, {
+    ...(input.driver.runContinuationWorker === true ? { runContinuationWorker: true } : {}),
+    ...(input.wrapProjectionStore === undefined
+      ? {}
+      : { wrapProjectionStore: input.wrapProjectionStore }),
+  }).pipe(provideDeterministicTestRuntime);
   input.driver.assertOutput(result, transcript);
   assertProviderNativeSubagentRootTurns(result);
   for (const [threadId, projection] of result.projections) {

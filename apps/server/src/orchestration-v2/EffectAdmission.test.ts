@@ -6,7 +6,9 @@ import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 
+import { recordingWaitObserver } from "../observability/WaitObserver.testkit.ts";
 import * as EffectAdmission from "./EffectAdmission.ts";
 
 interface Harness {
@@ -143,6 +145,31 @@ it.effect(
       assert.isUndefined(yield* reserve(admission));
     }),
 );
+
+it.effect("counts the time its gate stood closed and saturated for the wait observer", () => {
+  const { observer, readers } = recordingWaitObserver();
+  return Effect.gen(function* () {
+    const { admission, pressure } = yield* makeHarness(4);
+    const closedMs = readers.get("EffectAdmission.closedMs")!;
+    const saturatedMs = readers.get("EffectAdmission.saturatedMs")!;
+    yield* Ref.set(pressure, 60);
+    const slots = [];
+    for (let index = 0; index < 4; index++) slots.push(yield* reserve(admission));
+    assert.deepEqual([closedMs(), saturatedMs()], [0, 0]);
+
+    // Full since the fourth slot; saturated from the second high sample.
+    yield* TestClock.adjust("3 seconds");
+    assert.deepEqual([closedMs(), saturatedMs()], [3_000, 1_000]);
+    // Two slots still fill the saturated allowance; the third freed reopens the gate.
+    yield* slots[0]!.release;
+    yield* slots[1]!.release;
+    assert.equal(closedMs(), 3_000);
+    yield* slots[2]!.release;
+    yield* TestClock.adjust("2 seconds");
+    assert.deepEqual([closedMs(), saturatedMs()], [3_000, 3_000]);
+    yield* slots[3]!.release;
+  }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+});
 
 it.effect("reopens only below three quarters of the closing mark, not at or above it", () =>
   Effect.gen(function* () {

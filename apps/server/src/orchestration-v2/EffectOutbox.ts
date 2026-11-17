@@ -247,6 +247,13 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
+  /** Each message a thread's steers carry that they have neither delivered nor finished with. */
+  readonly undeliveredSteers: (input: {
+    readonly threadId: ThreadId;
+  }) => Effect.Effect<
+    ReadonlyArray<{ readonly effectId: string; readonly messageId: MessageId }>,
+    EffectOutboxError
+  >;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -606,6 +613,31 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             return row === undefined ? Effect.succeedNone : rowToEffect(row).pipe(Effect.asSome);
           }),
           Effect.mapError((cause) => new EffectOutboxError({ operation: "get", effectId, cause })),
+        ),
+      undeliveredSteers: ({ threadId }) =>
+        sql<{ readonly effect_id: string; readonly message_id: string }>`
+          WITH steer AS (
+            SELECT effect_id, payload_json
+            FROM orchestration_v2_effect_outbox
+            WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+              AND effect_type = 'provider-turn.steer'
+              AND COALESCE(json_extract(payload_json, '$.deliveryPhase'), '') != 'accepted'
+          )
+          SELECT effect_id, json_extract(payload_json, '$.messageId') AS message_id FROM steer
+          UNION ALL
+          SELECT steer.effect_id, merged.value AS message_id
+          FROM steer, json_each(steer.payload_json, '$.mergedMessageIds') AS merged
+        `.pipe(
+          NodeSqliteClient.readOnly,
+          Effect.map((rows) =>
+            rows.map((row) => ({
+              effectId: row.effect_id,
+              messageId: MessageId.make(row.message_id),
+            })),
+          ),
+          Effect.mapError(
+            (cause) => new EffectOutboxError({ operation: "undelivered-steers", cause }),
+          ),
         ),
       awaitAvailable: Queue.take(available),
       awaitControlAvailable: (type) => Queue.take(controlAvailable[type]),

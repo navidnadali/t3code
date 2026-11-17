@@ -2,6 +2,7 @@ import {
   CommandId,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
+  OrchestrationV2PendingBackgroundTask,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Subagent,
   type OrchestrationV2TurnItem,
@@ -39,6 +40,10 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+
+const encodeRoster = Schema.encodeEffect(
+  Schema.fromJsonString(Schema.Array(OrchestrationV2PendingBackgroundTask)),
+);
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
@@ -81,12 +86,15 @@ const CurrentProviderBatch = Context.Reference<ProviderBatchPublication | undefi
 );
 
 export interface EventSinkV2Shape {
-  /** Items that are not provider snapshots, such as a consumer's own control items, never batch. */
+  /**
+   * Items `canBatch` accepts share commits; the rest, such as a consumer's own control items, run
+   * alone once the items before them have committed.
+   */
   readonly consumeProviderEvents: <A extends { readonly type: string }, E, R, E2, R2>(
     source: Stream.Stream<A, E, R>,
     process: (event: A) => Effect.Effect<void, E2, R2>,
     after: Effect.Effect<boolean, E2, R2>,
-    canBatch: Effect.Effect<boolean, never, R2>,
+    canBatch: (event: A) => Effect.Effect<boolean, never, R2>,
   ) => Effect.Effect<
     void,
     E | E2 | ProviderCommitBatch.CommitBatchError | Schema.SchemaError,
@@ -137,6 +145,14 @@ export interface EventSinkV2Shape {
     };
     /** Also refuse while this effect runs. */
     readonly unlessEffectRunning?: string;
+    /**
+     * The provider thread's roster as the writer read it. If the stored roster has changed since,
+     * as an older run's report does before this run starts, its provider-thread.updated keeps it.
+     */
+    readonly rosterAsRead?: {
+      readonly providerThreadId: ProviderThreadId;
+      readonly pendingBackgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>;
+    };
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects?: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<
@@ -158,6 +174,24 @@ export interface EventSinkV2Shape {
   }) => Effect.Effect<
     {
       readonly committed: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
+  /**
+   * While a run newer than afterRunOrdinal holds the provider thread without having started its
+   * turn, stores only the payload's pendingBackgroundTasks on the stored row, updated at the event's
+   * occurredAt. A roster already stored appends nothing. `unattached` is false once that run started.
+   */
+  readonly writeProviderThreadRosterIfUnattached: (input: {
+    readonly afterRunOrdinal: number;
+    readonly event: Extract<
+      OrchestrationV2DomainEvent,
+      { readonly type: "provider-thread.updated" }
+    >;
+  }) => Effect.Effect<
+    {
+      readonly unattached: boolean;
       readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
     },
     EventSinkV2Error
@@ -429,6 +463,37 @@ const layerBase: Layer.Layer<
         });
       });
 
+    const sameRoster = Effect.fnUntraced(function* (
+      left: ReadonlyArray<OrchestrationV2PendingBackgroundTask>,
+      right: ReadonlyArray<OrchestrationV2PendingBackgroundTask>,
+    ) {
+      return (yield* encodeRoster(left)) === (yield* encodeRoster(right));
+    });
+
+    // The enclosing write's span already traces this merge.
+    const keepChangedStoredRoster = Effect.fnUntraced(function* (
+      events: ReadonlyArray<OrchestrationV2DomainEvent>,
+      asRead: NonNullable<Parameters<EventSinkV2Shape["writeIfRunCurrent"]>[0]["rosterAsRead"]>,
+    ) {
+      const rows = yield* sql<{ readonly payload_json: string }>`
+        SELECT payload_json
+        FROM orchestration_v2_projection_provider_threads
+        WHERE provider_thread_id = ${asRead.providerThreadId}
+        LIMIT 1
+      `;
+      const row = rows[0];
+      if (row === undefined) return events;
+      const stored =
+        (yield* ProjectionStore.decodeProviderThreadPayload(row.payload_json))
+          .pendingBackgroundTasks ?? [];
+      if (yield* sameRoster(stored, asRead.pendingBackgroundTasks)) return events;
+      return events.map((event) =>
+        event.type === "provider-thread.updated" && event.payload.id === asRead.providerThreadId
+          ? { ...event, payload: { ...event.payload, pendingBackgroundTasks: stored } }
+          : event,
+      );
+    });
+
     const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
       const runOrdinals = new Map(
         events.flatMap((event) =>
@@ -628,10 +693,14 @@ const layerBase: Layer.Layer<
               }
             }
 
+            const events =
+              input.rosterAsRead === undefined
+                ? input.events
+                : yield* keepChangedStoredRoster(input.events, input.rosterAsRead);
             const normalized = yield* normalizeEvents(
               input.guardPendingUserInputCancellations === true
-                ? yield* guardUserInputCancellations(input.events)
-                : input.events,
+                ? yield* guardUserInputCancellations(events)
+                : events,
             );
             const storedEvents = yield* eventStore.append({
               ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
@@ -707,6 +776,61 @@ const layerBase: Layer.Layer<
         }),
         (result) =>
           result.committed
+            ? publishStoredEvents(result.storedEvents, result.outcomes)
+            : Effect.void,
+      );
+    });
+
+    const writeProviderThreadRosterIfUnattachedEffect = Effect.fn(
+      "orchestrationV2.EventSink.writeProviderThreadRosterIfUnattached",
+    )(function* (input: Parameters<EventSinkV2Shape["writeProviderThreadRosterIfUnattached"]>[0]) {
+      yield* Effect.annotateCurrentSpan({
+        "orchestration_v2.provider_thread_id": input.event.payload.id,
+        "orchestration_v2.after_run_ordinal": input.afterRunOrdinal,
+      });
+
+      return yield* commitThenPublish(
+        Effect.gen(function* () {
+          // The run that claimed the row attaches at its turn start, which stores it running.
+          const rows = yield* sql<{ readonly payload_json: string }>`
+            SELECT p.payload_json
+            FROM orchestration_v2_projection_provider_threads p
+            JOIN orchestration_v2_projection_runs r
+              ON r.thread_id = p.thread_id
+             AND r.ordinal = p.last_run_ordinal
+            WHERE p.provider_thread_id = ${input.event.payload.id}
+              AND p.last_run_ordinal > ${input.afterRunOrdinal}
+              AND r.status IN ('preparing', 'queued', 'starting')
+            LIMIT 1
+          `;
+          const current = rows[0];
+          const none = {
+            storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+            outcomes: [] as ReadonlyArray<RunOutcome>,
+          };
+          if (current === undefined) return { unattached: false, ...none };
+          const stored = yield* ProjectionStore.decodeProviderThreadPayload(current.payload_json);
+          const roster = input.event.payload.pendingBackgroundTasks ?? [];
+          if (yield* sameRoster(stored.pendingBackgroundTasks ?? [], roster)) {
+            return { unattached: true, ...none };
+          }
+          const storedEvents = yield* eventStore.append({
+            events: [
+              {
+                ...input.event,
+                payload: {
+                  ...stored,
+                  pendingBackgroundTasks: roster,
+                  updatedAt: input.event.occurredAt,
+                },
+              },
+            ],
+          });
+          const outcomes = yield* applyStoredEvents(storedEvents);
+          return { unattached: true, storedEvents, outcomes };
+        }),
+        (result) =>
+          result.storedEvents.length > 0
             ? publishStoredEvents(result.storedEvents, result.outcomes)
             : Effect.void,
       );
@@ -1235,6 +1359,10 @@ const layerBase: Layer.Layer<
                 cause,
               }),
           ),
+        ),
+      writeProviderThreadRosterIfUnattached: (input) =>
+        writeProviderThreadRosterIfUnattachedEffect(input).pipe(
+          Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 1, cause })),
         ),
       writeIfProviderThreadUnchanged: (input) =>
         writeIfProviderThreadUnchangedEffect(input).pipe(

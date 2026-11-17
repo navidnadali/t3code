@@ -15,12 +15,16 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ProviderTurnId,
+  RunId,
   RuntimeRequestId,
   ScheduledTaskId,
   ThreadId,
   TurnItemId,
   type ModelSelection,
+  type OrchestrationV2Command,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -33,6 +37,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -45,6 +50,7 @@ import * as EventSink from "./EventSink.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import { queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
@@ -2514,7 +2520,14 @@ it.effect.each(["steer", "auto"] as const)(
           threadDisposition: "reusable",
         });
         yield* Fiber.join(queuedSettled);
-        const deferredStarting = yield* watchRun("deferred", "starting");
+        // Created behind the queued run, it starts by an update; created after that run ended,
+        // it is created starting.
+        const deferredStarting = yield* watch(
+          (event) =>
+            (event.type === "run.created" || event.type === "run.updated") &&
+            event.payload.userMessageId === "deferred" &&
+            event.payload.status === "starting",
+        );
         yield* worker.drain();
         yield* Fiber.join(deferredStarting);
         yield* worker.drain();
@@ -8115,10 +8128,1491 @@ it.effect("an automatic promotion into a turn that just ended is refused, never 
   }),
 );
 
+// A delegated child whose original task settled: its parent's first follow-up runs as the
+// child's turn, and later follow-ups queue behind it with tasks of their own.
+const delegatedFollowupHarness = Effect.fn("delegatedFollowupHarness")(function* (
+  name: string,
+  steerAcknowledgement: Effect.Effect<
+    void,
+    ProviderAdapter.ProviderAdapterSteerRunError
+  > = Effect.void,
+) {
+  const harness = yield* nextTurnSelectionHarness(
+    name,
+    false,
+    true,
+    Effect.void,
+    true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    Effect.void,
+    steerAcknowledgement,
+  );
+  const parentThreadId = ThreadId.make(`thread:${name}:parent`);
+  const childThreadId = ThreadId.make(`thread:${name}`);
+  const parentRunId = RunId.make(`run:${name}:parent`);
+  const originalTaskId = NodeId.make(`node:${name}:original`);
+  /** The parent's thread_send to its child, or the user's own message there. */
+  const send = Effect.fn("send")(function* (
+    key: string,
+    dispatchMode: Extract<OrchestrationV2Command, { type: "message.dispatch" }>["dispatchMode"],
+    options: { readonly fromUser?: boolean; readonly deliveryIntent?: "auto" } = {},
+  ) {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`send-${key}`),
+      threadId: childThreadId,
+      messageId: MessageId.make(`message:${key}`),
+      text: key,
+      attachments: [],
+      dispatchMode,
+      ...(options.deliveryIntent === undefined ? {} : { deliveryIntent: options.deliveryIntent }),
+      ...(options.fromUser === true
+        ? { createdBy: "user" as const, creationSource: "web" as const }
+        : {
+            senderThreadId: parentThreadId,
+            createdBy: "agent" as const,
+            creationSource: "mcp" as const,
+          }),
+    });
+  });
+  // Replays the child's events from the start, so one already written is found too.
+  const childEvent = <A>(match: (event: OrchestrationV2DomainEvent) => A | undefined) =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      return yield* sink.stream({ threadId: childThreadId, afterSequence: 0 }).pipe(
+        Stream.filterMap(({ event }) => {
+          const value = match(event);
+          return value === undefined ? Result.failVoid : Result.succeed(value);
+        }),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.map((values) => values[0]!),
+      );
+    });
+  /** Starts the child's next queued run once its run-end reaction picked it. */
+  const startRun = Effect.fn("startRun")(function* (runId: RunId) {
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+    const attemptId = yield* childEvent((event) =>
+      event.type === "run.updated" &&
+      event.payload.id === runId &&
+      event.payload.status !== "queued"
+        ? (event.payload.activeAttemptId ?? undefined)
+        : undefined,
+    );
+    yield* worker.drain();
+    yield* childEvent((event) =>
+      event.type === "provider-turn.updated" &&
+      event.payload.runAttemptId === attemptId &&
+      event.payload.status === "running"
+        ? true
+        : undefined,
+    );
+  });
+  const startChildTurn = Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`create-${name}-parent`),
+      threadId: parentThreadId,
+      projectId: ProjectId.make(`project:${name}`),
+      title: "Coordinator",
+      modelSelection: runSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: harness.cwd,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const now = yield* DateTime.now;
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(`${name}:parent-run`),
+          type: "run.updated",
+          threadId: parentThreadId,
+          runId: parentRunId,
+          occurredAt: now,
+          payload: {
+            id: parentRunId,
+            threadId: parentThreadId,
+            ordinal: 1,
+            providerInstanceId: instanceId,
+            modelSelection: runSelection,
+            providerThreadId: null,
+            userMessageId: MessageId.make(`message:${name}:parent`),
+            rootNodeId: NodeId.make(`node:${name}:parent-root`),
+            activeAttemptId: null,
+            status: "completed",
+            requestedAt: now,
+            startedAt: now,
+            completedAt: now,
+            checkpointId: null,
+            contextHandoffId: null,
+            delegatedCompletion: { disposition: "open", nextGeneration: 2, delivery: null },
+          },
+        },
+        {
+          id: EventId.make(`${name}:original-task`),
+          type: "subagent.updated",
+          threadId: parentThreadId,
+          runId: parentRunId,
+          nodeId: originalTaskId,
+          occurredAt: now,
+          payload: {
+            id: originalTaskId,
+            threadId: parentThreadId,
+            runId: parentRunId,
+            parentNodeId: NodeId.make(`node:${name}:parent-root`),
+            origin: "app_owned",
+            createdBy: "agent",
+            driver,
+            providerInstanceId: instanceId,
+            providerThreadId: null,
+            childThreadId,
+            nativeTaskRef: null,
+            prompt: "Start the work.",
+            title: "Worker",
+            model: null,
+            completionWake: "always",
+            completionDelivery: { state: "acknowledged", observedByRunId: parentRunId },
+            status: "completed",
+            result: "Started.",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+          },
+        },
+        {
+          id: EventId.make(`${name}:child`),
+          type: "thread.created",
+          threadId: childThreadId,
+          occurredAt: now,
+          payload: {
+            createdBy: "agent",
+            creationSource: "server",
+            id: childThreadId,
+            projectId: ProjectId.make(`project:${name}`),
+            title: "Worker",
+            providerInstanceId: instanceId,
+            modelSelection: runSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: harness.cwd,
+            activeProviderThreadId: null,
+            lineage: {
+              parentThreadId,
+              relationshipToParent: "subagent",
+              rootThreadId: parentThreadId,
+            },
+            forkedFrom: { type: "node", nodeId: originalTaskId },
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        },
+      ],
+    });
+    yield* send("first", { type: "start_immediately" });
+    const firstRun = (yield* orchestrator.getThreadProjection(childThreadId)).runs[0]!;
+    yield* startRun(firstRun.id);
+    yield* (yield* ThreadCommandExecutor.ThreadCommandExecutor).withLock(
+      childThreadId,
+      Effect.void,
+    );
+  });
+  /** The task the parent got for a message it sent its child. */
+  const taskOf = Effect.fn("taskOf")(function* (key: string) {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const child = yield* orchestrator.getThreadProjection(childThreadId);
+    const taskId = child.runs.find(
+      (run) => run.userMessageId === MessageId.make(`message:${key}`),
+    )?.delegatedTaskId;
+    assert.isDefined(taskId, `no task for ${key}`);
+    return taskId!;
+  });
+  /** The parent's next update of a task that matches, from now on. */
+  const nextTaskUpdate = Effect.fn("nextTaskUpdate")(function* (
+    taskId: NodeId,
+    matches: (task: OrchestrationV2Subagent) => boolean,
+  ) {
+    const sink = yield* EventSink.EventSinkV2;
+    const afterSequence = yield* sink.latestSequence({ threadId: parentThreadId });
+    return yield* sink.stream({ threadId: parentThreadId, afterSequence }).pipe(
+      Stream.filterMap(({ event }) =>
+        event.type === "subagent.updated" && event.payload.id === taskId && matches(event.payload)
+          ? Result.succeed(event.payload)
+          : Result.failVoid,
+      ),
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.map((updates) => updates[0]!),
+      Effect.forkScoped,
+    );
+  });
+  /** Ends a child turn with an answer; its checkpoint capture completes its run. */
+  const endTurn = Effect.fn("endTurn")(function* (index: number, answer: string) {
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const turnInput = harness.started[index]!;
+    const turn = yield* childEvent((event) =>
+      event.type === "provider-turn.updated" && event.payload.runAttemptId === turnInput.attemptId
+        ? event.payload
+        : undefined,
+    );
+    const runReaches = (status: OrchestrationV2Run["status"]) =>
+      Effect.flatMap(sink.latestSequence({ threadId: childThreadId }), (afterSequence) =>
+        sink.stream({ threadId: childThreadId, afterSequence }).pipe(
+          Stream.filter(
+            ({ event }) =>
+              event.type === "run.updated" &&
+              event.payload.id === turnInput.runId &&
+              event.payload.status === status,
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        ),
+      );
+    const waiting = yield* runReaches("waiting");
+    const now = yield* DateTime.now;
+    yield* Queue.offer(harness.events, {
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        id: TurnItemId.make(`answer:${turnInput.runId}`),
+        threadId: childThreadId,
+        runId: turnInput.runId,
+        nodeId: turnInput.rootNodeId,
+        providerThreadId: turn.providerThreadId,
+        providerTurnId: turn.id,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "assistant_message",
+        messageId: MessageId.make(`message:answer:${turnInput.runId}`),
+        text: answer,
+        streaming: false,
+      },
+    });
+    yield* Queue.offer(harness.events, {
+      type: "provider_turn.updated",
+      driver,
+      providerTurn: { ...turn, status: "completed", completedAt: now },
+    });
+    yield* Queue.offer(harness.events, {
+      type: "turn.terminal",
+      driver,
+      providerThreadId: turn.providerThreadId,
+      providerTurnId: turn.id,
+      runOrdinal: turnInput.runOrdinal,
+      status: "completed",
+      failure: null,
+      threadDisposition: "reusable",
+    });
+    yield* Fiber.join(waiting);
+    // Its checkpoint capture ends the wait.
+    const completed = yield* runReaches("completed");
+    yield* worker.drain();
+    yield* Fiber.join(completed);
+  });
+  /** What the parent holds for the child: its tasks, result transfers and wake cohort. */
+  const parentView = Effect.gen(function* () {
+    const parent = yield* (yield* Orchestrator.OrchestratorV2).getThreadProjection(parentThreadId);
+    return {
+      tasks: parent.subagents.filter((task) => task.childThreadId === childThreadId),
+      transfers: parent.contextTransfers.filter(
+        (transfer) =>
+          transfer.type === "subagent_result" && transfer.sourceThreadId === childThreadId,
+      ),
+      delivery:
+        parent.runs.find((run) => run.id === parentRunId)?.delegatedCompletion?.delivery ?? null,
+    };
+  });
+  return {
+    ...harness,
+    parentThreadId,
+    childThreadId,
+    originalTaskId,
+    send,
+    startRun,
+    startChildTurn,
+    taskOf,
+    nextTaskUpdate,
+    endTurn,
+    parentView,
+  };
+});
+
+// A queued follow-up that automatic Send now (A) or a deferred steer (B) promotes into the
+// child's running turn cancels its own run before it starts. Its task settles with the turn it
+// joined, which got the message, never as cancelled.
+it.effect.each(["automatic Send now", "a deferred steer"] as const)(
+  "a parent's follow-up that %s steers into its child's turn settles with that turn, told once",
+  (promotion) =>
+    Effect.gen(function* () {
+      const harness = yield* delegatedFollowupHarness(
+        `r1-${promotion === "automatic Send now" ? "auto-send-now" : "deferred-steer"}`,
+      );
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        const firstTaskId = yield* harness.taskOf("first");
+        const live = yield* orchestrator.getThreadProjection(harness.childThreadId);
+        const run = live.runs.find((candidate) => candidate.id === first.runId)!;
+        const turn = live.providerTurns.find(
+          (candidate) => candidate.runAttemptId === first.attemptId,
+        )!;
+        if (promotion === "automatic Send now") {
+          yield* harness.send("second", { type: "queue_after_active" });
+        } else {
+          // The child's turn is between reports; an automatic send waits for it to run again.
+          const now = yield* DateTime.now;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("r1-gap-run"),
+                type: "run.updated",
+                threadId: harness.childThreadId,
+                occurredAt: now,
+                payload: { ...run, status: "starting" },
+              },
+              {
+                id: EventId.make("r1-gap-turn"),
+                type: "provider-turn.updated",
+                threadId: harness.childThreadId,
+                occurredAt: now,
+                payload: { ...turn, status: "pending" },
+              },
+            ],
+          });
+          yield* harness.send(
+            "second",
+            { type: "steer_active", targetRunId: first.runId },
+            { deliveryIntent: "auto" },
+          );
+          const deferred = (yield* orchestrator.getThreadProjection(
+            harness.childThreadId,
+          )).runs.find((candidate) => candidate.userMessageId === MessageId.make("message:second"));
+          assert.equal(deferred?.steerWhenReadyRunId, first.runId);
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("r1-ready-run"),
+                type: "run.updated",
+                threadId: harness.childThreadId,
+                occurredAt: now,
+                payload: run,
+              },
+            ],
+          });
+        }
+        const taskId = yield* harness.taskOf("second");
+        assert.equal(
+          (yield* harness.parentView).tasks.find((task) => task.id === taskId)?.status,
+          "pending",
+        );
+        const promoted = yield* steersInto(orchestrator, first.runId, 1);
+        const joined = yield* harness.nextTaskUpdate(taskId, (task) => task.status !== "pending");
+        if (promotion === "automatic Send now") {
+          yield* TestClock.adjust("61 seconds");
+        } else {
+          yield* Queue.offer(harness.events, {
+            type: "provider_turn.updated",
+            driver,
+            providerTurn: turn,
+          });
+        }
+        yield* Fiber.join(promoted);
+        yield* worker.drain();
+        assert.deepEqual(harness.steered, ["second"]);
+        // The parent hears nothing yet: the child is still answering in the turn it joined.
+        const running = yield* Fiber.join(joined);
+        assert.equal(running.status, "running");
+        assert.isNull(running.result);
+
+        const settled = yield* harness.nextTaskUpdate(taskId, (task) => task.result !== null);
+        yield* harness.endTurn(0, "Both follow-ups answered.");
+        const answered = yield* Fiber.join(settled);
+        assert.equal(answered.status, "completed");
+        assert.equal(answered.result, "Both follow-ups answered.");
+
+        const view = yield* harness.parentView;
+        assert.deepEqual(
+          view.tasks.map((task) => [task.id, task.status, task.result]).toSorted(),
+          [
+            [harness.originalTaskId, "completed", "Started."],
+            [firstTaskId, "completed", "Both follow-ups answered."],
+            [taskId, "completed", "Both follow-ups answered."],
+          ].toSorted(),
+        );
+        // One result for the shared turn, and one wake that names each task once.
+        assert.deepEqual(
+          view.transfers.map((transfer) => transfer.sourcePoint.runId),
+          [first.runId],
+        );
+        assert.deepEqual(view.delivery?.taskIds.toSorted(), [firstTaskId, taskId].toSorted());
+        assert.lengthOf(harness.started, 1);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect(
+  "a merged automatic steer settles each follow-up it carries once, with the turn they joined",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* delegatedFollowupHarness("r1-merged");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        const firstTaskId = yield* harness.taskOf("first");
+        // The parent's follow-up and the user's own message to the child each get a task.
+        yield* harness.send("second", { type: "queue_after_active" });
+        yield* harness.send("third", { type: "queue_after_active" }, { fromUser: true });
+        const secondTaskId = yield* harness.taskOf("second");
+        const thirdTaskId = yield* harness.taskOf("third");
+        const promoted = yield* steersInto(orchestrator, first.runId, 2);
+        const joined = yield* Effect.forEach([secondTaskId, thirdTaskId], (taskId) =>
+          harness.nextTaskUpdate(taskId, (task) => task.status !== "pending"),
+        );
+        yield* TestClock.adjust("61 seconds");
+        yield* Fiber.join(promoted);
+        yield* worker.drain();
+        assert.deepEqual(harness.steered, [
+          [
+            "2 queued messages, sent together:",
+            "[1/2] From the user:\nthird",
+            `[2/2] From thread ${harness.parentThreadId}:\nsecond`,
+          ].join("\n\n"),
+        ]);
+        assert.deepEqual(
+          (yield* Effect.forEach(joined, Fiber.join)).map((task) => [task.status, task.result]),
+          [
+            ["running", null],
+            ["running", null],
+          ],
+        );
+
+        const settled = yield* Effect.forEach([secondTaskId, thirdTaskId], (taskId) =>
+          harness.nextTaskUpdate(taskId, (task) => task.result !== null),
+        );
+        yield* harness.endTurn(0, "All three answered.");
+        yield* Effect.forEach(settled, Fiber.join);
+        // Recovery finds nothing left to settle or tell.
+        const before = yield* harness.parentView;
+        yield* orchestrator.recoverDelegatedTasks;
+        const view = yield* harness.parentView;
+        assert.deepEqual(view, before);
+        assert.deepEqual(
+          view.tasks
+            .filter((task) => task.id !== harness.originalTaskId)
+            .map((task) => [task.id, task.status, task.result])
+            .toSorted(),
+          [firstTaskId, secondTaskId, thirdTaskId]
+            .map((id) => [id, "completed", "All three answered."])
+            .toSorted(),
+        );
+        assert.deepEqual(
+          view.transfers.map((transfer) => transfer.sourcePoint.runId),
+          [first.runId],
+        );
+        assert.deepEqual(
+          view.delivery?.taskIds.toSorted(),
+          [firstTaskId, secondTaskId, thirdTaskId].toSorted(),
+        );
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect(
+  "a promoted follow-up whose steer misses the turn settles once, from the run it queues again as",
+  () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const harness = yield* delegatedFollowupHarness(
+        "r1-missed",
+        Effect.suspend(() =>
+          attempts++ > 0
+            ? Effect.void
+            : Effect.fail(
+                new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver,
+                  providerThreadId: ProviderThreadId.make("provider-thread:r1-missed"),
+                  providerTurnId: ProviderTurnId.make("provider-turn:r1-missed"),
+                  deliveryNotSent: true,
+                  cause: "The turn ended before the steer reached it",
+                }),
+              ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        const firstTaskId = yield* harness.taskOf("first");
+        yield* harness.send("second", { type: "queue_after_active" });
+        const taskId = yield* harness.taskOf("second");
+        const promoted = yield* steersInto(orchestrator, first.runId, 1);
+        yield* TestClock.adjust("61 seconds");
+        yield* Fiber.join(promoted);
+        yield* worker.drain();
+        assert.deepEqual(harness.steered, []);
+        // The message queues again, as the same follow-up.
+        const again = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs.find(
+          (run) =>
+            run.status === "queued" && run.userMessageId === MessageId.make("message:second"),
+        );
+        assert.equal(again?.steerFollowUpOfRunId, first.runId);
+        assert.equal(again?.delegatedTaskId, taskId);
+
+        yield* harness.endTurn(0, "First answered.");
+        yield* harness.startRun(again!.id);
+        assert.deepEqual(
+          harness.started.map((turn) => turn.message.text),
+          ["first", "second"],
+        );
+        const settled = yield* harness.nextTaskUpdate(taskId, (task) => task.result !== null);
+        yield* harness.endTurn(1, "Second answered.");
+        yield* Fiber.join(settled);
+        const view = yield* harness.parentView;
+        assert.deepEqual(
+          view.tasks.map((task) => [task.id, task.status, task.result]).toSorted(),
+          [
+            [harness.originalTaskId, "completed", "Started."],
+            [firstTaskId, "completed", "First answered."],
+            [taskId, "completed", "Second answered."],
+          ].toSorted(),
+        );
+        assert.deepEqual(
+          view.transfers.map((transfer) => transfer.sourcePoint.runId).toSorted(),
+          [first.runId, again!.id].toSorted(),
+        );
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect.each([
+  { name: "steered before the Stop", deliverBeforeStop: true },
+  { name: "steer still pending at the Stop", deliverBeforeStop: false },
+])("a Stop leaves a promoted follow-up's task with its message ($name)", ({ deliverBeforeStop }) =>
+  Effect.gen(function* () {
+    const harness = yield* delegatedFollowupHarness(`r1-stop-${deliverBeforeStop}`);
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* harness.startChildTurn;
+      const first = harness.started[0]!;
+      const firstTaskId = yield* harness.taskOf("first");
+      yield* harness.send("second", { type: "queue_after_active" });
+      const taskId = yield* harness.taskOf("second");
+      const promoted = yield* steersInto(orchestrator, first.runId, 1);
+      yield* TestClock.adjust("61 seconds");
+      yield* Fiber.join(promoted);
+      if (deliverBeforeStop) yield* worker.drain();
+      assert.lengthOf(harness.steered, deliverBeforeStop ? 1 : 0);
+      const interrupted = yield* orchestrator.streamDomainEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "run.updated" &&
+            event.payload.id === first.runId &&
+            event.payload.status === "interrupted",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      const firstStopped = yield* harness.nextTaskUpdate(
+        firstTaskId,
+        (task) => task.result !== null,
+      );
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make(`stop-${deliverBeforeStop}`),
+        threadId: harness.childThreadId,
+        reason: "held by the user",
+      });
+      yield* worker.drain();
+      yield* Fiber.join(interrupted);
+      assert.equal((yield* Fiber.join(firstStopped)).status, "interrupted");
+      yield* stepClock(harness.childThreadId, 1, true);
+      const task = (yield* harness.parentView).tasks.find((candidate) => candidate.id === taskId);
+      if (deliverBeforeStop) {
+        // The child had the message when it was stopped; the task ends with that turn.
+        assert.equal(task?.status, "interrupted");
+        assert.equal(task?.result, "Child task ended with status interrupted.");
+        assert.lengthOf(harness.started, 1);
+        return;
+      }
+      // The message is held again, and its task waits with it until the queue resumes.
+      const held = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs.find(
+        (run) => run.status === "queued" && run.userMessageId === MessageId.make("message:second"),
+      )!;
+      assert.equal(held.queueHeld, true);
+      assert.equal(task?.status, "idle");
+      assert.isNull(task?.result ?? null);
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make(`resume-${deliverBeforeStop}`),
+        threadId: harness.childThreadId,
+      });
+      yield* harness.startRun(held.id);
+      assert.deepEqual(
+        harness.started.map((turn) => turn.message.text),
+        ["first", "second"],
+      );
+      const settled = yield* harness.nextTaskUpdate(
+        taskId,
+        (candidate) => candidate.result !== null,
+      );
+      yield* harness.endTurn(1, "Second answered after the Stop.");
+      const answered = yield* Fiber.join(settled);
+      assert.equal(answered.status, "completed");
+      assert.equal(answered.result, "Second answered after the Stop.");
+      assert.lengthOf((yield* harness.parentView).tasks, 3);
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect(
+  "a promoted follow-up waits for its steer when the turn it joined ends before the steer is sent",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* delegatedFollowupHarness("r1-ended-first");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const sink = yield* EventSink.EventSinkV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        const firstTaskId = yield* harness.taskOf("first");
+        yield* harness.send("second", { type: "queue_after_active" });
+        const taskId = yield* harness.taskOf("second");
+        const promoted = yield* steersInto(orchestrator, first.runId, 1);
+        yield* TestClock.adjust("61 seconds");
+        yield* Fiber.join(promoted);
+        // The steer is still to be sent when the turn ends, and the user's message waiting behind
+        // the turn ends its run at once.
+        yield* harness.send("third", { type: "queue_after_active" }, { fromUser: true });
+        const thirdTaskId = yield* harness.taskOf("third");
+        const firstSettled = yield* harness.nextTaskUpdate(
+          firstTaskId,
+          (task) => task.result !== null,
+        );
+        const turn = (yield* orchestrator.getThreadProjection(harness.childThreadId))
+          .providerTurns[0]!;
+        const afterSequence = yield* sink.latestSequence({ threadId: harness.childThreadId });
+        const ended = yield* sink.stream({ threadId: harness.childThreadId, afterSequence }).pipe(
+          Stream.filter(
+            ({ event }) =>
+              event.type === "run.updated" &&
+              event.payload.id === first.runId &&
+              event.payload.status === "completed",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        const now = yield* DateTime.now;
+        yield* Queue.offer(harness.events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: { ...turn, status: "completed", completedAt: now },
+        });
+        yield* Queue.offer(harness.events, {
+          type: "turn.terminal",
+          driver,
+          providerThreadId: turn.providerThreadId,
+          providerTurnId: turn.id,
+          runOrdinal: first.runOrdinal,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(ended);
+        yield* Fiber.join(firstSettled);
+        yield* executor.withLock(harness.parentThreadId, Effect.void);
+        // The turn ended without the message, so its follow-up has no answer yet.
+        const waiting = (yield* harness.parentView).tasks.find((task) => task.id === taskId);
+        assert.isNull(waiting?.result ?? null);
+
+        // The steer finds the turn over and queues the message again, as the same follow-up. It
+        // is due at once, so it steers into the next turn: the user's message's.
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* worker.drain();
+        assert.deepEqual(harness.steered, []);
+        const runs = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs;
+        const third = runs.find((run) => run.userMessageId === MessageId.make("message:third"))!;
+        const again = runs.find(
+          (run) =>
+            run.status === "queued" && run.userMessageId === MessageId.make("message:second"),
+        )!;
+        assert.equal(again.delegatedTaskId, taskId);
+        const steeredAgain = yield* steersInto(orchestrator, third.id, 1);
+        yield* harness.startRun(third.id);
+        yield* Fiber.join(steeredAgain);
+        yield* worker.drain();
+        assert.deepEqual(harness.steered, ["second"]);
+        const settled = yield* harness.nextTaskUpdate(taskId, (task) => task.result !== null);
+        yield* harness.endTurn(1, "Third and second answered.");
+        const answered = yield* Fiber.join(settled);
+        assert.equal(answered.status, "completed");
+        assert.equal(answered.result, "Third and second answered.");
+        const tasks = (yield* harness.parentView).tasks;
+        assert.deepEqual(
+          tasks.map((task) => task.id).toSorted(),
+          [harness.originalTaskId, firstTaskId, taskId, thirdTaskId].toSorted(),
+        );
+        assert.equal(
+          tasks.find((task) => task.id === thirdTaskId)?.result,
+          "Third and second answered.",
+        );
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect("a promoted follow-up held for its steer settles once that steer fails for good", () =>
+  Effect.gen(function* () {
+    const harness = yield* delegatedFollowupHarness(
+      "r1-steer-fails",
+      Effect.fail(
+        new ProviderAdapter.ProviderAdapterSteerRunError({
+          driver,
+          providerThreadId: ProviderThreadId.make("provider-thread:r1-steer-fails"),
+          providerTurnId: ProviderTurnId.make("provider-turn:r1-steer-fails"),
+          cause: "The provider dropped the connection mid-steer",
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+      const sink = yield* EventSink.EventSinkV2;
+      yield* harness.startChildTurn;
+      const first = harness.started[0]!;
+      const firstTaskId = yield* harness.taskOf("first");
+      yield* harness.send("second", { type: "queue_after_active" });
+      const taskId = yield* harness.taskOf("second");
+      const promoted = yield* steersInto(orchestrator, first.runId, 1);
+      yield* TestClock.adjust("61 seconds");
+      yield* Fiber.join(promoted);
+      // The provider fails mid-steer, so whether the message arrived is unknown.
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* worker.drain();
+      assert.deepEqual(harness.steered, []);
+      // The turn then fails, so no checkpoint capture follows it to finalize the child again.
+      const firstSettled = yield* harness.nextTaskUpdate(
+        firstTaskId,
+        (task) => task.result !== null,
+      );
+      const turn = (yield* orchestrator.getThreadProjection(harness.childThreadId))
+        .providerTurns[0]!;
+      const afterSequence = yield* sink.latestSequence({ threadId: harness.childThreadId });
+      const ended = yield* sink.stream({ threadId: harness.childThreadId, afterSequence }).pipe(
+        Stream.filter(
+          ({ event }) =>
+            event.type === "run.updated" &&
+            event.payload.id === first.runId &&
+            event.payload.status === "failed",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      const now = yield* DateTime.now;
+      yield* Queue.offer(harness.events, {
+        type: "provider_turn.updated",
+        driver,
+        providerTurn: { ...turn, status: "failed", completedAt: now },
+      });
+      yield* Queue.offer(harness.events, {
+        type: "turn.terminal",
+        driver,
+        providerThreadId: turn.providerThreadId,
+        providerTurnId: turn.id,
+        runOrdinal: first.runOrdinal,
+        status: "failed",
+        failure: makeProviderFailure({ message: "The provider crashed", class: "provider_error" }),
+        failureItemOrdinal: 100,
+        threadDisposition: "reusable",
+      });
+      yield* Fiber.join(ended);
+      yield* Fiber.join(firstSettled);
+      yield* executor.withLock(harness.parentThreadId, Effect.void);
+      assert.isNull(
+        (yield* harness.parentView).tasks.find((task) => task.id === taskId)?.result ?? null,
+      );
+
+      // The steer is never sent again while its delivery is uncertain; once it has failed for
+      // good, the follow-up settles with the turn it joined.
+      const settled = yield* harness.nextTaskUpdate(taskId, (task) => task.result !== null);
+      yield* stepClock(harness.childThreadId, 2, true);
+      assert.deepEqual(harness.steered, []);
+      const answered = yield* Fiber.join(settled);
+      assert.equal(answered.status, "failed");
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect("cancelling a promoted follow-up before its steer runs leaves nothing of it queued", () =>
+  Effect.gen(function* () {
+    const harness = yield* delegatedFollowupHarness("r1-cancel-undelivered");
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* harness.startChildTurn;
+      const first = harness.started[0]!;
+      yield* harness.send("second", { type: "queue_after_active" });
+      const taskId = yield* harness.taskOf("second");
+      const promoted = yield* steersInto(orchestrator, first.runId, 1);
+      yield* TestClock.adjust("61 seconds");
+      yield* Fiber.join(promoted);
+      // The parent cancels the follow-up while the steer carrying it is still to run.
+      yield* orchestrator.cancelDelegatedTask({
+        parentThreadId: harness.parentThreadId,
+        taskId,
+        command: {
+          type: "thread.stop",
+          commandId: CommandId.make("cancel-undelivered"),
+          threadId: harness.childThreadId,
+          stopDelegatedTasks: false,
+        },
+        stopDescendants: () => Effect.void,
+      });
+      yield* worker.drain();
+      yield* stepClock(harness.childThreadId, 1, true);
+      assert.deepEqual(harness.steered, []);
+      const child = yield* orchestrator.getThreadProjection(harness.childThreadId);
+      assert.deepEqual(
+        child.runs
+          .filter(
+            (run) =>
+              run.status === "queued" && run.userMessageId === MessageId.make("message:second"),
+          )
+          .map((run) => run.id),
+        [],
+      );
+      const cancelled = (yield* harness.parentView).tasks.find((task) => task.id === taskId);
+      assert.equal(cancelled?.status, "interrupted");
+      assert.equal(cancelled?.completionDelivery?.state, "disposed");
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect(
+  "a self-send sent into another task's turn queues again as its own task when its steer misses",
+  () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const harness = yield* delegatedFollowupHarness(
+        "r1-self-send",
+        Effect.suspend(() =>
+          attempts++ > 0
+            ? Effect.void
+            : Effect.fail(
+                new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver,
+                  providerThreadId: ProviderThreadId.make("provider-thread:r1-self-send"),
+                  providerTurnId: ProviderTurnId.make("provider-turn:r1-self-send"),
+                  deliveryNotSent: true,
+                  cause: "The turn ended before the steer reached it",
+                }),
+              ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* harness.startChildTurn;
+        const firstTaskId = yield* harness.taskOf("first");
+        // The child queues a message to itself, which continues its running follow-up.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("send-self"),
+          threadId: harness.childThreadId,
+          messageId: MessageId.make("message:self"),
+          text: "self",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          senderThreadId: harness.childThreadId,
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        assert.equal(yield* harness.taskOf("self"), firstTaskId);
+        // The parent's next follow-up is moved ahead of it, so it runs next.
+        yield* harness.send("second", { type: "queue_after_active" });
+        const secondTaskId = yield* harness.taskOf("second");
+        const queued = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs;
+        const self = queued.find((run) => run.userMessageId === MessageId.make("message:self"))!;
+        const second = queued.find(
+          (run) => run.userMessageId === MessageId.make("message:second"),
+        )!;
+        yield* orchestrator.dispatch({
+          type: "queued-run.reorder",
+          commandId: CommandId.make("reorder-second"),
+          threadId: harness.childThreadId,
+          runId: second.id,
+          beforeRunId: self.id,
+        });
+        yield* harness.endTurn(0, "First answered.");
+        yield* harness.startRun(second.id);
+        // The user sends the self-send into that turn; the steer misses it.
+        const joined = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs.find(
+          (run) => run.id === second.id,
+        )!;
+        yield* orchestrator.dispatch({
+          type: "queued-message.promote-to-steer",
+          commandId: CommandId.make("send-now-self"),
+          threadId: harness.childThreadId,
+          queuedRunId: self.id,
+          targetRunId: joined.id,
+        });
+        yield* worker.drain();
+        assert.deepEqual(harness.steered, []);
+        const again = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs.find(
+          (run) => run.status === "queued" && run.userMessageId === MessageId.make("message:self"),
+        );
+        assert.notEqual(again?.delegatedTaskId, secondTaskId);
+        assert.equal(again?.delegatedTaskId, firstTaskId);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect(
+  "a resumed self-send of a stopped task, sent into another task's turn, queues again when its steer misses",
+  () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const harness = yield* delegatedFollowupHarness(
+        "r1-stopped-self-send",
+        Effect.suspend(() =>
+          attempts++ > 0
+            ? Effect.void
+            : Effect.fail(
+                new ProviderAdapter.ProviderAdapterSteerRunError({
+                  driver,
+                  providerThreadId: ProviderThreadId.make("provider-thread:r1-stopped-self-send"),
+                  providerTurnId: ProviderTurnId.make("provider-turn:r1-stopped-self-send"),
+                  deliveryNotSent: true,
+                  cause: "The turn ended before the steer reached it",
+                }),
+              ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        const firstTaskId = yield* harness.taskOf("first");
+        // The child queues a message to itself, which continues its running follow-up.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("send-self"),
+          threadId: harness.childThreadId,
+          messageId: MessageId.make("message:self"),
+          text: "self",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          senderThreadId: harness.childThreadId,
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        assert.equal(yield* harness.taskOf("self"), firstTaskId);
+        // The parent's next follow-up is moved ahead of it.
+        yield* harness.send("second", { type: "queue_after_active" });
+        const queued = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs;
+        const self = queued.find((run) => run.userMessageId === MessageId.make("message:self"))!;
+        const second = queued.find(
+          (run) => run.userMessageId === MessageId.make("message:second"),
+        )!;
+        yield* orchestrator.dispatch({
+          type: "queued-run.reorder",
+          commandId: CommandId.make("reorder-second"),
+          threadId: harness.childThreadId,
+          runId: second.id,
+          beforeRunId: self.id,
+        });
+        // Stop holds both queued messages, and the first task ends interrupted.
+        const firstSettled = yield* harness.nextTaskUpdate(
+          firstTaskId,
+          (task) => task.result !== null,
+        );
+        const interrupted = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.id === first.runId &&
+              event.payload.status === "interrupted",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make("stop-first"),
+          threadId: harness.childThreadId,
+          reason: "held by the user",
+        });
+        yield* worker.drain();
+        yield* Fiber.join(interrupted);
+        assert.equal((yield* Fiber.join(firstSettled)).status, "interrupted");
+        // The user resumes the queue; the parent's follow-up starts, and the user sends the
+        // retained self-send into it. The steer misses its turn.
+        yield* orchestrator.dispatch({
+          type: "queue.resume",
+          commandId: CommandId.make("resume-queue"),
+          threadId: harness.childThreadId,
+        });
+        yield* harness.startRun(second.id);
+        yield* orchestrator.dispatch({
+          type: "queued-message.promote-to-steer",
+          commandId: CommandId.make("send-now-self"),
+          threadId: harness.childThreadId,
+          queuedRunId: self.id,
+          targetRunId: second.id,
+        });
+        yield* worker.drain();
+        assert.deepEqual(harness.steered, []);
+        // The message is queued again, not lost because its old task has ended.
+        const again = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs.find(
+          (run) => run.status === "queued" && run.userMessageId === MessageId.make("message:self"),
+        );
+        assert.isDefined(again);
+        assert.equal(again?.delegatedTaskId, firstTaskId);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+// A task moved on to its next run while the steer carrying an earlier self-send of it is still
+// to run, and the turn that steer was sent into has ended.
+it.effect.each([
+  {
+    name: "task_cancel after its next run started queues nothing of the self-send",
+    userFirst: false,
+    cancel: true,
+  },
+  {
+    name: "task_cancel while its next run waits behind a user's turn settles it cancelled",
+    userFirst: true,
+    cancel: true,
+  },
+  {
+    name: "an interrupt of its next run leaves it waiting for the self-send's answer",
+    userFirst: false,
+    cancel: false,
+  },
+])(
+  "a task that moved on past an earlier self-send's pending steer: $name",
+  ({ userFirst, cancel }) =>
+    Effect.gen(function* () {
+      const harness = yield* delegatedFollowupHarness(`r1-moved-on-${userFirst}-${cancel}`);
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        const firstTaskId = yield* harness.taskOf("first");
+        // The child queues two messages to itself; both continue its running follow-up. The user's
+        // message can be queued between them.
+        for (const name of userFirst ? ["self-a", "user", "self-b"] : ["self-a", "self-b"])
+          if (name === "user")
+            yield* harness.send("user", { type: "queue_after_active" }, { fromUser: true });
+          else
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`send-${name}`),
+              threadId: harness.childThreadId,
+              messageId: MessageId.make(`message:${name}`),
+              text: name,
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              senderThreadId: harness.childThreadId,
+              createdBy: "agent",
+              creationSource: "mcp",
+            });
+        const queued = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs;
+        const selfA = queued.find((run) => run.userMessageId === MessageId.make("message:self-a"))!;
+        const next = queued.find(
+          (run) => run.userMessageId === MessageId.make(`message:${userFirst ? "user" : "self-b"}`),
+        )!;
+        assert.equal(selfA.delegatedTaskId, firstTaskId);
+        // The user sends the first into the running turn; the turn ends before that steer runs,
+        // and the next queued message starts.
+        yield* orchestrator.dispatch({
+          type: "queued-message.promote-to-steer",
+          commandId: CommandId.make("send-now-self-a"),
+          threadId: harness.childThreadId,
+          queuedRunId: selfA.id,
+          targetRunId: first.runId,
+        });
+        const turn = (yield* orchestrator.getThreadProjection(harness.childThreadId))
+          .providerTurns[0]!;
+        const afterSequence = yield* sink.latestSequence({ threadId: harness.childThreadId });
+        const nextStarted = yield* sink
+          .stream({ threadId: harness.childThreadId, afterSequence })
+          .pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "run.updated" &&
+                event.payload.id === next.id &&
+                event.payload.status !== "queued",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+        const now = yield* DateTime.now;
+        yield* Queue.offer(harness.events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: { ...turn, status: "completed", completedAt: now },
+        });
+        yield* Queue.offer(harness.events, {
+          type: "turn.terminal",
+          driver,
+          providerThreadId: turn.providerThreadId,
+          providerTurnId: turn.id,
+          runOrdinal: first.runOrdinal,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(nextStarted);
+        if (!cancel) {
+          // The user interrupts the task's next run before the first self-send's steer runs.
+          const settled = yield* harness.nextTaskUpdate(
+            firstTaskId,
+            (task) => task.result !== null,
+          );
+          yield* orchestrator.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make("interrupt-moved-on"),
+            threadId: harness.childThreadId,
+            runId: next.id,
+          });
+          yield* executor.withLock(harness.parentThreadId, Effect.void);
+          // The self-send has no answer yet, so the task does not settle from the interrupted run.
+          assert.isNull(
+            (yield* harness.parentView).tasks.find((task) => task.id === firstTaskId)?.result ??
+              null,
+          );
+          // Its steer finds the turn over and queues it again, as the same task, which settles
+          // once from it.
+          yield* worker.drain();
+          assert.deepEqual(harness.steered, []);
+          const again = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs.find(
+            (run) =>
+              run.userMessageId === MessageId.make("message:self-a") &&
+              run.id !== selfA.id &&
+              run.status !== "cancelled",
+          )!;
+          assert.equal(again.delegatedTaskId, firstTaskId);
+          yield* harness.startRun(again.id);
+          yield* harness.endTurn(harness.started.length - 1, "Self-a answered.");
+          const answered = yield* Fiber.join(settled);
+          assert.equal(answered.status, "completed");
+          assert.equal(answered.result, "Self-a answered.");
+          return;
+        }
+        // The parent cancels the task now, before the first self-send's steer runs.
+        yield* orchestrator.cancelDelegatedTask({
+          parentThreadId: harness.parentThreadId,
+          taskId: firstTaskId,
+          command: {
+            type: "thread.stop",
+            commandId: CommandId.make("cancel-moved-on"),
+            threadId: harness.childThreadId,
+            stopDelegatedTasks: false,
+          },
+          stopDescendants: () => Effect.void,
+        });
+        yield* worker.drain();
+        yield* stepClock(harness.childThreadId, 1, true);
+        assert.deepEqual(harness.steered, []);
+        assert.deepEqual(
+          (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs
+            .filter(
+              (run) =>
+                run.status === "queued" && run.userMessageId === MessageId.make("message:self-a"),
+            )
+            .map((run) => run.id),
+          [],
+        );
+        // The task ends cancelled, and its parent is woken for none of it.
+        const cancelled = (yield* harness.parentView).tasks.find((task) => task.id === firstTaskId);
+        assert.equal(cancelled?.status, "interrupted");
+        assert.equal(cancelled?.completionDelivery?.state, "disposed");
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect(
+  "cancelling a promoted follow-up held for its steer after its turn ended queues nothing of it",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* delegatedFollowupHarness("r1-cancel-held");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        const firstTaskId = yield* harness.taskOf("first");
+        yield* harness.send("second", { type: "queue_after_active" });
+        const taskId = yield* harness.taskOf("second");
+        const promoted = yield* steersInto(orchestrator, first.runId, 1);
+        yield* TestClock.adjust("61 seconds");
+        yield* Fiber.join(promoted);
+        // The turn ends before the steer runs; the user's waiting message ends its run at once.
+        yield* harness.send("third", { type: "queue_after_active" }, { fromUser: true });
+        const firstSettled = yield* harness.nextTaskUpdate(
+          firstTaskId,
+          (task) => task.result !== null,
+        );
+        const turn = (yield* orchestrator.getThreadProjection(harness.childThreadId))
+          .providerTurns[0]!;
+        const afterSequence = yield* sink.latestSequence({ threadId: harness.childThreadId });
+        const ended = yield* sink.stream({ threadId: harness.childThreadId, afterSequence }).pipe(
+          Stream.filter(
+            ({ event }) =>
+              event.type === "run.updated" &&
+              event.payload.id === first.runId &&
+              event.payload.status === "completed",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        const now = yield* DateTime.now;
+        yield* Queue.offer(harness.events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: { ...turn, status: "completed", completedAt: now },
+        });
+        yield* Queue.offer(harness.events, {
+          type: "turn.terminal",
+          driver,
+          providerThreadId: turn.providerThreadId,
+          providerTurnId: turn.id,
+          runOrdinal: first.runOrdinal,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(ended);
+        yield* Fiber.join(firstSettled);
+        yield* executor.withLock(harness.parentThreadId, Effect.void);
+        // Held for its steer, the follow-up is cancelled before that steer runs.
+        yield* orchestrator.cancelDelegatedTask({
+          parentThreadId: harness.parentThreadId,
+          taskId,
+          command: {
+            type: "thread.stop",
+            commandId: CommandId.make("cancel-held"),
+            threadId: harness.childThreadId,
+            stopDelegatedTasks: false,
+          },
+          stopDescendants: () => Effect.void,
+        });
+        yield* worker.drain();
+        yield* stepClock(harness.childThreadId, 1, true);
+        assert.deepEqual(harness.steered, []);
+        assert.deepEqual(
+          (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs
+            .filter(
+              (run) =>
+                run.status === "queued" && run.userMessageId === MessageId.make("message:second"),
+            )
+            .map((run) => run.id),
+          [],
+        );
+        const cancelled = (yield* harness.parentView).tasks.find((task) => task.id === taskId);
+        assert.equal(cancelled?.status, "interrupted");
+        assert.equal(cancelled?.completionDelivery?.state, "disposed");
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect(
+  "a promoted follow-up still waits for a subagent the turn it joined started, after a wake of its own",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* delegatedFollowupHarness("r1-joined-subagent");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const sink = yield* EventSink.EventSinkV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        yield* harness.send("second", { type: "queue_after_active" });
+        const taskId = yield* harness.taskOf("second");
+        const promoted = yield* steersInto(orchestrator, first.runId, 1);
+        yield* TestClock.adjust("61 seconds");
+        yield* Fiber.join(promoted);
+        yield* worker.drain();
+        assert.deepEqual(harness.steered, ["second"]);
+        // The joined turn delegates work of its own.
+        const now = yield* DateTime.now;
+        const subagent = {
+          id: NodeId.make("node:r1-joined-subagent:grandchild"),
+          threadId: harness.childThreadId,
+          runId: first.runId,
+          parentNodeId: first.rootNodeId,
+          origin: "app_owned" as const,
+          createdBy: "agent" as const,
+          driver,
+          providerInstanceId: instanceId,
+          providerThreadId: null,
+          childThreadId: ThreadId.make("thread:r1-joined-subagent:grandchild"),
+          nativeTaskRef: null,
+          prompt: "Check the other half.",
+          title: null,
+          model: null,
+          status: "running" as const,
+          result: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("r1-joined-subagent:grandchild"),
+              type: "subagent.updated",
+              threadId: harness.childThreadId,
+              runId: first.runId,
+              nodeId: subagent.id,
+              occurredAt: now,
+              payload: subagent,
+            },
+          ],
+        });
+        // A command the turn started finishes; its wake continues the latest open follow-up.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("r1-joined-subagent:wake"),
+          threadId: harness.childThreadId,
+          messageId: MessageId.make("message:wake"),
+          text: "Background activity updated",
+          attachments: [],
+          notification: {
+            source: { kind: "command" },
+            outcome: "completed",
+            summary: 'Command "build" finished',
+          },
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+        });
+        const wake = (yield* orchestrator.getThreadProjection(harness.childThreadId)).runs.find(
+          (run) => run.userMessageId === MessageId.make("message:wake"),
+        )!;
+        assert.equal(wake.delegatedTaskId, taskId);
+        yield* harness.endTurn(0, "Both follow-ups answered; a check still runs.");
+        yield* harness.startRun(wake.id);
+        yield* harness.endTurn(1, "The build finished.");
+        yield* executor.withLock(harness.parentThreadId, Effect.void);
+        const held = (yield* harness.parentView).tasks.find((task) => task.id === taskId);
+        assert.isNull(
+          held?.result ?? null,
+          "the promoted follow-up settled while a subagent of the turn it joined still ran",
+        );
+
+        const settled = yield* harness.nextTaskUpdate(taskId, (task) => task.result !== null);
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("r1-joined-subagent:grandchild-done"),
+              type: "subagent.updated",
+              threadId: harness.childThreadId,
+              runId: first.runId,
+              nodeId: subagent.id,
+              occurredAt: now,
+              payload: { ...subagent, status: "completed", result: "Checked.", completedAt: now },
+            },
+          ],
+        });
+        const answered = yield* Fiber.join(settled);
+        assert.equal(answered.status, "completed");
+        assert.equal(answered.result, "The build finished.");
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect(
+  "cancelling a promoted follow-up stops the turn it joined and wakes its parent for none of it",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* delegatedFollowupHarness("r1-cancel");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* harness.startChildTurn;
+        const first = harness.started[0]!;
+        yield* harness.send("second", { type: "queue_after_active" });
+        const taskId = yield* harness.taskOf("second");
+        const promoted = yield* steersInto(orchestrator, first.runId, 1);
+        const joined = yield* harness.nextTaskUpdate(taskId, (task) => task.status !== "pending");
+        yield* TestClock.adjust("61 seconds");
+        yield* Fiber.join(promoted);
+        yield* worker.drain();
+        assert.equal((yield* Fiber.join(joined)).status, "running");
+
+        const settled = yield* harness.nextTaskUpdate(taskId, (task) => task.result !== null);
+        yield* orchestrator.cancelDelegatedTask({
+          parentThreadId: harness.parentThreadId,
+          taskId,
+          command: {
+            type: "thread.stop",
+            commandId: CommandId.make("cancel-second"),
+            threadId: harness.childThreadId,
+            stopDelegatedTasks: false,
+          },
+          stopDescendants: () => Effect.void,
+        });
+        yield* worker.drain();
+        const cancelled = yield* Fiber.join(settled);
+        assert.equal(cancelled.cancelledRunId, first.runId);
+        assert.equal(cancelled.status, "interrupted");
+        assert.equal(cancelled.completionDelivery?.state, "disposed");
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
 // A waiting run's turn is over; until its checkpoint capture runs, nothing else may start.
-const waitingRunHarness = Effect.fn("waitingRunHarness")(function* (name: string) {
+const waitingRunHarness = Effect.fn("waitingRunHarness")(function* (
+  name: string,
+  steerAcknowledgement?: Effect.Effect<void, ProviderAdapter.ProviderAdapterSteerRunError>,
+) {
   // Later turns edit the workspace as they start, so a checkpoint taken after one shows the edit.
-  const nextTurnEdit = { write: Effect.void as Effect.Effect<void> };
+  const nextTurnEdit = { write: Effect.void as Effect.Effect<void>, file: "next-turn.txt" };
   const harness = yield* nextTurnSelectionHarness(
     name,
     false,
@@ -8131,14 +9625,14 @@ const waitingRunHarness = Effect.fn("waitingRunHarness")(function* (name: string
     undefined,
     undefined,
     undefined,
-    undefined,
+    steerAcknowledgement,
     Effect.suspend(() => nextTurnEdit.write),
   );
   nextTurnEdit.write = Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     yield* fileSystem.writeFileString(
-      path.join(harness.cwd, "next-turn.txt"),
+      path.join(harness.cwd, nextTurnEdit.file),
       "edited by the next turn\n",
     );
   }).pipe(Effect.provide(NodeServices.layer), Effect.orDie);
@@ -8221,8 +9715,19 @@ const waitingRunHarness = Effect.fn("waitingRunHarness")(function* (name: string
       )) as typeof getThreadRecords);
     return Deferred.await(read).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
   });
-  return { ...harness, settleTurn, watch, storedEvents, waitReactionRead };
+  return { ...harness, settleTurn, watch, storedEvents, waitReactionRead, nextTurnEdit };
 });
+
+// A provider's own wake turn, which already runs in the CLI; its continuation run takes it in.
+const providerWake = {
+  createdBy: "agent",
+  creationSource: "provider",
+  notification: {
+    source: { kind: "background_task" },
+    outcome: "updated",
+    summary: "Background activity updated",
+  },
+} as const;
 
 const visibleSends = [
   { kind: "a user send", deliveryIntent: "auto", createdBy: "user", creationSource: "web" },
@@ -8333,6 +9838,9 @@ it.effect.each(visibleSends)(
 
 it.effect.each([
   { kind: "a completion wake" },
+  // Its run would start beside the provider's background work, whose later updates it can miss.
+  { kind: "a provider's wake turn" },
+  { kind: "a notice T3 delivers" },
   { kind: "Stop" },
   { kind: "a request waiting on the user" },
 ] as const)("keeps a run waiting for its checkpoint despite $kind", ({ kind }) =>
@@ -8450,11 +9958,15 @@ it.effect.each([
                   taskIds: [NodeId.make(`${name}:task`)],
                 },
               }
-            : {
-                deliveryIntent: "auto" as const,
-                createdBy: "user" as const,
-                creationSource: "web" as const,
-              }),
+            : kind === "a provider's wake turn"
+              ? providerWake
+              : kind === "a notice T3 delivers"
+                ? { ...providerWake, creationSource: "server" as const }
+                : {
+                    deliveryIntent: "auto" as const,
+                    createdBy: "user" as const,
+                    creationSource: "web" as const,
+                  }),
         });
         // Reactions to the send settle under the thread's lock.
         yield* (yield* ThreadCommandExecutor.ThreadCommandExecutor).withLock(threadId, Effect.void);
@@ -9152,4 +10664,468 @@ it.effect("leaves a waiting run to its checkpoint capture once that capture runs
       }).pipe(Effect.provide(layer));
     }),
   ),
+);
+
+// A steer into a wake or notice continuation can reach the provider after
+// the turn it targeted ended, so the provider reports it not delivered and it follows up. The
+// follow-up may start no earlier than that run's wait, which records its finalize and capture.
+const missesFirstSteer = (name: string) => {
+  const steers = { attempts: 0 };
+  const acknowledgement = Effect.suspend(() =>
+    steers.attempts++ > 0
+      ? Effect.void
+      : Effect.fail(
+          new ProviderAdapter.ProviderAdapterSteerRunError({
+            driver,
+            providerThreadId: ProviderThreadId.make(`provider-thread:thread:${name}`),
+            providerTurnId: ProviderTurnId.make(`provider-turn:${name}`),
+            deliveryNotSent: true,
+            cause: "The turn ended before the steer reached it",
+          }),
+        ),
+  );
+  return { steers, acknowledgement };
+};
+
+const crossThreadAutoSend = (threadId: ThreadId, name: string) => ({
+  type: "message.dispatch" as const,
+  commandId: CommandId.make(name),
+  threadId,
+  messageId: MessageId.make(`message:${name}`),
+  text: name,
+  attachments: [],
+  deliveryIntent: "auto" as const,
+  dispatchMode: { type: "start_immediately" as const },
+  senderThreadId: ThreadId.make("thread:sender"),
+  createdBy: "agent" as const,
+  creationSource: "mcp" as const,
+});
+
+/**
+ * The shape: a notice continuation runs before its provider turn reports running, a
+ * cross-thread message sent then is deferred into it, and the turn's running report promotes it.
+ * A delegated lane's continuation carries its task. Returns the continuation's turn input.
+ */
+const deferredSteerIntoContinuation = Effect.fn("deferredSteerIntoContinuation")(function* (
+  harness: Effect.Success<ReturnType<typeof waitingRunHarness>>,
+  threadId: ThreadId,
+  name: string,
+  lane: "root" | "delegated",
+) {
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+  const sink = yield* EventSink.EventSinkV2;
+  // The notice queues behind the first run's wait, which a hidden wake does not end.
+  yield* harness.settleTurn(threadId, 0);
+  yield* queueFrom(orchestrator, threadId, `${name}-notice`, "wake");
+  const queued = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+    (candidate) => candidate.userMessageId === MessageId.make(`message:${name}-notice`),
+  )!;
+  assert.equal(queued.status, "queued");
+  if (lane === "delegated") {
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(`${name}:lane-task`),
+          type: "run.updated",
+          threadId,
+          runId: queued.id,
+          occurredAt: yield* DateTime.now,
+          payload: { ...queued, delegatedTaskId: NodeId.make(`${name}:task`) },
+        },
+      ],
+    });
+  }
+  const continuationRunning = yield* harness.watch(
+    threadId,
+    (event) => event.type === "provider-turn.updated" && event.payload.status === "running",
+  );
+  yield* worker.drain();
+  yield* orchestrator.resumeQueuedRuns;
+  yield* worker.drain();
+  yield* Fiber.join(continuationRunning);
+  const continuation = harness.started[1]!;
+  assert.equal(continuation.runId, queued.id);
+  const projection = yield* orchestrator.getThreadProjection(threadId);
+  const run = projection.runs.find((candidate) => candidate.id === continuation.runId)!;
+  const turn = projection.providerTurns.find(
+    (candidate) => candidate.runAttemptId === continuation.attemptId,
+  )!;
+  const paused = yield* harness.watch(
+    threadId,
+    (event) =>
+      event.type === "provider-turn.updated" &&
+      event.payload.id === turn.id &&
+      event.payload.status === "pending",
+  );
+  yield* Queue.offer(harness.events, {
+    type: "provider_turn.updated",
+    driver,
+    providerTurn: { ...turn, status: "pending" },
+  });
+  yield* Fiber.join(paused);
+  yield* orchestrator.dispatch(crossThreadAutoSend(threadId, name));
+  const deferred = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+    (candidate) =>
+      candidate.status === "queued" &&
+      candidate.userMessageId === MessageId.make(`message:${name}`),
+  );
+  assert.equal(deferred?.steerWhenReadyRunId, run.id);
+  const promoted = yield* steersInto(orchestrator, run.id, 1);
+  yield* Queue.offer(harness.events, {
+    type: "provider_turn.updated",
+    driver,
+    providerTurn: { ...turn, status: "running" },
+  });
+  yield* Fiber.join(promoted);
+  return continuation;
+});
+
+it.effect.each([
+  { lane: "root", declinedWhile: "running", backgroundWork: false },
+  { lane: "root", declinedWhile: "waiting", backgroundWork: false },
+  { lane: "delegated", declinedWhile: "running", backgroundWork: false },
+  { lane: "delegated", declinedWhile: "waiting", backgroundWork: false },
+  { lane: "root", declinedWhile: "running", backgroundWork: true },
+] as const)(
+  "starts a not-delivered steer's follow-up at its $lane continuation's wait, declined while $declinedWhile (background work: $backgroundWork)",
+  ({ lane, declinedWhile, backgroundWork }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const name = `follow-up-at-wait-${lane}-${declinedWhile}${backgroundWork ? "-background" : ""}`;
+        const { steers, acknowledgement } = missesFirstSteer(name);
+        const harness = yield* waitingRunHarness(name, acknowledgement);
+        const { started, steered, layer, startFirstTurn, settleTurn, watch, storedEvents } =
+          harness;
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = yield* startFirstTurn;
+          const continuation = yield* deferredSteerIntoContinuation(harness, threadId, name, lane);
+          const messageId = MessageId.make(`message:${name}`);
+          // The follow-up's turn edits the workspace; the continuation's checkpoint must not hold it.
+          harness.nextTurnEdit.file = "follow-up-turn.txt";
+          const followUpStarting = yield* watch(
+            threadId,
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.userMessageId === messageId &&
+              event.payload.steerFollowUpOfRunId === continuation.runId &&
+              event.payload.status === "starting",
+          );
+          if (declinedWhile === "running") {
+            yield* worker.drain();
+            const declined = yield* orchestrator.getThreadProjection(threadId);
+            assert.equal(steers.attempts, 1);
+            assert.equal(
+              declined.runs.find((run) => run.id === continuation.runId)?.status,
+              "running",
+            );
+            assert.equal(
+              declined.runs.find(
+                (run) => run.status === "queued" && run.userMessageId === messageId,
+              )?.steerFollowUpOfRunId,
+              continuation.runId,
+            );
+            // Background work the continuation started still runs when its turn ends.
+            const providerThreadOf = Effect.map(
+              orchestrator.getThreadProjection(threadId),
+              ({ providerThreads }) =>
+                providerThreads.find(
+                  (candidate) => candidate.id === continuation.providerThread.id,
+                )!,
+            );
+            if (backgroundWork) {
+              const reported = yield* watch(
+                threadId,
+                (event) =>
+                  event.type === "provider-thread.updated" &&
+                  (event.payload.pendingBackgroundTasks?.length ?? 0) > 0,
+              );
+              yield* Queue.offer(harness.events, {
+                type: "provider_thread.updated",
+                driver,
+                providerThread: {
+                  ...(yield* providerThreadOf),
+                  status: "active",
+                  pendingBackgroundTasks: [
+                    { taskId: `${name}:build`, kind: "background_task", description: "build" },
+                  ],
+                },
+                pendingBackgroundWork: true,
+              });
+              yield* Fiber.join(reported);
+            }
+            // The turn ends: the run's wait starts the follow-up, with no clock or capture first.
+            yield* settleTurn(threadId, 1);
+            yield* Fiber.join(followUpStarting);
+            if (backgroundWork) {
+              // The roster this work leaves behind is the background roster's; here it only must not hold the
+              // follow-up back or deliver it twice.
+              yield* Queue.offer(harness.events, {
+                type: "provider_thread.updated",
+                driver,
+                providerThread: {
+                  ...(yield* providerThreadOf),
+                  status: "idle",
+                  pendingBackgroundTasks: [],
+                },
+                pendingBackgroundWork: false,
+              });
+            }
+          } else {
+            // The run reaches its wait before the steer comes back; the decline starts it at once.
+            yield* settleTurn(threadId, 1);
+            assert.equal(
+              (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+                (run) => run.id === continuation.runId,
+              )?.status,
+              "waiting",
+            );
+            const outbox = yield* EffectOutbox.EffectOutboxV2;
+            const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+            const steer = Option.getOrThrow(yield* outbox.claimNext({ workerId: name }));
+            assert.equal(steer.request.type, "provider-turn.steer");
+            yield* executor.execute(steer);
+            yield* outbox.succeed({ effectId: steer.id, workerId: name });
+            yield* Fiber.join(followUpStarting);
+          }
+          const atWait = yield* orchestrator.getThreadProjection(threadId);
+          const ended = atWait.runs.find((run) => run.id === continuation.runId)!;
+          assert.equal(ended.status, "completed");
+          assert.isNull(ended.checkpointId);
+          assert.equal(
+            ended.delegatedTaskId,
+            lane === "delegated" ? NodeId.make(`${name}:task`) : undefined,
+          );
+          const followUp = atWait.runs.find(
+            (run) => run.userMessageId === messageId && run.steerFollowUpOfRunId !== undefined,
+          )!;
+          const followUpTurnRunning = yield* watch(
+            threadId,
+            (event) =>
+              event.type === "provider-turn.updated" &&
+              event.payload.status === "running" &&
+              event.payload.runAttemptId === followUp.activeAttemptId,
+          );
+          yield* worker.drain();
+          yield* Fiber.join(followUpTurnRunning);
+          // Delivered once, as its own turn, after the continuation's capture.
+          assert.deepEqual(
+            started.map((turn) => turn.message.text),
+            ["first", `${name}-notice`, name],
+          );
+          assert.deepEqual(steered, []);
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          assert.lengthOf(
+            after.runs.filter(
+              (run) =>
+                run.userMessageId === messageId &&
+                (run.status === "queued" || ACTIVE_RUN_STATUSES.has(run.status)),
+            ),
+            1,
+          );
+          const captured = after.runs.find((run) => run.id === continuation.runId)!;
+          assert.isNotNull(captured.checkpointId);
+          const events = yield* storedEvents(threadId);
+          const capturedAt = events.findIndex(
+            (event) => event.type === "checkpoint.captured" && event.runId === continuation.runId,
+          );
+          const followUpTurnAt = events.findIndex(
+            (event) =>
+              event.type === "provider-turn.updated" &&
+              event.payload.runAttemptId === followUp.activeAttemptId &&
+              event.payload.status === "running",
+          );
+          assert.isAtLeast(capturedAt, 0);
+          assert.isAbove(followUpTurnAt, capturedAt);
+          const checkpoint = after.checkpoints.find((row) => row.id === captured.checkpointId);
+          assert.equal(checkpoint?.status, "ready");
+          assert.notInclude(
+            (checkpoint?.files ?? []).map((file) => file.path),
+            "follow-up-turn.txt",
+          );
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
+);
+
+it.effect("keeps a not-delivered steer's follow-up ahead of what was queued after the steer", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = "follow-up-keeps-place";
+      const { steers, acknowledgement } = missesFirstSteer(name);
+      const { started, steered, layer, startFirstTurn, settleTurn, watch } =
+        yield* waitingRunHarness(name, acknowledgement);
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const threadId = yield* startFirstTurn;
+        // The agent's messages to its own thread never steer: one queued before the steer is sent,
+        // one after it, while the steer is still on its way.
+        yield* queueFrom(orchestrator, threadId, `${name}-before`, "self");
+        yield* orchestrator.dispatch(crossThreadAutoSend(threadId, name));
+        yield* queueFrom(orchestrator, threadId, `${name}-after`, "self");
+        yield* worker.drain();
+        assert.equal(steers.attempts, 1);
+        const queued = queuedRunsInDeliveryOrder(yield* orchestrator.getThreadProjection(threadId));
+        assert.deepEqual(
+          queued.map((run) => [run.userMessageId, run.steerFollowUpOfRunId !== undefined]),
+          [
+            [MessageId.make(`message:${name}-before`), false],
+            [MessageId.make(`message:${name}`), true],
+            [MessageId.make(`message:${name}-after`), false],
+          ],
+        );
+        // The run's wait starts the message queued before the steer; the follow-up then steers
+        // into that turn once, ahead of the later message.
+        const beforeRunning = yield* watch(
+          threadId,
+          (event) =>
+            event.type === "provider-turn.updated" &&
+            event.payload.status === "running" &&
+            event.payload.runAttemptId !== started[0]!.attemptId,
+        );
+        yield* settleTurn(threadId, 0);
+        yield* worker.drain();
+        yield* Fiber.join(beforeRunning);
+        yield* TestClock.adjust("5 seconds");
+        yield* worker.drain();
+        assert.deepEqual(
+          started.map((turn) => turn.message.text),
+          ["first", `${name}-before`],
+        );
+        assert.deepEqual(steered, [name]);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(
+          after.runs.filter((run) => run.status === "queued").map((run) => run.userMessageId),
+          [MessageId.make(`message:${name}-after`)],
+        );
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+// A provider's background work, such as a Muse workflow, outlives the turn that started it and
+// reports itself on the provider thread's root snapshot. A visible message that ends the run's
+// wait starts the next run beside that work, and the work's later snapshots must still land.
+// The turn start reads the provider thread long before it stores it running.
+it.effect.each([
+  { ends: "", afterTurnStartRead: false },
+  { ends: ", ending after the next turn start read the thread", afterTurnStartRead: true },
+] as const)(
+  "keeps the provider's background work current when a visible message ends a wait$ends",
+  ({ afterTurnStartRead }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const name = `waiting-ends-beside-background-work${afterTurnStartRead ? "-read" : ""}`;
+        const { started, events, layer, startFirstTurn, settleTurn, watch } =
+          yield* waitingRunHarness(name);
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = yield* startFirstTurn;
+          const providerThreadOf = Effect.map(
+            orchestrator.getThreadProjection(threadId),
+            ({ providerThreads }) =>
+              providerThreads.find((candidate) => candidate.id === started[0]!.providerThread.id)!,
+          );
+          const workflow = {
+            taskId: "task:workflow",
+            kind: "background_task" as const,
+            description: "ping-pong",
+          };
+          const reported = yield* watch(
+            threadId,
+            (event) =>
+              event.type === "provider-thread.updated" &&
+              (event.payload.pendingBackgroundTasks?.length ?? 0) > 0,
+          );
+          yield* Queue.offer(events, {
+            type: "provider_thread.updated",
+            driver,
+            providerThread: {
+              ...(yield* providerThreadOf),
+              status: "active",
+              pendingBackgroundTasks: [workflow],
+            },
+            pendingBackgroundWork: true,
+          });
+          yield* Fiber.join(reported);
+          yield* settleTurn(threadId, 0);
+          const first = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+          assert.equal(first.status, "waiting");
+
+          const messageId = MessageId.make(`message:${name}`);
+          const starting = yield* watch(
+            threadId,
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.userMessageId === messageId &&
+              event.payload.status === "starting",
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(name),
+            threadId,
+            messageId,
+            text: "Anything else?",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            deliveryIntent: "auto",
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* Fiber.join(starting);
+
+          // The workflow finishes after the message's run started.
+          const finished = Queue.offer(events, {
+            type: "provider_thread.updated",
+            driver,
+            providerThread: {
+              ...(yield* providerThreadOf),
+              status: "idle",
+              pendingBackgroundTasks: [],
+            },
+            pendingBackgroundWork: false,
+          });
+          let turnStartRead: { mockRestore: () => void } | undefined;
+          if (afterTurnStartRead) {
+            const cleared = yield* watch(
+              threadId,
+              (event) =>
+                event.type === "provider-thread.updated" &&
+                (event.payload.pendingBackgroundTasks ?? []).length === 0,
+            );
+            const projections = yield* ProjectionStore.ProjectionStoreV2;
+            const getTurnStartContext = projections.getTurnStartContext;
+            turnStartRead = vi
+              .spyOn(projections, "getTurnStartContext")
+              .mockImplementationOnce(((...args: Parameters<typeof getTurnStartContext>) =>
+                getTurnStartContext(...args).pipe(
+                  Effect.tap(() =>
+                    finished.pipe(Effect.andThen(Fiber.join(cleared)), Effect.orDie),
+                  ),
+                )) as typeof getTurnStartContext);
+          } else {
+            yield* finished;
+          }
+          const nextTurnRunning = yield* watch(
+            threadId,
+            (event) =>
+              event.type === "provider-turn.updated" &&
+              event.payload.status === "running" &&
+              event.payload.runAttemptId !== first.activeAttemptId,
+          );
+          yield* worker.drain();
+          yield* Fiber.join(nextTurnRunning);
+          turnStartRead?.mockRestore();
+          assert.deepEqual(
+            started.map((turn) => turn.message.text),
+            ["first", "Anything else?"],
+          );
+          assert.deepEqual((yield* providerThreadOf).pendingBackgroundTasks ?? [], []);
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
 );

@@ -81,8 +81,10 @@ function waitEndDueAt(
   run: OrchestrationV2Run,
   message: OrchestrationV2ConversationMessage,
 ): DateTime.Utc | null {
-  return run.status !== "queued" || run.queueHeld === true || isHiddenWake(message)
-    ? null
+  if (run.status !== "queued" || run.queueHeld === true || isHiddenWake(message)) return null;
+  // A steer that missed its turn was already sent to be delivered now.
+  return run.steerFollowUpOfRunId !== undefined
+    ? run.requestedAt
     : DateTime.addDuration(run.requestedAt, QUEUED_DELIVERY_PROMOTION_GRACE);
 }
 

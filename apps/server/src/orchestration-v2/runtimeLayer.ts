@@ -392,6 +392,7 @@ export const layer = Layer.mergeAll(
   layerProviderRuntimeRecoveryProvided,
   layerProjectionMaintenanceProvided,
   layerLegacyV1ThreadImporterProvided,
+  ThreadCommandExecutor.layerThreadSizes,
 );
 
 export const layerProduction = Layer.mergeAll(

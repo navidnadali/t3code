@@ -3,6 +3,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import {
   EnvironmentId,
   type ModelSelection,
@@ -18,6 +19,8 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderSessionId,
+  ProviderThreadId,
+  ProviderTurnId,
   RunId,
   ThreadId,
   TurnItemId,
@@ -49,8 +52,10 @@ import {
   CodexProviderCapabilitiesV2,
   normalizeCodexThreadLoadModelSelection,
 } from "./Adapters/CodexAdapterV2.ts";
+import { recordingWaitObserver } from "../observability/WaitObserver.testkit.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
+import * as IngestLag from "./IngestLag.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
@@ -2046,6 +2051,225 @@ it.effect(
     }),
 );
 
+it.effect(
+  "ProviderSessionManagerV2 stamps each event's arrival and counts what a subscriber has not taken",
+  () => {
+    const { observer, reports } = recordingWaitObserver();
+    return Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const threadId = ThreadId.make("thread-ingest-arrival");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now: yield* DateTime.now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const first = yield* runtime.subscribeEvents!;
+        const second = yield* runtime.subscribeEvents!;
+        const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(adapterQueue);
+        yield* Queue.offer(adapterQueue!, {
+          type: "background_work.updated",
+          driver: CODEX_DRIVER,
+          providerTurnId: ProviderTurnId.make("provider-turn-ingest-arrival"),
+          pending: true,
+        });
+        yield* Queue.offer(adapterQueue!, {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: ProviderThreadId.make("provider-thread-ingest-arrival"),
+          providerTurnId: ProviderTurnId.make("provider-turn-ingest-arrival"),
+          runOrdinal: 1,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        const received = yield* first.events.pipe(Stream.take(2), Stream.runCollect);
+        assert.isDefined(IngestLag.arrivalOf(received[0]!));
+        // Publishing reached both queues at once; the second has not taken its copies yet.
+        assert.equal(second.pending?.(), 2);
+        // The terminal reported the backlog ahead of it in each subscription: the second's
+        // held one event, while the first may already have taken its own.
+        const backlogs = reports("depth").filter(
+          ([site]) => site === "ProviderIngest.terminalBacklog",
+        );
+        assert.equal(backlogs.length, 2);
+        assert.deepEqual(backlogs[1], ["ProviderIngest.terminalBacklog", 1]);
+        // Each event went to both subscriptions, whichever thread it was for.
+        assert.deepEqual(
+          reports("depth").filter(([site]) => site === "ProviderIngest.fanout"),
+          [
+            ["ProviderIngest.fanout", 2],
+            ["ProviderIngest.fanout", 2],
+          ],
+        );
+        yield* second.events.pipe(Stream.take(2), Stream.runDrain);
+        assert.equal(second.pending?.(), 0);
+        yield* manager.close(providerSessionId);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+    }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+  },
+);
+
+it.effect(
+  "ProviderSessionManagerV2 reports a session update's ingest lag once it persists it",
+  () => {
+    const { observer, reports } = recordingWaitObserver();
+    return Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const threadId = ThreadId.make("thread-session-update-lag");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now: yield* DateTime.now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const subscription = yield* runtime.subscribeEvents!;
+        const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(adapterQueue);
+        // Runs drop a session update; the session manager writes it before publishing it.
+        yield* Queue.offer(adapterQueue!, {
+          type: "provider_session.updated",
+          driver: CODEX_DRIVER,
+          providerSession: {
+            ...runtime.providerSession,
+            extensionStatuses: [{ key: "watch", text: "Watching" }],
+          },
+        });
+        const lags = () =>
+          reports("wait").filter(([site]) => String(site).startsWith("ProviderIngest.lag."));
+        const seen = yield* Queue.unbounded<void>();
+        const taken = yield* subscription.events.pipe(
+          Stream.tap(() => Queue.offer(seen, undefined)),
+          Stream.take(2),
+          Stream.runDrain,
+          Effect.forkChild,
+        );
+        // The session manager writes an update before it publishes it.
+        yield* Queue.take(seen);
+        // With no thread attached the session writes nothing, so it reports nothing either.
+        yield* manager.detach({ providerSessionId, threadId });
+        yield* Queue.offer(adapterQueue!, {
+          type: "provider_session.updated",
+          driver: CODEX_DRIVER,
+          providerSession: { ...runtime.providerSession, extensionStatuses: [] },
+        });
+        yield* Fiber.join(taken);
+        assert.deepEqual(lags(), [["ProviderIngest.lag.lifecycle", 0, undefined]]);
+        yield* manager.close(providerSessionId);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+    }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+  },
+);
+
+it.effect(
+  "ProviderSessionManagerV2 counts what a subscription holds until its consumer takes it",
+  () => {
+    const { observer, reports } = recordingWaitObserver();
+    return Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const threadId = ThreadId.make("thread-ingest-prefetch");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now: yield* DateTime.now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const watcher = yield* runtime.subscribeEvents!;
+        const slow = yield* runtime.subscribeEvents!;
+        const sentinel = yield* runtime.subscribeEvents!;
+        const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(adapterQueue);
+        const work = (index: number, pending: boolean) =>
+          Queue.offer(adapterQueue!, {
+            type: "background_work.updated",
+            driver: CODEX_DRIVER,
+            providerTurnId: ProviderTurnId.make(`provider-turn-prefetch-${index}`),
+            pending,
+          });
+        for (let index = 0; index < 3; index++) yield* work(index, true);
+        yield* watcher.events.pipe(Stream.take(3), Stream.runDrain);
+        assert.equal(slow.pending?.(), 3);
+        // The slow consumer takes everything queued at once, then holds its first event.
+        const holding = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const consumer = yield* slow.events.pipe(
+          Stream.mapEffect(() =>
+            Deferred.succeed(holding, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+          Stream.take(6),
+          Stream.runDrain,
+          Effect.forkChild,
+        );
+        yield* Deferred.await(holding);
+        assert.equal(slow.pending?.(), 0);
+        // What arrives meanwhile waits in the subscription, ahead of the terminal.
+        for (let index = 3; index < 5; index++) yield* work(index, true);
+        yield* Queue.offer(adapterQueue!, {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: ProviderThreadId.make("provider-thread-prefetch"),
+          providerTurnId: ProviderTurnId.make("provider-turn-prefetch-0"),
+          runOrdinal: 1,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        // The sentinel only shows the terminal published; it may have taken its events by then.
+        yield* sentinel.events.pipe(Stream.take(6), Stream.runDrain);
+        assert.equal(slow.pending?.(), 3);
+        const backlogs = reports("depth").filter(
+          ([site]) => site === "ProviderIngest.terminalBacklog",
+        );
+        assert.equal(backlogs.length, 2);
+        assert.deepEqual(backlogs[0], ["ProviderIngest.terminalBacklog", 2]);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(consumer);
+        yield* manager.close(providerSessionId);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+    }).pipe(Effect.provideService(CurrentWaitObserver, observer));
+  },
+);
+
 it.effect.each(["session metadata", "session status changes", "provider work"] as const)(
   "ProviderSessionManagerV2 expires idle sessions according to %s",
   (activity) =>
@@ -2266,6 +2490,54 @@ it.effect("ProviderSessionManagerV2 drains subscribers when the provider stops",
       );
       assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));
       assert.equal((yield* Ref.get(state)).closeCount, 1);
+    });
+
+    yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 hands a lagging subscriber its whole backlog at once", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const effect = Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread-provider-session-manager-backlog");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+      });
+      const runtime = yield* manager.open({
+        threadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const lagging = yield* runtime.subscribeEvents!;
+      const current = yield* runtime.subscribeEvents!;
+      const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+      assert.isDefined(adapterQueue);
+      for (const status of ["running", "stopped"] as const)
+        yield* Queue.offer(adapterQueue!, {
+          type: "provider_session.updated",
+          driver: CODEX_DRIVER,
+          providerSession: { ...runtime.providerSession, status, updatedAt: now },
+        });
+      yield* Queue.end(adapterQueue!);
+      // Once the current subscriber has everything, so does the lagging one's queue.
+      yield* current.events.pipe(Stream.runDrain);
+
+      // Ingestion can then drop superseded snapshots from the backlog before committing it.
+      const chunks = yield* lagging.events.pipe(Stream.chunks, Stream.runCollect);
+      assert.deepEqual(
+        Array.from(chunks, (chunk) => chunk.map((event) => event.type)),
+        [["provider_session.updated", "provider_session.updated"]],
+      );
     });
 
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
@@ -4432,6 +4704,7 @@ it.effect(
   "ProviderSessionManagerV2 persists session-scoped requests and recovered commands without a run",
   () =>
     Effect.gen(function* () {
+      const { observer, reports } = recordingWaitObserver();
       const state = yield* Ref.make(emptyState);
       const effect = Effect.gen(function* () {
         const eventSink = yield* EventSink.EventSinkV2;
@@ -4623,9 +4896,17 @@ it.effect(
         assert.equal(node?.status, "waiting");
         assert.equal(turnItem?.runId, null);
         assert.equal(turnItem?.status, "waiting");
+        // Written without a run's subscription, they still report their ingest lag.
+        assert.includeMembers(
+          reports("wait").map(([site]) => site),
+          ["ProviderIngest.lag.delta", "ProviderIngest.lag.lifecycle"],
+        );
       });
 
-      yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
+      yield* effect.pipe(
+        Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })),
+        Effect.provideService(CurrentWaitObserver, observer),
+      );
     }),
 );
 

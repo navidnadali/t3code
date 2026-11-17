@@ -13292,6 +13292,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   const publishedRoster = (harness: Effect.Success<typeof makeWakeHarness>) =>
     providerThreadRosterEvents(harness.events).at(-1)?.providerThread.pendingBackgroundTasks ?? [];
 
+  const rostersSince = (harness: Effect.Success<typeof makeWakeHarness>, eventIndex: number) =>
+    providerThreadRosterEvents(harness.events.slice(eventIndex)).map(
+      (event) => event.providerThread.pendingBackgroundTasks ?? [],
+    );
+
   it.effect.each([
     { rescheduled: false, firedAfter: "60 seconds" },
     { rescheduled: true, firedAfter: "60 seconds" },
@@ -13363,10 +13368,14 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       const harness = yield* makeWakeHarness;
       yield* startScheduleWakeupTurn(harness);
       yield* TestClock.adjust("10 seconds");
+      // The probe leaves the wakeup out, and the run's stored roster can miss it too.
+      const settled = providerThreadRosterEvents(harness.events).at(-1)!.providerThread;
+      assert.isFalse(yield* harness.runtime.hasPendingBackgroundWorkForThread!(settled));
+      const beforeStart = harness.events.length;
       yield* harness.runtime.startTurn(
         makeClaudeTestTurnInput({
           threadId: harness.threadId,
-          providerThread: harness.providerThread,
+          providerThread: { ...settled, pendingBackgroundTasks: [] },
           now: yield* DateTime.now,
           attemptId: RunAttemptId.make("attempt-claude-schedule-wakeup-user"),
           text: "What time is it?",
@@ -13374,6 +13383,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           providerTurnOrdinal: 2,
         }),
       );
+      assert.isTrue(backgroundWorkHoldsCompletion(rostersSince(harness, beforeStart).at(-1) ?? []));
       yield* harness.offerAndWait(wakeTurnInit);
       yield* harness.offerAndWait(
         makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-000000002401", text: "Noon." }),
@@ -13385,6 +13395,58 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.equal(harness.terminalEvents()[1]?.status, "completed");
       assert.isTrue(backgroundWorkHoldsCompletion(publishedRoster(harness)));
       assert.isTrue(yield* harness.hasPendingBackgroundWork);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  // A run claims its provider thread before its turn ingests, so its stored roster can miss a
+  // change; a turn on the live query publishes Claude's current roster over it.
+  it.effect("a turn on the live query replaces a stale stored roster with Claude's", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      // The command ends within the turn, so Claude owes no wake for it.
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-claude-stale-roster-1"),
+          text: "Run the build in the background and wait for it.",
+          attachments: [],
+        }),
+      );
+      yield* Queue.offer(harness.sdkMessages, wakeTaskStarted);
+      yield* Queue.offer(harness.sdkMessages, wakeNotification);
+      yield* Queue.offer(harness.sdkMessages, turnOneResult);
+      yield* harness.awaitTerminal(1);
+      const settled = providerThreadRosterEvents(harness.events).at(-1)!.providerThread;
+      assert.deepEqual(settled.pendingBackgroundTasks, []);
+      const beforeStart = harness.events.length;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: {
+            ...settled,
+            pendingBackgroundTasks: [
+              { taskId: WAKE_TASK_ID, kind: "background_task", description: WAKE_TASK_DESCRIPTION },
+            ],
+          },
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-claude-stale-roster-2"),
+          text: "Anything else?",
+          attachments: [],
+          providerTurnOrdinal: 2,
+        }),
+      );
+      assert.deepEqual(rostersSince(harness, beforeStart), [[]]);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -16941,6 +17003,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         // Query replacement reads the internal roster, which the exit already cleared.
         assert.isFalse(yield* harness.hasPendingBackgroundWork);
         yield* harness.offerAndWait(wakeTurnInit);
+        const beforeWakeRun = harness.events.length;
         yield* harness.runtime.startTurn(
           makeClaudeTestTurnInput({
             threadId: harness.threadId,
@@ -16953,6 +17016,14 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             messageCreatedBy: "agent",
             messageCreationSource: "provider",
           }),
+        );
+        // The run's stored roster lacks the owed wakes; its turn start publishes them.
+        assert.deepEqual(
+          rostersSince(harness, beforeWakeRun)[0]?.map((task) => [
+            task.taskId,
+            task.awaited === true,
+          ]),
+          taskIds.map((id) => [id, true]),
         );
         yield* harness.offerAndWait(wakeAssistant);
         yield* harness.offerAndWait(wakeResult);

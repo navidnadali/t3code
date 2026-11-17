@@ -1,3 +1,4 @@
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
@@ -166,6 +167,33 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
   const full = () => slots.length >= allowed;
   const canAct = () => saturated || slots.length >= whenSaturated;
 
+  // Time the gate held gated effects back, and ran at the saturated allowance, for the wait observer.
+  const closed = { sinceMs: undefined as number | undefined, totalMs: 0 };
+  const reduced = { sinceMs: undefined as number | undefined, totalMs: 0 };
+  const toggle = (span: typeof closed, on: boolean, nowMs: number) => {
+    if (on && span.sinceMs === undefined) span.sinceMs = nowMs;
+    if (!on && span.sinceMs !== undefined) {
+      span.totalMs += nowMs - span.sinceMs;
+      span.sinceMs = undefined;
+    }
+  };
+  const track = (nowMs: number) => {
+    toggle(closed, full(), nowMs);
+    toggle(reduced, saturated, nowMs);
+  };
+  const observer = yield* CurrentWaitObserver;
+  if (observer !== undefined) {
+    const clock = yield* Clock.clockWith(Effect.succeed);
+    const reader = (span: typeof closed) => () =>
+      span.totalMs +
+      (span.sinceMs === undefined ? 0 : clock.currentTimeMillisUnsafe() - span.sinceMs);
+    const unregister = [
+      observer.register("EffectAdmission.closedMs", "counter", reader(closed)),
+      observer.register("EffectAdmission.saturatedMs", "counter", reader(reduced)),
+    ];
+    yield* Effect.addFinalizer(() => Effect.sync(() => unregister.forEach((undo) => undo())));
+  }
+
   // Stops `current` from inside its own run: the loop ends and its finalizer closes the scope.
   const stop = (current: Sampler) => {
     current.active = false;
@@ -189,6 +217,7 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
     {
       const nowMs = yield* Clock.currentTimeMillis;
       if (prune(nowMs)) yield* options.onSlotFreed;
+      track(nowMs);
       if (!canAct()) return stop(current);
       const pressure = yield* next;
       if (pressure >= options.closeAbove) {
@@ -210,6 +239,7 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
       } else {
         return;
       }
+      track(nowMs);
       yield* Effect.logInfo("Orchestration effect admission changed", {
         saturated,
         allowed,
@@ -258,6 +288,7 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
     if (index === -1) return;
     const wasFull = full();
     slots.splice(index, 1);
+    track(yield* Clock.currentTimeMillis);
     if (ran && wasFull && !full()) yield* options.onSlotFreed;
     yield* settle;
   });
@@ -266,11 +297,13 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
     const nowMs = yield* Clock.currentTimeMillis;
     if (prune(nowMs)) yield* options.onSlotFreed;
     if (full()) {
+      track(nowMs);
       yield* settle;
       return Option.none();
     }
     const slot: Slot = { takenAtMs: nowMs };
     slots.push(slot);
+    track(nowMs);
     yield* settle;
     return Option.some({ release: giveBack(slot, true), discard: giveBack(slot, false) });
   });
@@ -279,6 +312,7 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
     excludedTypes: Effect.gen(function* () {
       const nowMs = yield* Clock.currentTimeMillis;
       if (prune(nowMs)) yield* options.onSlotFreed;
+      track(nowMs);
       yield* settle;
       return full() ? GATED_EFFECT_TYPES : [];
     }),

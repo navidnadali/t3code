@@ -1,5 +1,6 @@
-import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
+import { makeAssistantStreamingFilter, makeIngestionMailbox } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import {
   isOrchestrationV2WorkActive,
   CommandId,
@@ -25,6 +26,7 @@ import {
   type TurnItemId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -44,6 +46,8 @@ import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EventSink from "./EventSink.ts";
+import * as IngestLag from "./IngestLag.ts";
+import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { PROVIDER_STOP_REASON_SIGNAL } from "@t3tools/provider-core/server/subagentProjection";
@@ -597,6 +601,79 @@ export function routeProviderEvent(
   }
 }
 
+/** Asks a run past its root terminal whether ingestion can stop; it writes nothing. */
+interface StopRecheck {
+  readonly type: "stop_recheck";
+}
+const stopRecheck: StopRecheck = { type: "stop_recheck" };
+
+/**
+ * Whether `event` is another run's root work on a thread this run does not own, which
+ * `routeProviderEvent` rejects. A shared provider session hands every run every thread's events;
+ * dropping these before the commit path keeps a run's cost to its own. Child items without a run,
+ * turns without a thread or attempt, and every control are kept.
+ */
+export function isAnotherRunsProviderEvent(
+  event: ProviderAdapter.ProviderAdapterV2Event,
+  identity: ProviderEventRouteIdentity,
+  state: ProviderEventRoutingState,
+): boolean {
+  const unowned = (threadId: ThreadId) =>
+    threadId !== identity.threadId && !state.ownedThreadIds.has(threadId);
+  const anotherRuns = (runId: OrchestrationV2Run["id"] | null, threadId: ThreadId) =>
+    runId !== null && runId !== identity.runId && unowned(threadId);
+  switch (event.type) {
+    case "turn_item.updated":
+      return anotherRuns(event.turnItem.runId, event.turnItem.threadId);
+    case "node.updated":
+      return anotherRuns(event.node.runId, event.node.threadId);
+    case "message.updated":
+      return anotherRuns(event.message.runId, event.message.threadId);
+    case "plan.updated":
+      return anotherRuns(event.plan.runId, event.plan.threadId);
+    case "provider_turn.updated": {
+      const turn = event.providerTurn;
+      return (
+        event.threadId !== undefined &&
+        unowned(event.threadId) &&
+        turn.runAttemptId !== null &&
+        turn.runAttemptId !== identity.attemptId &&
+        turn.providerThreadId !== identity.providerThreadId &&
+        !state.ownedProviderThreadIds.has(turn.providerThreadId) &&
+        !state.ownedProviderTurns.has(turn.id)
+      );
+    }
+    default:
+      return false;
+  }
+}
+
+/**
+ * Whether routing `event` may give this run a thread or provider thread it does not own yet, so
+ * that another run's event behind it could route here. Drops wait until such an event is routed.
+ */
+export function mayExtendRunOwnership(
+  event: ProviderAdapter.ProviderAdapterV2Event,
+  identity: ProviderEventRouteIdentity,
+  state: ProviderEventRoutingState,
+): boolean {
+  switch (event.type) {
+    case "app_thread.created":
+    case "subagent.updated":
+    case "provider_thread.updated":
+      return true;
+    case "node.updated":
+      return (
+        event.node.providerThreadId !== null &&
+        event.node.providerThreadId !== identity.providerThreadId &&
+        !state.ownedProviderThreadIds.has(event.node.providerThreadId) &&
+        !isAnotherRunsProviderEvent(event, identity, state)
+      );
+    default:
+      return false;
+  }
+}
+
 export class RunExecutionStartError extends Schema.TaggedError<RunExecutionStartError>()(
   "RunExecutionStartError",
   {
@@ -708,6 +785,17 @@ export const layer: Layer.Layer<
   RunExecutionServiceV2,
   Effect.gen(function* () {
     const scope = yield* Effect.scope;
+    const waitObserver = yield* CurrentWaitObserver;
+    // Events runs dropped before ingestion because another run on their session owns them.
+    let fanoutDropped = 0;
+    if (waitObserver !== undefined) {
+      const unregister = waitObserver.register(
+        IngestLag.FANOUT_DROPPED_SITE,
+        "counter",
+        () => fanoutDropped,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unregister));
+    }
     const checkpointService = yield* CheckpointService.CheckpointServiceV2;
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -1214,10 +1302,16 @@ export const layer: Layer.Layer<
           attemptId: input.attempt.id,
           providerThreadId: input.providerThread.id,
         };
-        const eventSubscription =
+        // The ingestion mailbox, made below, holds what ingestion took and has not processed.
+        const mailboxBacklog = { pending: (): number => 0 };
+        const eventSubscription = IngestLag.observeBacklog(
+          waitObserver,
           input.session.subscribeEvents === undefined
             ? { events: input.session.events, close: Effect.void }
-            : yield* input.session.subscribeEvents;
+            : yield* input.session.subscribeEvents,
+          input.run.threadId,
+          () => mailboxBacklog.pending(),
+        );
         const inheritedBackgroundTurnItems = yield* (
           input.loadInheritedBackgroundTurnItems?.() ?? Effect.succeed([])
         ).pipe(
@@ -1266,6 +1360,9 @@ export const layer: Layer.Layer<
         const childSnapshotPendingWork = new Set<ProviderThreadId>();
         let rootTurnOwnershipChecked = false;
         const assistantStreaming = makeAssistantStreamingFilter(responseStreamingMode);
+        const mailbox = makeIngestionMailbox();
+        const mailboxSettled = yield* Queue.dropping<void>(1);
+        mailboxBacklog.pending = mailbox.pending;
         // Set when ingestion ends or finalization settles the run's open items, which a later
         // streaming snapshot must not reopen.
         let idleFlushClosed = false;
@@ -1326,9 +1423,10 @@ export const layer: Layer.Layer<
           // as interrupted. The completed write refuses in the same transaction
           // as a stored Stop request, so a racing Stop stays authoritative.
           const handedOff = terminal.status === "interrupted" && (yield* workspaceHandedOff);
-          if (!handedOff || !(yield* writeTerminal({ ...terminal, status: "completed" }))) {
-            yield* writeTerminal(terminal);
-          }
+          let written = handedOff && (yield* writeTerminal({ ...terminal, status: "completed" }));
+          if (!written) written = yield* writeTerminal(terminal);
+          // A terminal's ingest lag runs to these writes, not to the ingestor's.
+          if (written) yield* IngestLag.markPersisted;
           if (isRunOwnedSubagentTerminalStatus(terminal.status) && !childTurnsContinue(terminal)) {
             yield* Ref.set(openRunOwnedSubagents, emptyOpenRunOwnedSubagentProjection());
             idleFlushClosed = true;
@@ -1806,10 +1904,39 @@ export const layer: Layer.Layer<
                   }
               : {}),
           });
-          if (isRootProviderThreadUpdate && rootTerminalAlreadySeen && storedEvents.length === 0) {
-            yield* Ref.set(providerThreadOwnerLost, true);
+          if (
+            event.type === "provider_thread.updated" &&
+            isRootProviderThreadUpdate &&
+            rootTerminalAlreadySeen &&
+            storedEvents.length === 0
+          ) {
+            // A newer run claims the thread when queued but ingests only from its turn start.
+            // Until it attaches, this run's snapshots are the only report of background work.
+            const { unattached, storedEvents: corrected } = yield* eventSink
+              .writeProviderThreadRosterIfUnattached({
+                afterRunOrdinal: input.run.ordinal,
+                event: {
+                  id: yield* idAllocator.allocate.event({
+                    threadId: input.run.threadId,
+                    providerSessionId: input.providerSessionId,
+                  }),
+                  type: "provider-thread.updated",
+                  threadId: input.run.threadId,
+                  runId: input.run.id,
+                  nodeId: input.rootNode.id,
+                  driver: event.driver,
+                  providerInstanceId: input.run.providerInstanceId,
+                  occurredAt: yield* DateTime.now,
+                  payload: event.providerThread,
+                },
+              })
+              .pipe(ProviderEventIngestor.retryLockTimeout);
+            if (!unattached) yield* Ref.set(providerThreadOwnerLost, true);
+            // A correction is this event's write, so its ingest lag counts.
+            if (corrected.length > 0) yield* IngestLag.markPersisted;
+            return unattached;
           }
-          return storedEvents.length;
+          return storedEvents.length > 0;
         });
         // The timer only wakes ingestion. The flush runs as an ingestion step outside any provider
         // batch, so it stays ordered with routing and snapshots, and a write has committed when
@@ -1854,7 +1981,7 @@ export const layer: Layer.Layer<
           if (idleFlushWake !== undefined && idleFlushWake.at <= now) idleFlushWake = undefined;
           if (idleFlushClosed) return;
           const rootSettled = yield* Ref.get(rootRunFinalized);
-          for (const event of assistantStreaming.takeIdleFlushes(now)) {
+          for (const event of assistantStreaming.takeIdleFlushes(now, mailbox.isWaiting)) {
             // Settling the root run closed its messages; only children may still stream.
             if (rootSettled && streamedThreadId(event) === input.run.threadId) continue;
             // The held text's child may have been handed to another run since it arrived.
@@ -1881,7 +2008,7 @@ export const layer: Layer.Layer<
           ) {
             yield* Ref.set(latestRootProviderTurn, event.providerTurn);
           }
-          let storedEventCount = 0;
+          let stored = false;
           const deliveredEvent = assistantStreaming.filter(
             event,
             DateTime.toEpochMillis(yield* DateTime.now),
@@ -1899,14 +2026,14 @@ export const layer: Layer.Layer<
             rootTurnOwnershipChecked = true;
             // Stop plans under this lock from stored turns. Storing the first turn and rechecking
             // the attempt under it means Stop either saw the turn or already settled the run.
-            const [stored, owned] = yield* threadCommands.withLock(
+            const [ingested, owned] = yield* threadCommands.withLock(
               input.run.threadId,
               Effect.all([
                 ingestDelivered(event, deliveredEvent),
                 shouldStartProviderTurn().pipe(Effect.orElseSucceed(() => true)),
               ]),
             );
-            storedEventCount = stored;
+            stored = ingested;
             if (!owned) {
               yield* Ref.get(latestProviderThread).pipe(
                 Effect.flatMap((providerThread) =>
@@ -1927,7 +2054,7 @@ export const layer: Layer.Layer<
               );
             }
           } else if (deliveredEvent) {
-            storedEventCount = yield* ingestDelivered(event, deliveredEvent);
+            stored = yield* ingestDelivered(event, deliveredEvent);
           } else if (
             event.type === "turn_item.updated" &&
             (event.turnItem.type === "assistant_message" || event.turnItem.type === "reasoning") &&
@@ -1942,7 +2069,7 @@ export const layer: Layer.Layer<
             reservedHeldTurnItemIds.add(event.turnItem.id);
           }
           if (event.type === "provider_thread.updated") {
-            if (event.providerThread.id === input.providerThread.id && storedEventCount > 0) {
+            if (event.providerThread.id === input.providerThread.id && stored) {
               yield* Ref.set(latestProviderThread, event.providerThread);
               rootSnapshotPendingWork = event.pendingBackgroundWork === true;
             } else if (event.providerThread.id !== input.providerThread.id) {
@@ -1988,22 +2115,109 @@ export const layer: Layer.Layer<
                 : { ...event, failure: { ...event.failure, code: RUN_START_FAILED_CODE } },
             ),
           );
+        // Another run's events are dropped before the mailbox, so they neither split this run's
+        // streamed text nor reach a commit. Owned threads change only as routing takes an event
+        // `mayExtendRunOwnership` names, so drops wait while one is queued.
+        const queuedOwnershipChanges = new WeakSet<ProviderAdapter.ProviderAdapterV2Event>();
+        let ownershipChangesQueued = 0;
+        // Past the root terminal every event used to recheck whether ingestion can stop; a pass
+        // that dropped events still rechecks once, after the events it kept.
+        let rootTerminalQueued = false;
+        let stopRecheckDue = false;
+        // Ingestion refills the mailbox only once everything it handed over is ingested, taking all
+        // the subscription queued meanwhile, so a backlog's superseded text snapshots never commit.
+        const mailboxEvents = Stream.unwrap(
+          Effect.map(Stream.toPull(eventSubscription.events), (pullQueued) =>
+            Stream.fromPull(
+              Effect.succeed(
+                Effect.gen(function* (): Effect.fn.Return<
+                  Arr.NonEmptyReadonlyArray<ProviderAdapter.ProviderAdapterV2Event | StopRecheck>,
+                  Cause.Done | ProviderAdapter.ProviderAdapterV2Error
+                > {
+                  for (;;) {
+                    // One chunk per pull: each chunk costs a pass through the merge and consume.
+                    const taken = mailbox.takeAll();
+                    if (Arr.isReadonlyArrayNonEmpty(taken)) return taken;
+                    if (stopRecheckDue) {
+                      stopRecheckDue = false;
+                      return [stopRecheck] as const;
+                    }
+                    // Every handed-over event settles unless its consume is ending, which ends this pull.
+                    while (mailbox.pending() > 0) yield* Queue.take(mailboxSettled);
+                    let dropped = 0;
+                    for (const queued of yield* pullQueued) {
+                      const routing = yield* Ref.get(eventRouting);
+                      if (
+                        ownershipChangesQueued === 0 &&
+                        isAnotherRunsProviderEvent(queued, routeIdentity, routing)
+                      ) {
+                        dropped++;
+                        continue;
+                      }
+                      if (mayExtendRunOwnership(queued, routeIdentity, routing)) {
+                        queuedOwnershipChanges.add(queued);
+                        ownershipChangesQueued++;
+                      }
+                      if (
+                        queued.type === "turn.terminal" &&
+                        queued.providerThreadId === routeIdentity.providerThreadId
+                      )
+                        rootTerminalQueued = true;
+                      // A coalesced snapshot is never processed, so it releases its count here.
+                      const replaced = mailbox.offer(queued);
+                      if (replaced !== undefined && queuedOwnershipChanges.delete(replaced))
+                        ownershipChangesQueued--;
+                    }
+                    if (dropped === 0) continue;
+                    fanoutDropped += dropped;
+                    if (rootTerminalQueued) stopRecheckDue = true;
+                  }
+                }),
+              ),
+            ),
+          ),
+        );
         const providerEventFiber = yield* eventSink
           .consumeProviderEvents(
-            eventSubscription.events.pipe(
+            mailboxEvents.pipe(
               Stream.merge(Stream.fromQueue(idleFlushTicks), { haltStrategy: "left" }),
             ),
             (event) =>
               event.type === "idle_flush"
                 ? flushIdleAssistantText(event.at)
-                : Effect.gen(function* () {
-                    yield* ingestEvent(yield* routeEvent(yield* markUnstartedFailure(event)));
-                  }),
+                : event.type === "stop_recheck"
+                  ? Effect.void
+                  : Effect.gen(function* () {
+                      yield* ingestEvent(yield* routeEvent(yield* markUnstartedFailure(event)));
+                    }).pipe(
+                      Effect.ensuring(
+                        Effect.suspend(() => {
+                          mailbox.settle(event);
+                          if (queuedOwnershipChanges.delete(event)) ownershipChangesQueued--;
+                          return mailbox.pending() === 0
+                            ? Queue.offer(mailboxSettled, undefined)
+                            : Effect.void;
+                        }),
+                      ),
+                    ),
             Effect.gen(function* () {
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
               return yield* shouldStopProviderEventIngestion;
             }),
-            Ref.get(rootTerminalSeen).pipe(Effect.map((seen) => !seen)),
+            // Until the root terminal, a running turn's usage reports share commits with the
+            // snapshots around them. A report that may be the root's first stays alone: it rechecks
+            // ownership under the thread lock.
+            (event) =>
+              Ref.get(rootTerminalSeen).pipe(
+                Effect.map(
+                  (seen) =>
+                    !seen &&
+                    (ProviderCommitBatch.isSnapshot(event) ||
+                      (event.type === "provider_turn.updated" &&
+                        !isTerminalProviderTurnStatus(event.providerTurn.status) &&
+                        (rootTurnOwnershipChecked || input.shouldStartProviderTurn === undefined))),
+                ),
+              ),
           )
           .pipe(
             Effect.ensuring(closeIdleFlush),

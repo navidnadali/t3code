@@ -11,6 +11,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -25,6 +26,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
+import { recordingWaitObserver } from "../observability/WaitObserver.testkit.ts";
 import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -435,6 +437,7 @@ it.effect("refuses a change when the calling thread cannot be read", () =>
 
 it.effect("reads a waking caller's modes after its continuation starts the run", () =>
   Effect.gen(function* () {
+    const { observer, reports } = recordingWaitObserver();
     const shell = yield* Ref.make(liveThreadShell(fullAccessThreadId, { activeRunId: null }));
     const waiting = yield* Deferred.make<void>();
     const settled = yield* Deferred.make<void>();
@@ -454,6 +457,7 @@ it.effect("reads a waking caller's modes after its continuation starts the run",
         awaitSettle: () =>
           Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Deferred.await(settled))),
       }),
+      Effect.provideService(CurrentWaitObserver, observer),
       Effect.forkChild,
     );
     yield* Deferred.await(waiting);
@@ -462,13 +466,19 @@ it.effect("reads a waking caller's modes after its continuation starts the run",
       shell,
       liveThreadShell(fullAccessThreadId, { runtimeMode: "approval-required" }),
     );
+    yield* TestClock.adjust("3 seconds");
     yield* Deferred.succeed(settled, undefined);
     expect(yield* Fiber.join(outcome)).toBe("capability_denied");
+    // The wait is measured with how it ended.
+    expect(reports("wait")).toEqual([
+      ["McpToolAccess.wakeRunWait", 3e9, undefined, undefined, undefined, "became-active"],
+    ]);
   }),
 );
 
-it.effect("logs a wake caller's wait that gave up at a minute, before its refusal", () =>
+it.effect("logs a wake caller's wait that gave up at ten minutes, before its refusal", () =>
   Effect.gen(function* () {
+    const { observer, reports } = recordingWaitObserver();
     const lines: Array<{ readonly event: unknown; readonly fields: unknown }> = [];
     const logger = Logger.make(({ message, logLevel }) => {
       if (logLevel === "Warn" && Array.isArray(message)) {
@@ -495,16 +505,42 @@ it.effect("logs a wake caller's wait that gave up at a minute, before its refusa
         progress: () => Effect.succeed({ pending: 1, settles: 0 }),
         awaitSettle: () => Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Effect.never)),
       }),
+      Effect.provideService(CurrentWaitObserver, observer),
       Effect.forkChild,
     );
     yield* Deferred.await(waiting);
-    yield* TestClock.adjust("60 seconds");
+    yield* TestClock.adjust("10 minutes");
     expect(yield* Fiber.join(outcome)).toBe("parent_not_active");
+    expect(reports("wait")).toEqual([
+      ["McpToolAccess.wakeRunWait", 600e9, undefined, undefined, undefined, "timed-out"],
+    ]);
     expect(lines.map((line) => line.event)).toEqual([
       "orchestrator-mcp.wake-run-wait-timed-out",
       "orchestrator-mcp.caller-not-active",
     ]);
     expect(lines[0]?.fields).toEqual({ threadId: endedThreadId, pending: 1 });
+  }),
+);
+
+it.effect("refuses an archived waking caller at once: its thread starts no run", () =>
+  Effect.gen(function* () {
+    const outcome = yield* call("acts_as_caller", archivedBackground).pipe(
+      Effect.provide(
+        probeServer(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+          }),
+        ),
+      ),
+      Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+        offer: () => Effect.void,
+        take: Effect.never,
+        settle: () => Effect.void,
+        progress: () => Effect.succeed({ pending: 1, settles: 0 }),
+        awaitSettle: () => Effect.never,
+      }),
+    );
+    expect(outcome).toBe("parent_not_active");
   }),
 );
 

@@ -688,6 +688,8 @@ export interface ProviderAdapterV2ForkThreadInput {
 export interface ProviderAdapterV2EventSubscription {
   readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
   readonly close: Effect.Effect<void>;
+  /** Events published to this subscription and not yet taken from it. */
+  readonly pending?: () => number;
 }
 
 export interface ProviderAdapterV2HistoricalContext {

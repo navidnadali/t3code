@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as ByteSize from "effect/ByteSize";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -54,8 +55,8 @@ function aggregateLines(lines: ReadonlyArray<string>) {
   });
 }
 
-function readTraces(fileSystem: Partial<FileSystem.FileSystem>) {
-  return TraceDiagnostics.readTraceDiagnostics({ traceFilePath, maxFiles: 1, readAt }).pipe(
+function readTraces(fileSystem: Partial<FileSystem.FileSystem>, maxFiles = 1) {
+  return TraceDiagnostics.readTraceDiagnostics({ traceFilePath, maxFiles, readAt }).pipe(
     Effect.provide(TraceDiagnostics.layer.pipe(Layer.provide(FileSystem.layerNoop(fileSystem)))),
   );
 }
@@ -337,6 +338,68 @@ describe("TraceDiagnostics", () => {
         errorTag: "TraceFileReadError",
         causeTag: "PermissionDenied",
       });
+    }),
+  );
+
+  it.effect("reads only the newest rotated files that fit its byte budget", () =>
+    Effect.gen(function* () {
+      const read = (sizesMiB: ReadonlyMap<string, number>, maxFiles: number) =>
+        readTraces(
+          {
+            stat: (path) =>
+              Effect.succeed({
+                type: "File",
+                size: ByteSize.mebibytes(sizesMiB.get(path) ?? 0),
+              } as FileSystem.File.Info),
+            stream: (path) =>
+              Stream.make(
+                new TextEncoder().encode(
+                  record({
+                    name: path.slice(traceFilePath.length) || "current",
+                    traceId: "trace-a",
+                    spanId: "span-a",
+                    startMs: 1_000,
+                    durationMs: 50,
+                  }),
+                ),
+              ),
+          },
+          maxFiles,
+        );
+
+      // Hours of 64 MiB backups: only the newest that fit 128 MiB are parsed in-process.
+      const long = yield* read(
+        new Map([
+          [traceFilePath, 40],
+          [`${traceFilePath}.1`, 64],
+          [`${traceFilePath}.2`, 64],
+          [`${traceFilePath}.3`, 64],
+        ]),
+        300,
+      );
+      assert.deepStrictEqual(long.scannedFilePaths, [`${traceFilePath}.1`, traceFilePath]);
+      assert.equal(long.recordCount, 2);
+
+      // The newest file is read even when it alone is over the budget.
+      const oversized = yield* read(
+        new Map([
+          [traceFilePath, 200],
+          [`${traceFilePath}.1`, 1],
+        ]),
+        1,
+      );
+      assert.deepStrictEqual(oversized.scannedFilePaths, [traceFilePath]);
+
+      // The default rotation, ten full 10 MiB backups and the open file, is read whole.
+      const defaults = yield* read(
+        new Map(TraceDiagnostics.toRotatedTracePaths(traceFilePath, 10).map((path) => [path, 10])),
+        10,
+      );
+      assert.deepStrictEqual(
+        defaults.scannedFilePaths,
+        TraceDiagnostics.toRotatedTracePaths(traceFilePath, 10),
+      );
+      assert.equal(defaults.recordCount, 11);
     }),
   );
 });

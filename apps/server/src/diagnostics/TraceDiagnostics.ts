@@ -61,6 +61,8 @@ interface TraceDiagnosticsErrorSummary {
 export const DEFAULT_SLOW_SPAN_THRESHOLD_MS = 1_000;
 const TOP_LIMIT = 10;
 const RECENT_LIMIT = 20;
+// Parsed on the server's event loop. The default rotation keeps at most 11 x 10 MiB, all read.
+const MAX_SCANNED_BYTES = 128 * 1024 * 1024;
 
 export function toRotatedTracePaths(
   traceFilePath: string,
@@ -449,7 +451,21 @@ export const make = Effect.gen(function* () {
     function* (options) {
       const readAt = options.readAt ?? (yield* DateTime.now);
       const slowSpanThresholdMs = options.slowSpanThresholdMs ?? DEFAULT_SLOW_SPAN_THRESHOLD_MS;
-      const paths = toRotatedTracePaths(options.traceFilePath, options.maxFiles);
+      const rotatedPaths = toRotatedTracePaths(options.traceFilePath, options.maxFiles);
+      // The newest files that fit MAX_SCANNED_BYTES, and always the newest file.
+      let first = rotatedPaths.length;
+      let scannedBytes = 0;
+      while (first > 0) {
+        // A file that cannot be sized is left for the stream to read or report.
+        const bytes = yield* fileSystem.stat(rotatedPaths[first - 1]!).pipe(
+          Effect.map((info) => Number(info.size)),
+          Effect.orElseSucceed(() => 0),
+        );
+        if (scannedBytes > 0 && scannedBytes + bytes > MAX_SCANNED_BYTES) break;
+        scannedBytes += bytes;
+        first -= 1;
+      }
+      const paths = rotatedPaths.slice(first);
       const aggregator = makeTraceDiagnosticsAggregator(slowSpanThresholdMs);
       const results = yield* Effect.forEach(
         paths,

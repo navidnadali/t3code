@@ -77,6 +77,8 @@ const createLedger = (sql: SqlClient.SqlClient) =>
  */
 export const moveRc1PerfForkMigrations = Effect.fn("moveRc1PerfForkMigrations")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  // Checked before the write lock too: a current database's start must not take it.
+  if ((yield* rc1LedgerRows()).length === 0) return;
   yield* sql.withTransaction(
     Effect.gen(function* () {
       const found = yield* rc1LedgerRows();
@@ -226,12 +228,18 @@ export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function
       }),
     );
   }
-  const executed = yield* run({
-    loader: Migrator.fromRecord(
-      Object.fromEntries(entries.map(([id, name, migration]) => [`${id}_${name}`, migration])),
-    ),
-    table: PERF_FORK_MIGRATIONS_TABLE,
-  });
+  // The migrator takes the write lock even when it has nothing to run.
+  const executed =
+    unrecorded.length === 0
+      ? []
+      : yield* run({
+          loader: Migrator.fromRecord(
+            Object.fromEntries(
+              entries.map(([id, name, migration]) => [`${id}_${name}`, migration]),
+            ),
+          ),
+          table: PERF_FORK_MIGRATIONS_TABLE,
+        });
   if (executed.length > 0) {
     yield* Effect.log("Performance fork migrations ran successfully").pipe(
       Effect.annotateLogs({ migrations: executed.map(perfForkMigrationLabel) }),

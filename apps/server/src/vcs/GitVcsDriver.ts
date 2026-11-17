@@ -1,5 +1,6 @@
 import * as NodeBuffer from "node:buffer";
 
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
@@ -60,6 +61,7 @@ import {
   makeGitConfigSnapshots,
 } from "./gitConfigSnapshot.ts";
 import * as CheckoutCloner from "./CheckoutCloner.ts";
+import * as CheckpointUntrackedBlobs from "./checkpointUntrackedBlobs.ts";
 import * as VcsDriver from "./VcsDriver.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 
@@ -1261,6 +1263,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       : input.fromCheckpointRef;
   });
 
+  const untrackedBlobs = CheckpointUntrackedBlobs.make(execute, fileSystem);
+
   const checkpoints: VcsDriver.VcsCheckpointOps = {
     captureCheckpoint: Effect.fn("GitVcsDriver.checkpoints.captureCheckpoint")(function* (input) {
       const operation = VcsProcess.CHECKPOINT_CAPTURE_OPERATION;
@@ -1287,6 +1291,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         lastMove !== undefined && lastMove.to === head
           ? `${lastMove.at} ${headMoves.filter((move) => move.at === lastMove.at).length}`
           : undefined;
+      const startedAt = yield* Clock.currentTimeMillis;
       const indexId = yield* random.uuidV4();
       const tempIndexPath = path.join(gitCommonDir, `t3-checkpoint-index-${indexId}`);
       const hostEnv = yield* HostProcess.Environment;
@@ -1574,6 +1579,16 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           }
         }
 
+        // Untracked files have no stat data in a new index, so git add would rehash every one.
+        const untracked =
+          topLevel === undefined || head === undefined || sparseCheckout || workspaceIgnored
+            ? undefined
+            : { cwd: input.cwd, topLevel, head, env: commitEnv };
+        const { reused, before } =
+          untracked === undefined
+            ? CheckpointUntrackedBlobs.NOTHING
+            : yield* untrackedBlobs.reuse({ ...untracked, indexConfig });
+
         const stageFiles = (exclusions: ReadonlyArray<string>) =>
           execute({
             operation,
@@ -1595,6 +1610,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             ],
             env: commitEnv,
           });
+        const stagingAt = yield* Clock.currentTimeMillis;
         yield* stageFiles([]).pipe(
           Effect.catchTags({
             VcsProcessExitError: (error) =>
@@ -1652,6 +1668,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
               ),
           }),
         );
+
+        const stagingMs = (yield* Clock.currentTimeMillis) - stagingAt;
 
         const writeTreeResult = yield* execute({
           operation,
@@ -1924,6 +1942,16 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             input.checkpointRef,
             commitOid,
           );
+        }
+        if (untracked !== undefined) {
+          yield* untrackedBlobs.remember({
+            ...untracked,
+            tree: treeOid,
+            startedAt,
+            stagingMs,
+            reused,
+            before,
+          });
         }
       }).pipe(Effect.ensuring(cleanupTempIndex));
 

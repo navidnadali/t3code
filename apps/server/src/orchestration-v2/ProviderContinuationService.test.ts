@@ -12,6 +12,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2Notification,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -104,12 +105,17 @@ const makeGuard = Effect.fnUntraced(function* (completed?: Deferred.Deferred<voi
 function layerTest(input: {
   readonly dispatched: Queue.Queue<unknown>;
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
+  readonly beforeDispatch?: (threadId: ThreadId) => Effect.Effect<void>;
 }) {
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     // A wake's dispatch key reads only the thread's lineage; the tests' reads are the deliveries'.
     getThreadRecords: ((_threadId: ThreadId, fields: ReadonlyArray<string>) =>
       fields.length === 0 ? Effect.succeed(projection) : input.getThreadRecords()) as never,
-    dispatch: (command) => Queue.offer(input.dispatched, command).pipe(Effect.as({} as never)),
+    dispatch: (command) =>
+      (
+        ("threadId" in command ? input.beforeDispatch?.(command.threadId) : undefined) ??
+        Effect.void
+      ).pipe(Effect.andThen(Queue.offer(input.dispatched, command)), Effect.as({} as never)),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
     Layer.provide(
@@ -783,6 +789,43 @@ describe("ProviderContinuationService", () => {
       );
     });
   });
+  it.effect(
+    "a wake held by another thread's parent lock does not delay other threads' wakes",
+    () => {
+      return Effect.gen(function* () {
+        const dispatched = yield* Queue.unbounded<unknown>();
+        const blockedChildId = ThreadId.make("thread-provider-continuation-blocked-child");
+        const dispatchedAt = new Map<ThreadId, number>();
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* requests.offer({ ...request(), threadId: blockedChildId });
+          yield* requests.offer(request());
+          yield* TestClock.adjust("10 minutes");
+          yield* Queue.take(dispatched);
+          yield* Queue.take(dispatched);
+          assert.equal(dispatchedAt.get(blockedChildId), 10 * 60 * 1000);
+          assert.equal(dispatchedAt.get(threadId), 0);
+        }).pipe(
+          Effect.provide(
+            layerTest({
+              dispatched,
+              getThreadRecords: () => Effect.succeed(projection),
+              // Models the child's message intake waiting on its coordinator's dispatch lock.
+              beforeDispatch: (dispatchThreadId) =>
+                (dispatchThreadId === blockedChildId
+                  ? Effect.sleep("10 minutes")
+                  : Effect.void
+                ).pipe(
+                  Effect.andThen(Clock.currentTimeMillis),
+                  Effect.map((now) => void dispatchedAt.set(dispatchThreadId, now)),
+                ),
+            }),
+          ),
+          Effect.scoped,
+        );
+      });
+    },
+  );
 });
 
 // A fleet of threads whose dispatches take the locks Orchestrator's dispatch takes: a completion
@@ -831,6 +874,8 @@ function makeFleet(input: {
   /** How long a dispatch takes once it holds its locks. */
   readonly cost?: Duration.Input;
   readonly outcome?: (entry: FleetEntry, attempt: number) => "ok" | "fail" | "die";
+  /** How long a thread's lineage read takes, by thread name. */
+  readonly lineageReads?: Readonly<Record<string, Duration.Input>>;
 }) {
   const parents = new Map(
     Object.entries(input.parents ?? {}).map(([child, parent]) => [
@@ -868,8 +913,12 @@ function makeFleet(input: {
     };
   };
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-    getThreadRecords: ((threadId: ThreadId, _fields: unknown, filter?: ProjectionRecordFilter) =>
-      Effect.sync(() => ({
+    getThreadRecords: ((
+      threadId: ThreadId,
+      fields: ReadonlyArray<string>,
+      filter?: ProjectionRecordFilter,
+    ) => {
+      const read = Effect.sync(() => ({
         thread: thread(threadId),
         // A delivered completion is no longer current, so a retry of it is dropped.
         messages: (filter?.messageIds ?? [])
@@ -895,7 +944,12 @@ function makeFleet(input: {
           },
         })),
         providerTurns: [],
-      }))) as never,
+      }));
+      const lineageRead = Object.entries(input.lineageReads ?? {}).find(
+        ([name]) => fields.length === 0 && fleetThread(name) === threadId,
+      )?.[1];
+      return lineageRead === undefined ? read : Effect.delay(read, lineageRead);
+    }) as never,
     dispatch: (command) => {
       const message = command as unknown as {
         readonly threadId: ThreadId;
@@ -1074,6 +1128,35 @@ describe("ProviderContinuationService dispatch per key", () => {
           );
         }).pipe(Effect.provide(refused.layer), Effect.scoped);
       });
+    },
+  );
+
+  it.effect(
+    "a slow lineage read for one thread's wake holds up neither other wakes nor completions",
+    () => {
+      const fleet = makeFleet({
+        parents: { slow: "p", seat: "q" },
+        lineageReads: { slow: "10 minutes" },
+      });
+      return Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* inOneTick(
+          Effect.forEach(
+            [
+              fleetWake("slow", "slow-0"),
+              fleetWake("seat"),
+              fleetWake("slow", "slow-1"),
+              fleetCompletion("r", "r-0"),
+            ],
+            requests.offer,
+            { discard: true },
+          ),
+        );
+        assert.deepEqual(fleet.landedLabels().toSorted(), ["r-0", "seat"]);
+
+        yield* TestClock.adjust("10 minutes");
+        assert.deepEqual(fleet.landedLabels().slice(2), ["slow-0", "slow-1"]);
+      }).pipe(Effect.provide(fleet.layer), Effect.scoped);
     },
   );
 

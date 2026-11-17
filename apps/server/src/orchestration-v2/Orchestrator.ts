@@ -2650,30 +2650,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     });
 
-  /** A child's results join only the cohorts of its own tasks' runs; the parent's others are not its to offer. */
-  const offerChildCompletionDeliveries =
-    /* The enclosing operation owns the span. */
-    Effect.fnUntraced(function* (parentThreadId: ThreadId, childThreadId: ThreadId) {
-      const { subagents } = yield* projectionStore.getThreadRecords(parentThreadId, ["subagents"], {
-        subagentChildThreadIds: [childThreadId],
-      });
-      const parentRunIds = new Set(
-        subagents.flatMap((task) => {
-          const state = task.completionDelivery?.state;
-          return task.origin === "app_owned" &&
-            task.childThreadId === childThreadId &&
-            task.runId !== null &&
-            (task.result === null ||
-              (state !== "delivered" && state !== "acknowledged" && state !== "disposed"))
-            ? [task.runId]
-            : [];
-        }),
-      );
-      for (const parentRunId of parentRunIds) {
-        yield* offerDelegatedCompletionDelivery(parentThreadId, parentRunId);
-      }
-    });
-
   /** Marks a wake the provider received delivered and reserves the next one for pending siblings. */
   const acceptDelegatedCompletionDelivery = Effect.fn(
     "Orchestrator.acceptDelegatedCompletionDelivery",
@@ -11163,6 +11139,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       remoteChild,
       status: command.status,
       result: command.result,
+      ...(command.executedModel === undefined ? {} : { executedModel: command.executedModel }),
       completedAt: now,
       updatedAt: now,
     };
@@ -15959,7 +15936,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           messageRoles: ["assistant"],
           messageRunIds: [childRun.id],
           turnItemRunId: childRun.id,
-          turnItemTypes: ["assistant_message", "error"],
+          turnItemTypes: ["assistant_message", "error", "system_notice"],
         },
       );
       // The result run's provider thread, attempt and turns: its source point and model note.
@@ -18329,7 +18306,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return;
       yield* threadDispatch.withLock(
         parentThreadId,
-        offerChildCompletionDeliveries(parentThreadId, threadId).pipe(
+        Effect.gen(function* () {
+          // A task's wake lives on the run that requested it; the parent's other wakes are not this child's.
+          const { subagents } = yield* projectionStore.getThreadRecords(
+            parentThreadId,
+            ["subagents"],
+            { subagentChildThreadIds: [threadId] },
+          );
+          // A settled task's result was delivered already: its run's wake is not this capture's.
+          const parentRunIds = new Set(
+            subagents.flatMap((task) => {
+              const state = task.completionDelivery?.state;
+              return task.childThreadId === threadId &&
+                task.runId !== null &&
+                (task.result === null ||
+                  (state !== "delivered" && state !== "acknowledged" && state !== "disposed"))
+                ? [task.runId]
+                : [];
+            }),
+          );
+          for (const parentRunId of parentRunIds) {
+            yield* offerDelegatedCompletionDelivery(parentThreadId, parentRunId);
+          }
+        }).pipe(
           Effect.andThen(
             finalizeAppOwnedSubagent(
               threadId,

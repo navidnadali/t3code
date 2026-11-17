@@ -5,6 +5,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -400,12 +401,42 @@ export const layer = Layer.effectDiscard(
       ProviderContinuationRequests.ProviderContinuationRequest
     >({ concurrency: COMPLETION_DISPATCH_CONCURRENCY, handle });
 
+    // A thread's wakes wait here, in order, while its family is read, off the intake.
+    const waitingForFamily = new Map<
+      ThreadId,
+      Array<ProviderContinuationRequests.ProviderContinuationRequest>
+    >();
+    const familyReads = yield* FiberSet.make<void>();
+    const flushWakes = (threadId: ThreadId, family: ThreadId): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        const next = waitingForFamily.get(threadId)!.shift();
+        if (next !== undefined)
+          return wakes.offer(family, next).pipe(Effect.andThen(flushWakes(threadId, family)));
+        waitingForFamily.delete(threadId);
+        return Effect.void;
+      });
+    const offerWake = (request: ProviderContinuationRequests.ProviderContinuationRequest) =>
+      Effect.suspend(() => {
+        const queued = waitingForFamily.get(request.threadId);
+        if (queued !== undefined) {
+          queued.push(request);
+          return Effect.void;
+        }
+        const known = familyKeys.get(request.threadId);
+        if (known !== undefined) return wakes.offer(known, request);
+        waitingForFamily.set(request.threadId, [request]);
+        return FiberSet.run(
+          familyReads,
+          wakeFamily(request.threadId).pipe(
+            Effect.flatMap((family) => flushWakes(request.threadId, family)),
+          ),
+        ).pipe(Effect.asVoid);
+      });
+
     yield* requests.take.pipe(
       Effect.flatMap((request) =>
         request.delegatedCompletion === undefined
-          ? wakeFamily(request.threadId).pipe(
-              Effect.flatMap((family) => wakes.offer(family, request)),
-            )
+          ? offerWake(request)
           : completions.offer(request.threadId, request),
       ),
       Effect.forever,

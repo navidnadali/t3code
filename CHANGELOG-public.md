@@ -2,6 +2,21 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.9-perf.10 (2026-11-17)
+
+Upstream main of 2026-11-16 and run fixes
+
+Upstream base: 7d32075e3757.
+
+Upstream T3 Code 0.1.9 at main of 2026-11-16, with upstream migration 96; Node 26.13.1.
+
+- Upstream: everything on upstream's main up to 2026-11-16, among it steering queued messages into a running Grok turn (upstream #37335), one busy thread's lock no longer stalling other threads' queued runs (upstream #37417) and the title repair migration 96.
+- A child agent's checkpoint capture skips the runs of its settled tasks.
+- A start whose schema is already current takes no write lock in the fork's migration chain.
+- A wake's lineage read no longer holds up the continuation intake.
+- Trace diagnostics read only the newest trace files, up to 128 MiB.
+- Cmd+Enter on an edited message with a fresh context starts it when the server can end the wait.
+
 ## v0.1.9-perf.9 (2026-11-16)
 
 Queued-message delivery, completion wakes and restart recovery

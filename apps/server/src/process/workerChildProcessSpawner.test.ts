@@ -355,15 +355,15 @@ describe("WorkerChildProcessSpawner", () => {
           // Set after the remote side started: Node reads process.env at each spawn.
           yield* Effect.acquireRelease(
             Effect.sync(() => {
-              process.env.T3_SPAWN_LATE = "late";
+              process.env.T3_SPAWN_TEST_LATE = "late";
             }),
             () =>
               Effect.sync(() => {
-                delete process.env.T3_SPAWN_LATE;
+                delete process.env.T3_SPAWN_TEST_LATE;
               }),
           );
           const printEnv =
-            "process.stdout.write(JSON.stringify([process.env.T3_SPAWN_SET, process.env.T3_SPAWN_LATE, typeof process.env.PATH]))";
+            "process.stdout.write(JSON.stringify([process.env.T3_SPAWN_TEST_SET, process.env.T3_SPAWN_TEST_LATE, typeof process.env.PATH]))";
           const commands = [
             node("process.stdout.write('out'); process.stderr.write('err'); process.exitCode = 3"),
             node(
@@ -374,19 +374,19 @@ describe("WorkerChildProcessSpawner", () => {
             }),
             node("process.stdout.write(process.cwd())", { cwd: NodeOS.tmpdir() }),
             node(printEnv),
-            node(printEnv, { env: { T3_SPAWN_SET: "set" }, extendEnv: true }),
-            node(printEnv, { env: { T3_SPAWN_SET: "set" } }),
+            node(printEnv, { env: { T3_SPAWN_TEST_SET: "set" }, extendEnv: true }),
+            node(printEnv, { env: { T3_SPAWN_TEST_SET: "set" } }),
             node("process.kill(process.pid, 'SIGTERM')"),
             node("process.kill(process.pid, 'SIGKILL')"),
             node(`process.stdout.write(Buffer.alloc(${3 * 1024 * 1024}, 97))`),
             ChildProcess.make("git", ["--version"]),
             ChildProcess.make("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd() }),
             ChildProcess.make("git", ["cat-file", "-p", "HEAD"], { cwd: process.cwd() }),
-            ChildProcess.make("git", ["rev-parse", "--verify", "refs/heads/t3-missing-ref-probe"], {
+            ChildProcess.make("git", ["rev-parse", "--verify", "refs/heads/t3-missing-ref"], {
               cwd: process.cwd(),
             }),
             ChildProcess.make("git", ["hash-object", "--stdin"], {
-              stdin: Stream.encodeText(Stream.make("spawner-input\n")),
+              stdin: Stream.encodeText(Stream.make("spawn-test\n")),
             }),
           ];
           for (const command of commands) {
@@ -454,8 +454,8 @@ describe("WorkerChildProcessSpawner", () => {
         Effect.gen(function* () {
           const nodeSpawner = yield* ChildProcessSpawner;
           const remoteSpawner = yield* remote.make(nodeSpawner);
-          const missingExecutable = ChildProcess.make("t3-missing-executable-probe", ["--version"]);
-          const missingCwd = node("1", { cwd: "/nonexistent/t3-missing-cwd-probe" });
+          const missingExecutable = ChildProcess.make("t3-missing-executable", ["--version"]);
+          const missingCwd = node("1", { cwd: "/nonexistent/t3-missing-cwd" });
 
           const expected = yield* spawnError(nodeSpawner, missingExecutable);
           expect(expected).toMatchObject({
@@ -1601,10 +1601,10 @@ describe("WorkerChildProcessSpawner", () => {
         const remoteSpawner = yield* WorkerChildProcessSpawner.makeProcessSpawner(nodeSpawner);
         // The child's descendant, in the spawner's group, SIGKILLs the spawner once connected.
         const descendant = watch.connectScript(
-          'process.kill(Number(process.env.T3_SPAWN_SPAWNER), "SIGKILL");',
+          'process.kill(Number(process.env.T3_SPAWN_TEST_SPAWNER), "SIGKILL");',
         );
         const child = node(
-          `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { stdio: "ignore", env: { ...process.env, T3_SPAWN_SPAWNER: String(process.ppid) } }).unref(); setInterval(() => {}, 1000)`,
+          `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { stdio: "ignore", env: { ...process.env, T3_SPAWN_TEST_SPAWNER: String(process.ppid) } }).unref(); setInterval(() => {}, 1000)`,
           { detached: false },
         );
         yield* Effect.gen(function* () {
@@ -1813,7 +1813,7 @@ describe("WorkerChildProcessSpawner", () => {
               const missing = yield* Effect.flip(
                 vcs.run({
                   operation: "test.worker-spawner",
-                  command: "t3-missing-executable-probe",
+                  command: "t3-missing-executable",
                   args: [],
                   cwd: process.cwd(),
                 }),
@@ -1827,7 +1827,7 @@ describe("WorkerChildProcessSpawner", () => {
               const missingCwd = yield* Effect.flip(
                 git.execute({
                   operation: "test.worker-spawner",
-                  cwd: "/nonexistent/t3-missing-cwd-probe",
+                  cwd: "/nonexistent/t3-missing-cwd",
                   args: ["--version"],
                 }),
               );

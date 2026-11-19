@@ -227,9 +227,13 @@ it.effect("discovers on the reader worker and deletes on the writer", () =>
       assert.equal(result.deletedEventCount, 150);
       assert.equal(result.deletedReceiptCount, 100);
       const writer = workerStatements.filter((statement) => !statement.readOnly);
-      // Only the in-transaction check for rows appended during the pass reads on the writer.
+      // Discovery reads stay on the reader. The writer reads only in the anchor delete's check for
+      // rows appended after the reference scan, besides its own INSERT ... SELECT writes.
       assert.deepEqual(
-        writer.filter(({ sql }) => /\bSELECT\b/.test(sql) && !sql.includes("AS prompt_sequence")),
+        writer.filter(
+          ({ sql }) =>
+            /\bSELECT\b/.test(sql) && !/^\s*INSERT\b/i.test(sql) && !sql.includes("AS anchor"),
+        ),
         [],
       );
       assert(workerStatements.some(({ readOnly, sql }) => readOnly && /\bSELECT\b/.test(sql)));
@@ -3264,7 +3268,14 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
         | "head-then-tied"
         | "idle"
         | "idle-then-start";
-      const claimSteps = (pending: number, backlog: Backlog) => {
+      const claimSteps = (
+        pending: number,
+        backlog: Backlog,
+        statements: ReadonlyArray<readonly [string, ReadonlyArray<unknown>]> = [
+          [claimQuery, claimParams],
+        ],
+        baseMs = 0,
+      ) => {
         const db = new NodeSqlite.DatabaseSync(":memory:");
         try {
           for (const { sql: ddl } of schema) db.exec(ddl);
@@ -3286,11 +3297,12 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             const threadId = `thread:claim-cost:${index}`;
             const at = DateTime.formatIso(
               DateTime.makeUnsafe(
-                backlog === "head-then-later" && index > 2
-                  ? 200_000 + index
-                  : backlog === "head-then-tied"
-                    ? Math.min(index, 2)
-                    : index,
+                baseMs +
+                  (backlog === "head-then-later" && index > 2
+                    ? 200_000 + index
+                    : backlog === "head-then-tied"
+                      ? Math.min(index, 2)
+                      : index),
               ),
             );
             const last = index === pending;
@@ -3312,9 +3324,13 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
               at,
             );
           }
-          const claim = db.prepare(claimQuery);
-          claim.all(...(claimParams as Array<NodeSqlite.SQLInputValue>));
-          return claim.stat("vmStep");
+          let steps = 0;
+          for (const [query, params] of statements) {
+            const claim = db.prepare(query);
+            claim.all(...(params as Array<NodeSqlite.SQLInputValue>));
+            steps += claim.stat("vmStep");
+          }
+          return steps;
         } finally {
           db.close();
         }
@@ -3335,6 +3351,42 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           `a claim (${backlog}) took ${atTwoThousand} VM steps at 2,000 pending against ${atTwoHundred} at 200`,
         );
       }
+
+      // A user's unit that has finished leaves aged work owed, with no unit open and no mark
+      // pending: a claim after it costs the same whatever young backlog waits.
+      const userStart = {
+        id: "effect:claim-cost:user-start",
+        commandId: CommandId.make("command:claim-cost:user-start"),
+        threadId: ThreadId.make("thread:claim-cost:user"),
+        request: {
+          type: "provider-turn.start",
+          runId: RunId.make("run:claim-cost:user"),
+          claimPriority: "user",
+        },
+      } satisfies EffectOutbox.PendingOrchestrationEffectV2;
+      yield* outbox.enqueue([userStart]);
+      assert.equal(
+        Option.getOrUndefined(yield* outbox.claimNext({ workerId: "claim-cost-worker" }))?.id,
+        userStart.id,
+      );
+      assert.isTrue(
+        yield* outbox.succeed({ effectId: userStart.id, workerId: "claim-cost-worker" }),
+      );
+      yield* TestClock.adjust("3 minutes");
+      yield* outbox.claimNext({ workerId: "claim-cost-worker" });
+      claims.length = 0;
+      yield* outbox
+        .claimNext({ workerId: "claim-cost-worker" })
+        .pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+      const afterUnit = [...claims];
+      const youngBase = DateTime.toEpochMillis(yield* DateTime.now) - 60_000;
+      const youngAtTwoHundred = claimSteps(200, "idle", afterUnit, youngBase);
+      const youngAtTwoThousand = claimSteps(2_000, "idle", afterUnit, youngBase);
+      assert.isAtMost(
+        youngAtTwoThousand,
+        youngAtTwoHundred * 1.1,
+        `a claim after a finished unit took ${youngAtTwoThousand} VM steps at 2,000 young pending against ${youngAtTwoHundred} at 200`,
+      );
     }),
   );
 

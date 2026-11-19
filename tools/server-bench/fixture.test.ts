@@ -13,6 +13,10 @@ import { afterAll, describe, expect, it, onTestFinished, vi } from "vite-plus/te
 
 import { BUILD_MIGRATION_HEAD } from "../../apps/server/src/persistence/databaseMigrationHead.ts";
 import {
+  PERF_FORK_MIGRATIONS,
+  perfForkMigrationLabel,
+} from "../../apps/server/src/persistence/PerfForkMigrations.ts";
+import {
   contentFindings,
   ContentRewriteError,
   emptyCounts,
@@ -69,7 +73,7 @@ const SAMPLES: Record<string, string> = {
   "huggingface-token": `hf_${"Ab12".repeat(8)}`,
   "sendgrid-key": `SG.${"Ab12_".repeat(4)}Ab.${"Ab12-".repeat(8)}Ab1`,
   "mailgun-key": `key-${"0123456789abcdef".repeat(2)}`,
-  "tfe-token": `tfe_${"Ab12".repeat(5)}`,
+  "prefixed-token": `xq${"_"}${"Ab1-".repeat(9)}`,
   jwt: `eyJ${"hbGciOi"}J.eyJ${"zdWIiOi"}J.${"Ab12".repeat(3)}`,
   bearer: `Bearer ${"Ab12.".repeat(5)}`,
   "url-credentials": `postgres://${"bench"}:${"hunter2"}@db.invalid/x`,
@@ -802,6 +806,82 @@ describe("secrets", () => {
     expect(secretHits(redacted)).toEqual([]);
   });
 
+  // A short lowercase prefix, `_` and 16+ token characters mixing upper and lower case is a token
+  // whatever the prefix. Not the ids providers mint (Claude, OpenAI, OpenCode, Kiro), MCP tool
+  // names, hex ids, snake_case or one-case names.
+  it("takes a short-prefixed mixed-case token for a credential, but not an ordinary id", () => {
+    const flagged = (text: string) => {
+      const rows: Array<string> = [];
+      extendedFindings(text, (row) => rows.push(row));
+      return {
+        hits: secretHits(text, { entropy: false }).includes("prefixed-token"),
+        redacted: redact(text, { entropy: false }) !== text,
+        extended: rows.some((row) => row.endsWith("|sanitiser:prefixed token")),
+      };
+    };
+    // Made-up random parts, assembled at run time like the samples.
+    const random = (length: number) => "Ab3dE5gH7j".repeat(7).slice(0, length);
+    const tokens = [
+      SAMPLES["prefixed-token"] as string,
+      // The shortest body, a short one, and the length of 32 random bytes in base64url.
+      `xq_${"Ab1-".repeat(4)}`,
+      `xq_${"Ab12".repeat(5)}`,
+      `xqzv_${"aB3_".repeat(10)}x9Z`,
+      // Found past a letter run too long to be a prefix, and past an id prefix.
+      `abcdefghij_xq_${"Ab1-".repeat(9)}`,
+      `toolu_xq_${"Ab1-".repeat(9)}`,
+      // A body that starts like a Kiro tool use id but is not one, and an overlong Kiro id.
+      `xq_tooluse_${random(35)}`,
+      `tooluse_ab_${random(37)}`,
+    ];
+    for (const token of tokens) {
+      const all = { hits: true, redacted: true, extended: true };
+      expect(flagged(token), token).toEqual(all);
+      expect(flagged(`note ${token} end`), token).toEqual(all);
+      // In JSON right after an escape (`\n`), and as a key.
+      expect(flagged(JSON.stringify({ note: `line\n${token}` })), token).toEqual(all);
+      expect(flagged(JSON.stringify({ [token]: 1 })), token).toEqual(all);
+    }
+    const ids = [
+      // Claude message, tool use, server tool use and request ids, and a reasoning item's id.
+      `msg_01${random(22)}`,
+      `toolu_01${random(22)}`,
+      `srvtoolu_01${random(22)}`,
+      `req_011C${random(20)}`,
+      `msg_01${random(22)}:thinking:0`,
+      // OpenAI call ids, hex response and reasoning ids, chat completion ids.
+      `call_${random(24)}`,
+      `rs_${"0a1b2c3d".repeat(6)}`,
+      `resp_${"0a1b2c3d4e".repeat(5)}`,
+      `chatcmpl-${"Ab12".repeat(8)}`,
+      // OpenCode ids: twelve hex digits of time and fourteen random characters.
+      ...["ses", "msg", "prt", "evt", "per", "que", "sh", "frm"].map(
+        (prefix) => `${prefix}_0eb7a1b2c3d4${random(14)}`,
+      ),
+      // Kiro tool use ids, alone and after the tool's name, also with `_` in the random part.
+      `tooluse_${random(22)}`,
+      `run_command_tooluse_${random(22)}`,
+      `invoke_subagent_tooluse_${random(22)}`,
+      `tooluse_ab_${random(19)}`,
+      `run_command_tooluse_ab_${random(19)}`,
+      // MCP tool names, also with a dotted server and past Claude's 64 characters.
+      "mcp__claude_ai_Firecrawl__firecrawl_scrape",
+      "mcp__atlassian__getAccessibleAtlassianResources",
+      "mcp__github.example__list_MyPrivateRepositories",
+      `mcp__some.server-name__${"list_AllTheThings_".repeat(5)}x`,
+      // snake_case and one-case names, and a ULID after a prefix.
+      `tool_${"long_snake_case_name_".repeat(3)}`,
+      "cache_creation_input_tokens",
+      "env_SOME_LONG_CONSTANT_NAME_HERE",
+      "run_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    ];
+    const none = { hits: false, redacted: false, extended: false };
+    for (const id of ids) {
+      expect(flagged(id), id).toEqual(none);
+      expect(flagged(JSON.stringify({ id, [id]: 1 })), id).toEqual(none);
+    }
+  });
+
   it("keeps JSON valid at any nesting depth and removes whole private key blocks", () => {
     const pem = SAMPLES["private-key"] as string;
     const pgp = [
@@ -1308,10 +1388,8 @@ describe("fixture CLI", () => {
         runnable: Record<string, number>;
       };
     };
-    expect(summary.migrations).toEqual([
-      "t3_perf_fork_migrations:1_ProjectionTurnItemCounts",
-      "t3_perf_fork_migrations:2_TurnItemMessageOrdinalIndex",
-    ]);
+    // The copy has no fork ledger (dropped above), so it runs the whole chain this build ships.
+    expect(summary.migrations).toEqual(PERF_FORK_MIGRATIONS.map(perfForkMigrationLabel));
     expect(summary.check.secretHits).toEqual({});
     expect(summary.check.credentialColumns).toEqual({});
     expect(summary.check.rawHits).toEqual({});
@@ -1406,7 +1484,7 @@ describe("sanitise content", () => {
     expect(run(["scan", clean]).status).toBe(0);
 
     // Planted afterwards, each in its own row, all in one copy and one scan: a token in an id
-    // field, prose in a message, and a random value under a session name (the extended check reads it as one).
+    // field, prose in a message, and a random value under a session name (the reference sanitiser reads it as one).
     const planted = NodePath.join(directory, "planted.sqlite");
     NodeFS.copyFileSync(clean, planted);
     const db = new NodeSqlite.DatabaseSync(planted);
@@ -1531,7 +1609,7 @@ describe("content blanking", () => {
     // A rewritten key has at least ten letters, so keys of one object stay distinct.
     expect(Object.keys(env)[1]).toMatch(/^[a-z]{10}$/);
     expect(Object.values(env).every(isFiller)).toBe(true);
-    // A credential-named key keeps no value the extended check could read; an id under one is blanked.
+    // A credential-named key keeps no value the reference check could read; an id under one is blanked.
     expect([isFiller(out.token as string), isFiller(out.tokenId as string)]).toEqual([true, true]);
     expect(keptAs("thread_id", `gh${"p"}_${"A1b2".repeat(9)}`)).toBe("id");
     expect(
@@ -1635,7 +1713,7 @@ describe("allowlist limits", () => {
       out.smtp,
       out.dbPass,
     ]).toEqual([0, 0, 0, 1234, 1, { expiresIn: 0 }, { pass: 0, fail: 1 }, 0, 0, { pass: 0 }, 0]);
-    // Cases planted after sanitising: the check must report each.
+    // Known cases, planted after sanitising: the check must report each.
     const planted = (value: unknown) => {
       const kinds: Array<string> = [];
       contentFindings(JSON.stringify(value), null, "blank", (kind) => kinds.push(kind));
@@ -1712,8 +1790,8 @@ describe("allowlist limits", () => {
 });
 
 describe("allowlisted ids", () => {
-  // Claude reasoning ids whose random part ended in `pwd` (any case), kept as ids, read
-  // by the extended check as `pwd:<8 letters>` assignments; the self-check failed, nothing written.
+  // Claude reasoning ids whose random part ends in `pwd` (any case) are kept as ids, but read
+  // by the reference extended check as `pwd:<8 letters>` assignments, so the self-check would fail.
   const NATIVE_ID = "abc_123XXXXXXXXXXXXXXXXXXXpWd:abcdefgh:1";
 
   it("blanks a kept id that an extended rule reads as a credential", () => {
@@ -1836,7 +1914,7 @@ describe("v1 imports", () => {
 });
 
 describe("server on a fixture", () => {
-  it("a server boots on a synthetic database and runs nothing", async () => {
+  it("a base server boots on a synthetic database and runs nothing", async () => {
     const database = NodePath.join(scratch("boot"), "synthetic.sqlite");
     synth(database, "0.05");
     const events = count(database, `SELECT COUNT(*) AS n FROM orchestration_events`);

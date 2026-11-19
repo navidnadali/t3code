@@ -11,16 +11,18 @@ import * as Path from "effect/Path";
 
 import { migrationManifest, runMigrations, type RunMigrationsOptions } from "./Migrations.ts";
 import { PERF_FORK_MIGRATIONS_TABLE, runPerfForkMigrations } from "./PerfForkMigrations.ts";
+import { THREAD_ITEM_TOTALS } from "./PerfForkMigrations/003_ThreadItemTotals.ts";
 import { normalizeSql, PERF_FORK_ORDINAL_INDEX } from "./testkit/PerfForkOrdinalIndex.ts";
 import { PERF_FORK_RUN_ID_TURN_ITEM_COUNTS } from "./testkit/PerfForkRunIdTurnItemCounts.ts";
+import * as EventLogPruneState from "./PerfForkMigrations/EventLogPruneState.ts";
 
 const EXIT_SCRIPT = new URL("../../../../scripts/perf-fork-schema-exit.sql", import.meta.url);
 const EXIT_SCRIPT_BEFORE_085 = new URL(
   "../../../../scripts/perf-fork-schema-exit-before-085.sql",
   import.meta.url,
 );
-// Upstream's last migration when release candidate 1 recorded the fork's at 77 and 78.
-const RC1_UPSTREAM_HEAD = 76;
+// Upstream's last migration when the fork's first builds recorded the fork's at 77 and 78.
+const EARLY_FORK_UPSTREAM_HEAD = 76;
 // Upstream's last migration in the last fork build before upstream's migration 85.
 const BEFORE_085_UPSTREAM_HEAD = 80;
 const COUNTS_TABLE = "orchestration_v2_projection_turn_item_counts";
@@ -157,6 +159,8 @@ const forkLedger = (db: NodeSqlite.DatabaseSync) =>
 const FORK_CHAIN = [
   [1, "ProjectionTurnItemCounts"],
   [2, "TurnItemMessageOrdinalIndex"],
+  [3, "ThreadItemTotals"],
+  [4, EventLogPruneState.NAME],
 ];
 
 const countsAsStored = (db: NodeSqlite.DatabaseSync, key = "run_key") =>
@@ -206,7 +210,11 @@ it.effect(
         assert.deepEqual(messageOrdinalIndexes(db), upstreamIndex);
         writeTurnItems(db);
         assert.deepEqual(countsAsStored(db), countsFromItems(db));
-        const { [PERF_FORK_MIGRATIONS_TABLE]: _forkLedger, ...rest } = contents(db);
+        const {
+          [PERF_FORK_MIGRATIONS_TABLE]: _forkLedger,
+          [THREAD_ITEM_TOTALS]: _threadItemTotals,
+          ...rest
+        } = contents(db);
         return rest;
       });
 
@@ -260,6 +268,7 @@ it.effect(
         const {
           [COUNTS_TABLE]: _counts,
           [PERF_FORK_MIGRATIONS_TABLE]: _forkLedger,
+          [THREAD_ITEM_TOTALS]: _threadItemTotals,
           ...rest
         } = contents(db);
         return rest;
@@ -301,14 +310,14 @@ it.effect(
     }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.effect("leaves release candidate 1's schema so upstream's migrations start on it", () =>
+it.effect("leaves the first fork builds' schema so upstream's migrations start on it", () =>
   Effect.gen(function* () {
     const filename = yield* tempDatabase;
     const exitScript = NodeFS.readFileSync(EXIT_SCRIPT_BEFORE_085, "utf8");
     const upstreamIds = migrationManifest.map(([id]) => id);
     const upstreamIndex = yield* upstream094Index;
 
-    yield* migrate(filename, { toMigrationInclusive: RC1_UPSTREAM_HEAD });
+    yield* migrate(filename, { toMigrationInclusive: EARLY_FORK_UPSTREAM_HEAD });
     yield* withDatabase(filename, (db) => {
       for (const statement of PERF_FORK_RUN_ID_TURN_ITEM_COUNTS) db.exec(statement);
       db.exec(PERF_FORK_ORDINAL_INDEX);
@@ -322,7 +331,7 @@ it.effect("leaves release candidate 1's schema so upstream's migrations start on
       assert.deepEqual(messageOrdinalIndexes(db), upstreamIndex);
       assert.deepEqual(
         ledgerIds(db),
-        upstreamIds.filter((id) => id <= RC1_UPSTREAM_HEAD),
+        upstreamIds.filter((id) => id <= EARLY_FORK_UPSTREAM_HEAD),
       );
     });
 

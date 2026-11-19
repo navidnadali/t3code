@@ -17,7 +17,7 @@ export const HELP = `Usage:
   node tools/server-bench/snapshot-client.ts --url <origin> --thread <id> [options]
 
 Models a client that polls a thread's full snapshot (GET /api/orchestration/threads/:id) and gives
-up on slow responses, as a client built on Node's fetch with a timeout does. It sends one request
+up on slow responses, like a bot (Node's fetch) that can grow a server's heap. It sends one request
 at a time; each stops reading the body and aborts --timeout after it starts. An abort after the
 handler returned but before the server wrote the response is the disconnect a server must
 release. The bearer token comes from T3_BENCH_TOKEN or --token-file (scope orchestration:read).

@@ -2,6 +2,24 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.9-perf.13 (2026-11-19)
+
+Linear turn starts, writer priority, compaction and fewer commit-lane writes
+
+Upstream base: 7d32075e3757.
+
+Same upstream main as 0.1.9-perf.10 (2026-11-16). Two new migrations in the fork's own chain: 3 ThreadItemTotals and 4 EventLogPruneState (upstream's chain is unchanged at 96). Going back to 0.1.9-perf.12 is a data step first: scripts/perf-fork-004-down.sql, then scripts/perf-fork-003-down.sql.
+
+- Turn start: its synchronous planning is linear in the thread's history. On a synthetic 25,000-run thread the event-loop block per turn start fell from about 3.0 s (median) to about 0.7 s; what remains is the turn's context decode.
+- Migrations: the fork's migration ledger is checked before a start's first write; a gap, an unknown id or a renamed id refuses the start and the service preflight.
+- SQLite: background writes queue beside foreground ones, so a person's write is not stuck behind maintenance.
+- Bounded reads on long threads: the shell's item totals (fork migration 3), secret and link cards, turn-start messages and follow-ups.
+- Event log: resumable compaction with a disk headroom guard (fork migration 4). The offline filtered copy is library code only in this release; its operator script and a durability fix follow in 0.1.9-perf.14.
+- Effect outbox: a person's turn start is claimed ahead of automation.
+- Commit lane: superseded snapshots are coalesced and writer round trips are fewer. Releasing the effect slot on the lane is behind T3CODE_EFFECT_SLOT_RELEASE_ON_LANE (default off).
+- Provider commit batch: one consumer's jobs stay out of savepoints and are re-applied after a failure. T3CODE_PROVIDER_COMMIT_JOB_SAVEPOINTS=true restores a savepoint per job; it is read once at start.
+- Forge CLI: a permit is kept for interactive reads, and recently updated open merge requests are re-read with a backoff.
+
 ## v0.1.9-perf.12 (2026-11-17)
 
 Hotfix: linear id reads for a run's provider turn and a rewind's off-branch runs

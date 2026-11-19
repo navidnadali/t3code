@@ -391,7 +391,7 @@ it.effect(
   "delivers user messages, automations and cross-thread messages within 125 s past 200 queued agent messages",
   () =>
     Effect.gen(function* () {
-      // The bench's O2 rotation: user, cross-thread, automation, one every 20 s.
+      // The bench's rotation: user, cross-thread, automation, one every 20 s.
       const result = yield* busyOrchestrator({
         name: "busy-orchestrator-backlog",
         backlog: 200,

@@ -10,8 +10,10 @@ const FORK_TABLE = "t3_perf_fork_migrations";
 const FORK_CHAIN: Array<[number, string]> = [
   [1, "ProjectionTurnItemCounts"],
   [2, "TurnItemMessageOrdinalIndex"],
+  [3, "ThreadItemTotals"],
+  [4, "EventLogPruneState"],
 ];
-const RC32_RAN_AT = "2026-11-04 02:38:01";
+const PERF5_RAN_AT = "2026-11-04 00:00:00";
 const UPSTREAM_COUNTS_ID = 85;
 const COUNTS = "orchestration_v2_projection_turn_item_counts";
 const COUNT_TRIGGERS = [
@@ -22,7 +24,7 @@ const COUNT_TRIGGERS = [
 const ORDINAL_INDEX = "orchestration_v2_projection_turn_items_message_ordinal_idx";
 
 // Release 0.1.6-perf.5's fork chain, verbatim: migration 1 (counts keyed by run_id) and 2.
-const RC32_FORK_SCHEMA = [
+const PERF5_FORK_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS orchestration_v2_projection_turn_item_counts (
     thread_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
@@ -146,7 +148,7 @@ const insertItems = (
     }
   });
 
-const RC32_ITEMS = [
+const PERF5_ITEMS = [
   ["thread-a", "run-1", "user_message"],
   ["thread-a", "run-1", "assistant_message"],
   ["thread-a", "run-1", "command_execution"],
@@ -164,19 +166,19 @@ const assertTriggersKeepCountsInStep = Effect.gen(function* () {
     ["thread-c", "run-9", "user_message"],
     ["thread-c", null, "assistant_message"],
   ]);
-  yield* sql`UPDATE orchestration_v2_projection_turn_items SET run_id = 'run-2' WHERE turn_item_id = 'rc32-0'`;
+  yield* sql`UPDATE orchestration_v2_projection_turn_items SET run_id = 'run-2' WHERE turn_item_id = 'perf5-0'`;
   yield* sql`UPDATE orchestration_v2_projection_turn_items SET run_id = NULL WHERE turn_item_id = 'after-0'`;
-  yield* sql`DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'rc32-6'`;
+  yield* sql`DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'perf5-6'`;
   assert.deepStrictEqual(yield* counts, yield* countedFromItems);
 });
 
 // A database as release 0.1.6-perf.5 leaves it: upstream's chain through `upstreamHead` (78 by
 // that build, 80 when a newer upstream build also ran), the fork chain recorded, counts filled.
-const atRc32 = (upstreamHead: number) =>
+const atPerf5 = (upstreamHead: number) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* runMigrations({ toMigrationInclusive: upstreamHead });
-    for (const statement of RC32_FORK_SCHEMA) yield* sql.unsafe(statement);
+    for (const statement of PERF5_FORK_SCHEMA) yield* sql.unsafe(statement);
     yield* sql.unsafe(`CREATE TABLE ${FORK_TABLE} (
   migration_id integer PRIMARY KEY NOT NULL,
   created_at datetime NOT NULL DEFAULT current_timestamp,
@@ -185,10 +187,10 @@ const atRc32 = (upstreamHead: number) =>
     for (const [id, name] of FORK_CHAIN) {
       yield* sql`
         INSERT INTO ${sql(FORK_TABLE)} (migration_id, name, created_at)
-        VALUES (${id}, ${name}, ${RC32_RAN_AT})
+        VALUES (${id}, ${name}, ${PERF5_RAN_AT})
       `;
     }
-    yield* insertItems("rc32", RC32_ITEMS);
+    yield* insertItems("perf5", PERF5_ITEMS);
   });
 
 const upstreamChain = migrationManifest.map(([id, name]) => [id, name] as const);
@@ -199,7 +201,7 @@ describe("turn-item counts across the upgrade to upstream's migration 85", () =>
     "a database at release 0.1.6-perf.5's state (upstream %i) upgrades: upstream's counts, once each, in step",
     (upstreamHead) =>
       Effect.gen(function* () {
-        yield* atRc32(upstreamHead);
+        yield* atPerf5(upstreamHead);
         const ran = yield* runMigrations();
         assert.deepStrictEqual(
           ran.map(([id]) => id),
@@ -208,7 +210,7 @@ describe("turn-item counts across the upgrade to upstream's migration 85", () =>
         assert.deepStrictEqual(yield* ledger, upstreamChain);
         assert.deepStrictEqual(
           (yield* forkLedger).map((row) => [row.migration_id, row.name, row.created_at]),
-          FORK_CHAIN.map(([id, name]) => [id, name, RC32_RAN_AT]),
+          FORK_CHAIN.map(([id, name]) => [id, name, PERF5_RAN_AT]),
         );
         yield* assertCountObjectsOnce;
         assert.deepStrictEqual(yield* counts, yield* countedFromItems);
@@ -227,7 +229,7 @@ describe("turn-item counts across the upgrade to upstream's migration 85", () =>
         FORK_CHAIN,
       );
       yield* assertCountObjectsOnce;
-      yield* insertItems("rc32", RC32_ITEMS);
+      yield* insertItems("perf5", PERF5_ITEMS);
       yield* assertTriggersKeepCountsInStep;
     }).pipe(Effect.provide(memory)),
   );
@@ -239,7 +241,7 @@ describe("turn-item counts across the upgrade to upstream's migration 85", () =>
         const sql = yield* SqlClient.SqlClient;
         // An upstream build's database: upstream's chain, no fork chain yet.
         yield* runMigrations({ toPerfForkMigrationInclusive: 0 });
-        yield* insertItems("rc32", RC32_ITEMS);
+        yield* insertItems("perf5", PERF5_ITEMS);
         // Neither dropped nor recounted: this row stays only if nothing touches the table.
         yield* sql`
         INSERT INTO orchestration_v2_projection_turn_item_counts (thread_id, run_key, item_count)
@@ -260,7 +262,7 @@ describe("turn-item counts across the upgrade to upstream's migration 85", () =>
   it.effect("an upgrade that fails after migration 85 completes when started again", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* atRc32(80);
+      yield* atPerf5(80);
       // A hand-applied index under migration 86's name stops that migration (no IF NOT EXISTS).
       yield* sql`
         CREATE INDEX orchestration_v2_projection_turn_items_queued_input_idx

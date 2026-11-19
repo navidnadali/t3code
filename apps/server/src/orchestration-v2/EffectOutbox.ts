@@ -28,7 +28,9 @@ import * as Queue from "effect/Queue";
 import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as Statement from "effect/sql/Statement";
 
 import { forkParked } from "../serverActivation.ts";
 
@@ -60,6 +62,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-turn.start"),
     runId: RunId,
+    /** A person's turn on a root thread: its thread's effects claim ahead of other threads'. */
+    claimPriority: Schema.optional(Schema.Literal("user")),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.interrupt"),
@@ -172,6 +176,48 @@ export const PROCESS_BOUND_EFFECT_TYPES = [
   "provider-turn.restart",
   "runtime-request.respond",
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+
+/**
+ * A person's message on a root thread starts a turn that claims ahead of automation.
+ * Agents, wakes, completion deliveries and scheduled prompts, and any child thread's turn, keep
+ * the outbox's FIFO order.
+ */
+export const turnStartClaimPriority = (
+  thread: { readonly lineage: { readonly parentThreadId: string | null } },
+  message:
+    | {
+        readonly createdBy: string;
+        readonly creationSource: string;
+        readonly scheduledTaskId?: unknown;
+        readonly notification?: unknown;
+        readonly delegatedCompletion?: unknown;
+      }
+    | undefined,
+): { readonly claimPriority?: "user" } =>
+  thread.lineage.parentThreadId === null &&
+  message !== undefined &&
+  message.scheduledTaskId === undefined &&
+  message.notification === undefined &&
+  message.delegatedCompletion === undefined &&
+  (message.createdBy === "user" ||
+    message.creationSource === "web" ||
+    message.creationSource === "mobile")
+    ? { claimPriority: "user" }
+    : {};
+
+/**
+ * How long a unit's later claims count as that unit after its first: two slot turnovers (a capture
+ * holds seconds and the next slot frees within a turn start), so a hung capture cannot keep a
+ * unit open; its start then claims as a new unit.
+ */
+const PRIORITY_UNIT_WINDOW = Duration.minutes(2);
+
+/**
+ * How long a non-priority effect waits, from when it is available, before priority claims alternate
+ * with it: half the 10 min a flood of user turns may add to its FIFO wait, as it then shares the
+ * slots one claim in two.
+ */
+const PRIORITY_STARVATION_AGE = Duration.minutes(5);
 
 export const OrchestrationEffectStatusV2 = Schema.Literals([
   "pending",
@@ -530,6 +576,40 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
     const replayableSteer = sql`(${trackedSteer}
       AND COALESCE(json_extract(payload_json, '$.deliveryPhase'), '') != 'invoked')`;
 
+    // A thread whose person-requested turn start waits claims first, its earlier effects included
+    // (they precede the start on its thread). Claim order within a thread stays as it was.
+    const priorityThreads = sql`(
+      SELECT thread_id FROM orchestration_v2_effect_outbox
+      WHERE status = 'pending' AND effect_type = 'provider-turn.start'
+        AND json_extract(payload_json, '$.claimPriority') = 'user'
+    )`;
+    // The starvation guard reads the claims before it, so claims go one at a time: a claim and what
+    // it records are one step for every worker.
+    const claimLock = yield* Semaphore.make(1);
+    // A priority unit is a user message's turn start with its thread's effects ahead of it (its
+    // capture, a detach), keyed by that start's effect id: it opens at its first claim, and its later
+    // claims (what is left ahead of the start, the start, the start again after a retry) continue it
+    // within PRIORITY_UNIT_WINDOW.
+    const priorityUnits = new Map<string, { readonly openedAt: number }>();
+    // Aged non-priority claims owed: one per priority claim (a unit's claims stay together, repaid
+    // after it). Only an aged claim settles one, so claims filtered past aged work cannot; with no
+    // aged work to claim the debt lapses, as nothing waits on it.
+    let owedAged = 0;
+    // The unit whose claims the debt is for: while it is owed, only that unit continues.
+    let currentUnit: string | undefined;
+    // Whether a marked start may be pending, so claims without one keep the plain FIFO statement.
+    // Set by every enqueue or retry that can make one pending; cleared only after a read finds
+    // none and nothing set it meanwhile.
+    const markedStartPending = sql<{ readonly marked: number }>`
+      SELECT EXISTS (SELECT 1 FROM ${priorityThreads} AS marked) AS marked
+    `.pipe(Effect.map((rows) => rows[0]?.marked === 1));
+    let markedHint = yield* markedStartPending.pipe(Effect.orElseSucceed(() => true));
+    let markedGeneration = 0;
+    const markMaybePending = () => {
+      markedHint = true;
+      markedGeneration += 1;
+    };
+
     const service: EffectOutboxV2Shape = {
       recordSteerDelivery: Effect.fn("EffectOutbox.recordSteerDelivery")(
         function* (effectId, leaseOwner, phase, options) {
@@ -596,6 +676,14 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             `,
             { concurrency: 1, discard: true },
           );
+          if (
+            effects.some(
+              (effect) =>
+                effect.request.type === "provider-turn.start" &&
+                effect.request.claimPriority === "user",
+            )
+          )
+            markMaybePending();
           // EventSink owns the corresponding post-commit notification.
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "enqueue", cause })),
@@ -745,7 +833,10 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             AND (effect_type IN ${sql.in(REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS)} OR ${replayableSteer})
           RETURNING effect_id
         `;
-        if (requeuedRows.length > 0) yield* notifyAvailable(requeuedRows.length);
+        if (requeuedRows.length > 0) {
+          markMaybePending();
+          yield* notifyAvailable(requeuedRows.length);
+        }
         return { requeued: requeuedRows.length, cancelled: cancelledRows.length };
       }).pipe(
         Effect.mapError(
@@ -763,8 +854,22 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         }) {
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);
+          const nowMs = DateTime.toEpochMillis(now);
+          // Only a claim that may take any effect opens a unit or pays the aged claim a unit owes: one
+          // that leaves gated work out (a full gate, a control lane) cannot take gated aged work.
+          const unrestricted = excludeEffectTypes.length === 0 && controlLane === undefined;
+          for (const [startId, unit] of priorityUnits)
+            if (nowMs - unit.openedAt > Duration.toMillis(PRIORITY_UNIT_WINDOW))
+              priorityUnits.delete(startId);
           // Idle claims return empty; tracing their full SQL on every poll overwhelms useful traces.
-          const claimStatement = sql<EffectRow>`
+          // `unitIds`: candidates looked up by id, which the planner otherwise tests one by one while
+          // it walks every pending effect in claim order.
+          const claimWhere = (
+            phase: Statement.Fragment,
+            availableBefore = nowIso,
+            unitIds?: ReadonlyArray<string>,
+          ) =>
+            sql<EffectRow>`
             UPDATE orchestration_v2_effect_outbox
             SET
               status = 'running',
@@ -774,26 +879,157 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               last_error = NULL
             WHERE effect_id = (
               SELECT candidate.effect_id
-              FROM orchestration_v2_effect_outbox AS candidate
+              FROM ${
+                unitIds === undefined
+                  ? sql`orchestration_v2_effect_outbox AS candidate`
+                  : sql`json_each(${JSON.stringify(unitIds)}) AS unit_id
+                      CROSS JOIN orchestration_v2_effect_outbox AS candidate`
+              }
               WHERE ${claimableCandidatePredicate(
-                nowIso,
+                availableBefore,
                 excludeRestartContinuations,
                 excludeEffectTypes,
                 controlLane,
                 maxRunningTitleGenerations,
               )}
                 AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
+                AND ${phase}
               ORDER BY candidate.available_at ASC, candidate.created_at ASC, candidate.effect_id ASC
               LIMIT 1
             )
             RETURNING *
-          `;
+          `.pipe(Effect.withTracerEnabled(false));
+          const agedBefore = DateTime.formatIso(
+            DateTime.subtractDuration(now, PRIORITY_STARVATION_AGE),
+          );
+          // Whether aged non-priority work is claimable now, read without claiming it.
+          const agedClaimable = sql<{ readonly found: number }>`
+            SELECT EXISTS (
+              SELECT 1 FROM orchestration_v2_effect_outbox AS candidate
+              WHERE ${claimableCandidatePredicate(
+                agedBefore,
+                excludeRestartContinuations,
+                excludeEffectTypes,
+                controlLane,
+                maxRunningTitleGenerations,
+              )}
+                AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
+                AND candidate.thread_id NOT IN ${priorityThreads}
+            ) AS found
+          `.pipe(
+            Effect.map((rows) => rows[0]?.found === 1),
+            Effect.withTracerEnabled(false),
+          );
+          // In order, each only when the one before it claims nothing: an open unit's start or what
+          // is left ahead of it on its thread (the slot its capture frees is its own), an aged
+          // non-priority effect a unit is owed, an effect on a thread whose marked start waits, then
+          // plain FIFO.
+          const claimPhased = Effect.gen(function* () {
+            // Set when this claim's aged probe found nothing: no aged work waits.
+            let agedWaits: boolean | undefined;
+            const unitIds =
+              priorityUnits.size === 0
+                ? []
+                : yield* sql<{ readonly unit_id: string; readonly effect_id: string }>`
+                    SELECT unit_start.effect_id AS unit_id, ahead.effect_id
+                    FROM orchestration_v2_effect_outbox AS unit_start
+                    JOIN orchestration_v2_effect_outbox AS ahead
+                      INDEXED BY orchestration_v2_effect_outbox_thread_status_idx
+                      ON ahead.thread_id = unit_start.thread_id
+                        AND ahead.status = 'pending'
+                        AND ahead.available_at <= ${nowIso}
+                        AND ahead.rowid <= unit_start.rowid
+                    WHERE unit_start.effect_id IN ${sql.in([...priorityUnits.keys()])}
+                  `.pipe(Effect.withTracerEnabled(false));
+            // While aged work is owed, only the unit the debt is for continues.
+            const continuing =
+              unrestricted && owedAged > 0
+                ? unitIds.filter((row) => row.unit_id === currentUnit)
+                : unitIds;
+            if (continuing.length > 0) {
+              const rows = yield* claimWhere(
+                sql`candidate.effect_id = unit_id.value`,
+                nowIso,
+                continuing.map((row) => row.effect_id),
+              );
+              if (rows[0] !== undefined) {
+                const unit = continuing.find(
+                  (row) => row.effect_id === rows[0]!.effect_id,
+                )?.unit_id;
+                return { row: rows[0], phase: "unit" as const, unit };
+              }
+            }
+            // Owed only while priority work can claim: with none, FIFO serves aged work first anyway.
+            // Bounded by availability, so with nothing aged the probe reads no young backlog.
+            if (unrestricted && owedAged > 0 && (priorityUnits.size > 0 || markedHint)) {
+              const rows = yield* claimWhere(
+                sql`candidate.thread_id NOT IN ${priorityThreads}`,
+                agedBefore,
+              );
+              if (rows[0] !== undefined) return { row: rows[0], phase: "starved" as const };
+              owedAged = 0;
+              currentUnit = undefined;
+              agedWaits = false;
+            }
+            // While aged work waits, a new unit opens only once no open unit has a claim due (a
+            // retry's delay does not hold others back), and plain FIFO leaves users' threads alone.
+            const held =
+              markedHint &&
+              unrestricted &&
+              unitIds.length > 0 &&
+              (agedWaits ?? (yield* agedClaimable));
+            if (markedHint && !held) {
+              const generation = markedGeneration;
+              const rows = yield* claimWhere(sql`candidate.thread_id IN ${priorityThreads}`);
+              if (rows[0] !== undefined) return { row: rows[0], phase: "priority" as const };
+              const pending = yield* markedStartPending.pipe(Effect.orElseSucceed(() => true));
+              if (!pending && generation === markedGeneration) markedHint = false;
+            }
+            const rows = yield* claimWhere(
+              held ? sql`candidate.thread_id NOT IN ${priorityThreads}` : sql`1 = 1`,
+            );
+            if (rows[0] !== undefined) return { row: rows[0], phase: "fifo" as const };
+            // The aged work that held users back went since the check: a user's effect goes next.
+            if (!held) return undefined;
+            const users = yield* claimWhere(sql`candidate.thread_id IN ${priorityThreads}`);
+            return users[0] === undefined
+              ? undefined
+              : { row: users[0], phase: "priority" as const };
+          });
           while (true) {
-            const rows = yield* claimStatement.pipe(Effect.withTracerEnabled(false));
-            const row = rows[0];
-            if (row === undefined) return Option.none();
+            const claimed = yield* claimPhased;
+            if (claimed === undefined) return Option.none();
+            const { row, phase } = claimed;
             const decoded = yield* Effect.result(rowToEffect(row));
             if (Result.isSuccess(decoded)) {
+              const request = decoded.success.request;
+              if (phase === "starved") owedAged -= 1;
+              if (claimed.phase === "unit" && unrestricted) {
+                owedAged += 1;
+                currentUnit = claimed.unit;
+              }
+              if (phase === "priority" && unrestricted) {
+                // The unit: the marked start itself, or the one its thread waits on. The claim is
+                // already this worker's, so a failed read only skips the unit, owing aged work.
+                const unitStartId =
+                  request.type === "provider-turn.start" && request.claimPriority === "user"
+                    ? row.effect_id
+                    : yield* sql<{ readonly effect_id: string }>`
+                        SELECT effect_id FROM orchestration_v2_effect_outbox
+                        WHERE thread_id = ${row.thread_id} AND status = 'pending'
+                          AND effect_type = 'provider-turn.start'
+                          AND json_extract(payload_json, '$.claimPriority') = 'user'
+                        ORDER BY rowid ASC
+                        LIMIT 1
+                      `.pipe(
+                        Effect.map((rows) => rows[0]?.effect_id),
+                        Effect.orElseSucceed(() => undefined),
+                      );
+                if (unitStartId !== undefined && !priorityUnits.has(unitStartId))
+                  priorityUnits.set(unitStartId, { openedAt: nowMs });
+                owedAged += 1;
+                currentUnit = unitStartId;
+              }
               cancellationSignals.set(row.effect_id, Deferred.makeUnsafe<void>());
               return Option.some(decoded.success);
             }
@@ -810,6 +1046,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             });
           }
         },
+        claimLock.withPermits(1),
         Effect.mapError((cause) =>
           isEffectOutboxError(cause) ? cause : new EffectOutboxError({ operation: "claim", cause }),
         ),
@@ -871,6 +1108,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           `;
           if (rows.length === 1) {
             cancellationSignals.delete(effectId);
+            // A retried marked start is pending again.
+            markMaybePending();
             yield* notifyAvailable();
           }
           return rows.length === 1;

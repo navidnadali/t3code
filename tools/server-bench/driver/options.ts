@@ -181,7 +181,7 @@ providers:manage whenever a planned instance has a settings entry (every bench i
                             readers read seeded threads (archived ones too), picked to match the
                             turn-item distribution of every fixture thread, archive included;
                             fresh: new projects and threads
-  --sessions N              streaming sessions on --provider (default 25)
+  --sessions N              streaming sessions on --provider (default 60)
 ${PROVIDER_LOAD_USAGE}
   --subscribers N           WebSocket clients: shell stream + one thread stream (default: every
                             session)
@@ -240,7 +240,7 @@ const parseFlags = (argv: ReadonlyArray<string>) =>
       out: { type: "string" },
       "token-file": { type: "string" },
       mode: { type: "string", default: "history" },
-      sessions: { type: "string", default: "25" },
+      sessions: { type: "string", default: "60" },
       subscribers: { type: "string" },
       pollers: { type: "string", default: "10" },
       projects: { type: "string", default: "8" },

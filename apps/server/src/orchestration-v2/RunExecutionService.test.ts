@@ -4375,11 +4375,13 @@ it.effect.each([
 );
 
 // EventSink owns commit batching; this layer must preserve event order and terminal delivery.
+// A backlog is ingested once per item state: an item's newer snapshot takes its waiting one's place,
+// so the command's two running reports never reach the commit path.
 it.effect.each([
   { count: 21, text: 0 },
   { count: 41, text: 10_000 },
 ])(
-  "ingests a provider backlog exactly once and in order ($count events, $text bytes each)",
+  "ingests a provider backlog once and in order, each item at its newest state ($count events, $text bytes each)",
   ({ count, text }) =>
     Effect.gen(function* () {
       const key = `backlog-${count}-${text}`;
@@ -4441,7 +4443,16 @@ it.effect.each([
             Effect.andThen(Deferred.succeed(release, undefined)),
           ),
       });
-      assert.deepEqual(writes.flat(), [...items, terminal]);
+      // The command takes its first report's place with its last state; everything else, the
+      // terminal last, once and in the provider's order.
+      assert.deepEqual(writes.flat(), [
+        ...items.slice(0, 5),
+        items[15],
+        ...items.slice(6, 10),
+        ...items.slice(11, 15),
+        ...items.slice(16),
+        terminal,
+      ]);
     }),
 );
 
@@ -4455,10 +4466,18 @@ it.effect("closes a child whose completion failed to write", () =>
         driver,
         node: { ...makeRunOwnedSubagentNodeFixture({ ids, status: "running" }), status },
       }) as const;
+    // The child's running state is stored before its completion arrives (a completion that arrives
+    // with it replaces it; see below).
+    const runningStored = yield* Deferred.make<void>();
     const { finalEvents } = yield* captureRootRunTermination({
       key,
       shouldFinalizeRun: () => Effect.succeed(true),
-      events: () => Stream.make(node("running"), node("completed")),
+      events: () =>
+        Stream.make(node("running")).pipe(
+          Stream.concat(
+            Stream.fromEffect(Deferred.await(runningStored).pipe(Effect.as(node("completed")))),
+          ),
+        ),
       ingestNormalized: (input) =>
         input.event.type === "node.updated" && input.event.node.status === "completed"
           ? Effect.fail(
@@ -4467,7 +4486,7 @@ it.effect("closes a child whose completion failed to write", () =>
                 eventCount: 1,
               }),
             )
-          : Effect.succeed([]),
+          : Deferred.succeed(runningStored, undefined).pipe(Effect.as([])),
     });
     const closed = finalEvents.find(
       (event) => event.type === "node.updated" && event.payload.id === ids.subagentNodeId,
@@ -4475,6 +4494,49 @@ it.effect("closes a child whose completion failed to write", () =>
     assert.isDefined(closed);
     assert.notEqual(closed?.type === "node.updated" ? closed.payload.status : undefined, "running");
   }),
+);
+
+it.effect(
+  "stores nothing open for a child whose completion arrived with its start and failed to write",
+  () =>
+    Effect.gen(function* () {
+      const key = "child-close-failed-coalesced";
+      const ids = backgroundScenarioIds(key);
+      const node = (status: "running" | "completed") =>
+        ({
+          type: "node.updated",
+          driver,
+          node: { ...makeRunOwnedSubagentNodeFixture({ ids, status: "running" }), status },
+        }) as const;
+      const stored: Array<string> = [];
+      const { finalEvents } = yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () => Stream.make(node("running"), node("completed")),
+        ingestNormalized: (input) =>
+          input.event.type === "node.updated" && input.event.node.status === "completed"
+            ? Effect.fail(
+                new ProviderEventIngestor.ProviderEventPublishError({
+                  providerSessionId: ProviderSessionId.make(`session:${key}`),
+                  eventCount: 1,
+                }),
+              )
+            : Effect.sync(() => {
+                if (input.event.type === "node.updated") stored.push(input.event.node.status);
+              }).pipe(Effect.as([])),
+      });
+      // The completion took the start's place and failed: the child was never stored, so nothing is
+      // left running and there is nothing to close.
+      assert.deepEqual(stored, []);
+      assert.isUndefined(
+        finalEvents.find(
+          (event) =>
+            event.type === "node.updated" &&
+            event.payload.id === ids.subagentNodeId &&
+            event.payload.status === "running",
+        ),
+      );
+    }),
 );
 
 it.effect("fails the run when its event stream ends without a root terminal", () =>
@@ -5659,13 +5721,23 @@ it.effect("commits a running turn's usage reports with the snapshots around them
           status,
         },
       }) as ProviderAdapter.ProviderAdapterV2Event;
+    // A control between the reports keeps each its own state (in one backlog the newest report
+    // takes the others' place; see below).
+    const control = (ids: BackgroundScenarioIds) =>
+      ({
+        type: "provider_thread.updated",
+        driver,
+        providerThread: { id: ids.providerThreadId, driver, status: "active" },
+      }) as ProviderAdapter.ProviderAdapterV2Event;
     yield* runBackgroundItemScenario(
       "usage-reports-batch",
       (ids) => [
         rootTurn(ids, "running"),
         backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 1),
+        control(ids),
         rootTurn(ids, "running"),
         backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 2),
+        control(ids),
         rootTurn(ids, "running"),
         rootTurn(ids, "completed"),
         rootTerminalEvent(ids, "completed"),
@@ -5687,6 +5759,60 @@ it.effect("commits a running turn's usage reports with the snapshots around them
     // ownership under the thread lock, and a settled turn's report ends the turn, so both stay alone.
     assert.deepEqual(ingested, ["running", "running in commit", "running in commit", "completed"]);
   }),
+);
+
+it.effect(
+  "ingests one backlog's running usage reports as the newest, in the first one's place",
+  () =>
+    Effect.gen(function* () {
+      const ingested: Array<string> = [];
+      const rootTurn = (
+        ids: BackgroundScenarioIds,
+        status: "running" | "completed",
+        usedTokens?: number,
+      ): ProviderAdapter.ProviderAdapterV2Event =>
+        ({
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: {
+            id: ids.rootProviderTurnId,
+            providerThreadId: ids.providerThreadId,
+            nodeId: ids.rootNodeId,
+            runAttemptId: ids.attemptId,
+            status,
+            ...(usedTokens === undefined ? {} : { tokenUsage: { usedTokens } }),
+          },
+        }) as ProviderAdapter.ProviderAdapterV2Event;
+      yield* runBackgroundItemScenario(
+        "usage-reports-coalesced",
+        (ids) => [
+          rootTurn(ids, "running", 1),
+          backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 1),
+          rootTurn(ids, "running", 2),
+          backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 2),
+          rootTurn(ids, "running", 3),
+          rootTurn(ids, "completed"),
+          rootTerminalEvent(ids, "completed"),
+        ],
+        {
+          batched: true,
+          shouldStartProviderTurn: () => Effect.succeed(true),
+          onIngest: (event, write) =>
+            Effect.sync(() => {
+              if (event.type === "provider_turn.updated") {
+                const usage = (event.providerTurn as { tokenUsage?: { usedTokens: number } })
+                  .tokenUsage;
+                ingested.push(
+                  `${event.providerTurn.status}${usage === undefined ? "" : `:${usage.usedTokens}`}${write.inSharedCommit ? " in commit" : ""}`,
+                );
+              }
+            }),
+        },
+      );
+      // The newest report is the root turn's first ingested one, so it still rechecks ownership
+      // alone; the turn's end stays a control.
+      assert.deepEqual(ingested, ["running:3", "completed"]);
+    }),
 );
 
 it.effect.each([0, 1, 3, 10])(
@@ -5874,7 +6000,7 @@ it.effect("keeps every run on a shared provider session up with its own turn", (
       }
     }).pipe(Effect.forkChild);
     yield* TestClock.adjust("5 minutes");
-    // Before this, all eight fell behind together, further each round:
+    // Before this, all nine fell behind together, 14 rounds (140 s) after 5 minutes and growing:
     // each other thread's usage report cost every run a writer pass that wrote nothing. Now one.
     assert.deepEqual(
       ingestedRound.map((ingested) => round - ingested <= 2),
@@ -6035,19 +6161,18 @@ it.effect.each([{ anotherRun: false }, { anotherRun: true }])(
       yield* Deferred.succeed(releaseBlocker, undefined);
       yield* Fiber.join(scenario);
 
-      // Text that a newer snapshot superseded before another kind of event arrived is never
-      // ingested; every other event is, once and in order.
+      // A snapshot a newer one of its item superseded before a control (here the provider turn's
+      // end) arrived is never ingested (any item, not only streamed text, and an item's final
+      // replaces its steps); each item keeps its first arrival's place, and every control is
+      // ingested once, in order, after everything that arrived before it.
       assert.deepEqual(yield* Ref.get(ingested), [
         'message.updated:streaming:"First.\\n\\n" in commit',
         'turn_item.updated:streaming:"First.\\n\\n" in commit',
         "provider_thread",
-        'message.updated:streaming:"First.\\n\\nSecond.\\n\\nThird.\\n\\n" in commit',
-        'turn_item.updated:streaming:"First.\\n\\nSecond.\\n\\nThird.\\n\\n" in commit',
-        "provider_turn:running in commit",
-        "tool:running in commit",
-        "tool:completed in commit",
         'message.updated:final:"First.\\n\\nSecond.\\n\\nThird.\\n\\nFourth.\\n\\nFifth." in commit',
         'turn_item.updated:final:"First.\\n\\nSecond.\\n\\nThird.\\n\\nFourth.\\n\\nFifth." in commit',
+        "provider_turn:running in commit",
+        "tool:completed in commit",
         "provider_turn:completed",
         "turn.terminal",
       ]);
@@ -6164,11 +6289,9 @@ it.effect(
       yield* Deferred.succeed(releaseBlocker, undefined);
       yield* Fiber.join(scenario);
 
-      // Taking the first step while the write still ran would commit it on its own.
-      assert.deepEqual(yield* Ref.get(ingested), [
-        'streaming:"One.\\n\\nTwo.\\n\\n"',
-        'final:"One.\\n\\nTwo.\\n\\nThree."',
-      ]);
+      // Taking the first step while the write still ran would commit it on its own. The final,
+      // arriving in the same batch, replaces the steps too.
+      assert.deepEqual(yield* Ref.get(ingested), ['final:"One.\\n\\nTwo.\\n\\nThree."']);
     }),
 );
 
@@ -6239,16 +6362,395 @@ it.effect("keeps interleaved streamed texts in the order they first appeared", (
   }),
 );
 
-it.effect("ends finished Codex seats' work on time on a session with many bound threads", () =>
+// A backlog's snapshots of one run, as on a busy server, where a run's events wait seconds for
+// the shared commit lane. Each provider event carries its index in `sentIndex`, so what the run
+// ingests can be checked against what the provider sent.
+type IndexedEvent = ProviderAdapter.ProviderAdapterV2Event & { readonly sentIndex: number };
+
+/** A snapshot's item, or null for a control (anything that is not one item's whole state). */
+function coalescedItemKey(event: ProviderAdapter.ProviderAdapterV2Event): string | null {
+  switch (event.type) {
+    case "provider_turn.updated":
+      return ["completed", "interrupted", "failed", "cancelled"].includes(event.providerTurn.status)
+        ? null
+        : `provider_turn:${event.providerTurn.id}`;
+    case "node.updated":
+      return `node:${event.node.id}`;
+    case "turn_item.updated":
+      return `turn_item:${event.turnItem.id}`;
+    case "message.updated":
+      return `message:${event.message.id}`;
+    default:
+      return null;
+  }
+}
+
+function isFinalSnapshot(event: ProviderAdapter.ProviderAdapterV2Event): boolean {
+  if (event.type === "message.updated") return !event.message.streaming;
+  if (event.type === "turn_item.updated")
+    return "streaming" in event.turnItem && event.turnItem.streaming === true
+      ? false
+      : !["pending", "running", "waiting", "idle"].includes(event.turnItem.status);
+  if (event.type === "node.updated")
+    return !["pending", "running", "waiting", "idle"].includes(event.node.status);
+  return false;
+}
+
+/**
+ * A coalescer ahead of the commit lane keeps: each item's newest state once between controls (a final
+ * starts a new state), per-item order, first-arrival order, controls in place, every final, and a
+ * crash at any cut losing no item that arrived before one it kept.
+ */
+function assertCoalescingInvariants(
+  sent: ReadonlyArray<IndexedEvent>,
+  ingested: ReadonlyArray<number>,
+  complete = true,
+) {
+  // Every invariant is checked, so a broken coalescer shows each one it breaks.
+  const broken: Array<string> = [];
+  const check = (invariant: string, holds: boolean, detail: string) => {
+    if (!holds) broken.push(`${invariant}: ${detail}`);
+  };
+  // The state each snapshot belongs to: (segment between controls, item, finals seen before).
+  const state = new Map<number, string>();
+  const stateFirst = new Map<string, number>();
+  const stateLast = new Map<string, number>();
+  const finalsSeen = new Map<string, number>();
+  let segment = 0;
+  const controls: Array<number> = [];
+  for (const event of sent) {
+    const key = coalescedItemKey(event);
+    if (key === null) {
+      controls.push(event.sentIndex);
+      segment++;
+      continue;
+    }
+    const id = `${segment}|${key}|${finalsSeen.get(key) ?? 0}`;
+    state.set(event.sentIndex, id);
+    if (!stateFirst.has(id)) stateFirst.set(id, event.sentIndex);
+    stateLast.set(id, event.sentIndex);
+    if (isFinalSnapshot(event)) finalsSeen.set(key, (finalsSeen.get(key) ?? 0) + 1);
+  }
+  const keyOf = new Map(sent.map((event) => [event.sentIndex, coalescedItemKey(event)]));
+  const slotOf = (index: number) => (state.has(index) ? stateFirst.get(state.get(index)!)! : index);
+  // Newest state, once.
+  const ingestedStates = ingested.flatMap((index) => {
+    const id = state.get(index);
+    return id === undefined ? [] : [id];
+  });
+  const twice = ingestedStates.filter((id, at) => ingestedStates.indexOf(id) !== at);
+  check("newest state once", twice.length === 0, `ingested twice: ${twice.join(", ")}`);
+  const stale = ingested.filter(
+    (index) => state.has(index) && stateLast.get(state.get(index)!) !== index,
+  );
+  check("newest state once", stale.length === 0, `not the newest: #${stale.join(", #")}`);
+  // Per-item order.
+  const lastOfKey = new Map<string, number>();
+  for (const index of ingested) {
+    const key = keyOf.get(index);
+    if (key === null || key === undefined) continue;
+    check("per-item order", index > (lastOfKey.get(key) ?? -1), `${key} went back to #${index}`);
+    lastOfKey.set(key, Math.max(index, lastOfKey.get(key) ?? -1));
+  }
+  // First arrival.
+  const firsts = ingested.map(slotOf);
+  check(
+    "first arrival",
+    firsts.every((first, at) => at === 0 || first > firsts[at - 1]!),
+    `slots in ingest order ${JSON.stringify(firsts)}`,
+  );
+  // Controls and terminals.
+  for (const control of controls) {
+    if (!ingested.includes(control)) {
+      check("controls", !complete, `control #${control} never ingested`);
+      continue;
+    }
+    check(
+      "controls",
+      ingested.filter((index) => index === control).length === 1,
+      `control #${control} ingested more than once`,
+    );
+    const at = ingested.indexOf(control);
+    const early = ingested
+      .slice(0, at)
+      .filter((index) => slotOf(index) > control || index > control);
+    check(
+      "controls",
+      early.length === 0,
+      `#${early.join(", #")} arrived after #${control} but went before it`,
+    );
+    const late = ingested.slice(at + 1).filter((index) => index < control);
+    check(
+      "controls",
+      late.length === 0,
+      `#${late.join(", #")} arrived before #${control} but went after it`,
+    );
+  }
+  // Finals, once everything sent was ingested.
+  if (complete)
+    for (const event of sent)
+      if (coalescedItemKey(event) !== null && isFinalSnapshot(event))
+        check("finals", ingested.includes(event.sentIndex), `final #${event.sentIndex} dropped`);
+  // Crash: every cut of what was ingested holds each item that arrived first.
+  for (let cut = 1; cut <= ingested.length; cut++) {
+    const prefix = new Set(
+      ingested.slice(0, cut).map((index) => state.get(index) ?? `control:${index}`),
+    );
+    const reach = Math.max(...firsts.slice(0, cut));
+    const lost = [...stateFirst].filter(([id, first]) => first <= reach && !prefix.has(id));
+    check(
+      "crash cuts",
+      lost.length === 0,
+      `a crash after ${cut} write(s) loses ${lost.map(([id]) => id).join(", ")}, which arrived first`,
+    );
+  }
+  assert.deepEqual([...new Set(broken)], [], "coalescing invariants");
+}
+
+function coalescedBacklog(ids: BackgroundScenarioIds): ReadonlyArray<IndexedEvent> {
+  const usage = (usedTokens: number) =>
+    ({
+      type: "provider_turn.updated",
+      driver,
+      providerTurn: {
+        id: ids.rootProviderTurnId,
+        providerThreadId: ids.providerThreadId,
+        nodeId: ids.rootNodeId,
+        runAttemptId: ids.attemptId,
+        status: "running",
+        tokenUsage: { usedTokens },
+      },
+    }) as ProviderAdapter.ProviderAdapterV2Event;
+  const node = (status: "running" | "completed") =>
+    ({
+      type: "node.updated",
+      driver,
+      node: {
+        id: NodeId.make(`${ids.rootNodeId}:tool-a`),
+        threadId: ids.threadId,
+        runId: ids.runId,
+        parentNodeId: ids.rootNodeId,
+        rootNodeId: ids.rootNodeId,
+        kind: "tool_call",
+        status,
+        providerThreadId: null,
+      },
+    }) as ProviderAdapter.ProviderAdapterV2Event;
+  const tool = (name: string, status: "running" | "completed", title?: string) => {
+    const event = backgroundTurnItemEvent(
+      ids,
+      "dynamic_tool",
+      status,
+      2,
+      TurnItemId.make(`${ids.itemId}:${name}`),
+    );
+    return title === undefined
+      ? event
+      : ({
+          ...event,
+          turnItem: { ...(event as { turnItem: object }).turnItem, title },
+        } as ProviderAdapter.ProviderAdapterV2Event);
+  };
+  const text = (value: string, streaming: boolean) =>
+    ({
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        ...makeLinkedChildTurnItemFixture({ ids, driver, type: "assistant_message" }),
+        id: TurnItemId.make(`${ids.itemId}:text`),
+        threadId: ids.threadId,
+        runId: ids.runId,
+        nodeId: ids.rootNodeId,
+        providerTurnId: ids.rootProviderTurnId,
+        text: value,
+        streaming,
+        status: streaming ? "running" : "completed",
+      },
+    }) as ProviderAdapter.ProviderAdapterV2Event;
+  const control = {
+    type: "provider_thread.updated",
+    driver,
+    providerThread: { id: ids.providerThreadId, driver, status: "active" },
+  } as ProviderAdapter.ProviderAdapterV2Event;
+  return [
+    // The held write.
+    control,
+    // What the provider sent meanwhile: a usage report, a tool call, a text step and a second tool
+    // call, the first tool's result, another usage report; a control; the second tool's result, the
+    // text's final, usage, a third tool that runs, finishes and is renamed after it finished; the
+    // provider turn's end and the run's terminal.
+    usage(1),
+    node("running"),
+    tool("a", "running"),
+    text("Before the tools.\n\n", true),
+    tool("c", "running"),
+    node("completed"),
+    tool("a", "completed"),
+    usage(2),
+    control,
+    tool("c", "completed"),
+    text("Before the tools.\n\nAfter them.", false),
+    usage(3),
+    tool("d", "running"),
+    tool("d", "completed"),
+    tool("d", "completed", "Tool d, renamed"),
+    {
+      type: "provider_turn.updated",
+      driver,
+      providerTurn: {
+        id: ids.rootProviderTurnId,
+        providerThreadId: ids.providerThreadId,
+        nodeId: ids.rootNodeId,
+        runAttemptId: ids.attemptId,
+        status: "completed",
+      },
+    } as ProviderAdapter.ProviderAdapterV2Event,
+    rootTerminalEvent(ids, "completed"),
+  ].map((event, sentIndex) => ({ ...event, sentIndex }) as IndexedEvent);
+}
+
+/** Runs the backlog behind a held control write; returns the indexes the run ingested, in order. */
+function runCoalescedBacklog(key: string, failAtWrite?: number) {
+  return Effect.gen(function* () {
+    const ids = backgroundScenarioIds(key);
+    const sent = coalescedBacklog(ids);
+    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    const ingested = yield* Ref.make<ReadonlyArray<number>>([]);
+    const lane = yield* Ref.make(0);
+    const blockerStarted = yield* Deferred.make<void>();
+    const releaseBlocker = yield* Deferred.make<void>();
+    const finalized = yield* Deferred.make<void>();
+    let writes = 0;
+    const scenario = yield* runBackgroundItemScenario(key, () => Stream.fromQueue(providerEvents), {
+      batched: true,
+      onIngest: (event, write) =>
+        Effect.gen(function* () {
+          const index = (event as Partial<IndexedEvent>).sentIndex!;
+          if (++writes === failAtWrite) return yield* Effect.die("injected write failure");
+          if (index === 0) {
+            yield* Deferred.succeed(blockerStarted, undefined);
+            yield* Deferred.await(releaseBlocker);
+          }
+          if (write.inSharedCommit) yield* Ref.update(lane, (count) => count + 1);
+          yield* Ref.update(ingested, (current) => [...current, index]);
+        }),
+      // The terminal is ingested where it finalizes the run (once, whatever it writes).
+      onFinalized: () =>
+        Ref.update(ingested, (current) =>
+          current.includes(sent.at(-1)!.sentIndex) ? current : [...current, sent.at(-1)!.sentIndex],
+        ).pipe(Effect.andThen(Deferred.succeed(finalized, undefined))),
+    }).pipe(Effect.exit, Effect.forkChild);
+    yield* Queue.offer(providerEvents, sent[0]!);
+    yield* Deferred.await(blockerStarted);
+    yield* Queue.offerAll(providerEvents, sent.slice(1));
+    yield* Deferred.succeed(releaseBlocker, undefined);
+    // The run settles at its terminal, after everything before it. A broken coalescer can leave
+    // the run waiting for a state it dropped: what it ingested by then is still checked.
+    yield* Effect.raceFirst(Fiber.join(scenario).pipe(Effect.asVoid), Deferred.await(finalized));
+    yield* Fiber.interrupt(scenario);
+    return { sent, ingested: yield* Ref.get(ingested), laneWrites: yield* Ref.get(lane) };
+  });
+}
+
+it.effect("ingests each item of a backlog once, newest state at its first arrival", () =>
+  Effect.gen(function* () {
+    const { sent, ingested, laneWrites } = yield* runCoalescedBacklog("coalesced-backlog");
+    assertCoalescingInvariants(sent, ingested);
+    // The backlog's 14 snapshots are 10 states: the tools' running reports, the earlier usage
+    // reports and nothing else are superseded before the lane. Without coalescing all 14 reach it.
+    assert.equal(laneWrites, 10);
+    assert.deepEqual(ingested, [0, 8, 6, 7, 4, 5, 9, 10, 11, 12, 14, 15, 16, 17]);
+  }),
+);
+
+it.effect(
+  "ingests a late final queued before a background item's result after the root terminal",
+  () =>
+    Effect.gen(function* () {
+      // After the root terminal every event is checked for the end of ingestion; a background
+      // command keeps it open. A result moved ahead of an event that arrived before it would end
+      // ingestion first and drop that event.
+      const key = "coalesced-post-terminal";
+      const ids = backgroundScenarioIds(key);
+      const command = TurnItemId.make(`${ids.itemId}:command`);
+      const late = TurnItemId.make(`${ids.itemId}:late`);
+      const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const ingested = yield* Ref.make<ReadonlyArray<string>>([]);
+      const blockerStarted = yield* Deferred.make<void>();
+      const releaseBlocker = yield* Deferred.make<void>();
+      let blocked = false;
+      const scenario = yield* runBackgroundItemScenario(
+        key,
+        () => Stream.fromQueue(providerEvents),
+        {
+          batched: true,
+          onIngest: (event) =>
+            Effect.gen(function* () {
+              if (event.type === "provider_thread.updated" && !blocked) {
+                blocked = true;
+                yield* Deferred.succeed(blockerStarted, undefined);
+                yield* Deferred.await(releaseBlocker);
+              }
+              if (event.type === "turn_item.updated")
+                yield* Ref.update(ingested, (current) => [
+                  ...current,
+                  `${event.turnItem.id === command ? "command" : "late"}:${event.turnItem.status}`,
+                ]);
+            }),
+        },
+      ).pipe(Effect.forkChild);
+      yield* Queue.offerAll(providerEvents, [
+        backgroundTurnItemEvent(ids, "command_execution", "running", 2, command),
+        rootTerminalEvent(ids, "completed"),
+        {
+          type: "provider_thread.updated",
+          driver,
+          providerThread: { id: ids.providerThreadId, driver, status: "active" },
+        } as ProviderAdapter.ProviderAdapterV2Event,
+      ]);
+      yield* Deferred.await(blockerStarted);
+      yield* Queue.offerAll(providerEvents, [
+        backgroundTurnItemEvent(ids, "command_execution", "running", 2, command),
+        backgroundTurnItemEvent(ids, "dynamic_tool", "completed", 3, late),
+        backgroundTurnItemEvent(ids, "command_execution", "completed", 2, command),
+      ]);
+      yield* Deferred.succeed(releaseBlocker, undefined);
+      yield* Fiber.join(scenario);
+      assert.deepEqual(yield* Ref.get(ingested), [
+        "command:running",
+        "command:running",
+        "late:completed",
+        "command:completed",
+      ]);
+    }),
+);
+
+it.effect("persists a prefix of the coalesced backlog when a write fails mid-batch", () =>
+  Effect.gen(function* () {
+    // The third write (item a's result, which took its running report's place) fails: its run
+    // keeps the two writes before it, and nothing after it.
+    const { sent, ingested } = yield* runCoalescedBacklog("coalesced-backlog-crash", 4);
+    assert.deepEqual(ingested.slice(0, 3), [0, 8, 6]);
+    // Nothing of the backlog is written after the failure; only the run's end (its terminal's
+    // index, recorded when the run is finalized) may follow.
+    assert.deepEqual(
+      ingested.slice(3).filter((index) => index !== sent.at(-1)!.sentIndex),
+      [],
+    );
+    assertCoalescingInvariants(sent, ingested.slice(0, 3), false);
+  }),
+);
+
+it.effect("ends finished Codex seats' work on time on a session with 90 bound threads", () =>
   Effect.gen(function* () {
     // Only run consumers subscribe and Codex reports only turns it tracks, so a bound thread without
     // a run costs nothing. A finished run keeps its consumer while work it started runs on (a
-    // seat's follower), and that consumer gets every event of the session. Bound threads: a few live
-    // runs, many recently finished seats, the rest with no consumer.
-    const live = 3;
-    const seats = 24;
+    // seat's follower), and that consumer gets every event of the session. 90 bound threads: 2 live
+    // runs, 28 recently finished seats, 60 threads with no consumer.
+    const live = 2;
+    const seats = 28;
     const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
-    const write = Effect.sleep("90 millis");
+    const write = Effect.sleep("100 millis");
     const holding = yield* Deferred.make<void>();
     yield* coordinator
       .consume(
@@ -6406,18 +6908,18 @@ it.effect("ends finished Codex seats' work on time on a session with many bound 
 );
 
 it.effect.each([
-  // A slow writer pass: each lagging consumer, behind throughout, runs every usage report on the session
-  // alone.
-  { live: 6, writeMs: 350 },
-  // Many bound threads with events, on a faster writer pass.
-  { live: 15, writeMs: 120 },
+  // A few lagging consumers, each behind throughout, run every usage report on the session alone:
+  // a writer pass of seconds.
+  { live: 6, writeMs: 400 },
+  // Every bound thread with events in a busy window, on a 1 s writer pass.
+  { live: 16, writeMs: 100 },
 ])(
   "keeps $live live runs on a shared provider session up with a busy session's event mix ($writeMs ms writes)",
   ({ live, writeMs }) =>
     Effect.gen(function* () {
-      // A busy session's mix, as one shared Codex session sends it.
-      // Every 10 s each live run reports usage once, writes six turn
-      // items (three tool calls) and three node snapshots. The other bound threads have no
+      // A busy Codex session's mix: per usage report a few turn items and node snapshots. Every
+      // 10 s each live run reports usage once, writes four turn items (two tool calls) and four
+      // node snapshots. The other bound threads, up to 90, have no
       // consumer and send nothing.
       const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
       const write = Effect.sleep(Duration.millis(writeMs));
@@ -6522,7 +7024,7 @@ it.effect.each([
         }
       }).pipe(Effect.forkChild);
       yield* TestClock.adjust("5 minutes");
-      // Before this the runs fell many rounds behind, and an earlier fix only moved which ones:
+      // Before these fixes the runs fell 20 and 12-13 rounds behind; with the first two 10-11 and
       // each run still queued every other run's snapshots, jobs that grow as the runs squared.
       const behind = ingestedRound.map((ingested) => round - ingested);
       assert.deepEqual(

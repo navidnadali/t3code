@@ -37,6 +37,14 @@ import {
 /** Projection metadata rows: events at or below the pruned-through sequence may be gone. */
 export const EVENT_LOG_PRUNED_THROUGH = "event-log-pruned-through";
 export const EVENT_LOG_PRUNE_MARK = "event-log-prune-mark";
+/**
+ * The compaction's progress: rows at or below the cursor are classified under rule v1 (a looser
+ * rule takes a new key, so every row is classified again); the reference scan has read through its
+ * position, continuously from its start.
+ */
+export const EVENT_LOG_PRUNE_CURSOR = "event-log-prune-cursor:v1";
+export const EVENT_LOG_REFERENCE_SCAN = "event-log-reference-scan:v1";
+export const EVENT_LOG_REFERENCE_SCAN_FROM = "event-log-reference-scan-from:v1";
 
 export type UnsequencedProjectEvent = ApplicationProjectEvent extends infer Event
   ? Event extends ApplicationProjectEvent

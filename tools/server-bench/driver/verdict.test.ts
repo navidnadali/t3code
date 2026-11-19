@@ -5,11 +5,11 @@ import { judgeWindow, type WindowEvidence } from "./verdict.ts";
 const healthy: WindowEvidence = {
   worstErrorRate: { type: "poll.mcp.t3_thread_read", rate: 0.005 },
   maxErrorRate: 0.01,
-  sessions: 25,
-  sessionsWithOutput: 25,
+  sessions: 60,
+  sessionsWithOutput: 60,
   distribution: { p50Ratio: 1.05, p95Ratio: 0.9, tolerance: 0.2, withinTolerance: true },
-  sessionMcpRequired: 25,
-  sessionMcpCallers: 25,
+  sessionMcpRequired: 60,
+  sessionMcpCallers: 60,
   driver: {
     eventLoopUtilization: 0.2,
     eventLoopDelayP99Ms: 12,
@@ -43,14 +43,14 @@ describe("judgeWindow", () => {
 
   it("rejects a responsive server whose provider produced no output", () => {
     expect(judgeWindow({ ...healthy, sessionsWithOutput: 0 })).toBe(
-      "only 0 of 25 sessions produced provider output during the window",
+      "only 0 of 60 sessions produced provider output during the window",
     );
-    expect(judgeWindow({ ...healthy, sessionsWithOutput: 24 })).toContain("only 24 of 25");
+    expect(judgeWindow({ ...healthy, sessionsWithOutput: 59 })).toContain("only 59 of 60");
   });
 
   it("rejects a window in which some sessions could not call their MCP tools", () => {
     expect(judgeWindow({ ...healthy, sessionMcpCallers: 12 })).toBe(
-      "only 12 of 25 sessions had an MCP client when the window opened",
+      "only 12 of 60 sessions had an MCP client when the window opened",
     );
     expect(judgeWindow({ ...healthy, sessionMcpRequired: 0, sessionMcpCallers: 0 })).toBeNull();
   });

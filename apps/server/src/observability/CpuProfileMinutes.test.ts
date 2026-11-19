@@ -25,10 +25,10 @@ describe("CpuProfileMinutes", () => {
       nodes: [
         node(1, "(root)", "", -1, 0),
         node(2, "(program)", "", -1, 100),
-        node(3, "decodeProjection", "file:///srv/app/t3/dist/server.mjs", 41, 500),
+        node(3, "decodeProjection", "file:///srv/t3/dist/server.mjs", 41, 500),
         // Two nodes of one function on different stacks count together.
-        node(4, "decodeProjection", "file:///srv/app/t3/dist/server.mjs", 41, 150),
-        node(5, "", "file:///srv/app/t3/dist/server.mjs", 99, 200),
+        node(4, "decodeProjection", "file:///srv/t3/dist/server.mjs", 41, 150),
+        node(5, "", "file:///srv/t3/dist/server.mjs", 99, 200),
         node(6, "(garbage collector)", "", -1, 30),
         node(7, "small", "node:internal/streams/readable", 7, 20),
       ],

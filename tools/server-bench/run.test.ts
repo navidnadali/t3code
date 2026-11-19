@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Tests build real fixture templates on disk.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -27,11 +28,11 @@ const withTempDir = async (run: (directory: string) => Promise<void>) => {
 };
 
 describe("readDriverResult", () => {
-  it("reads the driver's driver.json: window, per-call latencies and event rates", () => {
+  it("reads the load driver's driver.json: window, per-call latencies and event rates", () => {
     const summary = readDriverResult({
       schemaVersion: 1,
       status: "ok",
-      knobs: { sessions: 24, seed: "1" },
+      knobs: { sessions: 60, seed: "1" },
       timeline: { warmup: "2026-10-31T21:00:00.000Z", window: "2026-10-31T21:01:00.000Z" },
       windowSeconds: 300.004,
       calls: {
@@ -73,7 +74,7 @@ describe("readDriverResult", () => {
           max_ms: 15_000,
         },
       },
-      knobs: { sessions: 24, seed: "1" },
+      knobs: { sessions: 60, seed: "1" },
     });
   });
 
@@ -458,6 +459,26 @@ describe("workload fingerprint", () => {
       expect(third).not.toBe(second);
       write(viaEnv, "{}\n{}\n");
       expect(await transcriptsHash(env, fixture, fixtures)).not.toBe(third);
+    });
+  });
+});
+
+describe("command line", () => {
+  it("requires --base: the base every result records is never assumed", async () => {
+    await withTempDir(async (directory) => {
+      const result = NodeChildProcess.spawnSync(
+        process.execPath,
+        [
+          NodePath.join(import.meta.dirname, "run.ts"),
+          "--fixture",
+          "none",
+          "--out",
+          NodePath.join(directory, "out"),
+        ],
+        { encoding: "utf8" },
+      );
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain("--base <ref> is required");
     });
   });
 });

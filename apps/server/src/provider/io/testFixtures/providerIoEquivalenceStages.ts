@@ -9,7 +9,7 @@ import {
 } from "../../EventNdjsonRecord.ts";
 import type { ProviderIoStage } from "../providerIoProtocol.ts";
 
-// The provider stages the fork made pure, composed the way a worker would run them: framing, JSON,
+// The provider stages made pure, composed the way a worker would run them: framing, JSON,
 // schema decode and protocol-log record building. Terminal conditions throw, as they end the session.
 
 export type LogRecord =

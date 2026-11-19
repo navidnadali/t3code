@@ -32,12 +32,17 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import { TestClock } from "effect/testing";
+import { ChildProcessSpawner } from "effect/process";
 
 import * as GitManager from "../git/GitManager.ts";
+import * as ProcessRunner from "../processRunner.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerActivation from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -1023,15 +1028,67 @@ describe("PullRequestSyncReactor", () => {
             assert.deepStrictEqual(minutesOf(1), [0, 60, 120, 150]);
             assert.deepStrictEqual(minutesOf(2).slice(0, 2), [0, 20]);
             assert.deepStrictEqual(minutesOf(3).slice(0, 2), [0, 5]);
-            // One updated less than half an hour ago is still read on every sweep.
+            // One updated just now: every sweep for its first 6 quiet minutes, then a sixth of
+            // its quiet time, joining the quiet cadence past half an hour.
             assert.deepStrictEqual(
-              minutesOf(4).slice(0, 30),
-              Array.from({ length: 30 }, (_, minute) => minute),
+              minutesOf(4).filter((minute) => minute <= 60),
+              [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 16, 19, 23, 27, 32, 38, 45, 53],
             );
             assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
           }).pipe(Effect.provide(fixture.layer));
         }),
       ),
+  );
+
+  // Every open pull request updated in the last half hour was read on every sweep (once a minute):
+  // dozens of forge detail reads a minute holding the forge CLI permits. It is now
+  // read again after a sixth of how long it had been quiet at its last read, at least a sweep apart,
+  // up to the quiet cadence's 5 minutes at half an hour.
+  it.effect("reads a recently updated pull request again after a sixth of its quiet time", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const quietForMinutes = new Map([
+          [1, 2],
+          [2, 24],
+        ]);
+        const updatedAt = new Map(
+          Array.from(quietForMinutes, ([number, minutes]) => [
+            number,
+            DateTime.formatIso(DateTime.makeUnsafe(Date.parse(NOW) - minutes * 60_000)),
+          ]),
+        );
+        const reads: Array<{ readonly number: number; readonly minute: number }> = [];
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("one", {
+              pullRequests: [...updatedAt].map(([number, at]) =>
+                makeLink(number, { updatedAt: at }),
+              ),
+            }),
+          ]),
+          summary: (input) =>
+            Clock.currentTimeMillis.pipe(
+              Effect.map((nowMs) => {
+                reads.push({ number: input.number, minute: (nowMs - Date.parse(NOW)) / 60_000 });
+                return makeSummary(input, { updatedAt: updatedAt.get(input.number)! });
+              }),
+            ),
+        });
+        const minutesOf = (number: number) =>
+          reads.filter((read) => read.number === number).map((read) => read.minute);
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          while ((yield* Clock.currentTimeMillis) < Date.parse(NOW) + 30 * 60_000) {
+            yield* sweepAgain(fixture, reactor);
+          }
+          // Quiet 2 min at its first read: every sweep until 6 min quiet, then a sixth of it.
+          assert.deepStrictEqual(minutesOf(1), [0, 1, 2, 3, 4, 5, 7, 9, 11, 14, 17, 21, 25, 30]);
+          // Quiet 24 min: 4 min, then the quiet cadence (5 min and up) past half an hour.
+          assert.deepStrictEqual(minutesOf(2), [0, 4, 9, 15, 22, 30]);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
   );
 
   it.effect("counts a quiet pull request's interval from when its read ends", () =>
@@ -1385,6 +1442,77 @@ describe("PullRequestSyncReactor", () => {
           (yield* Ref.get(fixture.summaryCalls)).map((ref) => ref.number).toSorted(),
           [1, 2, 3, 4],
         );
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+  );
+
+  // The sweep's merge-request reads could hold every forge CLI permit (4) and a person's PR panel
+  // read waited behind them for up to a minute. However many reads
+  // a sweep has due, a read made outside it starts while the sweep's reads still run.
+  it.effect("leaves a forge CLI permit for a read outside the sweep while the sweep reads", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(NOW));
+      const release = yield* Deferred.make<void>();
+      const started = yield* Queue.unbounded<string>();
+      const vcs = yield* VcsProcess.makeWith({ parallelism: 8, cpuQuota: null }).pipe(
+        Effect.provideService(
+          ProcessRunner.ProcessRunner,
+          ProcessRunner.ProcessRunner.of({
+            run: (input) =>
+              Queue.offer(started, input.args.at(-1)!).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as({
+                  stdout: "",
+                  stderr: "",
+                  code: ChildProcessSpawner.ExitCode(0),
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                }),
+              ),
+          }),
+        ),
+      );
+      const glab = (operation: string, number: string) =>
+        vcs.run({ operation, command: "glab", args: ["mr", "view", number], cwd: "/workspace" });
+      const numbers = Array.from({ length: 6 }, (_, index) => index + 1);
+      const fixture = yield* makeHarness({
+        snapshot: makeSnapshot(
+          numbers.map((number) =>
+            makeThread(`thread-${number}`, {
+              pullRequests: [makeLink(number, null, { host: "gitlab.example.com" })],
+            }),
+          ),
+        ),
+        summary: (input) =>
+          glab("GitLabPullRequestCli.getMergeRequestDetail", String(input.number)).pipe(
+            Effect.orDie,
+            Effect.as(makeSummary(input)),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const reactor = yield* PullRequestSyncReactor.PullRequestSyncReactor;
+        yield* reactor.start();
+        yield* Deferred.succeed(fixture.activation, undefined);
+        // The sweep's reads take what forge permits they may.
+        yield* Queue.takeN(started, 3);
+        yield* TestClock.adjust("1 second");
+        const panel = yield* glab("ws.rpc.pullRequests.detail", "panel").pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const panelStarted = yield* Effect.gen(function* () {
+          while (true) if ((yield* Queue.take(started)) === "panel") return true;
+        }).pipe(Effect.timeoutOption("1 second"), Effect.forkChild({ startImmediately: true }));
+        yield* TestClock.adjust("1 second");
+        assert.isTrue(
+          Option.isSome(yield* Fiber.join(panelStarted)),
+          "the panel's read waited for a permit behind the sweep's reads",
+        );
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(panel);
+        yield* reactor.drain;
       }).pipe(Effect.provide(fixture.layer));
     }),
   );

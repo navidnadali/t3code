@@ -243,7 +243,7 @@ export const KNOWN_LITERALS: ReadonlySet<string> = (() => {
 const TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
 const ID_KEY = /^(?:id|ids|ID|uuid)$|_(?:id|ids)$|[a-z0-9](?:Id|Ids|ID|IDs)$/;
-// Composite ids nest encoded ids, so one id can run to hundreds of characters.
+// Composite ids nest encoded ids: event ids can run to hundreds of characters.
 const ID_VALUE = /^[^\s\x00-\x1f\x7f]{1,4096}$/u;
 const ENUM_KEY =
   /^(?:type|kind|status|role)$|_(?:type|kind|status|role)$|[a-z0-9](?:Type|Kind|Status|Role)$/;
@@ -253,7 +253,7 @@ const MODEL_KEY =
 const MODEL_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]+-]{0,127}$/;
 const HASH_KEY = /(?:^|_|[a-z0-9])(?:sha|Sha|SHA|hash|Hash|oid|Oid|commit|Commit|revision)$/;
 const HASH_VALUE = /^[0-9a-f]{7,64}$/i;
-/** A key ending in a credential word: the extended check reads any 8-character value after it. */
+/** A key ending in a credential word: the reference check reads any 8-character value after it. */
 const CREDENTIAL_KEY_END =
   /(?:token|secret|password|passwd|pwd|access[_-]?key|api[_-]?key|apikey|private[_-]?key)$/i;
 /** Object keys kept as written; any other key becomes lowercase letters of its size. */
@@ -326,9 +326,9 @@ export const keptAs = (key: string | null, value: string, marked = false): Kept 
 const keptFindings = (value: string, kept: Kept, key: string | null): Array<string> => {
   if (kept === "literal" || kept === "timestamp") return [];
   const findings = scanDecoded(value, { entropy: false });
-  // The extended check's rule: a high-entropy value under a key/token/session/auth/… name is a credential.
+  // The reference sanitiser's rule: a high-entropy value under a key/token/session/auth/… name is a credential.
   if (key !== null && NAMEY.test(key) && highEntropy(value)) findings.push("high-entropy");
-  // And the extended check's rules on the value alone: a random id can read as one (`…pWd:abcdefgh:1`).
+  // And its rules on the value alone: a random id can read as one (`…pWd:abcdefgh:1`).
   if (extendedMayMatch(value)) extendedFindings(value, (row) => findings.push(row));
   return findings;
 };

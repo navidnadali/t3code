@@ -57,22 +57,31 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
           placement = "append",
           keepExisting = false,
         }) {
-          const existing = yield* sql<{ readonly ordinal: number }>`
-          SELECT ordinal
-          FROM orchestration_v2_turn_item_positions
-          WHERE thread_id = ${threadId} AND turn_item_id = ${turnItemId}
-          LIMIT 1
+          // The item's position and its run's ordinal in one round trip.
+          const [found] = yield* sql<{
+            readonly ordinal: number | null;
+            readonly run_ordinal: number | null;
+          }>`
+          SELECT
+            (
+              SELECT ordinal
+              FROM orchestration_v2_turn_item_positions
+              WHERE thread_id = ${threadId} AND turn_item_id = ${turnItemId}
+              LIMIT 1
+            ) AS ordinal,
+            ${
+              runId === null || suppliedRunOrdinal !== undefined
+                ? sql`NULL`
+                : sql`(
+                    SELECT ordinal
+                    FROM orchestration_v2_projection_runs
+                    WHERE thread_id = ${threadId} AND run_id = ${runId}
+                    LIMIT 1
+                  )`
+            } AS run_ordinal
         `;
-          const runRows =
-            runId === null || suppliedRunOrdinal !== undefined
-              ? []
-              : yield* sql<{ readonly ordinal: number }>`
-                SELECT ordinal
-                FROM orchestration_v2_projection_runs
-                WHERE thread_id = ${threadId} AND run_id = ${runId}
-                LIMIT 1
-              `;
-          const runOrdinal = suppliedRunOrdinal ?? runRows[0]?.ordinal ?? null;
+          const existing = found?.ordinal == null ? [] : [{ ordinal: found.ordinal }];
+          const runOrdinal = suppliedRunOrdinal ?? found?.run_ordinal ?? null;
           const lowerBound = runOrdinal === null ? 0 : runOrdinal * TURN_ITEM_ORDINALS_PER_RUN;
           const upperBound = lowerBound + TURN_ITEM_ORDINALS_PER_RUN - 1;
           const current = existing[0]?.ordinal;
@@ -85,7 +94,7 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
             ) {
               return current;
             }
-            yield* sql`
+            const moved = yield* sql<{ readonly ordinal: number }>`
             UPDATE orchestration_v2_turn_item_positions
             SET ordinal = (
               SELECT COALESCE(MAX(ordinal), ${lowerBound}) + 1
@@ -95,9 +104,11 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
                 AND ordinal <= ${upperBound}
             )
             WHERE thread_id = ${threadId} AND turn_item_id = ${turnItemId}
-          `;
+            RETURNING ordinal
+          `.pipe(Effect.map((rows) => rows[0]?.ordinal as number | undefined));
+            if (moved !== undefined) return moved;
           } else {
-            yield* sql`
+            const inserted = yield* sql<{ readonly ordinal: number }>`
             INSERT INTO orchestration_v2_turn_item_positions (thread_id, turn_item_id, ordinal)
             SELECT
               ${threadId},
@@ -112,7 +123,9 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
               AND ordinal >= ${lowerBound}
               AND ordinal <= ${upperBound}
             ON CONFLICT(thread_id, turn_item_id) DO NOTHING
+            RETURNING ordinal
           `;
+            if (inserted[0] !== undefined) return inserted[0].ordinal;
           }
           const rows = yield* sql<{ readonly ordinal: number }>`
           SELECT ordinal

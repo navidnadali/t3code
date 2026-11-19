@@ -43,6 +43,7 @@ import * as EffectWorker from "./EffectWorker.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
+import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
@@ -1750,4 +1751,96 @@ it.effect.each([3, 4])(
         processLossCount > 3 ? ["recover-child"] : ["dispatch", "recover-child"],
       );
     }),
+);
+
+// A gated turn start can spend most of its slot waiting on the commit lane while turn starts
+// queue in the outbox behind a full gate.
+it.effect("lets another turn start run while a gated one waits on the commit lane", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const workerId = "worker-lane-wait";
+    const turnStart = (index: number) =>
+      admissionEffect(index, now, workerId, {
+        type: "provider-turn.start",
+        runId: RunId.make(`run:admission-${index}`),
+      });
+    const pending = [turnStart(1)];
+    const available = yield* Queue.unbounded<void>();
+    const started = yield* Queue.unbounded<string>();
+    // Another run's write holds the commit lane until the test lets it go.
+    const lane = yield* ProviderCommitBatch.make((work) => work, true);
+    const laneHeld = yield* Deferred.make<void>();
+    const releaseLane = yield* Deferred.make<void>();
+    yield* lane
+      .consume(
+        Stream.make({ type: "node.updated" }),
+        () =>
+          Deferred.succeed(laneHeld, undefined).pipe(Effect.andThen(Deferred.await(releaseLane))),
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(laneHeld);
+    const layerOutbox = mockNormalOutbox({
+      claimNext: ({ excludeEffectTypes = [] }) =>
+        Effect.sync(() => {
+          const next = pending.find((effect) => !excludeEffectTypes.includes(effect.request.type));
+          if (next === undefined) return Option.none();
+          pending.splice(pending.indexOf(next), 1);
+          return Option.some(next);
+        }),
+      nextClaimableAt: () => Effect.succeedNone,
+      nextClaimableAtExcluding: (excludeEffectTypes) =>
+        Effect.sync(() =>
+          pending.some((effect) => !excludeEffectTypes.includes(effect.request.type))
+            ? Option.some(DateTime.makeUnsafe(now))
+            : Option.none(),
+        ),
+      awaitAvailable: Queue.take(available),
+      notifyAvailable: (count = 1) =>
+        Queue.offerAll(
+          available,
+          Array.from({ length: count }, () => undefined),
+        ).pipe(Effect.asVoid),
+      get: () => Effect.succeedNone,
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      succeed: () => Effect.succeed(true),
+    });
+    // A turn start writes through the commit lane (its run's claim), then does its own work.
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({
+        execute: (effect) =>
+          Queue.offer(started, effect.id).pipe(Effect.andThen(lane.barrier(Effect.void))),
+      }),
+    );
+    // Two workers, one slot while saturated (the allowance is half the workers).
+    const daemon = yield* EffectWorker.runDaemonWithOptions({
+      concurrency: 2,
+      admission: { delayAboveMs: 40 },
+      pressure: Effect.succeed(Effect.succeed(60)),
+      livenessPollIntervalMs: 3_600_000,
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layerWithOptions({ workerId, releaseSlotOnLane: true }).pipe(
+          Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+        ),
+      ),
+      Effect.forkChild,
+    );
+    yield* Queue.offerAll(available, [undefined]);
+    assert.deepEqual(yield* startsWithin(started, 1, "the first turn start"), [
+      "effect:admission-1",
+    ]);
+    // The gate saturates; the first start waits on the lane, so its slot runs the second start.
+    yield* TestClock.adjust("3 seconds");
+    pending.push(turnStart(2));
+    yield* Queue.offerAll(available, [undefined]);
+    assert.deepEqual(yield* startsWithin(started, 1, "the second turn start, lane still held"), [
+      "effect:admission-2",
+    ]);
+    assert.isFalse(yield* Deferred.isDone(releaseLane));
+    yield* Deferred.succeed(releaseLane, undefined);
+    yield* Fiber.interrupt(daemon);
+  }),
 );

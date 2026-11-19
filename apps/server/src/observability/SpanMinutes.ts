@@ -18,9 +18,9 @@ import * as Tracer from "effect/Tracer";
 export const SPAN_MINUTES_FILE_NAME = "server.span-minutes.ndjson";
 
 const MINUTE_MS = 60_000;
-// A busy server's minute line, with the waits, runs to tens of KB: a 4 MiB file closes every
-// hour or two and gzips several times smaller, so 96 archives hold days of minutes. The byte cap
-// bounds the disk for any names.
+// A busy server ends a few hundred span names a minute, a line of tens of KB with the waits: a 4 MiB
+// file closes every hour or two and gzips several times smaller, so 96 archives hold several days.
+// The byte cap bounds the disk for any names.
 export const SPAN_MINUTE_LOG_LIMITS = {
   maxBytes: 4 * 1024 * 1024,
   maxArchives: 96,

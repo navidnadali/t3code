@@ -1,3 +1,5 @@
+import * as NodeSqlite from "node:sqlite";
+
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointScopeId,
@@ -24,6 +26,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as HugeThreadReads from "./testkit/HugeThreadReads.ts";
 
 const layerDatabase = Layer.mergeAll(
   SqlitePersistence.layerMemory,
@@ -350,6 +353,42 @@ it.effect.each(["sqlite"] as const)(
         runId: oldRunId,
         occurredAt: now,
         payload: marker,
+      });
+      // Another run's /compact is read only for a run a handoff targets; turn start reads the
+      // ones its restart note turns on by key.
+      assert.notInclude(
+        (yield* store.getTurnStartContext(threadId, runId)).messages.map((m) => m.id),
+        marker.id,
+      );
+      yield* store.apply({
+        id: EventId.make("old-compact-handoff"),
+        type: "context-handoff.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          id: ContextHandoffId.make("handoff:old-compact"),
+          transferId: null,
+          threadId,
+          targetRunId: oldRunId,
+          fromProviderThreadIds: [],
+          toProviderThreadId: ProviderThreadId.make("provider-thread:old-compact"),
+          coveredRunOrdinals: { from: 1, to: 1 },
+          strategy: "full_thread_summary",
+          status: "ready",
+          summaryMessageId: null,
+          summaryText: "Earlier work.",
+          createdByProviderInstanceId: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      yield* putRun({
+        ...run,
+        id: oldRunId,
+        ordinal: 1,
+        status: "completed",
+        userMessageId: marker.id,
       });
       assert.include(
         (yield* store.getTurnStartContext(threadId, runId)).messages.map((m) => m.id),
@@ -1008,4 +1047,130 @@ it.effect(
         transfers.find((item) => item.type === "fork" && item.targetThreadId === threadId)?.id;
       assert.equal(madeBy(context.contextTransfers), madeBy(whole.contextTransfers));
     }).pipe(Effect.provide(layerDatabase)),
+);
+
+// A turn start once read every message of the thread to find /compact and /goal messages; on a long
+// thread that one statement took seconds. The turn start's messages
+// are its run's and the few that a decision names, so their reads must not grow with the thread.
+it.effect("reads a turn start's messages by key on a thread with a long thread's history", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const now = yield* DateTime.now;
+    const instanceId = ProviderInstanceId.make("codex");
+    const threadId = ThreadId.make("thread:huge-turn-start");
+    const providerThreadId = ProviderThreadId.make("provider-thread:huge-turn-start");
+    const thread: OrchestrationV2AppThread = {
+      id: threadId,
+      projectId: ProjectId.make("project:huge-turn-start"),
+      title: "Huge thread",
+      providerInstanceId: instanceId,
+      modelSelection: { instanceId, model: "test" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: null,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdBy: "user",
+      creationSource: "web",
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    };
+    yield* store.apply({
+      id: EventId.make("event:huge-turn-start:thread"),
+      type: "thread.created",
+      threadId,
+      occurredAt: now,
+      payload: thread,
+    });
+    // An earlier completed run, as history is, and the run starting now.
+    for (const [ordinal, status] of [
+      [1, "completed"],
+      [2, "starting"],
+    ] as const) {
+      const runId = RunId.make(`run:huge-turn-start:${ordinal}`);
+      const messageId = MessageId.make(`message:huge-turn-start:${ordinal}`);
+      yield* store.apply({
+        id: EventId.make(`event:huge-turn-start:run:${ordinal}`),
+        type: "run.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          id: runId,
+          threadId,
+          ordinal,
+          providerInstanceId: instanceId,
+          modelSelection: thread.modelSelection,
+          providerThreadId,
+          userMessageId: messageId,
+          rootNodeId: NodeId.make(`node:huge-turn-start:${ordinal}`),
+          activeAttemptId: null,
+          status,
+          requestedAt: now,
+          startedAt: now,
+          completedAt: status === "completed" ? now : null,
+          checkpointId: null,
+          contextHandoffId: null,
+        },
+      });
+      yield* store.apply({
+        id: EventId.make(`event:huge-turn-start:message:${ordinal}`),
+        type: "message.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          id: messageId,
+          threadId,
+          runId,
+          nodeId: null,
+          role: "user",
+          text: `Request ${ordinal}`,
+          attachments: [],
+          streaming: false,
+          createdBy: "user",
+          creationSource: "web",
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    }
+    const startingRunId = RunId.make("run:huge-turn-start:2");
+    const { statements, record } = HugeThreadReads.captureStatements(["test.turnStartContext"]);
+    const context = yield* store
+      .getTurnStartContext(threadId, startingRunId)
+      .pipe(Effect.withSpan("test.turnStartContext"), record);
+    assert.include(
+      context.messages.map((message) => message.id),
+      MessageId.make("message:huge-turn-start:2"),
+    );
+
+    const copyPath = "file:/huge-turn-start?vfs=memdb";
+    using copy = new NodeSqlite.DatabaseSync(copyPath);
+    yield* sql`VACUUM INTO ${copyPath}`;
+    const messageReads = statements.filter(([query]) =>
+      query.includes("FROM orchestration_v2_projection_messages"),
+    );
+    assert.isAbove(messageReads.length, 0);
+    const short = HugeThreadReads.replayReads(copy, messageReads);
+    HugeThreadReads.addThreadHistory(
+      copy,
+      threadId,
+      HugeThreadReads.HUGE_THREAD.runs,
+      HugeThreadReads.HUGE_THREAD.providerTurns,
+    );
+    const long = HugeThreadReads.replayReads(copy, messageReads);
+    // Bound: the short thread's message reads, whatever the history (VM steps within a seek's
+    // variance). Runs, attempts and provider turns are still read whole here: O(R), O(A), O(T).
+    assert.deepEqual(long.rows, short.rows);
+    assert.isAtMost(long.steps, short.steps + 64);
+  }).pipe(Effect.provide(layerDatabase)),
 );

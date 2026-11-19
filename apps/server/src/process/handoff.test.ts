@@ -1242,7 +1242,7 @@ describe("provider process hand-off", () => {
           env: process.env,
           stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"],
         };
-        for (const command of ["t3-no-such-command-probe", notExecutable]) {
+        for (const command of ["t3-no-such-command", notExecutable]) {
           const viaNode = yield* events(NodeChildProcess.spawn(command, [], options));
           expect(viaNode).toContainEqual(expect.stringMatching(/^close -(2|13) null$/));
           const handedOff = yield* events(

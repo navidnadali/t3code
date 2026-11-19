@@ -52,6 +52,7 @@ import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegist
 import * as ProviderRuntimeRecoveryService from "../ProviderRuntimeRecoveryService.ts";
 import * as ProviderSessionManager from "../ProviderSessionManager.ts";
 import * as CommandOutputRecorder from "./CommandOutputRecorder.ts";
+import { NoStoreControlRecorder, recordNoStoreControls } from "./SupersededItemStates.ts";
 import * as ProviderSwitchService from "../ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "../ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "../ProviderTurnStartService.ts";
@@ -405,7 +406,17 @@ function makeReplayRuntime<Error>(
   const layerCommandReceiptStoreProvided = CommandReceiptStore.layer.pipe(
     Layer.provide(layerDatabase),
   );
-  const layerProviderEventIngestorProvided = ProviderEventIngestor.layer.pipe(
+  // A comparison that set NoStoreControlRecorder learns each run's controls that stored nothing.
+  const layerProviderEventIngestorRecorded = Layer.effect(
+    ProviderEventIngestor.ProviderEventIngestorV2,
+    Effect.gen(function* () {
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const recorder = yield* NoStoreControlRecorder;
+      return recorder === undefined ? ingestor : recordNoStoreControls(ingestor, recorder);
+    }),
+  );
+  const layerProviderEventIngestorProvided = layerProviderEventIngestorRecorded.pipe(
+    Layer.provide(ProviderEventIngestor.layer),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({

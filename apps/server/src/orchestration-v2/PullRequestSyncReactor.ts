@@ -34,6 +34,7 @@ import * as Stream from "effect/Stream";
 import * as GitManager from "../git/GitManager.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -55,6 +56,15 @@ export const quietSyncIntervalMs = (quietForMs: number) =>
     QUIET_SYNC_MAX_INTERVAL_MS,
     Math.max(QUIET_SYNC_INTERVAL_MS, quietForMs / QUIET_SYNC_BACKOFF_DIVISOR),
   );
+
+// One updated in the last QUIET_AFTER_MS backs off the same way from zero: read on every sweep
+// while a sixth of its quiet time is under a sweep's minute, it meets the quiet cadence's 5 min floor
+// at half an hour. A read between sweeps (a requested refresh) does not delay the next sweep's.
+/** How long after a read a pull request updated `quietForMs` before that read is due again. */
+const syncIntervalMs = (quietForMs: number) =>
+  quietForMs >= QUIET_AFTER_MS
+    ? quietSyncIntervalMs(quietForMs)
+    : quietForMs / QUIET_SYNC_BACKOFF_DIVISOR;
 // A pull request closed this long ago is rarely reopened, so the sweep stops reading it, as it
 // does merged ones. A reader that sees it open, or a requested refresh, still reads it at once.
 const CLOSED_FINAL_AFTER_MS = 24 * 60 * 60 * 1_000;
@@ -405,12 +415,12 @@ export const make = Effect.gen(function* () {
     if (active.every(isFinal)) return false;
     const open = active.filter((entry) => entry.link.snapshot?.state === "open");
     if (open.length > 0) {
-      // NaN, from a missing or unparsable updatedAt, counts as recently updated.
       const updatedAtMs = Math.max(
         ...open.map((entry) => Date.parse(entry.link.snapshot?.updatedAt ?? "")),
       );
-      if (!(nowMs - updatedAtMs >= QUIET_AFTER_MS)) return true;
-      return last === undefined || sinceLastMs >= quietSyncIntervalMs(last - updatedAtMs);
+      // NaN, from a missing or unparsable updatedAt, is read on every sweep.
+      if (Number.isNaN(updatedAtMs)) return true;
+      return last === undefined || sinceLastMs >= syncIntervalMs(last - updatedAtMs);
     }
     return sinceLastMs >= SLOW_SYNC_INTERVAL_MS;
   };
@@ -713,7 +723,10 @@ export const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker((scope: "all" | "requested") =>
     Effect.suspend(() => {
       if (scope === "requested") requestedSweepQueued = false;
-      return pullRequests.withSharedProjectReads(sweep(scope));
+      // Scheduled reads leave a forge CLI permit for reads someone is waiting for.
+      return pullRequests
+        .withSharedProjectReads(sweep(scope))
+        .pipe(Effect.provideService(VcsProcess.ForgeBackground, true));
     }).pipe(Effect.catchCause(logSkipped("pull request sync sweep failed", {}))),
   );
 

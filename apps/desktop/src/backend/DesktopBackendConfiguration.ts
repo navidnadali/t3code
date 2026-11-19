@@ -750,7 +750,7 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
     runtime.kind === "executable"
       ? `${WSL_SERVER_SYSTEM_PATH}:${preflight.resolvedPath}`
       : `${nodeBinDirOf(runtime.nodePath)}:${WSL_SERVER_SYSTEM_PATH}:${preflight.resolvedPath}`;
-  // The WSL backend gets nothing from the young-generation default: the Linux
+  // The WSL backend gets nothing from the young-generation default (by decision): the Linux
   // executable has the cap built in, the node fallback runs Node's default, and the bootstrap
   // descriptor rules a relaunch out either way.
   const command =

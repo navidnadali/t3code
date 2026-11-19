@@ -107,11 +107,49 @@ it.effect(
         // In this one-thread fixture a provider transaction never spans a run boundary.
         assert.equal(new Set(events.map((event) => event.runId)).size, 1);
       }
-      // Both turns' snapshots and running usage reports go through provider transactions.
+      // Both turns' item snapshots (node, message, turn item) go through provider transactions.
+      // A later change added each turn's running usage report there too (8 writes). Since coalescing, that
+      // report, arriving in the same backlog as the turn's first report with no control between,
+      // replaces it in place: one provider turn's whole state, newest wins.
       assert.equal(
         [...batches.values()].reduce((total, events) => total + events.length, 0),
-        8,
+        6,
       );
+      // (ii) Each turn's running state is stored once, before the turn's end, and it is the newest
+      // report: the usage the provider sent after the turn's text is kept, not the bare first report.
+      const turnStates = new Map<
+        string,
+        Array<{ sequence: number; event: OrchestrationV2DomainEvent }>
+      >();
+      for (const { sequence, event } of stored)
+        if (event.type === "provider-turn.updated")
+          turnStates.set(event.payload.id, [
+            ...(turnStates.get(event.payload.id) ?? []),
+            { sequence, event },
+          ]);
+      assert.equal(turnStates.size, 2);
+      for (const [turn, states] of turnStates) {
+        const running = states.filter(
+          ({ event }) =>
+            event.type === "provider-turn.updated" && event.payload.status === "running",
+        );
+        const ended = states.find(
+          ({ event }) =>
+            event.type === "provider-turn.updated" && event.payload.status === "completed",
+        );
+        assert.equal(running.length, 1, `${turn}: running state stored ${running.length} times`);
+        assert.isDefined(ended);
+        assert.isBelow(running[0]!.sequence, ended!.sequence);
+        const usage =
+          running[0]!.event.type === "provider-turn.updated"
+            ? running[0]!.event.payload.tokenUsage
+            : undefined;
+        assert.isAbove(
+          usage?.usedTokens ?? 0,
+          0,
+          `${turn}: the stored running state lost its usage`,
+        );
+      }
       // (iii) Per run, every snapshot from its provider commits before the run settles, and per
       // item the stored order is the provider's: no item goes back from a settled status.
       const settledAt = new Map<string, number>();

@@ -998,7 +998,7 @@ it.effect("a subscriber whose scope closes while the hub starts leaves no hub be
   }).pipe(Effect.scoped),
 );
 
-// Reviewer scenario (F3): a subagent archived when the hub started and unarchived later.
+// A review scenario: a subagent archived when the hub started and unarchived later.
 it.effect(
   "a transcript-only update of a subagent thread is dropped whatever the hub knew at start",
   () =>

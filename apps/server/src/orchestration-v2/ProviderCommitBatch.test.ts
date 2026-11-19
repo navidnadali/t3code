@@ -669,3 +669,121 @@ it.effect("reports ingest lag only from a consumer that persisted the event", ()
     );
   }).pipe(Effect.provideService(CurrentWaitObserver, observer));
 });
+
+it.effect("lends a caller's slot out only while its write waits on the lane", () =>
+  Effect.gen(function* () {
+    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const steps: Array<string> = [];
+    // Lent on the fiber that writes, as the effect worker does for its execution's own fiber.
+    const withLaneWait = <A, E>(effect: Effect.Effect<A, E>) =>
+      Effect.withFiber((fiber) =>
+        Effect.provideService(effect, ProviderCommitBatch.CurrentLaneWait, {
+          owner: fiber.id,
+          suspend: Effect.sync(() => steps.push("suspend")),
+          resume: Effect.sync(() => steps.push("resume")),
+        }),
+      );
+    // An idle lane runs the write at once: nothing to lend.
+    yield* withLaneWait(coordinator.barrier(Effect.sync(() => steps.push("write"))));
+    assert.deepEqual(steps, ["write"]);
+    steps.length = 0;
+
+    // A held lane queues the write: the slot goes out first and comes back after the write, even a
+    // failed or an interrupted one (its effect's end then gives it back).
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    yield* coordinator
+      .consume(
+        Stream.make({ type: "node.updated" }),
+        () => Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(held);
+    const queued = yield* withLaneWait(
+      coordinator.barrier(Effect.sync(() => steps.push("write"))),
+    ).pipe(Effect.forkChild);
+    const failing = yield* withLaneWait(coordinator.barrier(Effect.fail("write failed"))).pipe(
+      Effect.exit,
+      Effect.forkChild,
+    );
+    const interrupted = yield* withLaneWait(coordinator.barrier(Effect.void)).pipe(
+      Effect.forkChild,
+    );
+    yield* Effect.yieldNow;
+    assert.deepEqual(steps, ["suspend", "suspend", "suspend"]);
+    yield* Fiber.interrupt(interrupted);
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(queued);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(failing)));
+    assert.deepEqual(steps, [
+      "suspend",
+      "suspend",
+      "suspend",
+      "resume",
+      "write",
+      "resume",
+      "resume",
+    ]);
+    // A fiber the owner forks inherits the lane wait, not the slot: its write lends nothing.
+    steps.length = 0;
+    const forkedHeld = yield* Deferred.make<void>();
+    const forkedRelease = yield* Deferred.make<void>();
+    yield* coordinator
+      .consume(
+        Stream.make({ type: "node.updated" }),
+        () =>
+          Deferred.succeed(forkedHeld, undefined).pipe(
+            Effect.andThen(Deferred.await(forkedRelease)),
+          ),
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(forkedHeld);
+    const forked = yield* withLaneWait(
+      coordinator.barrier(Effect.sync(() => steps.push("write"))).pipe(Effect.forkChild),
+    );
+    yield* Effect.yieldNow;
+    yield* Deferred.succeed(forkedRelease, undefined);
+    yield* Fiber.join(forked);
+    assert.deepEqual(steps, ["write"]);
+  }),
+);
+
+it.effect("lends a caller's slot while its write waits for room in the lane's queue", () =>
+  Effect.gen(function* () {
+    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const steps: Array<string> = [];
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    yield* coordinator
+      .consume(
+        Stream.make({ type: "node.updated" }),
+        () => Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(held);
+    // Other writers fill the lane's queue behind the held batch.
+    for (let writer = 0; writer < 64; writer++)
+      yield* coordinator.barrier(Effect.void).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    const waiting = yield* Effect.withFiber((fiber) =>
+      Effect.provideService(
+        coordinator.barrier(Effect.sync(() => steps.push("write"))),
+        ProviderCommitBatch.CurrentLaneWait,
+        {
+          owner: fiber.id,
+          suspend: Effect.sync(() => steps.push("suspend")),
+          resume: Effect.sync(() => steps.push("resume")),
+        },
+      ),
+    ).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    // Its write cannot even queue yet, and its slot is already out.
+    assert.deepEqual(steps, ["suspend"]);
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(waiting);
+    assert.deepEqual(steps, ["suspend", "write", "resume"]);
+  }),
+);

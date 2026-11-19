@@ -7647,7 +7647,7 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
             payload: { ...busy, status: "completed", completedAt: now },
           },
         ]);
-        // Each start that fails sends the results again, after C2c's growing backoff.
+        // Each start that fails sends the results again, after its growing retry backoff.
         for (let failures = 1; failures < 8; failures += 1) {
           for (const parent of parents) {
             assert.equal(
@@ -7969,33 +7969,33 @@ interface SeatBacklogShape {
   readonly wakeSizes: ReadonlyArray<number>;
 }
 
-// A synthetic seat backlog: one completion wake per parent run, these task counts in delivery
-// order (mostly small wakes, some over the 25-result cap), and a notice partway through; from
-// many children, the top five with these [wakes, tasks].
+// A busy seat queues one completion wake per parent run: here 220, naming 1,400 distinct tasks
+// (these counts, in delivery order), with a notice after the 40th; 100 children, the top five with
+// these [wakes, tasks].
 const SEAT_BACKLOG: SeatBacklogShape = {
   children: 100,
   top: [
     [40, 50],
-    [40, 46],
-    [38, 42],
-    [36, 40],
-    [35, 36],
+    [39, 46],
+    [38, 43],
+    [37, 40],
+    [36, 37],
   ],
   noticeAfter: 40,
   wakeSizes: [
-    1, 7, 6, 27, 4, 3, 2, 1, 7, 6, 5, 4, 3, 27, 1, 7, 6, 5, 4, 3, 2, 1, 7, 27, 5,
-    4, 3, 2, 1, 7, 6, 5, 4, 27, 2, 1, 7, 6, 5, 4, 3, 2, 1, 27, 6, 5, 4, 3, 2, 1,
-    7, 6, 5, 27, 3, 2, 1, 7, 6, 5, 4, 3, 2, 27, 7, 6, 5, 4, 3, 2, 1, 7, 6, 27, 4,
-    3, 2, 1, 7, 6, 5, 4, 3, 27, 1, 7, 6, 5, 4, 3, 2, 1, 7, 27, 5, 4, 3, 2, 1, 7,
-    6, 5, 4, 27, 2, 1, 7, 6, 5, 4, 3, 2, 1, 27, 6, 5, 4, 3, 2, 1, 7, 6, 5, 27, 3,
-    2, 1, 7, 6, 5, 4, 3, 2, 27, 7, 6, 5, 4, 3, 2, 1, 7, 6, 27, 4, 3, 2, 1, 7, 6,
-    5, 4, 3, 27, 1, 7, 6, 5, 4, 3, 2, 1, 7, 27, 5, 4, 3, 2, 1, 7, 6, 5, 4, 27, 2,
-    1, 7, 6, 5, 4, 3, 2, 1, 27, 6, 5, 4, 3, 2, 1, 7, 6, 5, 27, 3, 2, 1, 7, 6, 5,
+    1, 11, 5, 2, 7, 1, 9, 2, 19, 11, 1, 3, 1, 14, 2, 1, 5, 3, 4, 2, 1, 11, 21, 22, 3, 12, 12, 1, 1,
+    1, 1, 3, 1, 44, 2, 1, 5, 1, 12, 64, 6, 2, 1, 9, 4, 1, 17, 3, 8, 15, 5, 3, 7, 3, 6, 5, 2, 2, 3,
+    13, 3, 1, 1, 12, 2, 3, 12, 3, 1, 14, 6, 2, 6, 2, 1, 23, 5, 1, 3, 27, 11, 23, 7, 40, 1, 1, 6, 1,
+    6, 1, 3, 1, 1, 1, 2, 2, 1, 14, 1, 30, 5, 7, 5, 9, 6, 6, 1, 3, 1, 2, 2, 2, 1, 8, 1, 1, 7, 12, 2,
+    1, 4, 4, 1, 3, 5, 1, 1, 7, 1, 2, 1, 11, 1, 1, 1, 7, 14, 6, 2, 2, 3, 1, 2, 57, 18, 6, 13, 7, 1,
+    4, 6, 22, 10, 1, 6, 5, 13, 4, 4, 1, 1, 3, 3, 6, 7, 1, 4, 1, 13, 1, 1, 5, 8, 7, 5, 7, 1, 2, 1, 1,
+    5, 6, 1, 5, 2, 5, 1, 1, 4, 5, 1, 1, 10, 1, 20, 1, 4, 8, 10, 24, 3, 1, 4, 6, 1, 53, 3, 9, 3, 4,
+    7, 14, 7, 8, 3, 4, 8, 1, 7, 1,
   ],
 };
 
-// Wakes 31-51 of that queue with the notice where it stood, two of them over the 25-result cap;
-// fewer children, so the top two still lead.
+// Wakes 31-51 of that queue with the notice where it stood: 205 tasks, six wakes with one, two
+// over the 25-result cap (44 and 64); fewer children, so the top two still lead.
 const SEAT_BACKLOG_STRETCH: SeatBacklogShape = {
   children: 36,
   top: [
@@ -8111,7 +8111,7 @@ const seedSeatBacklog = (key: string, shape: SeatBacklogShape) =>
         ];
       }),
     });
-    // Queued as before merging reached seats: one wake per parent run.
+    // Queued before merging reached seats, as builds without merging queued them.
     const noticeId = MessageId.make(`${key}-notice`);
     const separate = yield* queueWakesApart(threadId, parents, seeded.busyRunId, key, {
       index: shape.noticeAfter,
@@ -8140,10 +8140,12 @@ const drainSeatBacklog = (key: string, shape: SeatBacklogShape) =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const sink = yield* EventSink.EventSinkV2;
-    const { threadId, busyRunId, now, tasks, separate, noticeId } =
-      yield* seedSeatBacklog(key, shape);
+    const { threadId, busyRunId, now, tasks, separate, noticeId } = yield* seedSeatBacklog(
+      key,
+      shape,
+    );
 
-    // The queued shape, counted run by run.
+    // The seeded shape, counted the way a seat's queue is counted.
     const queued = yield* orchestrator.getThreadProjection(threadId);
     const queuedRuns = queued.runs.filter((run) => run.status === "queued");
     assert.equal(queuedRuns.length, shape.wakeSizes.length + 1);
@@ -8250,7 +8252,7 @@ const drainSeatBacklog = (key: string, shape: SeatBacklogShape) =>
       ),
       [],
     );
-    // Before merging, every queued run started on its own; the notice starts alone.
+    // Without merging every queued run started on its own; the notice starts alone.
     assert.equal(starts, mergedDrainStarts(shape.wakeSizes) + 1);
   });
 
@@ -8262,10 +8264,10 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
     );
 
     // The whole queue takes about a minute: T3_BENCH_FULL_SEAT_BACKLOG=1 vp test run
-    // src/orchestration-v2/DelegatedCompletionDelivery.test.ts -t "whole seat backlog" (from apps/server).
+    // src/orchestration-v2/DelegatedCompletionDelivery.test.ts -t "221-run" (from apps/server).
     it.effect.runIf(process.env.T3_BENCH_FULL_SEAT_BACKLOG === "1")(
-      "drains the whole seat backlog, each child's task reported once",
-      () => drainSeatBacklog("seat-whole", SEAT_BACKLOG),
+      "drains a 221-run seat backlog, each child's task reported once",
+      () => drainSeatBacklog("seat-full", SEAT_BACKLOG),
     );
   },
 );
@@ -8353,7 +8355,7 @@ const SETTLE_SCRIPT = new URL(
   import.meta.url,
 );
 
-// Where a merged wake's run can be when 0.1.9-perf.9 stops, and what the script must leave: the run's
+// Where a merged wake's run can be at a rollback, and what the script must leave: the run's
 // status, and its parent runs all settled, the wake's own left to the older build and the others
 // settled, or each sent again (the table in docs/operations/merged-completion-wake-rollback.md).
 type SettleCase = {
@@ -8528,7 +8530,7 @@ it.effect(
         ProviderContinuationRequests.layer,
       );
 
-      // 0.1.9-perf.9 queues one merged wake per thread, each carrying three parent runs' results.
+      // A merging build queues one merged wake per thread, each with three parent runs' results.
       const threads = yield* Effect.forEach(SETTLE_STATES, (state) =>
         Effect.gen(function* () {
           const settle: SettleCase = SETTLE_CASES[state];
@@ -8835,7 +8837,7 @@ it.effect(
       yield* Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
-        // What a build before 0.1.9-perf.9 reads: no wake carries another parent run, and every open
+        // What a build before merging reads: no wake carries another parent run, and every open
         // delivery is its wake's own parent run or a wake not sent yet.
         for (const { threadId } of threads) {
           const projection = yield* orchestrator.getThreadProjection(threadId);

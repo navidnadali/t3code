@@ -248,7 +248,7 @@ const resumedMcpQueryInput = {
   },
 } satisfies ClaudeAgentSdkQueryOpenInput;
 
-// the history worker runs from the server's command spawner, so a fork or a resume never
+// The history worker runs from the server's command spawner, so a fork or a resume never
 // forks the server itself.
 const historyWorkerRoute = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
@@ -1083,7 +1083,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
   const byNumber = (left: number, right: number) => left - right;
 
   // Each poll walked every job each CLI had ever run; with many long-lived CLIs that blocked the
-  // server on every poll.
+  // server for hundreds of ms a poll.
   it("keeps only the descendants each CLI still has running, however many jobs it ran", () => {
     const clis = [1000, 2000, 3000];
     const trackers = clis.map(makeClaudeDescendantTracker);
@@ -1168,7 +1168,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
     }),
   );
 
-  // the server's command spawner runs `ps`, so polling never forks the server itself.
+  // The server's command spawner runs `ps`, so polling never forks the server itself.
   it.effect("reads the process table through the server's command spawner", () =>
     Effect.gen(function* () {
       const cli = fakeClaudeCli("cat > /dev/null");

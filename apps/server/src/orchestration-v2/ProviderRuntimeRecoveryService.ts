@@ -516,7 +516,14 @@ export const make = Effect.gen(function* () {
           id: `effect:restart-resend:${run.id}:${commandId}`,
           commandId: resendCommandId,
           threadId: projection.thread.id,
-          request: { type: "provider-turn.start", runId: run.id },
+          request: {
+            type: "provider-turn.start",
+            runId: run.id,
+            ...EffectOutbox.turnStartClaimPriority(
+              projection.thread,
+              queuedMessages.find((message) => message.id === run.userMessageId),
+            ),
+          },
         });
       }
       for (const run of resentRuns) {

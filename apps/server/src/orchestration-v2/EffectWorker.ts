@@ -5,6 +5,7 @@ import { CommandId, type RunId } from "@t3tools/contracts";
 import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Config from "effect/Config";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -27,6 +28,7 @@ import {
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as EffectAdmission from "./EffectAdmission.ts";
+import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
@@ -852,7 +854,15 @@ export class OrchestrationEffectWorkerV2 extends Context.Service<
 export interface OrchestrationEffectWorkerOptions {
   readonly workerId?: string;
   readonly maxAttempts?: number;
+  /** A gated effect lends its slot out while it waits on the commit lane (default: the env knob). */
+  readonly releaseSlotOnLane?: boolean;
 }
+
+/** Off by default, as before. */
+const releaseSlotOnLaneConfig = Config.Boolean("T3CODE_EFFECT_SLOT_RELEASE_ON_LANE").pipe(
+  Config.withDefault(false),
+  Effect.orDie,
+);
 
 export const layerWithOptions = (
   options: OrchestrationEffectWorkerOptions = {},
@@ -868,6 +878,7 @@ export const layerWithOptions = (
       const executor = yield* OrchestrationEffectExecutorV2;
       const waitObserver = yield* CurrentWaitObserver;
       const workerId = options.workerId ?? `orchestration-v2:${process.pid}`;
+      const releaseSlotOnLane = options.releaseSlotOnLane ?? (yield* releaseSlotOnLaneConfig);
       const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
       const wasCancelled = (effectId: string) =>
         outbox.get(effectId).pipe(
@@ -965,6 +976,7 @@ export const layerWithOptions = (
       const runClaimed = Effect.fnUntraced(function* (
         effect: EffectOutbox.OrchestrationEffectV2,
         gated: boolean,
+        slot?: EffectAdmission.AdmissionSlot,
       ) {
         // Arm cancellation before rereading durable state to close the read-to-registration race.
         const cancellation = outbox
@@ -994,20 +1006,30 @@ export const layerWithOptions = (
         }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
         if (cancelledBeforeExecution) return true;
 
-        const execution = executor
-          .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
-          .pipe(
-            boundExecution(effect),
-            Effect.withSpan("EffectWorker.runEffect", {
-              attributes: {
-                "effect.type": effect.request.type,
-                "effect.queue_wait_ms": queueWaitMs,
-                "effect.attempt": effect.attemptCount,
-                "effect.gated": gated,
-              },
-            }),
-            Effect.as("executed" as const),
-          );
+        const lendsSlot = releaseSlotOnLane && gated && slot !== undefined;
+        const execution = Effect.withFiber((fiber) =>
+          executor
+            .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
+            .pipe(
+              Effect.provideService(
+                ProviderCommitBatch.CurrentLaneWait,
+                lendsSlot
+                  ? { owner: fiber.id, suspend: slot.suspend, resume: slot.resume }
+                  : undefined,
+              ),
+            ),
+        ).pipe(
+          boundExecution(effect),
+          Effect.withSpan("EffectWorker.runEffect", {
+            attributes: {
+              "effect.type": effect.request.type,
+              "effect.queue_wait_ms": queueWaitMs,
+              "effect.attempt": effect.attemptCount,
+              "effect.gated": gated,
+            },
+          }),
+          Effect.as("executed" as const),
+        );
         const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
           Effect.ensuring(outbox.clearCancellation(effect.id)),
         );
@@ -1106,7 +1128,7 @@ export const layerWithOptions = (
           const gated = EffectAdmission.isGated(effect.request.type);
           // An ungated effect frees its slot at once; a worker refused it meanwhile is woken.
           if (!gated && slot !== undefined) yield* slot.release;
-          const execution = runClaimed(effect, gated).pipe(
+          const execution = runClaimed(effect, gated, slot).pipe(
             Effect.ensuring(gated && slot !== undefined ? slot.release : Effect.void),
           );
           if (filter.controlLane === "steer-reply" && backgroundScope !== undefined) {

@@ -84,6 +84,14 @@ const GIT_PROCESS_CORES_SHARE = 4;
 // hold no git permit, so a forge call never delays a git command.
 const FORGE_PROCESS_CONCURRENCY = 4;
 
+/**
+ * Set by background work that reads a forge on a schedule (the pull request sync sweep): its CLI
+ * calls take at most all but one forge permit, so a read someone is waiting for always has one.
+ */
+export const ForgeBackground = Context.Reference<boolean>("t3/vcs/VcsProcess/ForgeBackground", {
+  defaultValue: () => false,
+});
+
 /** Git processes allowed at once on a machine with `parallelism` cores and a cgroup CPU quota. */
 export const gitProcessConcurrency = (parallelism: number, cpuQuota: number | null): number => {
   const cores = cpuQuota === null ? parallelism : Math.min(parallelism, cpuQuota);
@@ -350,6 +358,7 @@ export const makeWith = Effect.fn("VcsProcess.makeWith")(function* (pools: VcsPr
     ),
   );
   const forgeProcesses = yield* Semaphore.make(FORGE_PROCESS_CONCURRENCY);
+  const backgroundForgeProcesses = yield* Semaphore.make(FORGE_PROCESS_CONCURRENCY - 1);
   const keyedProcesses = new Map<string, Semaphore.Semaphore>();
   const keyedPermit = (concurrency: NonNullable<VcsProcessInput["concurrency"]>) => {
     let semaphore = keyedProcesses.get(concurrency.key);
@@ -520,10 +529,11 @@ export const makeWith = Effect.fn("VcsProcess.makeWith")(function* (pools: VcsPr
 
   const run = Effect.fn("VcsProcess.run")(function* (input: VcsProcessInput) {
     // Each command waits only for its own pool: git's, sized by the machine, or the forge CLIs'.
+    const background = input.command !== "git" && (yield* ForgeBackground);
     const pool =
       input.command === "git"
         ? { name: "git", processes: gitProcesses }
-        : { name: "forge", processes: forgeProcesses };
+        : { name: background ? "forge-background" : "forge", processes: forgeProcesses };
     yield* Effect.annotateCurrentSpan("vcs.pool", pool.name);
     // Time waiting for a slot, keyed and pooled, summed over retries; a retry times only its own wait.
     let permitWaitMs = 0;
@@ -558,9 +568,11 @@ export const makeWith = Effect.fn("VcsProcess.makeWith")(function* (pools: VcsPr
         }),
       );
     }
-    return yield* input.concurrency === undefined
-      ? bounded
-      : keyedPermit(input.concurrency)(bounded);
+    const keyed =
+      input.concurrency === undefined ? bounded : keyedPermit(input.concurrency)(bounded);
+    // Background forge calls first take one of their own, fewer, permits, before any keyed or
+    // forge permit, so one waiting for it holds nothing another call needs.
+    return yield* background ? backgroundForgeProcesses.withPermits(1)(keyed) : keyed;
   });
 
   return VcsProcess.of({ run });

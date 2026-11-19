@@ -108,7 +108,7 @@ const result = (
   created_at: "2026-10-31T21:00:00.000Z",
   identity: {
     server_sha: scale === 1 ? BASE_SHA : "9fc90220c0000000000000000000000000000000",
-    server_ref: scale === 1 ? "main" : "perf/change-a",
+    server_ref: scale === 1 ? "main" : "candidate",
     server_dirty: false,
     server_version: "t3 0.1.6",
     base_sha: BASE_SHA,
@@ -149,7 +149,7 @@ const before = result("perf-base", 1, {
     max: { cpu: { main: { user_pct: 22 } } },
   },
 });
-const after = result("change-a", 0.5);
+const after = result("candidate", 0.5);
 
 const line = (markdown: string, label: string) =>
   markdown.split("\n").find((row) => row.startsWith(`| ${label} |`));

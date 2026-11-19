@@ -128,7 +128,7 @@ it.layer(NodeServices.layer)("service preflight database", (it) => {
     }),
   );
 
-  it.effect("passes the fork's release candidate 1 rows and blocks a newer fork migration", () =>
+  it.effect("passes the first fork builds' rows and blocks a newer fork migration", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -139,7 +139,7 @@ it.layer(NodeServices.layer)("service preflight database", (it) => {
       const db = new NodeSqlite.DatabaseSync(databasePath);
       db.exec("CREATE TABLE effect_sql_migrations (migration_id INTEGER PRIMARY KEY, name TEXT)");
       const insert = db.prepare("INSERT INTO effect_sql_migrations VALUES (?, ?)");
-      // Release candidate 1: upstream's chain through 76, then the fork's at 77 and 78.
+      // The first fork builds: upstream's chain through 76, then the fork's at 77 and 78.
       for (const [id, name] of migrationManifest) if (id <= 76) insert.run(id, name);
       insert.run(77, "ProjectionTurnItemCounts");
       insert.run(78, "TurnItemMessageOrdinalIndex");
@@ -162,6 +162,50 @@ it.layer(NodeServices.layer)("service preflight database", (it) => {
       expect(result.status === "blocked" ? result.reason : "").toContain(
         `${PERF_FORK_MIGRATIONS_TABLE}:${PERF_FORK_MIGRATION_HEAD + 1}_FromNewerFork`,
       );
+    }),
+  );
+  // A fork id recorded without an earlier one, or a different fork migration under a known id, is
+  // history this build's chain would silently skip past: block it like a newer build's.
+  it.effect.each([
+    {
+      ledger: "a gap below its highest id",
+      rows: [[2, "TurnItemMessageOrdinalIndex"]] as const,
+      named: `${PERF_FORK_MIGRATIONS_TABLE}:1_ProjectionTurnItemCounts`,
+    },
+    {
+      ledger: "a different migration under a known id",
+      rows: [
+        [1, "ProjectionTurnItemCounts"],
+        [2, "FromOtherBranch"],
+      ] as const,
+      named: `${PERF_FORK_MIGRATIONS_TABLE}:2_FromOtherBranch`,
+    },
+  ])("blocks a fork ledger with $ledger", ({ rows, named }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const databasePath = path.join(
+        yield* fs.makeTempDirectoryScoped({ prefix: "t3-preflight-" }),
+        "state.sqlite",
+      );
+      const db = new NodeSqlite.DatabaseSync(databasePath);
+      db.exec("CREATE TABLE effect_sql_migrations (migration_id INTEGER PRIMARY KEY, name TEXT)");
+      const insert = db.prepare("INSERT INTO effect_sql_migrations VALUES (?, ?)");
+      for (const [id, name] of migrationManifest) insert.run(id, name);
+      db.exec(
+        `CREATE TABLE ${PERF_FORK_MIGRATIONS_TABLE} (migration_id INTEGER PRIMARY KEY, name TEXT)`,
+      );
+      const insertFork = db.prepare(`INSERT INTO ${PERF_FORK_MIGRATIONS_TABLE} VALUES (?, ?)`);
+      for (const [id, name] of rows) insertFork.run(id, name);
+      db.close();
+
+      const result = runServicePreflight({
+        databasePath,
+        launcherProtocol: SERVICE_LAUNCHER_PROTOCOL,
+      });
+
+      expect(result.status).toBe("blocked");
+      expect(result.status === "blocked" ? result.reason : "").toContain(named);
     }),
   );
 });

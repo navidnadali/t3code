@@ -5,8 +5,10 @@ import {
   latestProviderTurnForAttempt,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ContextHandoff,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2TurnItem,
@@ -69,9 +71,9 @@ import * as CheckpointService from "./CheckpointService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import {
-  isRestartNoteContinuation,
-  pendingRestartCancelledBackgroundWork,
+  planRestartNote,
   restartCancelledBackgroundWorkNote,
+  turnStartIndex,
 } from "./RestartBackgroundNote.ts";
 
 export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStartError>()(
@@ -91,6 +93,53 @@ const NON_COMPLETING_TERMINAL_RUN_STATUSES: ReadonlySet<OrchestrationV2Run["stat
   "cancelled",
   "rolled_back",
 ]);
+
+/**
+ * Running provider turns on the provider thread whose earlier runs ended without completing, with
+ * those runs. Every attempt of such a run owns a possible abandoned turn, including attempts a
+ * steering restart superseded.
+ */
+export function abandonedProviderTurns(
+  projection: {
+    readonly runs: ReadonlyArray<OrchestrationV2Run>;
+    readonly attempts: ReadonlyArray<Pick<OrchestrationV2RunAttempt, "id" | "runId">>;
+    readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
+  },
+  run: Pick<OrchestrationV2Run, "ordinal">,
+  providerThreadId: OrchestrationV2ProviderThread["id"],
+  // Each run's attempts in projection order, gathered once: a thread can hold tens of thousands.
+  index: ReturnType<typeof turnStartIndex> = turnStartIndex(
+    projection.runs,
+    projection.providerTurns,
+    projection.attempts,
+  ),
+): ReadonlyArray<{ readonly turn: OrchestrationV2ProviderTurn; readonly run: OrchestrationV2Run }> {
+  // Only a running turn on the provider thread can be abandoned; most starts find none.
+  const running = projection.providerTurns.filter(
+    (turn) => turn.providerThreadId === providerThreadId && turn.status === "running",
+  );
+  if (running.length === 0) return [];
+  const abandonedRuns = new Map<string | null, OrchestrationV2Run>();
+  for (const previous of projection.runs) {
+    if (
+      previous.ordinal >= run.ordinal ||
+      previous.providerThreadId !== providerThreadId ||
+      !NON_COMPLETING_TERMINAL_RUN_STATUSES.has(previous.status)
+    ) {
+      continue;
+    }
+    if (previous.activeAttemptId !== null) {
+      abandonedRuns.set(previous.activeAttemptId, previous);
+    }
+    for (const attempt of index.attemptsOf(previous.id)) {
+      abandonedRuns.set(attempt.id, previous);
+    }
+  }
+  return running.flatMap((turn) => {
+    const previous = abandonedRuns.get(turn.runAttemptId);
+    return previous === undefined ? [] : [{ turn, run: previous }];
+  });
+}
 
 export const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 const isProviderAdapterProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
@@ -716,33 +765,15 @@ export const layer: Layer.Layer<
         (candidate) => candidate.id === providerSessionId,
       );
       // A run that ended without completing can leave its provider turn projected as
-      // running when the agent ignored Stop or an interrupt timed out. Every attempt
-      // of such a run owns a possible abandoned turn, including attempts a steering
-      // restart superseded, and the session cannot be reused until those turns stop.
-      const abandonedRuns = new Map<string | null, OrchestrationV2Run>();
-      for (const previous of projection.runs) {
-        if (
-          previous.ordinal >= run.ordinal ||
-          previous.providerThreadId !== providerThread.id ||
-          !NON_COMPLETING_TERMINAL_RUN_STATUSES.has(previous.status)
-        ) {
-          continue;
-        }
-        if (previous.activeAttemptId !== null) {
-          abandonedRuns.set(previous.activeAttemptId, previous);
-        }
-        for (const attempt of projection.attempts) {
-          if (attempt.runId === previous.id) abandonedRuns.set(attempt.id, previous);
-        }
-      }
-      const abandonedTurns = projection.providerTurns.flatMap((turn) => {
-        const previous = abandonedRuns.get(turn.runAttemptId);
-        return turn.providerThreadId === providerThread.id &&
-          turn.status === "running" &&
-          previous !== undefined
-          ? [{ turn, run: previous }]
-          : [];
-      });
+      // running when the agent ignored Stop or an interrupt timed out; the session
+      // cannot be reused until those turns stop.
+      // One set of lookups over the projection for all of the start's planning.
+      const planning = turnStartIndex(
+        projection.runs,
+        projection.providerTurns,
+        projection.attempts,
+      );
+      const abandonedTurns = abandonedProviderTurns(projection, run, providerThread.id, planning);
       const abandonedTurn = abandonedTurns.at(-1)?.turn;
       if (abandonedTurn !== undefined) {
         const liveSession = yield* providerSessions.get(providerSessionId);
@@ -899,27 +930,39 @@ export const layer: Layer.Layer<
         session.providerSession.capabilities.turns.supportsNativeGoals === true;
       const goalCommand = goalDriver && parseGoalCommand(providerMessage) !== null;
       // The provider turn marks cancellation work delivered; restart continuations use their own text or resume natively.
-      const noteContinuation = isRestartNoteContinuation(
-        run,
-        projection.runs,
-        projection.providerTurns,
-        projection.attempts,
+      const restartNotes = planRestartNote(
+        {
+          runs: projection.runs,
+          providerTurns: projection.providerTurns,
+          run,
+          attempts: projection.attempts,
+        },
+        planning,
       );
-      const restartCancelledWork = pendingRestartCancelledBackgroundWork({
-        runs: projection.runs,
-        providerTurns: projection.providerTurns,
-        compactionMessageIds: new Set(
-          projection.messages
-            .filter(
-              (candidate) =>
-                isCompactionCommandMessage(candidate) ||
-                (goalDriver && parseGoalCommand(candidate) !== null),
-            )
-            .map((candidate) => candidate.id),
-        ),
-        run,
-        attempts: projection.attempts,
-      });
+      const noteContinuation = restartNotes.isContinuation(run);
+      const isRestartNoteCompaction = (candidate: OrchestrationV2ConversationMessage) =>
+        isCompactionCommandMessage(candidate) ||
+        (goalDriver && parseGoalCommand(candidate) !== null);
+      const compactionMessageIds = new Set(
+        projection.messages.filter(isRestartNoteCompaction).map((candidate) => candidate.id),
+      );
+      for (const candidate of restartNotes.compactionCandidates()) {
+        const read = projection.messages.find((message) => message.id === candidate.userMessageId);
+        // A message the context did not read by key counts only as a user's, as its text match did.
+        const message =
+          read ??
+          (yield* projectionStore.getMessagesById(projection.thread.id, [
+            candidate.userMessageId,
+          ])).get(candidate.userMessageId);
+        if (
+          message === undefined ||
+          (read === undefined && message.role !== "user") ||
+          !isRestartNoteCompaction(message)
+        )
+          break;
+        compactionMessageIds.add(message.id);
+      }
+      const restartCancelledWork = restartNotes.pending(compactionMessageIds);
       const restartNote =
         restartCancelledWork.length === 0
           ? ""

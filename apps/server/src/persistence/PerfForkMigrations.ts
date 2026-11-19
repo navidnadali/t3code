@@ -5,6 +5,11 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import Migration0001 from "./PerfForkMigrations/001_ProjectionTurnItemCounts.ts";
 import Migration0002 from "./PerfForkMigrations/002_TurnItemMessageOrdinalIndex.ts";
+import Migration0003, {
+  THREAD_ITEM_TOTALS,
+  THREAD_ITEM_TOTALS_TRIGGERS,
+} from "./PerfForkMigrations/003_ThreadItemTotals.ts";
+import * as EventLogPruneState from "./PerfForkMigrations/EventLogPruneState.ts";
 
 /**
  * The performance fork's schema changes run as a chain of their own, recorded in this table, so
@@ -29,25 +34,99 @@ const perfForkMigrationEntries = [
   [1, "ProjectionTurnItemCounts", Migration0001, []],
   // Upstream's migration 94 owns the message-ordinal index now.
   [2, "TurnItemMessageOrdinalIndex", Migration0002, []],
-] as const;
+  // The shell's item count starts from these totals instead of summing a thread's runs.
+  [
+    3,
+    "ThreadItemTotals",
+    Migration0003,
+    [
+      ["table", THREAD_ITEM_TOTALS, THREAD_ITEM_TOTALS],
+      ...THREAD_ITEM_TOTALS_TRIGGERS.map(([name, table]) => ["trigger", name, table] as const),
+    ],
+  ],
+  // The event-log compaction's state. Its id is set here only; a renumber is this line.
+  // 4, after the shell's ThreadItemTotals (3) in ship order.
+  [
+    4,
+    EventLogPruneState.NAME,
+    EventLogPruneState.default,
+    [["table", EventLogPruneState.TABLE, EventLogPruneState.TABLE]],
+  ],
+] as const satisfies ReadonlyArray<
+  readonly [
+    number,
+    string,
+    Effect.Effect<void, unknown, SqlClient.SqlClient>,
+    ReadonlyArray<PerfForkObject>,
+  ]
+>;
 
-export const PERF_FORK_MIGRATION_HEAD = Math.max(...perfForkMigrationEntries.map(([id]) => id));
+export const PERF_FORK_MIGRATION_IDS: ReadonlyArray<number> = perfForkMigrationEntries.map(
+  ([id]) => id,
+);
+
+/** The chain this build ships, [id, name] in order: what a fresh database runs. */
+export const PERF_FORK_MIGRATIONS: ReadonlyArray<readonly [number, string]> =
+  perfForkMigrationEntries.map(([id, name]) => [id, name] as const);
+
+export const PERF_FORK_MIGRATION_HEAD = Math.max(...PERF_FORK_MIGRATION_IDS);
 
 /** How logs, reports and the service preflight name a migration of this chain. */
 export const perfForkMigrationLabel = ([id, name]: readonly [number, string]) =>
   `${PERF_FORK_MIGRATIONS_TABLE}:${id}_${name}`;
 
-// Release candidate 1 recorded the chain in upstream's ledger: [ledger id, name, chain id].
-const RC1_LEDGER_ROWS = [
+/**
+ * The migrator runs only the ids above the highest one a database recorded, so the chain must run
+ * 1, 2, ..., N in order: an id out of order is a migration some database never runs.
+ */
+export const perfForkChainProblems = (ids: ReadonlyArray<number>): ReadonlyArray<string> =>
+  ids.flatMap((id, index) =>
+    id === index + 1 ? [] : [`fork migration ${id} is listed where ${index + 1} belongs`],
+  );
+
+/**
+ * What a database's fork ledger holds that this build's chain cannot run safely: an id the build
+ * does not know (a newer or another branch's build recorded it), a different migration under an id
+ * it knows, or an id missing below the highest recorded one, which the migrator would never run.
+ */
+export const perfForkLedgerProblems = (
+  recorded: ReadonlyArray<{ readonly id: number; readonly name: string }>,
+  chain: ReadonlyArray<
+    readonly [number, string, ...ReadonlyArray<unknown>]
+  > = perfForkMigrationEntries,
+): ReadonlyArray<string> => {
+  const names = new Map<number, string>(chain.map(([id, name]) => [id, name]));
+  const ids = new Set(recorded.map(({ id }) => id));
+  const highest = Math.max(0, ...ids);
+  const problems: Array<string> = [];
+  for (const { id, name } of recorded) {
+    const expected = names.get(id);
+    if (expected === undefined) {
+      problems.push(`${perfForkMigrationLabel([id, name])} (unknown to this build)`);
+    } else if (expected !== name) {
+      problems.push(`${perfForkMigrationLabel([id, name])} (this build: ${expected})`);
+    }
+  }
+  for (let id = 1; id < highest; id++) {
+    if (ids.has(id)) continue;
+    problems.push(
+      `${perfForkMigrationLabel([id, names.get(id) ?? "unknown"])} (never recorded, below ${highest})`,
+    );
+  }
+  return problems;
+};
+
+// The fork's first builds recorded the chain in upstream's ledger: [ledger id, name, chain id].
+const LEGACY_LEDGER_ROWS = [
   [77, "ProjectionTurnItemCounts", 1],
   [78, "TurnItemMessageOrdinalIndex", 2],
 ] as const;
 
-export const isRc1PerfForkMigration = (row: { readonly id: number; readonly name: string }) =>
-  RC1_LEDGER_ROWS.some(([id, name]) => row.id === id && row.name === name);
+export const isLegacyPerfForkMigration = (row: { readonly id: number; readonly name: string }) =>
+  LEGACY_LEDGER_ROWS.some(([id, name]) => row.id === id && row.name === name);
 
 // Untraced helpers below run inside their caller's span.
-const rc1LedgerRows = Effect.fnUntraced(function* () {
+const legacyLedgerRows = Effect.fnUntraced(function* () {
   const sql = yield* SqlClient.SqlClient;
   const upstreamLedger = yield* sql`
     SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'
@@ -55,9 +134,9 @@ const rc1LedgerRows = Effect.fnUntraced(function* () {
   if (upstreamLedger.length === 0) return [];
   const rows = yield* sql<{ readonly migration_id: number; readonly name: string }>`
     SELECT migration_id, name FROM effect_sql_migrations
-    WHERE migration_id IN ${sql.in(RC1_LEDGER_ROWS.map(([id]) => id))}
+    WHERE migration_id IN ${sql.in(LEGACY_LEDGER_ROWS.map(([id]) => id))}
   `;
-  return RC1_LEDGER_ROWS.filter(([id, name]) =>
+  return LEGACY_LEDGER_ROWS.filter(([id, name]) =>
     rows.some((row) => row.migration_id === id && row.name === name),
   );
 });
@@ -70,18 +149,55 @@ const createLedger = (sql: SqlClient.SqlClient) =>
   name VARCHAR(255) NOT NULL
 )`;
 
+const ledgerRefusal = (problems: ReadonlyArray<string>) =>
+  new Migrator.MigrationError({
+    kind: "Failed",
+    message: `This database's performance fork migration history cannot be run by this build: ${problems.join(", ")}. Start the build that recorded it, or apply that build's documented down step first.`,
+  });
+
+const recordedForkLedger = Effect.fnUntraced(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const ledger = yield* sql`
+    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ${PERF_FORK_MIGRATIONS_TABLE}
+  `;
+  if (ledger.length === 0) return [];
+  return (yield* sql<{ readonly migration_id: number; readonly name: string }>`
+    SELECT migration_id, name FROM ${sql(PERF_FORK_MIGRATIONS_TABLE)}
+  `).map((row) => ({ id: row.migration_id, name: row.name }));
+});
+
 /**
- * Moves release candidate 1's rows from upstream's ledger into this chain's, keeping when they
+ * Refuses a fork ledger this build cannot run before a start writes anything: the first fork
+ * builds' move, upstream's chain and the fork's. The first fork builds' rows count as the fork ids the
+ * move would record (it records one only after every earlier id).
+ */
+export const assertPerfForkLedgerRunnable = Effect.fn("assertPerfForkLedgerRunnable")(function* () {
+  const recorded = yield* recordedForkLedger();
+  const ids = new Set(recorded.map(({ id }) => id));
+  const moving: Array<{ readonly id: number; readonly name: string }> = [];
+  for (const [, name, id] of yield* legacyLedgerRows()) {
+    if (ids.has(id)) continue;
+    if (perfForkMigrationEntries.every(([earlier]) => earlier >= id || ids.has(earlier))) {
+      moving.push({ id, name });
+      ids.add(id);
+    }
+  }
+  const problems = perfForkLedgerProblems([...recorded, ...moving]);
+  if (problems.length > 0) return yield* ledgerRefusal(problems);
+});
+
+/**
+ * Moves the first fork builds' rows from upstream's ledger into this chain's, keeping when they
  * ran, so those migrations do not run again. A row recorded without every earlier migration of
  * the chain is dropped instead: the migrator would skip those; the bodies are safe to run again.
  */
-export const moveRc1PerfForkMigrations = Effect.fn("moveRc1PerfForkMigrations")(function* () {
+export const moveLegacyPerfForkMigrations = Effect.fn("moveLegacyPerfForkMigrations")(function* () {
   const sql = yield* SqlClient.SqlClient;
   // Checked before the write lock too: a current database's start must not take it.
-  if ((yield* rc1LedgerRows()).length === 0) return;
+  if ((yield* legacyLedgerRows()).length === 0) return;
   yield* sql.withTransaction(
     Effect.gen(function* () {
-      const found = yield* rc1LedgerRows();
+      const found = yield* legacyLedgerRows();
       if (found.length === 0) return;
       yield* createLedger(sql);
       const recorded = new Set(
@@ -197,13 +313,13 @@ const unrecordedEntries = Effect.fnUntraced(function* (throughId: number | undef
 });
 
 /**
- * Whether a start's fork chain writes anything: release candidate 1's rows to move, migrations to
+ * Whether a start's fork chain writes anything: the first fork builds' rows to move, migrations to
  * run, or a recorded migration's objects to restore. A few small reads, cheap on every start.
  */
 export const hasPendingPerfForkMigrations = Effect.fn("hasPendingPerfForkMigrations")(function* (
   throughId?: number,
 ) {
-  if ((yield* rc1LedgerRows()).length > 0) return true;
+  if ((yield* legacyLedgerRows()).length > 0) return true;
   const { recorded, unrecorded } = yield* unrecordedEntries(throughId);
   if (unrecorded.length > 0) return true;
   for (const [id, name, , objects] of chainEntries(throughId)) {
@@ -220,7 +336,13 @@ export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function
 ) {
   const entries = chainEntries(throughId);
   if (entries.length === 0) return [];
-  const { unrecorded } = yield* unrecordedEntries(throughId);
+  const { recorded: ledgerRows, unrecorded } = yield* unrecordedEntries(throughId);
+  // Refuse before anything runs: the migrator would skip a gap for good, and a build must not run
+  // on a fork migration it does not know (a newer build, or another branch under the same id).
+  const problems = perfForkLedgerProblems(
+    ledgerRows.map((row) => ({ id: row.migration_id, name: row.name })),
+  );
+  if (problems.length > 0) return yield* ledgerRefusal(problems);
   if (unrecorded.length > 0) {
     yield* Effect.log(DATABASE_MIGRATION_PROGRESS_MESSAGE).pipe(
       Effect.annotateLogs({
@@ -295,17 +417,5 @@ export const runPerfForkMigrations = Effect.fn("runPerfForkMigrations")(function
       );
   }
 
-  const names = new Map<number, string>(perfForkMigrationEntries.map(([id, name]) => [id, name]));
-  const divergent = recorded.flatMap((row) => {
-    const expected = names.get(row.migration_id);
-    const label = perfForkMigrationLabel([row.migration_id, row.name]);
-    if (expected === undefined) return [`${label} (unknown to this build)`];
-    return expected === row.name ? [] : [`${label} (this build: ${expected})`];
-  });
-  if (divergent.length > 0) {
-    yield* Effect.logWarning(
-      "Performance fork migration history diverges from this build; recorded migration ids are skipped, not reconciled by name.",
-    ).pipe(Effect.annotateLogs({ divergent }));
-  }
   return executed;
 });

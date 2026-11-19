@@ -2125,7 +2125,7 @@ export const layer: Layer.Layer<
         let rootTerminalQueued = false;
         let stopRecheckDue = false;
         // Ingestion refills the mailbox only once everything it handed over is ingested, taking all
-        // the subscription queued meanwhile, so a backlog's superseded text snapshots never commit.
+        // the subscription queued meanwhile, so a backlog's superseded item snapshots never commit.
         const mailboxEvents = Stream.unwrap(
           Effect.map(Stream.toPull(eventSubscription.events), (pullQueued) =>
             Stream.fromPull(
@@ -2161,8 +2161,10 @@ export const layer: Layer.Layer<
                       if (
                         queued.type === "turn.terminal" &&
                         queued.providerThreadId === routeIdentity.providerThreadId
-                      )
+                      ) {
                         rootTerminalQueued = true;
+                        mailbox.rootTerminalQueued();
+                      }
                       // A coalesced snapshot is never processed, so it releases its count here.
                       const replaced = mailbox.offer(queued);
                       if (replaced !== undefined && queuedOwnershipChanges.delete(replaced))

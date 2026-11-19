@@ -73,7 +73,7 @@ const sanitiseCommand = Command.make(
     }),
 ).pipe(
   Command.withDescription(
-    "Copy a T3 database with VACUUM INTO and run the server's migrations; keep every thread. Clear credentials, links and queued work (sessions, pairing, peer links, provider runtime, scheduled tasks, outbox, launch workflows, webhook requests, pull request state); do the start-up work in place (the server's v1 import and restart recovery, pending deliveries settled, auto-pull, auto-settle, pull request links, snoozes and usage-limit recovery off); compact the event store; blank every string outside the allowlist (see fixture.md); compact; and check the content, the extended rules, the raw bytes and the start-up work.",
+    "Copy a T3 database with VACUUM INTO and run the server's migrations; keep every thread. Clear credentials, links and queued work (sessions, pairing, peer links, provider runtime, scheduled tasks, outbox, launch workflows, webhook requests, pull request state); do the start-up work in place (the server's v1 import and restart recovery, pending deliveries settled, auto-pull, auto-settle, pull request links, snoozes and usage-limit recovery off); compact the event store; blank every string outside the allowlist (see fixture.md); compact; and check the content, the reference sanitiser's extended rules, the raw bytes and the start-up work.",
   ),
 );
 
@@ -201,7 +201,7 @@ const scanCommand = Command.make(
     }),
 ).pipe(
   Command.withDescription(
-    "Check a fixture: every value allowlisted or filler, credential patterns in decoded content and in the raw file, the extended check, credential-named columns, and work a server would run on start.",
+    "Check a fixture: every value allowlisted or filler, credential patterns in decoded content and in the raw file, the reference sanitiser's extended check, credential-named columns, and work a server would run on start.",
   ),
 );
 

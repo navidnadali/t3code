@@ -10702,7 +10702,7 @@ const crossThreadAutoSend = (threadId: ThreadId, name: string) => ({
 });
 
 /**
- * The shape: a notice continuation runs before its provider turn reports running, a
+ * The shape a running server shows: a notice continuation runs before its provider turn reports running, a
  * cross-thread message sent then is deferred into it, and the turn's running report promotes it.
  * A delegated lane's continuation carries its task. Returns the continuation's turn input.
  */
@@ -10860,7 +10860,7 @@ it.effect.each([
             yield* settleTurn(threadId, 1);
             yield* Fiber.join(followUpStarting);
             if (backgroundWork) {
-              // The roster this work leaves behind is the background roster's; here it only must not hold the
+              // The roster this work leaves behind is another test's subject; here it only must not hold the
               // follow-up back or deliver it twice.
               yield* Queue.offer(harness.events, {
                 type: "provider_thread.updated",

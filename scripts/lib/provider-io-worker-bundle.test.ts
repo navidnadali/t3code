@@ -65,18 +65,15 @@ it.effect("embeds a worker that loads only built-ins", () =>
 
 it.effect("rejects a worker whose dynamic import does not resolve", () =>
   Effect.gen(function* () {
-    assert.include(
-      yield* rejection('void import("fork-guard-not-a-package");\n'),
-      "fork-guard-not-a-package",
-    );
+    assert.include(yield* rejection('void import("t3-not-a-package");\n'), "t3-not-a-package");
   }),
 );
 
 it.effect("rejects a worker whose static import does not resolve", () =>
   Effect.gen(function* () {
     assert.include(
-      yield* rejection('import * as Missing from "fork-guard-not-a-package";\nconsole.log(Missing);\n'),
-      "fork-guard-not-a-package",
+      yield* rejection('import * as Missing from "t3-not-a-package";\nconsole.log(Missing);\n'),
+      "t3-not-a-package",
     );
   }),
 );
@@ -209,11 +206,11 @@ it.effect("refuses every route by which bundled code could load code from outsid
         "  () => viaModule(globalModule(), planted),\n" +
         "  () => {\n" +
         "    globalModule().registerHooks({\n" +
-        '      resolve: (specifier: string, context: unknown, next: any) => specifier === "fork-guard-hooked"\n' +
+        '      resolve: (specifier: string, context: unknown, next: any) => specifier === "t3-test-hooked"\n' +
         '        ? { url: NodeURL.pathToFileURL(dir + "/planted.mjs").href, shortCircuit: true }\n' +
         "        : next(specifier, context),\n" +
         "    });\n" +
-        '    return import(name("fork-guard-", "hooked")).then((m: any) => m.default);\n' +
+        '    return import(name("t3-test-", "hooked")).then((m: any) => m.default);\n' +
         "  },\n" +
         '  () => viaModule(code("return mod" + "ule")().constructor, planted),\n' +
         // The node:module the bundle imports exposes no loader.
@@ -231,7 +228,7 @@ it.effect("refuses every route by which bundled code could load code from outsid
         "    session.close();\n" +
         "    Module.registerHooks({\n" +
         "      resolve: (specifier: string, context: unknown, next: any) =>\n" +
-        '        specifier === "fork-guard-repl"\n' +
+        '        specifier === "t3-test-repl"\n' +
         '          ? { url: NodeURL.pathToFileURL(planted).href, format: "commonjs", shortCircuit: true }\n' +
         "          : next(specifier, context),\n" +
         "      load: (url: string, context: unknown, next: any) =>\n" +
@@ -239,7 +236,7 @@ it.effect("refuses every route by which bundled code could load code from outsid
         '          ? { format: "commonjs", source: NodeFS.readFileSync(planted, "utf8"), shortCircuit: true }\n' +
         "          : next(url, context),\n" +
         "    });\n" +
-        '    return import(name("fork-guard-", "repl")).then((m: any) => m.default);\n' +
+        '    return import(name("t3-test-", "repl")).then((m: any) => m.default);\n' +
         "  }),\n" +
         '  () => (process as any).getBuiltinModule(name("re", "pl")).start,\n' +
         '  () => import(name("node:", "inspector")).then((m: any) => m.Session),\n' +
@@ -253,7 +250,7 @@ it.effect("refuses every route by which bundled code could load code from outsid
         // replaces the process, and ffi and sqlite extensions load native code.
         "  guarded(() => process.kill(process.pid, 0)),\n" +
         "  guarded(() => process.kill(0, 0)),\n" +
-        '  guarded(() => (process as any).execve("/nonexistent-fork-guard")),\n' +
+        '  guarded(() => (process as any).execve("/nonexistent-t3-test")),\n' +
         '  () => import(name("node:", "ffi")),\n' +
         '  () => (process as any).getBuiltinModule(name("ff", "i")),\n' +
         '  () => import(name("node:", "sqlite")).then((m: any) => m.DatabaseSync),\n' +

@@ -7,8 +7,8 @@ import type {
 import * as DateTime from "effect/DateTime";
 
 /**
- * On a busy orchestrator visible messages take only a few of an hour's starts, so this rarely
- * binds. Under a visible flood a wake still gets every fifth start.
+ * Visible messages take a few of the starts an hour on a busy orchestrator, so this rarely
+ * binds there. Under a visible flood a wake still gets every fifth start (~15 min at ~3 min a run).
  */
 export const MAX_VISIBLE_STARTS_AHEAD_OF_WAKE = 4;
 

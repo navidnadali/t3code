@@ -779,7 +779,7 @@ const splitAt = (text: string, offsets: ReadonlyArray<number>) => {
   return [0, ...offsets].map((start, index) => all.slice(start, offsets[index] ?? all.length));
 };
 
-it.effect("runs the fork's Codex wire decode in a worker as it runs in-thread", () =>
+it.effect("runs the Codex wire decode in a worker as it runs in-thread", () =>
   withPool({ workers: 1 }, (pool) =>
     Effect.gen(function* () {
       const text =
@@ -825,7 +825,7 @@ it.effect("runs the fork's Codex wire decode in a worker as it runs in-thread", 
   ),
 );
 
-it.effect("runs the fork's ACP wire decode in a worker and encodes on its parser", () =>
+it.effect("runs the ACP wire decode in a worker and encodes on its parser", () =>
   withPool({ workers: 1 }, (pool) =>
     Effect.gen(function* () {
       const text =

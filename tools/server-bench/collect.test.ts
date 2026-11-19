@@ -89,7 +89,7 @@ describe("parseProcStat", () => {
 });
 
 describe("primaryRole", () => {
-  it("uses the checkpoint rule: over 100 MB read, writes 0.8-1.25x reads", () => {
+  it("uses the host sampler's checkpoint rule: over 100 MB read, writes 0.8-1.25x reads", () => {
     const role = (comm: string, rchar: number, wchar: number, tid = 1001) =>
       primaryRole(PID, thread(tid, comm, 20, io(rchar, wchar)));
 
@@ -343,7 +343,7 @@ describe("readTraceWindow", () => {
       ]);
       expect(read.bad_lines).toBe(1);
       expect(summary.spans).toBe(101);
-      // A fixed sample with known answers: these definitions give these results.
+      // The host sampler's selftest numbers: same definitions, same results.
       expect(summary.sql["sqlite|reader"]).toEqual({
         count: 100,
         errors: 0,

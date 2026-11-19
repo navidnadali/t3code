@@ -33,7 +33,7 @@ export const QUEUED_DELIVERY_PROMOTION_TICK = Duration.seconds(5);
  * minute. Steers a user or agent sends themselves do not count.
  */
 export const QUEUED_DELIVERY_PROMOTION_SPACING = Duration.seconds(60);
-/** One automatic steer carries every due message up to this many (C2's merged-wake bound)... */
+/** One automatic steer carries every due message up to this many (the merged-wake bound)... */
 export const QUEUED_DELIVERY_MERGE_MAX_ITEMS = 25;
 /** ...and this much text; a longer message still goes, alone. The rest go in the next steer. */
 export const QUEUED_DELIVERY_MERGE_MAX_BYTES = 32 * 1024;

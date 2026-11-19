@@ -84,6 +84,192 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
     restore(Effect.provideService(effect, ReadOnly, restore)),
   );
 
+const DeferredWrite = Context.Reference<boolean>("@t3tools/shared/nodeSqliteClient/DeferredWrite", {
+  defaultValue: () => false,
+});
+/**
+ * A withDeferredWrites scope: a carried write of its that fails is kept here until the scope fails, and
+ * the scope's end waits for the replies of statements still carrying its writes.
+ */
+interface DeferredScope {
+  failure?: SqlError;
+  carriers: number;
+  drained: Array<() => void>;
+}
+const DeferredWriteScope = Context.Reference<DeferredScope | undefined>(
+  "@t3tools/shared/nodeSqliteClient/DeferredWriteScope",
+  { defaultValue: () => undefined },
+);
+const FlushDeferredWrites = Context.Reference<boolean>(
+  "@t3tools/shared/nodeSqliteClient/FlushDeferredWrites",
+  { defaultValue: () => false },
+);
+
+/** A statement the writer ran, kept so that its effect can be applied again without the code that issued it. */
+export interface RecordedStatement {
+  readonly sql: string;
+  readonly params: ReadonlyArray<unknown>;
+}
+const StatementRecorder = Context.Reference<Array<RecordedStatement> | undefined>(
+  "@t3tools/shared/nodeSqliteClient/StatementRecorder",
+  { defaultValue: () => undefined },
+);
+// A plain SELECT changes nothing (the client registers no SQL function with side effects).
+const isPlainRead = (sql: string) => /^\s*SELECT\b/i.test(sql);
+
+/**
+ * Runs `effect`, keeping in `into`, in order, each statement it runs on the writer that may change the
+ * database (all but plain SELECTs, its savepoints included), once it succeeded or was queued as a
+ * deferred write. Applied again on the state `effect` started from, they reproduce what it wrote.
+ */
+export const recordStatements =
+  (into: Array<RecordedStatement>) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.provideService(effect, StatementRecorder, into);
+
+// A binding as it was when its statement ran: a caller may reuse a buffer after its write.
+const keptBinding = (value: unknown): unknown =>
+  ArrayBuffer.isView(value)
+    ? new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength))
+    : value instanceof ArrayBuffer
+      ? value.slice(0)
+      : value;
+
+const recordingCache = new WeakMap<Connection, Connection>();
+/** The writer connection, keeping what a recordStatements scope runs on it. */
+const recordingConnection = (connection: Connection): Connection => {
+  const cached = recordingCache.get(connection);
+  if (cached !== undefined) return cached;
+  const kept = <A>(
+    sql: string,
+    params: ReadonlyArray<unknown> | undefined,
+    effect: Effect.Effect<A, SqlError>,
+  ): Effect.Effect<A, SqlError> =>
+    Effect.withFiber((fiber) => {
+      const into = Context.get(fiber.context, StatementRecorder);
+      if (into === undefined || isPlainRead(sql)) return effect;
+      const kept = { sql, params: (params ?? []).map(keptBinding) };
+      return Effect.tap(effect, () =>
+        Effect.sync(() => {
+          into.push(kept);
+        }),
+      );
+    });
+  const recording = identity<Connection>({
+    execute: (sql, params, rowTransform) =>
+      kept(sql, params, connection.execute(sql, params, rowTransform)),
+    executeRaw: (sql, params) => kept(sql, params, connection.executeRaw(sql, params)),
+    executeValues: (sql, params) => kept(sql, params, connection.executeValues(sql, params)),
+    executeValuesUnprepared: (sql, params) =>
+      kept(sql, params, connection.executeValuesUnprepared(sql, params)),
+    executeUnprepared: (sql, params, rowTransform) =>
+      kept(sql, params, connection.executeUnprepared(sql, params, rowTransform)),
+    executeStream: (sql, params, rowTransform) =>
+      connection.executeStream(sql, params, rowTransform),
+  });
+  recordingCache.set(connection, recording);
+  return recording;
+};
+
+const transactionLevel = (sql: Client.SqlClient, operation: string) =>
+  Effect.flatMap(Effect.serviceOption(sql.transactionService), (transaction) =>
+    Option.isNone(transaction)
+      ? Effect.die(new Error(`${operation} runs only inside a transaction`))
+      : Effect.map(Client.activeTransactionConnection(transaction.value), (connection) => ({
+          connection,
+          depth: transaction.value[1],
+        })),
+  );
+
+/**
+ * Runs recorded statements again, in order, on the connection of the transaction the caller holds. Nothing
+ * records them again.
+ */
+export const applyStatements = (
+  sql: Client.SqlClient,
+  statements: ReadonlyArray<RecordedStatement>,
+) =>
+  Effect.flatMap(transactionLevel(sql, "applyStatements"), ({ connection }) =>
+    Effect.forEach(
+      statements,
+      (statement) =>
+        Effect.provideService(
+          connection.executeRaw(statement.sql, statement.params),
+          StatementRecorder,
+          undefined,
+        ),
+      { discard: true },
+    ),
+  );
+
+/** Runs between a restart's ROLLBACK and its BEGIN, when a test injects a competing write there. */
+export const RestartGapProbe = Context.Reference<Effect.Effect<void> | undefined>(
+  "@t3tools/shared/nodeSqliteClient/RestartGapProbe",
+  { defaultValue: () => undefined },
+);
+
+/**
+ * Rolls back the caller's transaction at its top level and begins a new one on the same connection, which
+ * the caller keeps throughout: no other statement of this process reaches the writer in between. If it
+ * cannot begin again, a deferred BEGIN leaves the caller's own ROLLBACK something to end.
+ */
+export const restartTransaction = (sql: Client.SqlClient) =>
+  Effect.flatMap(transactionLevel(sql, "restartTransaction"), ({ connection, depth }) => {
+    if (depth !== 0)
+      return Effect.die(new Error("restartTransaction runs only at a transaction's top level"));
+    const unrecorded = <A>(effect: Effect.Effect<A, SqlError>) =>
+      Effect.provideService(effect, StatementRecorder, undefined);
+    return Effect.withFiber((fiber) =>
+      unrecorded(
+        connection.executeUnprepared("ROLLBACK", [], undefined).pipe(
+          Effect.andThen(Context.get(fiber.context, RestartGapProbe) ?? Effect.void),
+          Effect.andThen(connection.executeUnprepared("BEGIN IMMEDIATE", [], undefined)),
+          Effect.tapError(() =>
+            Effect.ignore(connection.executeUnprepared("BEGIN", [], undefined)),
+          ),
+          Effect.asVoid,
+        ),
+      ),
+    );
+  });
+
+/** Marks a write whose result the caller ignores; inside withDeferredWrites it may share a later round trip. */
+export const deferredWrite = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, DeferredWrite, true);
+
+/**
+ * In a writer-worker transaction, the deferred writes `effect` makes at this transaction level go to the
+ * worker with its next statement that awaits a reply, in order, and the rest before `effect` completes,
+ * so their failures fail `effect`. In transactions it opens, and elsewhere, they run at once.
+ */
+export const withDeferredWrites =
+  (sql: Client.SqlClient) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | SqlError, R> =>
+    Effect.flatMap(Effect.serviceOption(sql.transactionService), (transaction) =>
+      Option.isNone(transaction)
+        ? // Without withTransaction's connection nothing could flush, so nothing waits.
+          effect
+        : Effect.provideService(
+            effect.pipe(
+              Effect.tap(() =>
+                // On the transaction's own connection, below statement tracing; a no-op when nothing waits.
+                Effect.flatMap(
+                  Client.activeTransactionConnection(transaction.value),
+                  (connection) =>
+                    Effect.provideService(
+                      connection.executeUnprepared("SELECT 1", [], undefined),
+                      FlushDeferredWrites,
+                      true,
+                    ),
+                ),
+              ),
+            ),
+            // A token per run: a failure stays with the run that hit it.
+            DeferredWriteScope,
+            { carriers: 0, drained: [] },
+          ),
+    );
+
 /**
  * Permits for reads of a thread's whole history, one fewer than the reader workers (at least one).
  * Such a read holds one from before its transaction until decoded, so this bounds the history row
@@ -274,6 +460,145 @@ class ReaderSlots {
         waiter.wake();
       }
     }, 0);
+  }
+}
+
+type WriterPriority = "foreground" | "background";
+
+const WriterPriorityRef = Context.Reference<WriterPriority>(
+  "@t3tools/shared/nodeSqliteClient/WriterPriority",
+  { defaultValue: () => "foreground" },
+);
+
+/**
+ * Runs `effect`'s writer acquisitions at background priority: each goes after every foreground one
+ * waiting, and a release with no foreground waiter hands the writer to the oldest background one. A
+ * foreground acquisition then waits for at most the one background hold in flight, kept short.
+ */
+export const background = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, WriterPriorityRef, "background");
+
+/** The subset of a semaphore a connection target uses: one permit at a time. */
+interface ConnectionLock {
+  readonly take: (permits: 1) => Effect.Effect<unknown>;
+  readonly release: (permits: 1) => Effect.Effect<unknown>;
+  readonly withPermits: (
+    permits: 1,
+  ) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+}
+
+interface BackgroundWaiter {
+  granted: boolean;
+  wake: (() => void) | undefined;
+}
+
+// How long a background waiter waits before it looks again for an idle writer itself: a
+// foreground holder that took the writer before any background waiter queued releases it without
+// the hand-off below.
+const BACKGROUND_RECHECK_MS = 20;
+
+// Background acquisitions of the writer. Foreground ones use the writer's semaphore exactly as
+// they did before, so their order and scheduling are unchanged; while a background waiter queues,
+// foreground releases end with a hand-off that gives the writer to the oldest background waiter
+// when no foreground acquisition is waiting for it.
+class BackgroundWriter {
+  private readonly waiters = new Set<BackgroundWaiter>();
+  private readonly semaphore: Semaphore.Semaphore;
+  /** Gives the writer to the oldest background waiter if it is free and no foreground one waits. */
+  readonly handOff: Effect.Effect<void>;
+  private readonly release: Effect.Effect<void>;
+  /** Foreground locks used while a background waiter queues: the same semaphore, then the hand-off. */
+  readonly foregroundHandingOff: ConnectionLock;
+  readonly background: ConnectionLock;
+
+  constructor(semaphore: Semaphore.Semaphore) {
+    this.semaphore = semaphore;
+    // Uninterruptible: the take and the grant are one step, or an interrupt between them leaks it.
+    this.handOff = Effect.suspend(() => {
+      const next = this.waiters.values().next().value;
+      if (next === undefined || this.foregroundWaiting()) return Effect.void;
+      return Effect.flatMap(semaphore.takeIfAvailable(1), (taken) =>
+        Effect.withFiber((fiber) => {
+          if (!taken) return Effect.void;
+          // A foreground acquisition that queued meanwhile goes first.
+          if (this.foregroundWaiting() || !this.waiters.delete(next)) return semaphore.release(1);
+          next.granted = true;
+          fiber.currentDispatcher.scheduleTask(() => next.wake?.(), 0);
+          return Effect.void;
+        }),
+      );
+    }).pipe(Effect.uninterruptible);
+    this.release = Effect.andThen(semaphore.release(1), this.handOff);
+    this.foregroundHandingOff = {
+      take: () => semaphore.take(1),
+      release: () => this.release,
+      withPermits: () => (effect) =>
+        Effect.ensuring(semaphore.withPermits(1)(effect), this.handOff),
+    };
+    this.background = {
+      // The caller restores interruption around this and runs it without scheduler yields.
+      take: () => this.acquire(() => Effect.void, identity),
+      release: () => this.release,
+      withPermits: () => (effect) =>
+        Effect.uninterruptibleMask((restore) =>
+          this.acquire(() => Effect.ensuring(restore(effect), this.release), restore),
+        ),
+    };
+  }
+
+  get waiting(): boolean {
+    return this.waiters.size > 0;
+  }
+
+  // Effect's semaphore keeps its queued acquisitions in `waiters` (effect 4.1.3); unknown, it
+  // reads as one waiting so background work never goes ahead of a foreground acquisition.
+  private foregroundWaiting(): boolean {
+    const waiters = (this.semaphore as unknown as { readonly waiters?: { readonly size: number } })
+      .waiters;
+    return waiters === undefined || waiters.size > 0;
+  }
+
+  // Queues, then tries the hand-off itself (an idle writer), and again every BACKGROUND_RECHECK;
+  // only the wait is interruptible, and a waiter handed the writer but interrupted passes it on.
+  private acquire<A, E, R>(
+    onAcquire: () => Effect.Effect<A, E, R>,
+    restore: <X, Y, Z>(effect: Effect.Effect<X, Y, Z>) => Effect.Effect<X, Y, Z>,
+  ): Effect.Effect<A, E, R> {
+    return Effect.suspend(() => {
+      const waiter: BackgroundWaiter = { granted: false, wake: undefined };
+      this.waiters.add(waiter);
+      const granted = Effect.callback<boolean>((resume) => {
+        if (waiter.granted) return resume(Effect.succeed(true));
+        waiter.wake = () => resume(Effect.succeed(true));
+      });
+      // A wall-clock timer: the holder's release is real, whatever clock the caller runs on.
+      const recheck = Effect.callback<boolean>((resume) => {
+        // @effect-diagnostics-next-line globalTimersInEffect:off -- a real release is wall-clock.
+        const timer = setTimeout(() => resume(Effect.succeed(false)), BACKGROUND_RECHECK_MS);
+        return Effect.sync(() => clearTimeout(timer));
+      });
+      const waitOnce = Effect.andThen(
+        this.handOff,
+        Effect.suspend(() =>
+          waiter.granted ? Effect.succeed(true) : Effect.raceFirst(granted, recheck),
+        ),
+      );
+      const wait: Effect.Effect<void> = Effect.flatMap(waitOnce, (done) =>
+        done || waiter.granted ? Effect.void : wait,
+      );
+      return restore(wait).pipe(
+        Effect.onInterrupt(() =>
+          Effect.suspend(() => {
+            if (!waiter.granted) {
+              this.waiters.delete(waiter);
+              return Effect.void;
+            }
+            return this.release;
+          }),
+        ),
+        Effect.andThen(Effect.suspend(onAcquire)),
+      );
+    });
   }
 }
 
@@ -474,11 +799,32 @@ parentPort.on("message", (request) => {
     parentPort.close();
     return;
   }
-  const { id, sql, params, cached, values, raw, safeIntegers, received } = request;
+  const { id, sql, params, cached, values, raw, safeIntegers, received, prelude } = request;
   let operation = "open";
   let iterator;
   try {
     if (db === undefined) throw new Error("database connection is unavailable");
+    if (prelude !== undefined) {
+      operation = "execute";
+      // Deferred writes run first, in order; the statement that carried them reports their failure.
+      for (const [index, deferred] of prelude.entries()) {
+        try {
+          const statement = prepare(deferred.sql, deferred.cached);
+          statement.setReadBigInts(deferred.safeIntegers === true);
+          statement.run(...deferred.params);
+        } catch (error) {
+          statements.delete(deferred.sql);
+          // A COMMIT that cannot run must not leave its transaction open.
+          if (/^\\s*(?:COMMIT|END)\\b/i.test(sql)) {
+            try {
+              db.exec("ROLLBACK");
+            } catch {}
+          }
+          parentPort.postMessage({ id, error: { operation, ...describe(error) }, carried: index });
+          return;
+        }
+      }
+    }
     operation = "prepare";
     const statement = prepare(sql, cached);
     operation = "execute";
@@ -550,6 +896,8 @@ type WorkerReply =
   | {
       readonly id: number;
       readonly error: WorkerFailure & { readonly operation: "open" | "prepare" | "execute" };
+      /** The index of the carried (deferred) statement that failed; the request itself did not run. */
+      readonly carried?: number;
     };
 
 const workerFailureMessages = {
@@ -570,6 +918,40 @@ const failedWith = (
     workerFailureMessages[operation],
     operation,
   );
+
+/** Succeeds once no statement still carries the scope's writes; fails if any of them failed. */
+const carriersSettled = (scope: DeferredScope) =>
+  Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
+    // Checked where the wait registers, in one step: the fiber can yield before this runs,
+    // and a last reply landing in that gap would find no one waiting.
+    const settle = () =>
+      resume(scope.failure === undefined ? Effect.succeed([]) : Effect.fail(scope.failure));
+    if (scope.carriers === 0) settle();
+    else scope.drained.push(settle);
+  });
+
+/**
+ * A waiting write's bindings as of now: buffers are copied, since the caller may reuse them before the
+ * write is sent. Undefined when a value is not one SQLite binds, so the write is sent at once instead.
+ */
+const waitingBindings = (params: ReadonlyArray<unknown>): ReadonlyArray<unknown> | undefined => {
+  const copy: Array<unknown> = [];
+  for (const value of params) {
+    if (
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "bigint"
+    )
+      copy.push(value);
+    else if (ArrayBuffer.isView(value))
+      copy.push(
+        new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)),
+      );
+    else return undefined;
+  }
+  return copy;
+};
 
 // Read-transaction cleanup succeeds after worker exit because it can no longer change anything.
 const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test(sql);
@@ -620,6 +1002,16 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
       announce = resolve;
     });
     let stoppedMessage: string | undefined;
+    // Writer only: inside a transaction this connection began, deferred writes wait here for the next
+    // statement that awaits a reply, which carries them to the worker.
+    let inTransaction = false;
+    let deferred: Array<{
+      readonly sql: string;
+      readonly params: ReadonlyArray<unknown>;
+      readonly cached: boolean;
+      readonly safeIntegers: boolean;
+      readonly scope: DeferredScope | undefined;
+    }> = [];
     const pending = new Map<
       number,
       {
@@ -637,11 +1029,18 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
         readonly safeIntegers: boolean;
         readonly received: Int32Array;
       },
+      carried: typeof deferred = [],
     ) => {
+      const payload =
+        carried.length === 0
+          ? message
+          : { ...message, prelude: carried.map(({ scope: _scope, ...statement }) => statement) };
       try {
         // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
-        worker.postMessage(message);
+        worker.postMessage(payload);
       } catch (cause) {
+        // Statements it carried were never sent: back in the queue, for the next statement or the rollback.
+        if (carried.length > 0) deferred = [...carried, ...deferred];
         const request = pending.get(message.id);
         if (request === undefined) return;
         pending.delete(message.id);
@@ -705,7 +1104,56 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
           ? endsReadTransaction(input.sql)
           : /^\s*ROLLBACK\b/i.test(input.sql);
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
+        let begins = false;
+        const rollsBack = options.role === "writer" && /^\s*ROLLBACK\b/i.test(input.sql);
+        let flushed: DeferredScope | undefined;
+        if (options.role !== "writer" && Context.get(fiber.context, FlushDeferredWrites)) {
+          return Effect.succeed([]);
+        }
+        if (options.role === "writer") {
+          // A scope whose carried write failed fails on its next statement and at its end, even if the
+          // statement that carried the write had its error handled; rollbacks always go through.
+          const scope = Context.get(fiber.context, DeferredWriteScope);
+          if (scope?.failure !== undefined && !/^\s*ROLLBACK\b/i.test(input.sql)) {
+            return Effect.fail(scope.failure);
+          }
+          if (Context.get(fiber.context, FlushDeferredWrites)) {
+            // Statements may still carry this scope's writes: their replies decide, after the
+            // flush has carried whatever still waits here.
+            if (scope === undefined) return Effect.succeed([]);
+            if (deferred.length === 0) return carriersSettled(scope);
+            flushed = scope;
+          }
+          // Only values SQLite binds wait: anything else posts with the statement and fails on its own.
+          const bindings =
+            inTransaction &&
+            stoppedMessage === undefined &&
+            scope !== undefined &&
+            !input.raw &&
+            Context.get(fiber.context, DeferredWrite)
+              ? waitingBindings(input.params)
+              : undefined;
+          if (bindings !== undefined) {
+            deferred.push({
+              sql: input.sql,
+              params: bindings,
+              cached: input.cached && !hasLargeBinding(input.params),
+              safeIntegers,
+              scope,
+            });
+            return Effect.succeed([]);
+          }
+          if (/^\s*(?:COMMIT|END)\b|^\s*ROLLBACK\s*(?:TRANSACTION\s*)?;?\s*$/i.test(input.sql)) {
+            inTransaction = false;
+          }
+          begins = /^\s*BEGIN\b/i.test(input.sql);
+        }
         const reply = Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
+          // A rollback discards what waits (a SAVEPOINT carries what waited before it); if it fails,
+          // it undid nothing, so those writes' scopes wait for its reply and fail with its error.
+          // Taken in the step that counts those scopes: a scope never finds its writes in neither.
+          const discarded = rollsBack ? deferred : [];
+          if (rollsBack) deferred = [];
           // The fiber can yield between building this effect and running it, so the worker's
           // state is read here, in the same synchronous step as the post: a worker that stopped
           // in that gap must fail the statement rather than never answer it.
@@ -719,24 +1167,50 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
           }
           const id = nextRequestId++;
           const received = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+          const prelude = deferred;
+          if (prelude.length > 0) deferred = [];
+          // Each scope whose writes this statement carries or discards waits for its reply before it can end.
+          const carrying = new Set<DeferredScope>();
+          for (const statement of [...prelude, ...discarded])
+            if (statement.scope !== undefined) carrying.add(statement.scope);
+          for (const carried of carrying) carried.carriers += 1;
           pending.set(id, {
             endsTransaction,
             received,
             rows: [],
-            resume: (reply) =>
+            resume: (reply) => {
+              if (begins && "rows" in reply) inTransaction = true;
+              // The failed carried write and the ones after it never ran, and a failed rollback's
+              // discarded writes never will: their scopes fail.
+              if ("error" in reply) {
+                const failure = failedWith(reply.error, reply.error.operation);
+                const lost = [
+                  ...(reply.carried === undefined ? [] : prelude.slice(reply.carried)),
+                  ...discarded,
+                ];
+                for (const statement of lost) {
+                  if (statement.scope !== undefined) statement.scope.failure ??= failure;
+                }
+              }
+              for (const carried of carrying) {
+                carried.carriers -= 1;
+                if (carried.carriers === 0) for (const done of carried.drained.splice(0)) done();
+              }
               resume(
                 "rows" in reply
                   ? Effect.succeed(reply.rows)
                   : Effect.fail(failedWith(reply.error, reply.error.operation)),
-              ),
+              );
+            },
           });
           if (pending.size === 1) worker.ref();
           const cached = input.cached && !hasLargeBinding(input.params);
-          send({ id, safeIntegers, ...input, cached, received });
+          send({ id, safeIntegers, ...input, cached, received }, prelude);
         });
         // A posted write runs to the end, as it did on the event loop; the caller and its lock
         // must not move on while the worker is still applying it. Reads stay cancellable.
-        return options.role === "writer" ? Effect.uninterruptible(reply) : reply;
+        const posted = options.role === "writer" ? Effect.uninterruptible(reply) : reply;
+        return flushed === undefined ? posted : Effect.andThen(posted, carriersSettled(flushed));
       });
 
     const connection = identity<Connection>({
@@ -1195,8 +1669,13 @@ const make = Effect.fn("makeWithDatabase")(function* (
         );
       },
       executeUnprepared(sql, params, rowTransform) {
-        const effect = prepare(sql).pipe(
-          Effect.flatMap((statement) => runStatement(statement, params ?? [])),
+        // Nothing waits on this connection, so a deferring scope's flush has nothing to send.
+        const effect = Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) =>
+          Context.get(fiber.context, FlushDeferredWrites)
+            ? Effect.succeed([])
+            : prepare(sql).pipe(
+                Effect.flatMap((statement) => runStatement(statement, params ?? [])),
+              ),
         );
         return rowTransform ? Effect.map(effect, rowTransform) : effect;
       },
@@ -1207,17 +1686,21 @@ const make = Effect.fn("makeWithDatabase")(function* (
   });
 
   const semaphore = yield* Semaphore.make(1);
+  const backgroundWriter = new BackgroundWriter(semaphore);
   const writerWorker = options.writerWorker === true && isFileDatabase;
   let checkpointAfterWrite: (() => void) | undefined;
-  const writerConnection: Effect.Effect<Connection, SqlError> = writerWorker
-    ? yield* makeWorkerConnection({
-        filename: options.filename,
-        role: "writer",
-        readOnly: options.readonly ?? false,
-        pragmas: writerPragmas,
-        onReply: () => checkpointAfterWrite?.(),
-      })
-    : Effect.succeed(yield* makeConnection);
+  const writerConnection: Effect.Effect<Connection, SqlError> = Effect.map(
+    writerWorker
+      ? yield* makeWorkerConnection({
+          filename: options.filename,
+          role: "writer",
+          readOnly: options.readonly ?? false,
+          pragmas: writerPragmas,
+          onReply: () => checkpointAfterWrite?.(),
+        })
+      : Effect.succeed(yield* makeConnection),
+    recordingConnection,
+  );
   // Opening now fails the layer for a file that is not a database, not its first query.
   const opened = yield* writerConnection;
   // Started after the writer, so it stops first and the writer's close can checkpoint.
@@ -1252,14 +1735,24 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
   interface Target {
     readonly name: Acquired["connection"];
-    readonly lock: Semaphore.Semaphore;
+    readonly lock: ConnectionLock;
+    readonly background: boolean;
     readonly connection: Connection;
   }
-  const writer = Effect.map(writerConnection, (connection): Target => ({
-    name: "writer",
-    lock: semaphore,
-    connection,
-  }));
+  // Foreground acquisitions take the semaphore itself unless a background waiter queues.
+  const writerLock = (priority: WriterPriority): ConnectionLock =>
+    priority === "background"
+      ? backgroundWriter.background
+      : backgroundWriter.waiting
+        ? backgroundWriter.foregroundHandingOff
+        : semaphore;
+  const writer = (priority: WriterPriority) =>
+    Effect.map(writerConnection, (connection): Target => ({
+      name: "writer",
+      lock: writerLock(priority),
+      background: priority === "background",
+      connection,
+    }));
   let activeWriter: ConnectionOwner | undefined;
   // Callers must run route uninterruptibly and pass `claimed` a finalizer that runs `release` once.
   // Waits use the caller's `restore`, not readOnly's, which may have been captured outside a mask.
@@ -1268,8 +1761,9 @@ const make = Effect.fn("makeWithDatabase")(function* (
     restore: typeof Effect.interruptible,
   ) =>
     Effect.withFiber((fiber): Effect.Effect<Target, SqlError> => {
+      const priority = Context.get(fiber.context, WriterPriorityRef);
       if (readers.length === 0 || readerPool.unavailable || !Context.get(fiber.context, ReadOnly)) {
-        return writer;
+        return writer(priority);
       }
       const readClass = Context.get(fiber.context, ReadClassRef);
       const claim = Effect.andThen(
@@ -1297,10 +1791,11 @@ const make = Effect.fn("makeWithDatabase")(function* (
             Effect.provideService(reader.acquire, ReadOnly, restore),
             (readerConnection) =>
               readerConnection === undefined
-                ? Effect.andThen(release, writer)
+                ? Effect.andThen(release, writer(priority))
                 : Effect.succeed<Target>({
                     name: "reader",
                     lock: reader.lock,
+                    background: false,
                     connection: readerConnection,
                   }),
           ),
@@ -1310,18 +1805,21 @@ const make = Effect.fn("makeWithDatabase")(function* (
   // The wait observer hears of every acquisition, traced or not.
   const observeWait = (
     fiber: Fiber.Fiber<unknown, unknown>,
-    target: { readonly name: Acquired["connection"] },
+    target: Target,
     clock: Clock.Clock,
     start: bigint,
     ownerAtWaitStart: ConnectionOwner | undefined,
   ) =>
-    fiber
-      .getRef(CurrentWaitObserver)
-      ?.wait(
-        target.name === "writer" ? "sqlite.writer" : "sqlite.reader",
-        Number(clock.monotonicTimeNanosUnsafe() - start),
-        ownerAtWaitStart?.name,
-      );
+    fiber.getRef(CurrentWaitObserver)?.wait(
+      // Background waits are long by design; kept apart, they leave the writer's waits as they were.
+      target.name === "reader"
+        ? "sqlite.reader"
+        : target.background
+          ? "sqlite.writer.background"
+          : "sqlite.writer",
+      Number(clock.monotonicTimeNanosUnsafe() - start),
+      ownerAtWaitStart?.name,
+    );
 
   const acquired = (
     target: { readonly name: Acquired["connection"] },
@@ -1445,14 +1943,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const body = Effect.withFiber<A, E, R>((fiber) => {
           annotateAcquired(fiber, pending.acquired, pending.ownerAtWaitStart);
           pending.restore = undefined;
+          // A deferring scope belongs to its own level: a transaction opened inside it starts without one.
+          const own = Effect.provideService(effect, DeferredWriteScope, undefined);
           // Savepoints acquire nothing and keep their transaction's connection.
           return pending.acquired === undefined
-            ? effect
-            : Effect.provideService(
-                effect,
-                OnReaderWorker,
-                pending.acquired.connection === "reader",
-              );
+            ? own
+            : Effect.provideService(own, OnReaderWorker, pending.acquired.connection === "reader");
         });
         return restore(
           withTransaction(body).pipe(Effect.provideService(TransactionAcquire, pending)),

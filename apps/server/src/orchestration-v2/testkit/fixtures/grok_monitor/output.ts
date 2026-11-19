@@ -47,17 +47,25 @@ export function assertGrokMonitorOutput(
       : [],
   );
   const firstCompleted = monitorUpdates.findIndex((update) => update.status === "completed");
-  for (const tick of GROK_MONITOR_TICKS.slice(0, -1)) {
+  assert.isAtLeast(firstCompleted, 0, "the monitor never completed");
+  // A tick's running state can be superseded before it is written (the mailbox writes an
+  // item's newest state), so a tick shows first in a running state or in the completed one. The
+  // monitor completes only once every tick is in its output.
+  for (const tick of GROK_MONITOR_TICKS) {
     const tickUpdate = monitorUpdates.findIndex((update) => update.output?.includes(tick));
     assert.isAtLeast(tickUpdate, 0, `missing monitor update for ${tick}`);
-    assert.isBelow(tickUpdate, firstCompleted, `the monitor completed before ${tick}`);
-    assert.equal(monitorUpdates[tickUpdate]?.status, "running", `${tick} must show running`);
+    assert.include(monitorUpdates[firstCompleted]?.output, tick, `completed before ${tick}`);
+    if (tickUpdate < firstCompleted)
+      assert.equal(monitorUpdates[tickUpdate]?.status, "running", `${tick} must show running`);
   }
 
   // A persistent monitor keeps running after its run ends. Background work and
   // the restart note must then name it a monitor, as they do for Claude's Monitor.
-  const runningMonitor = monitorUpdates.find((update) => update.status === "running");
-  assert.isDefined(runningMonitor);
+  // Its stored running state, or (each superseded) its completed one as it ran.
+  const runningMonitor = monitorUpdates.find((update) => update.status === "running") ?? {
+    ...monitorUpdates[firstCompleted]!,
+    status: "running" as const,
+  };
   assert.deepEqual(
     derivePendingBackgroundWork({
       latestRun: rootRun,

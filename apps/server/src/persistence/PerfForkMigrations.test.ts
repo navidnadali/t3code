@@ -24,6 +24,10 @@ import ProviderTurnAttemptIndex from "./Migrations/093_ProviderTurnAttemptIndex.
 import TurnItemMessageOrdinalIndex from "./Migrations/094_TurnItemMessageOrdinalIndex.ts";
 import TurnItemInlineWorkOutput from "./Migrations/095_TurnItemInlineWorkOutput.ts";
 import {
+  PERF_FORK_MIGRATION_IDS,
+  PERF_FORK_MIGRATIONS,
+  perfForkChainProblems,
+  perfForkLedgerProblems,
   replacePerfForkTurnItemCounts,
   runPerfForkMigrations,
   UPSTREAM_TURN_ITEM_COUNTS_MIGRATION_ID,
@@ -34,27 +38,30 @@ import {
   PERF_FORK_ORDINAL_INDEX,
 } from "./testkit/PerfForkOrdinalIndex.ts";
 import { PERF_FORK_RUN_ID_TURN_ITEM_COUNTS } from "./testkit/PerfForkRunIdTurnItemCounts.ts";
+import * as EventLogPruneState from "./PerfForkMigrations/EventLogPruneState.ts";
 
 const FORK_TABLE = "t3_perf_fork_migrations";
 const FORK_CHAIN: Array<[number, string]> = [
   [1, "ProjectionTurnItemCounts"],
   [2, "TurnItemMessageOrdinalIndex"],
+  [3, "ThreadItemTotals"],
+  [4, EventLogPruneState.NAME],
 ];
-// Release candidate 1 recorded the fork's chain in upstream's ledger, under upstream's next ids.
-const RC1_IDS: Record<number, number> = { 1: 77, 2: 78 };
-const RC1_RAN_AT = "2026-11-01 00:00:00";
+// The fork's first builds recorded its chain in upstream's ledger, under upstream's next ids.
+const EARLY_FORK_IDS: Record<number, number> = { 1: 77, 2: 78 };
+const EARLY_FORK_RAN_AT = "2026-11-01 00:00:00";
 const upstreamChain = migrationManifest;
 const UPSTREAM_HEAD = Math.max(...upstreamChain.map(([id]) => id));
-// Upstream's last migration when release candidate 1 recorded the fork's at 77 and 78; any later
-// upstream migration runs on a release candidate 1 database.
-const RC1_UPSTREAM_HEAD = 76;
-const upstreamSinceRc1 = upstreamChain.filter(([id]) => id > RC1_UPSTREAM_HEAD);
+// Upstream's last migration when the first builds recorded the fork's at 77 and 78; any later
+// upstream migration runs on such a database.
+const EARLY_FORK_UPSTREAM_HEAD = 76;
+const upstreamSinceEarlyFork = upstreamChain.filter(([id]) => id > EARLY_FORK_UPSTREAM_HEAD);
 // Upstream's last migration in the last fork build before upstream's migration 85.
 const BEFORE_085_UPSTREAM_HEAD = 80;
 // Upstream's last migration in 0.1.9-perf.7, the last fork build before upstream's migration 94.
 const BEFORE_094_UPSTREAM_HEAD = 92;
-const FORK_RAN_AT = "2026-11-15 13:25:00";
-const UPSTREAM_RAN_AT = "2026-11-15 13:20:00";
+const FORK_RAN_AT = "2026-11-15 00:05:00";
+const UPSTREAM_RAN_AT = "2026-11-15 00:00:00";
 
 const ledger = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -145,19 +152,19 @@ const insertTurnItems = Effect.gen(function* () {
   }
 });
 
-// A database as release candidate 1 left it: upstream's chain through 76, the fork's objects (its
+// A database as the first fork builds left it: upstream's chain through 76, the fork's objects (its
 // counts keyed by run_id, its index) and the given fork migrations recorded in upstream's ledger.
-const atRc1 = (forkIds: ReadonlyArray<number>) =>
+const atFirstForkBuild = (forkIds: ReadonlyArray<number>) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    yield* runMigrations({ toMigrationInclusive: RC1_UPSTREAM_HEAD });
+    yield* runMigrations({ toMigrationInclusive: EARLY_FORK_UPSTREAM_HEAD });
     for (const statement of PERF_FORK_RUN_ID_TURN_ITEM_COUNTS) yield* sql.unsafe(statement);
     yield* sql.unsafe(PERF_FORK_ORDINAL_INDEX);
     for (const [id, name] of FORK_CHAIN) {
       if (!forkIds.includes(id)) continue;
       yield* sql`
         INSERT INTO effect_sql_migrations (migration_id, name, created_at)
-        VALUES (${RC1_IDS[id]!}, ${name}, ${RC1_RAN_AT})
+        VALUES (${EARLY_FORK_IDS[id]!}, ${name}, ${EARLY_FORK_RAN_AT})
       `;
     }
   });
@@ -251,7 +258,7 @@ const insertUpgradeItems = Effect.gen(function* () {
   }
 });
 
-// A real case: upstream's 0.1.10-nightly started on 0.1.9-perf.7's database. Its migrator ran 93 and
+// Upstream's 0.1.10-nightly started on a 0.1.9-perf.7 database. Its migrator ran 93 and
 // 94, a transaction each, and was killed during 95, whose transaction rolled back.
 const upstreamNightlyKilledIn095 = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -314,22 +321,22 @@ describe("performance fork migrations", () => {
 
   it.effect.each([
     { recorded: [1, 2], moved: [1, 2], dropIndex: false },
-    // Builds with the turn item counts but before the message-ordinal index.
+    // Builds with fork migration 1 but before migration 2.
     { recorded: [1], moved: [1], dropIndex: true },
     // Row 77 deleted by hand: recording 2 alone would make the migrator skip 1.
     { recorded: [2], moved: [], dropIndex: false },
   ])(
-    "moves release candidate 1's rows $recorded to the fork's table without running them again",
+    "moves the first fork builds' rows $recorded to the fork's table without running them again",
     ({ recorded, moved, dropIndex }) =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         const expectedSchema = yield* freshSchema;
-        yield* atRc1(recorded);
+        yield* atFirstForkBuild(recorded);
         if (dropIndex) yield* sql.unsafe(`DROP INDEX ${ORDINAL_INDEX}`);
         yield* insertTurnItems;
         yield* insertStrayCount("run_id");
 
-        assert.deepStrictEqual(yield* runMigrations(), upstreamSinceRc1);
+        assert.deepStrictEqual(yield* runMigrations(), upstreamSinceEarlyFork);
         assert.deepStrictEqual(yield* ledger, upstreamChain);
         const forkRows = yield* forkLedger;
         assert.deepStrictEqual(
@@ -337,7 +344,9 @@ describe("performance fork migrations", () => {
           FORK_CHAIN,
         );
         assert.deepStrictEqual(
-          forkRows.filter((row) => row.created_at === RC1_RAN_AT).map((row) => row.migration_id),
+          forkRows
+            .filter((row) => row.created_at === EARLY_FORK_RAN_AT)
+            .map((row) => row.migration_id),
           moved,
         );
         // Upstream's migration 85 replaced the fork's counts with its own, counted from the items.
@@ -347,10 +356,10 @@ describe("performance fork migrations", () => {
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("keeps the fork's own rows when release candidate 1 ran again on the database", () =>
+  it.effect("keeps the fork's own rows when a first fork build ran again on the database", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* atRc1([1, 2]);
+      yield* atFirstForkBuild([1, 2]);
       yield* sql`
         CREATE TABLE ${sql(FORK_TABLE)} (
           migration_id integer PRIMARY KEY NOT NULL,
@@ -365,7 +374,7 @@ describe("performance fork migrations", () => {
         `;
       }
 
-      assert.deepStrictEqual(yield* runMigrations(), upstreamSinceRc1);
+      assert.deepStrictEqual(yield* runMigrations(), upstreamSinceEarlyFork);
       assert.deepStrictEqual(yield* ledger, upstreamChain);
       assert.deepStrictEqual(
         yield* forkLedger,
@@ -409,10 +418,10 @@ describe("performance fork migrations", () => {
   it.effect.each([
     { from: "0.1.9-perf.7's (upstream 92)", upstreamHead: BEFORE_094_UPSTREAM_HEAD },
     { from: "0.1.7-perf.6's (upstream 80)", upstreamHead: BEFORE_085_UPSTREAM_HEAD },
-    // The fork's chain recorded before upstream's 77, as on an older database.
-    { from: "an older database's (upstream 76)", upstreamHead: 76 },
+    // The fork's chain recorded before upstream's 77, as the first builds did.
+    { from: "a first build's (upstream 76)", upstreamHead: 76 },
     {
-      from: "a nightly-migrated database's (nightly ran 93-94)",
+      from: "a nightly's (it ran 93-94)",
       upstreamHead: BEFORE_094_UPSTREAM_HEAD,
       upstreamBuild: upstreamNightlyKilledIn095,
     },
@@ -512,23 +521,134 @@ describe("performance fork migrations", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("warns about fork migrations that a newer fork build recorded", () =>
+  // The migrator runs only ids above the highest one a database recorded, so a fork id out of
+  // order, or a database that recorded a later id without an earlier one, is a migration that
+  // never runs (as when two branches both claimed fork migration 3). These turn that silent
+  // skip into a refusal.
+  it("number the fork's chain 1, 2, ..., N in order", () => {
+    // The chain this build ships, as the rows here and the bench fixture's report read it.
+    assert.deepStrictEqual(PERF_FORK_MIGRATIONS, FORK_CHAIN);
+    assert.deepStrictEqual(perfForkChainProblems(PERF_FORK_MIGRATION_IDS), []);
+    assert.deepStrictEqual(perfForkChainProblems([1, 2, 3, 4]), []);
+    for (const ids of [
+      [1, 2, 4],
+      [2, 3],
+      [1, 1, 2],
+      [2, 1],
+      [0, 1],
+    ]) {
+      assert.isNotEmpty(perfForkChainProblems(ids), JSON.stringify(ids));
+    }
+  });
+
+  it("name what a fork ledger holds that this build cannot run", () => {
+    const chain = [
+      [1, "A"],
+      [2, "B"],
+      [3, "C"],
+      [4, "D"],
+    ] as const;
+    const rows = (pairs: ReadonlyArray<readonly [number, string]>) =>
+      pairs.map(([id, name]) => ({ id, name }));
+    assert.deepStrictEqual(perfForkLedgerProblems(rows([]), chain), []);
+    assert.deepStrictEqual(
+      perfForkLedgerProblems(
+        rows([
+          [1, "A"],
+          [2, "B"],
+        ]),
+        chain,
+      ),
+      [],
+    );
+    assert.deepStrictEqual(perfForkLedgerProblems(rows(chain), chain), []);
+    // 4 recorded without 3: the migrator would never run 3.
+    const gap = perfForkLedgerProblems(
+      rows([
+        [1, "A"],
+        [2, "B"],
+        [4, "D"],
+      ]),
+      chain,
+    );
+    assert.lengthOf(gap, 1);
+    assert.include(gap[0], `${FORK_TABLE}:3_C`);
+    const unknown = perfForkLedgerProblems(rows([...chain, [5, "E"]]), chain);
+    assert.lengthOf(unknown, 1);
+    assert.include(unknown[0], `${FORK_TABLE}:5_E`);
+    const renamed = perfForkLedgerProblems(
+      rows([
+        [1, "A"],
+        [2, "B"],
+        [3, "Other"],
+      ]),
+      chain,
+    );
+    assert.lengthOf(renamed, 1);
+    assert.include(renamed[0], `${FORK_TABLE}:3_Other`);
+    assert.include(renamed[0], "C");
+  });
+
+  // The refusal once came after upstream's pending migrations had committed. A start
+  // with upstream work pending must refuse before it writes anything, upstream's ledger included.
+  it.effect("refuse a fork ledger it cannot run before upstream's pending migrations write", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: UPSTREAM_HEAD - 1 });
+      yield* sql.unsafe(
+        `CREATE TABLE IF NOT EXISTS ${FORK_TABLE} (migration_id integer PRIMARY KEY NOT NULL, created_at datetime NOT NULL DEFAULT current_timestamp, name VARCHAR(255) NOT NULL)`,
+      );
+      yield* sql.unsafe(
+        `INSERT INTO ${FORK_TABLE} (migration_id, name) VALUES (1, '${FORK_CHAIN[0]![1]}'), (2, 'FromOtherBranch')`,
+      );
+      const snapshot = Effect.gen(function* () {
+        return {
+          upstream:
+            yield* sql`SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id`,
+          fork: yield* sql`SELECT migration_id, name FROM ${sql(FORK_TABLE)} ORDER BY migration_id`,
+          schema:
+            yield* sql`SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name`,
+        };
+      });
+      const before = yield* snapshot;
+
+      const error = yield* Effect.flip(runMigrations());
+
+      assert.include(String(error.message), `${FORK_TABLE}:2_FromOtherBranch`);
+      assert.deepStrictEqual(yield* snapshot, before);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect.each([
+    {
+      ledger: "an id this build does not know (a newer fork build recorded it)",
+      tamper: `INSERT INTO ${FORK_TABLE} (migration_id, name) VALUES (${FORK_CHAIN.length + 1}, 'FromNewerFork')`,
+      named: `${FORK_TABLE}:${FORK_CHAIN.length + 1}_FromNewerFork`,
+    },
+    {
+      ledger: "a gap below its highest id",
+      tamper: `DELETE FROM ${FORK_TABLE} WHERE migration_id = 1`,
+      named: `${FORK_TABLE}:1_${FORK_CHAIN[0]![1]}`,
+    },
+    {
+      ledger: "a different migration under an id this build knows",
+      tamper: `UPDATE ${FORK_TABLE} SET name = 'FromOtherBranch' WHERE migration_id = 2`,
+      named: `${FORK_TABLE}:2_FromOtherBranch`,
+    },
+  ])("refuse to start on a fork ledger with $ledger, and write nothing", ({ tamper, named }) =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations();
-      yield* sql`
-        INSERT INTO ${sql(FORK_TABLE)} (migration_id, name)
-        VALUES (${FORK_CHAIN.length + 1}, 'FromNewerFork')
-      `;
-      const warnings: Array<unknown> = [];
+      yield* sql.unsafe(tamper);
+      const before =
+        yield* sql`SELECT migration_id, name FROM ${sql(FORK_TABLE)} ORDER BY migration_id`;
 
+      const error = yield* Effect.flip(runMigrations());
+
+      assert.include(String(error.message), named);
       assert.deepStrictEqual(
-        yield* runMigrations().pipe(Effect.provide(captureWarnings(warnings))),
-        [],
-      );
-      assert.include(
-        JSON.stringify(warnings),
-        `${FORK_TABLE}:${FORK_CHAIN.length + 1}_FromNewerFork`,
+        yield* sql`SELECT migration_id, name FROM ${sql(FORK_TABLE)} ORDER BY migration_id`,
+        before,
       );
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
@@ -557,13 +677,13 @@ describe("pending migration work", () => {
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("includes a release candidate 1 row the fork's chain would move", () =>
+  it.effect("includes a first fork build's row the fork's chain would move", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations();
-      // Hand-edited: upstream's own row at 78 under the name release candidate 1 recorded there.
+      // Hand-edited: upstream's own row at 78 under the name the fork's first builds recorded there.
       yield* sql`
-        UPDATE effect_sql_migrations SET name = ${FORK_CHAIN[1]![1]} WHERE migration_id = ${RC1_IDS[2]!}
+        UPDATE effect_sql_migrations SET name = ${FORK_CHAIN[1]![1]} WHERE migration_id = ${EARLY_FORK_IDS[2]!}
       `;
       assert.isTrue(yield* hasPendingMigrations());
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),

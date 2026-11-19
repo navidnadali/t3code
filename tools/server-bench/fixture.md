@@ -21,14 +21,15 @@ the long passes (2,000 rows); a single SQLite step (`VACUUM INTO`, a migration, 
 first.
 
 The source may be the live `~/.t3/userdata/statev2.sqlite`: `VACUUM INTO` reads one consistent snapshot through a
-read-only connection while the server writes. For a fixture that leaves the machine, copy it first and sanitise the copy.
+read-only connection while the server writes. For a fixture that leaves the machine, copy it first (as the reference
+sanitiser does) and sanitise the copy.
 
 `tsc -p tools/server-bench --noEmit` runs in no script or CI job: run it by hand after changing these files.
 
 ## sanitise
 
 Every thread, run, item, message and event stays. The work a boot would do on start is done now, the way the
-server does it, so the fixture keeps the source's scale and a boot writes nothing:
+server does it, so the fixture keeps its source's scale and a boot writes nothing:
 
 1. Make a private (`0700`) scratch directory beside the destination and `VACUUM INTO` a `0600` scratch file
    there; run the server's migrations on it.
@@ -50,7 +51,8 @@ server does it, so the fixture keeps the source's scale and a boot writes nothin
    `importPendingTranscripts`), then the restart recovery (`ProviderRuntimeRecoveryService.reconcile("startup")`,
    continuation off): active runs, attempts, nodes, provider turns and items cancelled, pending runtime requests
    closed, provider threads idle, sessions stopped, unheld queues held.
-4. Settle what a boot would still deliver or finish, as the server leaves it once done: remote delegated completions lose their pending delivery, subagent completion
+4. Settle what a boot would still deliver or finish, as the server leaves it once done (the reference sanitiser
+   is the model): remote delegated completions lose their pending delivery, subagent completion
    deliveries are disposed, a merged pull request wake whose run failed, was cut or rolled back keeps only its
    first pull request (a boot sends such news again), messages still streaming are final, a finished app-owned subagent child gets its
    task's result (`[bench fixture] Result withheld…`) and a consumed `subagent_result` transfer to its parent,
@@ -86,7 +88,7 @@ server does it, so the fixture keeps the source's scale and a boot writes nothin
 8. `VACUUM INTO` the destination: no free pages, so no deleted or blanked text survives on disk.
 9. Self-check, else delete the destination and fail (below).
 
-The report (`--report`) lists every table's rows in the source and the fixture. Every table but
+The report (`--report`) lists every table's rows in the source and the fixture. On a real database every table but
 the ones in step 2 keeps its row count; events change by the step-5 updates less the prune (step 6). Settings
 and `secrets/` live outside the database; copy only `statev2.sqlite`.
 
@@ -135,9 +137,9 @@ regenerate any filler without the original. Seeds come from an HMAC with a rando
 equal texts get equal filler within a run (duplicates stay duplicates) and filler cannot be matched against a
 guessed original. The letters cannot spell a credential word (no c, h, k, t, w or y, never two consonants
 together), words run at most seven letters, and there are no digits, capitals, `:` or `=`, so no pattern of
-either check can match in or right after filler. Thread
-payloads lose their pull request snapshots (step 5), and the message search index is smaller (fewer distinct words), so search benches on a fixture will not match the
-source database.
+either check can match in or right after filler. On a real database payload size quantiles are unchanged; thread
+payloads lose their pull request snapshots (step 5), and the message search index is smaller by
+about a sixth (fewer distinct words), so search benches on a fixture will not match production.
 
 `--keep-content` skips blanking and runs the pattern layer alone (every visible character of a finding becomes
 `*`). It fails open by nature: use it only for a copy that never leaves the machine. `scan --keep-content`
@@ -149,7 +151,9 @@ Matched on decoded strings (JSON unwrapped, ANSI colour codes read as spaces), s
 or a colour code is found: private key blocks (whole, to the footer or the end of the string, and markers and
 60–76 column base64 body lines on their own, for a key split across strings), token formats
 (GitHub, GitLab, Anthropic, OpenAI, AWS, Google API and OAuth `ya29.`, Slack `xox?-`/`xapp-`/webhooks, Atlassian
-`ATATT`, Stripe, npm, Hugging Face, SendGrid, Mailgun, `tfe_` tokens, JWT, `Bearer`, `Basic` that decodes to
+`ATATT`, Stripe, npm, Hugging Face, SendGrid, Mailgun, any short lowercase prefix with `_` and 16 or more
+token characters mixing upper and lower case (not the id prefixes the supported providers mint, Kiro tool use ids
+or the words of an MCP tool name), JWT, `Bearer`, `Basic` that decodes to
 `user:password`, URLs with a password, the user name possibly empty), assignments whose name contains
 `password`, `passwd`, `passphrase`, `secret`, `token`, `credential`, `api_key`, `access_key`, `private_key` or
 `auth`, or is `key`/`pass`/`pwd` between separators (`DB_PASSWORD=`, `export CF_API_TOKEN=`, `"refresh_token":`,
@@ -163,12 +167,15 @@ Three independent gates, on every value of every table:
 
 - Content: each string is allowlisted and unflagged by the pattern layer, or filler; every key is an identifier or
   rewritten; every BLOB is zeros (`notBlanked`, `secretHits`).
-- the extended check (`fixture/extended.ts`, a rule-for-rule port of the original extended check script with the 52
-  patterns of the original sanitiser script): every value as stored and, when JSON, every decoded string with keys and
+- The reference sanitiser's extended check (`fixture/extended.ts`, a rule-for-rule port of its extended-check
+  script with the 52 patterns of its sanitiser script, one named token prefix generalised to any short prefix): every value as stored and, when JSON, every decoded string with keys and
   nested JSON, the search index's shadow tables included; keyword, env-var and name=value high-entropy
   assignments, extra token forms, PEM markers, base64 body lines and arrays of them (`extendedHits`, by
-  `table:scope|kind`).
-- Raw file bytes: the token patterns find nothing (free pages and indexes included, escapes read as spaces), and
+  `table:scope|kind`). On a real source copy the port and the Python script gave the same count in every row before that rule was
+  generalised; the generalised rule finds what the named one found wherever the body mixes upper and lower case.
+- Raw file bytes: the token patterns find nothing (free pages and indexes included, escapes read as spaces;
+  the short-prefixed rule is left to the decoded passes, which read every value of this `VACUUM INTO` copy, as a
+  raw record runs an id into the next field), and
   no credential-named column is non-null.
 
 And nothing a server would run on start: recovery threads (runtime, subagent results, delegated completions),
@@ -182,10 +189,12 @@ imports (`runnable`). Anything planted after sanitising, a token in an id or pro
 Boot it with its own `--base-dir` and `HOME`, never on the machine its data came from without one. With content
 blanked, project and worktree paths point nowhere. A first boot of a sanitised fixture writes no event: the
 start-up work (step 3), deliveries (4), settle sweep, pull request sync and timers (5) and prune (6) are
-done, and the recovery queries find nothing. The server's first prune pass, a minute after start, only sets the
+done, and the recovery queries find nothing (on a real fixture, with the earlier compaction: no event, row or
+sequence change, all recovery counts 0). The server's first prune pass, a minute after start, only sets the
 prune mark (a row in `orchestration_v2_projection_metadata`) and deletes nothing, however long ago the fixture
 was made; the next pass that can delete runs a day later. It may still run `git`: read-only repository
-identity probes per project. At the blanked
+identity probes per project (on a sanitised fixture `GIT_TRACE`
+recorded none in the first 20 s after ready). At the blanked
 paths they find no repository. For bench runs set, in `<base-dir>/userdata/settings.json`,
 `"enableProviderUpdateChecks": false` (no model manifest fetch), `"sidebarAutoSettleAfterDays": null` and
 `"sidebarAutoSettleOnMerge": false` (no settle sweep on threads the bench creates), and the environment variable

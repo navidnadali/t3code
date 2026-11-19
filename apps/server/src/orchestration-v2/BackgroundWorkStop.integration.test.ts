@@ -964,7 +964,7 @@ const stopEarlierBackgroundWork = ({
         const owner = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
           (run) => run.id === latestRun.runId,
         )!;
-        // Upstream queued the follow-up behind a checkpoint wait; A2 starts a visible message
+        // Upstream queued the follow-up behind a checkpoint wait; this build starts a visible message
         // instead of queueing it there, so queue it behind an active run.
         yield* sink.write({
           events: [

@@ -1,6 +1,9 @@
 import { DatabaseReclaimError, type DatabaseStorageStatus } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
+import * as Config from "effect/Config";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -9,9 +12,12 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as SqlClient from "effect/sql/SqlClient";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect has no free-space query.
+import * as NodeFSP from "node:fs/promises";
 
 import { resolveHostCliCommand } from "../cli/invocation.ts";
 import * as ServerConfig from "../config.ts";
@@ -22,6 +28,28 @@ import { forkParked } from "../serverActivation.ts";
 // Bound each reclaim pass to one minute of churn.
 const RECLAIM_PAGES_PER_PASS = 1024;
 const COMPACTION_INTERVAL = Duration.hours(6);
+
+// A compaction pass rewrites index pages and WAL frames that file system snapshots can keep,
+// so it writes only while the database's file system and, where the host publishes one, the host's
+// headroom are above their floors. Otherwise it waits and checks again, its progress kept.
+const MIN_FREE_MB = Config.Int("T3CODE_EVENT_PRUNE_MIN_FREE_MB").pipe(Config.withDefault(2048));
+const MIN_HOST_HEADROOM_MB = Config.Int("T3CODE_EVENT_PRUNE_MIN_HOST_HEADROOM_MB").pipe(
+  Config.withDefault(65_536),
+);
+// The host's signal: JSON { availableBytes, updatedAt } it rewrites at least hourly. Absent: no
+// host limit. Unreadable or older than HEADROOM_SIGNAL_MAX_AGE: no room, since the host stopped.
+const HEADROOM_FILE = Config.String("T3CODE_EVENT_PRUNE_HEADROOM_FILE").pipe(Config.option);
+const HEADROOM_SIGNAL_MAX_AGE = Duration.hours(2);
+// Clocks differ a little; a value further ahead than this is wrong, not fresh.
+const HEADROOM_SIGNAL_MAX_AHEAD = Duration.minutes(10);
+const UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+const HEADROOM_RECHECK = Duration.minutes(5);
+// A passing check covers the writes of this long; deletes come in batches of milliseconds.
+const HEADROOM_CHECK_CACHE = Duration.seconds(30);
+const HeadroomSignal = Schema.fromJsonString(
+  Schema.Struct({ availableBytes: Schema.Number, updatedAt: Schema.String }),
+);
+const decodeHeadroomSignal = Schema.decodeUnknownEffect(HeadroomSignal);
 
 export class DatabaseStorage extends Context.Service<
   DatabaseStorage,
@@ -137,6 +165,78 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const minFreeBytes = (yield* MIN_FREE_MB.pipe(Effect.orElseSucceed(() => 2048))) * 2 ** 20;
+  const minHostHeadroomBytes =
+    (yield* MIN_HOST_HEADROOM_MB.pipe(Effect.orElseSucceed(() => 65_536))) * 2 ** 20;
+  const headroomFile = Option.getOrElse(
+    yield* HEADROOM_FILE.pipe(Effect.orElseSucceed(() => Option.none<string>())),
+    () => path.join(path.dirname(config.dbPath), "storage-headroom.json"),
+  );
+  const formatMiB = (bytes: number) => `${Math.floor(bytes / 2 ** 20)} MiB`;
+  // Why the pass may not write now, or undefined when it may.
+  const headroomShortfall = Effect.gen(function* () {
+    const disk = yield* Effect.tryPromise({
+      try: () => NodeFSP.statfs(path.dirname(config.dbPath)),
+      // An unknown free space does not stop the pass; the host signal still can.
+      catch: () => undefined,
+    }).pipe(Effect.option);
+    if (Option.isSome(disk) && disk.value.bavail * disk.value.bsize < minFreeBytes) {
+      return `the database's file system has ${formatMiB(disk.value.bavail * disk.value.bsize)} free, below ${formatMiB(minFreeBytes)}`;
+    }
+    // Only a missing file means no host limit; one the server cannot read is no room.
+    const text = yield* fs.readFileString(headroomFile).pipe(
+      Effect.asSome,
+      Effect.catchTags({
+        PlatformError: (error) =>
+          Effect.succeed(
+            error.reason._tag === "NotFound" ? Option.none<string>() : Option.some(""),
+          ),
+      }),
+    );
+    if (Option.isNone(text)) return undefined;
+    const signal = yield* decodeHeadroomSignal(text.value).pipe(Effect.option);
+    if (
+      Option.isNone(signal) ||
+      !Number.isSafeInteger(signal.value.availableBytes) ||
+      signal.value.availableBytes < 0 ||
+      !UTC_TIMESTAMP.test(signal.value.updatedAt)
+    ) {
+      return `the host headroom signal ${headroomFile} is unreadable`;
+    }
+    const age = DateTime.toEpochMillis(yield* DateTime.now) - Date.parse(signal.value.updatedAt);
+    if (
+      !(age <= Duration.toMillis(HEADROOM_SIGNAL_MAX_AGE)) ||
+      age < -Duration.toMillis(HEADROOM_SIGNAL_MAX_AHEAD)
+    ) {
+      return `the host headroom signal ${headroomFile} is stale`;
+    }
+    if (signal.value.availableBytes < minHostHeadroomBytes) {
+      return `the host reports ${formatMiB(signal.value.availableBytes)} of headroom, below ${formatMiB(minHostHeadroomBytes)}`;
+    }
+    return undefined;
+  });
+  let headroomCheckedUntil = 0;
+  // Returns whether it waited.
+  const awaitHeadroom = Effect.gen(function* () {
+    if ((yield* Clock.currentTimeMillis) < headroomCheckedUntil) return false;
+    let paused = false;
+    while (true) {
+      const shortfall = yield* headroomShortfall;
+      if (shortfall === undefined) break;
+      if (!paused) {
+        yield* Effect.logWarning("Event-log compaction paused: no room to write", {
+          reason: shortfall,
+        });
+        paused = true;
+      }
+      yield* Effect.sleep(HEADROOM_RECHECK);
+    }
+    if (paused) yield* Effect.logInfo("Event-log compaction resumed");
+    headroomCheckedUntil =
+      (yield* Clock.currentTimeMillis) + Duration.toMillis(HEADROOM_CHECK_CACHE);
+    return paused;
+  });
+
   // Even a pass that deletes nothing scans the event store. Persist completion
   // so restarting does not trigger another scan before the six-hour interval.
   const compactedAtPath = path.join(path.dirname(config.dbPath), "compacted-at");
@@ -149,7 +249,14 @@ const make = Effect.gen(function* () {
       yield* Effect.sleep((Number(elapsed) / 1_000_000) * 9);
       sliceStarted = yield* Clock.monotonicTimeNanos;
     });
-    const result = yield* maintenance.pruneEventStore(betweenPages);
+    // A wait for headroom is not work: the duty slice starts again after it.
+    const beforeWrite = Effect.gen(function* () {
+      if (yield* awaitHeadroom) sliceStarted = yield* Clock.monotonicTimeNanos;
+    });
+    // Background priority: the commit lane and every other writer already waiting go first.
+    const result = yield* maintenance
+      .pruneEventStore(betweenPages, beforeWrite)
+      .pipe(NodeSqliteClient.background);
     const completedAt = yield* Clock.currentTimeMillis;
     yield* fs.writeFileString(compactedAtPath, String(completedAt)).pipe(Effect.ignore);
     if (result.deletedEventCount > 0 || result.deletedReceiptCount > 0) {

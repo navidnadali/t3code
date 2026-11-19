@@ -1957,6 +1957,19 @@ it.effect(
       });
       const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
       yield* worker.drain();
+      // The row settles once the child's stop has run, which can land after the drain returns.
+      yield* orchestrator
+        .streamStoredEventsFrom({ threadId: parentThreadId, eventType: "subagent.updated" })
+        .pipe(
+          Stream.filter(
+            ({ event }) =>
+              event.type === "subagent.updated" &&
+              event.payload.id === task.id &&
+              event.payload.status === "completed",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+        );
       assert.deepEqual(yield* statuses, {
         row: "completed",
         native: "interrupted",

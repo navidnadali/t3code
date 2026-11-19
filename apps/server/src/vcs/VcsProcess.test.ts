@@ -557,6 +557,57 @@ describe("VcsProcess.run", () => {
     }),
   );
 
+  it.effect("background forge calls leave one forge permit for the rest", () =>
+    Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      const starts = yield* Queue.unbounded<string>();
+      const service = yield* VcsProcess.makeWith({ parallelism: 8, cpuQuota: null }).pipe(
+        Effect.provideService(
+          ProcessRunner.ProcessRunner,
+          ProcessRunner.ProcessRunner.of({
+            run: (input) =>
+              Queue.offer(starts, input.args[0]!).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as({
+                  stdout: "",
+                  stderr: "",
+                  code: ChildProcessSpawner.ExitCode(0),
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                }),
+              ),
+          }),
+        ),
+      );
+      // Keyed like gh's calls: a background call waiting for its own permit holds no keyed one.
+      const forge = (name: string) =>
+        service
+          .run({
+            operation: "synthetic.forge.read",
+            command: "gh",
+            args: [name],
+            cwd: "/workspace",
+            concurrency: { key: "synthetic-gh", limit: 4 },
+          })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+      const background = yield* Effect.forEach(Array.from({ length: 6 }), (_, index) =>
+        forge(`background-${index}`).pipe(Effect.provideService(VcsProcess.ForgeBackground, true)),
+      );
+      const first = yield* Queue.takeN(starts, 3);
+      const foreground = yield* Effect.forEach(["foreground-0", "foreground-1"], forge);
+      const next = yield* Queue.take(starts);
+      // Three background calls run; the fourth permit goes to the first call that is not background.
+      expect(first.every((name) => name.startsWith("background-"))).toBe(true);
+      expect(next).toBe("foreground-0");
+      expect(yield* Queue.size(starts)).toBe(0);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.joinAll([...background, ...foreground]);
+    }),
+  );
+
   it.effect("git concurrency follows the machine's parallelism", () =>
     Effect.gen(function* () {
       // A quarter of the cores, between 8 and 32: 8 on small machines, 16 on a 64-core host.

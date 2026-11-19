@@ -54,6 +54,21 @@ const stoppedWorkers = vi.hoisted(() => new WeakMap<NodeWorkerThreads.Worker, ()
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
 const checkpointWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
+// Statements the next COMMIT posted to a writer carries, as a client that deferred a write to it would send.
+const carriedByNextCommit = vi.hoisted(() => ({
+  statements: undefined as ReadonlyArray<Record<string, unknown>> | undefined,
+}));
+// Breaks the next SAVEPOINT posted to a writer, sent alone or carried, keeping its name: a SAVEPOINT that fails.
+const breakNextSavepoint = vi.hoisted(() => ({ on: false }));
+// Once armed, holds the writer's reply to the next statement carrying waiting writes until the test delivers it,
+// or, with afterNext, until just after the writer's next reply.
+const heldCarrierReply = vi.hoisted(() => ({
+  armed: false,
+  afterNext: false,
+  id: undefined as unknown,
+  onHeld: undefined as (() => void) | undefined,
+  deliver: undefined as (() => void) | undefined,
+}));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
@@ -81,7 +96,74 @@ vi.mock("node:worker_threads", async (importOriginal) => {
       }
       const dropped = stoppedWorkers.get(this);
       if (dropped !== undefined) return dropped();
+      if (
+        heldCarrierReply.armed &&
+        typeof request === "object" &&
+        request !== null &&
+        "prelude" in request &&
+        Array.isArray(request.prelude) &&
+        request.prelude.length > 0
+      ) {
+        heldCarrierReply.armed = false;
+        heldCarrierReply.id = (request as { readonly id?: unknown }).id;
+      }
+      if (breakNextSavepoint.on && typeof request === "object" && request !== null) {
+        const broken = (statement: Record<string, unknown>) => {
+          if (!breakNextSavepoint.on || !/^\s*SAVEPOINT\b/i.test(String(statement.sql)))
+            return statement;
+          breakNextSavepoint.on = false;
+          return { ...statement, sql: `${String(statement.sql)} broken` };
+        };
+        const message = request as Record<string, unknown>;
+        const prelude = message.prelude as ReadonlyArray<Record<string, unknown>> | undefined;
+        if (prelude !== undefined || "sql" in message) {
+          const sent = broken({
+            ...message,
+            ...(prelude === undefined ? {} : { prelude: prelude.map(broken) }),
+          });
+          // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+          return super.postMessage(sent);
+        }
+      }
+      const carried = carriedByNextCommit.statements;
+      if (
+        carried !== undefined &&
+        typeof request === "object" &&
+        request !== null &&
+        "sql" in request &&
+        /^\s*COMMIT\b/i.test(String(request.sql))
+      ) {
+        carriedByNextCommit.statements = undefined;
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        return super.postMessage({ ...request, prelude: carried });
+      }
       super.postMessage(...args);
+    }
+    override emit(event: string | symbol, ...args: Array<any>): boolean {
+      const [message] = args;
+      if (
+        event === "message" &&
+        heldCarrierReply.id !== undefined &&
+        typeof message === "object" &&
+        message !== null &&
+        message.id === heldCarrierReply.id
+      ) {
+        heldCarrierReply.id = undefined;
+        heldCarrierReply.deliver = () => {
+          heldCarrierReply.deliver = undefined;
+          super.emit(event, ...args);
+        };
+        heldCarrierReply.onHeld?.();
+        return true;
+      }
+      const deliver = heldCarrierReply.deliver;
+      if (event === "message" && heldCarrierReply.afterNext && deliver !== undefined) {
+        heldCarrierReply.afterNext = false;
+        const emitted = super.emit(event, ...args);
+        deliver();
+        return emitted;
+      }
+      return super.emit(event, ...args);
     }
     override ref() {
       workerRefs.set(this, true);
@@ -282,6 +364,853 @@ it.effect.each([false, true])("batches worker results without losing rows (reade
     }).pipe(
       Effect.provide(SqliteClient.layer({ filename, writerWorker: true, readerWorker: true })),
     );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+const writerMessagesSince = (count: number) => {
+  const writer = startedWorkers.filter((worker) => !checkpointWorkers.includes(worker)).at(-1)!;
+  return workerMessages
+    .get(writer)!
+    .slice(count)
+    .filter((message) => "sql" in message);
+};
+const writerMessageCount = () => {
+  const writer = startedWorkers.filter((worker) => !checkpointWorkers.includes(worker)).at(-1)!;
+  return workerMessages.get(writer)!.length;
+};
+
+it.effect(
+  "sends deferred writes with the next awaited statement, in order, and flushes the rest",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`SELECT 1`;
+        const before = writerMessageCount();
+        const read = yield* sql.withTransaction(
+          SqliteClient.withDeferredWrites(sql)(
+            Effect.gen(function* () {
+              yield* sql`UPDATE counters SET value = 1 WHERE id = 1`.pipe(
+                SqliteClient.deferredWrite,
+              );
+              yield* sql`UPDATE counters SET value = value + 1 WHERE id = 1`.pipe(
+                SqliteClient.deferredWrite,
+              );
+              // Reads see the deferred writes before them.
+              const [row] = yield* sql<{ readonly value: number }>`
+              SELECT value FROM counters WHERE id = 1
+            `;
+              yield* sql`UPDATE counters SET value = value * 10 WHERE id = 1`.pipe(
+                SqliteClient.deferredWrite,
+              );
+              return row?.value;
+            }),
+          ),
+        );
+        assert.equal(read, 2);
+        const messages = writerMessagesSince(before);
+        // BEGIN, the read carrying two writes, the scope's flush carrying one, COMMIT.
+        assert.deepEqual(
+          messages.map((message) => [
+            String(message.sql).trim().split(/\s+/)[0],
+            (message.prelude as ReadonlyArray<unknown> | undefined)?.length ?? 0,
+          ]),
+          [
+            ["BEGIN", 0],
+            ["SELECT", 2],
+            ["SELECT", 1],
+            ["COMMIT", 0],
+          ],
+        );
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 20,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "fails the deferring scope with a deferred write's error and keeps the writer usable",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+        yield* sql`INSERT INTO unique_entries VALUES ('taken')`;
+        const error = yield* sql
+          .withTransaction(
+            SqliteClient.withDeferredWrites(sql)(
+              Effect.gen(function* () {
+                yield* sql`UPDATE counters SET value = 7 WHERE id = 1`.pipe(
+                  SqliteClient.deferredWrite,
+                );
+                yield* sql`INSERT INTO unique_entries VALUES ('taken')`.pipe(
+                  SqliteClient.deferredWrite,
+                );
+                yield* sql`UPDATE counters SET value = 8 WHERE id = 1`.pipe(
+                  SqliteClient.deferredWrite,
+                );
+              }),
+            ),
+          )
+          .pipe(Effect.flip);
+        assert(SqlError.isSqlError(error));
+        assert.equal(error.reason._tag, "UniqueViolation");
+        // The transaction rolled back as a whole, and the writer takes the next one.
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 0,
+        });
+        yield* sql.withTransaction(sql`UPDATE counters SET value = 3 WHERE id = 1`);
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 3,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("rolls back only a failed savepoint's deferred writes", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`SELECT 1`;
+      const before = writerMessageCount();
+      yield* sql.withTransaction(
+        SqliteClient.withDeferredWrites(sql)(
+          Effect.gen(function* () {
+            yield* sql`UPDATE counters SET value = 5 WHERE id = 1`;
+            const nested = yield* sql
+              .withTransaction(
+                SqliteClient.withDeferredWrites(sql)(
+                  sql`UPDATE counters SET value = 99 WHERE id = 1`.pipe(
+                    SqliteClient.deferredWrite,
+                    Effect.andThen(Effect.fail("stop" as const)),
+                  ),
+                ),
+              )
+              .pipe(Effect.flip);
+            assert.equal(nested, "stop");
+            yield* sql`UPDATE counters SET value = value + 1 WHERE id = 1`.pipe(
+              SqliteClient.deferredWrite,
+            );
+          }),
+        ),
+      );
+      assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+        value: 6,
+      });
+      // The nested write waited and its rollback discarded it unsent.
+      assert.deepEqual(
+        writerMessagesSince(before).map((message) => String(message.sql).trim().split(/\s+/)[0]),
+        ["BEGIN", "UPDATE", "SAVEPOINT", "ROLLBACK", "SELECT", "COMMIT"],
+      );
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("opens a savepoint with the writes waiting before it, so its rollback keeps them", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`SELECT 1`;
+      const before = writerMessageCount();
+      yield* sql.withTransaction(
+        SqliteClient.withDeferredWrites(sql)(
+          Effect.gen(function* () {
+            yield* sql`UPDATE counters SET value = 5 WHERE id = 1`.pipe(SqliteClient.deferredWrite);
+            const nested = yield* sql
+              .withTransaction(
+                SqliteClient.withDeferredWrites(sql)(
+                  sql`UPDATE counters SET value = 99 WHERE id = 1`.pipe(
+                    SqliteClient.deferredWrite,
+                    Effect.andThen(Effect.fail("stop" as const)),
+                  ),
+                ),
+              )
+              .pipe(Effect.flip);
+            assert.equal(nested, "stop");
+            yield* sql`UPDATE counters SET value = value + 1 WHERE id = 1`.pipe(
+              SqliteClient.deferredWrite,
+            );
+          }),
+        ),
+      );
+      assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+        value: 6,
+      });
+      assert.deepEqual(
+        writerMessagesSince(before).map((message) => [
+          String(message.sql).trim().split(/\s+/)[0],
+          (message.prelude as ReadonlyArray<unknown> | undefined)?.length ?? 0,
+        ]),
+        [
+          ["BEGIN", 0],
+          ["SAVEPOINT", 1],
+          ["ROLLBACK", 0],
+          ["SELECT", 1],
+          ["COMMIT", 0],
+        ],
+      );
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("keeps an earlier savepoint when a later one's first statement cannot be sent", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          // Both savepoints take the same name; the second's SAVEPOINT waits for a statement that never posts.
+          yield* sql.withTransaction(sql`UPDATE counters SET value = 5 WHERE id = 1`);
+          const failure = yield* sql
+            .withTransaction(sql.unsafe("UPDATE counters SET value = ? WHERE id = 1", [() => 1]))
+            .pipe(Effect.flip);
+          assert(SqlError.isSqlError(failure));
+        }),
+      );
+      assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+        value: 5,
+      });
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "runs a nested transaction's marked writes at once, so its own failure rolls it back",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+        yield* sql`INSERT INTO unique_entries VALUES ('taken')`;
+        yield* sql.withTransaction(
+          SqliteClient.withDeferredWrites(sql)(
+            Effect.gen(function* () {
+              // The scope belongs to the outer level; the nested body opens none of its own.
+              const nested = yield* sql
+                .withTransaction(
+                  Effect.gen(function* () {
+                    yield* sql`UPDATE counters SET value = 7 WHERE id = 1`.pipe(
+                      SqliteClient.deferredWrite,
+                    );
+                    yield* sql`INSERT INTO unique_entries VALUES ('taken')`.pipe(
+                      SqliteClient.deferredWrite,
+                    );
+                  }),
+                )
+                .pipe(Effect.flip);
+              assert(SqlError.isSqlError(nested));
+              assert.equal(nested.reason._tag, "UniqueViolation");
+              const [row] = yield* sql<{ readonly value: number }>`
+              SELECT value FROM counters WHERE id = 1
+            `;
+              assert.equal(row?.value, 0);
+            }),
+          ),
+        );
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 0,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("runs a deferred write with the safe-integer setting it was made with", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE big_rows(id INTEGER PRIMARY KEY, name TEXT)`;
+      const large = 9007199254740993n;
+      // Safe integers for the whole transaction: COMMIT reports the last rowid too.
+      yield* sql
+        .withTransaction(
+          SqliteClient.withDeferredWrites(sql)(
+            sql`INSERT INTO big_rows VALUES (${large}, 'large')`.pipe(SqliteClient.deferredWrite),
+          ),
+        )
+        .pipe(Effect.provideService(SqlClient.SafeIntegers, true));
+      const row = other.prepare("SELECT name FROM big_rows").get();
+      assert.deepEqual(row, { name: "large" });
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "fails the deferring scope when another statement carried its failed write and that error was handled",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+        yield* sql`INSERT INTO unique_entries VALUES ('taken')`;
+        const error = yield* sql
+          .withTransaction(
+            SqliteClient.withDeferredWrites(sql)(
+              Effect.gen(function* () {
+                yield* sql`UPDATE counters SET value = 7 WHERE id = 1`.pipe(
+                  SqliteClient.deferredWrite,
+                );
+                yield* sql`INSERT INTO unique_entries VALUES ('taken')`.pipe(
+                  SqliteClient.deferredWrite,
+                );
+                yield* sql`UPDATE counters SET value = 99 WHERE id = 1`.pipe(
+                  SqliteClient.deferredWrite,
+                );
+                // The nested transaction's SAVEPOINT carries the waiting writes; its failure is ignored here.
+                yield* sql.withTransaction(Effect.void).pipe(Effect.ignore);
+              }),
+            ),
+          )
+          .pipe(Effect.flip);
+        assert(SqlError.isSqlError(error));
+        assert.equal(error.reason._tag, "UniqueViolation");
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 0,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("starts each run of a deferring scope without an earlier run's failure", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+      yield* sql`INSERT INTO unique_entries VALUES ('taken')`;
+      // One effect, run twice: the first run's failure must not stay with it.
+      const insert = sql.withTransaction(
+        SqliteClient.withDeferredWrites(sql)(
+          sql`INSERT INTO unique_entries VALUES ('taken')`.pipe(SqliteClient.deferredWrite),
+        ),
+      );
+      const first = yield* insert.pipe(Effect.flip);
+      assert(SqlError.isSqlError(first));
+      yield* sql`DELETE FROM unique_entries`;
+      yield* insert;
+      assert.deepEqual(other.prepare("SELECT COUNT(*) AS n FROM unique_entries").get(), { n: 1 });
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "fails a nested transaction whose SAVEPOINT fails, and keeps a later sibling's rollback",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`SELECT 1`;
+            breakNextSavepoint.on = true;
+            // Its SAVEPOINT fails; even with its statement's error handled inside, it must not succeed.
+            const first = yield* sql
+              .withTransaction(sql`UPDATE counters SET value = 7 WHERE id = 1`.pipe(Effect.ignore))
+              .pipe(Effect.exit);
+            assert(Exit.isFailure(first));
+            // A sibling with the same savepoint name rolls back its own write.
+            const second = yield* sql
+              .withTransaction(
+                sql`UPDATE counters SET value = 9 WHERE id = 1`.pipe(
+                  Effect.andThen(Effect.fail("stop" as const)),
+                ),
+              )
+              .pipe(Effect.flip);
+            assert.equal(second, "stop");
+          }),
+        );
+        assert.isFalse(breakNextSavepoint.on);
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 0,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("stores a deferred write's buffer binding as it was when the write was made", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE blobs(value BLOB)`;
+      const bytes = new Uint8Array([1]);
+      yield* sql.withTransaction(
+        SqliteClient.withDeferredWrites(sql)(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO blobs VALUES (${bytes})`.pipe(SqliteClient.deferredWrite);
+            // The caller reuses its buffer once the write has been made.
+            bytes[0] = 2;
+          }),
+        ),
+      );
+      assert.deepEqual(other.prepare("SELECT hex(value) AS value FROM blobs").get(), {
+        value: "01",
+      });
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "keeps the writer usable after a deferred write's unsendable binding fails a handled scope",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql.withTransaction(
+          SqliteClient.withDeferredWrites(sql)(
+            sql
+              .unsafe("UPDATE counters SET value = ? WHERE id = 1", [() => 1])
+              .pipe(SqliteClient.deferredWrite),
+          ).pipe(Effect.ignore),
+        );
+        yield* sql.withTransaction(sql`UPDATE counters SET value = 3 WHERE id = 1`);
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 3,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "waits for a concurrent statement that carried the scope's write before the scope succeeds",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+        yield* sql`INSERT INTO unique_entries VALUES ('taken')`;
+        const error = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              const queued = yield* Deferred.make<void>();
+              const scope = yield* SqliteClient.withDeferredWrites(sql)(
+                Effect.gen(function* () {
+                  yield* sql`UPDATE counters SET value = 7 WHERE id = 1`.pipe(
+                    SqliteClient.deferredWrite,
+                  );
+                  yield* sql`INSERT INTO unique_entries VALUES ('taken')`.pipe(
+                    SqliteClient.deferredWrite,
+                  );
+                  yield* Deferred.succeed(queued, undefined);
+                  // A concurrent statement takes the writes; this scope ends while it waits for its reply.
+                  yield* Effect.yieldNow;
+                }),
+              ).pipe(Effect.forkChild);
+              yield* Deferred.await(queued);
+              // The carrier handles its own error, as unrelated code may.
+              yield* sql`SELECT 1`.pipe(Effect.ignore);
+              yield* Fiber.join(scope);
+            }),
+          )
+          .pipe(Effect.flip);
+        assert(SqlError.isSqlError(error));
+        assert.equal(error.reason._tag, "UniqueViolation");
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 0,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+// A transaction begun by a statement, not by withTransaction, has no connection for a scope to flush.
+it.effect("runs a deferred write at once in a transaction a BEGIN statement opened", () =>
+  Effect.gen(function* () {
+    const { filename } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+      yield* sql`INSERT INTO unique_entries VALUES ('taken')`;
+      yield* sql`BEGIN IMMEDIATE`;
+      const exit = yield* SqliteClient.withDeferredWrites(sql)(
+        sql`INSERT INTO unique_entries VALUES ('taken')`.pipe(SqliteClient.deferredWrite),
+      ).pipe(Effect.exit);
+      yield* sql`ROLLBACK`;
+      assert(Exit.isFailure(exit));
+      const error = Cause.squash(exit.cause);
+      assert(SqlError.isSqlError(error));
+      assert.equal(error.reason._tag, "UniqueViolation");
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+// A scope with writes still waiting at its end flushes them, then still waits for an earlier carrier.
+it.effect(
+  "fails a deferring scope whose earlier carrier fails after its last writes are flushed",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+        yield* sql`INSERT INTO unique_entries VALUES ('taken')`;
+        const held = yield* Deferred.make<void>();
+        // The carrier's reply, a failure, lands just after the reply to the scope's flush.
+        heldCarrierReply.armed = true;
+        heldCarrierReply.afterNext = true;
+        heldCarrierReply.onHeld = () => void Deferred.doneUnsafe(held, Exit.void);
+        const error = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              const queued = yield* Deferred.make<void>();
+              const scope = yield* SqliteClient.withDeferredWrites(sql)(
+                Effect.gen(function* () {
+                  yield* sql`INSERT INTO unique_entries VALUES ('taken')`.pipe(
+                    SqliteClient.deferredWrite,
+                  );
+                  yield* Deferred.succeed(queued, undefined);
+                  yield* Deferred.await(held);
+                  yield* sql`UPDATE counters SET value = 7 WHERE id = 1`.pipe(
+                    SqliteClient.deferredWrite,
+                  );
+                }),
+              ).pipe(Effect.forkChild);
+              yield* Deferred.await(queued);
+              // The carrier handles its own error, as unrelated code may.
+              yield* sql`SELECT 1`.pipe(Effect.ignore);
+              yield* Fiber.join(scope);
+            }),
+          )
+          .pipe(Effect.flip);
+        heldCarrierReply.onHeld = undefined;
+        assert(SqlError.isSqlError(error));
+        assert.equal(error.reason._tag, "UniqueViolation");
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 0,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+// A scope's end that finds a carrier's reply still out waits for it. The reply is delivered at each
+// step of that end in turn, so one run has it land between the scope's check and its wait.
+it.live("ends a deferring scope whichever step of its end the last carrier's reply lands at", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const scheduler = new Scheduler.MixedScheduler();
+      let step = 0;
+      let deliverAt: number | undefined;
+      // Never yields, so a scope's end runs in one go; each step may deliver the held reply first.
+      const delivering: Scheduler.Scheduler = {
+        executionMode: scheduler.executionMode,
+        shouldYield: () => {
+          if (deliverAt !== undefined && step++ === deliverAt) heldCarrierReply.deliver?.();
+          return false;
+        },
+        makeDispatcher: () => scheduler.makeDispatcher(),
+      };
+      const endWithReplyAt = (at: number) =>
+        Effect.gen(function* () {
+          const held = yield* Deferred.make<void>();
+          const ending = yield* Deferred.make<void>();
+          let late = false;
+          heldCarrierReply.armed = true;
+          heldCarrierReply.onHeld = () => void Deferred.doneUnsafe(held, Exit.void);
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const queued = yield* Deferred.make<void>();
+              const scope = yield* SqliteClient.withDeferredWrites(sql)(
+                Effect.gen(function* () {
+                  yield* sql`UPDATE counters SET value = value + 1 WHERE id = 1`.pipe(
+                    SqliteClient.deferredWrite,
+                  );
+                  yield* Deferred.succeed(queued, undefined);
+                  yield* Deferred.await(held);
+                  yield* Effect.sync(() => {
+                    step = 0;
+                    deliverAt = at;
+                  });
+                  yield* Deferred.succeed(ending, undefined);
+                }),
+              ).pipe(Effect.provideService(Scheduler.Scheduler, delivering), Effect.forkChild);
+              yield* Deferred.await(queued);
+              // A reply no step delivered arrives once the scope's end has gone as far as it can
+              // without it: the yield lets the scope run on first.
+              const fallback = yield* Deferred.await(ending).pipe(
+                Effect.andThen(Effect.yieldNow),
+                Effect.andThen(
+                  Effect.sync(() => {
+                    if (heldCarrierReply.deliver === undefined) return;
+                    late = true;
+                    heldCarrierReply.deliver();
+                  }),
+                ),
+                Effect.forkChild,
+              );
+              // Carries the scope's waiting write; its reply is held.
+              yield* sql`SELECT 1`;
+              yield* Fiber.join(fallback);
+              // Once the reply is in, the scope's end needs no I/O: the project timeout catches a hang.
+              yield* Fiber.join(scope);
+            }),
+          );
+          deliverAt = undefined;
+          heldCarrierReply.onHeld = undefined;
+          return late;
+        });
+      const lateRuns = yield* Effect.forEach(
+        Array.from({ length: 32 }, (_, at) => at),
+        endWithReplyAt,
+      );
+      // The first run's reply lands before the scope's end checks; the last one's after it waits.
+      assert.deepEqual([lateRuns[0], lateRuns.at(-1)], [false, true]);
+      assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+        value: 32,
+      });
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("runs no flush statement for a deferring scope on the main-thread writer", () =>
+  Effect.gen(function* () {
+    const { filename } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`SELECT 1 AS warm`;
+      const prepared = yield* Effect.acquireRelease(
+        Effect.sync(() => vi.spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      yield* sql.withTransaction(SqliteClient.withDeferredWrites(sql)(Effect.void));
+      assert.deepEqual(
+        prepared.mock.calls.map(([text]) => String(text)).filter((text) => /^SELECT 1$/.test(text)),
+        [],
+      );
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: false })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "rolls back a transaction whose COMMIT carries a write that fails, keeping the writer usable",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE unique_entries(name TEXT UNIQUE)`;
+        yield* sql`INSERT INTO unique_entries VALUES ('taken')`;
+        carriedByNextCommit.statements = [
+          { sql: "INSERT INTO unique_entries VALUES ('taken')", params: [], cached: false },
+        ];
+        const error = yield* sql
+          .withTransaction(sql`UPDATE counters SET value = 9 WHERE id = 1`)
+          .pipe(Effect.flip);
+        assert(SqlError.isSqlError(error));
+        assert.equal(error.reason._tag, "UniqueViolation");
+        // Nothing of the transaction committed, and none of it stays open on the writer.
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 0,
+        });
+        yield* sql.withTransaction(sql`UPDATE counters SET value = 4 WHERE id = 1`);
+        assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+          value: 4,
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("discards waiting writes on a rollback without sending them", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`SELECT 1`;
+      const before = writerMessageCount();
+      const error = yield* sql
+        .withTransaction(
+          SqliteClient.withDeferredWrites(sql)(
+            sql`UPDATE counters SET value = 5 WHERE id = 1`.pipe(
+              SqliteClient.deferredWrite,
+              Effect.andThen(Effect.fail("stop" as const)),
+            ),
+          ),
+        )
+        .pipe(Effect.flip);
+      assert.equal(error, "stop");
+      assert.deepEqual(
+        writerMessagesSince(before).map((message) => [
+          String(message.sql).trim().split(/\s+/)[0],
+          (message.prelude as ReadonlyArray<unknown> | undefined)?.length ?? 0,
+        ]),
+        [
+          ["BEGIN", 0],
+          ["ROLLBACK", 0],
+        ],
+      );
+      assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+        value: 0,
+      });
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+// A scope may end at any step of a concurrent rollback that discards its waiting write. Whichever step it is, the
+// write is kept and committed, or the rollback's failure fails the scope: it never vanishes from a commit.
+it.live(
+  "never commits without a waiting write a failed rollback discarded, whichever step the scope ends at",
+  () =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const scheduler = new Scheduler.MixedScheduler();
+        let step = 0;
+        let endAt: number | undefined;
+        let end = () => {};
+        // At the chosen step of the rollback, the scope is let end and the rollback yields to it.
+        const yielding: Scheduler.Scheduler = {
+          executionMode: scheduler.executionMode,
+          shouldYield: () => {
+            if (endAt === undefined || step++ !== endAt) return false;
+            end();
+            return true;
+          },
+          makeDispatcher: () => scheduler.makeDispatcher(),
+        };
+        const endScopeAt = (at: number) =>
+          Effect.gen(function* () {
+            const queued = yield* Deferred.make<void>();
+            const ending = yield* Deferred.make<void>();
+            const exit = yield* sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  const scope = yield* SqliteClient.withDeferredWrites(sql)(
+                    Effect.gen(function* () {
+                      yield* sql`UPDATE counters SET value = 7 WHERE id = 1`.pipe(
+                        SqliteClient.deferredWrite,
+                      );
+                      yield* Deferred.succeed(queued, undefined);
+                      yield* Deferred.await(ending);
+                    }),
+                  ).pipe(Effect.forkChild);
+                  yield* Deferred.await(queued);
+                  yield* Effect.sync(() => {
+                    step = 0;
+                    endAt = at;
+                    end = () => void Deferred.doneUnsafe(ending, Exit.void);
+                  });
+                  // Handled, as the caller may; a rollback no step interrupted lets the scope end after it.
+                  yield* sql`ROLLBACK TO SAVEPOINT missing`.pipe(
+                    Effect.ignore,
+                    Effect.provideService(Scheduler.Scheduler, yielding),
+                  );
+                  endAt = undefined;
+                  yield* Deferred.succeed(ending, undefined);
+                  yield* Fiber.join(scope);
+                }),
+              )
+              .pipe(Effect.exit);
+            const { value } = other.prepare("SELECT value FROM counters WHERE id = 1").get() as {
+              value: number;
+            };
+            other.exec("UPDATE counters SET value = 0 WHERE id = 1");
+            return Exit.isSuccess(exit)
+              ? value === 7
+                ? "kept"
+                : "lost"
+              : SqlError.isSqlError(Cause.squash(exit.cause)) && value === 0
+                ? "failed"
+                : "other";
+          });
+        const outcomes = yield* Effect.forEach(
+          Array.from({ length: 32 }, (_, at) => at),
+          endScopeAt,
+        );
+        assert.deepEqual(
+          outcomes.filter((outcome) => outcome !== "kept" && outcome !== "failed"),
+          [],
+        );
+        // The sweep reaches both sides: the scope ending before the rollback, and after it.
+        assert.deepEqual([outcomes[0], outcomes.at(-1)], ["kept", "failed"]);
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+// A rollback that fails undoes nothing, so writes it discarded unsent cannot just vanish: their scope fails.
+it.effect("fails a deferring scope whose waiting writes a failed rollback discarded", () =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const error = yield* sql
+        .withTransaction(
+          SqliteClient.withDeferredWrites(sql)(
+            Effect.gen(function* () {
+              yield* sql`UPDATE counters SET value = 5 WHERE id = 1`.pipe(
+                SqliteClient.deferredWrite,
+              );
+              // The caller handles the rollback's error, as it may.
+              yield* sql`ROLLBACK TO SAVEPOINT missing`.pipe(Effect.ignore);
+            }),
+          ),
+        )
+        .pipe(Effect.flip);
+      assert(SqlError.isSqlError(error));
+      assert.include(String(error.reason.cause), "no such savepoint");
+      assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+        value: 0,
+      });
+      yield* sql.withTransaction(sql`UPDATE counters SET value = 4 WHERE id = 1`);
+      assert.deepEqual(other.prepare("SELECT value FROM counters WHERE id = 1").get(), {
+        value: 4,
+      });
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([
+  { writer: "the writer worker", writerWorker: true },
+  { writer: "the main-thread writer", writerWorker: false },
+])("runs a deferred write at once outside a deferring transaction on $writer", ({ writerWorker }) =>
+  Effect.gen(function* () {
+    const { filename, other } = yield* makeTempDatabase;
+    const value = () => other.prepare("SELECT value FROM counters WHERE id = 1").get();
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      // No transaction: an autocommit write, visible at once.
+      yield* SqliteClient.withDeferredWrites(sql)(
+        sql`UPDATE counters SET value = 1 WHERE id = 1`.pipe(SqliteClient.deferredWrite),
+      );
+      assert.deepEqual(value(), { value: 1 });
+      // A transaction without the scope: the write is its own statement.
+      const before = writerWorker ? writerMessageCount() : 0;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`UPDATE counters SET value = 2 WHERE id = 1`.pipe(SqliteClient.deferredWrite);
+          const [row] = yield* sql<{
+            readonly value: number;
+          }>`SELECT value FROM counters WHERE id = 1`;
+          assert.equal(row?.value, 2);
+        }),
+      );
+      assert.deepEqual(value(), { value: 2 });
+      if (writerWorker) {
+        assert.deepEqual(
+          writerMessagesSince(before).map((message) => [
+            String(message.sql).trim().split(/\s+/)[0],
+            (message.prelude as ReadonlyArray<unknown> | undefined)?.length ?? 0,
+          ]),
+          [
+            ["BEGIN", 0],
+            ["UPDATE", 0],
+            ["SELECT", 0],
+            ["COMMIT", 0],
+          ],
+        );
+      }
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker })));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
@@ -1777,4 +2706,529 @@ it.effect.each([
         }),
       { writerWorker },
     ),
+);
+
+// Writer priority: background writes share the writer without making foreground ones wait behind them.
+type Mark = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+const foreground: Mark = (effect) => effect;
+
+// A writer transaction that records its start and holds the writer until released.
+const holdWriter = (
+  sql: SqlClient.SqlClient,
+  name: string,
+  started: Array<string>,
+  mark = foreground,
+) =>
+  Effect.gen(function* () {
+    const running = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const fiber = yield* sql
+      .withTransaction(
+        sql`SELECT ${name} AS name`.pipe(
+          Effect.andThen(Effect.sync(() => started.push(name))),
+          Effect.andThen(Deferred.succeed(running, undefined)),
+          Effect.andThen(Deferred.await(release)),
+        ),
+      )
+      .pipe(mark, Effect.withSpan(`test.${name}`), Effect.forkChild({ startImmediately: true }));
+    return {
+      fiber,
+      running: Deferred.await(running),
+      release: Deferred.succeed(release, undefined).pipe(Effect.andThen(Fiber.join(fiber))),
+    };
+  });
+
+// A single statement takes the writer through the other acquisition path, outside a transaction.
+const writerStatement = (
+  sql: SqlClient.SqlClient,
+  name: string,
+  started: Array<string>,
+  mark = foreground,
+) =>
+  sql`SELECT ${name} AS name`.pipe(
+    Effect.andThen(Effect.sync(() => started.push(name))),
+    mark,
+    Effect.forkChild({ startImmediately: true }),
+  );
+
+// Lets every runnable fiber run before an assertion that something has NOT started.
+const settle = Effect.gen(function* () {
+  for (let turn = 0; turn < 20; turn++) yield* Effect.yieldNow;
+  yield* TestClock.adjust("1 second");
+  for (let turn = 0; turn < 20; turn++) yield* Effect.yieldNow;
+});
+
+const writerClients = [
+  { writer: "in-process", writerWorker: false },
+  { writer: "worker", writerWorker: true },
+] as const;
+
+it.effect.each(writerClients)(
+  "a background write waits while the writer is held ($writer writer)",
+  ({ writerWorker }) =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const started: Array<string> = [];
+          // On an idle writer a background write starts at once.
+          yield* Fiber.join(yield* writerStatement(sql, "idle", started, SqliteClient.background));
+          const holder = yield* holdWriter(sql, "holder", started);
+          yield* holder.running;
+          const statement = yield* writerStatement(
+            sql,
+            "statement",
+            started,
+            SqliteClient.background,
+          );
+          const transaction = yield* holdWriter(
+            sql,
+            "transaction",
+            started,
+            SqliteClient.background,
+          );
+          yield* settle;
+          assert.deepEqual(started, ["idle", "holder"]);
+          yield* holder.release;
+          yield* Fiber.join(statement);
+          yield* transaction.running;
+          yield* transaction.release;
+          assert.deepEqual(started, ["idle", "holder", "statement", "transaction"]);
+        }),
+      { writerWorker },
+    ),
+);
+
+it.effect.each(writerClients)(
+  "a background write yields to a foreground acquisition already waiting ($writer writer)",
+  ({ writerWorker }) =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const started: Array<string> = [];
+          const holder = yield* holdWriter(sql, "holder", started);
+          yield* holder.running;
+          // The background ones queue first; both foreground ones still go before them.
+          const backgroundTransaction = yield* holdWriter(
+            sql,
+            "background-transaction",
+            started,
+            SqliteClient.background,
+          );
+          const backgroundStatement = yield* writerStatement(
+            sql,
+            "background-statement",
+            started,
+            SqliteClient.background,
+          );
+          const foregroundStatement = yield* writerStatement(sql, "foreground-statement", started);
+          const foregroundTransaction = yield* holdWriter(sql, "foreground-transaction", started);
+          yield* settle;
+          yield* holder.release;
+          yield* Fiber.join(foregroundStatement);
+          yield* foregroundTransaction.running;
+          yield* settle;
+          assert.deepEqual(started, ["holder", "foreground-statement", "foreground-transaction"]);
+          yield* foregroundTransaction.release;
+          yield* backgroundTransaction.running;
+          yield* backgroundTransaction.release;
+          yield* Fiber.join(backgroundStatement);
+          assert.deepEqual(started, [
+            "holder",
+            "foreground-statement",
+            "foreground-transaction",
+            "background-transaction",
+            "background-statement",
+          ]);
+        }),
+      { writerWorker },
+    ),
+);
+
+it.effect.each(writerClients)(
+  "a foreground acquisition waits for at most the one background hold in flight ($writer writer)",
+  ({ writerWorker }) =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const started: Array<string> = [];
+          const holder = yield* holdWriter(sql, "holder", started);
+          yield* holder.running;
+          // Continuous background demand: three queued before any foreground arrives.
+          const backgrounds = yield* Effect.forEach(["b1", "b2", "b3"], (name) =>
+            holdWriter(sql, name, started, SqliteClient.background),
+          );
+          const first = yield* writerStatement(sql, "f1", started);
+          yield* settle;
+          yield* holder.release;
+          yield* Fiber.join(first);
+          yield* backgrounds[0]!.running;
+          // A foreground arrival during a background hold goes next, ahead of the queued background ones.
+          const second = yield* writerStatement(sql, "f2", started);
+          yield* settle;
+          assert.deepEqual(started, ["holder", "f1", "b1"]);
+          yield* backgrounds[0]!.release;
+          yield* Fiber.join(second);
+          for (const background of backgrounds.slice(1)) {
+            yield* background.running;
+            yield* background.release;
+          }
+          assert.deepEqual(started, ["holder", "f1", "b1", "f2", "b2", "b3"]);
+        }),
+      { writerWorker },
+    ),
+);
+
+it.effect.each(writerClients)(
+  "a background write takes the gap at a foreground release with no one waiting ($writer writer)",
+  ({ writerWorker }) =>
+    withReaderClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const started: Array<string> = [];
+          // A lane that takes the writer again the moment it lets go, in the same fiber.
+          const gates = yield* Effect.forEach([1, 2, 3], () => Deferred.make<void>());
+          // Progress is awaited, not settled for: a worker writer's round trip takes real time.
+          const lanes = yield* Effect.forEach([1, 2, 3], () => Deferred.make<void>());
+          const lane = yield* Effect.forEach(
+            gates,
+            (gate, index) =>
+              sql.withTransaction(
+                sql`SELECT ${index} AS turn`.pipe(
+                  Effect.andThen(Effect.sync(() => started.push(`lane-${index + 1}`))),
+                  Effect.andThen(Deferred.succeed(lanes[index]!, undefined)),
+                  Effect.andThen(Deferred.await(gate)),
+                ),
+              ),
+            { discard: true },
+          ).pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.await(lanes[0]!);
+          const background = yield* writerStatement(
+            sql,
+            "background",
+            started,
+            SqliteClient.background,
+          );
+          yield* settle;
+          assert.deepEqual(started, ["lane-1"]);
+          // lane-1 took the writer before the background write queued, so lane-2 follows it at
+          // once; lane-2's release, with no foreground waiter, hands the writer to the background.
+          yield* Deferred.succeed(gates[0]!, undefined);
+          yield* Deferred.await(lanes[1]!);
+          yield* settle;
+          assert.deepEqual(started, ["lane-1", "lane-2"]);
+          yield* Deferred.succeed(gates[1]!, undefined);
+          yield* Fiber.join(background);
+          yield* Deferred.await(lanes[2]!);
+          assert.deepEqual(started, ["lane-1", "lane-2", "background", "lane-3"]);
+          yield* Deferred.succeed(gates[2]!, undefined);
+          yield* Fiber.join(lane);
+        }),
+      { writerWorker },
+    ),
+);
+
+it.effect(
+  "reports a background write's wait at its own site, apart from foreground writer waits",
+  () =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        const started: Array<string> = [];
+        const holder = yield* holdWriter(sql, "holder", started);
+        yield* holder.running;
+        const { waits, observer } = recordingObserver();
+        const background = yield* writerStatement(sql, "background", started, (effect) =>
+          SqliteClient.background(Effect.provideService(effect, CurrentWaitObserver, observer)),
+        );
+        yield* settle;
+        yield* holder.release;
+        yield* Fiber.join(background);
+        assert.deepStrictEqual(waits, [["sqlite.writer.background", 1e9, "test.holder"]]);
+      }),
+    ),
+);
+
+it.effect("drops an interrupted background waiter without holding up later writes", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const started: Array<string> = [];
+      const holder = yield* holdWriter(sql, "holder", started);
+      yield* holder.running;
+      const dropped = yield* writerStatement(sql, "dropped", started, SqliteClient.background);
+      yield* settle;
+      yield* Fiber.interrupt(dropped);
+      const waiting = yield* writerStatement(sql, "background", started, SqliteClient.background);
+      yield* settle;
+      yield* holder.release;
+      yield* Fiber.join(waiting);
+      yield* Fiber.join(yield* writerStatement(sql, "foreground", started));
+      yield* Fiber.join(yield* writerStatement(sql, "idle", started, SqliteClient.background));
+      assert.deepEqual(started, ["holder", "background", "foreground", "idle"]);
+    }),
+  ),
+);
+
+// Measured on 5960bd711f's plain semaphore; see the row that uses it.
+const PLAIN_SEMAPHORE_TURNS: ReadonlyArray<string> = [
+  "a+0",
+  "b+1",
+  "c+1",
+  "d+2",
+  "e+2",
+  "f+2",
+  "g+2",
+  "h+3",
+];
+
+// Sweeps every yield point: the contender yields after each operation (MaxOpsBeforeYield 1).
+const yieldingEveryStep: Mark = (effect) =>
+  Effect.provideService(effect, Scheduler.MaxOpsBeforeYield, 1);
+
+const acquisitions = [
+  { path: "statement", priority: "foreground" },
+  { path: "statement", priority: "background" },
+  { path: "transaction", priority: "foreground" },
+  { path: "transaction", priority: "background" },
+] as const;
+
+const contend = (
+  sql: SqlClient.SqlClient,
+  path: "statement" | "transaction",
+  priority: "foreground" | "background",
+) => {
+  const statement = sql`SELECT 1`;
+  const acquisition = path === "statement" ? statement : sql.withTransaction(statement);
+  return acquisition.pipe(
+    priority === "background" ? SqliteClient.background : foreground,
+    yieldingEveryStep,
+    Effect.forkChild({ startImmediately: true }),
+  );
+};
+
+it.effect.each(acquisitions)(
+  "a $priority $path acquisition gets the writer released at any step of its acquisition",
+  ({ path, priority }) =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        for (let step = 0; step < 40; step++) {
+          const started: Array<string> = [];
+          const holder = yield* holdWriter(sql, "holder", started);
+          yield* holder.running;
+          const contender = yield* contend(sql, path, priority);
+          for (let turn = 0; turn < step; turn++) yield* Effect.yieldNow;
+          yield* holder.release;
+          // A contender stranded on a free writer never finishes: the test times out here.
+          yield* Fiber.join(contender);
+        }
+      }),
+    ),
+);
+
+it.effect.each(acquisitions)(
+  "a $priority $path acquisition interrupted at any step leaves the writer free",
+  ({ path, priority }) =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        for (let step = 0; step < 40; step++) {
+          const contender = yield* contend(sql, path, priority);
+          for (let turn = 0; turn < step; turn++) yield* Effect.yieldNow;
+          yield* Fiber.interrupt(contender);
+          // A writer leaked by the interrupted acquisition never frees: the test times out here.
+          yield* sql`SELECT 1`;
+        }
+      }),
+    ),
+);
+
+// Foreground writes keep the semaphore's scheduling exactly: queued behind a holder, they run at
+// the same scheduler turns relative to other fibers as on the plain semaphore (5960bd711f). A lock
+// that handed the writer on one turn at a time kept their order but moved them against other
+// fibers' work, which flipped SteeringCompletion's turn-gap rows. Re-pin after an Effect upgrade.
+it.effect("queued foreground writes run at the plain semaphore's scheduler turns", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const started: Array<string> = [];
+      const holder = yield* holdWriter(sql, "holder", started);
+      yield* holder.running;
+      let turn = 0;
+      const ticks: Array<readonly [string, number]> = [];
+      const names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+      const queued = yield* Effect.forEach(names, (name, index) =>
+        (index % 2 === 0
+          ? sql`SELECT ${name} AS name`
+          : sql.withTransaction(sql`SELECT ${name} AS name`)
+        ).pipe(
+          Effect.andThen(Effect.sync(() => ticks.push([name, turn]))),
+          Effect.forkChild({ startImmediately: true }),
+        ),
+      );
+      const ticker = yield* Effect.gen(function* () {
+        for (;;) {
+          turn++;
+          yield* Effect.yieldNow;
+        }
+      }).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* holder.release;
+      yield* Effect.forEach(queued, Fiber.join);
+      yield* Fiber.interrupt(ticker);
+      const first = Math.min(...ticks.map(([, at]) => at));
+      assert.deepEqual(
+        ticks.map(([name, at]) => `${name}+${at - first}`),
+        PLAIN_SEMAPHORE_TURNS,
+      );
+    }),
+  ),
+);
+
+const statementShape = (statement: SqliteClient.RecordedStatement) =>
+  `${statement.sql.replace(/\s+/g, " ").trim()} ${JSON.stringify(statement.params)}`;
+
+it.effect.each([false, true])(
+  "keeps what a scope wrote, its savepoints included and its reads and failed statements left out, and applies it again (worker=%s)",
+  (writerWorker) =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const kept: Array<SqliteClient.RecordedStatement> = [];
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* SqliteClient.recordStatements(kept)(
+              Effect.gen(function* () {
+                yield* sql`UPDATE counters SET value = ${5} WHERE id = 1`;
+                yield* sql`SELECT value FROM counters WHERE id = 1`;
+                yield* sql
+                  .withTransaction(
+                    sql`UPDATE counters SET value = 6 WHERE id = 1`.pipe(
+                      Effect.andThen(Effect.fail("undo")),
+                    ),
+                  )
+                  .pipe(Effect.ignore);
+                yield* sql`INSERT INTO counters VALUES (1, 0)`.pipe(Effect.ignore);
+                yield* sql`INSERT INTO counters VALUES (${2}, ${9})`;
+              }),
+            );
+            // Undone, then applied again from what was kept: the same rows.
+            yield* SqliteClient.restartTransaction(sql);
+            assert.deepEqual(yield* sql`SELECT id, value FROM counters ORDER BY id`, [
+              { id: 1, value: 0 },
+            ]);
+            yield* SqliteClient.applyStatements(sql, kept);
+          }),
+        );
+        assert.deepEqual(kept.map(statementShape), [
+          "UPDATE counters SET value = ? WHERE id = 1 [5]",
+          "SAVEPOINT effect_sql_1 []",
+          "UPDATE counters SET value = 6 WHERE id = 1 []",
+          "ROLLBACK TO SAVEPOINT effect_sql_1 []",
+          "INSERT INTO counters VALUES (?, ?) [2,9]",
+        ]);
+        assert.deepEqual(other.prepare("SELECT id, value FROM counters ORDER BY id").all(), [
+          { id: 1, value: 5 },
+          { id: 2, value: 9 },
+        ]);
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([false, true])(
+  "restarts a transaction on its own connection, so another writer waits until it commits (worker=%s)",
+  (writerWorker) =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const release = yield* Deferred.make<void>();
+        const asking = yield* Deferred.make<void>();
+        let landed = false;
+        const competing = yield* Deferred.await(release).pipe(
+          Effect.andThen(Deferred.succeed(asking, undefined)),
+          Effect.andThen(sql`UPDATE counters SET value = 100 WHERE id = 1`),
+          Effect.andThen(
+            Effect.sync(() => {
+              landed = true;
+            }),
+          ),
+          Effect.forkScoped,
+        );
+        let landedInGap: boolean | undefined;
+        const probe = Effect.gen(function* () {
+          yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(asking);
+          for (let turn = 0; turn < 100; turn++) yield* Effect.yieldNow;
+          landedInGap = landed;
+        });
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO counters VALUES (3, 3)`;
+              yield* SqliteClient.restartTransaction(sql);
+              yield* sql`INSERT INTO counters VALUES (2, 2)`;
+            }),
+          )
+          .pipe(Effect.provideService(SqliteClient.RestartGapProbe, probe));
+        yield* Fiber.join(competing);
+        assert.isFalse(landedInGap);
+        // The write before the restart was undone; the other writer ran after the commit.
+        assert.deepEqual(other.prepare("SELECT id, value FROM counters ORDER BY id").all(), [
+          { id: 1, value: 100 },
+          { id: 2, value: 2 },
+        ]);
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([false, true])(
+  "leaves a transaction for its caller to roll back when a restart cannot begin again (worker=%s)",
+  (writerWorker) =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        // Another process takes the write lock in the gap, so BEGIN IMMEDIATE is busy at once.
+        const probe = sql
+          .unsafe("PRAGMA busy_timeout = 0")
+          .pipe(Effect.orDie, Effect.andThen(Effect.sync(() => other.exec("BEGIN IMMEDIATE"))));
+        const exit = yield* sql
+          .withTransaction(
+            sql`INSERT INTO counters VALUES (3, 3)`.pipe(
+              Effect.andThen(SqliteClient.restartTransaction(sql)),
+            ),
+          )
+          .pipe(Effect.provideService(SqliteClient.RestartGapProbe, probe), Effect.exit);
+        other.exec("ROLLBACK");
+        assert(Exit.isFailure(exit));
+        assert.isFalse(Cause.hasDies(exit.cause));
+        assert(SqlError.isSqlError(Cause.squash(exit.cause)));
+        // Nothing was written, and the writer takes the next transaction.
+        yield* sql.withTransaction(sql`UPDATE counters SET value = 4 WHERE id = 1`);
+        assert.deepEqual(other.prepare("SELECT id, value FROM counters ORDER BY id").all(), [
+          { id: 1, value: 4 },
+        ]);
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([false, true])(
+  "applies a kept buffer binding with the bytes it wrote, though the buffer changed after (worker=%s)",
+  (writerWorker) =>
+    Effect.gen(function* () {
+      const { filename, other } = yield* makeTempDatabase;
+      other.exec("CREATE TABLE blobs(id INTEGER PRIMARY KEY, value BLOB NOT NULL)");
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const kept: Array<SqliteClient.RecordedStatement> = [];
+        const bytes = new Uint8Array([1, 2]);
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* SqliteClient.recordStatements(kept)(sql`INSERT INTO blobs VALUES (1, ${bytes})`);
+            bytes[0] = 99;
+            yield* SqliteClient.restartTransaction(sql);
+            yield* SqliteClient.applyStatements(sql, kept);
+          }),
+        );
+        assert.deepEqual(other.prepare("SELECT hex(value) AS value FROM blobs").get(), {
+          value: "0102",
+        });
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker })));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

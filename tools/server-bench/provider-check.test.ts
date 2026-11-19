@@ -154,7 +154,7 @@ describe("provider check runs", () => {
   });
 
   it("reads the causes this server build logs, verbatim", () => {
-    // Entries copied unchanged from the fault runs' server.log; a new log format shows up here.
+    // Entries as a fault run's server.log has them (checkout paths shortened); a new log format shows up here.
     const log = NodeFS.readFileSync(
       NodePath.join(import.meta.dirname, "provider-check.server-log.txt"),
       "utf8",

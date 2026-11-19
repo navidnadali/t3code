@@ -391,7 +391,7 @@ it.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
     ),
 );
 
-// thread views, the palette and mobile run discovery, so its login shell must not fork the
+// Thread views, the palette and mobile run discovery, so its login shell must not fork the
 // server.
 it.effect.skipIf(!commandsLeaveTheServer)(
   "reads the login shell from the server's command spawner",

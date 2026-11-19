@@ -2,23 +2,23 @@
   {
     runId: 'run:thread:mcp%3A407ac761-5ea4-4809-b09f-886c22d680cc:ordinal:1',
     cause: 'RunExecutionIngestError: Failed while ingesting orchestration V2 run execution run:thread:mcp%3A407ac761-5ea4-4809-b09f-886c22d680cc:ordinal:1.\n' +
-      '    at file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:281049:95\n' +
-      '    at file:///build/t3code/apps/server/dist/Effect-BniB5fSx.mjs:10044:96\n' +
-      '    at RunExecutionService.startRootRun (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302189:23)\n' +
-      '    at RunExecutionService.startRootRun (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:280729:50)\n' +
-      '    at ProviderTurnStartService.start (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302571:57)\n' +
-      '    at ProviderTurnStartService.start (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302222:48)\n' +
-      '    at OrchestrationEffectExecutorV2.execute (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302878:30)\n' +
-      '    at OrchestrationEffectExecutorV2.execute (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302547:53)\n' +
-      '    at serverActivation.forkParkedFiber (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:317187:29)\n' +
-      '    at serverActivation.forkParkedFiber (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:141244:25)\n' +
-      '    at ServerRuntimeStartup.startEffectWorkerWithRelay (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:317263:79)\n' +
-      '    at ServerRuntimeStartup.startEffectWorkerWithRelay (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:317186:36) {\n' +
+      '    at file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:281049:95\n' +
+      '    at file:///srv/t3/apps/server/dist/Effect-BniB5fSx.mjs:10044:96\n' +
+      '    at RunExecutionService.startRootRun (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302189:23)\n' +
+      '    at RunExecutionService.startRootRun (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:280729:50)\n' +
+      '    at ProviderTurnStartService.start (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302571:57)\n' +
+      '    at ProviderTurnStartService.start (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302222:48)\n' +
+      '    at OrchestrationEffectExecutorV2.execute (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302878:30)\n' +
+      '    at OrchestrationEffectExecutorV2.execute (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302547:53)\n' +
+      '    at serverActivation.forkParkedFiber (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:317187:29)\n' +
+      '    at serverActivation.forkParkedFiber (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:141244:25)\n' +
+      '    at ServerRuntimeStartup.startEffectWorkerWithRelay (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:317263:79)\n' +
+      '    at ServerRuntimeStartup.startEffectWorkerWithRelay (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:317186:36) {\n' +
       '  [cause]: ProviderAdapterEventStreamError: Failed while streaming codex provider session provider-session:provider-instance:codexBench:shared events.\n' +
-      '      at file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:229203:73\n' +
-      '      at file:///build/t3code/apps/server/dist/Effect-BniB5fSx.mjs:9989:96 {\n' +
+      '      at file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:229203:73\n' +
+      '      at file:///srv/t3/apps/server/dist/Effect-BniB5fSx.mjs:9989:96 {\n' +
       '    [cause]: CodexAppServerProcessExitedError: Codex App Server process exited with code 1\n' +
-      '        at file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:227470:10\n' +
+      '        at file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:227470:10\n' +
       '  }\n' +
       '}'
   }
@@ -29,15 +29,15 @@
     providerThreadId: 'provider-thread:provider:acpRegistry:native-thread:pending%3Arun%3Athread%3Amcp%253A45b0f4b3-7ac0-44a1-be2e-28a3765d0b7f%3Aordinal%3A1',
     providerTurnId: 'provider-turn:provider:acpRegistry:native-turn:provider-instance%3AacpBench%3A7e21e034-2406-4721-b470-aa566e4aaa93%3Aturn%3A1',
     cause: 'AcpProcessExitedError: ACP process exited with code 1\n' +
-      '    at Object.onSuccess (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:169851:23)\n' +
-      '    at AcpAdapterV2.startTurn (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:178315:54)\n' +
-      '    at AcpAdapterV2.startTurn (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:178036:30)\n' +
-      '    at AcpAdapterV2.startTurn.transition (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:282133:25)\n' +
-      '    at AcpAdapterV2.startTurn.transition (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:178314:22)\n' +
-      '    at RunExecutionService.startRootRun (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302189:23)\n' +
-      '    at RunExecutionService.startRootRun (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:280729:50)\n' +
-      '    at ProviderTurnStartService.start (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302571:57)\n' +
-      '    at ProviderTurnStartService.start (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302222:48)\n' +
-      '    at OrchestrationEffectExecutorV2.execute (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302878:30)\n' +
-      '    at OrchestrationEffectExecutorV2.execute (definition) (file:///build/t3code/apps/server/dist/binCli-DRSmVb1j.mjs:302547:53)'
+      '    at Object.onSuccess (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:169851:23)\n' +
+      '    at AcpAdapterV2.startTurn (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:178315:54)\n' +
+      '    at AcpAdapterV2.startTurn (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:178036:30)\n' +
+      '    at AcpAdapterV2.startTurn.transition (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:282133:25)\n' +
+      '    at AcpAdapterV2.startTurn.transition (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:178314:22)\n' +
+      '    at RunExecutionService.startRootRun (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302189:23)\n' +
+      '    at RunExecutionService.startRootRun (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:280729:50)\n' +
+      '    at ProviderTurnStartService.start (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302571:57)\n' +
+      '    at ProviderTurnStartService.start (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302222:48)\n' +
+      '    at OrchestrationEffectExecutorV2.execute (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302878:30)\n' +
+      '    at OrchestrationEffectExecutorV2.execute (definition) (file:///srv/t3/apps/server/dist/binCli-DRSmVb1j.mjs:302547:53)'
   }

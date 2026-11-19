@@ -37,7 +37,7 @@ describe("parseGitConfigList", () => {
 
 describe("gitConfigListDependencies", () => {
   const options = {
-    home: "/srv/me",
+    home: "/u/me",
     windows: false,
     isAbsolute: (p: string) => p.startsWith("/"),
   };
@@ -51,25 +51,25 @@ describe("gitConfigListDependencies", () => {
     {
       name: "absolute origins, and not the repository's relative ones",
       entries: [
-        entry("file:/srv/me/.gitconfig", "user.name"),
+        entry("file:/u/me/.gitconfig", "user.name"),
         entry("file:.git/config", "core.bare"),
         entry("command line:", "safe.barerepository"),
       ],
-      expected: { paths: ["/srv/me/.gitconfig"], supported: true },
+      expected: { paths: ["/u/me/.gitconfig"], supported: true },
     },
     {
       name: "include targets whether or not they were read",
       entries: [
-        entry("file:/srv/me/.gitconfig", "include.path", "~/.gitconfig-local"),
-        entry("file:/srv/me/.gitconfig", "includeif.gitdir:~/work/.path", "work/../config"),
+        entry("file:/u/me/.gitconfig", "include.path", "~/.gitconfig-local"),
+        entry("file:/u/me/.gitconfig", "includeif.gitdir:~/work/.path", "work/../config"),
         entry("file:.git/config", "includeif.hasconfig:remote.*.url:https://x/**.path", "/etc/x"),
         entry("file:.git/config", "includeif.gitdir/i:/w/.path", "/etc/y"),
       ],
       expected: {
         paths: [
-          "/srv/me/.gitconfig",
-          "/srv/me/.gitconfig-local",
-          "/srv/me/work/../config",
+          "/u/me/.gitconfig",
+          "/u/me/.gitconfig-local",
+          "/u/me/work/../config",
           "/etc/x",
           "/etc/y",
         ],
@@ -83,13 +83,13 @@ describe("gitConfigListDependencies", () => {
     },
     {
       name: "an include that depends on the branch",
-      entries: [entry("file:/srv/me/.gitconfig", "includeif.onbranch:main.path", "/etc/main")],
-      expected: { paths: ["/srv/me/.gitconfig", "/etc/main"], supported: false },
+      entries: [entry("file:/u/me/.gitconfig", "includeif.onbranch:main.path", "/etc/main")],
+      expected: { paths: ["/u/me/.gitconfig", "/etc/main"], supported: false },
     },
     {
       name: "an include in another user's home",
-      entries: [entry("file:/srv/me/.gitconfig", "include.path", "~other/config")],
-      expected: { paths: ["/srv/me/.gitconfig"], supported: false },
+      entries: [entry("file:/u/me/.gitconfig", "include.path", "~other/config")],
+      expected: { paths: ["/u/me/.gitconfig"], supported: false },
     },
     {
       name: "an include under the runtime prefix",
@@ -127,14 +127,14 @@ describe("gitConfigListDependencies", () => {
 
 describe("gitConfigEnvironmentSignature", () => {
   it("changes with the config Git takes from the environment", () => {
-    const base = { HOME: "/srv/me", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "a.b" };
+    const base = { HOME: "/u/me", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "a.b" };
     assert.notEqual(
       gitConfigEnvironmentSignature({ ...base, GIT_CONFIG_VALUE_0: "1" }),
       gitConfigEnvironmentSignature({ ...base, GIT_CONFIG_VALUE_0: "2" }),
     );
     assert.notEqual(
       gitConfigEnvironmentSignature(base),
-      gitConfigEnvironmentSignature({ ...base, HOME: "/srv/other" }),
+      gitConfigEnvironmentSignature({ ...base, HOME: "/u/other" }),
     );
     assert.isNull(gitConfigEnvironmentSignature({ ...base, GIT_CONFIG: "/tmp/only" }));
     assert.isNull(gitConfigEnvironmentSignature({ ...base, GIT_CONFIG_COUNT: "1001" }));

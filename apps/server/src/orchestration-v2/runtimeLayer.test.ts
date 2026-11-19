@@ -10527,7 +10527,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const visible = Array.from({ length: 8 }, (_, index) => `visible-${index + 1}`);
       for (const key of visible) yield* send(key);
 
-      // C1 lets a wake through after four visible starts; each wake carries at most 25 results.
+      // The wake-ordering rule lets a wake through after four visible starts; each wake carries at most 25 results.
       const startedRunIds = yield* watchQueuedStarts(threadId);
       const starts: Array<string> = [];
       let current = yield* runFor("active");
@@ -11318,9 +11318,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           );
           const pendingStarts = starts.filter((effect) => effect.status === "pending");
           assert.lengthOf(pendingStarts, 1);
+          // A person's queued message on a root thread: its start keeps the claim priority.
           assert.deepEqual(pendingStarts[0]?.request, {
             type: "provider-turn.start",
             runId: source.id,
+            claimPriority: "user",
           });
         }
         const afterRetries = yield* orchestrator.getThreadProjection(threadId);

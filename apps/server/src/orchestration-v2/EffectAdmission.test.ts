@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -313,7 +314,7 @@ it.effect("keeps counting a slot through the longest ordinary turn start", () =>
     const { admission } = yield* makeHarness(2);
     const first = yield* reserve(admission);
     const second = yield* reserve(admission);
-    // Turn starts can run for minutes: their slow tail must not expire the slot, or
+    // Turn starts run a minute or two, as a rule: their slow tail must not expire the slot, or
     // the gate would drift back towards the worker count under exactly the load it is for.
     yield* TestClock.adjust("5 minutes");
     assert.deepEqual(yield* admission.excludedTypes, EffectAdmission.GATED_EFFECT_TYPES);
@@ -433,7 +434,7 @@ it.effect("starts its sample counts afresh after it stops", () =>
   }),
 );
 
-/** Replays a loop-delay p99 series, one sample a second, through an armed gate: the state after each sample. */
+/** Replays a 1 Hz loop-delay p99 shape through an armed gate: the state after each sample. */
 const replay = (series: ReadonlyArray<number>) =>
   Effect.gen(function* () {
     const { admission, pressure } = yield* makeHarness(4);
@@ -534,5 +535,185 @@ it.effect("sizes the saturated allowance, the reopen mark and the pressure readi
       250,
     );
     assert.equal(Duration.toMillis(EffectAdmission.SLOT_MAX_HOLD), 600_000);
+  }),
+);
+
+// A gated effect waiting on the commit lane does no main-thread work, so its slot can
+// run another gated effect meanwhile; it takes its slot back when its write lands.
+it.effect("lends a waiting effect's slot to another gated effect", () =>
+  Effect.gen(function* () {
+    const { admission, freed } = yield* makeHarness(2);
+    const waiting = yield* reserve(admission);
+    const working = yield* reserve(admission);
+    assert.isUndefined(yield* reserve(admission));
+
+    // While it waits on the lane, its slot runs another effect; the skipped workers are woken.
+    yield* waiting!.suspend;
+    assert.equal(yield* Ref.get(freed), 1);
+    assert.equal((yield* admission.state).inFlight, 1);
+    const borrower = yield* reserve(admission);
+    assert.isDefined(borrower);
+    assert.deepEqual(yield* admission.excludedTypes, EffectAdmission.GATED_EFFECT_TYPES);
+
+    // Its write lands: it takes a slot back at once, three over two until two are given back.
+    yield* waiting!.resume;
+    assert.equal((yield* admission.state).inFlight, 3);
+    yield* working!.release;
+    assert.isUndefined(yield* reserve(admission));
+    // Released once, in whichever state: no slot is freed twice.
+    yield* waiting!.release;
+    yield* waiting!.release;
+    assert.equal((yield* admission.state).inFlight, 1);
+    assert.isDefined(yield* reserve(admission));
+    yield* borrower!.release;
+  }),
+);
+
+it.effect("gives back nothing an effect does not hold when it ends lent out", () =>
+  Effect.gen(function* () {
+    const { admission, freed } = yield* makeHarness(1);
+    const lent = yield* reserve(admission);
+    yield* lent!.suspend;
+    assert.equal(yield* Ref.get(freed), 1);
+    const other = yield* reserve(admission);
+    // Its effect ends while lent out: release, then a late resume or suspend, change nothing.
+    yield* lent!.release;
+    yield* lent!.resume;
+    yield* lent!.suspend;
+    assert.equal((yield* admission.state).inFlight, 1);
+    assert.equal(yield* Ref.get(freed), 1);
+    yield* other!.release;
+    assert.equal((yield* admission.state).inFlight, 0);
+  }),
+);
+
+it.effect(
+  "takes a returning effect's slot back at once, so a lock it holds cannot stall the gate",
+  () =>
+    Effect.gen(function* () {
+      // At one slot: A lends its slot for a write made under a lock; B takes the slot and waits for
+      // that lock. A's write lands: if A had to wait for B's slot, neither could go on.
+      const { admission } = yield* makeHarness(1);
+      const a = yield* reserve(admission);
+      yield* a!.suspend;
+      const b = yield* reserve(admission);
+      assert.isDefined(b);
+      const resumed = yield* a!.resume.pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.isDefined(resumed.pollUnsafe(), "the returning effect waited for a slot");
+      // Over the allowance until one gives its slot back: no new gated claim meanwhile.
+      assert.isUndefined(yield* reserve(admission));
+      assert.deepEqual(yield* admission.excludedTypes, EffectAdmission.GATED_EFFECT_TYPES);
+      yield* a!.release;
+      assert.isUndefined(yield* reserve(admission));
+      yield* b!.release;
+      assert.isDefined(yield* reserve(admission));
+    }),
+);
+
+it.effect(
+  "lends no more slots than its allowance, so gated work in flight stays within twice it",
+  () =>
+    Effect.gen(function* () {
+      // Bound: in flight = slots held + slots lent; a claim is admitted only below the allowance and a
+      // slot is lent only while fewer than the saturated allowance are out (one here).
+      const { admission } = yield* makeHarness(1);
+      const first = yield* reserve(admission);
+      yield* first!.suspend;
+      const second = yield* reserve(admission);
+      assert.isDefined(second);
+      // One slot is already out: the second effect keeps its slot while it waits on the lane.
+      yield* second!.suspend;
+      assert.isUndefined(yield* reserve(admission), "a third gated effect was admitted");
+      assert.equal((yield* admission.state).inFlight, 1);
+      yield* first!.resume;
+      yield* second!.resume;
+      assert.equal((yield* admission.state).inFlight, 2);
+      yield* first!.release;
+      yield* second!.release;
+      assert.equal((yield* admission.state).inFlight, 0);
+    }),
+);
+
+it.effect(
+  "bounds lent slots by the saturated allowance, whatever the allowance is when they return",
+  () =>
+    Effect.gen(function* () {
+      // Four workers: four slots open, two when saturated. Lending stops at two, so a drop to the
+      // saturated allowance cannot leave more out than it allows: in flight <= 4 + 2.
+      const { admission, pressure } = yield* makeHarness(4);
+      const first = yield* Effect.forEach([1, 2, 3, 4], () => reserve(admission));
+      yield* Effect.forEach(first, (slot) => slot!.suspend);
+      assert.equal((yield* admission.state).inFlight, 2, "only two of four slots were lent");
+      const more = yield* Effect.forEach([1, 2], () => reserve(admission));
+      assert.isTrue(more.every((slot) => slot !== undefined));
+      assert.isUndefined(yield* reserve(admission));
+      yield* Ref.set(pressure, 60);
+      yield* TestClock.adjust("3 seconds");
+      assert.equal((yield* admission.state).allowed, 2);
+      yield* Effect.forEach(first, (slot) => slot!.resume);
+      assert.equal((yield* admission.state).inFlight, 6);
+      assert.isUndefined(yield* reserve(admission));
+      yield* Effect.forEach([...first, ...more], (slot) => slot!.release);
+      assert.equal((yield* admission.state).inFlight, 0);
+    }),
+);
+
+it.effect("lends nothing for a slot that already expired", () =>
+  Effect.gen(function* () {
+    const { admission } = yield* makeHarness(1);
+    const hung = yield* reserve(admission);
+    yield* TestClock.adjust(EffectAdmission.SLOT_MAX_HOLD);
+    const next = yield* reserve(admission);
+    assert.isDefined(next);
+    // The hung effect's slot no longer counts: lending it would free nothing and its return would
+    // add a slot nobody gave back.
+    yield* hung!.suspend;
+    yield* hung!.resume;
+    assert.equal((yield* admission.state).inFlight, 1);
+    assert.isUndefined(yield* reserve(admission));
+    yield* hung!.release;
+    yield* next!.release;
+    assert.equal((yield* admission.state).inFlight, 0);
+  }),
+);
+
+it.effect("counts a returning effect as lent until it holds a slot again", () =>
+  Effect.gen(function* () {
+    // At one slot: A lends its slot and B takes it. A's return is held at its clock read, where it
+    // can yield; until it holds a slot it still counts as lent, so B keeps its slot when it waits on
+    // the lane and no third effect is admitted.
+    const { admission } = yield* makeHarness(1);
+    const a = yield* reserve(admission);
+    yield* a!.suspend;
+    const b = yield* reserve(admission);
+    const clock = yield* Clock.clockWith(Effect.succeed);
+    const reading = yield* Deferred.make<void>();
+    const proceed = yield* Deferred.make<void>();
+    const heldAtRead: Clock.Clock = {
+      currentTimeMillisUnsafe: () => clock.currentTimeMillisUnsafe(),
+      currentTimeMillis: Deferred.succeed(reading, undefined).pipe(
+        Effect.andThen(Deferred.await(proceed)),
+        Effect.andThen(clock.currentTimeMillis),
+      ),
+      currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
+      currentTimeNanos: clock.currentTimeNanos,
+      monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+      monotonicTimeNanos: clock.monotonicTimeNanos,
+      sleep: (duration) => clock.sleep(duration),
+    };
+    const returning = yield* a!.resume.pipe(
+      Effect.provideService(Clock.Clock, heldAtRead),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(reading);
+    yield* b!.suspend;
+    const c = yield* reserve(admission);
+    yield* Deferred.succeed(proceed, undefined);
+    yield* Fiber.join(returning);
+    assert.isUndefined(c, "a third gated effect was admitted while the first one returned");
+    assert.equal((yield* admission.state).inFlight, 2);
+    yield* Effect.forEach([a, b, c], (slot) => slot?.release ?? Effect.void);
+    assert.equal((yield* admission.state).inFlight, 0);
   }),
 );

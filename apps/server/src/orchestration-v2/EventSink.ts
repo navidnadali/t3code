@@ -28,6 +28,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlError from "effect/sql/SqlError";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { replayAndBufferProjectedLiveEvents } from "./LiveStreamBudget.ts";
 import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventStore.ts";
@@ -517,7 +518,16 @@ const layerBase: Layer.Layer<
       );
     };
 
-    const applyStoredEvents =
+    // The projection rows, thread touches and head share one round trip to the writer, flushed before the
+    // lineage read below, which tolerates its own failure and so must not carry them.
+    const applyStoredEvents = Effect.fnUntraced(function* (
+      storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>,
+    ) {
+      yield* NodeSqliteClient.withDeferredWrites(sql)(applyProjections(storedEvents));
+      // Read lineage here, on the connection this transaction holds; see makeRunOutcomeRecorder.
+      return yield* runOutcomes.prepare(storedEvents);
+    });
+    const applyProjections =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(function* (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) {
         yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
@@ -544,10 +554,8 @@ const layerBase: Layer.Layer<
               schema_version = excluded.schema_version,
               last_sequence = excluded.last_sequence,
               updated_at = excluded.updated_at
-          `;
+          `.pipe(NodeSqliteClient.deferredWrite);
         }
-        // Read lineage here, on the connection this transaction holds; see makeRunOutcomeRecorder.
-        return yield* runOutcomes.prepare(storedEvents);
       });
 
     // The enclosing write or commit span already traces this per-event projection merge.
@@ -1278,39 +1286,46 @@ const layerBase: Layer.Layer<
       return result;
     });
 
+    const toBatchError = (cause: unknown) =>
+      ProviderCommitBatch.isCommitBatchError(cause)
+        ? cause
+        : new ProviderCommitBatch.CommitBatchError({ cause });
     const coordinator = yield* ProviderCommitBatch.make(
-      (work) =>
-        withProviderBatch(work).pipe(
-          Effect.mapError((cause) =>
-            ProviderCommitBatch.isCommitBatchError(cause)
-              ? cause
-              : new ProviderCommitBatch.CommitBatchError({ cause }),
-          ),
-        ),
+      (work) => withProviderBatch(work).pipe(Effect.mapError(toBatchError)),
       yield* ProviderCommitBatch.enabled,
-      // Each snapshot owns a savepoint and its deferred publications within the shared commit.
-      Effect.fnUntraced(function* (
-        work: Effect.Effect<void, ProviderCommitBatch.CommitBatchError>,
-      ) {
-        const batch = yield* CurrentProviderBatch;
-        const publicationCount = batch?.publish.length ?? 0;
-        const eventCount = batch?.eventCount ?? 0;
-        return yield* sql.withTransaction(work).pipe(
-          Effect.onError(() =>
-            Effect.sync(() => {
+      {
+        // A failed job's publications and counts are dropped by its recording, not here: the jobs
+        // before it in a rolled-back run are applied again and keep theirs.
+        segment: (work) =>
+          sql
+            .withTransaction(work)
+            .pipe(
+              Effect.mapError((cause) =>
+                SqlError.isSqlError(cause) ? toBatchError(cause) : cause,
+              ),
+            ),
+        // The deferred publications and event count a job queues are marked at its start, and its
+        // statements are kept, so the job can be applied again, or dropped, without running it.
+        record: Effect.map(CurrentProviderBatch, (batch) => {
+          const publicationCount = batch?.publish.length ?? 0;
+          const eventCount = batch?.eventCount ?? 0;
+          const statements: Array<NodeSqliteClient.RecordedStatement> = [];
+          return {
+            around: NodeSqliteClient.recordStatements(statements),
+            reapply: sql
+              .withTransaction(NodeSqliteClient.applyStatements(sql, statements))
+              .pipe(Effect.mapError(toBatchError)),
+            discard: Effect.sync(() => {
               if (batch !== undefined) {
                 batch.publish.length = publicationCount;
                 batch.eventCount = eventCount;
               }
             }),
-          ),
-          Effect.mapError((cause) =>
-            ProviderCommitBatch.isCommitBatchError(cause)
-              ? cause
-              : new ProviderCommitBatch.CommitBatchError({ cause }),
-          ),
-        );
-      }),
+          };
+        }),
+        restart: NodeSqliteClient.restartTransaction(sql).pipe(Effect.mapError(toBatchError)),
+        perJobSavepoints: yield* ProviderCommitBatch.perJobSavepoints,
+      },
     );
 
     return EventSinkV2.of({

@@ -4,8 +4,8 @@ import * as Result from "effect/Result";
 
 import type { ProviderIoStage } from "../providerIoProtocol.ts";
 
-// the fork's pure stages wrapped for the pool, so tests run real provider code in a worker. The
-// production registry is the worker offload's. Outputs are plain data; errors cross as their diagnostics.
+// The pure provider stages wrapped for the pool, so tests run real provider code in a worker. The
+// production registry is the offloads'. Outputs are plain data; errors cross as their diagnostics.
 export type CodexWireOutput =
   | { readonly _tag: "Message"; readonly line: string; readonly message: unknown }
   | {

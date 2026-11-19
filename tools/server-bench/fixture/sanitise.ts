@@ -135,7 +135,7 @@ const reportBlankStep = (step: BlankStep) =>
     : Effect.void;
 
 /**
- * the extended check (`fixture/extended.ts`) on every value of every table, the search
+ * The reference extended check (`fixture/extended.ts`) on every value of every table, the search
  * index's shadow tables included: `table:scope|kind` counts. A gate beside the self-check.
  */
 export const extendedTables = function* (
@@ -340,7 +340,7 @@ const SUBAGENT_RESULT_CHILDREN = `
 
 /**
  * What the restart recovery leaves open and a boot would still act on (requests answerable by a
- * message, open tool and subagent items, remote delegations), closed as the earlier sanitiser closes
+ * message, open tool and subagent items, remote delegations), closed as the reference sanitiser closes
  * them. Rows no boot would touch stay as they are.
  */
 const settleLeftovers = (db: NodeSqlite.DatabaseSync, now: string) => {
@@ -453,7 +453,7 @@ const settleLeftovers = (db: NodeSqlite.DatabaseSync, now: string) => {
 };
 
 /**
- * What a boot would still deliver, settled as the server leaves it once done (as the earlier
+ * What a boot would still deliver, settled as the server leaves it once done (as the reference
  * sanitiser does): delegated and subagent deliveries closed, streaming messages final, finished
  * subagent children given a result and a consumed transfer, failed v1 transcripts marked imported.
  */
@@ -730,7 +730,7 @@ export const compactInto = Effect.fn("fixture.compactInto")(function* (
 export interface FixtureCheck {
   readonly mode: ContentMode;
   readonly secretHits: Record<string, number>;
-  /** the extended check: `table:scope|kind` counts, all of which must be zero. */
+  /** The reference extended check: `table:scope|kind` counts, all of which must be zero. */
   readonly extendedHits: Record<string, number>;
   readonly notBlanked: Record<string, number>;
   readonly credentialColumns: Record<string, number>;

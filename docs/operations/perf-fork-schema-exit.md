@@ -14,7 +14,7 @@ The performance fork runs its own migrations as a separate chain, recorded in
   `094_TurnItemMessageOrdinalIndex` creates the same index (same name, columns and `WHERE`) with
   `IF NOT EXISTS`: on a database that has the fork's, it records 94 and keeps that index as its own.
 
-The fork's first release candidate recorded them in `effect_sql_migrations` as 77 and 78, ids
+The fork's first builds recorded them in `effect_sql_migrations` as 77 and 78, ids
 upstream uses for its own migrations. Any later fork build moves those two rows to
 `t3_perf_fork_migrations` when it starts. Until then, an upstream build that ships its own 77 or 78
 refuses to start on the database. An older one is blocked by `t3 service`, whose preflight finds
@@ -65,14 +65,14 @@ upstream's 85, they cannot read them: `t3 service` blocks them, since the databa
 migrations they do not know, and a direct start fails every read of the counts. Restore the backup
 taken before that upgrade.
 
-## Rolling back to the first release candidate
+## Rolling back to the fork's first builds
 
 A database that a later fork build started needs nothing while that build's upstream migrations
-end at 76: the first release candidate records 77 and 78 again (running both, which recounts the
+end at 76: the first builds record 77 and 78 again (running both, which recounts the
 turn items), and the next later start moves them back.
 
 Once a fork build with upstream migrations past 76 has run on the database, such as upstream's
-`077_RepairBooleanSettledOverride`, the first release candidate refuses it. Its service preflight
+`077_RepairBooleanSettledOverride`, the first builds refuse it. Its service preflight
 reports ready, then startup fails with "would skip required schema migrations:
 77_ProjectionTurnItemCounts (recorded: RepairBooleanSettledOverride)". Restore the backup taken before
 that upgrade. While upstream's 077 is the only upstream migration past 76 that the database records,
@@ -83,7 +83,7 @@ sqlite3 -bail <T3 home>/userdata/statev2.sqlite \
   "DELETE FROM effect_sql_migrations WHERE migration_id = 77 AND name = 'RepairBooleanSettledOverride'"
 ```
 
-The release candidate then runs its own 77 and 78 again. The next later fork start moves them back and
+Those builds then run their own 77 and 78 again. The next later fork start moves them back and
 runs upstream's 077 again, a data repair that is safe to repeat. With any other upstream migration
 past 76 recorded, only the backup is safe.
 
@@ -91,7 +91,7 @@ past 76 recorded, only the backup is safe.
 
 Each script runs in one transaction and keeps every other row. First it checks the counts table and
 stops, with nothing changed, on the other script's database. Both drop `t3_perf_fork_migrations`
-and delete only the first release candidate's records of 77 and 78. Neither drops the
+and delete only the first builds' records of 77 and 78. Neither drops the
 message-ordinal index, since it is upstream's 94's too: a build past 94 never creates it again,
 and a build before 94 keeps it current on every write and takes it as its own at 94.
 `perf-fork-schema-exit-before-085.sql` also drops the fork's counts table and its triggers, the

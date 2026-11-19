@@ -1,9 +1,13 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
@@ -203,4 +207,301 @@ it.effect(
       yield* TestClock.adjust(500);
       yield* Deferred.await(restarted);
     }).pipe(Effect.provide(testConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+// The commit lane can keep the single writer close to fully busy, so the compaction pass
+// shares it at background priority: a foreground write already waiting goes first.
+it.effect("the compaction pass writes after foreground writes already waiting for the writer", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(startupTime);
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TABLE writes (name TEXT NOT NULL)`;
+    const passWriting = yield* Deferred.make<void>();
+    const passWrote = yield* Deferred.make<void>();
+    const compact = () =>
+      Deferred.succeed(passWriting, undefined).pipe(
+        Effect.andThen(sql`INSERT INTO writes VALUES ('compaction')`),
+        Effect.andThen(Deferred.succeed(passWrote, undefined)),
+        Effect.as(emptyCompaction),
+        Effect.orDie,
+      );
+    // A foreground transaction holds the writer while the pass, then a foreground write, queue for it.
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const holder = yield* sql
+      .withTransaction(
+        sql`INSERT INTO writes VALUES ('holder')`.pipe(
+          Effect.andThen(Deferred.succeed(held, undefined)),
+          Effect.andThen(Deferred.await(release)),
+        ),
+      )
+      .pipe(Effect.forkChild({ startImmediately: true }));
+    yield* Deferred.await(held);
+    yield* Effect.gen(function* () {
+      yield* TestClock.adjust(minute);
+      yield* Deferred.await(passWriting);
+      // Lets the pass's write reach the writer and queue there first.
+      for (let turn = 0; turn < 20; turn++) yield* Effect.yieldNow;
+      const foreground = yield* sql`INSERT INTO writes VALUES ('foreground')`.pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      yield* Fiber.join(foreground);
+      yield* Deferred.await(passWrote);
+      const rows = yield* sql<{ readonly name: string }>`SELECT name FROM writes ORDER BY rowid`;
+      assert.deepEqual(
+        rows.map((row) => row.name),
+        ["holder", "foreground", "compaction"],
+      );
+    }).pipe(
+      Effect.provide(
+        DatabaseStorage.layer.pipe(
+          Layer.provide(
+            Layer.succeed(ProjectionMaintenance.ProjectionMaintenanceV2, {
+              pruneEventStore: compact,
+            }),
+          ),
+        ),
+      ),
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(Sqlite.layerMemory, testConfig.pipe(Layer.provideMerge(NodeServices.layer))),
+    ),
+  ),
+);
+
+// A pass's deletes rewrite index pages that file system snapshots can pin, and a host can have
+// little room left. A pass pauses while the database's file system, or the host's
+// headroom signal, is below its floor, and resumes from its progress once there is room again.
+const dueStore = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  for (let index = 0; index < 120; index++) {
+    yield* sql`
+      INSERT INTO orchestration_events (
+        event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+        actor_kind, payload_json, metadata_json, application_event_version
+      ) VALUES (
+        ${`event:guard:${index}`}, 'thread', 'thread:guard', ${index}, 'node.updated',
+        '2026-10-01T00:00:00.000Z', 'server', '{"status":"running"}', '{}', 2
+      )
+    `;
+  }
+  // Marked two days ago through the head: the first pass is due and prunes all but the head.
+  const markedAt = DateTime.formatIso(DateTime.makeUnsafe(startupTime - 2 * 86_400_000));
+  for (const name of ["thread-projections", "event-log-prune-mark"]) {
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_metadata (projection_name, schema_version, last_sequence, updated_at)
+      VALUES (${name}, 2, (SELECT MAX(sequence) FROM orchestration_events), ${markedAt})
+      ON CONFLICT(projection_name) DO UPDATE SET
+        last_sequence = excluded.last_sequence, updated_at = excluded.updated_at
+    `;
+  }
+});
+
+// The boundary the pass published, and whether the due mark is still the one from two days ago.
+const boundaryRows = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{ readonly projection_name: string; readonly updated_at: string }>`
+    SELECT projection_name, updated_at FROM orchestration_v2_projection_metadata
+    WHERE projection_name IN ('event-log-prune-mark', 'event-log-pruned-through')
+  `;
+  const markedAt = DateTime.formatIso(DateTime.makeUnsafe(startupTime - 2 * 86_400_000));
+  return {
+    prunedThrough: rows.find((row) => row.projection_name === "event-log-pruned-through")
+      ?.updated_at,
+    markedTwoDaysAgo:
+      rows.find((row) => row.projection_name === "event-log-prune-mark")?.updated_at === markedAt,
+  };
+}).pipe(Effect.orDie);
+
+const eventCount = Effect.flatMap(
+  SqlClient.SqlClient,
+  (sql) => sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM orchestration_events`,
+).pipe(Effect.map((rows) => rows[0]?.count ?? 0));
+
+// Runs the storage service's own pass on the due store; settles on whichever comes first: the pass
+// completing (its completion file) or the pass saying it paused.
+type InStore = Effect.Effect<
+  void,
+  never,
+  ServerConfig.ServerConfig | FileSystem.FileSystem | Path.Path
+>;
+
+const guardedPass = (
+  env: Record<string, string>,
+  options: {
+    readonly before?: InStore;
+    readonly afterPause?: InStore;
+    readonly atFirst?: Effect.Effect<unknown, never, SqlClient.SqlClient>;
+  } = {},
+) =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(startupTime);
+    yield* dueStore;
+    if (options.before !== undefined) yield* options.before;
+    const fs = yield* FileSystem.FileSystem;
+    const completed = yield* Deferred.make<void>();
+    const paused = yield* Deferred.make<string>();
+    const capture = Logger.make(({ message }) => {
+      const text = Array.isArray(message) ? message.join(" ") : String(message);
+      if (/compaction paused/i.test(text)) Deferred.doneUnsafe(paused, Effect.succeed(text));
+    });
+    return yield* Effect.gen(function* () {
+      yield* TestClock.adjust(minute);
+      const first = yield* Effect.raceFirst(
+        Deferred.await(paused).pipe(Effect.as("paused" as const)),
+        Deferred.await(completed).pipe(Effect.as("completed" as const)),
+      );
+      const leftAtFirst = yield* eventCount;
+      const atFirst = options.atFirst === undefined ? undefined : yield* options.atFirst;
+      if (first === "paused" && options.afterPause !== undefined) {
+        yield* options.afterPause;
+        yield* TestClock.adjust("5 minutes");
+        yield* Deferred.await(completed);
+      }
+      return { first, leftAtFirst, atFirst, leftAtEnd: yield* eventCount };
+    }).pipe(
+      Effect.provide(
+        DatabaseStorage.layer.pipe(
+          Layer.provide(ProjectionMaintenance.layer),
+          Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord(env))),
+          Layer.provide(Logger.layer([capture], { mergeWithExisting: true })),
+        ),
+      ),
+      Effect.provideService(FileSystem.FileSystem, {
+        ...fs,
+        writeFileString: (file, content, options) =>
+          fs
+            .writeFileString(file, content, options)
+            .pipe(
+              Effect.ensuring(
+                file.endsWith("compacted-at")
+                  ? Deferred.succeed(completed, undefined)
+                  : Effect.void,
+              ),
+            ),
+      }),
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(Sqlite.layerMemory, testConfig.pipe(Layer.provideMerge(NodeServices.layer))),
+    ),
+  );
+
+it.effect("a compaction pass pauses while the database's file system is below its floor", () =>
+  Effect.gen(function* () {
+    // A floor no disk meets: the pass must not delete, nor even publish its boundary.
+    const result = yield* guardedPass(
+      { T3CODE_EVENT_PRUNE_MIN_FREE_MB: String(2 ** 40) },
+      { atFirst: boundaryRows },
+    );
+    assert.equal(result.first, "paused");
+    assert.equal(result.leftAtFirst, 120);
+    assert.deepEqual(result.atFirst, { prunedThrough: undefined, markedTwoDaysAgo: true });
+  }),
+);
+
+// A signal the server cannot read is not an absent one.
+it.effect("a compaction pass treats an unreadable host headroom signal as no room", () =>
+  Effect.gen(function* () {
+    const result = yield* guardedPass(
+      {},
+      {
+        before: Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const config = yield* ServerConfig.ServerConfig;
+          // A directory where the file should be: reading it fails with an error other than NotFound.
+          yield* fs.makeDirectory(path.join(path.dirname(config.dbPath), "storage-headroom.json"));
+        }).pipe(Effect.orDie),
+      },
+    );
+    assert.equal(result.first, "paused");
+    assert.equal(result.leftAtFirst, 120);
+  }),
+);
+
+const headroomSignal = (availableBytes: number, updatedAt: number) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const config = yield* ServerConfig.ServerConfig;
+    yield* fs.writeFileString(
+      path.join(path.dirname(config.dbPath), "storage-headroom.json"),
+      JSON.stringify({
+        availableBytes,
+        updatedAt: DateTime.formatIso(DateTime.makeUnsafe(updatedAt)),
+      }),
+    );
+  }).pipe(Effect.orDie);
+
+const GiB = 2 ** 30;
+
+it.effect("a compaction pass pauses on a low host headroom signal and resumes once it rises", () =>
+  Effect.gen(function* () {
+    const result = yield* guardedPass(
+      {},
+      {
+        before: headroomSignal(10 * GiB, startupTime),
+        afterPause: headroomSignal(500 * GiB, startupTime + minute),
+      },
+    );
+    assert.equal(result.first, "paused");
+    assert.equal(result.leftAtFirst, 120);
+    // Resumed from its progress: everything but the stream's head is gone.
+    assert.equal(result.leftAtEnd, 1);
+  }),
+);
+
+it.effect("a compaction pass treats a stale host headroom signal as no room", () =>
+  Effect.gen(function* () {
+    // Plenty of room, but written three hours ago: the host stopped updating it.
+    const result = yield* guardedPass(
+      {},
+      { before: headroomSignal(500 * GiB, startupTime - 3 * 3_600_000) },
+    );
+    assert.equal(result.first, "paused");
+    assert.equal(result.leftAtFirst, 120);
+  }),
+);
+
+// The signal's contract: bytes as an integer, a UTC timestamp
+// with Z, not more than 10 min ahead; anything else is no room.
+it.effect.each([
+  { case: "dated an hour ahead", signal: { availableBytes: 500 * GiB, ahead: 3_600_000 } },
+  { case: "a fractional byte count", signal: { availableBytes: 500 * GiB + 0.5, ahead: 0 } },
+  { case: "a local time without Z", signal: { availableBytes: 500 * GiB, ahead: 0, local: true } },
+])("a compaction pass treats a host headroom signal $case as no room", ({ signal }) =>
+  Effect.gen(function* () {
+    const result = yield* guardedPass(
+      {},
+      {
+        before: Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const config = yield* ServerConfig.ServerConfig;
+          const at = DateTime.formatIso(DateTime.makeUnsafe(startupTime + signal.ahead));
+          yield* fs.writeFileString(
+            path.join(path.dirname(config.dbPath), "storage-headroom.json"),
+            JSON.stringify({
+              availableBytes: signal.availableBytes,
+              updatedAt: "local" in signal ? at.replace("Z", "") : at,
+            }),
+          );
+        }).pipe(Effect.orDie),
+      },
+    );
+    assert.equal(result.first, "paused");
+    assert.equal(result.leftAtFirst, 120);
+  }),
+);
+
+it.effect("a compaction pass without a host headroom signal runs as before", () =>
+  Effect.gen(function* () {
+    const result = yield* guardedPass({});
+    assert.equal(result.first, "completed");
+    assert.equal(result.leftAtFirst, 1);
+  }),
 );

@@ -119,7 +119,7 @@ it.effect("keeps the probe subprocess alive while gateway model discovery can fi
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// every health check and workspace scan starts a Claude CLI, so on Linux it must not fork
+// Every health check and workspace scan starts a Claude CLI, so on Linux it must not fork
 // the server.
 it.effect("starts the probe's CLI from the server's provider launcher on Linux", () =>
   Effect.gen(function* () {

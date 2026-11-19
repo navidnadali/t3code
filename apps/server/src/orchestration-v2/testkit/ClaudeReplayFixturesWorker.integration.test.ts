@@ -15,6 +15,11 @@ import {
 } from "../Adapters/ClaudeAgentSdkWireReplay.testkit.ts";
 import { ORCHESTRATOR_REPLAY_FIXTURES } from "./fixtures/index.ts";
 import { runReplayFixture } from "./ProviderReplayFixtures.ts";
+import {
+  collapseSupersededItemStates,
+  NoStoreControlRecorder,
+  type NoStoreControl,
+} from "./SupersededItemStates.ts";
 
 // The CLI asks these for a permission, which the worker relays to main.
 const PERMISSION_FIXTURES = new Set([
@@ -447,13 +452,14 @@ const runAtWireLevel = ([name, fixture, provider]: Fixture, workers: 0 | 2) =>
             .pipe(Effect.tap((opened) => Effect.sync(() => opens.push(Option.isSome(opened))))),
       };
     }
+    const controls: Array<NoStoreControl> = [];
     const result = yield* runReplayFixture({
       fixtureName: name,
       buildInput: fixture.buildInput,
       driver: provider,
       harness: makeClaudeWireReplayHarness({ pool, recording }),
-    });
-    return { result, recording, opens };
+    }).pipe(Effect.provideService(NoStoreControlRecorder, controls));
+    return { result, recording, opens, controls };
   }).pipe(Effect.scoped);
 
 describe("Claude replay comparison", () => {
@@ -1149,8 +1155,14 @@ describe("Claude replay fixtures at the SDK wire level, in-thread and on provide
         comparable(inWorker.recording.adapterEvents),
         comparable(inThread.recording.adapterEvents),
       );
+      // A run's backlog can coalesce an item's superseded states in one mode and not the other
+      // stores are compared once those states are collapsed, never across a control,
+      // stored or not; finals and every newest state stay exact.
       assert.deepStrictEqual(
-        ...comparableStores(inWorker.result.storedEvents, inThread.result.storedEvents),
+        ...comparableStores(
+          collapseSupersededItemStates(inWorker.result.storedEvents, inWorker.controls),
+          collapseSupersededItemStates(inThread.result.storedEvents, inThread.controls),
+        ),
       );
       if (!TRAILING_FRAME_RACE.has(name)) {
         assert.deepStrictEqual(

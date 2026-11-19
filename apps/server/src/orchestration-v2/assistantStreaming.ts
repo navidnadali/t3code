@@ -1,5 +1,7 @@
-import type { ResponseStreamingMode } from "@t3tools/contracts";
+import { isOrchestrationV2WorkActive, type ResponseStreamingMode } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+import * as IngestLag from "./IngestLag.ts";
 
 // List fences can open at any indentation; closers may be at most three spaces deeper.
 // A backtick fence's info string cannot contain a backtick, so "```npm test``` runs" is inline code.
@@ -150,44 +152,127 @@ function streamedSnapshot(
     : { key: `${event.type}:${message.id}`, streaming: message.streaming };
 }
 
+const TERMINAL_PROVIDER_TURN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "interrupted",
+  "failed",
+  "cancelled",
+]);
+
 /**
- * A run's provider events between the subscription and ingestion. A newer streaming snapshot of
- * assistant text replaces the item's waiting one in place unless an event of another kind arrived
- * between them, so a backlog commits its newest text once and each item keeps its place.
+ * The item whose whole state a snapshot carries, and whether it is the item's final state. Null for
+ * events ingestion must see as they arrived: controls, terminals, a turn's end, plan updates (step
+ * timings come from each transition) and subagent updates (they can move a child thread).
+ */
+function itemSnapshot(
+  event: ProviderAdapter.ProviderAdapterV2Event,
+): { readonly key: string; readonly final: boolean } | null {
+  switch (event.type) {
+    case "node.updated":
+      return {
+        key: `${event.type}:${event.node.id}`,
+        final: !isOrchestrationV2WorkActive(event.node.status),
+      };
+    case "message.updated":
+      return { key: `${event.type}:${event.message.id}`, final: !event.message.streaming };
+    case "turn_item.updated": {
+      const text = streamedMessage(event);
+      return {
+        key: `${event.type}:${event.turnItem.id}`,
+        final:
+          text === null ? !isOrchestrationV2WorkActive(event.turnItem.status) : !text.streaming,
+      };
+    }
+    case "provider_turn.updated":
+      // A running turn's reports (usage) only; its end is a control.
+      return TERMINAL_PROVIDER_TURN_STATUSES.has(event.providerTurn.status)
+        ? null
+        : { key: `${event.type}:${event.providerTurn.id}`, final: false };
+    default:
+      return null;
+  }
+}
+
+/**
+ * The projection keeps a provider turn's last reported usage when a later report omits it, so a
+ * report taking another's place carries that usage forward (and the arrival it took over).
+ */
+function keepUsage(
+  replaced: ProviderAdapter.ProviderAdapterV2Event,
+  newer: ProviderAdapter.ProviderAdapterV2Event,
+): ProviderAdapter.ProviderAdapterV2Event {
+  if (
+    newer.type !== "provider_turn.updated" ||
+    replaced.type !== "provider_turn.updated" ||
+    newer.providerTurn.tokenUsage !== undefined ||
+    replaced.providerTurn.tokenUsage === undefined
+  )
+    return newer;
+  const merged = {
+    ...newer,
+    providerTurn: { ...newer.providerTurn, tokenUsage: replaced.providerTurn.tokenUsage },
+  };
+  const arrival = IngestLag.arrivalOf(newer);
+  if (arrival !== undefined) IngestLag.markArrival(merged, arrival);
+  return merged;
+}
+
+/** A still-streaming text step, which only a newer step of its text replaces. */
+function streamedStep(
+  event: ProviderAdapter.ProviderAdapterV2Event,
+): { readonly key: string; readonly final: boolean } | null {
+  const snapshot = streamedSnapshot(event);
+  return snapshot?.streaming === true ? { key: snapshot.key, final: false } : null;
+}
+
+/**
+ * A run's provider events between the subscription and ingestion. An item's newer snapshot replaces
+ * its waiting one in place unless a control arrived between them, so a backlog commits each item's
+ * newest state once, where it first arrived. A final is never replaced: later snapshots queue behind.
  */
 export function makeIngestionMailbox() {
-  let entries: Array<{
-    readonly event: ProviderAdapter.ProviderAdapterV2Event;
-    readonly key: string | null;
-  }> = [];
-  // Streaming snapshots waiting since the last event of another kind, by key.
+  let entries: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+  // Item snapshots that a newer one may still replace (waiting since the last control), by item.
   const open = new Map<string, number>();
   const waiting = new Map<string, number>();
   let unsettled = 0;
+  // From the root terminal on, ingestion checks whether to stop after every event, so a state moved
+  // ahead could end it before the events it overtook: only streamed text steps are replaced then.
+  let afterRootTerminal = false;
   return {
     /** Queues `event`; returns the waiting snapshot it replaced in place, which is gone. */
     offer(
       event: ProviderAdapter.ProviderAdapterV2Event,
     ): ProviderAdapter.ProviderAdapterV2Event | undefined {
-      const snapshot = streamedSnapshot(event);
-      if (snapshot?.streaming === true) {
-        const waitingAt = open.get(snapshot.key);
-        // Text takes its display position when first ingested, so the newer step keeps the place.
+      const item = afterRootTerminal ? streamedStep(event) : itemSnapshot(event);
+      if (item === null) open.clear();
+      else {
+        const waitingAt = open.get(item.key);
+        // An item takes its display position when first ingested, so the newer state keeps the
+        // place. The replaced snapshot was of the same item, so its streamed text still waits once.
         if (waitingAt !== undefined) {
-          const replaced = entries[waitingAt]!.event;
-          entries[waitingAt] = { event, key: snapshot.key };
+          const replaced = entries[waitingAt]!;
+          entries[waitingAt] = keepUsage(replaced, event);
+          if (item.final) open.delete(item.key);
           return replaced;
         }
-        open.set(snapshot.key, entries.length);
-      } else open.clear();
-      if (snapshot !== null) waiting.set(snapshot.key, (waiting.get(snapshot.key) ?? 0) + 1);
-      entries.push({ event, key: snapshot?.key ?? null });
+        if (item.final) open.delete(item.key);
+        else open.set(item.key, entries.length);
+      }
+      const streamed = streamedSnapshot(event);
+      if (streamed !== null) waiting.set(streamed.key, (waiting.get(streamed.key) ?? 0) + 1);
+      entries.push(event);
       unsettled++;
       return undefined;
     },
+    /** The run's root terminal is queued: later events keep their order but for streamed text. */
+    rootTerminalQueued(): void {
+      afterRootTerminal = true;
+      open.clear();
+    },
     /** Takes everything queued, in order; a later snapshot no longer replaces what was taken. */
     takeAll(): ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event> {
-      const taken = entries.map((entry) => entry.event);
+      const taken = entries;
       entries = [];
       open.clear();
       return taken;

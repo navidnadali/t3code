@@ -14,13 +14,13 @@ import {
 const required = ["--url", "http://127.0.0.1:3773/ignored", "--out", "/tmp/bench"];
 
 describe("parseDriverOptions", () => {
-  it("defaults to a history workload of 25 sessions, 25 subscribers and 10 pollers", () => {
+  it("defaults to the history workload", () => {
     const options = parseDriverOptions(required);
     expect(options).toMatchObject({
       url: "http://127.0.0.1:3773",
       mode: "history",
-      sessions: 25,
-      subscribers: 25,
+      sessions: 60,
+      subscribers: 60,
       pollers: 10,
       warmupMs: 60_000,
       windowMs: 300_000,

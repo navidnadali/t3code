@@ -86,12 +86,12 @@ describe("resolveMaxSemiSpaceMb", () => {
     expect(resolveMaxSemiSpaceMb({ NODE_OPTIONS: "--max-semi-space-size=16" }, [])).toBeNull();
     expect(
       resolveMaxSemiSpaceMb(
-        { NODE_OPTIONS: "--max-old-space-size=8192 --max-semi-space-size 32" },
+        { NODE_OPTIONS: "--max-old-space-size=12288 --max-semi-space-size 32" },
         [],
       ),
     ).toBeNull();
     expect(resolveMaxSemiSpaceMb({}, ["--max-semi-space-size=8"])).toBeNull();
-    expect(resolveMaxSemiSpaceMb({ NODE_OPTIONS: "--max-old-space-size=8192" }, [])).toBe(64);
+    expect(resolveMaxSemiSpaceMb({ NODE_OPTIONS: "--max-old-space-size=12288" }, [])).toBe(64);
   });
 });
 
@@ -128,8 +128,8 @@ describe("nodeOptionsWithMaxSemiSpace", () => {
   it("appends the flag after what the user set", () => {
     expect(nodeOptionsWithMaxSemiSpace(undefined, 64)).toBe(flag);
     expect(nodeOptionsWithMaxSemiSpace("", 64)).toBe(flag);
-    expect(nodeOptionsWithMaxSemiSpace(" --max-old-space-size=8192 ", 64)).toBe(
-      `--max-old-space-size=8192 ${flag}`,
+    expect(nodeOptionsWithMaxSemiSpace(" --max-old-space-size=12288 ", 64)).toBe(
+      `--max-old-space-size=12288 ${flag}`,
     );
   });
 });
@@ -138,10 +138,10 @@ describe("serverChildEnvironment", () => {
   it("gives a spawned server the flag and keeps the parent's NODE_OPTIONS for the server's children", () => {
     const env = serverChildEnvironment({
       PATH: "/bin",
-      NODE_OPTIONS: "--max-old-space-size=8192",
+      NODE_OPTIONS: "--max-old-space-size=12288",
     });
-    expect(env.NODE_OPTIONS).toBe(`--max-old-space-size=8192 ${flag}`);
-    expect(env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=8192");
+    expect(env.NODE_OPTIONS).toBe(`--max-old-space-size=12288 ${flag}`);
+    expect(env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=12288");
     expect(env.PATH).toBe("/bin");
     expect(serverChildEnvironment({}).NODE_OPTIONS).toBe(flag);
     expect(serverChildEnvironment({})[INHERITED_NODE_OPTIONS_ENV]).toBe("");
@@ -159,16 +159,16 @@ describe("describeNodeRuntime", () => {
     expect(
       describeNodeRuntime({
         execArgv: [],
-        nodeOptionsAtStart: `--max-old-space-size=8192 ${flag}`,
-        nodeOptionsForChildren: "--max-old-space-size=8192",
-        heapSizeLimitBytes: 8_690_597_888,
+        nodeOptionsAtStart: `--max-old-space-size=12288 ${flag}`,
+        nodeOptionsForChildren: "--max-old-space-size=12288",
+        heapSizeLimitBytes: 12_985_565_184,
         applied: true,
       }),
     ).toEqual({
       execArgv: [],
-      nodeOptions: `--max-old-space-size=8192 ${flag}`,
-      nodeOptionsForChildren: "--max-old-space-size=8192",
-      heapSizeLimitMiB: 8288,
+      nodeOptions: `--max-old-space-size=12288 ${flag}`,
+      nodeOptionsForChildren: "--max-old-space-size=12288",
+      heapSizeLimitMiB: 12384,
       maxSemiSpaceMiB: 64,
       youngGenerationDefault: true,
     });
@@ -347,7 +347,7 @@ describe("applyYoungGenerationDefault", () => {
 
   it("reaches the relaunch rules with the single executable's argument shape, whatever the platform records", () => {
     // The shipped binary's argv is [exe, exe, ...arguments]: Node inserts its own path at argv[1].
-    // Where no startup record exists (macOS), that must not keep the server (review R1).
+    // Where no startup record exists (macOS), that must not keep the server.
     const argv = process.argv;
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
@@ -701,7 +701,7 @@ describe("planYoungGenerationRelaunch", () => {
     const result = plan({
       argv: ["/usr/bin/node", "/opt/t3/dist/bin.mjs", "start", "--no-browser"],
       execArgv: ["--experimental-strip-types"],
-      env: { NODE_OPTIONS: "--max-old-space-size=8192", HOME: "/home/t3" },
+      env: { NODE_OPTIONS: "--max-old-space-size=12288", HOME: "/srv/t3" },
     });
     expect(result).toEqual({
       kind: "relaunch",
@@ -714,9 +714,9 @@ describe("planYoungGenerationRelaunch", () => {
         "--no-browser",
       ],
       env: {
-        HOME: "/home/t3",
-        NODE_OPTIONS: `--max-old-space-size=8192 ${flag}`,
-        [INHERITED_NODE_OPTIONS_ENV]: "--max-old-space-size=8192",
+        HOME: "/srv/t3",
+        NODE_OPTIONS: `--max-old-space-size=12288 ${flag}`,
+        [INHERITED_NODE_OPTIONS_ENV]: "--max-old-space-size=12288",
       },
     });
   });
@@ -1199,27 +1199,27 @@ describe.skipIf(!canRelaunch)("the entrypoint", () => {
 });
 
 describe("review follow-ups", () => {
-  it("ignores a marker that is not backed by the flag (M1)", () => {
+  it("ignores a marker that is not backed by the flag", () => {
     // A stray or stale marker must neither suppress the relaunch nor rewrite NODE_OPTIONS for children.
     const stray = plan({
-      env: { [INHERITED_NODE_OPTIONS_ENV]: "", NODE_OPTIONS: "--max-old-space-size=8192" },
+      env: { [INHERITED_NODE_OPTIONS_ENV]: "", NODE_OPTIONS: "--max-old-space-size=12288" },
     });
     expect(stray.kind).toBe("relaunch");
     if (stray.kind !== "relaunch") return;
-    expect(stray.env.NODE_OPTIONS).toBe(`--max-old-space-size=8192 ${flag}`);
-    expect(stray.env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=8192");
+    expect(stray.env.NODE_OPTIONS).toBe(`--max-old-space-size=12288 ${flag}`);
+    expect(stray.env[INHERITED_NODE_OPTIONS_ENV]).toBe("--max-old-space-size=12288");
     expect(plan({ env: { [INHERITED_NODE_OPTIONS_ENV]: "", NODE_OPTIONS: flag } }).kind).toBe(
       "keep",
     );
   });
-  it("keeps the process when the inspector is active (M2)", () => {
+  it("keeps the process when the inspector is active", () => {
     expect(plan({ execArgv: ["--inspect"] }).kind).toBe("keep");
     expect(plan({ execArgv: ["--inspect-brk=9230"] }).kind).toBe("keep");
     expect(plan({ env: { NODE_OPTIONS: "--inspect-port=9229" } }).kind).toBe("keep");
     expect(plan({ inspectorActive: true }).kind).toBe("keep");
     expect(plan({ execArgv: ["--experimental-strip-types"] }).kind).toBe("relaunch");
   });
-  it("never stats the file system for the fast-path and known commands, nor before the cheap keep checks (N2)", () => {
+  it("never stats the file system for the fast-path and known commands, nor before the cheap keep checks", () => {
     const calls: Array<string> = [];
     const spy = (path: string) => {
       calls.push(path);
@@ -1258,7 +1258,7 @@ describe("review follow-ups", () => {
     );
     expect(calls).toEqual(["my-project"]);
   });
-  it("bounds the escape hatch (N3)", () => {
+  it("bounds the escape hatch", () => {
     expect(resolveMaxSemiSpaceMb({ [MAX_SEMI_SPACE_ENV]: "1024" }, [])).toBe(1024);
     expect(resolveMaxSemiSpaceMb({ [MAX_SEMI_SPACE_ENV]: "1025" }, [])).toBe(
       DEFAULT_MAX_SEMI_SPACE_MB,

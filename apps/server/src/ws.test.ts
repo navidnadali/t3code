@@ -2473,7 +2473,7 @@ it("encodes a shared stream item once, as the RPC JSON codec encodes a chunk", (
   );
 });
 
-// Review E1: each encoder keeps its own cache, so an object that reaches both streams is never
+// Each encoder keeps its own cache, so an object that reaches both streams is never
 // served with the other stream's encoding.
 it("an item encoded for the shell stream is not served to the thread stream from the cache", () => {
   const item: OrchestrationV2ShellStreamItem = {
@@ -2487,7 +2487,7 @@ it("an item encoded for the shell stream is not served to the thread stream from
   assert.throws(() => encodeThreadStreamItem(item as never));
 });
 
-// Review E2: the two stream RPCs served through the server's real definitions by RpcServer with
+// The two stream RPCs served through the server's real definitions by RpcServer with
 // the JSON codec (pass-through items), decoded with the client contract's chunk codec, and
 // byte-identical to the same handlers served through the contract definitions.
 const decodeProjectShellJson = Schema.decodeSync(Schema.toCodecJson(OrchestrationProjectShell));
@@ -4716,7 +4716,7 @@ it.effect("ACP session RPCs list a thread missing its history and repair it on i
   ),
 );
 
-// Reviewer scenario (F2): the resume replay reads a thread after the hub's held delta for it was read.
+// A review scenario: the resume replay reads a thread after the hub's held delta for it was read.
 it.effect("a resumed shell subscriber never receives a shell older than one its replay sent", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -4878,7 +4878,7 @@ const subscribeInto = (afterSequence: number, seen: Array<string>) =>
     );
   });
 
-// the replay read A before the hub did, then waited on B; the hub's newer A must survive.
+// The replay read A before the hub did, then waited on B; the hub's newer A must survive.
 it.effect(
   "a hub delta read after the replay's read of its thread is delivered even if the replay finished later",
   () =>
@@ -4918,7 +4918,7 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
-// a hub batch that read A before the replay did (the shared read then expired) and publishes
+// A hub batch that read A before the replay did (the shared read then expired) and publishes
 // after the live tail opened must not deliver the older A.
 it.effect(
   "a hub batch published after the live tail opened cannot deliver a shell older than the replay's",
@@ -4980,7 +4980,7 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
-// Reviewer scenario (F2b): two project updates land while the resume replay is still reading that project.
+// A review scenario: two project updates land while the resume replay is still reading that project.
 it.effect(
   "a resumed shell subscriber never receives a project shell older than one its replay sent",
   () =>
@@ -5078,7 +5078,7 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
-// Review R1: a project's repository identity changes without a project event. A shared project
+// A project's repository identity changes without a project event. A shared project
 // read must add it per caller, or a resume replay that joins the hub's read sends an identity
 // older than the one the client's own initial items carried, until the next project event.
 it.effect(
@@ -5170,7 +5170,7 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
-// a hub batch that waits on another aggregate must not deliver a project row with a
+// A hub batch that waits on another aggregate must not deliver a project row with a
 // repository identity older than the refresh this subscriber already sent (no project event in
 // the replay, so no read ordinal guards the delta).
 it.effect(
@@ -5295,7 +5295,7 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
-// the live tail keeps the hub's batch boundaries; the RPC server waits for a client
+// The live tail keeps the hub's batch boundaries; the RPC server waits for a client
 // acknowledgement per chunk, so one chunk per delta would make a burst one round trip per delta.
 it.effect("live thread deltas of one hub batch reach the subscriber in one chunk", () =>
   Effect.gen(function* () {

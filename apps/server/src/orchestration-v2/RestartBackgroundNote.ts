@@ -12,6 +12,7 @@ import type {
   OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import { isProviderNativeSubagentThread } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { subagentHoldsCompletion } from "@t3tools/provider-core/server/subagentProjection";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { latestRootProviderFailure, runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
@@ -479,34 +480,204 @@ export function isRestartContinuationSource(
     : source.status === "cancelled";
 }
 
+type Note = { readonly work: ReadonlyArray<Work>; readonly settled: boolean };
+
+/**
+ * The lookups a turn start's planning shares over one projection, in projection order (a run id
+ * keeps its first run, as `find` did), each built in one pass on use. A start often asks about one
+ * attempt's turns or one run's attempts only, so the first such question scans: comparing ids is
+ * cheaper than hashing every one.
+ */
+export function turnStartIndex(
+  runs: ReadonlyArray<OrchestrationV2Run>,
+  providerTurns: ReadonlyArray<
+    Pick<ProviderTurnState, "runAttemptId" | "status"> & {
+      readonly providerThreadId?: ProviderTurnState["providerThreadId"];
+    }
+  >,
+  attempts: ReadonlyArray<Attempt>,
+) {
+  type Turns = { completed: boolean; cancelled: boolean; completedOn: Array<string> };
+  let runsById: Map<string, OrchestrationV2Run> | undefined;
+  let attemptsByRun: Map<string, Array<Attempt>> | undefined;
+  let turnsByAttempt: Map<string | null, Turns> | undefined;
+  const none: ReadonlyArray<Attempt> = [];
+  const add = (of: Turns, turn: (typeof providerTurns)[number]) => {
+    if (turn.status === "completed") {
+      of.completed = true;
+      if (turn.providerThreadId !== undefined) of.completedOn.push(turn.providerThreadId);
+    } else if (turn.status === "cancelled") of.cancelled = true;
+  };
+  let turnQuestions = 0;
+  let attemptQuestions = 0;
+  const turnsOf = (attemptId: string | null): Turns | undefined => {
+    if (turnsByAttempt === undefined) {
+      if (turnQuestions++ === 0) {
+        let of: Turns | undefined;
+        for (const turn of providerTurns)
+          if (turn.runAttemptId === attemptId)
+            add((of ??= { completed: false, cancelled: false, completedOn: [] }), turn);
+        return of;
+      }
+      turnsByAttempt = new Map();
+      for (const turn of providerTurns) {
+        let of = turnsByAttempt.get(turn.runAttemptId);
+        if (of === undefined) {
+          of = { completed: false, cancelled: false, completedOn: [] };
+          turnsByAttempt.set(turn.runAttemptId, of);
+        }
+        add(of, turn);
+      }
+    }
+    return turnsByAttempt.get(attemptId);
+  };
+  const attemptsOf = (runId: string): ReadonlyArray<Attempt> => {
+    if (attemptsByRun === undefined) {
+      if (attemptQuestions++ === 0) return attempts.filter((attempt) => attempt.runId === runId);
+      attemptsByRun = new Map();
+      for (const attempt of attempts) {
+        const of = attemptsByRun.get(attempt.runId);
+        if (of === undefined) attemptsByRun.set(attempt.runId, [attempt]);
+        else of.push(attempt);
+      }
+    }
+    return attemptsByRun.get(runId) ?? none;
+  };
+  const completed = (attemptId: string | null) => turnsOf(attemptId)?.completed === true;
+  return {
+    runById: (id: string) => {
+      if (runsById === undefined) {
+        runsById = new Map();
+        for (const run of runs) if (!runsById.has(run.id)) runsById.set(run.id, run);
+      }
+      return runsById.get(id);
+    },
+    attemptsOf,
+    completed,
+    cancelled: (attemptId: string | null) => turnsOf(attemptId)?.cancelled === true,
+    /** A completed provider turn of the attempt on that provider thread. */
+    completedOn: (attemptId: string | null, providerThreadId: string) =>
+      turnsOf(attemptId)?.completedOn.includes(providerThreadId) === true,
+    /** Any of the run's attempts has a completed provider turn. */
+    runCompleted: (runId: string) => attemptsOf(runId).some((attempt) => completed(attempt.id)),
+  };
+}
+
+/**
+ * What the restart-note checks look up over one projection, with each run's continuation verdict
+ * remembered: a turn start on a thread with tens of thousands of runs must not rescan them per
+ * run.
+ */
+export function restartNoteIndex(
+  runs: ReadonlyArray<OrchestrationV2Run>,
+  providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>,
+  attempts: ReadonlyArray<Attempt>,
+  shared: ReturnType<typeof turnStartIndex> = turnStartIndex(runs, providerTurns, attempts),
+) {
+  const isSource = (
+    source: Pick<
+      OrchestrationV2Run,
+      "status" | "activeAttemptId" | "restartCancelledBackgroundWork"
+    >,
+  ) =>
+    (source.status === "completed" ||
+      source.status === "waiting" ||
+      source.status === "cancelled") &&
+    (source.restartCancelledBackgroundWork?.length ?? 0) > 0 &&
+    !shared.cancelled(source.activeAttemptId);
+  const continues = (current: OrchestrationV2Run) =>
+    current.restartContinuationOfRunId !== undefined &&
+    !shared.runCompleted(current.id) &&
+    !(current.activeAttemptId !== null && shared.completed(current.activeAttemptId));
+  // The runs a continuation's walk passes, as `restartContinuationNote` walks them: through
+  // runs that continue an unfinished run, stopping at a missing run or one it already passed.
+  const walk = (source: OrchestrationV2Run, stopAt: (run: OrchestrationV2Run) => boolean) => {
+    const path = [source];
+    const visited = new Set([source.id]);
+    // Where the path's loop starts, when it loops: the position of the run it came back to.
+    let loopsFrom = -1;
+    let stopped = false;
+    let current = source;
+    while (continues(current)) {
+      const previous = shared.runById(current.restartContinuationOfRunId!);
+      if (previous === undefined) break;
+      if (visited.has(previous.id)) {
+        loopsFrom = path.findIndex((run) => run.id === previous.id);
+        break;
+      }
+      if (stopAt(previous)) {
+        stopped = true;
+        break;
+      }
+      visited.add(previous.id);
+      path.push(previous);
+      current = previous;
+    }
+    return { path, loopsFrom, stopped, end: current };
+  };
+  const noteFrom = (source: OrchestrationV2Run): Note => {
+    const { path, end } = walk(source, () => false);
+    if (path.length === 1)
+      return { work: source.restartCancelledBackgroundWork ?? [], settled: isSource(end) };
+    // Merging is associative: the walk's note is its last run's work, then each earlier run's new
+    // entries, latest first, read once each.
+    const work = [...(end.restartCancelledBackgroundWork ?? [])];
+    const seen = new Set(work.map(workIdentity));
+    for (let index = path.length - 2; index >= 0; index -= 1) {
+      for (const entry of path[index]!.restartCancelledBackgroundWork ?? []) {
+        const identity = workIdentity(entry);
+        if (seen.has(identity)) continue;
+        seen.add(identity);
+        work.push(entry);
+      }
+    }
+    return { work, settled: isSource(end) };
+  };
+  // Whether the walk from one of the projection's runs carries any work, remembered per run: a
+  // note's work is empty only when every run it passes holds none. Every run on a loop passes the
+  // whole loop, wherever its walk starts, so they share one answer.
+  const carries = new Map<string, boolean>();
+  const holds = (run: OrchestrationV2Run) => (run.restartCancelledBackgroundWork?.length ?? 0) > 0;
+  const carriesWork = (source: OrchestrationV2Run): boolean => {
+    const remembered = carries.get(source.id);
+    if (remembered !== undefined) return remembered;
+    const { path, loopsFrom, stopped, end } = walk(source, (run) => carries.has(run.id));
+    let carried =
+      stopped && end.restartContinuationOfRunId !== undefined
+        ? carries.get(shared.runById(end.restartContinuationOfRunId)!.id)!
+        : false;
+    let before = path.length;
+    if (loopsFrom !== -1) {
+      const loop = path.slice(loopsFrom);
+      carried = loop.some(holds);
+      for (const run of loop) carries.set(run.id, carried);
+      before = loopsFrom;
+    }
+    for (let index = before - 1; index >= 0; index -= 1) {
+      const run = path[index]!;
+      carried ||= holds(run);
+      carries.set(run.id, carried);
+    }
+    return carried;
+  };
+  const isContinuation = (run: Pick<OrchestrationV2Run, "restartContinuationOfRunId">) => {
+    const source =
+      run.restartContinuationOfRunId === undefined
+        ? undefined
+        : shared.runById(run.restartContinuationOfRunId);
+    return source !== undefined && carriesWork(source);
+  };
+  return { noteFrom, isContinuation };
+}
+
 /** Running does not prove prompt acceptance; carry continuation notes until a completed turn proves delivery. */
 export function restartContinuationNote(
   source: OrchestrationV2Run,
   runs: ReadonlyArray<OrchestrationV2Run>,
   providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>,
   attempts: ReadonlyArray<Attempt>,
-): { readonly work: ReadonlyArray<Work>; readonly settled: boolean } {
-  const completedAttempts = new Set(
-    providerTurns.filter((turn) => turn.status === "completed").map((turn) => turn.runAttemptId),
-  );
-  const completedRuns = new Set(
-    attempts.filter((attempt) => completedAttempts.has(attempt.id)).map((attempt) => attempt.runId),
-  );
-  let current = source;
-  let work = current.restartCancelledBackgroundWork ?? [];
-  const visited = new Set([current.id]);
-  while (
-    current.restartContinuationOfRunId !== undefined &&
-    !completedRuns.has(current.id) &&
-    !(current.activeAttemptId !== null && completedAttempts.has(current.activeAttemptId))
-  ) {
-    const previous = runs.find((candidate) => candidate.id === current.restartContinuationOfRunId);
-    if (previous === undefined || visited.has(previous.id)) break;
-    visited.add(previous.id);
-    current = previous;
-    work = mergeRestartCancelledBackgroundWork(current.restartCancelledBackgroundWork ?? [], work);
-  }
-  return { work, settled: isRestartNoteSource(current, providerTurns) };
+): Note {
+  return restartNoteIndex(runs, providerTurns, attempts).noteFrom(source);
 }
 
 export function isRestartNoteContinuation(
@@ -515,21 +686,12 @@ export function isRestartNoteContinuation(
   providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>,
   attempts: ReadonlyArray<Attempt>,
 ): boolean {
-  const source =
-    run.restartContinuationOfRunId === undefined
-      ? undefined
-      : runs.find((candidate) => candidate.id === run.restartContinuationOfRunId);
-  return (
-    source !== undefined &&
-    restartContinuationNote(source, runs, providerTurns, attempts).work.length > 0
-  );
+  return restartNoteIndex(runs, providerTurns, attempts).isContinuation(run);
 }
 
-/** Derive delivery from later completed turns on the same provider thread, excluding compactions, resumes, and rolled-back runs. */
-export function pendingRestartCancelledBackgroundWork(input: {
+interface RestartNoteInput {
   readonly runs: ReadonlyArray<OrchestrationV2Run>;
   readonly providerTurns: ReadonlyArray<ProviderTurnState>;
-  readonly compactionMessageIds: ReadonlySet<string>;
   readonly run: Pick<
     OrchestrationV2Run,
     | "id"
@@ -542,65 +704,200 @@ export function pendingRestartCancelledBackgroundWork(input: {
   >;
 
   readonly attempts: ReadonlyArray<Attempt>;
-}): ReadonlyArray<Work> {
-  const isCompaction = (run: typeof input.run) => input.compactionMessageIds.has(run.userMessageId);
-  if (
-    input.run.providerThreadId === null ||
-    input.run.restartContinuationOfRunId !== undefined ||
-    isCompaction(input.run)
-  )
-    return [];
-  const providerThreadId = input.run.providerThreadId;
-  const deliveredAttemptIds = new Set(
-    input.providerTurns
-      .filter((turn) => turn.providerThreadId === providerThreadId && turn.status === "completed")
-      .map((turn) => turn.runAttemptId),
-  );
-  const sameThread = input.runs.filter((run) => run.providerThreadId === providerThreadId);
-  const prompted = sameThread.filter(
-    (candidate) =>
-      candidate.id !== input.run.id &&
-      candidate.activeAttemptId !== null &&
-      candidate.status !== "rolled_back" &&
-      (deliveredAttemptIds.has(candidate.activeAttemptId) ||
-        input.attempts.some(
-          (attempt) => attempt.runId === candidate.id && deliveredAttemptIds.has(attempt.id),
-        )) &&
-      !isCompaction(candidate) &&
-      (candidate.restartContinuationOfRunId === undefined ||
-        isRestartNoteContinuation(candidate, input.runs, input.providerTurns, input.attempts)),
-  );
-  // Earlier attempts may already have delivered the note; a steer's replacement attempt must not repeat it.
-  const alreadyDelivered = input.attempts.some(
-    (attempt) =>
-      attempt.runId === input.run.id &&
-      attempt.id !== input.run.activeAttemptId &&
-      deliveredAttemptIds.has(attempt.id),
-  );
-  if (alreadyDelivered) return [];
-  return sameThread
-    .filter(
-      (source) =>
-        runRanAfter(input.run, source) &&
-        (source.restartCancelledBackgroundWork?.length ?? 0) > 0 &&
-        !prompted.some((later) => runRanAfter(later, source)),
-    )
-    .reduce<ReadonlyArray<Work>>(
-      (work, source) =>
-        mergeRestartCancelledBackgroundWork(work, source.restartCancelledBackgroundWork ?? []),
-      [],
-    );
 }
+
+// `runRanAfter`'s order as a key read once per run: end (unfinished last), then ordinal.
+const ranAfterKey = (run: Pick<OrchestrationV2Run, "ordinal" | "completedAt">) => ({
+  end: !run.completedAt ? Number.POSITIVE_INFINITY : DateTime.toEpochMillis(run.completedAt),
+  ordinal: run.ordinal,
+});
+const keyRanAfter = (
+  left: ReturnType<typeof ranAfterKey>,
+  right: ReturnType<typeof ranAfterKey>,
+) => (left.end === right.end ? left.ordinal > right.ordinal : left.end > right.end);
+
+/**
+ * Positions latest-ran first by the runs' cached ran-after keys, ties in position order (a stable
+ * sort). A thread's runs are in ran order already, as a rule, and the sort (V8's TimSort) takes a
+ * single pass over them then.
+ */
+export const latestRanFirst = (ends: ArrayLike<number>, ordinals: ArrayLike<number>) =>
+  Array.from({ length: ends.length }, (_, position) => position).sort((left, right) =>
+    ends[left] === ends[right]
+      ? ordinals[right]! - ordinals[left]!
+      : ends[left]! > ends[right]!
+        ? -1
+        : 1,
+  );
+
+/**
+ * A turn start's restart-note decisions over one projection, in the order it makes them: whether its
+ * run continues a restart note, the runs whose compaction the note can turn on, and the pending note.
+ * The provider thread's runs and which of them prompted it are worked out once, for both.
+ */
+export function planRestartNote(
+  input: RestartNoteInput,
+  shared: ReturnType<typeof turnStartIndex> = turnStartIndex(
+    input.runs,
+    input.providerTurns,
+    input.attempts,
+  ),
+) {
+  const index = restartNoteIndex(input.runs, input.providerTurns, input.attempts, shared);
+  let threadRuns:
+    | {
+        readonly delivered: (attemptId: string | null) => boolean;
+        readonly sameThread: ReadonlyArray<OrchestrationV2Run>;
+        // By position in `sameThread`: whether the run prompted the thread unless a compaction,
+        // worked out when first asked, and its ran-after key.
+        readonly prompted: (position: number) => boolean;
+        readonly ends: Float64Array;
+        readonly ordinals: Float64Array;
+      }
+    | undefined;
+  // The provider thread's runs, and whether each prompted it apart from being a compaction.
+  const restartNoteRuns = (
+    providerThreadId: NonNullable<OrchestrationV2Run["providerThreadId"]>,
+  ) => {
+    if (threadRuns !== undefined) return threadRuns;
+    // An attempt whose provider turn on this thread completed delivered its prompt.
+    const delivered = (attemptId: string | null) => shared.completedOn(attemptId, providerThreadId);
+    const sameThread = input.runs.filter((run) => run.providerThreadId === providerThreadId);
+    const ends = new Float64Array(sameThread.length);
+    const ordinals = new Float64Array(sameThread.length);
+    sameThread.forEach((candidate, position) => {
+      const key = ranAfterKey(candidate);
+      ends[position] = key.end;
+      ordinals[position] = key.ordinal;
+    });
+    // A start asks about the latest-ran runs, as a rule, so each verdict waits until asked for.
+    const verdicts = new Int8Array(sameThread.length);
+    const prompted = (position: number) => {
+      if (verdicts[position] === 0) {
+        const candidate = sameThread[position]!;
+        verdicts[position] =
+          candidate.id !== input.run.id &&
+          candidate.activeAttemptId !== null &&
+          candidate.status !== "rolled_back" &&
+          (delivered(candidate.activeAttemptId) ||
+            shared.attemptsOf(candidate.id).some((attempt) => delivered(attempt.id))) &&
+          (candidate.restartContinuationOfRunId === undefined || index.isContinuation(candidate))
+            ? 1
+            : 2;
+      }
+      return verdicts[position] === 1;
+    };
+    threadRuns = { delivered, sameThread, prompted, ends, ordinals };
+    return threadRuns;
+  };
+  const holdsWork = (source: OrchestrationV2Run) =>
+    (source.restartCancelledBackgroundWork?.length ?? 0) > 0;
+  return {
+    isContinuation: index.isContinuation,
+    /**
+     * The runs whose compaction `pending` can turn on, latest-ran first: each prompted the provider
+     * thread unless its message is a compaction. Only those up to the first that is not one can, as
+     * it ran after the rest; none when no earlier run there holds the work.
+     */
+    *compactionCandidates(): Generator<OrchestrationV2Run> {
+      if (input.run.providerThreadId === null || input.run.restartContinuationOfRunId !== undefined)
+        return;
+      const { sameThread, prompted, ends, ordinals } = restartNoteRuns(input.run.providerThreadId);
+      const runKey = ranAfterKey(input.run);
+      const ranBefore = (position: number) =>
+        keyRanAfter(runKey, { end: ends[position]!, ordinal: ordinals[position]! });
+      if (!sameThread.some((source, position) => ranBefore(position) && holdsWork(source))) return;
+      // Each run's verdict is worked out as it is taken: a caller that stops at the first run that
+      // is not a compaction pays for the runs it takes.
+      for (const position of latestRanFirst(ends, ordinals))
+        if (prompted(position)) yield sameThread[position]!;
+    },
+    /** Derive delivery from later completed turns on the same provider thread, excluding compactions, resumes, and rolled-back runs. */
+    pending: (compactionMessageIds: ReadonlySet<string>): ReadonlyArray<Work> => {
+      const isCompaction = (run: Pick<OrchestrationV2Run, "userMessageId">) =>
+        compactionMessageIds.has(run.userMessageId);
+      if (
+        input.run.providerThreadId === null ||
+        input.run.restartContinuationOfRunId !== undefined ||
+        isCompaction(input.run)
+      )
+        return [];
+      const { delivered, sameThread, prompted, ends, ordinals } = restartNoteRuns(
+        input.run.providerThreadId,
+      );
+      // The latest-ran run that prompted the thread: a source has a later prompt only if it ran before.
+      // Scanned from the end, asking only about runs that ran no earlier than the latest so far; a
+      // tie goes to the earlier position, as a forward scan keeping the first gave it.
+      let latest = -1;
+      for (let position = sameThread.length - 1; position >= 0; position--) {
+        if (
+          latest !== -1 &&
+          (ends[position] === ends[latest]
+            ? ordinals[position]! < ordinals[latest]!
+            : ends[position]! < ends[latest]!)
+        )
+          continue;
+        if (prompted(position) && !isCompaction(sameThread[position]!)) latest = position;
+      }
+      // Earlier attempts may already have delivered the note; a steer's replacement attempt must not repeat it.
+      const alreadyDelivered = shared
+        .attemptsOf(input.run.id)
+        .some((attempt) => attempt.id !== input.run.activeAttemptId && delivered(attempt.id));
+      if (alreadyDelivered) return [];
+      const runKey = ranAfterKey(input.run);
+      const latestKey =
+        latest === -1 ? undefined : { end: ends[latest]!, ordinal: ordinals[latest]! };
+      const work: Array<Work> = [];
+      const seen = new Set<string>();
+      for (let position = 0; position < sameThread.length; position++) {
+        const source = sameThread[position]!;
+        const key = { end: ends[position]!, ordinal: ordinals[position]! };
+        if (
+          !keyRanAfter(runKey, key) ||
+          !holdsWork(source) ||
+          (latestKey !== undefined && keyRanAfter(latestKey, key))
+        )
+          continue;
+        for (const entry of source.restartCancelledBackgroundWork ?? []) {
+          const identity = workIdentity(entry);
+          if (seen.has(identity)) continue;
+          seen.add(identity);
+          work.push(entry);
+        }
+      }
+      return work;
+    },
+  };
+}
+
+/** Derive delivery from later completed turns on the same provider thread, excluding compactions, resumes, and rolled-back runs. */
+export function pendingRestartCancelledBackgroundWork(
+  input: RestartNoteInput & { readonly compactionMessageIds: ReadonlySet<string> },
+): ReadonlyArray<Work> {
+  return planRestartNote(input).pending(input.compactionMessageIds);
+}
+
+/**
+ * The runs whose compaction `pendingRestartCancelledBackgroundWork` can turn on, latest-ran first:
+ * each prompted the provider thread unless its message is a compaction. Only those up to the first
+ * that is not one can, as it ran after the rest; none when no earlier run there holds the work.
+ */
+export function restartNoteCompactionCandidates(
+  input: RestartNoteInput,
+): ReadonlyArray<OrchestrationV2Run> {
+  return [...planRestartNote(input).compactionCandidates()];
+}
+
+const workIdentity = (entry: Work) => entry.id ?? `${entry.kind}\u0000${entry.label}`;
 
 export function mergeRestartCancelledBackgroundWork(
   current: ReadonlyArray<Work>,
   added: ReadonlyArray<Work>,
 ): ReadonlyArray<Work> {
-  const identity = (entry: Work) => entry.id ?? `${entry.kind}\u0000${entry.label}`;
-  const seen = new Set(current.map(identity));
+  const seen = new Set(current.map(workIdentity));
   const merged = [...current];
   for (const entry of added) {
-    const key = identity(entry);
+    const key = workIdentity(entry);
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(entry);

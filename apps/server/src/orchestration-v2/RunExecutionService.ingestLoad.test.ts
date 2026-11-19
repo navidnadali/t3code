@@ -304,7 +304,12 @@ it.effect(
             }),
           ),
         true,
-        (work) => hold(SAVEPOINT_MS).pipe(Effect.andThen(work)),
+        // The model's lane costs were taken with a savepoint per job.
+        {
+          ...ProviderCommitBatch.noIsolation,
+          segment: (work) => hold(SAVEPOINT_MS).pipe(Effect.andThen(work)),
+          perJobSavepoints: true,
+        },
       );
       const write = (hotStamp: number | undefined) =>
         Effect.gen(function* () {
@@ -504,8 +509,8 @@ it.effect(
       const windowMs = (yield* Clock.currentTimeMillis) - windowStart;
       assert.isAtLeast(busyMs / windowMs, 0.95, "the shared writer is saturated");
       assert.isAbove(hotLags.length, 0);
-      // At one commit a delta, assistant text committed long after the adapter stamped it: a
-      // backlog was ingested a 50 ms step at a time, each one paying a writer pass.
+      // At one commit a delta, a saturated writer committed assistant text minutes after the adapter
+      // stamped it: a backlog was ingested a 50 ms step at a time, each one paying a writer pass.
       assert.isAtMost(percentile(hotLags, 0.9), 5, "p90 adapter-to-commit lag of the long answers");
     }),
 );

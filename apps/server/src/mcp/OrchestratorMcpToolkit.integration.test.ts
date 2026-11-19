@@ -1247,7 +1247,7 @@ describe("orchestrator MCP toolkit in a provider wake turn", () => {
     ),
   );
 
-  // Seen in practice: a seat's wake takes its parent's lock before its run is created, and that lock was held
+  // A seat's wake takes its parent's lock before its run is created, and that lock can be held
   // for minutes. The call waits at most ten minutes; past that it is refused as before.
   it.effect.each([
     { heldSeconds: 599, outcome: "joins the run" },
@@ -1546,7 +1546,7 @@ describe("orchestrator MCP toolkit in a provider wake turn", () => {
       captureFirst: true,
       probe: false,
     },
-    // A user's queued message can end a stranded child's wait too.
+    // A stranded child often gets a user's queued message while waiting.
     { when: "a user's message ended its wait", captureFirst: false, probe: true, user: true },
     {
       when: "a user's message ended its wait, with no live probe",

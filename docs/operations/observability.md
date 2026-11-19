@@ -194,13 +194,13 @@ SQL spans that `T3CODE_TRACE_SQL_MIN_DURATION_MS` only counts.
   thread; it opens no port and needs no signal. Two profiles overlap at each minute's end, as
   restarting one makes V8 walk the whole heap again (seconds on a large heap). The first start
   logs the code already compiled, so set it before the heap grows. Sampling keeps the event loop
-out of idle: at 10 ms it adds noticeably to event loop utilization under load, with little
+  out of idle: at 10 ms it added 0.14–0.20 to event loop utilization under a heavy synthetic load,
 extra CPU; a 50 ms or 100 ms interval costs much less.
 Profile at 10 ms only for a short, deliberate window; for longer ones use 100 ms.
 
 At 4 MiB the file is gzipped to `server.span-minutes.ndjson.<UTC close time>.gz`. The newest 96
-archives are kept, at most 96 MiB together: several days on a busy server, more on a quieter one.
-To list the five span names with the most time each minute:
+archives are kept, at most 96 MiB together: several days on a server that ends a few hundred span
+names a minute (a line of tens of KB), more on a quieter one. To list the five span names with the most time each minute:
 
 ```bash
 cd ~/.t3/userdata/logs
@@ -259,8 +259,8 @@ waiting. Read CPU together with page faults:
 
 Every child process Node starts is created synchronously on the thread that spawns it
 (`posix_spawn` on macOS, `fork` on Linux). On Linux each `fork` copies the page tables of the whole
-server, so its cost grows with the server's memory: from milliseconds per fork on a small
-server to hundreds of milliseconds on a very large one. On Linux and macOS the server therefore starts these commands from a
+server, so its cost grows with the server's memory: about 10–17 ms per fork at 1–2 GB, and an
+estimated few hundred ms for a server many times larger. On Linux and macOS the server therefore starts these commands from a
 small spawner process, started once while the server is small, so the server does not fork for them
 (each fork copies only the spawner's page tables):
 
@@ -1022,8 +1022,8 @@ reader in the pool, the most passed over first, so none starves; then to small o
 to small, page and history reads in that order. History reads that already hold all readers but two
 (at least one) go after every other queued read. Within a class, reads go in the order they queued.
 The order counts turns, not reader time, and no reader is kept for small reads: when history reads
-hold every reader, a small read waits for one of them to finish. In a review probe (two looping full
-snapshots of a very large thread beside history, window and small reads) small reads waited up to
+hold every reader, a small read waits for one of them to finish. In a probe (two looping full
+snapshots of a thread with tens of thousands of items beside history, window and small reads) small reads waited up to
 1.7 s at p95 with one reader, 0.5 s with two, 0.2-0.33 s with four and 95-209 ms with eight; before
 this order they waited 36-79 ms with four, but snapshot windows starved (6 in 8 s against 149). A
 read's statements go to a reader worker together; while reads fall back to the main connection they
@@ -1064,7 +1064,7 @@ saturated allowance's worth of such effects in flight until the gate is open wit
 server or a single session pays no wake-ups for it; the price is that the first close after the
 sampler starts takes its two samples from then. Effects already running are never stopped, a slot
 counts against the allowance for ten minutes at most (a safety valve against hung starts, well past
-the slow tail of long turn starts — not a tuning value), the last
+the slow tail of turn starts, which run a minute or two as a rule — not a tuning value), the last
 slot given back wakes one idle worker — after its claim took work, gated
 or not, or when it expired; a claim that found nothing returns it without a wake-up — and a
 reopened gate wakes them all. The time an

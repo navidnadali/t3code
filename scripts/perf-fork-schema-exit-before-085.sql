@@ -1,6 +1,6 @@
 -- Leaves the performance fork's schema for an upstream build, on a database that has not run
 -- upstream's migration 85, keeping every other row: the fork's turn-item counts (keyed by run_id,
--- under the names 85 creates) and their triggers, its migrations table, and release candidate 1's
+-- under the names 85 creates) and their triggers, its migrations table, and the first fork builds'
 -- records of its migrations in upstream's table (77 and 78). The message-ordinal index stays:
 -- upstream's migration 94 creates the same index and takes this one as it is. Stop the server
 -- first. See docs/operations/perf-fork-schema-exit.md.
@@ -20,6 +20,13 @@ DROP TRIGGER IF EXISTS orchestration_v2_turn_item_counts_insert;
 DROP TRIGGER IF EXISTS orchestration_v2_turn_item_counts_update;
 DROP TRIGGER IF EXISTS orchestration_v2_turn_item_counts_delete;
 DROP TABLE IF EXISTS orchestration_v2_projection_turn_item_counts;
+DROP TRIGGER IF EXISTS t3_perf_thread_item_totals_item_insert;
+DROP TRIGGER IF EXISTS t3_perf_thread_item_totals_item_update;
+DROP TRIGGER IF EXISTS t3_perf_thread_item_totals_item_delete;
+DROP TRIGGER IF EXISTS t3_perf_thread_item_totals_run_insert;
+DROP TRIGGER IF EXISTS t3_perf_thread_item_totals_run_delete;
+DROP TRIGGER IF EXISTS t3_perf_thread_item_totals_run_update;
+DROP TABLE IF EXISTS t3_perf_thread_item_totals;
 DROP TABLE IF EXISTS t3_perf_fork_migrations;
 DELETE FROM effect_sql_migrations
 WHERE (migration_id = 77 AND name = 'ProjectionTurnItemCounts')

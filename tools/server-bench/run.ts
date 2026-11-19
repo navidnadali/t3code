@@ -53,8 +53,8 @@ Refs
                            first. Without dist/ it runs src/bin.ts (smoke only; compare refuses
                            dist against source).
   label=...                names the result (default: the ref with / as -).
-  --base <ref>             the base every result records; compare refuses different bases
-                           [main].
+  --base <ref>             required: the base every result records; compare refuses different
+                           bases.
   --build-cmd <sh>         [vp i && vp run --filter t3 build]
 
 Fixture (restored for every run with a reflink copy where the filesystem supports it)
@@ -69,7 +69,7 @@ Load
   --driver <path|stub>     [driver.ts beside this file when it exists, else driver-stub.ts]
   --warmup 60s --window 300s, --sessions/--subscribers/--pollers N (passed through when given),
   --driver-arg=<arg>       repeated, appended verbatim (e.g. --driver-arg=--mode --driver-arg=fresh).
-  The driver (the driver contract) is started as: node <driver> --url <origin> --out <run>/driver
+  The driver (the load driver's contract) is started as: node <driver> --url <origin> --out <run>/driver
   --server-pid <pid> --warmup <n>s --window <n>s [--sessions N] [--subscribers N] [--pollers N]
   [driver args], with T3_BENCH_TOKEN (a bearer token from the server's bootstrap grant) in its
   environment. It writes <out>/driver.json: { status: "ok"|"failed", failure?: { reason },
@@ -1089,7 +1089,7 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
     args: [...argv],
     options: {
       ref: { type: "string", multiple: true },
-      base: { type: "string", default: "main" },
+      base: { type: "string" },
       fixture: { type: "string" },
       runs: { type: "string", default: "3" },
       retries: { type: "string", default: "2" },
@@ -1116,6 +1116,9 @@ async function main(argv: ReadonlyArray<string>): Promise<number> {
   if (values.help) {
     console.log(HELP);
     return 0;
+  }
+  if (values.base === undefined) {
+    throw new Error("--base <ref> is required: the base every result records (see --help)");
   }
   const refs = values.ref ?? [];
   if (refs.length === 0) throw new Error("at least one --ref is required (see --help)");

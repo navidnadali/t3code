@@ -7682,10 +7682,18 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.isNotEmpty(countQueries);
       for (const countQuery of countQueries) {
         for (const detail of yield* planOf(countQuery)) {
-          // A thread's counts read only each run's status, never its row and payload.
+          // A thread's counts read no run of its settled history: a run's status from a covering
+          // index, or the rows of only the thread's runs in a status the count leaves out.
           if (/^SEARCH (r|run) /.test(detail)) {
-            assert.include(detail, "COVERING INDEX", detail);
+            assert.isTrue(
+              detail.includes("COVERING INDEX") ||
+                detail.endsWith(
+                  "USING INDEX orchestration_v2_projection_runs_thread_status_idx (thread_id=? AND status=?)",
+                ),
+              detail,
+            );
           }
+          assert.notMatch(detail, /^SCAN (r|run|counts|totals)\b/, detail);
           if (detail.includes("orchestration_v2_projection_turn_items")) {
             // Only held input is read from the sparse index; transcript history stays unread.
             assert.include(
@@ -8071,6 +8079,152 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         yield* applyRun(otherThreadId, "late", 2, false);
         assert.equal(yield* itemCountOf(otherThreadId), 2);
       }),
+  );
+
+  // An item whose run belongs to another thread shows in its own thread's timeline
+  // whatever that run's status: the thread's projection holds only the thread's own runs. The
+  // shell counts what the timeline shows (0.1.9-perf.12 hid it, or went negative for held input).
+  it.effect("counts an item in another thread's run as its own thread's timeline shows it", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const projectId = ProjectId.make("project:shell-foreign-run");
+      const ownerThreadId = ThreadId.make("thread:shell-foreign-run:owner");
+      const itemThreadId = ThreadId.make("thread:shell-foreign-run:items");
+      for (const threadId of [ownerThreadId, itemThreadId]) {
+        yield* projectionStore.apply({
+          id: EventId.make(`event:${threadId}:created`),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId,
+            title: threadId,
+            providerInstanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        });
+      }
+      const applyRun = (suffix: string, ordinal: number, status: "rolled_back" | "cancelled") => {
+        const runId = RunId.make(`run:shell-foreign-run:${suffix}`);
+        const rootNodeId = NodeId.make(`node:shell-foreign-run:${suffix}`);
+        return projectionStore
+          .apply({
+            id: EventId.make(`event:shell-foreign-run:${suffix}:run`),
+            type: "run.created",
+            threadId: ownerThreadId,
+            runId,
+            nodeId: rootNodeId,
+            driver,
+            occurredAt: now,
+            payload: {
+              id: runId,
+              threadId: ownerThreadId,
+              ordinal,
+              providerInstanceId,
+              modelSelection,
+              providerThreadId: null,
+              userMessageId: MessageId.make(`message:shell-foreign-run:${suffix}:user`),
+              rootNodeId,
+              activeAttemptId: null,
+              status,
+              requestedAt: now,
+              startedAt: now,
+              completedAt: now,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          })
+          .pipe(Effect.as(runId));
+      };
+      let ordinal = 0;
+      const applyItem = (threadId: ThreadId, runId: RunId, held: boolean) => {
+        ordinal += 1;
+        const id = TurnItemId.make(`turn-item:shell-foreign-run:${ordinal}`);
+        const base = {
+          id,
+          threadId,
+          runId,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "completed" as const,
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+        };
+        return projectionStore.apply({
+          id: EventId.make(`event:shell-foreign-run:item:${ordinal}`),
+          type: "turn-item.updated",
+          threadId,
+          runId,
+          occurredAt: now,
+          payload: held
+            ? {
+                ...base,
+                type: "user_message",
+                createdBy: "user",
+                creationSource: "web",
+                messageId: MessageId.make(`message:shell-foreign-run:${ordinal}`),
+                inputIntent: "queued_turn",
+                text: "held",
+                attachments: [],
+              }
+            : {
+                ...base,
+                type: "assistant_message",
+                messageId: MessageId.make(`message:shell-foreign-run:${ordinal}`),
+                text: `item ${ordinal}`,
+                streaming: false,
+              },
+        });
+      };
+      const rolledBackRunId = yield* applyRun("rolled-back", 1, "rolled_back");
+      const cancelledRunId = yield* applyRun("cancelled", 2, "cancelled");
+      yield* applyItem(itemThreadId, rolledBackRunId, false);
+      yield* applyItem(itemThreadId, rolledBackRunId, false);
+      yield* applyItem(itemThreadId, cancelledRunId, true);
+      yield* applyItem(ownerThreadId, cancelledRunId, true);
+      yield* applyItem(ownerThreadId, cancelledRunId, false);
+
+      const snapshot = yield* projectionStore.getShellSnapshot({ projectId });
+      for (const [threadId, itemCount] of [
+        [itemThreadId, 3],
+        [ownerThreadId, 1],
+      ] as const) {
+        const timeline = ProjectionStore.threadShellFromProjection(
+          yield* projectionStore.getThreadProjection(threadId),
+        );
+        const shell = yield* projectionStore.getThreadShell(threadId);
+        assert.equal(timeline.itemCount, itemCount);
+        assert.equal(shell?.itemCount, itemCount);
+        assert.equal(
+          snapshot.threads.find((thread) => thread.id === threadId)?.itemCount,
+          itemCount,
+        );
+      }
+    }),
   );
 
   it.effect("does not treat visited or marked-unread state as thread activity", () =>

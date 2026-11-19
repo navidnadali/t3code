@@ -21,6 +21,12 @@ export const enabled = Config.Boolean("T3CODE_PROVIDER_COMMIT_BATCHING").pipe(
   Effect.orDie,
 );
 
+/** Every job of a shared batch under a savepoint of its own, as before batches recorded their jobs. */
+export const perJobSavepoints = Config.Boolean("T3CODE_PROVIDER_COMMIT_JOB_SAVEPOINTS").pipe(
+  Config.withDefault(false),
+  Effect.orDie,
+);
+
 /** Provider snapshots, which a consumer batches unless it says otherwise. */
 export const isSnapshot = (event: { readonly type: string }) =>
   event.type === "node.updated" ||
@@ -90,6 +96,20 @@ function collect(queue: Queue.Queue<Job>) {
   );
 }
 
+/**
+ * What a caller does while its write waits on the lane: an admitted effect lends its slot out
+ * (`suspend`) and takes it back (`resume`, which never waits). Only on the `owner` fiber: fibers it
+ * forks (a run's ingestion) inherit the context but not the slot.
+ */
+export const CurrentLaneWait = Context.Reference<
+  | {
+      readonly owner: number;
+      readonly suspend: Effect.Effect<void>;
+      readonly resume: Effect.Effect<void>;
+    }
+  | undefined
+>("t3/ProviderCommitBatch/CurrentLaneWait", { defaultValue: () => undefined });
+
 const CurrentWorker = Context.Reference<number | undefined>(
   "t3/ProviderCommitBatch/CurrentWorker",
   {
@@ -97,12 +117,55 @@ const CurrentWorker = Context.Reference<number | undefined>(
   },
 );
 
+/** What a snapshot job wrote, kept while its batch is open. */
+export interface Recording {
+  /** Runs the job's body, keeping each statement it writes. */
+  readonly around: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+  /** Applies the kept statements again, under a savepoint of their own, without running the body. */
+  readonly reapply: Effect.Effect<void, CommitBatchError>;
+  /** Drops what the job queued for after the commit (publications, counts): a failed job's. */
+  readonly discard: Effect.Effect<void>;
+}
+
+/**
+ * How a shared batch keeps one job's failure from its other jobs while running each job's body once:
+ * one consumer's run of jobs shares a savepoint (none for a single-consumer batch); on a failure, the
+ * run rolls back and the jobs before the failed one are applied again from what they wrote.
+ */
+export interface Isolation {
+  /** Runs one consumer's run of jobs, in a batch of several consumers, under a savepoint. */
+  readonly segment: <A, E>(work: Effect.Effect<A, E>) => Effect.Effect<A, E | CommitBatchError>;
+  /** Starts a job's recording: marks what it queues for after the commit, and keeps what it writes. */
+  readonly record: Effect.Effect<Recording>;
+  /** Rolls the whole batch transaction back on its own connection, which it keeps. */
+  readonly restart: Effect.Effect<void, CommitBatchError>;
+  /** Every job of a multi-job batch under a savepoint of its own: the reference the batch must equal. */
+  readonly perJobSavepoints?: boolean;
+}
+
+/** No transaction to isolate in: jobs run as they are, and a failure keeps nothing to undo. */
+export const noIsolation: Isolation = {
+  segment: (work) => work,
+  record: Effect.succeed({
+    around: (effect) => effect,
+    reapply: Effect.void,
+    discard: Effect.void,
+  }),
+  restart: Effect.void,
+};
+
+/** A run of one consumer's jobs rolled back by its failed job, with the jobs before it to apply again. */
+class SegmentFailed {
+  readonly applied: ReadonlyArray<Recording>;
+  constructor(applied: ReadonlyArray<Recording>) {
+    this.applied = applied;
+  }
+}
+
 export const make = Effect.fn("ProviderCommitBatch.make")(function* (
   commit: (work: Effect.Effect<void, CommitBatchError>) => Effect.Effect<void, CommitBatchError>,
   enabled: boolean,
-  isolate: (
-    work: Effect.Effect<void, CommitBatchError>,
-  ) => Effect.Effect<void, CommitBatchError> = (work) => work,
+  isolation: Isolation = noIsolation,
 ) {
   const queue = yield* Queue.bounded<Job>(MAX_EVENTS);
   const pending = new Set<Job>();
@@ -186,6 +249,95 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
     );
     return Deferred.await(reply);
   });
+  // A savepoint per job, as the batch must behave; a lone job fails its transaction instead.
+  const perJob = (
+    jobs: ReadonlyArray<Job>,
+    outcomes: Map<Job, Exit.Exit<void, CommitBatchError>>,
+  ) =>
+    Effect.forEach(
+      jobs,
+      (job) =>
+        Effect.gen(function* () {
+          if (!job.owner.active) return yield* job.cancel;
+          const isolated = jobs.length > 1 && job.bytes > 0;
+          const recording = isolated ? yield* isolation.record : undefined;
+          const outcome = yield* (isolated ? isolation.segment(job.execute) : job.execute).pipe(
+            Effect.exit,
+          );
+          outcomes.set(job, outcome);
+          if (Exit.isFailure(outcome)) {
+            if (recording !== undefined) yield* recording.discard;
+            job.owner.active = false;
+            if (jobs.length === 1) return yield* Effect.failCause(outcome.cause);
+          }
+        }),
+      { discard: true },
+    );
+  // One consumer's consecutive jobs, recorded; stops at a failure, after which its later jobs cancel.
+  const runSegment = Effect.fnUntraced(function* (
+    segment: ReadonlyArray<Job>,
+    outcomes: Map<Job, Exit.Exit<void, CommitBatchError>>,
+  ) {
+    const applied: Array<Recording> = [];
+    let failed: Recording | undefined;
+    for (const job of segment) {
+      if (!job.owner.active) {
+        yield* job.cancel;
+        continue;
+      }
+      const recording = yield* isolation.record;
+      const outcome = yield* recording.around(job.execute).pipe(Effect.exit);
+      outcomes.set(job, outcome);
+      if (Exit.isSuccess(outcome)) applied.push(recording);
+      else {
+        job.owner.active = false;
+        failed = recording;
+      }
+    }
+    return { applied, failed };
+  });
+  const optimistic = Effect.fnUntraced(function* (
+    jobs: ReadonlyArray<Job>,
+    outcomes: Map<Job, Exit.Exit<void, CommitBatchError>>,
+  ) {
+    const segments: Array<Array<Job>> = [];
+    for (const job of jobs) {
+      const last = segments.at(-1);
+      if (last !== undefined && last[0]!.owner === job.owner) last.push(job);
+      else segments.push([job]);
+    }
+    if (segments.length === 1) {
+      const { applied, failed } = yield* runSegment(segments[0]!, outcomes);
+      if (failed === undefined) return;
+      yield* failed.discard;
+      yield* isolation.restart;
+      for (const recording of applied) yield* recording.reapply;
+      return;
+    }
+    for (const segment of segments) {
+      // A consumer's end writes nothing, so it needs no savepoint.
+      if (segment.every((job) => job.bytes === 0)) {
+        yield* runSegment(segment, outcomes);
+        continue;
+      }
+      const rolledBack = yield* isolation
+        .segment(
+          Effect.flatMap(runSegment(segment, outcomes), ({ applied, failed }) =>
+            failed === undefined
+              ? Effect.undefined
+              : Effect.andThen(failed.discard, Effect.fail(new SegmentFailed(applied))),
+          ),
+        )
+        .pipe(
+          Effect.catchIf(
+            (error): error is SegmentFailed => error instanceof SegmentFailed,
+            (error) => Effect.succeed(error),
+          ),
+        );
+      if (rolledBack !== undefined)
+        for (const recording of rolledBack.applied) yield* recording.reapply;
+    }
+  });
   if (enabled) {
     yield* collect(queue).pipe(
       Stream.runForEach((batch) =>
@@ -214,22 +366,10 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
                 (yield* Clock.currentTimeMillis) - Math.min(...jobs.map((job) => job.queuedAt)),
             });
             const outcomes = new Map<Job, Exit.Exit<void, CommitBatchError>>();
-            const work = Effect.forEach(
-              jobs,
-              (job) =>
-                Effect.gen(function* () {
-                  if (!job.owner.active) return yield* job.cancel;
-                  const outcome = yield* (
-                    jobs.length > 1 && job.bytes > 0 ? isolate(job.execute) : job.execute
-                  ).pipe(Effect.exit);
-                  outcomes.set(job, outcome);
-                  if (Exit.isFailure(outcome)) {
-                    job.owner.active = false;
-                    if (jobs.length === 1) return yield* Effect.failCause(outcome.cause);
-                  }
-                }),
-              { discard: true },
-            );
+            const work =
+              jobs.length === 1 || isolation.perJobSavepoints === true
+                ? perJob(jobs, outcomes)
+                : optimistic(jobs, outcomes);
             const exit = yield* restore(
               (jobs.every((job) => job.bytes === 0) ? work : commit(work)).pipe(
                 Effect.provideService(CurrentWorker, yield* Effect.fiberId),
@@ -269,7 +409,7 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
       return yield* effect;
     }
     const token = { active: true };
-    return yield* enqueue(Effect.exit(effect), token, "barrier", 0).pipe(
+    const queued = enqueue(Effect.exit(effect), token, "barrier", 0).pipe(
       Effect.flatten,
       Effect.orDie,
       Effect.flatten,
@@ -279,6 +419,16 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
         }),
       ),
     );
+    const lent = yield* CurrentLaneWait;
+    // The slot is out from before the write may wait for room in the queue until it settles; taking
+    // it back never waits, so this runs on every exit.
+    return yield* lent?.owner === (yield* Effect.fiberId)
+      ? Effect.acquireUseRelease(
+          lent.suspend,
+          () => queued,
+          () => lent.resume,
+        )
+      : queued;
   });
   const consume = Effect.fnUntraced(function* <A extends { readonly type: string }, E, R, E2, R2>(
     source: Stream.Stream<A, E, R>,

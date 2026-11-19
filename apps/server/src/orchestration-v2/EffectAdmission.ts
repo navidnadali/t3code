@@ -23,7 +23,7 @@ export const isGated = (effectType: string): boolean =>
 
 /**
  * A slot counts for this long at most. A safety valve against hung starts, not a tuning value:
- * turn starts can run for minutes, so the bound sits well past their slow tail —
+ * turn starts run a minute or two, as a rule, so the bound sits well past their slow tail —
  * a slot that expired would let the gate drift back towards the worker count.
  */
 export const SLOT_MAX_HOLD = Duration.minutes(10);
@@ -44,6 +44,14 @@ export interface AdmissionSlot {
   readonly release: Effect.Effect<void>;
   /** Gives the slot back unused, because the claim found nothing: no worker is woken for it. */
   readonly discard: Effect.Effect<void>;
+  /**
+   * Lends the slot out while its effect waits on the commit lane and does no main-thread work (only
+   * while fewer than the saturated allowance are lent); a worker skipped meanwhile is woken. `resume`
+   * takes a slot back at once, even past the allowance (the effect may hold locks a slot holder
+   * needs); no new gated claim runs until it is back under.
+   */
+  readonly suspend: Effect.Effect<void>;
+  readonly resume: Effect.Effect<void>;
 }
 
 export interface EffectAdmissionShape {
@@ -56,7 +64,12 @@ export interface EffectAdmissionShape {
 
 const ungated: EffectAdmissionShape = {
   excludedTypes: Effect.succeed([]),
-  reserve: Effect.succeedSome({ release: Effect.void, discard: Effect.void }),
+  reserve: Effect.succeedSome({
+    release: Effect.void,
+    discard: Effect.void,
+    suspend: Effect.void,
+    resume: Effect.void,
+  }),
   state: Effect.succeed({ allowed: Infinity, inFlight: 0, saturated: false, sampling: false }),
 };
 
@@ -86,8 +99,8 @@ export interface EffectAdmissionOptions {
 export const saturatedAllowance = (workers: number): number => Math.max(1, Math.ceil(workers / 2));
 
 /**
- * Headroom counts as back below three quarters of the closing pressure. Replayed on the recorded
- * 1 Hz loop-delay series: at light load a spike decays below that within a few seconds, while a
+ * Headroom counts as back below three quarters of the closing pressure. Replayed on a 1 Hz
+ * loop-delay series: at light load a spike decays below that within a few seconds, while a
  * saturated loop hovers around the mark and stays above it — half the mark held a spike-closed gate
  * for a minute at 250 sessions, and higher fractions, a bounded spell or the p50 flap at 80.
  */
@@ -157,6 +170,8 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
   let highRun = 0;
   let lowRun = 0;
   let slots: Array<Slot> = [];
+  // Slots lent out by effects waiting on the commit lane.
+  let lent = 0;
   let sampler: Sampler | undefined;
 
   const prune = (nowMs: number) => {
@@ -190,6 +205,7 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
     const unregister = [
       observer.register("EffectAdmission.closedMs", "counter", reader(closed)),
       observer.register("EffectAdmission.saturatedMs", "counter", reader(reduced)),
+      observer.register("EffectAdmission.lent", "gauge", () => lent),
     ];
     yield* Effect.addFinalizer(() => Effect.sync(() => unregister.forEach((undo) => undo())));
   }
@@ -293,6 +309,51 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
     yield* settle;
   });
 
+  // The slot an effect holds now: its reserved one, none while lent out, or the one it took back.
+  // In flight = held + lent; a claim needs held < allowed and a lend lent < whenSaturated, a constant,
+  // so in flight <= allowed + whenSaturated at each claim, whatever the allowance is later.
+  const lendable = (reserved: Slot): AdmissionSlot => {
+    let held: Slot | undefined = reserved;
+    let lentOut = false;
+    let ended = false;
+    const end = (ran: boolean) =>
+      Effect.suspend(() => {
+        ended = true;
+        if (lentOut) {
+          lentOut = false;
+          lent--;
+        }
+        const slot = held;
+        held = undefined;
+        return slot === undefined ? Effect.void : giveBack(slot, ran);
+      });
+    return {
+      release: end(true),
+      discard: end(false),
+      suspend: Effect.suspend(() => {
+        const slot = held;
+        // An expired slot no longer counts: lending it would give nothing back.
+        if (slot === undefined || ended || lent >= whenSaturated || !slots.includes(slot))
+          return Effect.void;
+        held = undefined;
+        lentOut = true;
+        lent++;
+        return giveBack(slot, true);
+      }),
+      // The clock is read first: the effect counts as lent until it holds its slot again.
+      resume: Effect.flatMap(Clock.currentTimeMillis, (nowMs) => {
+        if (!lentOut || ended) return Effect.void;
+        lentOut = false;
+        lent--;
+        const slot: Slot = { takenAtMs: nowMs };
+        slots.push(slot);
+        held = slot;
+        track(nowMs);
+        return settle;
+      }),
+    };
+  };
+
   const reserve: EffectAdmissionShape["reserve"] = Effect.gen(function* () {
     const nowMs = yield* Clock.currentTimeMillis;
     if (prune(nowMs)) yield* options.onSlotFreed;
@@ -305,7 +366,7 @@ export const make = Effect.fn("EffectAdmission.make")(function* (options: Effect
     slots.push(slot);
     track(nowMs);
     yield* settle;
-    return Option.some({ release: giveBack(slot, true), discard: giveBack(slot, false) });
+    return Option.some(lendable(slot));
   });
 
   return {

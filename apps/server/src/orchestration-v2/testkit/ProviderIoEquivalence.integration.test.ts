@@ -32,6 +32,11 @@ import { CLAUDE_AGENT_SDK_STAGE } from "../../provider/io/claudeAgentSdkProtocol
 import * as ProviderIoOffloads from "../../provider/io/ProviderIoOffloads.ts";
 import * as ProviderIoWorkerPool from "../../provider/io/ProviderIoWorkerPool.ts";
 import { AcpRegistryOrchestratorReplayHarness } from "../Adapters/AcpRegistryAdapterV2.testkit.ts";
+import {
+  collapseSupersededItemStates,
+  NoStoreControlRecorder,
+  type NoStoreControl,
+} from "./SupersededItemStates.ts";
 import { FxOrchestratorReplayHarness } from "../Adapters/FxAdapterV2.testkit.ts";
 import { GrokOrchestratorReplayHarness } from "../Adapters/GrokAdapterV2.testkit.ts";
 import * as ClaudeAdapterV2 from "../Adapters/ClaudeAdapterV2.ts";
@@ -216,7 +221,18 @@ const byEntity = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) => {
     const entity = entityOf(event);
     entities.set(entity, [...(entities.get(entity) ?? []), ownersOrNone ? unattributed : write]);
   }
-  return Object.fromEntries([...entities].toSorted(([a], [b]) => (a < b ? -1 : 1)));
+  // Ids are renamed by first appearance, so entities are ordered by key and writes with ids masked:
+  // a mode that coalesced more states drew fewer random ids before the later ones.
+  const canonical = (key: string, writes: ReadonlyArray<unknown>) =>
+    `${key}\n${JSON.stringify(writes)}`
+      .replace(ANY_UUID, "<uuid>")
+      .replace(ISO_TIMESTAMP, "<timestamp>");
+  return Object.fromEntries(
+    [...entities]
+      .map(([key, writes]) => [canonical(key, writes), key, writes] as const)
+      .toSorted(([a, keyA], [b, keyB]) => (a < b ? -1 : a > b ? 1 : keyA < keyB ? -1 : 1))
+      .map(([, key, writes]) => [key, writes] as const),
+  );
 };
 
 interface LogLine {
@@ -501,6 +517,7 @@ const adapterRow = <
       );
       const harness = yield* row.harness(Layer.succeedContext(services), input);
       const adapterEvents: Array<Array<unknown>> = [];
+      const controls: Array<NoStoreControl> = [];
       const result = yield* runReplayFixture({
         ...input,
         ...(row.checkOutput === false
@@ -519,7 +536,7 @@ const adapterRow = <
         ...(row.materializeWorkspace === undefined
           ? {}
           : { materializeWorkspace: row.materializeWorkspace }),
-      }).pipe(Effect.provide(services));
+      }).pipe(Effect.provide(services), Effect.provideService(NoStoreControlRecorder, controls));
       if (store !== undefined) {
         yield* store.close();
         for (const file of (yield* fileSystem.readDirectory(logDir)).toSorted()) {
@@ -532,8 +549,12 @@ const adapterRow = <
           }
         }
       }
+      // The two modes hand the commit path the same events in different chunks, so a run's backlog
+      // can coalesce an item's superseded states in one and not the other: writes are
+      // compared once those states are collapsed, never across a control, stored or not.
+      const sinkWrites = collapseSupersededItemStates(result.storedEvents, controls);
       const capture = normalize(
-        { adapterEvents, logLines, sinkWrites: result.storedEvents },
+        { adapterEvents, logLines, sinkWrites },
         path.dirname(logDir),
         row.freshIds === true,
       );
@@ -671,7 +692,7 @@ const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "codex",
     path: "replay",
-    // The worker offload moves long Codex stdout lines onto the workers.
+    // Long Codex stdout lines move onto the workers.
     offload: "required",
     stage: "codex-app-server",
     modes: LINE_OFFLOAD_MODES,
@@ -682,7 +703,7 @@ const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "acpRegistry",
     path: "replay",
-    // The worker offload moves long ACP stdout lines onto the workers.
+    // Long ACP stdout lines move onto the workers.
     offload: "required",
     stage: "acp",
     modes: LINE_OFFLOAD_MODES,
@@ -691,7 +712,7 @@ const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "acpRegistry",
     path: "replay, real log store",
-    // End to end with the store the server uses: ACP logs each request (in issue order).
+    // End to end with the store the server uses: ACP logs each request, in order.
     offload: "required",
     stage: "acp",
     modes: LINE_OFFLOAD_MODES,
@@ -722,7 +743,7 @@ const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "claudeAgent",
     path: "wire (fake CLI)",
-    // The worker path runs the Agent SDK on the workers (T3CODE_PROVIDER_IO_CLAUDE_SDK).
+    // The Agent SDK runs on the workers (T3CODE_PROVIDER_IO_CLAUDE_SDK).
     offload: "required",
     stage: CLAUDE_AGENT_SDK_STAGE,
     modes: [{ name: "2 workers", workers: 2 }],

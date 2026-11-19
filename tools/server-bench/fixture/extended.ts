@@ -1,8 +1,10 @@
 /**
- * the extended check (the original extended check script and the 52 patterns of the original sanitiser script),
- * ported rule for rule. Each value is read as stored (`raw`) and, if JSON, as its decoded strings
+ * The reference sanitiser's extended check (its extended-check script and the 52 patterns of its sanitiser script),
+ * ported rule for rule, one named token prefix generalised to any short prefix. Each value is read as stored (`raw`) and, if JSON, as its decoded strings
  * and keys (`decoded`). Counts by kind only; a clean fixture scores 0 in every row.
  */
+
+import { PREFIXED_TOKEN, mixedCaseBody } from "./secrets.ts";
 
 const ALNUM = /[A-Za-z0-9]/;
 const WORD = /[A-Za-z0-9_-]/;
@@ -68,6 +70,15 @@ const telegramOk: Check = (text, start) => {
   return start - i >= 8 && start - i <= 10 && boundaryOk(text, i, ALNUM);
 };
 
+/**
+ * The boundary `boundaryOk(…, ALNUM)` checks, as a lookbehind: no letter or digit before, or the
+ * end of a JSON escape (`\n`, `\u0041`, its backslash not itself escaped). A check that refused a
+ * match would have consumed it, hiding a token that starts inside it.
+ */
+const AFTER_ALNUM_BOUNDARY = String.raw`(?:(?<![A-Za-z0-9])|(?<=(?<!\\)(?:\\\\)*\\[nrtbf/])|(?<=(?<!\\)(?:\\\\)*\\u[0-9a-fA-F]{4}))`;
+
+const prefixedTokenOk: Check = (text, start, end) => mixedCaseBody(text.slice(start, end));
+
 const mailgunOk: Check = (text, start) =>
   start >= 32 &&
   /^[0-9a-f]{32}$/.test(text.slice(start - 32, start)) &&
@@ -113,7 +124,7 @@ const p = (
 const NOT_AFTER_ALNUM = notAfter(ALNUM);
 const NOT_AFTER_WORD = notAfter(WORD);
 
-/** The original sanitiser script's PATTERNS, in order. */
+/** The reference sanitiser's PATTERNS, in order. */
 export const SANITISER_PATTERNS: ReadonlyArray<SanitiserPattern> = [
   p("anthropic/openai sk-", "token", String.raw`sk-[A-Za-z0-9_\-]{20,}`, { check: NOT_AFTER_WORD }),
   p("github token", "token", String.raw`gh[pousr]_[A-Za-z0-9]{30,}`, { check: NOT_AFTER_ALNUM }),
@@ -199,7 +210,8 @@ export const SANITISER_PATTERNS: ReadonlyArray<SanitiserPattern> = [
   p("twilio key", "token", String.raw`SK[0-9a-f]{32}(?![0-9a-f])`, { check: NOT_AFTER_ALNUM }),
   p("postman key", "token", String.raw`PMAK-[a-f0-9]{24}-[a-f0-9]{34}`),
   p("cloudflare origin ca", "token", String.raw`v1\.0-[a-f0-9]{24}-[a-f0-9]{146}`),
-  p("tfe token", "token", String.raw`tfe_[A-Za-z0-9_\-]{16,}`, { check: NOT_AFTER_ALNUM }),
+  // Generalised from the reference's one named prefix: any short prefix, as the token patterns.
+  p("prefixed token", "token", AFTER_ALNUM_BOUNDARY + PREFIXED_TOKEN, { check: prefixedTokenOk }),
   p("tailscale key", "token", String.raw`tskey-[A-Za-z0-9\-]{20,}`, { check: NOT_AFTER_ALNUM }),
   p("doppler token", "token", String.raw`dp\.(?:pt|st|sa|ct|scim|audit)\.[A-Za-z0-9]{40,}`, {
     check: NOT_AFTER_ALNUM,
@@ -304,7 +316,7 @@ const NEEDS: Readonly<Record<string, string>> = {
   "twilio key": "SK[0-9a-f]",
   "postman key": "PMAK-",
   "cloudflare origin ca": "v1\\.0-",
-  "tfe token": "tfe_",
+  "prefixed token": "[a-z]_[A-Za-z0-9_\\-]{16}",
   "tailscale key": "tskey-",
   "doppler token": "dp\\.",
   "azure account key": "AccountKey=",

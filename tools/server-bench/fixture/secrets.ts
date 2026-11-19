@@ -8,11 +8,59 @@ interface TokenPattern {
   readonly pattern: RegExp;
   /** A match only counts when this holds (Basic auth must decode to `user:password`). */
   readonly confirm?: (match: RegExpMatchArray) => boolean;
+  /**
+   * Only on decoded strings. A raw record runs its fields together, so an id followed by the next
+   * field reads as one long token there; every kept value is scanned decoded instead.
+   */
+  readonly decodedOnly?: true;
 }
 
 // No `\b`: a token right after `\n` in JSON text follows the escape's `n`, a word character.
 // The lookbehinds only refuse a letter or digit run-in on decoded text; raw bytes are de-escaped.
 const AFTER = "(?<![A-Za-z0-9])";
+
+/**
+ * The prefixes of ids the supported providers mint as a prefix, `_` and a random part, which are
+ * ordinary ids, not credentials: Claude (`msg_01…`, `toolu_01…`, `srvtoolu_01…`, `req_011C…`),
+ * OpenAI call ids, OpenCode (`ses_`, `msg_`, `prt_`, `evt_`, `per_`, `que_`, `sh_`, `frm_`), and MCP
+ * tool names (`mcp__server__tool`). Kiro's are matched whole below.
+ */
+const ID_PREFIXES = [
+  "call",
+  "evt",
+  "frm",
+  "mcp",
+  "msg",
+  "per",
+  "prt",
+  "que",
+  "req",
+  "ses",
+  "sh",
+  "srvtoolu",
+  "toolu",
+];
+
+/** A whole Kiro tool use id's random part: 22 token characters, ending there. */
+const KIRO_ID = String.raw`[A-Za-z0-9_\-]{22}(?![A-Za-z0-9_\-])`;
+
+/**
+ * A token whatever its issuer: a short lowercase prefix, `_`, 16+ token characters. Not an id prefix
+ * above, a word in an MCP tool name (`mcp__` + 256 name characters, dots included), or a start in a
+ * whole Kiro tool use id (`tooluse_`, after its tool's name or not). Lookarounds: a refused start
+ * hides no token after it. Bounded, and only where a token fits, so a long run stays linear.
+ */
+export const PREFIXED_TOKEN = String.raw`(?=[a-z]{2,8}_[A-Za-z0-9_\-]{16})(?<!mcp__[A-Za-z0-9_.@/\-]{0,256})(?<!tooluse_(?=${KIRO_ID})[A-Za-z0-9_\-]{0,21})(?!(?:${ID_PREFIXES.join("|")})_)(?!(?:[a-z]{1,32}_){0,4}tooluse_${KIRO_ID})[a-z]{2,8}_[A-Za-z0-9_\-]{16,}`;
+
+/**
+ * A prefixed token's body (past its first `_`) mixes upper and lower case: snake_case, kebab-case,
+ * hex ids, ULIDs and constant names do not. A refused match hides nothing: every later start in
+ * it has a body that is the end of this one, of one case too.
+ */
+export const mixedCaseBody = (match: string) => {
+  const body = match.slice(match.indexOf("_") + 1);
+  return /[A-Z]/.test(body) && /[a-z]/.test(body);
+};
 
 const basicCredentials = (match: RegExpMatchArray) => {
   const decoded = Buffer.from(match.groups?.secret ?? "", "base64").toString("latin1");
@@ -48,7 +96,12 @@ export const TOKEN_PATTERNS: ReadonlyArray<TokenPattern> = [
     pattern: new RegExp(`${AFTER}SG\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}`, "g"),
   },
   { name: "mailgun-key", pattern: new RegExp(`${AFTER}key-[0-9a-f]{32}(?![0-9a-f])`, "g") },
-  { name: "tfe-token", pattern: new RegExp(`${AFTER}tfe_[A-Za-z0-9_-]{16,}`, "g") },
+  {
+    name: "prefixed-token",
+    pattern: new RegExp(`${AFTER}${PREFIXED_TOKEN}`, "g"),
+    confirm: (match) => mixedCaseBody(match[0]),
+    decodedOnly: true,
+  },
   {
     name: "jwt",
     pattern: new RegExp(
@@ -127,7 +180,7 @@ export const looksRandom = (token: string) =>
 const mask = (text: string) => text.replace(/\S/g, "*");
 
 // A key split across strings (a diff's lines in an array): the markers and the base64 body lines
-// on their own, as the extended check reads them.
+// on their own, as the reference extended check reads them.
 const KEY_MARKER = /-----(?:BEGIN|END)[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----/g;
 const KEY_BODY_LINE = /^[ +-]?[A-Za-z0-9+/]{60,76}={0,2}$/gm;
 
@@ -181,7 +234,7 @@ const withoutAnsi = (text: string) =>
  * one pass here spares the 24 per-pattern passes over the text that holds none (most text).
  */
 const TOKEN_HINT =
-  /-----BEGIN|gh[pousr]_|github_pat_|glpat-|sk-|AKIA|ASIA|AIza|ya29\.|xox|xapp-|hooks\.slack\.com\/services\/|ATATT|k_live_|npm_|hf_|SG\.|key-|tfe_|eyJ|[Bb]earer|[Bb]asic|:\/\//;
+  /-----BEGIN|gh[pousr]_|github_pat_|glpat-|sk-|AKIA|ASIA|AIza|ya29\.|xox|xapp-|hooks\.slack\.com\/services\/|ATATT|k_live_|npm_|hf_|SG\.|key-|[a-z]_[A-Za-z0-9_-]{16}|eyJ|[Bb]earer|[Bb]asic|:\/\//;
 
 /** Credential kinds found in one decoded string. */
 export const scanDecoded = (raw: string, options: DecodedScan): Array<string> => {
@@ -344,7 +397,8 @@ export const scanFileBytesSteps = function* (
         lastStart.set(name, start);
         hits.set(name, (hits.get(name) ?? 0) + 1);
       };
-      for (const { name, pattern, confirm } of TOKEN_PATTERNS) {
+      for (const { name, pattern, confirm, decodedOnly } of TOKEN_PATTERNS) {
+        if (decodedOnly) continue;
         for (const match of text.matchAll(pattern)) {
           if (confirm === undefined || confirm(match)) count(name, match);
         }

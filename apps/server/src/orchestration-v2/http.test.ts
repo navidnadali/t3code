@@ -387,7 +387,7 @@ class SnapshotReferenceApi extends HttpApi.make("reference").add(
   ),
 ) {}
 
-// The endpoint as upstream served it: HttpApiBuilder encodes and stringifies the returned snapshot.
+// The endpoint as the base build served it: HttpApiBuilder encodes and stringifies the returned snapshot.
 const serveReferenceSnapshot = (
   services: Context.Context<ThreadManagementService.ThreadManagementService>,
 ) =>
@@ -428,7 +428,7 @@ const serveReferenceSnapshot = (
     return handler;
   });
 
-it.effect("serves the full snapshot as upstream's endpoint did, with the same errors", () =>
+it.effect("serves the full snapshot as the base build's endpoint did, with the same errors", () =>
   Effect.gen(function* () {
     const { services, eventSink, handler } = yield* serveOrchestrationHttp(() => true);
     yield* eventSink.write({

@@ -147,7 +147,7 @@ describe("SpanMinutes", () => {
         const lines = yield* Queue.unbounded<string>();
         const secrets = [
           "deploy the reactor tonight",
-          "/home/someone/private-repo",
+          "/srv/someone/private-repo",
           "thread-7f3a9c",
         ];
         const waits = WaitMinutes.makeWaitAggregate();
@@ -258,12 +258,12 @@ describe("SpanMinutes", () => {
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it("keeps at least five days of 48 KB minute lines, by default", () => {
+  it("keeps at least five and a half days of a busy server's minute lines, by default", () => {
     const { maxBytes, maxArchives, maxArchiveBytes } = SpanMinutes.SPAN_MINUTE_LOG_LIMITS;
-    // A 48 KB minute line with every field, gzipped 4 to 1.
-    const linesPerFile = Math.floor(maxBytes / 48_000);
-    const archives = Math.min(maxArchives, Math.floor(maxArchiveBytes / (maxBytes / 4)));
-    assert.isAtLeast((archives * linesPerFile) / (24 * 60), 5);
+    // A busy server's minute line with every field (45,000 bytes) gzips 4.5 to 1.
+    const linesPerFile = Math.floor(maxBytes / 45_000);
+    const archives = Math.min(maxArchives, Math.floor(maxArchiveBytes / (maxBytes / 4.5)));
+    assert.isAtLeast((archives * linesPerFile) / (24 * 60), 5.5);
   });
 
   it.effect("gzips each closed file and keeps only the newest archives within both caps", () =>

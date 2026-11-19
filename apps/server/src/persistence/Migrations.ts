@@ -7,8 +7,9 @@ import {
   DATABASE_MIGRATIONS_STARTED_MESSAGE,
 } from "@t3tools/shared/databaseMigrationLog";
 import {
+  assertPerfForkLedgerRunnable,
   hasPendingPerfForkMigrations,
-  moveRc1PerfForkMigrations,
+  moveLegacyPerfForkMigrations,
   perfForkMigrationLabel,
   replacePerfForkTurnItemCounts,
   runPerfForkMigrations,
@@ -308,8 +309,10 @@ export const runMigrationChains = Effect.fn("runMigrations")(function* ({
   // The desktop waits past its readiness budget until the finished line follows this one.
   const started = yield* hasPendingMigrations();
   if (started) yield* Effect.log(DATABASE_MIGRATIONS_STARTED_MESSAGE);
-  // Before upstream's chain reads its ledger: release candidate 1 recorded the fork's there.
-  yield* moveRc1PerfForkMigrations();
+  // Before any write of this start: a fork ledger this build cannot run refuses the whole start.
+  yield* assertPerfForkLedgerRunnable();
+  // Before upstream's chain reads its ledger: the fork's first builds recorded the fork's there.
+  yield* moveLegacyPerfForkMigrations();
   const includesV2 =
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
   // The reconcile takes the write lock; CLI startup must not contend with the server for a no-op.

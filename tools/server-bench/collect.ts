@@ -16,7 +16,7 @@ export const HELP = `Usage:
 Samples one running T3 Code server at 1 Hz and writes one JSON summary of the window
 [start, start + duration]. run.ts uses the same functions for every bench run.
 
-Metric definitions:
+Metric definitions (those of the host sampler, so bench and production compare):
   CPU     utime/stime deltas of /proc/<pid>/task/<tid>/stat between the window's first and last
           snapshot, % of one core; "process" from /proc/<pid>/stat.
   I/O     syscr/syscw/rchar/wchar/read_bytes deltas of /proc/<pid>/task/<tid>/io, per second.
@@ -37,13 +37,13 @@ Metric definitions:
           re-read when a rotation happens during the read; spans whose end falls in the window.
           By name: count, total, avg, p50, p95, max (nearest rank); for "sqlite" and
           "sql.transaction" by "<name>|<db.connection>" with lock_wait_n, avg_lock_wait_ms and
-          p95_lock_wait_ms plus p50/max. Only names, durations, exit tags
+          p95_lock_wait_ms (the host sampler's keys) plus p50/max. Only names, durations, exit tags
           and the db.* attributes are kept. A trace that does not reach back to the window start
           (trace_coverage), rotated during every read (trace_rotated_during_read) or whose newest
           span ends 30 s or more before the window end (trace_stale) yields no span statistics;
           only server spans date a file, not the browser spans it relays (otlp-span).
 
-Thread labels ("role", a fixed rule; every Node worker thread has comm "WorkerThread"):
+Thread labels ("role", the host sampler's rule; every Node worker thread has comm "WorkerThread"):
   main           tid == pid.
   checkpoint     a WorkerThread whose lifetime rchar is over 100 MB with wchar/rchar in 0.8-1.25:
                  the WAL checkpoint worker copies WAL frames into the database; until it has
@@ -58,8 +58,9 @@ Thread labels ("role", a fixed rule; every Node worker thread has comm "WorkerTh
   writer, readers on first read); other WorkerThreads writing at most max(64 KiB, 1 % of reads)
   are readers.
 
-By design:
-  - one fixed window (the driver's measured window) for CPU, I/O and spans;
+Differences from the host sampler that remain (by design):
+  - one fixed window (the driver's measured window) for CPU, I/O and spans; production uses a
+    20 s CPU/I/O window and the last 120 s of spans per sample;
   - no 50 ms main-thread scheduler-state sampling, no child-process (claude) counts, no host PSI;
   - the environment GET latency comes from the load driver;
   - ELU, event-loop delay and heap come from the server's own gauges;
@@ -126,7 +127,7 @@ export interface IoRates {
 export interface ThreadRow {
   readonly tid: number;
   readonly comm: string;
-  /** The fixed rule's label (primaryRole), the grouping every summary uses. */
+  /** The host sampler's label, so bench and production group threads alike. */
   readonly role: ThreadRole;
   /** This harness's finer guess from I/O pattern and start order, and what it rests on. */
   readonly role_guess: ThreadRole;
@@ -154,7 +155,7 @@ export interface ProcWindowSummary {
   readonly cpu: {
     readonly main: CpuStats | null;
     readonly process: CpuStats | null;
-    /** Threads present at both window ends, by the fixed rule's label. */
+    /** Threads present at both window ends, by the host sampler's label. */
     readonly roles: Partial<Record<ThreadRole, CpuGroup>> | null;
     /** Every WorkerThread present at both ends: sqlite-reader + checkpoint. */
     readonly worker_threads: CpuGroup | null;
@@ -191,7 +192,7 @@ export function round3(value: number): number {
 const roundOrNull = (value: number | null | undefined) =>
   value === null || value === undefined || !Number.isFinite(value) ? null : round3(value);
 
-/** Nearest-rank percentile of an ascending list. */
+/** Nearest-rank percentile of an ascending list (the host sampler's pct_nr). */
 export function percentile(sorted: ReadonlyArray<number>, p: number): number | null {
   if (sorted.length === 0) return null;
   return sorted[Math.max(1, Math.ceil((p / 100) * sorted.length)) - 1] ?? null;
@@ -400,7 +401,7 @@ export class Collector {
 const isWorkerThread = (comm: string) => comm === "WorkerThread";
 
 /**
- * The fixed rule's label: comm cannot tell the SQLite workers apart; the WAL checkpoint worker
+ * The host sampler's label: comm cannot tell the SQLite workers apart; the WAL checkpoint worker
  * copies WAL pages into the database, so its lifetime wchar is close to its rchar.
  */
 export function primaryRole(pid: number, thread: ThreadSample): ThreadRole {
@@ -553,7 +554,7 @@ const addThread = (into: Totals, before: ThreadSample, after: ThreadSample) => {
 };
 
 /**
- * CPU, I/O and memory of the window: deltas between the first
+ * CPU, I/O and memory of the window, as the host sampler computes them: deltas between the first
  * and the last snapshot of the window for the threads present at both ends. Threads that start
  * inside the window are summed apart (from zero); the 1 s snapshots add the main thread's
  * per-second busy distribution and the RSS peak.
@@ -810,7 +811,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 /**
  * Spans ending inside the window from the trace and its rotated files (.1 newest .. .N),
  * read newest to oldest until a file starts before the window; re-read when the live file
- * rotates during the read. A trace whose newest span ends more than 30 s
+ * rotates during the read. Like the host sampler, a trace whose newest span ends more than 30 s
  * before the window end is stale (it stopped mid-window) and yields no spans.
  */
 export async function readTraceWindow(
@@ -927,7 +928,7 @@ export interface SpanSummary {
   readonly spans: number;
   readonly errors: number;
   readonly by_name: Readonly<Record<string, SpanStats>>;
-  /** Keyed `<span name>|<db.connection>`. */
+  /** Keyed `<span name>|<db.connection>`, as in the host sampler. */
   readonly sql: Readonly<Record<string, SqlStats>>;
   /** Who held the connection when a waiting SQL span started, by total wait. */
   readonly lock_owners: ReadonlyArray<{
@@ -1217,8 +1218,9 @@ const fingerprint = (value: string) =>
   `<redacted sha256:${NodeCrypto.createHash("sha256").update(value).digest("hex").slice(0, 12)}>`;
 
 /**
- * Knob values from an environment, redacted: a value redacted only for its shape (a path, a long list) keeps a
- * short fingerprint so two different settings never read the same; secret-named knobs stay plain "<redacted>".
+ * Knob values from an environment, redacted as the host sampler does, except that a value
+ * redacted only for its shape (a path, a long list) keeps a short fingerprint so two
+ * different settings never read the same; secret-named knobs stay plain "<redacted>".
  */
 export function knobsFromEnv(
   env: Readonly<Record<string, string | undefined>>,

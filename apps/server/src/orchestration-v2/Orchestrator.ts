@@ -1358,7 +1358,7 @@ type WakeClass = "completion" | "pull-request";
 // Merging takes other parent runs' results into a wake only while it carries at most this
 // many; one parent run's own results stay together, as before. A merged prompt inlines 16 kB
 // and names the rest (~200 B each), so 25 bounds the turn and the absorbing write, and drains
-// any backlog 25 results a wake.
+// a backlog of a thousand-odd results in a few dozen wakes.
 const MAX_MERGED_WAKE_ITEMS = 25;
 
 // A startup sends again pull request news whose wake failed (the server stopped before it reacted)
@@ -4047,7 +4047,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             id: `effect:${commandId}:provider-turn.start:${queuedRun.id}:${yield* idAllocator.allocate.event({ threadId, commandId })}`,
             commandId,
             threadId,
-            request: { type: "provider-turn.start", runId: queuedRun.id },
+            request: {
+              type: "provider-turn.start",
+              runId: queuedRun.id,
+              ...EffectOutbox.turnStartClaimPriority(projection.thread, queuedMessage),
+            },
           },
         ],
       );
@@ -9473,7 +9477,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         id: `effect:${command.commandId}:provider-turn.start:${runId}`,
         commandId: command.commandId,
         threadId: command.threadId,
-        request: { type: "provider-turn.start", runId },
+        request: {
+          type: "provider-turn.start",
+          runId,
+          ...EffectOutbox.turnStartClaimPriority(projection.thread, command),
+        },
       } satisfies PendingOrchestrationEffectV2;
       if (dispatchMode.type !== "defer_start") {
         yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
@@ -10503,7 +10511,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       id: `effect:${command.commandId}:provider-turn.start:${runId}`,
       commandId: command.commandId,
       threadId: command.threadId,
-      request: { type: "provider-turn.start", runId },
+      request: {
+        type: "provider-turn.start",
+        runId,
+        ...EffectOutbox.turnStartClaimPriority(projection.thread, command),
+      },
     } satisfies PendingOrchestrationEffectV2;
     yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
   });
@@ -10840,26 +10852,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     const run =
       pendingRun ??
-      (yield* projectionStore.getThreadRecords(command.threadId, ["runs"])).runs.find(
-        (row) => row.id === message.runId,
-      );
+      (yield* projectionStore.getThreadRecords(command.threadId, ["runs"], {
+        runIds: [message.runId],
+      })).runs.find((row) => row.id === message.runId);
     if (run === undefined || run.delegatedTaskId !== undefined) return;
     // A wake continues the latest follow-up while it is open, as it continues the original task.
     const latestFollowupId =
       command.notification === undefined
         ? undefined
         : (yield* projectionStore
-            .getThreadRecords(command.threadId, ["runs"])
-            .pipe(mapDispatchError(command))).runs
-            .filter((row) => row.id !== run.id && row.delegatedTaskId !== undefined)
-            .toSorted((a, b) => b.ordinal - a.ordinal)[0]?.delegatedTaskId;
+            .getLatestDelegatedTaskRun(command.threadId, run.id)
+            .pipe(mapDispatchError(command)))?.delegatedTaskId;
+    // The owner run, its turn and the named tasks: the parent's history stays unread.
     const parent = yield* projectionStore
-      .getThreadRecords(parentThreadId, ["runs", "subagents", "providerTurns", "attempts"], {
-        subagentIds: [
-          ...(child.forkedFrom?.type === "node" ? [child.forkedFrom.nodeId] : []),
-          ...(latestFollowupId === undefined ? [] : [latestFollowupId]),
-        ],
-      })
+      .getFollowUpOwnerRecords(parentThreadId, [
+        ...(child.forkedFrom?.type === "node" ? [child.forkedFrom.nodeId] : []),
+        ...(latestFollowupId === undefined ? [] : [latestFollowupId]),
+      ])
       .pipe(mapDispatchError(command));
     const original = parent.subagents.find(
       (task) =>
@@ -11597,22 +11606,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  // A card decides on its run, that run's active attempt and provider turn, and the thread's
+  // cards of its kind. The thread's other records stay unread: the dispatch holds its lock.
+  const cardRunRecords = (
+    command: { readonly threadId: ThreadId; readonly runId: RunId; readonly nodeId: NodeId },
+    type: "secret_request" | "link_request",
+  ) =>
+    projectionStore
+      .getRunCardRecords(command.threadId, command.runId, command.nodeId, type)
+      .pipe(
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+        ),
+      );
+
   const dispatchSecretRequestRecord = Effect.fn("orchestrationV2.dispatch.secretRequestRecord")(
     function* (
       command: Extract<OrchestrationV2InternalCommand, { readonly type: "secret_request.record" }>,
       events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     ) {
-      const projection = yield* projectionStore
-        .getThreadRecords(
-          command.threadId,
-          ["runs", "nodes", "turnItems", "attempts", "providerTurns"],
-          { turnItemTypes: ["secret_request"], messageRoles: [] },
-        )
-        .pipe(
-          Effect.mapError(
-            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
-          ),
-        );
+      const projection = yield* cardRunRecords(command, "secret_request");
       const run = projection.runs.find((candidate) => candidate.id === command.runId);
       if (run === undefined || run.rootNodeId !== command.nodeId) {
         return yield* new OrchestratorDispatchError({
@@ -11711,17 +11724,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
       effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
     ) {
-      const projection = yield* projectionStore
-        .getThreadRecords(
-          command.threadId,
-          ["runs", "nodes", "turnItems", "attempts", "providerTurns"],
-          { turnItemTypes: ["link_request"], messageRoles: [] },
-        )
-        .pipe(
-          Effect.mapError(
-            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
-          ),
-        );
+      const projection = yield* cardRunRecords(command, "link_request");
       const run = projection.runs.find((candidate) => candidate.id === command.runId);
       if (run === undefined) {
         return yield* new OrchestratorDispatchError({
@@ -13297,13 +13300,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           workspaceCwd: runWorkspaceOf(checkpointScope),
         },
       });
+      const message = (yield* projectionStore
+        .getMessagesById(command.threadId, [state.run.userMessageId])
+        .pipe(mapDispatchError(command))).get(state.run.userMessageId);
       yield* Ref.update(effects, (existing) => [
         ...existing,
         {
           id: `effect:${command.commandId}:provider-turn.start:${state.run.id}`,
           commandId: command.commandId,
           threadId: command.threadId,
-          request: { type: "provider-turn.start", runId: state.run.id },
+          request: {
+            type: "provider-turn.start",
+            runId: state.run.id,
+            ...EffectOutbox.turnStartClaimPriority(projection.thread, message),
+          },
         } satisfies PendingOrchestrationEffectV2,
       ]);
     },

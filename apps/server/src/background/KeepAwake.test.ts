@@ -82,7 +82,7 @@ const layerKeepAwake = KeepAwake.layer.pipe(
 );
 
 describe("KeepAwake.layer", () => {
-  // the inhibitor starts while runs start, so it must not fork the server.
+  // The inhibitor starts while runs start, so it must not fork the server.
   it.effect("starts the sleep inhibitor from the server's command spawner", () =>
     Effect.gen(function* () {
       const started = yield* Deferred.make<"ambient" | "server">();

@@ -71,7 +71,7 @@ const COMMITS_CAPACITY = 16_384;
 // Parsed packed-refs files kept, and the entries they may hold in all; a file with more is left to Git.
 const PACKED_REFS_CAPACITY = 256;
 const PACKED_REFS_ENTRY_BUDGET = 16_384;
-// A cold parse runs on the main thread at about 1.8 ms and 1.2 MB per MiB of file (review bench:
+// A cold parse runs on the main thread at about 1.8 ms and 1.2 MB per MiB of file (bench:
 // 6.2 MB → 11 ms, 62 MB → 184 ms), against 19–25 ms for a `git rev-parse` child; 8 MiB keeps one
 // parse below one child. Larger files are left to Git.
 const PACKED_REFS_MAX_BYTES = 8 * 1024 * 1024;

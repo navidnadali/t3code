@@ -363,7 +363,8 @@ it.effect("keeps an anchor that a row appended during the pass borrows from", ()
       let blocked = false;
       const blockFirstScanPage: Statement.Transformer = (statement) => {
         const [query] = statement.compile();
-        if (!blocked && query.includes("END AS prunable")) {
+        // The pass's classification read (it reads `kept` for each row of the page).
+        if (!blocked && query.includes("AS kept")) {
           blocked = true;
           return Deferred.succeed(scanStarted, undefined).pipe(
             Effect.andThen(Deferred.await(releaseScan)),

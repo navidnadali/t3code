@@ -154,7 +154,7 @@ const readStorage = Effect.gen(function* () {
  * refused while any other connection has the file open, even an idle one,
  * which is how a running server or desktop app is detected.
  */
-const lockExclusively = Effect.fn("DatabaseMaintenance.lockExclusively")(function* (
+export const lockExclusively = Effect.fn("DatabaseMaintenance.lockExclusively")(function* (
   databasePath: string,
 ) {
   const sql = yield* SqlClient.SqlClient;

@@ -66,7 +66,7 @@ const RESULT_FILE = "driver.json";
 const FAILED_MARKER = "driver.failed";
 const SCHEMA_VERSION = 1;
 const LOOP_DELAY_RESOLUTION_MS = 10;
-/** The bench's fake Claude CLI writes each session's MCP credential into this directory. */
+/** The fake Claude CLI writes each session's MCP credential into this directory. */
 const CREDENTIALS_ENV = "BENCH_MCP_CREDENTIALS_DIR";
 const STATE_ENV = "BENCH_STATE_DIR";
 

@@ -2,9 +2,8 @@ import packageJson from "../../package.json" with { type: "json" };
 import { BUILD_MIGRATION_HEAD, recordedMigrations } from "../persistence/databaseMigrationHead.ts";
 import { skippedV2Migrations } from "../persistence/Migrations.ts";
 import {
-  PERF_FORK_MIGRATION_HEAD,
   PERF_FORK_MIGRATIONS_TABLE,
-  perfForkMigrationLabel,
+  perfForkLedgerProblems,
 } from "../persistence/PerfForkMigrations.ts";
 import { reconciledV2PreviewHistory } from "../persistence/reconcileV2PreviewMigration.ts";
 import {
@@ -57,19 +56,24 @@ export function runServicePreflight(input: {
       reason: `Could not read this database to confirm t3@${version} supports it.`,
     };
   }
-  const newer = [
-    ...recorded
-      .filter(({ id }) => id > BUILD_MIGRATION_HEAD)
-      .map(({ id, name }) => `${id}_${name}`),
-    ...recordedFork
-      .filter(({ id }) => id > PERF_FORK_MIGRATION_HEAD)
-      .map(({ id, name }) => perfForkMigrationLabel([id, name])),
-  ];
+  const newer = recorded
+    .filter(({ id }) => id > BUILD_MIGRATION_HEAD)
+    .map(({ id, name }) => `${id}_${name}`);
   if (newer.length > 0) {
     return {
       status: "blocked",
       version,
       reason: `This database has migrations that t3@${version} does not know: ${newer.join(", ")}. A newer build wrote them, and running t3@${version} on this database is not safe. Stay on the newer release, or wait for a release that includes these migrations.`,
+    };
+  }
+  // The fork's chain: an id this build does not know, another migration under a known id, or a gap
+  // the migrator would never fill (it runs only ids above the highest recorded one).
+  const forkProblems = perfForkLedgerProblems(recordedFork);
+  if (forkProblems.length > 0) {
+    return {
+      status: "blocked",
+      version,
+      reason: `This database's performance fork migration history cannot be run by t3@${version}: ${forkProblems.join(", ")}. Stay on the build that recorded it, or apply that build's documented down step before starting t3@${version}.`,
     };
   }
 

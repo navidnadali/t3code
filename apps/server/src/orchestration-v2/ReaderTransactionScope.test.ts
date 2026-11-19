@@ -885,6 +885,7 @@ const consistencyCases: ReadonlyArray<ConsistencyCase> = [
     name: "turn start context",
     read: (store, fixture) => store.getTurnStartContext(fixture.fork, fixture.forkRunId),
     pauseBefore: (query) => query.includes("GLOB '/goal*'"),
+    // The run's own message, which the message read reads by key.
     write: (fixture) => [
       event("event:snapshot:fork:compact", {
         type: "message.updated",
@@ -892,9 +893,9 @@ const consistencyCases: ReadonlyArray<ConsistencyCase> = [
         payload: {
           createdBy: "user",
           creationSource: "web",
-          id: MessageId.make("message:snapshot:fork:compact"),
+          id: MessageId.make("message:snapshot:fork:user"),
           threadId: fixture.fork,
-          runId: null,
+          runId: fixture.forkRunId,
           nodeId: null,
           role: "user",
           text: "/compact",
@@ -932,6 +933,46 @@ const consistencyCases: ReadonlyArray<ConsistencyCase> = [
         ordinal: 1_000,
         status: "running",
       }),
+    ],
+  },
+  {
+    // A card read after its run's provider records would pair them with a later card.
+    name: "run card records",
+    read: (store, fixture) =>
+      store.getRunCardRecords(
+        fixture.fork,
+        fixture.forkRunId,
+        NodeId.make(`${fixture.forkRunId.replace(/^run:/, "node:")}:root`),
+        "secret_request",
+      ),
+    pauseBefore: (query, params, fixture) =>
+      query.includes("FROM orchestration_v2_projection_nodes") && params.includes(fixture.fork),
+    write: (fixture) => [
+      event("event:snapshot:fork:secret-card", {
+        type: "turn-item.updated",
+        threadId: fixture.fork,
+        runId: fixture.forkRunId,
+        payload: {
+          id: TurnItemId.make("item:snapshot:fork:secret-card"),
+          threadId: fixture.fork,
+          runId: fixture.forkRunId,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 1_000,
+          status: "waiting",
+          title: "Token",
+          startedAt: at(4),
+          completedAt: null,
+          updatedAt: at(4),
+          type: "secret_request",
+          label: "Token",
+          reason: "Needed",
+          secretStatus: "pending",
+        },
+      } as never),
     ],
   },
 ];

@@ -1,0 +1,32 @@
+{
+  "format": "t3-server-bench-shape",
+  "version": 1,
+  "source": {
+    "label": "t3cp.io long-thread fixture: hand-written round numbers, not measured from any deployment",
+    "capturedAt": "2026-10-17T00:00:00.000Z"
+  },
+  "pageSize": 4096,
+  "pageCount": 30000,
+  "tables": {
+    "projection_projects": { "rows": 1 },
+    "orchestration_v2_projection_threads": { "rows": 1 },
+    "orchestration_v2_projection_runs": { "rows": 20000 },
+    "orchestration_v2_projection_run_attempts": { "rows": 20000 },
+    "orchestration_v2_projection_provider_turns": { "rows": 20000 },
+    "orchestration_v2_projection_nodes": { "rows": 20000 },
+    "orchestration_v2_projection_turn_items": { "rows": 40000 },
+    "orchestration_v2_projection_messages": { "rows": 40000 },
+    "orchestration_v2_projection_checkpoint_scopes": { "rows": 1 },
+    "orchestration_v2_projection_provider_sessions": { "rows": 1 },
+    "orchestration_v2_projection_provider_session_bindings": { "rows": 1 },
+    "orchestration_v2_projection_provider_threads": { "rows": 1 }
+  },
+  "lineage": { "root": 1, "fork": 0, "subagent": 0 },
+  "mix": {
+    "turnItemTypes": {
+      "user_message": { "rows": 20000, "meanBytes": 200 },
+      "assistant_message": { "rows": 20000, "meanBytes": 400 }
+    }
+  },
+  "runOutcomes": { "incompleteEvery": 8, "continuationEvery": 16, "restartWorkEvery": 32 }
+}

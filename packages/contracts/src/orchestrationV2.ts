@@ -1751,6 +1751,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
     inputIntent: OrchestrationV2UserMessageInputIntent,
     /** The server steered it in on its own (automatic Send now), not a user or agent. */
     automaticDelivery: Schema.optional(Schema.Literal(true)),
+    /** A steer the provider queued but never ran before the run ended: queued again on the thread. */
+    returnedToQueue: Schema.optional(Schema.Literal(true)),
     text: Schema.String,
     /** Same as the text of message `messageId`. */
     textOmitted: DedupedBodyMarker,
@@ -2672,6 +2674,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     freshContext: OrchestrationV2Run.fields.freshContext,
     inputIntent: OrchestrationV2UserMessageInputIntent,
     automaticDelivery: Schema.optional(Schema.Literal(true)),
+    returnedToQueue: Schema.optional(Schema.Literal(true)),
     text: Schema.String,
     context: Schema.optional(OrchestrationMessageContext),
     attachments: Schema.Array(ChatAttachment),
@@ -3440,6 +3443,11 @@ export const OrchestrationV2Command = Schema.Union([
     steerFollowUpOfRunId: Schema.optional(RunId),
     /** The follow-up queues behind the runs there were when the steer was sent. */
     steerFollowUpAfterRunOrdinal: Schema.optional(NonNegativeInt),
+    /**
+     * A steer its provider returned unread: the follow-up goes ahead of every queued message except
+     * its source run's others already back, in the same command (no later move to wait for).
+     */
+    steerFollowUpAhead: Schema.optional(Schema.Literal(true)),
     /** The provider declined the steer: its follow-up must queue, and Stop drops it. */
     steerDeclined: Schema.optional(Schema.Literal(true)),
     usageLimitRecoveryRequestId: Schema.optional(CommandId),

@@ -139,7 +139,8 @@ export const ProviderAdapterV2Event = Schema.Union([
     threadId: ThreadId,
     runId: RunId,
     messageId: MessageId,
-    status: Schema.Literals(["pending", "completed", "cancelled"]),
+    /** returned: the provider never ran it, and the run ended; the thread queues it again. */
+    status: Schema.Literals(["pending", "completed", "cancelled", "returned"]),
   }),
   // Start before the root terminal; clear only after the final covered projection.
   // Consumer lifetime cannot depend on a producer probe that runs ahead of its queue.
@@ -624,6 +625,8 @@ export interface ProviderAdapterV2SteerInput {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly providerTurnId: ProviderTurnId;
   readonly message: ProviderAdapterV2TurnMessage;
+  /** Further messages this steer carries, in order, after `message` (a merged Send now). */
+  readonly mergedMessageIds?: ReadonlyArray<MessageId>;
   /** The selection sent with the message when it differs from the running turn's. */
   readonly modelSelection?: ModelSelection;
 }

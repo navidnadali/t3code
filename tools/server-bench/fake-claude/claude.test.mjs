@@ -19,6 +19,12 @@ import {
 } from "./claude.mjs";
 
 const FAKE = NodeURL.fileURLToPath(new URL("./claude.mjs", import.meta.url));
+const NOW_ABORT_STEERING = NodeURL.fileURLToPath(
+  new URL(
+    "../../../apps/server/src/orchestration-v2/testkit/fixtures/message_steering/claude_now_abort_transcript.ndjson",
+    import.meta.url,
+  ),
+);
 const SESSION = "11111111-2222-4333-8444-555555555555";
 const PROMPT = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const STEER = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
@@ -337,7 +343,9 @@ describe("fake claude process", () => {
     async (_when, together) => {
       using fake = startFake(STREAM_ARGS, {
         BENCH_SPEED: "0",
-        BENCH_TRANSCRIPT: "message_steering",
+        // The recording of a steer at priority "now", which cut its turn off (message_steering's
+        // own recording steers at "next" and cuts nothing).
+        BENCH_TRANSCRIPT: NOW_ABORT_STEERING,
         BENCH_HOLD_CUT_TURNS: "1",
       });
       const prompt = { type: "user", message: { role: "user", content: "hi" }, uuid: PROMPT };

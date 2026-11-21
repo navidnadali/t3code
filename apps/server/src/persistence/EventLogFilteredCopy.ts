@@ -233,6 +233,24 @@ const moveAside = Effect.fn("EventLogFilteredCopy.moveAside")(function* (
   );
 });
 
+// The copy is written with synchronous=OFF, so it is flushed before it replaces the original, and the
+// directory after each swap or restore, so a power loss leaves one whole database under each name.
+// Windows cannot open a directory to flush it, and flushes a file only through a handle it may
+// write: a file opens r+ (never truncated), a directory read-only.
+const flushToDisk = Effect.fn("EventLogFilteredCopy.flushToDisk")(function* (
+  fs: FileSystem.FileSystem,
+  file: string,
+  step: string,
+  options?: { readonly directory?: boolean },
+) {
+  if (options?.directory === true && (yield* HostProcess.Platform) === "win32") return;
+  yield* fs.open(file, { flag: options?.directory === true ? "r" : "r+" }).pipe(
+    Effect.flatMap((handle) => handle.sync),
+    Effect.scoped,
+    Effect.mapError((cause) => new FilteredCopyError({ step, reason: cause.message, cause })),
+  );
+});
+
 /**
  * Copies `databasePath` (its server stopped) to `<databasePath>.filtered-copy` with every table, keeping of
  * the events exactly what the online compaction keeps through the boundary due now; checks the copy
@@ -575,6 +593,7 @@ export const compactByFilteredCopy = Effect.fn("EventLogFilteredCopy.compact")(f
 
   // The swap, only for the file the copy was read from: the original keeps its bytes under a second name.
   if (options.swap) {
+    yield* flushToDisk(fs, copyPath, "swap");
     // The original moves aside while no other connection can have it open (moveAside), so no commit
     // lands in a log the swap leaves behind. Closing that connection removes the original's empty log.
     yield* moveAside(fs, databasePath, prePath, "swap", (file) =>
@@ -598,6 +617,7 @@ export const compactByFilteredCopy = Effect.fn("EventLogFilteredCopy.compact")(f
           }),
       ),
     );
+    yield* flushToDisk(fs, path.dirname(databasePath), "swap", { directory: true });
   }
   const ioAfter = yield* processIo;
   const io =
@@ -660,4 +680,5 @@ export const restoreBeforeFilteredCopy = Effect.fn("EventLogFilteredCopy.restore
     yield* fs.remove(databasePath + "-shm", { force: true });
     yield* fs.rename(prePath, databasePath);
   }).pipe(Effect.mapError(toError));
+  yield* flushToDisk(fs, path.dirname(databasePath), "restore", { directory: true });
 }, Effect.scoped);

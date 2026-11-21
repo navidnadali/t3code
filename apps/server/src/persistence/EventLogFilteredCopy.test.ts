@@ -372,6 +372,69 @@ it.effect("the swap keeps the original beside the copy, and one call restores it
   ),
 );
 
+// The copy is written with synchronous=OFF: it must reach the disk before it replaces the original, and
+// each swap's renames after they land, so a power loss leaves one whole database under the name.
+it.effect("the swap and the restore flush the copy and the renames to disk", () =>
+  withDatabase(({ db }) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const steps: Array<string> = [];
+      const opened: Array<string> = [];
+      const name = (file: string) =>
+        file === path.dirname(db) ? "<directory>" : path.basename(file);
+      const recording = FileSystem.FileSystem.of({
+        ...fs,
+        open: (file, options) =>
+          Effect.sync(() => opened.push(`${name(file)} ${options?.flag ?? "r"}`)).pipe(
+            Effect.andThen(fs.open(file, options)),
+            Effect.map(
+              (handle) =>
+                new Proxy(handle, {
+                  get: (target, property) =>
+                    property === "sync"
+                      ? Effect.sync(() => steps.push(`sync ${name(file)}`)).pipe(
+                          Effect.andThen(target.sync),
+                        )
+                      : Reflect.get(target, property, target),
+                }),
+            ),
+          ),
+        rename: (from, to) =>
+          Effect.sync(() => steps.push(`rename ${name(from)} -> ${name(to)}`)).pipe(
+            Effect.andThen(fs.rename(from, to)),
+          ),
+      });
+      const base = path.basename(db);
+      yield* FilteredCopy.compactByFilteredCopy(db, { swap: true }).pipe(
+        Effect.provideService(FileSystem.FileSystem, recording),
+      );
+      const copyFlushed = steps.indexOf(`sync ${base}${FilteredCopy.COPY_SUFFIX}`);
+      const originalAside = steps.indexOf(`rename ${base} -> ${base}${FilteredCopy.PRE_SUFFIX}`);
+      const copyIn = steps.indexOf(`rename ${base}${FilteredCopy.COPY_SUFFIX} -> ${base}`);
+      assert.isAtLeast(copyFlushed, 0, JSON.stringify(steps));
+      assert.isBelow(copyFlushed, originalAside, JSON.stringify(steps));
+      // Windows flushes a file only through a handle it may write: the copy opens r+ (never truncated).
+      assert.include(opened, `${base}${FilteredCopy.COPY_SUFFIX} r+`, JSON.stringify(opened));
+      assert.isAbove(copyIn, originalAside, JSON.stringify(steps));
+      // Windows cannot open a directory to flush it; there the file system flushes the renames.
+      const flushesDirectory = (yield* HostProcess.Platform) !== "win32";
+      if (flushesDirectory)
+        assert.isAbove(steps.lastIndexOf("sync <directory>"), copyIn, JSON.stringify(steps));
+
+      steps.length = 0;
+      yield* FilteredCopy.restoreBeforeFilteredCopy(db).pipe(
+        Effect.provideService(FileSystem.FileSystem, recording),
+      );
+      const restored = steps.indexOf(`rename ${base}${FilteredCopy.PRE_SUFFIX} -> ${base}`);
+      assert.isAtLeast(restored, 0, JSON.stringify(steps));
+      if (flushesDirectory)
+        assert.isAbove(steps.lastIndexOf("sync <directory>"), restored, JSON.stringify(steps));
+    }),
+  ),
+);
+
 it.effect("the filtered copy refuses a database whose last writer did not close it cleanly", () =>
   withDatabase(({ db }) =>
     Effect.gen(function* () {

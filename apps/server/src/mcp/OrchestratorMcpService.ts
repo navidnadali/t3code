@@ -3591,14 +3591,18 @@ const make = Effect.gen(function* () {
             task.childThreadId === input.threadId &&
             task.completionDelivery?.state !== "disposed",
         );
-      // A child waiting on a question or approval needs an answer, not a wake.
+      // A child waiting on a question or approval needs an answer, not a wake. As in task_status,
+      // only a live request holds it; it keeps working past a question answered by message.
       const childRequests = ownedTask
         ? (yield* threadManagement
             .getThreadRecords(input.threadId, ["runtimeRequests"])
             .pipe(Effect.mapError(threadManagementFailure))).runtimeRequests
         : [];
       const wakesCaller =
-        ownedTask && !childRequests.some((request) => request.status === "pending");
+        ownedTask &&
+        !childRequests.some(
+          (request) => request.status === "pending" && request.responseCapability.type === "live",
+        );
       return {
         threadId: input.threadId,
         runId: result.run?.id ?? null,

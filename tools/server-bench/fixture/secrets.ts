@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - reads raw file bytes in chunks.
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 
 import { parseJsonContainer, rewriteJson } from "./json.ts";
@@ -57,9 +58,28 @@ export const PREFIXED_TOKEN = String.raw`(?=[a-z]{2,8}_[A-Za-z0-9_\-]{16})(?<!mc
  * hex ids, ULIDs and constant names do not. A refused match hides nothing: every later start in
  * it has a body that is the end of this one, of one case too.
  */
-export const mixedCaseBody = (match: string) => {
+const mixedCaseBody = (match: string) => {
   const body = match.slice(match.indexOf("_") + 1);
   return /[A-Z]/.test(body) && /[a-z]/.test(body);
+};
+
+/**
+ * Issuers whose tokens can have a body of one case, which the mixed-case rule takes for an id: by
+ * the SHA-256 of their prefix, so no issuer is named here, and by the prefix's length.
+ */
+const ONE_CASE_TOKEN_PREFIXES: ReadonlyMap<number, ReadonlySet<string>> = new Map([
+  [3, new Set(["76efbfa34c5092b6c4b1a0c8e62af95f6fb50e6e19671e16745d68d5db4ade32"])],
+]);
+
+/** A short-prefixed match is a token: its body mixes case, or its prefix is a known issuer's. */
+export const prefixedTokenBody = (match: string) => {
+  if (mixedCaseBody(match)) return true;
+  const prefix = match.slice(0, match.indexOf("_"));
+  const digests = ONE_CASE_TOKEN_PREFIXES.get(prefix.length);
+  return (
+    digests !== undefined &&
+    digests.has(NodeCrypto.createHash("sha256").update(prefix).digest("hex"))
+  );
 };
 
 const basicCredentials = (match: RegExpMatchArray) => {
@@ -99,7 +119,7 @@ export const TOKEN_PATTERNS: ReadonlyArray<TokenPattern> = [
   {
     name: "prefixed-token",
     pattern: new RegExp(`${AFTER}${PREFIXED_TOKEN}`, "g"),
-    confirm: (match) => mixedCaseBody(match[0]),
+    confirm: (match) => prefixedTokenBody(match[0]),
     decodedOnly: true,
   },
   {

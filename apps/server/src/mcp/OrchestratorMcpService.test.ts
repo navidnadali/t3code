@@ -510,7 +510,7 @@ describe("OrchestratorMcpService", () => {
       const childThreadId = ThreadId.make("thread:mcp-next-child");
       const taskId = NodeId.make("node:mcp-next-task");
       let finished = false;
-      let pendingRequest = false;
+      let pendingRequest: "live" | "message" | null = null;
       const parentProjection = () =>
         ({
           thread: { id: parentThreadId },
@@ -545,7 +545,19 @@ describe("OrchestratorMcpService", () => {
           subagents: [],
           providerThreads: [],
           providerTurns: [],
-          runtimeRequests: pendingRequest ? [{ status: "pending" }] : [],
+          runtimeRequests:
+            pendingRequest === null
+              ? []
+              : [
+                  {
+                    kind: "user_input",
+                    status: "pending",
+                    responseCapability:
+                      pendingRequest === "live"
+                        ? { type: "live", providerSessionId: "provider-session:mcp-next-child" }
+                        : { type: "message" },
+                  },
+                ],
           nodes: [],
           turnItems: [],
         }) as unknown as OrchestrationV2ThreadProjection;
@@ -598,11 +610,23 @@ describe("OrchestratorMcpService", () => {
         assert.equal(waiting.next, ORCHESTRATOR_MCP_RUNNING_TASK_NEXT);
 
         // A child waiting on a question or approval needs an answer, not a wake.
-        pendingRequest = true;
+        pendingRequest = "live";
+        const blocked = yield* service.taskStatus(scope, taskId);
+        assert.isTrue(blocked.hasPendingQuestion);
+        assert.notProperty(blocked, "next");
         const asking = yield* service.waitForThread(scope, { threadId: childThreadId });
         assert.isTrue(asking.timedOut);
         assert.notProperty(asking, "next");
-        pendingRequest = false;
+
+        // A question answered by message leaves the child working, so its completion still wakes.
+        pendingRequest = "message";
+        const working = yield* service.taskStatus(scope, taskId);
+        assert.isFalse(working.hasPendingQuestion);
+        assert.equal(working.next, ORCHESTRATOR_MCP_RUNNING_TASK_NEXT);
+        const notified = yield* service.waitForThread(scope, { threadId: childThreadId });
+        assert.isTrue(notified.timedOut);
+        assert.equal(notified.next, ORCHESTRATOR_MCP_RUNNING_TASK_NEXT);
+        pendingRequest = null;
 
         finished = true;
         const completed = yield* service.taskStatus(scope, taskId);

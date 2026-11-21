@@ -137,7 +137,10 @@ const deliveries = [
 ] as const;
 
 it.effect.each(deliveries)(
-  "delivers %s with Claude's native pending-tool cancellation behavior",
+  // Claude Code aborts its tool batch for a "now" message and cancels the pending calls with its
+  // stock refusal. A delivery or steer, from any source, goes at "next", seen with the next tool
+  // result, so every call in the running batch completes.
+  "delivers %s without cancelling the running turn's tool calls",
   (delivery) =>
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace("claude-automatic-delivery");
@@ -406,8 +409,9 @@ it.effect.each(deliveries)(
         yield* worker.drain();
         const explicitSteer =
           delivery === "user steering" || delivery === "promoted queued message";
-        assert.equal(batchAbort.signal.aborted, explicitSteer);
+        assert.isFalse(batchAbort.signal.aborted);
         assert.equal(offers.length, explicitSteer ? 2 : 1);
+        if (explicitSteer) assert.equal(offers[1]?.priority, "next");
         const finished = yield* watch(
           (event) =>
             event.type === "run.updated" &&
@@ -417,7 +421,17 @@ it.effect.each(deliveries)(
         yield* Queue.offer(sdkMessages, toolResult("build", false));
         for (const id of statusIds)
           yield* Queue.offer(sdkMessages, toolResult(id, batchAbort.signal.aborted));
-        if (explicitSteer) yield* Queue.offer(sdkMessages, result("aborted", true));
+        // The steer reaches the model in the same turn, once the batch's results are in.
+        if (explicitSteer)
+          yield* Queue.offer(
+            sdkMessages,
+            frame({
+              type: "command_lifecycle",
+              command_uuid: offers[1]!.uuid,
+              state: "started",
+              session_id: sessionId,
+            }),
+          );
         yield* Queue.offer(sdkMessages, result("completed", false));
         yield* Fiber.join(finished);
         yield* worker.drain();
@@ -450,15 +464,20 @@ it.effect.each(deliveries)(
         );
         assert.equal(reads.length, 4);
         for (const read of reads) {
-          assert.equal(read.status, explicitSteer ? "cancelled" : "completed");
-          assert.equal(read.toolNonExecutionKind, explicitSteer ? "cancelled" : undefined);
-          assert.equal(read.type === "dynamic_tool" && read.output === refusal, explicitSteer);
+          assert.equal(read.status, "completed");
+          assert.isUndefined(read.toolNonExecutionKind);
+          assert.isFalse(read.type === "dynamic_tool" && read.output === refusal);
         }
         assert.equal(offers.length, 2);
-        assert.equal(
-          offers.filter((offer) => offer.priority === "now").length,
-          explicitSteer ? 1 : 0,
-        );
+        assert.equal(offers.filter((offer) => offer.priority === "now").length, 0);
+        if (explicitSteer) {
+          // Taken into the running turn: no turn of its own (a promoted message's queued run is cancelled).
+          assert.equal(after.runs.filter((run) => run.status !== "cancelled").length, 1);
+          assert.equal(
+            after.messages.find((message) => message.id === messageId)?.runId,
+            parent.id,
+          );
+        }
         if (!explicitSteer) {
           assert.equal(after.runs.length, 2);
           if (delivery === "child completion") {
@@ -494,6 +513,219 @@ it.effect.each(deliveries)(
         ),
       ),
     ),
+);
+
+// Replays a recorded shape: an orchestrator's turn had five delegate_task calls out (one
+// running, four waiting) when another thread's t3_thread_send message, queued as its own run, was
+// promoted into the turn from the UI. Sent at "now", Claude Code cancelled all five with its stock
+// refusal, which the orchestrator read as the user declining them.
+const delegateIds = ["delegate-1", "delegate-2", "delegate-3", "delegate-4", "delegate-5"];
+const delegateBatch = frame({
+  type: "assistant",
+  uuid: "delegate-batch",
+  session_id: sessionId,
+  parent_tool_use_id: null,
+  message: {
+    id: "delegate-batch",
+    role: "assistant",
+    type: "message",
+    model: modelSelection.model,
+    content: delegateIds.map((id, index) => ({
+      type: "tool_use",
+      id,
+      name: "mcp__t3-code__delegate_task",
+      input: { task: `Build part ${index + 1} of the release.` },
+    })),
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  },
+});
+
+it.effect("a message promoted into a turn with five delegate_task calls out cancels none", () =>
+  Effect.gen(function* () {
+    const cwd = yield* checkpointWorkspace("claude-promoted-steer-delegates");
+    const sdkMessages = yield* Queue.unbounded<SDKMessage>();
+    const offers: SDKUserMessage[] = [];
+    // @effect-diagnostics-next-line abortControllerInEffect:off - The fake SDK interrupts its batch independently of the test fiber.
+    const batchAbort = new AbortController();
+    const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+      instanceId: modelSelection.instanceId,
+      settings,
+      environment: {},
+      attachmentsDir: cwd,
+      fileSystem: yield* FileSystem.FileSystem,
+      path: yield* Path.Path,
+      random: yield* SecureRandom.SecureRandom,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      queryRunner: {
+        allocateSessionId: Effect.succeed(sessionId),
+        open: () =>
+          Effect.succeed({
+            messages: Stream.fromQueue(sdkMessages),
+            offer: (message) =>
+              Effect.sync(() => {
+                offers.push(message);
+                // As Claude Code does: a "now" message aborts the running tool batch.
+                if (message.priority === "now") batchAbort.abort({ kind: "interrupt" });
+              }),
+            setModel: () => Effect.void,
+            applyFlagSettings: () => Effect.void,
+            setPermissionMode: () => Effect.void,
+            renameSession: () => Effect.void,
+            backgroundTasks: () => Effect.succeed(false),
+            mcpServerStatus: Effect.succeed([]),
+            readMcpResource: () => Effect.die("unexpected MCP resource read"),
+            callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            listPermissionRules: Effect.die("unexpected permission rules read"),
+            stopTask: () => Effect.void,
+            interrupt: Effect.die("a promoted message must never interrupt"),
+            close: Effect.void,
+          }),
+        forkSession: () => Effect.die("unused"),
+        subagentLaunchToolUseId: () => Effect.succeed(null),
+        subagentModel: () => Effect.succeed(null),
+        assertComplete: Effect.void,
+      },
+    });
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const threadId = ThreadId.make("thread:promoted-steer");
+      const senderThreadId = ThreadId.make("thread:promoted-steer-sender");
+      const projectId = ProjectId.make("project:promoted-steer");
+      const watch = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
+        orchestrator.streamDomainEvents.pipe(
+          Stream.filter(predicate),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+      for (const [id, title] of [
+        [threadId, "Orchestrator"],
+        [senderThreadId, "Sender"],
+      ] as const)
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${id}`),
+          threadId: id,
+          projectId,
+          title,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: cwd,
+          createdBy: "user",
+          creationSource: "web",
+        });
+      const running = yield* watch(
+        (event) => event.type === "provider-turn.updated" && event.payload.status === "running",
+      );
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("brief"),
+        threadId,
+        messageId: MessageId.make("brief"),
+        text: "Run the release: delegate its five parts.",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* worker.drain();
+      yield* Fiber.join(running);
+      const pending = yield* watch(
+        (event) =>
+          event.type === "turn-item.updated" &&
+          event.payload.nativeItemRef?.nativeId === "delegate-5",
+      );
+      yield* Queue.offer(sdkMessages, delegateBatch);
+      yield* Fiber.join(pending);
+      const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      // Another thread's t3_thread_send: queued behind the running turn, as its own run.
+      const messageId = MessageId.make("cross-thread-message");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("cross-thread-send"),
+        threadId,
+        messageId,
+        senderThreadId,
+        text: "Status from the sender: part 3 can wait for the schema change.",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      const queuedRun = (yield* orchestrator.getThreadProjection(threadId)).runs[1]!;
+      // The UI's "Send into the current turn".
+      yield* orchestrator.dispatch({
+        type: "queued-message.promote-to-steer",
+        commandId: CommandId.make("promote"),
+        threadId,
+        queuedRunId: queuedRun.id,
+        targetRunId: parent.id,
+      });
+      yield* worker.drain();
+      assert.isFalse(batchAbort.signal.aborted);
+      assert.equal(offers.length, 2);
+      assert.equal(offers[1]?.priority, "next");
+      const finished = yield* watch(
+        (event) =>
+          event.type === "run.updated" &&
+          event.payload.id === parent.id &&
+          event.payload.status === "waiting",
+      );
+      // Every delegated task answers; the message is read with the results, in the same turn.
+      for (const id of delegateIds)
+        yield* Queue.offer(sdkMessages, toolResult(id, batchAbort.signal.aborted));
+      yield* Queue.offer(
+        sdkMessages,
+        frame({
+          type: "command_lifecycle",
+          command_uuid: offers[1]!.uuid,
+          state: "started",
+          session_id: sessionId,
+        }),
+      );
+      yield* Queue.offer(sdkMessages, result("completed", false));
+      yield* Fiber.join(finished);
+      yield* worker.drain();
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      const delegates = after.turnItems.filter((item) =>
+        delegateIds.includes(item.nativeItemRef?.nativeId ?? ""),
+      );
+      assert.equal(delegates.length, 5);
+      for (const call of delegates) {
+        assert.equal(call.status, "completed");
+        assert.isUndefined(call.toolNonExecutionKind);
+        assert.isFalse(call.type === "dynamic_tool" && call.output === refusal);
+      }
+      assert.equal(after.messages.find((message) => message.id === messageId)?.runId, parent.id);
+      assert.equal(after.runs.find((run) => run.id === queuedRun.id)?.status, "cancelled");
+      assert.include(
+        ["waiting", "completed"],
+        after.runs.find((run) => run.id === parent.id)?.status,
+      );
+    }).pipe(
+      Effect.provide(
+        ProviderReplayHarness.layerWithRegistry(
+          { name: "claude-promoted-steer-delegates" },
+          ProviderAdapterRegistry.layerSingle(adapter),
+          { runEffectWorker: false },
+        ),
+      ),
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        IdAllocator.layer,
+        McpProviderSessions.layer,
+        NodeServices.layer,
+        NodeCrypto.layer,
+      ),
+    ),
+  ),
 );
 
 it.effect("applies an effort change to the running Claude query without waiting for a turn", () =>
@@ -1247,7 +1479,7 @@ it.effect(
             yield* TestClock.adjust("5 seconds");
             yield* worker.drain();
           }
-          return offers.filter((offer) => offer.message.priority === "now");
+          return offers.filter((offer) => offer.message.priority === "next");
         });
         const steerText = (offer: (typeof offers)[number]) =>
           ["Report the build status.", "Peer thread finished the migration."].find((text) =>

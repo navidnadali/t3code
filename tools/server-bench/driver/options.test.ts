@@ -8,6 +8,7 @@ import {
   parseDriverOptions,
   parseDuration,
   parsePollMix,
+  USAGE,
   UsageError,
 } from "./options.ts";
 
@@ -22,10 +23,17 @@ describe("parseDriverOptions", () => {
       sessions: 60,
       subscribers: 60,
       pollers: 10,
+      sessionMcpRatePerMinute: 0.05,
       warmupMs: 60_000,
       windowMs: 300_000,
       stopSessions: true,
     });
+  });
+
+  // The help states the parser's own defaults.
+  it("documents the defaults it parses", () => {
+    expect(USAGE).toContain("--pollers N               MCP/HTTP pollers (default 10)");
+    expect(USAGE).toContain("(default 0.05; 0 turns it off)");
   });
 
   it("reads every knob from the command line", () => {

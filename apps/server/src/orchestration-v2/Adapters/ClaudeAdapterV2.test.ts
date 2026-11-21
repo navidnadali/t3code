@@ -75,6 +75,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as Scheduler from "effect/Scheduler";
 import * as TestClock from "effect/testing/TestClock";
 import { Tool } from "effect/ai";
 import { formatClaudeResumeCompactionQuestion } from "@t3tools/shared/claudeCompaction";
@@ -2625,7 +2626,7 @@ describe("ClaudeAdapterV2 attachments", () => {
           },
         });
 
-        assert.equal(offeredMessages[1]?.priority, "now");
+        assert.equal(offeredMessages[1]?.priority, "next");
         assert.deepEqual(offeredMessages[1]?.message.content, expectedContent);
         const documentPath = path.join(attachmentsDir, attachmentRelativePath(document)!);
         for (const scenario of [
@@ -6089,7 +6090,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           },
         });
         const attachmentNote = `\n\n[Attached file "requirements.pdf" is saved at: ${path.join(harness.attachmentsDir, attachmentRelativePath(attachment)!)}]`;
-        assert.equal(harness.offeredMessages[1]?.priority, "now");
+        assert.equal(harness.offeredMessages[1]?.priority, "next");
         assert.deepEqual(harness.offeredMessages[1]?.message.content, [
           { type: "text", text: `${leadingText}${attachmentNote}` },
           { type: "text", text: `/implement the fixes${attachmentNote}` },
@@ -6180,7 +6181,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           },
         }),
       );
-      // Past task_started the CLI queues a "now" steer until the call returns.
+      // Past task_started the CLI queues a steer until the call returns.
       yield* harness.offerAndWait(
         claudeSdkFrame({
           type: "system",
@@ -6376,13 +6377,690 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // At priority "next" Claude reads a steer with the next tool result. With no tool call left,
+  // it reports the steer queued, finishes the turn, and then answers the steer in a turn of its
+  // own (recorded from Claude Code 2.1.330). That turn belongs to the same run, and a steer it
+  // queued but never started is returned to the thread, never lost.
+  describe("a steer Claude queues behind the turn's last step", () => {
+    const queuedSteerHarness = (options?: {
+      readonly closed?: Array<string>;
+      readonly mergedMessageIds?: ReadonlyArray<MessageId>;
+    }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarnessWithOptions({
+          close: (queue) =>
+            Effect.sync(() => options?.closed?.push("closed")).pipe(
+              Effect.andThen(Queue.shutdown(queue)),
+            ),
+        });
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const attemptId = RunAttemptId.make("attempt-steer-queued");
+        const input = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId,
+          text: "Write the summary.",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(input);
+        const providerTurnId = idAllocator.derive.providerTurn({
+          driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+          nativeTurnId: `turn:${attemptId}`,
+        });
+        yield* harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: input.runId,
+          providerThread: harness.providerThread,
+          providerTurnId,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-steer-queued"),
+            text: "Also name the owner.",
+            attachments: [],
+          },
+          ...(options?.mergedMessageIds === undefined
+            ? {}
+            : { mergedMessageIds: options.mergedMessageIds }),
+        });
+        const lifecycle = (index: number, state: string, uuid: string) =>
+          harness.offerAndWait(
+            claudeSdkFrame({
+              type: "command_lifecycle",
+              command_uuid: harness.promptUuid(index),
+              state,
+              uuid,
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+        const steerStatus = () =>
+          harness.events
+            .flatMap((event) =>
+              event.type === "steer.updated" && event.messageId === "message-steer-queued"
+                ? [event.status]
+                : [],
+            )
+            .at(-1);
+        // Claude reports the steer queued, then ends the turn's first reply with a result.
+        yield* lifecycle(1, "queued", "00000000-0000-4000-8000-000000003001");
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000003002",
+            text: "Summary written.",
+          }),
+        );
+        // A failed result closes the CLI while it is handled, so nothing waits on its handling.
+        const firstResult = (input?: { readonly isError?: boolean }) =>
+          (input?.isError === true
+            ? (frame: SDKMessage) => Queue.offer(harness.sdkMessages, frame)
+            : harness.offerAndWait)(
+            claudeSdkFrame({
+              ...makeResultFrame({
+                uuid: "00000000-0000-4000-8000-000000003003",
+                result: "Summary written.",
+                ...(input?.isError === true
+                  ? { isError: true, subtype: "error_during_execution" }
+                  : {}),
+              }),
+              user_message_uuid: harness.promptUuid(0),
+            }),
+          );
+        return { harness, input, providerTurnId, lifecycle, steerStatus, firstResult };
+      });
+    const layer = Layer.mergeAll(
+      IdAllocator.layer,
+      McpProviderSessions.layer,
+      NodeServices.layer,
+      NodeCrypto.layer,
+    );
+
+    it.effect("its own turn runs in the same run, after the first reply", () =>
+      Effect.gen(function* () {
+        const { harness, lifecycle, steerStatus, firstResult } = yield* queuedSteerHarness();
+        yield* firstResult();
+        // The steer is still to run: the turn stays open.
+        assert.lengthOf(harness.terminalEvents(), 0);
+        assert.equal(steerStatus(), "pending");
+        yield* lifecycle(1, "started", "00000000-0000-4000-8000-000000003004");
+        yield* harness.until(() => steerStatus() === "completed");
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000003005",
+            text: "The owner is the platform team.",
+          }),
+        );
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            ...makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000003006",
+              result: "The owner is the platform team.",
+            }),
+            user_message_uuid: harness.promptUuid(1),
+          }),
+        );
+        yield* harness.awaitTerminal(1);
+        assert.deepEqual(
+          harness.terminalEvents().map((event) => event.status),
+          ["completed"],
+        );
+        const replies = harness.events.flatMap((event) =>
+          event.type === "message.updated" && event.message.role === "assistant"
+            ? [event.message.text]
+            : [],
+        );
+        assert.includeMembers(replies, ["Summary written.", "The owner is the platform team."]);
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    it.effect("its own turn's reply is kept when Claude gives it only as the result", () =>
+      Effect.gen(function* () {
+        const { harness, lifecycle, firstResult } = yield* queuedSteerHarness();
+        yield* firstResult();
+        yield* lifecycle(1, "started", "00000000-0000-4000-8000-000000003011");
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            ...makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000003012",
+              result: "The owner is the platform team.",
+            }),
+            user_message_uuid: harness.promptUuid(1),
+          }),
+        );
+        yield* harness.awaitTerminal(1);
+        const replies = harness.events.flatMap((event) =>
+          event.type === "message.updated" && event.message.role === "assistant"
+            ? [event.message.text]
+            : [],
+        );
+        assert.includeMembers(replies, ["Summary written.", "The owner is the platform team."]);
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    it.effect("a turn that ends on Claude cancelling it counts its result's usage once", () =>
+      Effect.gen(function* () {
+        const { harness, lifecycle, firstResult } = yield* queuedSteerHarness();
+        yield* firstResult();
+        yield* lifecycle(1, "cancelled", "00000000-0000-4000-8000-000000003013");
+        yield* harness.awaitTerminal(1);
+        const turn = harness.events.findLast((event) => event.type === "provider_turn.updated");
+        const usage =
+          turn?.type === "provider_turn.updated" ? turn.providerTurn.turnTokenUsage : undefined;
+        assert.equal(usage?.inputTokens, 1);
+        assert.equal(usage?.outputTokens, 1);
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    it.effect("with two queued steers, the second's cancel waits for the first's answer", () =>
+      Effect.gen(function* () {
+        const { harness, input, providerTurnId, lifecycle, firstResult } =
+          yield* queuedSteerHarness();
+        yield* harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: input.runId,
+          providerThread: harness.providerThread,
+          providerTurnId,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-steer-second"),
+            text: "And the deadline.",
+            attachments: [],
+          },
+        });
+        const status = (id: string) =>
+          harness.events
+            .flatMap((event) =>
+              event.type === "steer.updated" && event.messageId === id ? [event.status] : [],
+            )
+            .at(-1);
+        yield* lifecycle(2, "queued", "00000000-0000-4000-8000-000000003021");
+        yield* firstResult();
+        // The first steer's turn starts; the second is still queued behind it, then cancelled.
+        yield* lifecycle(1, "started", "00000000-0000-4000-8000-000000003022");
+        yield* lifecycle(2, "cancelled", "00000000-0000-4000-8000-000000003023");
+        yield* harness.until(() => status("message-steer-second") === "returned");
+        // Quiet longer than the deadline while the first steer's turn runs: it is not cut.
+        yield* TestClock.adjust("31 seconds");
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000003024",
+            text: "The owner is the platform team.",
+          }),
+        );
+        yield* harness.until(() =>
+          harness.events.some(
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.text === "The owner is the platform team.",
+          ),
+        );
+        // Events arrive in order: an early end would precede that reply.
+        assert.lengthOf(harness.terminalEvents(), 0, "the first steer's turn is still running");
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            ...makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000003025",
+              result: "The owner is the platform team.",
+            }),
+            user_message_uuid: harness.promptUuid(1),
+          }),
+        );
+        yield* harness.awaitTerminal(1);
+        assert.deepEqual(
+          harness.terminalEvents().map((event) => event.status),
+          ["completed"],
+        );
+        assert.equal(status("message-steer-queued"), "completed");
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    // A steer sent while the run waits for a queued one is unread until Claude reports it: the wait
+    // does not end over it, and a run that ends returns it instead of counting it as read.
+    describe("a second steer sent while the run waits", () => {
+      const withSecondSteer = (options?: { readonly closed?: Array<string> }) =>
+        Effect.gen(function* () {
+          const queued = yield* queuedSteerHarness(options);
+          const status = (id: string) =>
+            queued.harness.events
+              .flatMap((event) =>
+                event.type === "steer.updated" && event.messageId === id ? [event.status] : [],
+              )
+              .at(-1);
+          const sendSecond = queued.harness.runtime.steerTurn({
+            threadId: queued.harness.threadId,
+            runId: queued.input.runId,
+            providerThread: queued.harness.providerThread,
+            providerTurnId: queued.providerTurnId,
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId: MessageId.make("message-steer-second"),
+              text: "And the deadline.",
+              attachments: [],
+            },
+          });
+          return { ...queued, status, sendSecond };
+        });
+
+      it.effect("Claude cancelling the first before it reports the second keeps the run", () =>
+        Effect.gen(function* () {
+          const { harness, lifecycle, firstResult, status, sendSecond } = yield* withSecondSteer();
+          yield* firstResult();
+          yield* sendSecond;
+          yield* lifecycle(1, "cancelled", "00000000-0000-4000-8000-000000003201");
+          yield* lifecycle(2, "queued", "00000000-0000-4000-8000-000000003202");
+          yield* harness.until(() => status("message-steer-queued") === "returned");
+          assert.lengthOf(harness.terminalEvents(), 0, "the second steer is still to run");
+          yield* lifecycle(2, "started", "00000000-0000-4000-8000-000000003203");
+          yield* harness.until(() => status("message-steer-second") === "completed");
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              ...makeResultFrame({
+                uuid: "00000000-0000-4000-8000-000000003204",
+                result: "By Friday.",
+              }),
+              user_message_uuid: harness.promptUuid(2),
+            }),
+          );
+          yield* harness.awaitTerminal(1);
+          assert.equal(harness.terminalEvents()[0]?.status, "completed");
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect("the quiet deadline returns both, the unreported second too", () =>
+        Effect.gen(function* () {
+          const closed: Array<string> = [];
+          const { harness, firstResult, status, sendSecond } = yield* withSecondSteer({ closed });
+          yield* firstResult();
+          yield* sendSecond;
+          yield* TestClock.adjust("30 seconds");
+          yield* harness.awaitTerminal(1);
+          assert.equal(status("message-steer-queued"), "returned");
+          assert.equal(status("message-steer-second"), "returned");
+          yield* harness.until(() => closed.length > 0);
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect(
+        "Stop while the run waits returns the unreported second too, with no resend notice",
+        () =>
+          Effect.gen(function* () {
+            const { harness, providerTurnId, firstResult, status, sendSecond } =
+              yield* withSecondSteer();
+            yield* firstResult();
+            yield* sendSecond;
+            yield* harness.runtime.interruptTurn({
+              providerThread: harness.providerThread,
+              providerTurnId,
+            });
+            yield* harness.awaitTerminal(1);
+            assert.equal(harness.terminalEvents()[0]?.status, "interrupted");
+            assert.equal(status("message-steer-queued"), "returned");
+            assert.equal(status("message-steer-second"), "returned");
+            assert.isFalse(
+              harness.events.some(
+                (event) =>
+                  event.type === "turn_item.updated" &&
+                  JSON.stringify(event.turnItem).includes("Resend it if needed"),
+              ),
+            );
+          }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect("Claude exiting while the run waits returns the unreported second too", () =>
+        Effect.gen(function* () {
+          const { harness, firstResult, status, sendSecond } = yield* withSecondSteer();
+          yield* firstResult();
+          yield* sendSecond;
+          yield* Queue.shutdown(harness.sdkMessages);
+          yield* harness.awaitTerminal(1);
+          assert.equal(status("message-steer-queued"), "returned");
+          assert.equal(status("message-steer-second"), "returned");
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect("with background work, a failure held for the first keeps the second too", () =>
+        Effect.gen(function* () {
+          const closed: Array<string> = [];
+          const queued = yield* withSecondSteer({ closed });
+          const { harness, lifecycle, status, sendSecond } = queued;
+          yield* harness.offerAndWait(wakeTaskStarted);
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              ...makeResultFrame({
+                uuid: "00000000-0000-4000-8000-000000003205",
+                result: "API Error: 529 overloaded",
+                terminalReason: "api_error",
+                apiErrorStatus: 529,
+              }),
+              user_message_uuid: harness.promptUuid(0),
+            }),
+          );
+          yield* TestClock.adjust("1 second");
+          yield* sendSecond;
+          yield* lifecycle(1, "cancelled", "00000000-0000-4000-8000-000000003206");
+          assert.lengthOf(harness.terminalEvents(), 0);
+          yield* lifecycle(2, "queued", "00000000-0000-4000-8000-000000003207");
+          yield* lifecycle(2, "cancelled", "00000000-0000-4000-8000-000000003208");
+          yield* harness.awaitTerminal(1);
+          assert.equal(harness.terminalEvents()[0]?.status, "failed");
+          assert.equal(status("message-steer-queued"), "returned");
+          assert.equal(status("message-steer-second"), "returned");
+          assert.deepEqual(closed, []);
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+    });
+
+    it.effect("a merged steer returns every message it carried", () =>
+      Effect.gen(function* () {
+        const merged = [MessageId.make("message-merged-2"), MessageId.make("message-merged-3")];
+        const { harness, providerTurnId } = yield* queuedSteerHarness({
+          mergedMessageIds: merged,
+        });
+        yield* harness.runtime.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId,
+        });
+        yield* harness.awaitTerminal(1);
+        const returned = harness.events.flatMap((event) =>
+          event.type === "steer.updated" && event.status === "returned" ? [event.messageId] : [],
+        );
+        assert.deepEqual(returned, ["message-steer-queued", ...merged]);
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    it.effect("Claude cancelling it ends the turn and returns the steer", () =>
+      Effect.gen(function* () {
+        const { harness, lifecycle, steerStatus, firstResult } = yield* queuedSteerHarness();
+        yield* firstResult();
+        assert.lengthOf(harness.terminalEvents(), 0);
+        yield* lifecycle(1, "cancelled", "00000000-0000-4000-8000-000000003007");
+        yield* harness.awaitTerminal(1);
+        assert.equal(harness.terminalEvents()[0]?.status, "completed");
+        assert.equal(steerStatus(), "returned");
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    it.effect("a steer Claude does not start while quiet is returned and the CLI closed", () =>
+      Effect.gen(function* () {
+        const closed: Array<string> = [];
+        const { harness, steerStatus, firstResult } = yield* queuedSteerHarness({ closed });
+        yield* firstResult();
+        yield* TestClock.adjust("29 seconds");
+        assert.lengthOf(harness.terminalEvents(), 0);
+        yield* TestClock.adjust("1 second");
+        yield* harness.awaitTerminal(1);
+        assert.equal(harness.terminalEvents()[0]?.status, "completed");
+        assert.equal(steerStatus(), "returned");
+        yield* harness.until(() => closed.length > 0);
+        // The exit the close causes ends nothing again.
+        yield* TestClock.adjust("1 second");
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("1 second");
+        yield* Effect.yieldNow;
+
+        assert.deepEqual(
+          harness.terminalEvents().map((event) => event.status),
+          ["completed"],
+        );
+        // A short operation budget lets the close's exit run while the end is still being written.
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layer),
+        Effect.provideService(Scheduler.MaxOpsBeforeYield, 50),
+      ),
+    );
+
+    it.effect("Claude exiting as the quiet deadline ends the run settles it once", () =>
+      Effect.gen(function* () {
+        const { harness, steerStatus, firstResult } = yield* queuedSteerHarness();
+        yield* firstResult();
+        // Claude's process ends on its own at the moment the deadline ends the run.
+        yield* Effect.sleep("30 seconds").pipe(
+          Effect.andThen(Queue.shutdown(harness.sdkMessages)),
+          Effect.forkChild,
+        );
+        yield* TestClock.adjust("30 seconds");
+        yield* harness.awaitTerminal(1);
+        yield* harness.until(() => steerStatus() === "returned");
+        yield* TestClock.adjust("1 second");
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("1 second");
+        yield* Effect.yieldNow;
+        assert.lengthOf(harness.terminalEvents(), 1, "one end, never a second");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layer),
+        Effect.provideService(Scheduler.MaxOpsBeforeYield, 50),
+      ),
+    );
+
+    it.effect("a success-shaped API error ends the run as failed and returns the steer", () =>
+      Effect.gen(function* () {
+        const { harness, steerStatus } = yield* queuedSteerHarness();
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            ...makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000003032",
+              result: "API Error: 529 overloaded",
+              terminalReason: "api_error",
+              apiErrorStatus: 529,
+            }),
+            user_message_uuid: harness.promptUuid(0),
+          }),
+        );
+        yield* TestClock.adjust("1 second");
+        yield* harness.awaitTerminal(1);
+        assert.equal(harness.terminalEvents()[0]?.status, "failed");
+        yield* harness.until(() => steerStatus() === "returned");
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    it.effect("Stop returns it", () =>
+      Effect.gen(function* () {
+        const { harness, providerTurnId, steerStatus } = yield* queuedSteerHarness();
+        yield* harness.runtime.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId,
+        });
+        yield* harness.awaitTerminal(1);
+        assert.equal(harness.terminalEvents()[0]?.status, "interrupted");
+        assert.equal(steerStatus(), "returned");
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    it.effect("Claude exiting returns it", () =>
+      Effect.gen(function* () {
+        const { harness, steerStatus } = yield* queuedSteerHarness();
+        yield* Queue.shutdown(harness.sdkMessages);
+        yield* harness.awaitTerminal(1);
+        assert.notEqual(harness.terminalEvents()[0]?.status, "completed");
+        assert.equal(steerStatus(), "returned");
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    it.effect("a failed turn returns it and closes the CLI, which would run it on its own", () =>
+      Effect.gen(function* () {
+        const closed: Array<string> = [];
+        const { harness, steerStatus, firstResult } = yield* queuedSteerHarness({ closed });
+        yield* firstResult({ isError: true });
+        // A failed turn settles on the clock (its failure notice and teardown).
+        yield* TestClock.adjust("1 second");
+        yield* harness.awaitTerminal(1);
+        assert.equal(harness.terminalEvents()[0]?.status, "failed");
+        assert.equal(steerStatus(), "returned");
+        yield* harness.until(() => closed.length > 0);
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+
+    // Closing Claude ends the background work it runs, so a process running some is never closed
+    // for a queued steer: the run waits for Claude to start it and answer it, once. A process being
+    // stopped or already gone returns it, as does Claude's own cancel.
+    describe("with background work running", () => {
+      const withBackgroundWork = (options?: { readonly closed?: Array<string> }) =>
+        Effect.gen(function* () {
+          const queued = yield* queuedSteerHarness(options);
+          yield* queued.harness.offerAndWait(wakeTaskStarted);
+          assert.isTrue(yield* queued.harness.hasPendingBackgroundWork);
+          return queued;
+        });
+      const returnedCount = (harness: {
+        readonly events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>;
+      }) =>
+        harness.events.filter(
+          (event) =>
+            event.type === "steer.updated" &&
+            event.messageId === "message-steer-queued" &&
+            event.status === "returned",
+        ).length;
+      // A failure Claude reports as a result while its process goes on.
+      const apiError = (
+        harness: Effect.Success<ReturnType<typeof queuedSteerHarness>>["harness"],
+      ) =>
+        harness.offerAndWait(
+          claudeSdkFrame({
+            ...makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000003100",
+              result: "API Error: 529 overloaded",
+              terminalReason: "api_error",
+              apiErrorStatus: 529,
+            }),
+            user_message_uuid: harness.promptUuid(0),
+          }),
+        );
+      const answerSteer = (queued: Effect.Success<ReturnType<typeof queuedSteerHarness>>) =>
+        Effect.gen(function* () {
+          const { harness, lifecycle, steerStatus } = queued;
+          yield* lifecycle(1, "started", "00000000-0000-4000-8000-000000003101");
+          yield* harness.until(() => steerStatus() === "completed");
+          yield* harness.offerAndWait(
+            makeAssistantTextFrame({
+              uuid: "00000000-0000-4000-8000-000000003102",
+              text: "The owner is the platform team.",
+            }),
+          );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              ...makeResultFrame({
+                uuid: "00000000-0000-4000-8000-000000003103",
+                result: "The owner is the platform team.",
+              }),
+              user_message_uuid: harness.promptUuid(1),
+            }),
+          );
+          yield* harness.awaitTerminal(1);
+        });
+
+      it.effect("a failed turn keeps the work and Claude answers the steer once", () =>
+        Effect.gen(function* () {
+          const closed: Array<string> = [];
+          const queued = yield* withBackgroundWork({ closed });
+          const { harness, steerStatus } = queued;
+          yield* apiError(harness);
+          yield* TestClock.adjust("1 second");
+          // Ending now would return the steer and close the process with its work.
+          assert.lengthOf(harness.terminalEvents(), 0);
+          assert.equal(steerStatus(), "pending");
+          yield* answerSteer(queued);
+          assert.deepEqual(
+            harness.terminalEvents().map((event) => event.status),
+            ["completed"],
+          );
+          assert.equal(steerStatus(), "completed");
+          assert.equal(returnedCount(harness), 0, "never returned to the thread");
+          assert.deepEqual(closed, [], "the process and its background work stay");
+          assert.isTrue(yield* harness.hasPendingBackgroundWork);
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect("a steer Claude does not start while quiet waits with the work", () =>
+        Effect.gen(function* () {
+          const closed: Array<string> = [];
+          const queued = yield* withBackgroundWork({ closed });
+          const { harness, steerStatus, firstResult } = queued;
+          yield* firstResult();
+          yield* TestClock.adjust("30 seconds");
+          yield* TestClock.adjust("30 seconds");
+          yield* Effect.yieldNow;
+          assert.lengthOf(harness.terminalEvents(), 0);
+          assert.equal(steerStatus(), "pending");
+          assert.deepEqual(closed, []);
+          yield* answerSteer(queued);
+          assert.equal(harness.terminalEvents()[0]?.status, "completed");
+          assert.equal(returnedCount(harness), 0);
+          assert.deepEqual(closed, []);
+          assert.isTrue(yield* harness.hasPendingBackgroundWork);
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect("Claude cancelling it after a failure returns it once and closes nothing", () =>
+        Effect.gen(function* () {
+          const closed: Array<string> = [];
+          const { harness, lifecycle, steerStatus } = yield* withBackgroundWork({ closed });
+          yield* apiError(harness);
+          yield* TestClock.adjust("1 second");
+          assert.lengthOf(harness.terminalEvents(), 0);
+          yield* lifecycle(1, "cancelled", "00000000-0000-4000-8000-000000003104");
+          yield* harness.awaitTerminal(1);
+          assert.equal(harness.terminalEvents()[0]?.status, "failed");
+          assert.equal(steerStatus(), "returned");
+          assert.equal(returnedCount(harness), 1);
+          yield* TestClock.adjust("1 second");
+          yield* Effect.yieldNow;
+          assert.deepEqual(closed, [], "Claude dropped the steer itself: nothing to close");
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect("Stop, which closes the process itself, returns it", () =>
+        Effect.gen(function* () {
+          const { harness, providerTurnId, steerStatus } = yield* withBackgroundWork();
+          yield* harness.runtime.interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId,
+          });
+          yield* harness.awaitTerminal(1);
+          assert.equal(harness.terminalEvents()[0]?.status, "interrupted");
+          assert.equal(steerStatus(), "returned");
+          assert.equal(returnedCount(harness), 1);
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect("Claude exiting while the run waits returns it", () =>
+        Effect.gen(function* () {
+          const { harness, steerStatus } = yield* withBackgroundWork();
+          yield* apiError(harness);
+          yield* TestClock.adjust("1 second");
+          assert.lengthOf(harness.terminalEvents(), 0);
+          yield* Queue.shutdown(harness.sdkMessages);
+          yield* harness.awaitTerminal(1);
+          assert.notEqual(harness.terminalEvents()[0]?.status, "completed");
+          assert.equal(steerStatus(), "returned");
+          assert.equal(returnedCount(harness), 1);
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+
+      it.effect("an error that ends Claude's process returns it", () =>
+        Effect.gen(function* () {
+          const { harness, steerStatus, firstResult } = yield* withBackgroundWork();
+          yield* firstResult({ isError: true });
+          yield* TestClock.adjust("1 second");
+          yield* harness.awaitTerminal(1);
+          assert.equal(harness.terminalEvents()[0]?.status, "failed");
+          assert.equal(steerStatus(), "returned");
+          assert.equal(returnedCount(harness), 1);
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      );
+    });
+  });
+
   // Claude can answer a steer while its offer is still being logged.
   it.effect("settles a turn whose result echoes only a steer before the offer returns", () =>
     Effect.gen(function* () {
       let settleDuringOffer: (message: SDKUserMessage) => Effect.Effect<void> = () => Effect.void;
       const harness = yield* makeWakeHarnessWithOptions({
         offer: (message) =>
-          message.priority === "now"
+          message.priority === "next"
             ? Effect.suspend(() => settleDuringOffer(message))
             : Effect.void,
       });
@@ -8435,7 +9113,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             attachments: [],
           },
         });
-        assert.equal(harness.offeredMessages[1]?.priority, "now");
+        assert.equal(harness.offeredMessages[1]?.priority, "next");
       }
       const partialText = "The audit covers the `integ";
       if (!queryExits)

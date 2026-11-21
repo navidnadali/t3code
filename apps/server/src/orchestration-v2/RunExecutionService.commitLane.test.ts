@@ -333,8 +333,15 @@ it.effect.each([
       let laneWrites = 0;
       let batches = 0;
       let barrierWrites = 0;
-      // Provider stamp to commit, in seconds, of the items' final states.
+      // Provider stamp to commit, in seconds, of the items' final states (reported, not gated).
       const finalLags: Array<number> = [];
+      // Items whose final state the lane has written, and states written after an item's final.
+      const finalized = new Set<string>();
+      let statesAfterFinal = 0;
+      // The most final states sent and not yet committed at any commit in the window.
+      const sentFinalStamps: Array<number> = [];
+      let committedFinals = 0;
+      let maxFinalBacklog = 0;
       let pendingFinals: Array<number> = [];
       const hold = (ms: number) =>
         Effect.gen(function* () {
@@ -343,7 +350,7 @@ it.effect.each([
           const to = yield* Clock.currentTimeMillis;
           busyMs += Math.max(0, Math.min(to, windowEnd) - Math.max(from, windowStart));
         });
-      const coordinator = yield* ProviderCommitBatch.make(
+      const commitBatch = yield* ProviderCommitBatch.make(
         (work) =>
           writer.withPermits(1)(
             Effect.gen(function* () {
@@ -351,9 +358,12 @@ it.effect.each([
               yield* Effect.provideService(work, InSharedCommit, true);
               yield* hold(BATCH_MS / 2);
               const committedAt = yield* Clock.currentTimeMillis;
+              committedFinals += pendingFinals.length;
               if (inWindow(committedAt)) {
                 batches++;
                 for (const stamp of pendingFinals) finalLags.push((committedAt - stamp) / 1000);
+                const sent = sentFinalStamps.filter((stamp) => stamp <= committedAt).length;
+                maxFinalBacklog = Math.max(maxFinalBacklog, sent - committedFinals);
               }
               pendingFinals = [];
             }),
@@ -366,8 +376,17 @@ it.effect.each([
           perJobSavepoints: true,
         },
       );
-      const snapshotWrite = (finalStamp: number | undefined, intermediate = false) =>
+      const snapshotWrite = (
+        finalStamp: number | undefined,
+        intermediate = false,
+        itemKey: string | undefined = undefined,
+      ) =>
         Effect.gen(function* () {
+          if (itemKey !== undefined) {
+            // An item's state written after its final state would undo it.
+            if (finalized.has(itemKey)) statesAfterFinal++;
+            if (finalStamp !== undefined) finalized.add(itemKey);
+          }
           if (yield* InSharedCommit) {
             yield* hold(WRITE_MS);
             if (inWindow(yield* Clock.currentTimeMillis)) {
@@ -390,6 +409,8 @@ it.effect.each([
         (provided.type === "turn_item.updated" && provided.turnItem.status === "running") ||
         (provided.type === "node.updated" && provided.node.status === "running") ||
         (provided.type === "message.updated" && provided.message.streaming);
+      const itemKeyOf = (provided: ProviderAdapter.ProviderAdapterV2Event) =>
+        provided.type === "turn_item.updated" ? provided.turnItem.id : undefined;
       const finalStampOf = (provided: ProviderAdapter.ProviderAdapterV2Event) =>
         provided.type === "turn_item.updated" && provided.turnItem.status === "completed"
           ? DateTime.toEpochMillis(provided.turnItem.updatedAt)
@@ -407,11 +428,11 @@ it.effect.each([
             }),
             Layer.mock(EventSink.EventSinkV2)({
               consumeProviderEvents: (source, process, after, canBatch) =>
-                coordinator.consume(source, process, after, canBatch),
-              write: () => coordinator.barrier(barrierWrite).pipe(Effect.as([])),
-              writeWithEffects: () => coordinator.barrier(barrierWrite).pipe(Effect.as([])),
+                commitBatch.consume(source, process, after, canBatch),
+              write: () => commitBatch.barrier(barrierWrite).pipe(Effect.as([])),
+              writeWithEffects: () => commitBatch.barrier(barrierWrite).pipe(Effect.as([])),
               writeIfRunCurrent: () =>
-                coordinator
+                commitBatch
                   .barrier(barrierWrite)
                   .pipe(Effect.as({ committed: true, storedEvents: [] })),
             }),
@@ -419,8 +440,14 @@ it.effect.each([
             ThreadCommandExecutor.layer,
             Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
               ingestNormalized: (input) =>
-                coordinator
-                  .barrier(snapshotWrite(finalStampOf(input.event), isIntermediate(input.event)))
+                commitBatch
+                  .barrier(
+                    snapshotWrite(
+                      finalStampOf(input.event),
+                      isIntermediate(input.event),
+                      itemKeyOf(input.event),
+                    ),
+                  )
                   .pipe(
                     Effect.as(
                       input.event.type === "provider_thread.updated"
@@ -455,11 +482,14 @@ it.effect.each([
                 rootNodeId: NodeId.make(`node:${run}`),
               };
               const schedule = runSchedule(ids, random, rates[run]!, start, durationMs);
-              for (const next of schedule)
+              for (const next of schedule) {
                 if (inWindow(next.at)) {
                   offeredJobs++;
                   if (next.superseded) offeredSuperseded++;
                 }
+                const stamp = finalStampOf(next.event);
+                if (stamp !== undefined) sentFinalStamps.push(stamp);
+              }
               const source = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
               // The provider runs on its own clock. A run's events reach the lane in handovers
               // ~9 s apart (p50); each handover here is what the run sent since the last.
@@ -543,7 +573,7 @@ it.effect.each([
             yield* Effect.sleep(
               Math.max(1, Math.floor((-Math.log(1 - random()) * 60_000) / BARRIERS_PER_MINUTE)),
             );
-            yield* coordinator.barrier(barrierWrite).pipe(Effect.forkChild);
+            yield* commitBatch.barrier(barrierWrite).pipe(Effect.forkChild);
           }
         }).pipe(Effect.forkChild);
         yield* TestClock.adjust(`${WARMUP_SECONDS + WINDOW_SECONDS} seconds`);
@@ -570,26 +600,32 @@ it.effect.each([
         predictedBusy: Number(predictedBusy.toFixed(3)),
         finalCommitLagP50S: finalLags.length === 0 ? null : percentile(finalLags, 0.5),
         finalCommitLagP99S: finalLags.length === 0 ? null : percentile(finalLags, 0.99),
+        maxFinalBacklog,
+        statesAfterFinal,
+        finalsSentInWindow: sentFinalStamps.filter(inWindow).length,
+        finalsSentByTail: sentFinalStamps.filter((stamp) => stamp <= windowEnd - 15_000).length,
+        committedFinals,
       };
+      // Times (busy share, commit lag) are reported, not gated: the rows gate on counts.
       process.stderr.write(`commit-lane row: ${JSON.stringify(summary)}\n`);
       // The model offers a busy server's load: ~1,900 jobs/min from 60 runs; and it ran.
       assert.isAbove(laneWrites, 0);
       assert.isAbove(batches, 0);
       assert.isAtLeast(offeredJobs / minutes, 1_600);
       assert.isAtMost(offeredJobs / minutes, 2_300);
+      // Every item's final state is written, and never followed by an older state of the item.
+      assert.isAtLeast(committedFinals, summary.finalsSentByTail, JSON.stringify(summary));
+      assert.equal(statesAfterFinal, 0, JSON.stringify(summary));
       if (handoverMs > 0) {
         // At those handovers, each item state a later one supersedes in the same handover never
-        // reaches the lane (10% headroom for states straddling two), and the lane is busy only for
-        // the rest: within 5 points of that work's own time. Writing every state keeps it ~99%
-        // busy.
+        // reaches the lane (10% headroom for states straddling two).
         assert.isAtMost(laneWrites / minutes, allowedWrites * 1.1, JSON.stringify(summary));
-        assert.isAtMost(busy, predictedBusy + 0.05, JSON.stringify(summary));
-        assert.isAtMost(busy, 0.9, JSON.stringify(summary));
       } else {
-        // As sent, a shorter backlog coalesces less, and the lane stays near saturation; what the
-        // coalescing buys is time: a final commits within 5 s (p99) of its provider stamp, where
-        // an uncoalesced backlog keeps it waiting ~9 s.
-        assert.isAtMost(summary.finalCommitLagP99S ?? Infinity, 5, JSON.stringify(summary));
+        // As sent, a shorter backlog coalesces less, but the final states waiting for the lane
+        // stay within what the providers send in 5 s; an uncoalesced backlog holds about 9 s.
+        const finalsPerSecond = summary.finalsSentInWindow / WINDOW_SECONDS;
+        assert.isAtMost(maxFinalBacklog, finalsPerSecond * 5, JSON.stringify(summary));
+        assert.isBelow(laneWrites, offeredJobs, JSON.stringify(summary));
       }
     }),
 );

@@ -882,6 +882,39 @@ describe("secrets", () => {
     }
   });
 
+  // An issuer whose tokens can have a body of one case is known by its prefix (never named in this
+  // repository): its tokens count whatever the body's case, also as an allowlisted id field's value.
+  // Other prefixes keep the mixed-case rule, so one-case ids stay ids.
+  it("takes a known issuer's token with a one-case body, also from an allowlisted id field", () => {
+    const body = "a9b8c7d6e5f4".repeat(3);
+    const letters = [..."abcdefghijklmnopqrstuvwxyz"];
+    const shortPrefixes = letters.flatMap((a) =>
+      letters.flatMap((b) => [a + b, ...letters.map((c) => a + b + c)]),
+    );
+    const known = shortPrefixes.filter((prefix) =>
+      secretHits(`${prefix}_${body}`, { entropy: false }).includes("prefixed-token"),
+    );
+    expect(known.length).toBeGreaterThan(0);
+    expect(known.length).toBeLessThan(8);
+    for (const prefix of known) {
+      const token = `${prefix}_${body}`;
+      const rows: Array<string> = [];
+      extendedFindings(token, (row) => rows.push(row));
+      expect(
+        rows.some((row) => row.endsWith("|sanitiser:prefixed token")),
+        token,
+      ).toBe(true);
+      expect(redact(token, { entropy: false }), token).not.toBe(token);
+      expect(keptAs("thread_id", token)).toBe("id");
+      expect(isFiller(rewriteContent(token, "thread_id", "blank", emptyCounts())), token).toBe(
+        true,
+      );
+    }
+    for (const id of [`rs_${"0a1b2c3d".repeat(6)}`, `resp_${"0a1b2c3d4e".repeat(5)}`]) {
+      expect(secretHits(id, { entropy: false }), id).toEqual([]);
+    }
+  });
+
   it("keeps JSON valid at any nesting depth and removes whole private key blocks", () => {
     const pem = SAMPLES["private-key"] as string;
     const pgp = [

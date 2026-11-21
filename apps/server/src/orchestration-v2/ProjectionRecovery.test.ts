@@ -753,6 +753,88 @@ it.effect("lists idle threads whose queue waits unheld, through the recovery ind
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect(
+  "lists ended runs holding a returned steer, however old, through the user-message index",
+  () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const item = (
+        threadId: ThreadId,
+        runId: RunId,
+        id: string,
+        status: string,
+        payload: object,
+      ) =>
+        sql`
+        INSERT INTO orchestration_v2_projection_turn_items
+          (turn_item_id, thread_id, run_id, node_id, provider_thread_id, ordinal, type,
+           status, updated_at, payload_json)
+        VALUES (${id}, ${threadId}, ${runId}, NULL, NULL, 1, 'user_message', ${status}, '',
+          ${JSON.stringify(payload)})
+      `;
+      const message = (threadId: ThreadId, runId: RunId, id: string) =>
+        sql`
+        INSERT INTO orchestration_v2_projection_messages
+          (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+        VALUES (${id}, ${threadId}, ${runId}, NULL, 'user', 0, '', '', '{}')
+      `;
+      for (let index = 0; index < 200; index += 1) {
+        const threadId = yield* createThread(`returned-steer-settled-${index}`);
+        const runId = yield* createRun(threadId, "completed");
+        yield* item(threadId, runId, `item:settled:${index}`, "completed", {
+          messageId: `m:${index}`,
+        });
+        yield* message(threadId, runId, `m:${index}`);
+      }
+      // Ended days ago, the steer still on its run.
+      const old = yield* createThread("returned-steer-old");
+      const oldRun = yield* createRun(old, "completed", {
+        completedAt: DateTime.makeUnsafe("2026-01-01T00:00:00.000Z"),
+      });
+      yield* item(old, oldRun, "item:returned:old", "cancelled", {
+        messageId: "m:returned:old",
+        returnedToQueue: true,
+      });
+      yield* message(old, oldRun, "m:returned:old");
+      // Already queued again: its message moved to another run.
+      const moved = yield* createThread("returned-steer-moved");
+      const movedRun = yield* createRun(moved, "failed");
+      const laterRun = yield* createRun(moved, "queued", { ordinal: 2, startedAt: null });
+      yield* item(moved, movedRun, "item:returned:moved", "cancelled", {
+        messageId: "m:returned:moved",
+        returnedToQueue: true,
+      });
+      yield* message(moved, laterRun, "m:returned:moved");
+      // A run still going has not ended.
+      const live = yield* createThread("returned-steer-live");
+      const liveRun = yield* createRun(live, "running");
+      yield* item(live, liveRun, "item:returned:live", "cancelled", {
+        messageId: "m:returned:live",
+        returnedToQueue: true,
+      });
+      yield* message(live, liveRun, "m:returned:live");
+
+      const statements: Array<ReturnType<Statement.Statement<unknown>["compile"]>> = [];
+      const observe: Statement.Transformer = (statement) => {
+        statements.push(statement.compile());
+        return Effect.succeed(statement);
+      };
+      assert.deepEqual(
+        yield* projections
+          .getReturnedSteerRuns()
+          .pipe(Effect.provideService(Statement.CurrentTransformer, observe)),
+        [{ threadId: old, runId: oldRun }],
+      );
+      const [query, params] = statements[0]!;
+      const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, params);
+      assert.isTrue(
+        plan.some((row) => row.detail.includes("turn_items_user_message_idx")),
+        JSON.stringify(plan),
+      );
+    }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("maintains delegated candidate indexes across legacy rows and payload transitions", () =>
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;

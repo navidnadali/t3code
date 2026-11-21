@@ -2,6 +2,22 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.9-perf.14 (2026-11-21)
+
+Steers that keep Claude's tool calls and background work, and general fixes
+
+Upstream base: 7d32075e3757.
+
+Same upstream main as 0.1.9-perf.10 (2026-11-16); no new migrations.
+
+- Steering Claude: a steer (a person's, a queued message sent into the turn, or an agent's message) reaches Claude with the next tool result and cancels none of the turn's tool calls. At priority "now" Claude Code aborted the running tool batch with a refusal the model read as the user declining the calls.
+- A steer Claude queues behind the turn's last step is answered in the same run. One Claude never runs (it cancels it, exits, fails or is stopped) comes back to the thread once, as its next queued message; startup recovers one whose run ended before it was queued again, however long the server was down. A Claude process that runs background work (a background command, a monitor, a subagent) is never closed for a queued steer: the run waits for Claude to answer it.
+- t3_thread_wait tells a parent that the child's completion will wake it unless the child waits on a live question or approval, as task_status does; a question answered by message no longer keeps the parent polling.
+- macOS checkpoints flush objects with per-object fsync instead of core.fsyncMethod=batch, which Apple Git 2.50 and 2.54 break when staging a large file.
+- The session scanner no longer offers T3's own sandboxes as importable projects when they are reached through a symlink (such as macOS's /var to /private/var).
+- The offline event-log filtered copy is flushed to disk before it replaces the database and after its renames, and apps/server/scripts/event-log-filtered-copy.ts runs its copy and restore on a stopped server's database.
+- Bench tools: the fixture scanner keeps every token shape it recognised, the commit-lane shard merge skips a derived table, its commit latency is measured after the commit, and the driver's defaults are chosen bench parameters.
+
 ## v0.1.9-perf.13 (2026-11-19)
 
 Linear turn starts, writer priority, compaction and fewer commit-lane writes

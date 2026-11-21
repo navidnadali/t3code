@@ -296,7 +296,7 @@ const busyOrchestrator = (input: {
         yield* TestClock.adjust(Duration.seconds(step));
         yield* worker.drain();
       }
-      const steers = offers.filter((offer) => offer.message.priority === "now");
+      const steers = offers.filter((offer) => offer.message.priority === "next");
       const steerTexts = steers.map((offer) => JSON.stringify(offer.message.message));
       const delays = probes.map((probe) => {
         const steer = steers.find((offer) =>

@@ -1929,6 +1929,70 @@ layer("ProviderEventIngestorV2", (it) => {
     }),
   );
 
+  // The provider never ran it and the run ended: the item says so, and the thread queues it again.
+  it.effect("marks a steer the provider returned unread as cancelled and returned", () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId: threadEvent.threadId,
+      });
+      const runId = RunId.make("run:steer-returned");
+      const messageId = MessageId.make("message:steer-returned");
+      const steer: OrchestrationV2TurnItem = {
+        id: idAllocator.derive.userTurnItem({ messageId }),
+        threadId: threadEvent.threadId,
+        runId,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "pending",
+        title: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        type: "user_message",
+        createdBy: "user",
+        creationSource: "web",
+        messageId,
+        inputIntent: "steer",
+        text: "Steer queued behind the last step",
+        attachments: [],
+      };
+      yield* eventSink.write({ events: [threadEvent] });
+      const ingest = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+        ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId: threadEvent.threadId,
+          event,
+        });
+      yield* ingest({ type: "turn_item.updated", driver: CODEX_DRIVER, turnItem: steer });
+      yield* ingest({
+        type: "steer.updated",
+        driver: CODEX_DRIVER,
+        threadId: threadEvent.threadId,
+        runId,
+        messageId,
+        status: "returned",
+      });
+      const item = yield* projectionStore.getTurnItem({
+        threadId: threadEvent.threadId,
+        itemId: steer.id,
+      });
+      assert.deepInclude(item, { status: "cancelled", returnedToQueue: true });
+      assert.isNotNull(item?.completedAt);
+    }),
+  );
+
   it.effect("stores a bounded copy of a large file-change diff in both SQLite tables", () =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;

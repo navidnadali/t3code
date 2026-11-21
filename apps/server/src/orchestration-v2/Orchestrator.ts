@@ -1369,6 +1369,8 @@ const PULL_REQUEST_WAKE_RETRY_WINDOW = Duration.hours(4);
 const MAX_PULL_REQUEST_WAKE_RESTARTS = 3;
 const NOTICE_RETRY_MESSAGE_PREFIX = "message:notice-retry:";
 const NOTICE_RETRY_COMMAND_PREFIX = "command:notice-retry:";
+// A steer its provider returned unread, queued again on its thread (and placed).
+const STEER_RETURNED_COMMAND_PREFIX = "command:steer-returned:";
 
 /** A thread that takes no pull request watch news: archived, settled, or a provider's subagent. */
 function refusesPullRequestNews(
@@ -8747,7 +8749,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return;
       }
       let steerFollowUpQueuePosition: number | undefined;
-      if (
+      // A returned steer goes right behind its source run's others already back or, with none,
+      // to the front of the queue (delivery order: position, then ordinal). What comes after that
+      // point moves back together, once, in this command: never past a tie it would land in.
+      let steerFollowUpAheadMoves: ReadonlyArray<OrchestrationV2Run> = [];
+      if (command.steerFollowUpOfRunId !== undefined && command.steerFollowUpAhead === true) {
+        const sourceRunId = command.steerFollowUpOfRunId;
+        const placeOf = (candidate: OrchestrationV2Run) =>
+          candidate.queuePosition ?? candidate.ordinal;
+        const ordered = projection.runs
+          .filter((candidate) => candidate.status === "queued")
+          .toSorted(
+            (left, right) => placeOf(left) - placeOf(right) || left.ordinal - right.ordinal,
+          );
+        const lastSibling = ordered.findLast(
+          (candidate) => candidate.steerFollowUpOfRunId === sourceRunId,
+        );
+        const position = lastSibling === undefined ? 1 : placeOf(lastSibling) + 1;
+        const after =
+          lastSibling === undefined ? ordered : ordered.slice(ordered.indexOf(lastSibling) + 1);
+        const shift =
+          after.length === 0 ? 0 : Math.max(0, position + 1 - Math.min(...after.map(placeOf)));
+        steerFollowUpQueuePosition = position;
+        steerFollowUpAheadMoves =
+          shift === 0
+            ? []
+            : after.map((candidate) => ({
+                ...candidate,
+                queuePosition: placeOf(candidate) + shift,
+              }));
+      } else if (
         command.steerFollowUpOfRunId !== undefined &&
         command.steerFollowUpAfterRunOrdinal !== undefined
       ) {
@@ -8895,7 +8926,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: run,
       });
-      if (steerFollowUpQueuePosition !== undefined) {
+      // A returned steer's moves were worked out with its position; every other follow-up inserts.
+      for (const moved of steerFollowUpAheadMoves) {
+        yield* emitEvent({
+          type: "run.updated",
+          threadId: command.threadId,
+          runId: moved.id,
+          providerInstanceId: moved.providerInstanceId,
+          occurredAt: now,
+          payload: moved,
+        });
+      }
+      if (steerFollowUpQueuePosition !== undefined && command.steerFollowUpAhead !== true) {
         for (const queued of projection.runs) {
           if (
             queued.status !== "queued" ||
@@ -8955,6 +8997,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (item) => item.type === "user_message" && item.messageId === command.messageId,
       );
       if (existingItem?.type === "user_message") {
+        // Queued again, a returned steer is an ordinary queued message: the mark goes with the
+        // run that returned it, so this run's end never returns it a second time.
+        const { returnedToQueue: _returned, ...queuedItem } = existingItem;
         yield* emitEvent({
           type: "turn-item.updated",
           threadId: command.threadId,
@@ -8963,7 +9008,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           providerInstanceId: modelSelection.instanceId,
           occurredAt: now,
           payload: {
-            ...existingItem,
+            ...queuedItem,
             runId,
             nodeId: rootNodeId,
             providerThreadId: queuedProviderThread.id,
@@ -16346,6 +16391,96 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
     });
 
+  // A steer the provider queued but never ran comes back to the thread when its run ends, as
+  // its next queued message, ahead of anything queued (it was sent to run before them); a merged
+  // steer's messages come back in the order it carried them. Each command id names its message,
+  // so each comes back once; a message already moved is left.
+  const requeueReturnedSteers = Effect.fnUntraced(function* (threadId: ThreadId, runId: RunId) {
+    const records = yield* projectionStore.getThreadRecords(
+      threadId,
+      ["turnItems", "messages", "runs"],
+      {
+        turnItemTypes: ["user_message"],
+        turnItemRunIds: [runId],
+        messageRunIds: [runId],
+        runIds: [runId],
+      },
+    );
+    const steers = records.turnItems
+      .flatMap((item) =>
+        item.type === "user_message" &&
+        item.returnedToQueue === true &&
+        item.status === "cancelled" &&
+        item.runId === runId
+          ? [item]
+          : [],
+      )
+      .toSorted((left, right) => left.ordinal - right.ordinal)
+      .flatMap((item) => {
+        const message = records.messages.find(
+          (candidate) => candidate.id === item.messageId && candidate.runId === runId,
+        );
+        return message === undefined ? [] : [message];
+      });
+    if (steers.length === 0) return;
+    const ended = records.runs.find((run) => run.id === runId);
+    // Each dispatch places its message ahead of the queue by itself (steerFollowUpAhead), so no
+    // later step is owed if the server stops between them. The generic dispatch's "start the
+    // queue first" is skipped for these.
+    for (const message of steers) {
+      // Notifications must be queued messages.
+      const queuedOnly =
+        message.delegatedCompletion !== undefined || message.notification !== undefined;
+      yield* dispatchWithReceipt({
+        type: "message.dispatch",
+        // Per run and message: a message steered again and returned by a later run comes back too.
+        commandId: CommandId.make(`${STEER_RETURNED_COMMAND_PREFIX}${runId}:${message.id}`),
+        threadId,
+        messageId: message.id,
+        text: message.text,
+        ...(message.context ? { context: message.context } : {}),
+        attachments: message.attachments,
+        steerFollowUpOfRunId: runId,
+        steerFollowUpAhead: true,
+        ...(message.delegatedCompletion !== undefined && ended !== undefined
+          ? { modelSelection: ended.modelSelection }
+          : {}),
+        dispatchMode: { type: queuedOnly ? "queue_after_active" : "start_immediately" },
+        createdBy: message.createdBy,
+        creationSource: message.creationSource,
+        ...(message.delegatedCompletion === undefined
+          ? {}
+          : { delegatedCompletion: message.delegatedCompletion }),
+        ...(message.notification === undefined ? {} : { notification: message.notification }),
+        ...(message.scheduledTaskId === undefined
+          ? {}
+          : { scheduledTaskId: message.scheduledTaskId }),
+        ...(message.senderThreadId === undefined ? {} : { senderThreadId: message.senderThreadId }),
+        ...(message.linkedSender === undefined ? {} : { linkedSender: message.linkedSender }),
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to queue a returned steer again", {
+            threadId,
+            runId,
+            messageId: message.id,
+            cause,
+          }),
+        ),
+      );
+    }
+  });
+
+  // A returned steer whose run ended before the server queued it again (a stop in between) is
+  // queued at startup, however long the server was down.
+  const recoverReturnedSteers = Effect.gen(function* () {
+    const runs = yield* projectionStore.getReturnedSteerRuns();
+    yield* Effect.forEach(runs, ({ threadId, runId }) => requeueReturnedSteers(threadId, runId), {
+      discard: true,
+    });
+  }).pipe(
+    Effect.catchCause((cause) => Effect.logWarning("Failed to recover returned steers", { cause })),
+  );
+
   // A child's questions to its parent, which a stopped result run leaves open.
   const pendingTaskQuestions = (childThreadId: ThreadId) =>
     projectionStore
@@ -17291,9 +17426,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
     // The run-end release can lag behind a new send; start the queue first so the send waits behind it.
     // A restart continuation resumes the ended run, so it must not be overtaken by the queue.
+    // A returned steer goes ahead of the queue, so the queue does not start first.
     if (
       command.type === "message.dispatch" &&
       command.restartContinuationOfRunId === undefined &&
+      !command.commandId.startsWith(STEER_RETURNED_COMMAND_PREFIX) &&
       (command.dispatchMode.type === "start_immediately" ||
         command.dispatchMode.type === "queue_after_active" ||
         command.dispatchMode.type === "defer_start")
@@ -17821,6 +17958,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         if (run.status === "failed") {
           yield* retryUndeliveredNotice(threadId, run.id);
         }
+        // Before the queue starts: a steer the provider never ran is its next message.
+        if (reaction === "full")
+          yield* requeueReturnedSteers(threadId, run.id).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Failed to queue a returned steer again", {
+                threadId,
+                runId: run.id,
+                cause,
+              }),
+            ),
+          );
         // A settle (a cohort rewrite, or a queued run cancelled before it ran) ended no work.
         if (reaction === "full")
           yield* threadDispatch
@@ -18336,6 +18484,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   );
 
   const recoverDelegatedTasks = Effect.gen(function* () {
+    yield* recoverReturnedSteers;
     yield* projectionStore.getRecoveryThreadIds("subagent-results").pipe(
       Effect.tap((threadIds) =>
         Effect.annotateCurrentSpan("recovery.subagentResultThreads", threadIds.length),

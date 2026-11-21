@@ -752,13 +752,14 @@ function normalizeForWorktreeMatch(value: string, caseFold: boolean): string {
 
 function isT3ManagedWorktree(
   candidatePath: string,
-  worktreesDir: string,
+  worktreesDirs: ReadonlyArray<string>,
   caseFold: boolean,
 ): boolean {
   const normalized = normalizeForWorktreeMatch(candidatePath, caseFold);
   return (
-    normalized.startsWith(normalizeForWorktreeMatch(worktreesDir, caseFold)) ||
-    normalized.includes("/.t3/worktrees/")
+    worktreesDirs.some((worktreesDir) =>
+      normalized.startsWith(normalizeForWorktreeMatch(worktreesDir, caseFold)),
+    ) || normalized.includes("/.t3/worktrees/")
   );
 }
 
@@ -847,8 +848,24 @@ export const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const projectStore = yield* ProjectStore.ProjectStoreV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-  const baseDir = path.resolve(serverConfig.baseDir);
-  const worktreesDir = path.resolve(serverConfig.worktreesDir);
+  // A path as given and resolved: macOS reaches /var and /tmp through /private, so a session reports
+  // the resolved form of a directory the server was configured with through the link. A missing
+  // tail keeps its resolved parent.
+  const resolvedPath = (target: string): Effect.Effect<string> =>
+    fileSystem.realPath(target).pipe(
+      Effect.catch(() => {
+        const parent = path.dirname(target);
+        return parent === target
+          ? Effect.succeed(target)
+          : resolvedPath(parent).pipe(Effect.map((real) => path.join(real, path.basename(target))));
+      }),
+    );
+  const bothForms = (target: string) =>
+    resolvedPath(target).pipe(
+      Effect.map((real): ReadonlyArray<string> => (real === target ? [target] : [target, real])),
+    );
+  const baseDirs = yield* bothForms(path.resolve(serverConfig.baseDir));
+  const worktreesDirs = yield* bothForms(path.resolve(serverConfig.worktreesDir));
   const platform = yield* HostProcess.Platform;
   const isWindows = platform === "win32";
   const foldWorktreeCase = isWindows;
@@ -856,14 +873,16 @@ export const make = Effect.gen(function* () {
   const homeDir = yield* HostProcess.HomeDirectory;
   // `/private/tmp` is what macOS reports for sessions started in `/tmp`.
   const excludedProjectRoots = new Set(
-    [homeDir, NodeOS.tmpdir(), "/tmp", "/private/tmp"].map((directory) =>
-      normalizeProjectPathForComparison(path.resolve(directory)),
-    ),
+    (yield* Effect.forEach([homeDir, NodeOS.tmpdir(), "/tmp", "/private/tmp"], (directory) =>
+      bothForms(path.resolve(directory)),
+    ))
+      .flat()
+      .map((directory) => normalizeProjectPathForComparison(directory)),
   );
-  const excludedProjectAncestors = [
-    path.join(homeDir, "Downloads"),
-    path.join(homeDir, "Documents", "Codex"),
-  ];
+  const excludedProjectAncestors = (yield* Effect.forEach(
+    [path.join(homeDir, "Downloads"), path.join(homeDir, "Documents", "Codex")],
+    bothForms,
+  )).flat();
 
   const isExcludedProjectPath = (candidatePath: string) =>
     excludedProjectRoots.has(normalizeProjectPathForComparison(candidatePath)) ||
@@ -872,10 +891,12 @@ export const make = Effect.gen(function* () {
         normalizeForWorktreeMatch(ancestor, foldWorktreeCase),
       ),
     ) ||
-    normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
-      normalizeForWorktreeMatch(baseDir, foldWorktreeCase),
+    baseDirs.some((baseDir) =>
+      normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
+        normalizeForWorktreeMatch(baseDir, foldWorktreeCase),
+      ),
     ) ||
-    isT3ManagedWorktree(candidatePath, worktreesDir, foldWorktreeCase);
+    isT3ManagedWorktree(candidatePath, worktreesDirs, foldWorktreeCase);
 
   const listDirectory = (directory: string) =>
     fileSystem.readDirectory(directory).pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));

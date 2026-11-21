@@ -681,9 +681,12 @@ export const layer: Layer.Layer<
                 threadId: input.event.threadId,
                 itemId: idAllocator.derive.userTurnItem({ messageId: input.event.messageId }),
               });
+              // A steer the provider never ran is cancelled and marked for the thread to queue again.
+              const returned = input.event.status === "returned";
+              const status = returned ? "cancelled" : input.event.status;
               if (
                 item?.type !== "user_message" ||
-                item.status === input.event.status ||
+                (item.status === status && (!returned || item.returnedToQueue === true)) ||
                 (item.status !== "pending" && item.status !== "completed")
               ) {
                 return [];
@@ -695,8 +698,9 @@ export const layer: Layer.Layer<
                   threadId: item.threadId,
                   payload: {
                     ...item,
-                    status: input.event.status,
-                    completedAt: input.event.status === "pending" ? null : occurredAt,
+                    status,
+                    ...(returned ? { returnedToQueue: true as const } : {}),
+                    completedAt: status === "pending" ? null : occurredAt,
                     updatedAt: occurredAt,
                   },
                   runId: item.runId,

@@ -2610,12 +2610,13 @@ it.effect("keeps every run's completed_at column equal to its payload's complete
       fs.readdirSync(path.join(import.meta.dirname, ".."), { recursive: true }) as string[]
     )
       .filter((file) => file.endsWith(".ts") && !file.includes(".test."))
+      // Read by the native path, labelled with `/` on every platform.
       .flatMap((file) =>
         [
           ...fs
             .readFileSync(path.join(import.meta.dirname, "..", file), "utf8")
             .matchAll(/(INSERT INTO|UPDATE|REPLACE INTO) orchestration_v2_projection_runs\b/g),
-        ].map((match) => `${file}: ${match[1]}`),
+        ].map((match) => `${file.split(path.sep).join("/")}: ${match[1]}`),
       )
       .toSorted();
     assert.deepEqual(writers, [

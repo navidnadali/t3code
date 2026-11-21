@@ -172,7 +172,8 @@ Three independent gates, on every value of every table:
   nested JSON, the search index's shadow tables included; keyword, env-var and name=value high-entropy
   assignments, extra token forms, PEM markers, base64 body lines and arrays of them (`extendedHits`, by
   `table:scope|kind`). On a real source copy the port and the Python script gave the same count in every row before that rule was
-  generalised; the generalised rule finds what the named one found wherever the body mixes upper and lower case.
+  generalised; the generalised rule finds what the named one found: wherever the body mixes upper and lower case,
+  and with a body of one case after a known issuer's prefix (listed by its SHA-256, so it is not named).
 - Raw file bytes: the token patterns find nothing (free pages and indexes included, escapes read as spaces;
   the short-prefixed rule is left to the decoded passes, which read every value of this `VACUUM INTO` copy, as a
   raw record runs an id into the next field), and

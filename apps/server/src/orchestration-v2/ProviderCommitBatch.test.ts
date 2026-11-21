@@ -53,7 +53,7 @@ const recordBatches = Effect.fn("test.recordProviderBatches")(function* (
 ) {
   const output = yield* Queue.unbounded<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>>();
   let current: ProviderAdapter.ProviderAdapterV2Event[] = [];
-  const coordinator = yield* ProviderCommitBatch.make(
+  const commitBatch = yield* ProviderCommitBatch.make(
     (work) =>
       Effect.gen(function* () {
         yield* beforeCommit;
@@ -69,7 +69,7 @@ const recordBatches = Effect.fn("test.recordProviderBatches")(function* (
       : Effect.sync(() => {
           current.push(raw);
         });
-  return { ...coordinator, process, output };
+  return { ...commitBatch, process, output };
 });
 
 it.effect("publishes preceding snapshots before a control", () =>
@@ -159,8 +159,8 @@ it.effect("bounds transactions by count and bytes, including the final partial g
 it.effect("keeps updates immediate and ordered when batching is disabled", () =>
   Effect.gen(function* () {
     const seen: ProviderAdapter.ProviderAdapterV2Event[] = [];
-    const coordinator = yield* ProviderCommitBatch.make(() => Effect.die("must not batch"), false);
-    yield* coordinator.consume(
+    const commitBatch = yield* ProviderCommitBatch.make(() => Effect.die("must not batch"), false);
+    yield* commitBatch.consume(
       Stream.make(event(1), control, event(2)),
       (raw) =>
         Effect.sync(() => {
@@ -180,14 +180,14 @@ it.effect.each([
   "shares bounded transactions across $streams streams with $updates updates each",
   ({ streams, updates }) =>
     Effect.gen(function* () {
-      const coordinator = yield* recordBatches();
+      const commitBatch = yield* recordBatches();
       const inputs = yield* Effect.forEach(Array.from({ length: streams }), () =>
         Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>(),
       );
       const pulled = yield* Deferred.make<void>();
       let arrivals = 0;
       const consumers = yield* Effect.forEach(inputs, (input) =>
-        coordinator
+        commitBatch
           .consume(
             Stream.fromQueue(input).pipe(
               Stream.tap(() => {
@@ -197,7 +197,7 @@ it.effect.each([
                   : Effect.void;
               }),
             ),
-            coordinator.process,
+            commitBatch.process,
             Effect.succeed(true),
           )
           .pipe(Effect.forkScoped({ startImmediately: true })),
@@ -209,11 +209,11 @@ it.effect.each([
       yield* Deferred.await(pulled);
       yield* TestClock.adjust(0);
 
-      yield* coordinator.barrier(Effect.void);
+      yield* commitBatch.barrier(Effect.void);
       const batches: Array<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>> = [];
       let count = 0;
       while (count < streams * updates) {
-        const batch = yield* Queue.take(coordinator.output);
+        const batch = yield* Queue.take(commitBatch.output);
         batches.push(batch);
         count += batch.length;
       }
@@ -238,8 +238,8 @@ it.effect("does not hold the shared worker while one consumer checks background 
   Effect.gen(function* () {
     const checking = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
-    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
-    const consumer = yield* coordinator
+    const commitBatch = yield* ProviderCommitBatch.make((work) => work, true);
+    const consumer = yield* commitBatch
       .consume(
         Stream.make(control),
         () => Effect.void,
@@ -251,7 +251,7 @@ it.effect("does not hold the shared worker while one consumer checks background 
       .pipe(Effect.forkScoped({ startImmediately: true }));
     yield* Deferred.await(checking);
     assert.equal(
-      yield* coordinator.barrier(Effect.succeed("another run can commit")),
+      yield* commitBatch.barrier(Effect.succeed("another run can commit")),
       "another run can commit",
     );
     yield* Deferred.succeed(release, undefined);
@@ -263,8 +263,8 @@ it.effect("runs a control without queueing behind another consumer's commit", ()
   Effect.gen(function* () {
     const committing = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
-    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
-    const busy = yield* coordinator
+    const commitBatch = yield* ProviderCommitBatch.make((work) => work, true);
+    const busy = yield* commitBatch
       .consume(
         Stream.make(event(1)),
         () => Deferred.succeed(committing, undefined).pipe(Effect.andThen(Deferred.await(release))),
@@ -274,7 +274,7 @@ it.effect("runs a control without queueing behind another consumer's commit", ()
     yield* Deferred.await(committing);
     // A run's turn ends with controls in a row; each waited a full queue pass that wrote nothing.
     const handled = yield* Deferred.make<void>();
-    const consumer = yield* coordinator
+    const consumer = yield* commitBatch
       .consume(
         Stream.make(control),
         () => Deferred.succeed(handled, undefined),
@@ -293,7 +293,7 @@ it.effect.each(["job", "commit"] as const)(
   "isolates a %s failure at its transaction boundary",
   (mode) =>
     Effect.gen(function* () {
-      const coordinator = yield* ProviderCommitBatch.make(
+      const commitBatch = yield* ProviderCommitBatch.make(
         (work) =>
           mode === "commit"
             ? work.pipe(
@@ -308,7 +308,7 @@ it.effect.each(["job", "commit"] as const)(
         Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>(),
       );
       const consumers = yield* Effect.forEach(inputs, (input, index) =>
-        coordinator
+        commitBatch
           .consume(
             Stream.fromQueue(input),
             () => (mode === "job" && index === 1 ? Effect.fail("invalid update") : Effect.void),
@@ -318,7 +318,7 @@ it.effect.each(["job", "commit"] as const)(
       );
       for (const input of inputs) yield* Queue.offer(input, event(0));
       yield* TestClock.adjust(0);
-      yield* coordinator.barrier(Effect.void);
+      yield* commitBatch.barrier(Effect.void);
       assert.isTrue(Exit.isFailure(yield* Fiber.join(consumers[1]!)));
       if (mode === "commit") assert.isTrue(Exit.isFailure(yield* Fiber.join(consumers[0]!)));
       else {
@@ -326,9 +326,9 @@ it.effect.each(["job", "commit"] as const)(
         yield* Queue.offer(inputs[0]!, control);
         assert.isTrue(Exit.isSuccess(yield* Fiber.join(consumers[0]!)));
       }
-      assert.equal(yield* coordinator.barrier(Effect.succeed("recovered")), "recovered");
+      assert.equal(yield* commitBatch.barrier(Effect.succeed("recovered")), "recovered");
       assert.deepEqual(
-        yield* coordinator.barrier(Effect.fail("original error")).pipe(Effect.exit),
+        yield* commitBatch.barrier(Effect.fail("original error")).pipe(Effect.exit),
         Exit.fail("original error"),
       );
     }),
@@ -337,11 +337,11 @@ it.effect.each(["job", "commit"] as const)(
 it.effect("keeps a transaction failure when rolling back one failed snapshot", () =>
   Effect.gen(function* () {
     const transactionError = new ProviderCommitBatch.CommitBatchError({ cause: "ROLLBACK failed" });
-    const coordinator = yield* ProviderCommitBatch.make(
+    const commitBatch = yield* ProviderCommitBatch.make(
       (work) => work.pipe(Effect.mapError(() => transactionError)),
       true,
     );
-    const exit = yield* coordinator
+    const exit = yield* commitBatch
       .consume(
         Stream.concat(Stream.make(event(1)), Stream.never),
         () => Effect.fail("invalid snapshot"),
@@ -357,7 +357,7 @@ it.effect(
   "allows a command holding the thread lock to commit while a provider control waits for it",
   () =>
     Effect.gen(function* () {
-      const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+      const commitBatch = yield* ProviderCommitBatch.make((work) => work, true);
       const locks = yield* KeyedLock.make<ThreadId>();
       const threadId = ThreadId.make("locked-thread");
       const held = yield* Deferred.make<void>();
@@ -368,12 +368,12 @@ it.effect(
           threadId,
           Deferred.succeed(held, undefined).pipe(
             Effect.andThen(Deferred.await(waiting)),
-            Effect.andThen(coordinator.barrier(Deferred.succeed(committed, undefined))),
+            Effect.andThen(commitBatch.barrier(Deferred.succeed(committed, undefined))),
           ),
         )
         .pipe(Effect.forkScoped({ startImmediately: true }));
       yield* Deferred.await(held);
-      const consumer = yield* coordinator
+      const consumer = yield* commitBatch
         .consume(
           Stream.make(control),
           () =>
@@ -444,12 +444,12 @@ it.effect.each(["failure", "stop"] as const)(
   (mode) =>
     Effect.gen(function* () {
       const seen: ProviderAdapter.ProviderAdapterV2Event[] = [];
-      const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+      const commitBatch = yield* ProviderCommitBatch.make((work) => work, true);
       const source =
         mode === "failure"
           ? Stream.concat(Stream.make(event(1), event(2)), Stream.fail("provider failed"))
           : Stream.make(event(1), control, event(2));
-      const exit = yield* coordinator
+      const exit = yield* commitBatch
         .consume(
           source,
           (raw) =>
@@ -462,7 +462,7 @@ it.effect.each(["failure", "stop"] as const)(
       assert.deepEqual(seen, mode === "failure" ? [event(1), event(2)] : [event(1), control]);
       assert.equal(Exit.isFailure(exit), mode === "failure");
       assert.equal(
-        yield* coordinator.barrier(Effect.succeed("still available")),
+        yield* commitBatch.barrier(Effect.succeed("still available")),
         "still available",
       );
     }),
@@ -472,34 +472,34 @@ it.effect("does not force a separate commit for every consumer that ends", () =>
   Effect.gen(function* () {
     const pulled = yield* Deferred.make<void>();
     let arrivals = 0;
-    const coordinator = yield* recordBatches();
+    const commitBatch = yield* recordBatches();
     for (let index = 0; index < 10; index++) {
-      yield* coordinator
+      yield* commitBatch
         .consume(
           Stream.make(event(index)).pipe(
             Stream.tap(() =>
               ++arrivals === 10 ? Deferred.succeed(pulled, undefined) : Effect.void,
             ),
           ),
-          coordinator.process,
+          commitBatch.process,
           Effect.succeed(false),
         )
         .pipe(Effect.forkScoped({ startImmediately: true }));
     }
     yield* Deferred.await(pulled);
     yield* TestClock.adjust(0);
-    yield* coordinator.barrier(Effect.void);
+    yield* commitBatch.barrier(Effect.void);
     assert.deepEqual(
-      (yield* Queue.takeAll(coordinator.output)).map((batch) => batch.length),
+      (yield* Queue.takeAll(commitBatch.output)).map((batch) => batch.length),
       [10],
     );
   }),
 );
 
-it.effect("settles calls made after the coordinator's scope closes", () =>
+it.effect("settles calls made after the commit batch's scope closes", () =>
   Effect.gen(function* () {
-    const coordinator = yield* ProviderCommitBatch.make((work) => work, true).pipe(Effect.scoped);
-    const exit = yield* coordinator
+    const commitBatch = yield* ProviderCommitBatch.make((work) => work, true).pipe(Effect.scoped);
+    const exit = yield* commitBatch
       .barrier(Effect.die("must not execute after shutdown"))
       .pipe(Effect.exit);
     assert.isTrue(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause));
@@ -512,7 +512,7 @@ it.effect("reports each job's wait before its flush, the job flushing and the de
     const committing = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
     let commits = 0;
-    const coordinator = yield* ProviderCommitBatch.make(
+    const commitBatch = yield* ProviderCommitBatch.make(
       (work) =>
         commits++ === 0
           ? Deferred.succeed(committing, undefined).pipe(
@@ -523,12 +523,12 @@ it.effect("reports each job's wait before its flush, the job flushing and the de
       true,
     );
     const input = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
-    yield* coordinator
+    yield* commitBatch
       .consume(Stream.fromQueue(input), () => Effect.void, Effect.succeed(false))
       .pipe(Effect.withSpan("Probe.consume"), Effect.forkScoped);
     yield* Queue.offer(input, event(1));
     yield* Deferred.await(committing);
-    const command = yield* coordinator
+    const command = yield* commitBatch
       .barrier(Effect.void)
       .pipe(Effect.withSpan("Probe.command"), Effect.forkScoped);
     yield* Effect.yieldNow;
@@ -537,7 +537,7 @@ it.effect("reports each job's wait before its flush, the job flushing and the de
     yield* Deferred.succeed(release, undefined);
     yield* Fiber.join(command);
     // With nothing queued, a barrier commits at once.
-    yield* coordinator.barrier(Effect.void);
+    yield* commitBatch.barrier(Effect.void);
 
     assert.deepEqual(
       reports("depth").filter(([site]) => site === "ProviderCommitBatch.queue"),
@@ -568,7 +568,7 @@ it.effect(
       const committing = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
       let commits = 0;
-      const coordinator = yield* ProviderCommitBatch.make(
+      const commitBatch = yield* ProviderCommitBatch.make(
         (work) =>
           commits++ === 0
             ? Deferred.succeed(committing, undefined).pipe(
@@ -588,7 +588,7 @@ it.effect(
       const lifecycle: ProviderAdapter.ProviderAdapterV2Event = { ...control };
       const input = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
       const done = yield* Deferred.make<void>();
-      yield* coordinator
+      yield* commitBatch
         .consume(
           Stream.fromQueue(input),
           (raw) =>
@@ -634,10 +634,10 @@ it.effect(
 it.effect("reports ingest lag with batching off too", () => {
   const { observer, reports } = recordingWaitObserver();
   return Effect.gen(function* () {
-    const coordinator = yield* ProviderCommitBatch.make((work) => work, false);
+    const commitBatch = yield* ProviderCommitBatch.make((work) => work, false);
     const raw = event(1);
     IngestLag.markArrival(raw, yield* Clock.monotonicTimeNanos);
-    yield* coordinator.consume(
+    yield* commitBatch.consume(
       Stream.make(raw),
       () => IngestLag.markPersisted.pipe(Effect.andThen(TestClock.adjust("1 second"))),
       Effect.succeed(true),
@@ -652,13 +652,13 @@ it.effect("reports ingest lag with batching off too", () => {
 it.effect("reports ingest lag only from a consumer that persisted the event", () => {
   const { observer, reports } = recordingWaitObserver();
   return Effect.gen(function* () {
-    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const commitBatch = yield* ProviderCommitBatch.make((work) => work, true);
     const shared = event(1);
     IngestLag.markArrival(shared, yield* Clock.monotonicTimeNanos);
     // A shared session hands the event to every run; only its owner writes it.
-    yield* coordinator.consume(Stream.make(shared), () => Effect.void, Effect.succeed(true));
+    yield* commitBatch.consume(Stream.make(shared), () => Effect.void, Effect.succeed(true));
     yield* TestClock.adjust("2 seconds");
-    yield* coordinator.consume(
+    yield* commitBatch.consume(
       Stream.make(shared),
       () => IngestLag.markPersisted,
       Effect.succeed(true),
@@ -672,7 +672,7 @@ it.effect("reports ingest lag only from a consumer that persisted the event", ()
 
 it.effect("lends a caller's slot out only while its write waits on the lane", () =>
   Effect.gen(function* () {
-    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const commitBatch = yield* ProviderCommitBatch.make((work) => work, true);
     const steps: Array<string> = [];
     // Lent on the fiber that writes, as the effect worker does for its execution's own fiber.
     const withLaneWait = <A, E>(effect: Effect.Effect<A, E>) =>
@@ -684,7 +684,7 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
         }),
       );
     // An idle lane runs the write at once: nothing to lend.
-    yield* withLaneWait(coordinator.barrier(Effect.sync(() => steps.push("write"))));
+    yield* withLaneWait(commitBatch.barrier(Effect.sync(() => steps.push("write"))));
     assert.deepEqual(steps, ["write"]);
     steps.length = 0;
 
@@ -692,7 +692,7 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
     // failed or an interrupted one (its effect's end then gives it back).
     const held = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
-    yield* coordinator
+    yield* commitBatch
       .consume(
         Stream.make({ type: "node.updated" }),
         () => Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
@@ -701,13 +701,13 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
       .pipe(Effect.forkChild);
     yield* Deferred.await(held);
     const queued = yield* withLaneWait(
-      coordinator.barrier(Effect.sync(() => steps.push("write"))),
+      commitBatch.barrier(Effect.sync(() => steps.push("write"))),
     ).pipe(Effect.forkChild);
-    const failing = yield* withLaneWait(coordinator.barrier(Effect.fail("write failed"))).pipe(
+    const failing = yield* withLaneWait(commitBatch.barrier(Effect.fail("write failed"))).pipe(
       Effect.exit,
       Effect.forkChild,
     );
-    const interrupted = yield* withLaneWait(coordinator.barrier(Effect.void)).pipe(
+    const interrupted = yield* withLaneWait(commitBatch.barrier(Effect.void)).pipe(
       Effect.forkChild,
     );
     yield* Effect.yieldNow;
@@ -729,7 +729,7 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
     steps.length = 0;
     const forkedHeld = yield* Deferred.make<void>();
     const forkedRelease = yield* Deferred.make<void>();
-    yield* coordinator
+    yield* commitBatch
       .consume(
         Stream.make({ type: "node.updated" }),
         () =>
@@ -741,7 +741,7 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
       .pipe(Effect.forkChild);
     yield* Deferred.await(forkedHeld);
     const forked = yield* withLaneWait(
-      coordinator.barrier(Effect.sync(() => steps.push("write"))).pipe(Effect.forkChild),
+      commitBatch.barrier(Effect.sync(() => steps.push("write"))).pipe(Effect.forkChild),
     );
     yield* Effect.yieldNow;
     yield* Deferred.succeed(forkedRelease, undefined);
@@ -752,11 +752,11 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
 
 it.effect("lends a caller's slot while its write waits for room in the lane's queue", () =>
   Effect.gen(function* () {
-    const coordinator = yield* ProviderCommitBatch.make((work) => work, true);
+    const commitBatch = yield* ProviderCommitBatch.make((work) => work, true);
     const steps: Array<string> = [];
     const held = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
-    yield* coordinator
+    yield* commitBatch
       .consume(
         Stream.make({ type: "node.updated" }),
         () => Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
@@ -766,11 +766,11 @@ it.effect("lends a caller's slot while its write waits for room in the lane's qu
     yield* Deferred.await(held);
     // Other writers fill the lane's queue behind the held batch.
     for (let writer = 0; writer < 64; writer++)
-      yield* coordinator.barrier(Effect.void).pipe(Effect.forkChild);
+      yield* commitBatch.barrier(Effect.void).pipe(Effect.forkChild);
     yield* Effect.yieldNow;
     const waiting = yield* Effect.withFiber((fiber) =>
       Effect.provideService(
-        coordinator.barrier(Effect.sync(() => steps.push("write"))),
+        commitBatch.barrier(Effect.sync(() => steps.push("write"))),
         ProviderCommitBatch.CurrentLaneWait,
         {
           owner: fiber.id,

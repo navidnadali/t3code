@@ -289,6 +289,7 @@ it.effect(
           isNodeStored: () => Effect.die("not used"),
           canStartQueuedRun: () => Effect.die("not used"),
           getHeldQueuedRuns: () => Effect.die("not used"),
+          getReturnedSteerRuns: () => Effect.die("not used"),
           getIdleQueuedThreads: () => Effect.die("not used"),
           getPullRequestWakesToRetry: () => Effect.die("not used"),
           getRecoveryThreadIds: () => Effect.die("unused getRecoveryThreadIds"),

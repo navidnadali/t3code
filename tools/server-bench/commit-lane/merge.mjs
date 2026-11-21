@@ -68,7 +68,12 @@ log(
   `schema: ${tables.length} tables (${virtual.length} virtual), ${schema.filter((r) => r.type === "index").length} indexes, ${schema.filter((r) => r.type === "trigger").length} triggers`,
 );
 
-const derived = new Set(["orchestration_v2_projection_turn_item_counts", ...virtual]);
+// Filled by the destination's triggers as runs and items are copied.
+const derived = new Set([
+  "orchestration_v2_projection_turn_item_counts",
+  "t3_perf_thread_item_totals",
+  ...virtual,
+]);
 const fromShardZero = new Set([
   "effect_sql_migrations",
   "t3_perf_fork_migrations",

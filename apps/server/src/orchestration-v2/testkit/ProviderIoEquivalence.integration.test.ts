@@ -638,8 +638,9 @@ const claudeWireHarness = (services: Layer.Layer<ProviderIoServices>, input: Rep
     } satisfies OrchestratorV2ProviderReplayHarness<ProviderReplayTranscript, never>;
   }).pipe(Effect.orDie);
 
-// The fake CLI does not play wake turns, permission prompts or a turn cut off mid-tool, so the
-// fixtures that need them hang or diverge between runs (tools/server-bench/fake-claude/README.md).
+// The fake CLI plays no wake turns, permission prompts, turn cut mid-tool or steer queued behind a
+// turn (message_steering's "next" steer races its first turn's end), so those fixtures hang or
+// diverge here (tools/server-bench/fake-claude/README.md); the replay suites cover message_steering.
 const CLAUDE_WIRE_FIXTURES = new Set([
   "claude_idle_resume",
   "claude_local_bash_task",
@@ -647,7 +648,6 @@ const CLAUDE_WIRE_FIXTURES = new Set([
   "claude_nested_subagent_model",
   "claude_result_is_error",
   "command_output_streaming",
-  "message_steering",
   "multi_turn",
   "multi_turn_restart",
   "queued_turn",

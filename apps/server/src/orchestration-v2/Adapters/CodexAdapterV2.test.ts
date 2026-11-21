@@ -1973,6 +1973,133 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  // Codex takes a steer as native turn/steer input: the running command is not interrupted.
+  it.effect("a steer while a command runs is sent as turn/steer, never an interrupt", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "steer-keeps-command-thread";
+      const nativeTurnId = "steer-keeps-command";
+      const methods: Array<string> = [];
+      const command = (status: "inProgress" | "completed") => ({
+        type: "commandExecution",
+        id: "long-build",
+        command: "make",
+        cwd: "/workspace",
+        processId: "7",
+        source: "unifiedExecStartup",
+        status,
+        commandActions: [{ type: "unknown", command: "make" }],
+        aggregatedOutput: status === "completed" ? "built\n" : null,
+        exitCode: status === "completed" ? 0 : null,
+        durationMs: status === "completed" ? 10 : null,
+      });
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "steer-keeps-command",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "work" }),
+            {
+              type: "emit_inbound",
+              label: "command-started",
+              frame: {
+                method: "item/started",
+                params: {
+                  threadId: nativeThreadId,
+                  turnId: nativeTurnId,
+                  startedAtMs: 1782622441000,
+                  item: command("inProgress"),
+                },
+              },
+            },
+            {
+              type: "expect_outbound",
+              frame: {
+                id: 4,
+                method: "turn/steer",
+                params: {
+                  threadId: nativeThreadId,
+                  expectedTurnId: nativeTurnId,
+                  input: [{ type: "text", text: "follow up" }],
+                },
+              },
+            },
+            { type: "emit_inbound", frame: { id: 4, result: { turnId: nativeTurnId } } },
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "item/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turnId: nativeTurnId,
+                  completedAtMs: 1782622441010,
+                  item: command("completed"),
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        }),
+        () => Effect.void,
+        (method) =>
+          Effect.sync(() => {
+            methods.push(method);
+          }),
+      );
+      const input = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("steer-keeps-command"),
+        text: "work",
+      });
+      yield* harness.runtime.startTurn(input);
+      const commandItems = () =>
+        harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.nativeItemRef?.nativeId === "long-build"
+            ? [event.turnItem]
+            : [],
+        );
+      yield* harness.until(() => commandItems().length > 0);
+      yield* harness.runtime.steerTurn({
+        threadId: harness.threadId,
+        runId: input.runId,
+        providerThread: harness.providerThread,
+        providerTurnId: (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          nativeTurnId,
+        }),
+        message: { ...input.message, text: "follow up" },
+      });
+      yield* harness.firstTerminal;
+      assert.equal(methods.filter((method) => method === "turn/steer").length, 1);
+      assert.notInclude(methods, "turn/interrupt");
+      assert.equal(commandItems().at(-1)?.status, "completed");
+      assert.deepEqual(
+        harness.terminalEvents().map((event) => event.status),
+        ["completed"],
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
   it.effect.each([
     { runtimeMode: "full-access", turnIdKind: "present" },
     { runtimeMode: "auto-accept-edits", turnIdKind: "null" },

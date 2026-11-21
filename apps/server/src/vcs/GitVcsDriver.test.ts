@@ -2496,6 +2496,23 @@ it.effect("git metrics finalize cancellation without exposing arbitrary operatio
   ),
 );
 
+// Apple Git's batch fsync breaks the checkpoint's large-file staging into its private object store,
+// so macOS keeps per-object fsync. Checked by platform here; GitVcsDriver's bulk staging rows show it
+// live on a Mac.
+it.each([
+  { platform: "darwin", batch: false },
+  { platform: "linux", batch: false },
+  { platform: "win32", batch: true },
+])(
+  "a $platform checkpoint flushes objects and refs; batch fsync: $batch",
+  ({ platform, batch }) => {
+    const config = GitVcsDriver.checkpointDurableWriteConfig(platform);
+    assert.include(config, "core.fsync=objects,reference");
+    assert.include(config, "core.fsyncMethod=fsync");
+    assert.equal(config.includes("core.fsyncMethod=batch"), batch);
+  },
+);
+
 it.effect("git metrics count fsync fallback and transient retry subprocesses separately", () =>
   Effect.gen(function* () {
     const retryReady = yield* Deferred.make<void>();

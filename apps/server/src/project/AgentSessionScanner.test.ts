@@ -1327,6 +1327,34 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    // A Mac reaches its code trees through /var -> /private/var: the server is configured with the link,
+    // while a session reports the resolved path. Its own sandboxes must still be excluded.
+    it.effect("excludes sandboxes when the server's base dir is configured through a symlink", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const realBase = yield* fileSystem.realPath(
+          yield* makeTempDir("t3code-scanner-real-base-"),
+        );
+        const linkParent = yield* makeTempDir("t3code-scanner-base-link-");
+        const configBaseDir = path.join(linkParent, "base");
+        yield* fileSystem.symlink(realBase, configBaseDir);
+        const sandbox = path.join(realBase, "worktrees", "t3code", "wt-4");
+        yield* fileSystem.makeDirectory(sandbox, { recursive: true });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-slug", "a.jsonl"),
+          contents: claudeSessionLine(sandbox),
+          mtimeMs: Date.parse("2026-01-01T00:00:00.000Z"),
+        });
+
+        const result = yield* runScan({ claudeHomePath, codexHomePath, configBaseDir });
+
+        expect(result.candidates).toEqual([]);
+      }),
+    );
+
     it.effect("finds the cwd on a later line when the first records carry none", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

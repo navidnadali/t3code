@@ -486,6 +486,7 @@ export const layer: Layer.Layer<
               runId: run.id,
               providerThread: loaded.providerThread,
               providerTurnId: loaded.providerTurn.id,
+              ...(mergedIds.length === 0 ? {} : { mergedMessageIds: mergedIds }),
               ...(input.modelSelection === undefined
                 ? {}
                 : { modelSelection: input.modelSelection }),

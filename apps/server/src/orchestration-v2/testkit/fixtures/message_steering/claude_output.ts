@@ -33,6 +33,11 @@ export function assertClaudeMessageSteeringOutput(
     MESSAGE_STEERING_STEER_PROMPT,
   ]);
   assertUserMessageInputIntents(projection, ["turn_start", "steer"]);
+  // Recorded from Claude Code 2.1.330 with the steer at priority "next" and no tool call left in
+  // the turn: Claude reports the steer queued, finishes the first reply, then answers the steer in
+  // a turn of its own. Both replies belong to the one run the steer joined. (The "now" recording,
+  // where Claude aborted the first reply instead, is claude_now_abort_transcript.ndjson.)
+  assertAssistantTextIncludes(projection, "steering fixture initial response");
   assertAssistantTextIncludes(projection, "steering fixture observed");
   assert.equal(projection.runs.length, 1, "steering must attach to the active run");
   assert.equal(

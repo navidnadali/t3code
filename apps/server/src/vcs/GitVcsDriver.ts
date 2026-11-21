@@ -65,6 +65,21 @@ import * as CheckpointUntrackedBlobs from "./checkpointUntrackedBlobs.ts";
 import * as VcsDriver from "./VcsDriver.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 
+/**
+ * A checkpoint's Git configuration: flush objects and refs before publication (fsync set first,
+ * as Git 2.36 ignores an unknown batch). Batch on Windows only: Apple Git's batch breaks staging
+ * large files into the checkpoint's private object store; VcsProcess retries macOS full flushes.
+ */
+export function checkpointDurableWriteConfig(hostPlatform: string): ReadonlyArray<string> {
+  return [
+    "-c",
+    "core.fsync=objects,reference",
+    "-c",
+    "core.fsyncMethod=fsync",
+    ...(hostPlatform === "win32" ? ["-c", "core.fsyncMethod=batch"] : []),
+  ];
+}
+
 export interface ExecuteGitInput {
   readonly operation: string;
   readonly cwd: string;
@@ -1078,19 +1093,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       .map((entry) => path.join(cwd, entry));
   });
 
-  // Git defaults and macOS writeout-only can leave empty refs after crashes; flush before publication.
-  // Set fsync first: Git 2.36 ignores unknown batch without resetting the method.
-  // Batch fully flushes refs and equals fsync on macOS HFS+/APFS and Windows NTFS/ReFS.
-  // Keep per-object fsync elsewhere; VcsProcess retries unsupported macOS full flushes with plain fsync.
-  const durableWrite = [
-    "-c",
-    "core.fsync=objects,reference",
-    "-c",
-    "core.fsyncMethod=fsync",
-    ...(hostPlatform === "darwin" || hostPlatform === "win32"
-      ? ["-c", "core.fsyncMethod=batch"]
-      : []),
-  ] as const;
+  const durableWrite = checkpointDurableWriteConfig(hostPlatform);
 
   // Checkpoints must handle existing paths beyond Windows MAX_PATH, even when
   // core.longpaths is disabled in the user's Git configuration.

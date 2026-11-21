@@ -1707,10 +1707,18 @@ async function recordClaudeActiveSteeringQuery(input: {
   }
 
   const promptQueue = new RecordingPromptQueue();
-  const offerPrompt = (index: number, priority?: SDKUserMessage["priority"]) => {
+  // Prompts carry uuids, as the adapter's do, so Claude reports each one's lifecycle.
+  const offerPrompt = async (index: number, priority?: SDKUserMessage["priority"]) => {
     const message = ClaudeAdapterV2.makeClaudeUserMessage({
       text: input.prompts[index]!,
       ...(priority === undefined ? {} : { priority }),
+      uuid: await Effect.runPromise(
+        SecureRandom.SecureRandom.pipe(
+          Effect.flatMap((random) => random.uuidV4()),
+          Effect.filterOrFail(ClaudeAdapterV2.isClaudePromptUuid),
+          Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+      ),
     });
     input.entries.push({
       type: "expect_outbound",
@@ -1719,9 +1727,10 @@ async function recordClaudeActiveSteeringQuery(input: {
     });
     promptQueue.offer(message);
   };
-  const offerSteeringPrompts = () => {
+  // As the adapter steers: "next" is read with the next tool result; "now" would abort the turn.
+  const offerSteeringPrompts = async () => {
     for (let index = 1; index < input.prompts.length; index += 1) {
-      offerPrompt(index, "now");
+      await offerPrompt(index, "next");
     }
   };
 
@@ -1785,8 +1794,8 @@ async function recordClaudeActiveSteeringQuery(input: {
   });
   const iterator = queryRuntime[Symbol.asyncIterator]();
   try {
-    offerPrompt(0);
-    offerSteeringPrompts();
+    await offerPrompt(0);
+    await offerSteeringPrompts();
     const completed = await recordMessagesUntilTurnResults({
       iterator,
       entries: input.entries,

@@ -15,6 +15,7 @@ import {
   OrchestrationV2DomainEventJson,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
+import { CurrentWaitObserver } from "@t3tools/shared/WaitObserver";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -30,6 +31,10 @@ import * as EventStore from "../../../apps/server/src/orchestration-v2/EventStor
 import * as ProjectionStore from "../../../apps/server/src/orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../../apps/server/src/orchestration-v2/ProjectStore.ts";
 import * as Sqlite from "../../../apps/server/src/persistence/Sqlite.ts";
+import {
+  type LaneItem,
+  makeCommitLatency,
+} from "../../../apps/server/src/orchestration-v2/testkit/CommitLatency.ts";
 
 const args = process.argv.slice(2);
 const take = (name: string, fallback?: string) => {
@@ -256,26 +261,21 @@ const startBallast = () => {
   task();
 };
 const eluSamples: Array<number> = [];
+// Each event's commit latency, kept when it was queued inside the measured window.
+const latency: Array<number> = [];
+const commitLatency = makeCommitLatency((latencyMs) => {
+  if (inWindow(nowMs() - latencyMs)) latency.push(latencyMs);
+});
 
 const run = Effect.gen(function* () {
   const sink = yield* EventSink.EventSinkV2;
-  const queues = tails.map(() =>
-    Queue.unbounded<{ type: string; event: OrchestrationV2DomainEvent; at: number }, Cause.Done>(),
-  );
+  const queues = tails.map(() => Queue.unbounded<LaneItem, Cause.Done>());
   const live = yield* Effect.forEach(queues, (queue) => queue);
-  const latency: Array<number> = [];
   const consumers = yield* Effect.forEach(live, (queue) =>
     sink
       .consumeProviderEvents(
         Stream.fromQueue(queue),
-        ({ event, at }) =>
-          sink.write({ events: [event] }).pipe(
-            Effect.tap(() =>
-              Effect.sync(() => {
-                if (inWindow(at)) latency.push(nowMs() - at);
-              }),
-            ),
-          ),
+        (item) => commitLatency.process(sink, item),
         Effect.succeed(false),
         ({ event }) => Effect.succeed(SNAPSHOT.has(event.type)),
       )
@@ -298,7 +298,9 @@ const run = Effect.gen(function* () {
       const event = tails[thread]!.events[cursors[thread]!] as OrchestrationV2DomainEvent;
       cursors[thread]! += 1;
       if (cursors[thread] === tails[thread]!.events.length) open.splice(slot, 1);
-      yield* Queue.offer(live[thread]!, { type: event.type, event, at: nowMs() });
+      const item = { type: event.type, event };
+      yield* commitLatency.arrived(item);
+      yield* Queue.offer(live[thread]!, item);
       emitted += 1;
     }
     if (nowMs() >= nextElu) {
@@ -349,6 +351,8 @@ const result = await Effect.runPromise(
       ),
     ),
     Effect.scoped,
+    // The commit lane reads its observer once, as the sink is built.
+    Effect.provideService(CurrentWaitObserver, commitLatency.observer),
     Effect.withTracer(tracer),
   ),
 );

@@ -976,6 +976,14 @@ export interface ProjectionStoreV2Shape {
   readonly getHeldQueuedRuns: (
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationV2Run>, ProjectionStoreV2Error>;
+  /**
+   * Ended runs that still hold a steer their provider returned unread (its message is still on
+   * the run): the thread has not queued it again yet.
+   */
+  readonly getReturnedSteerRuns: () => Effect.Effect<
+    ReadonlyArray<{ readonly threadId: ThreadId; readonly runId: RunId }>,
+    ProjectionStoreV2Error
+  >;
   /** Threads with no active run and an unheld queued run, with the shape of that queue. */
   readonly getIdleQueuedThreads: () => Effect.Effect<
     ReadonlyArray<{
@@ -7089,6 +7097,30 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
       );
 
+    // Only user messages are read (through their partial index), never every turn item.
+    const getReturnedSteerRuns: ProjectionStoreV2Shape["getReturnedSteerRuns"] = () =>
+      sql<{ readonly thread_id: string; readonly run_id: string }>`
+        SELECT DISTINCT item.thread_id AS thread_id, item.run_id AS run_id
+        FROM orchestration_v2_projection_turn_items AS item
+          INDEXED BY orchestration_v2_projection_turn_items_user_message_idx
+        JOIN orchestration_v2_projection_runs AS run ON run.run_id = item.run_id
+        JOIN orchestration_v2_projection_messages AS message
+          ON message.message_id = json_extract(item.payload_json, '$.messageId')
+        WHERE item.type = 'user_message' AND item.status = 'cancelled'
+          AND json_extract(item.payload_json, '$.returnedToQueue') IS 1
+          AND run.status IN ('completed', 'failed', 'interrupted', 'cancelled', 'rolled_back')
+          AND message.run_id = item.run_id
+        ORDER BY item.thread_id, item.run_id
+      `.pipe(
+        Effect.map((rows) =>
+          rows.map((row) => ({
+            threadId: ThreadId.make(row.thread_id),
+            runId: RunId.make(row.run_id),
+          })),
+        ),
+        Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+      );
+
     const getPullRequestWakesToRetry: ProjectionStoreV2Shape["getPullRequestWakesToRetry"] = (
       since,
     ) =>
@@ -10972,6 +11004,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getIdleQueuedThreads: readOnReader(getIdleQueuedThreads),
       getPullRequestWakesToRetry: readOnReader(getPullRequestWakesToRetry),
       getHeldQueuedRuns: readOnReader(getHeldQueuedRuns),
+      getReturnedSteerRuns: readOnReader(getReturnedSteerRuns),
       getPendingNativeUserInputs: readOnReader(getPendingNativeUserInputs),
       hasUnpairedRunInterruptRequest: readOnReader(hasUnpairedRunInterruptRequest),
       hasRunInterruptRequest: readOnReader(hasRunInterruptRequest),

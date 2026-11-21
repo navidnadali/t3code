@@ -1,10 +1,11 @@
 /**
  * The reference sanitiser's extended check (its extended-check script and the 52 patterns of its sanitiser script),
- * ported rule for rule, one named token prefix generalised to any short prefix. Each value is read as stored (`raw`) and, if JSON, as its decoded strings
+ * ported rule for rule, one named token prefix generalised to any short prefix (its one-case tokens still found, by
+ * its prefix's digest). Each value is read as stored (`raw`) and, if JSON, as its decoded strings
  * and keys (`decoded`). Counts by kind only; a clean fixture scores 0 in every row.
  */
 
-import { PREFIXED_TOKEN, mixedCaseBody } from "./secrets.ts";
+import { PREFIXED_TOKEN, prefixedTokenBody } from "./secrets.ts";
 
 const ALNUM = /[A-Za-z0-9]/;
 const WORD = /[A-Za-z0-9_-]/;
@@ -77,7 +78,7 @@ const telegramOk: Check = (text, start) => {
  */
 const AFTER_ALNUM_BOUNDARY = String.raw`(?:(?<![A-Za-z0-9])|(?<=(?<!\\)(?:\\\\)*\\[nrtbf/])|(?<=(?<!\\)(?:\\\\)*\\u[0-9a-fA-F]{4}))`;
 
-const prefixedTokenOk: Check = (text, start, end) => mixedCaseBody(text.slice(start, end));
+const prefixedTokenOk: Check = (text, start, end) => prefixedTokenBody(text.slice(start, end));
 
 const mailgunOk: Check = (text, start) =>
   start >= 32 &&

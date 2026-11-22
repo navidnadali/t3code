@@ -21,6 +21,7 @@ import { DEFAULT_SLOW_SPAN_THRESHOLD_MS } from "../diagnostics/TraceDiagnostics.
 import * as BrowserTraceCollector from "./BrowserTraceCollector.ts";
 import * as CpuProfileMinutes from "./CpuProfileMinutes.ts";
 import * as HeapAttribution from "./HeapAttribution.ts";
+import * as OtlpExportFailures from "./OtlpExportFailures.ts";
 import * as SpanMinutes from "./SpanMinutes.ts";
 import * as WaitMinutes from "./WaitMinutes.ts";
 
@@ -67,7 +68,7 @@ export const layer = Layer.unwrap(
                 exportInterval: `${traces.exportIntervalMs} millis`,
                 headers: traces.headers,
                 resource,
-              });
+              }).pipe(Effect.provide(OtlpExportFailures.layer("traces")));
 
         // Without timing every span lasts 0 ms, so a slow SQL span would be summarised or
         // sampled out too.
@@ -149,7 +150,10 @@ export const layer = Layer.unwrap(
             exportInterval: `${metrics.exportIntervalMs} millis`,
             headers: metrics.headers,
             resource,
-          }).pipe(Layer.provide(SharedObservability.layerOtlpSerialization(metrics.protocol)));
+          }).pipe(
+            Layer.provide(OtlpExportFailures.layer("metrics")),
+            Layer.provide(SharedObservability.layerOtlpSerialization(metrics.protocol)),
+          );
 
     const layerOtelWarnings = Layer.effectDiscard(
       Effect.forEach(config.otelEnvironment.warnings, (warning) => Effect.logWarning(warning)),

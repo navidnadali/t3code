@@ -358,7 +358,7 @@ it.effect(
         yield* Fiber.join(consumer.fiber);
         yield* assertLanded(threadId, 1);
         // BEGIN, the item's position and run ordinal in one read, the event insert, one flush of the projection rows,
-        // the thread touch and the projection head, and COMMIT. perf.12 sends 8, 6 and 6.
+        // and COMMIT, which carries the thread touch and the projection head. perf.12 sends 8, 6 and 6.
         assert.deepEqual(perKind, { "turn-item": 5, node: 4, message: 4 });
       }),
     ),
@@ -432,8 +432,9 @@ it.effect(
         });
         const single = yield* batch([0, 0, 0, 0], 1);
         const interleaved = yield* batch([0, 0, 1, 1, 0], 2);
-        // One savepoint per job would be 4 and 5.
-        assert.deepEqual({ single, interleaved }, { single: 0, interleaved: 3 });
+        // One savepoint per job would be 4 and 5. The lane queues each consumer's snapshots on their
+        // own and takes a consumer's together, so [0, 0, 1, 1, 0] commits as two runs.
+        assert.deepEqual({ single, interleaved }, { single: 0, interleaved: 2 });
         const sql = yield* SqlClient.SqlClient;
         for (const [owner, last] of [
           [0, 24],
@@ -480,12 +481,20 @@ it.effect(
           "SELECT orchestration_v2_turn_item_positions",
           "INSERT orchestration_events",
           "INSERT orchestration_v2_projection_turn_items",
-          "UPDATE orchestration_v2_projection_threads",
-          "INSERT orchestration_v2_projection_metadata",
           "flush",
         ];
-        // The batch: the holder's empty transaction ends, then one BEGIN, each job in turn, one COMMIT.
-        assert.deepEqual(writerExecuted.map(shape), ["COMMIT", "BEGIN", ...job, ...job, "COMMIT"]);
+        // The batch: the holder's empty transaction ends, then one BEGIN, each job in turn, and the
+        // batch's thread touches and projection head once, which the COMMIT carries.
+        assert.deepEqual(writerExecuted.map(shape), [
+          "COMMIT",
+          "BEGIN",
+          ...job,
+          ...job,
+          "UPDATE orchestration_v2_projection_threads",
+          "UPDATE orchestration_v2_projection_threads",
+          "INSERT orchestration_v2_projection_metadata",
+          "COMMIT",
+        ]);
         yield* Effect.forEach([holder, ...consumers], (consumer) => Queue.end(consumer.queue));
       }),
     ),

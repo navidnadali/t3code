@@ -89,6 +89,7 @@ export type ClaudeAgentSdkWorkerRequest =
     }
   | { readonly type: "mcpServerStatus" }
   | { readonly type: "readMcpResource"; readonly server: string; readonly uri: string }
+  | { readonly type: "reconnectMcpServer"; readonly server: string }
   | { readonly type: "controlRequest"; readonly payload: Record<string, unknown> }
   | { readonly type: "interrupt" }
   | { readonly type: "close" }

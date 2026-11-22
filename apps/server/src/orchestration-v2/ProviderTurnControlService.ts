@@ -7,6 +7,7 @@ import {
   ProviderTurnId,
   RunAttemptId,
   ThreadId,
+  withMessageSenderNote,
 } from "@t3tools/contracts";
 import type * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
@@ -17,6 +18,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -120,6 +122,7 @@ export const layer: Layer.Layer<
   ProviderTurnControlServiceV2,
   never,
   | EventSink.EventSinkV2
+  | McpAppModelContext.McpAppModelContext
   | ProjectionStore.ProjectionStoreV2
   | ProviderSessionManager.ProviderSessionManagerV2
 > = Layer.effect(
@@ -128,6 +131,7 @@ export const layer: Layer.Layer<
     const eventSink = yield* EventSink.EventSinkV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const mcpAppModelContext = yield* McpAppModelContext.McpAppModelContext;
 
     const load = Effect.fn("ProviderTurnControlService.load")(function* (input: {
       readonly threadId: ThreadId;
@@ -464,6 +468,10 @@ export const layer: Layer.Layer<
             });
           }
           const mergedParts = parts.flatMap((part) => (part === undefined ? [] : [part]));
+          const appContext = yield* McpAppModelContext.forProvider(
+            mcpAppModelContext,
+            input.threadId,
+          );
           yield* loaded.session.value
             .steerTurn({
               ...(input.beforeInvoke === undefined
@@ -490,11 +498,13 @@ export const layer: Layer.Layer<
               ...(input.modelSelection === undefined
                 ? {}
                 : { modelSelection: input.modelSelection }),
+              ...(appContext.length === 0 ? {} : { appContext }),
               message: {
                 messageId: message.id,
+                // One message carries its sender note; a merged steer names each part's sender.
                 text:
                   mergedParts.length === 1
-                    ? steerProviderText(message)
+                    ? withMessageSenderNote(message, steerProviderText(message))
                     : mergedSteerText(
                         mergedParts.map((part) => ({
                           text: steerProviderText(part),

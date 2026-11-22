@@ -159,6 +159,9 @@ const busyOrchestrator = (input: {
             mcpServerStatus: Effect.succeed([]),
             readMcpResource: () => Effect.die("unexpected MCP resource read"),
             callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+            mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+            reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
             listPermissionRules: Effect.die("unexpected permission rules read"),
             stopTask: () => Effect.void,
             interrupt: Effect.die("automatic delivery must never interrupt"),
@@ -379,8 +382,19 @@ it.effect(
         settleForSeconds: 180,
       });
       assert.deepEqual(late(result.delays), []);
-      // Automatic steers stay a minute apart however many messages are due.
-      assert.isAtLeast(result.automaticSteerGapsMs.length, 5);
+      // Steering no longer cancels Claude's running tools, so an automation
+      // steers the live turn when it is sent instead of waiting out its grace.
+      assert.deepEqual(
+        result.delays.flatMap((probe) =>
+          probe.source === "automation" && (probe.delayMs === null || probe.delayMs > 5_000)
+            ? [probe.text]
+            : [],
+        ),
+        [],
+      );
+      // Automatic steers stay a minute apart however many messages are due: the user's messages
+      // alone take one about every minute.
+      assert.isAtLeast(result.automaticSteerGapsMs.length, 4);
       assert.isTrue(result.automaticSteerGapsMs.every((gap) => gap >= 60_000));
       assert.equal(result.stillQueued, 0);
       assert.equal(result.longRunStatus, "running");
@@ -420,13 +434,13 @@ it.effect(
     }),
 );
 
-it.effect("carries automations that come due just after an automatic steer in that steer", () =>
+// An automation steers the live turn at once, so the riders are user messages.
+it.effect("carries messages that come due just after an automatic steer in that steer", () =>
   Effect.gen(function* () {
-    // The user's message is due at 60 s; automations queued at 1 s and 59 s come due after it.
+    // The first message is due at 60 s; those queued at 1 s and 59 s come due after it.
     const result = yield* busyOrchestrator({
       name: "busy-orchestrator-rider",
-      probeAt: (second) =>
-        second === 0 ? ["user"] : second === 1 || second === 59 ? ["automation"] : [],
+      probeAt: (second) => (second === 0 || second === 1 || second === 59 ? ["user"] : []),
       probeForSeconds: 60,
       settleForSeconds: 120,
       stepSeconds: 1,

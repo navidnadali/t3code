@@ -26,7 +26,7 @@ function event(index: number, text = `delta:${index}`): ProviderAdapter.Provider
     type: "message.updated",
     driver,
     message: {
-      id: MessageId.make("single-message"),
+      id: MessageId.make(`message:${index}`),
       threadId,
       runId: null,
       nodeId: null,
@@ -41,6 +41,15 @@ function event(index: number, text = `delta:${index}`): ProviderAdapter.Provider
     },
   };
 }
+function snapshot(id: string, text: string, threadId = "single-thread") {
+  const base = event(0, text);
+  return base.type === "message.updated"
+    ? {
+        ...base,
+        message: { ...base.message, id: MessageId.make(id), threadId: ThreadId.make(threadId) },
+      }
+    : base;
+}
 const control: ProviderAdapter.ProviderAdapterV2Event = {
   type: "background_work.updated",
   driver,
@@ -50,6 +59,8 @@ const control: ProviderAdapter.ProviderAdapterV2Event = {
 
 const recordBatches = Effect.fn("test.recordProviderBatches")(function* (
   beforeCommit: Effect.Effect<void> = Effect.void,
+  isViewed?: (threadId: string) => boolean,
+  coalesceSnapshots = false,
 ) {
   const output = yield* Queue.unbounded<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>>();
   let current: ProviderAdapter.ProviderAdapterV2Event[] = [];
@@ -62,6 +73,9 @@ const recordBatches = Effect.fn("test.recordProviderBatches")(function* (
         if (current.length > 0) yield* Queue.offer(output, current);
       }),
     true,
+    undefined,
+    isViewed,
+    coalesceSnapshots,
   );
   const process = (raw: ProviderAdapter.ProviderAdapterV2Event) =>
     raw.type === "background_work.updated"
@@ -439,6 +453,241 @@ it.effect.each([false, true])(
     }),
 );
 
+it.effect.each(["none", "writer", "snapshots"] as const)(
+  "runs another stream's control during a busy commit; splits slow backlogs for a write waiting on %s",
+  (waitingOn) =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let first = true;
+      const recorder = yield* recordBatches(
+        Effect.gen(function* () {
+          if (!first) return;
+          first = false;
+          yield* Deferred.succeed(started, undefined);
+          yield* Deferred.await(release);
+        }),
+      );
+      const leading = yield* recorder
+        .consume(Stream.make(event(-1)), recorder.process, Effect.succeed(false))
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(started);
+      yield* recorder.consume(Stream.make(control), recorder.process, Effect.succeed(true));
+      assert.deepEqual(yield* Queue.takeAll(recorder.output), [[control]]);
+
+      const pulled = yield* Deferred.make<void>();
+      const backlog = [event(0), event(1), event(2)];
+      const slow = yield* recorder
+        .consume(
+          Stream.fromArray(backlog).pipe(
+            Stream.tap((raw) =>
+              raw === backlog.at(-1) ? Deferred.succeed(pulled, undefined) : Effect.void,
+            ),
+          ),
+          (raw) => recorder.process(raw).pipe(Effect.andThen(TestClock.adjust("100 millis"))),
+          Effect.succeed(false),
+        )
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(pulled);
+      yield* TestClock.adjust(0);
+      // An unrelated write stands in for one waiting on the writer the batch holds.
+      const writerFree = yield* Deferred.make<void>();
+      const write = yield* recorder
+        .barrier(
+          waitingOn === "writer" ? Deferred.await(writerFree) : Effect.void,
+          waitingOn === "snapshots" ? ["single-thread"] : ["other-thread"],
+        )
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(leading);
+      yield* Fiber.join(slow);
+      yield* Deferred.succeed(writerFree, undefined);
+      yield* Fiber.join(write);
+      assert.deepEqual(
+        yield* Queue.takeAll(recorder.output),
+        waitingOn === "none"
+          ? [[event(-1)], backlog]
+          : [[event(-1)], ...backlog.map((raw) => [raw])],
+      );
+    }),
+);
+
+const blockFirstCommit = Effect.gen(function* () {
+  const started = yield* Deferred.make<void>();
+  const release = yield* Deferred.make<void>();
+  let first = true;
+  const block = Effect.gen(function* () {
+    if (!first) return;
+    first = false;
+    yield* Deferred.succeed(started, undefined);
+    yield* Deferred.await(release);
+  });
+  return { started, release, block };
+});
+
+it.effect.each([
+  { keys: ["a", "b", "a", "b", "a", "b"], kept: [0, 4, 5] },
+  // A first appearance between two snapshots of an entity keeps the earlier snapshot.
+  { keys: ["a", "b", "a", "b", "c", "a", "b"], kept: [0, 2, 3, 4, 5, 6] },
+])("combines superseded snapshots queued behind a busy commit: $keys", ({ keys, kept }) =>
+  Effect.gen(function* () {
+    const writer = yield* blockFirstCommit;
+    const recorder = yield* recordBatches(writer.block, undefined, true);
+    const leading = yield* recorder
+      .consume(Stream.make(event(-1)), recorder.process, Effect.succeed(false))
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Deferred.await(writer.started);
+    const snapshots = keys.map((key, index) => snapshot(key, `${key}:${index}`));
+    const pulled = yield* Deferred.make<void>();
+    const consumer = yield* recorder
+      .consume(
+        Stream.fromIterable(snapshots).pipe(
+          Stream.tap((raw) =>
+            raw === snapshots.at(-1) ? Deferred.succeed(pulled, undefined) : Effect.void,
+          ),
+        ),
+        recorder.process,
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Deferred.await(pulled);
+    yield* TestClock.adjust(0);
+    yield* Deferred.succeed(writer.release, undefined);
+    yield* Fiber.join(leading);
+    yield* Fiber.join(consumer);
+    assert.deepEqual(yield* Queue.takeAll(recorder.output), [
+      [event(-1)],
+      kept.map((index) => snapshots[index]!),
+    ]);
+  }),
+);
+
+// A run's ingestion folds its own backlog before the lane and settles a count per processed item:
+// by default the lane processes every snapshot it is handed, also an entity's earlier one.
+it.effect("processes every queued snapshot of an entity unless asked to combine them", () =>
+  Effect.gen(function* () {
+    const writer = yield* blockFirstCommit;
+    const recorder = yield* recordBatches(writer.block);
+    const leading = yield* recorder
+      .consume(Stream.make(event(-1)), recorder.process, Effect.succeed(false))
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Deferred.await(writer.started);
+    const snapshots = ["a", "b", "a", "b"].map((key, index) => snapshot(key, `${key}:${index}`));
+    const pulled = yield* Deferred.make<void>();
+    const consumer = yield* recorder
+      .consume(
+        Stream.fromIterable(snapshots).pipe(
+          Stream.tap((raw) =>
+            raw === snapshots.at(-1) ? Deferred.succeed(pulled, undefined) : Effect.void,
+          ),
+        ),
+        recorder.process,
+        Effect.succeed(false),
+      )
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Deferred.await(pulled);
+    yield* TestClock.adjust(0);
+    yield* Deferred.succeed(writer.release, undefined);
+    yield* Fiber.join(leading);
+    yield* Fiber.join(consumer);
+    assert.deepEqual(yield* Queue.takeAll(recorder.output), [[event(-1)], snapshots]);
+  }),
+);
+
+it.effect("makes streams wait to read more once the shared backlog is full", () =>
+  Effect.gen(function* () {
+    const writer = yield* blockFirstCommit;
+    const recorder = yield* recordBatches(writer.block);
+    const leading = yield* recorder
+      .consume(Stream.make(event(-1)), recorder.process, Effect.succeed(false))
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Deferred.await(writer.started);
+    let arrivals = 0;
+    const streams = Array.from({ length: 5 }, (_, stream) =>
+      Array.from({ length: 64 }, (_, n) => snapshot(`${stream}:${n}`, `${stream}:${n}`)),
+    );
+    const consumers = yield* Effect.forEach(streams, (snapshots) =>
+      recorder
+        .consume(
+          Stream.fromIterable(snapshots).pipe(
+            Stream.tap(() =>
+              Effect.sync(() => {
+                arrivals++;
+              }),
+            ),
+          ),
+          recorder.process,
+          Effect.succeed(false),
+        )
+        .pipe(Effect.forkScoped({ startImmediately: true })),
+    );
+    yield* TestClock.adjust(0);
+    // 256 queued, plus at most one read per stream waiting for room.
+    assert.isAtMost(arrivals, 256 + streams.length);
+    yield* Deferred.succeed(writer.release, undefined);
+    yield* Fiber.join(leading);
+    yield* Effect.forEach(consumers, Fiber.join, { discard: true });
+    assert.lengthOf((yield* Queue.takeAll(recorder.output)).flat(), 1 + 5 * 64);
+  }),
+);
+
+it.effect.each([false, true])(
+  "orders a backlog by focus, thread kind and a finishing control with starved=%s",
+  (starved) =>
+    Effect.gen(function* () {
+      const writer = yield* blockFirstCommit;
+      const recorder = yield* recordBatches(writer.block, (threadId) => threadId === "focused");
+      const leading = yield* recorder
+        .consume(Stream.make(event(-1)), recorder.process, Effect.succeed(false))
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(writer.started);
+      const streams = [
+        { name: "subagent", delegated: true, finishing: false },
+        { name: "main", delegated: false, finishing: false },
+        { name: "finishing", delegated: false, finishing: true },
+        { name: "focused", delegated: false, finishing: false },
+      ];
+      const pulled = yield* Deferred.make<void>();
+      let arrivals = 0;
+      const consumers = yield* Effect.forEach(streams, ({ name, delegated, finishing }) =>
+        recorder
+          .consume(
+            // Open streams, so only the control marks a stream as finishing; EOF would too.
+            Stream.concat(
+              Stream.make(snapshot(name, name, name), ...(finishing ? [control] : [])),
+              Stream.never,
+            ).pipe(
+              Stream.tap(() =>
+                ++arrivals === streams.length + 1
+                  ? Deferred.succeed(pulled, undefined)
+                  : Effect.void,
+              ),
+            ),
+            recorder.process,
+            Effect.succeed(false),
+            undefined,
+            { threadId: name, delegated },
+          )
+          .pipe(Effect.forkScoped({ startImmediately: true })),
+      );
+      yield* Deferred.await(pulled);
+      yield* TestClock.adjust(starved ? "30 seconds" : 0);
+      yield* Deferred.succeed(writer.release, undefined);
+      yield* Fiber.join(leading);
+      const outputs = yield* Queue.takeN(recorder.output, 3);
+      yield* Effect.forEach(consumers, Fiber.interrupt, { discard: true });
+      // Waiting 30 seconds ranks a subagent like a main thread.
+      const order = starved
+        ? ["focused", "finishing", "subagent", "main"]
+        : ["focused", "finishing", "main", "subagent"];
+      assert.deepEqual(Array.from(outputs), [
+        [event(-1)],
+        order.map((name) => snapshot(name, name, name)),
+        [control],
+      ]);
+    }),
+);
+
 it.effect.each(["failure", "stop"] as const)(
   "flushes the prefix and respects a source %s barrier",
   (mode) =>
@@ -563,7 +812,19 @@ it.effect("reports each job's wait before its flush, the job flushing and the de
 it.effect(
   "reports each stamped event's ingest lag from its arrival to its commit, by class",
   () => {
-    const { observer, reports } = recordingWaitObserver();
+    const recording = recordingWaitObserver();
+    const { reports } = recording;
+    // The lifecycle event's lag is reported once the lane's reply returns, after `done`.
+    const lifecycleReported = Deferred.makeUnsafe<void>();
+    const observer: typeof recording.observer = {
+      ...recording.observer,
+      wait: (...args) => {
+        recording.observer.wait(...args);
+        if (args[0] === "ProviderIngest.lag.lifecycle") {
+          Deferred.doneUnsafe(lifecycleReported, Effect.void);
+        }
+      },
+    };
     return Effect.gen(function* () {
       const committing = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
@@ -608,6 +869,7 @@ it.effect(
       yield* TestClock.adjust("1 second");
       yield* Deferred.succeed(release, undefined);
       yield* Deferred.await(done);
+      yield* Deferred.await(lifecycleReported);
 
       assert.deepEqual(
         reports("wait").filter(([site]) => String(site).startsWith("ProviderIngest.")),
@@ -688,13 +950,13 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
     assert.deepEqual(steps, ["write"]);
     steps.length = 0;
 
-    // A held lane queues the write: the slot goes out first and comes back after the write, even a
-    // failed or an interrupted one (its effect's end then gives it back).
+    // A held lane holds the write back: the slot goes out while it waits and comes back before the
+    // write runs, also when the wait fails or is interrupted.
     const held = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
     yield* commitBatch
       .consume(
-        Stream.make({ type: "node.updated" }),
+        Stream.make(snapshot("held", "held")),
         () => Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
         Effect.succeed(false),
       )
@@ -721,8 +983,8 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
       "suspend",
       "suspend",
       "resume",
-      "write",
       "resume",
+      "write",
       "resume",
     ]);
     // A fiber the owner forks inherits the lane wait, not the slot: its write lends nothing.
@@ -731,7 +993,7 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
     const forkedRelease = yield* Deferred.make<void>();
     yield* commitBatch
       .consume(
-        Stream.make({ type: "node.updated" }),
+        Stream.make(snapshot("forked", "forked")),
         () =>
           Deferred.succeed(forkedHeld, undefined).pipe(
             Effect.andThen(Deferred.await(forkedRelease)),
@@ -747,43 +1009,5 @@ it.effect("lends a caller's slot out only while its write waits on the lane", ()
     yield* Deferred.succeed(forkedRelease, undefined);
     yield* Fiber.join(forked);
     assert.deepEqual(steps, ["write"]);
-  }),
-);
-
-it.effect("lends a caller's slot while its write waits for room in the lane's queue", () =>
-  Effect.gen(function* () {
-    const commitBatch = yield* ProviderCommitBatch.make((work) => work, true);
-    const steps: Array<string> = [];
-    const held = yield* Deferred.make<void>();
-    const release = yield* Deferred.make<void>();
-    yield* commitBatch
-      .consume(
-        Stream.make({ type: "node.updated" }),
-        () => Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
-        Effect.succeed(false),
-      )
-      .pipe(Effect.forkChild);
-    yield* Deferred.await(held);
-    // Other writers fill the lane's queue behind the held batch.
-    for (let writer = 0; writer < 64; writer++)
-      yield* commitBatch.barrier(Effect.void).pipe(Effect.forkChild);
-    yield* Effect.yieldNow;
-    const waiting = yield* Effect.withFiber((fiber) =>
-      Effect.provideService(
-        commitBatch.barrier(Effect.sync(() => steps.push("write"))),
-        ProviderCommitBatch.CurrentLaneWait,
-        {
-          owner: fiber.id,
-          suspend: Effect.sync(() => steps.push("suspend")),
-          resume: Effect.sync(() => steps.push("resume")),
-        },
-      ),
-    ).pipe(Effect.forkChild);
-    yield* Effect.yieldNow;
-    // Its write cannot even queue yet, and its slot is already out.
-    assert.deepEqual(steps, ["suspend"]);
-    yield* Deferred.succeed(release, undefined);
-    yield* Fiber.join(waiting);
-    assert.deepEqual(steps, ["suspend", "write", "resume"]);
   }),
 );

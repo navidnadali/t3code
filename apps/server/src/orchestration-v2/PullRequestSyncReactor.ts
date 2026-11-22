@@ -17,7 +17,10 @@ import {
   threadPullRequestKeysEqual,
   visibleThreadPullRequests,
 } from "../sourceControl/threadPullRequests.ts";
-import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
+import {
+  isChangeRequestCloseCommand,
+  sourceControlDefinitions,
+} from "../sourceControl/sourceControlDefinitions.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -34,8 +37,8 @@ import * as Stream from "effect/Stream";
 import * as GitManager from "../git/GitManager.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
-import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { forkParked } from "../serverActivation.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { isTerminalRunStatus } from "./ThreadManagementService.ts";
@@ -68,11 +71,8 @@ const syncIntervalMs = (quietForMs: number) =>
 // A pull request closed this long ago is rarely reopened, so the sweep stops reading it, as it
 // does merged ones. A reader that sees it open, or a requested refresh, still reads it at once.
 const CLOSED_FINAL_AFTER_MS = 24 * 60 * 60 * 1_000;
-
-const isChangeRequestCloseCommand = (command: string) =>
-  sourceControlDefinitions.definitions.some(
-    (definition) => definition.changeRequestCloseCommand?.test(command) === true,
-  );
+// A link whose host read failed waits a sweep, then twice as long after each further failure.
+const FAILED_READ_BACKOFF_MS = 60 * 1_000;
 
 // Where a shell starts a command, past `NAME=value` assignments and wrappers like `timeout 60`.
 // A create command anywhere else, as in `echo "gh pr create"`, is text, not a command that runs.
@@ -392,6 +392,7 @@ export const make = Effect.gen(function* () {
   // linking dozens of pull requests) is read together and shares the summary batches.
   let requestedSweepQueued = false;
   const retryStacks = new Set<string>();
+  const failedReads = new Map<string, { readonly retryAtMs: number; readonly backoffMs: number }>();
   // Group keys the host answered not-found for, or this server cannot read (no CLI, signed out,
   // unsupported host); they are read on the slow cadence until a read succeeds.
   const missing = new Set<string>();
@@ -399,6 +400,7 @@ export const make = Effect.gen(function* () {
   const pausedUntil = new Map<string, number>();
 
   const isDue = (key: string, entries: ReadonlyArray<LinkEntry>, nowMs: number): boolean => {
+    if ((failedReads.get(key)?.retryAtMs ?? 0) > nowMs) return false;
     if (requested.has(key)) return true;
     const active = entries.filter((entry) => isUnsettled(entry.thread));
     if (active.length === 0) return false;
@@ -449,12 +451,17 @@ export const make = Effect.gen(function* () {
 
     // A host-level refresh reaches every project, each retaining its own pending retry.
     for (const [key, entries] of groups) {
-      if (pendingRequests.has(threadPullRequestKeyOf(entries[0]!.link))) requested.add(key);
+      if (!pendingRequests.has(threadPullRequestKeyOf(entries[0]!.link))) continue;
+      requested.add(key);
+      // A new request reads at once; a failure after it backs off further, not from the start.
+      const failed = failedReads.get(key);
+      if (failed !== undefined) failedReads.set(key, { ...failed, retryAtMs: nowMs });
     }
     pendingRequests.clear();
 
     for (const key of lastSyncedAt.keys()) if (!groups.has(key)) lastSyncedAt.delete(key);
     for (const key of retryStacks) if (!groups.has(key)) retryStacks.delete(key);
+    for (const key of failedReads.keys()) if (!groups.has(key)) failedReads.delete(key);
     for (const key of missing) if (!groups.has(key)) missing.delete(key);
     for (const key of requested.keys()) if (!groups.has(key)) requested.delete(key);
 
@@ -624,6 +631,7 @@ export const make = Effect.gen(function* () {
       // The host answered, so the cadence clock ticks even if a dispatch below is rejected. It
       // counts from the answer: a read that queued for the host is due no sooner for the wait.
       lastSyncedAt.set(key, yield* Clock.currentTimeMillis);
+      failedReads.delete(key);
       requested.delete(key);
       yield* Effect.forEach(
         entries,
@@ -649,6 +657,13 @@ export const make = Effect.gen(function* () {
           const retryAt = rateLimitRetryAt(cause);
           if (retryAt !== undefined) {
             pausedUntil.set(pauseKey, Math.max(retryAt, pausedUntil.get(pauseKey) ?? 0));
+          } else {
+            const previous = failedReads.get(key);
+            const backoffMs =
+              previous === undefined
+                ? FAILED_READ_BACKOFF_MS
+                : Math.min(previous.backoffMs * 2, SLOW_SYNC_INTERVAL_MS);
+            failedReads.set(key, { retryAtMs: nowMs + backoffMs, backoffMs });
           }
           const reason = skipReason(cause);
           const skip = skips.get(reason);
@@ -723,11 +738,11 @@ export const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker((scope: "all" | "requested") =>
     Effect.suspend(() => {
       if (scope === "requested") requestedSweepQueued = false;
-      // Scheduled reads leave a forge CLI permit for reads someone is waiting for.
-      return pullRequests
-        .withSharedProjectReads(sweep(scope))
-        .pipe(Effect.provideService(VcsProcess.ForgeBackground, true));
-    }).pipe(Effect.catchCause(logSkipped("pull request sync sweep failed", {}))),
+      return pullRequests.withSharedProjectReads(sweep(scope));
+    }).pipe(
+      Effect.provideService(VcsProcess.Background, true),
+      Effect.catchCause(logSkipped("pull request sync sweep failed", {})),
+    ),
   );
 
   // Threads that ran a close command this run, with the commands already read for.

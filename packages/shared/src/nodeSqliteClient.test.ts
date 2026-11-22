@@ -1214,6 +1214,57 @@ it.effect.each([
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+// Each SAVEPOINT is a statement of its own here (it carries the writes waiting before it), so a
+// failed one fails its nested transaction; upstream sends them with the next statement instead.
+it.effect("preserves nested rollback around empty, failed and unsent savepoints", () =>
+  Effect.gen(function* () {
+    const { filename } = yield* makeTempDatabase;
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql.withTransaction(
+        Effect.forEach(Array.from({ length: 53 }), () => sql.withTransaction(Effect.void)),
+      );
+
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`UPDATE counters SET value = 1 WHERE id = 1`;
+          const failure = yield* sql
+            .withTransaction(
+              sql`UPDATE counters SET value = 2 WHERE id = 1`.pipe(
+                Effect.andThen(Effect.fail("bad update")),
+              ),
+            )
+            .pipe(Effect.flip);
+          assert.equal(failure, "bad update");
+          assert.equal(
+            yield* sql.withTransaction(Effect.fail("empty update")).pipe(Effect.flip),
+            "empty update",
+          );
+          assert.deepEqual(yield* sql`SELECT value FROM counters WHERE id = 1`, [{ value: 1 }]);
+          yield* sql.withTransaction(
+            sql
+              .withTransaction(
+                sql`UPDATE counters SET value = 3 WHERE id = 1`.pipe(
+                  Effect.andThen(Effect.fail("nested update")),
+                ),
+              )
+              .pipe(Effect.flip),
+          );
+          assert.deepEqual(yield* sql`SELECT value FROM counters WHERE id = 1`, [{ value: 1 }]);
+
+          yield* sql.withTransaction(sql`UPDATE counters SET value = 4 WHERE id = 1`);
+          yield* sql`UPDATE counters SET value = 5 WHERE id = 1`;
+          const unsent = yield* sql
+            .withTransaction(sql.unsafe("SELECT ?", [Symbol("uncloneable")]))
+            .pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(unsent));
+        }),
+      );
+      assert.deepEqual(yield* sql`SELECT value FROM counters WHERE id = 1`, [{ value: 5 }]);
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, writerWorker: true })));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("reuses a worker query after an iterator constraint failure", () =>
   Effect.gen(function* () {
     const { filename } = yield* makeTempDatabase;

@@ -271,6 +271,21 @@ export const withDeferredWrites =
     );
 
 /**
+ * For the writes that end a transaction's body: in a writer-worker transaction, the deferred writes
+ * `effect` makes wait for the transaction's next statement that awaits a reply, its COMMIT, which
+ * carries them and fails with their failure (the worker then rolls the transaction back). Nothing
+ * flushes them before: a COMMIT that follows at once costs no round trip of its own for them.
+ */
+export const withWritesCarriedByCommit =
+  (sql: Client.SqlClient) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.flatMap(Effect.serviceOption(sql.transactionService), (transaction) =>
+      Option.isNone(transaction)
+        ? effect
+        : Effect.provideService(effect, DeferredWriteScope, { carriers: 0, drained: [] }),
+    );
+
+/**
  * Permits for reads of a thread's whole history, one fewer than the reader workers (at least one).
  * Such a read holds one from before its transaction until decoded, so this bounds the history row
  * sets held at once.

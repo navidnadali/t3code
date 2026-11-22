@@ -36,6 +36,10 @@ vi.mock("./PerfForkMigrations.ts", async (importOriginal) => {
 const perf12ForkRefusal = (databasePath: string) =>
   (recordedMigrations(databasePath, PERF_FORK_MIGRATIONS_TABLE) ?? []).filter(({ id }) => id > 2);
 
+const DOWN_005_SCRIPT = NodeFS.readFileSync(
+  new URL("../../../../scripts/perf-fork-005-down.sql", import.meta.url),
+  "utf8",
+);
 const DOWN_004_SCRIPT = NodeFS.readFileSync(
   new URL("../../../../scripts/perf-fork-004-down.sql", import.meta.url),
   "utf8",
@@ -45,7 +49,7 @@ const DOWN_SCRIPT = NodeFS.readFileSync(
   "utf8",
 );
 const CHECK_SCRIPT = NodeFS.readFileSync(
-  new URL("../../../../scripts/perf-fork-003-check.sql", import.meta.url),
+  new URL("../../../../scripts/thread-item-counts-check.sql", import.meta.url),
   "utf8",
 );
 
@@ -84,96 +88,102 @@ const forkLedger = (db: NodeSqlite.DatabaseSync) =>
 
 it.layer(NodeServices.layer)("fork migration 3's down step", (it) => {
   // perf.12's preflight, and the guard's for a chain ending at 2, refuse a database with fork
-  // migration 3. The down step takes it out and leaves the ledger 1..2, so both pass and perf.12
-  // writes on upstream's counts alone; this build's next start runs 3 again, matching those writes.
-  it.effect("lets perf.12's preflight pass, and this build's next start rebuilds the totals", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const databasePath = path.join(
-        yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-003-down-" }),
-        "statev2.sqlite",
-      );
-      const migrate = runMigrations().pipe(
-        Effect.provide(NodeSqliteClient.layer({ filename: databasePath })),
-      );
-      const preflight = () =>
-        runServicePreflight({
-          databasePath,
-          launcherProtocol: SERVICE_LAUNCHER_PROTOCOL,
-          version: "0.1.9-perf.12",
-        });
-      yield* migrate;
-      {
-        using db = new NodeSqlite.DatabaseSync(databasePath);
-        insertRun(db, "run-1", "thread-1", 1);
-        insertItem(db, "a", "thread-1", "run-1");
-        assert.lengthOf(totalsObjects(db), 7);
-      }
-      // This build ships fork migrations 3 and 4: perf.12 refuses both until the rollback takes them out,
-      // newest first (004, then 003).
-      assert.deepEqual(perf12ForkRefusal(databasePath), [
-        { id: 3, name: "ThreadItemTotals" },
-        { id: 4, name: "EventLogPruneState" },
-      ]);
-      const blocked = preflight();
-      assert.strictEqual(blocked.status, "blocked");
-      assert.include(
-        blocked.status === "blocked" ? blocked.reason : "",
-        `${PERF_FORK_MIGRATIONS_TABLE}:3_ThreadItemTotals (unknown to this build)`,
-      );
-
-      {
-        using db = new NodeSqlite.DatabaseSync(databasePath);
-        db.exec(DOWN_004_SCRIPT);
-        db.exec(DOWN_SCRIPT);
-        assert.deepEqual(totalsObjects(db), []);
-        assert.deepEqual(forkLedger(db), [
-          [1, "ProjectionTurnItemCounts"],
-          [2, "TurnItemMessageOrdinalIndex"],
+  // migration 3. The down steps (5, 4, then 3) take them out and leave the ledger 1..2, so both pass
+  // and perf.12 writes on upstream's counts alone; this build's next start records 3 to 5 again
+  // (3 creates nothing since upstream's 102 keeps the totals), and upstream's totals match those writes.
+  it.effect(
+    "lets perf.12's preflight pass, and this build's next start reads upstream's totals",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const databasePath = path.join(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-003-down-" }),
+          "statev2.sqlite",
+        );
+        const migrate = runMigrations().pipe(
+          Effect.provide(NodeSqliteClient.layer({ filename: databasePath })),
+        );
+        const preflight = () =>
+          runServicePreflight({
+            databasePath,
+            launcherProtocol: SERVICE_LAUNCHER_PROTOCOL,
+            version: "0.1.9-perf.12",
+          });
+        yield* migrate;
+        {
+          using db = new NodeSqlite.DatabaseSync(databasePath);
+          insertRun(db, "run-1", "thread-1", 1);
+          insertItem(db, "a", "thread-1", "run-1");
+          assert.deepEqual(totalsObjects(db), []);
+        }
+        // This build ships fork migrations 3 to 5: perf.12 refuses them until the rollback takes them
+        // out, newest first (005, 004, then 003).
+        assert.deepEqual(perf12ForkRefusal(databasePath), [
+          { id: 3, name: "ThreadItemTotals" },
+          { id: 4, name: "EventLogPruneState" },
+          { id: 5, name: "RetireThreadItemTotals" },
         ]);
-      }
-      assert.deepEqual(perf12ForkRefusal(databasePath), []);
-      assert.deepEqual(preflight(), {
-        status: "ready",
-        version: "0.1.9-perf.12",
-        launcherProtocol: SERVICE_LAUNCHER_PROTOCOL,
-      });
+        const blocked = preflight();
+        assert.strictEqual(blocked.status, "blocked");
+        assert.include(
+          blocked.status === "blocked" ? blocked.reason : "",
+          `${PERF_FORK_MIGRATIONS_TABLE}:3_ThreadItemTotals (unknown to this build)`,
+        );
 
-      // perf.12's writes: no totals triggers, upstream's counts only.
-      {
+        {
+          using db = new NodeSqlite.DatabaseSync(databasePath);
+          db.exec(DOWN_005_SCRIPT);
+          db.exec(DOWN_004_SCRIPT);
+          db.exec(DOWN_SCRIPT);
+          assert.deepEqual(totalsObjects(db), []);
+          assert.deepEqual(forkLedger(db), [
+            [1, "ProjectionTurnItemCounts"],
+            [2, "TurnItemMessageOrdinalIndex"],
+          ]);
+        }
+        assert.deepEqual(perf12ForkRefusal(databasePath), []);
+        assert.deepEqual(preflight(), {
+          status: "ready",
+          version: "0.1.9-perf.12",
+          launcherProtocol: SERVICE_LAUNCHER_PROTOCOL,
+        });
+
+        // perf.12's writes: no totals triggers, upstream's counts only.
+        {
+          using db = new NodeSqlite.DatabaseSync(databasePath);
+          insertItem(db, "b", "thread-1", "run-1");
+          insertItem(db, "c", "thread-2", "run-2");
+          insertRun(db, "run-2", "thread-2", 1);
+          db.prepare(
+            "DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'a'",
+          ).run();
+        }
+
+        yield* migrate;
         using db = new NodeSqlite.DatabaseSync(databasePath);
-        insertItem(db, "b", "thread-1", "run-1");
-        insertItem(db, "c", "thread-2", "run-2");
-        insertRun(db, "run-2", "thread-2", 1);
-        db.prepare(
-          "DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'a'",
-        ).run();
-      }
-
-      yield* migrate;
-      using db = new NodeSqlite.DatabaseSync(databasePath);
-      assert.lengthOf(totalsObjects(db), 7);
-      assert.deepEqual(forkLedger(db).slice(-2), [
-        [3, "ThreadItemTotals"],
-        [4, "EventLogPruneState"],
-      ]);
-      assert.deepEqual(
-        { ...db.prepare(CHECK_SCRIPT).get() },
-        { threads: 2, drifted_threads: 0, drifted_items: 0, cross_thread_items: 0 },
-      );
-      assert.deepEqual(
-        db
-          .prepare(
-            "SELECT thread_id, item_count FROM t3_perf_thread_item_totals ORDER BY thread_id",
-          )
-          .all()
-          .map((row) => ({ ...row })),
-        [
-          { thread_id: "thread-1", item_count: 1 },
-          { thread_id: "thread-2", item_count: 1 },
-        ],
-      );
-    }),
+        assert.deepEqual(totalsObjects(db), []);
+        assert.deepEqual(forkLedger(db).slice(-3), [
+          [3, "ThreadItemTotals"],
+          [4, "EventLogPruneState"],
+          [5, "RetireThreadItemTotals"],
+        ]);
+        assert.deepEqual(
+          { ...db.prepare(CHECK_SCRIPT).get() },
+          { threads: 2, drifted_threads: 0, drifted_items: 0, cross_thread_items: 0 },
+        );
+        assert.deepEqual(
+          db
+            .prepare(
+              "SELECT thread_id, item_count FROM orchestration_v2_projection_thread_item_counts ORDER BY thread_id",
+            )
+            .all()
+            .map((row) => ({ ...row })),
+          [
+            { thread_id: "thread-1", item_count: 1 },
+            { thread_id: "thread-2", item_count: 1 },
+          ],
+        );
+      }),
   );
 });

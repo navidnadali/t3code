@@ -11,6 +11,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   RunId,
+  ScheduledTaskId,
   ScheduledTaskUpsertInput,
   ThreadId,
   type OrchestrationV2DomainEvent,
@@ -43,6 +44,7 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import { QUEUED_DELIVERY_PROMOTION_COMMAND_PREFIX } from "./QueuedDeliveryPromotion.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -137,10 +139,7 @@ const deliveries = [
 ] as const;
 
 it.effect.each(deliveries)(
-  // Claude Code aborts its tool batch for a "now" message and cancels the pending calls with its
-  // stock refusal. A delivery or steer, from any source, goes at "next", seen with the next tool
-  // result, so every call in the running batch completes.
-  "delivers %s without cancelling the running turn's tool calls",
+  "delivers %s without Claude cancelling the pending tool calls in its batch",
   (delivery) =>
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace("claude-automatic-delivery");
@@ -180,6 +179,9 @@ it.effect.each(deliveries)(
               mcpServerStatus: Effect.succeed([]),
               readMcpResource: () => Effect.die("unexpected MCP resource read"),
               callMcpTool: () => Effect.die("unexpected MCP tool call"),
+              mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+              mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+              reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
               listPermissionRules: Effect.die("unexpected permission rules read"),
               stopTask: () => Effect.void,
               interrupt: Effect.die("automatic delivery must never interrupt"),
@@ -407,11 +409,11 @@ it.effect.each(deliveries)(
           assert.equal(steer.inputIntent, "promoted_queued_to_steer");
         }
         yield* worker.drain();
-        const explicitSteer =
-          delivery === "user steering" || delivery === "promoted queued message";
-        assert.isFalse(batchAbort.signal.aborted);
-        assert.equal(offers.length, explicitSteer ? 2 : 1);
-        if (explicitSteer) assert.equal(offers[1]?.priority, "next");
+        // Every delivery steers at "next", which leaves the batch running. A bound automation's
+        // prompt steers as well: it steers a live turn wherever the steer leaves tools running.
+        assert.equal(batchAbort.signal.aborted, false);
+        assert.lengthOf(offers, 2);
+        assert.equal(offers[1]?.priority, "next");
         const finished = yield* watch(
           (event) =>
             event.type === "run.updated" &&
@@ -421,43 +423,16 @@ it.effect.each(deliveries)(
         yield* Queue.offer(sdkMessages, toolResult("build", false));
         for (const id of statusIds)
           yield* Queue.offer(sdkMessages, toolResult(id, batchAbort.signal.aborted));
-        // The steer reaches the model in the same turn, once the batch's results are in.
-        if (explicitSteer)
-          yield* Queue.offer(
-            sdkMessages,
-            frame({
-              type: "command_lifecycle",
-              command_uuid: offers[1]!.uuid,
-              state: "started",
-              session_id: sessionId,
-            }),
-          );
-        yield* Queue.offer(sdkMessages, result("completed", false));
+        yield* Queue.offer(
+          sdkMessages,
+          delivery === "child completion"
+            ? frame({ ...result("completed", false), user_message_uuid: offers[1]!.uuid })
+            : result("completed", false),
+        );
         yield* Fiber.join(finished);
         yield* worker.drain();
         yield* orchestrator.resumeQueuedRuns;
         yield* worker.drain();
-        if (!explicitSteer) {
-          const queued = (yield* orchestrator.getThreadProjection(threadId)).runs[1]!;
-          const noticeFinished = yield* watch(
-            (event) =>
-              event.type === "run.updated" &&
-              event.payload.id === queued.id &&
-              event.payload.status === "waiting",
-          );
-          const delivered =
-            delivery === "child completion"
-              ? yield* watch(
-                  (event) =>
-                    event.type === "subagent.updated" &&
-                    event.payload.completionDelivery?.state === "delivered",
-                )
-              : null;
-          yield* Queue.offer(sdkMessages, result("notice-completed", false));
-          yield* Fiber.join(noticeFinished);
-          yield* worker.drain();
-          if (delivered !== null) yield* Fiber.join(delivered);
-        }
         const after = yield* orchestrator.getThreadProjection(threadId);
         const reads = after.turnItems.filter((item) =>
           statusIds.includes(item.nativeItemRef?.nativeId ?? ""),
@@ -465,30 +440,29 @@ it.effect.each(deliveries)(
         assert.equal(reads.length, 4);
         for (const read of reads) {
           assert.equal(read.status, "completed");
-          assert.isUndefined(read.toolNonExecutionKind);
-          assert.isFalse(read.type === "dynamic_tool" && read.output === refusal);
+          assert.equal(read.toolNonExecutionKind, undefined);
+          assert.equal(read.type === "dynamic_tool" && read.output === refusal, false);
         }
-        assert.equal(offers.length, 2);
+        assert.lengthOf(offers, 2);
         assert.equal(offers.filter((offer) => offer.priority === "now").length, 0);
-        if (explicitSteer) {
-          // Taken into the running turn: no turn of its own (a promoted message's queued run is cancelled).
-          assert.equal(after.runs.filter((run) => run.status !== "cancelled").length, 1);
-          assert.equal(
-            after.messages.find((message) => message.id === messageId)?.runId,
-            parent.id,
+        if (delivery === "child completion") {
+          assert.lengthOf(after.runs, 1);
+          assert.deepEqual(
+            after.messages
+              .filter((message) => message.id === messageId)
+              .map((message) => message.runId),
+            [parent.id],
           );
-        }
-        if (!explicitSteer) {
-          assert.equal(after.runs.length, 2);
-          if (delivery === "child completion") {
-            assert.equal(after.messages.filter((message) => message.id === messageId).length, 1);
-            assert.equal(after.subagents[0]?.completionDelivery?.state, "delivered");
-          } else {
-            assert.equal(
-              after.messages.filter((message) => message.scheduledTaskId !== undefined).length,
-              1,
-            );
-          }
+          assert.equal(after.subagents[0]?.completionDelivery?.state, "delivered");
+        } else {
+          // Taken into the running turn: no turn of its own (a promoted message's queued run is cancelled).
+          const delivered =
+            delivery === "scheduled message"
+              ? after.messages.filter((message) => message.scheduledTaskId !== undefined)
+              : after.messages.filter((message) => message.id === messageId);
+          assert.lengthOf(delivered, 1);
+          assert.equal(after.runs.filter((run) => run.status !== "cancelled").length, 1);
+          assert.equal(delivered[0]?.runId, parent.id);
         }
         yield* orchestrator.recoverDelegatedTasks;
         yield* orchestrator.resumeQueuedRuns;
@@ -577,6 +551,9 @@ it.effect("a message promoted into a turn with five delegate_task calls out canc
             mcpServerStatus: Effect.succeed([]),
             readMcpResource: () => Effect.die("unexpected MCP resource read"),
             callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+            mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+            reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
             listPermissionRules: Effect.die("unexpected permission rules read"),
             stopTask: () => Effect.void,
             interrupt: Effect.die("a promoted message must never interrupt"),
@@ -759,6 +736,9 @@ it.effect("applies an effort change to the running Claude query without waiting 
             mcpServerStatus: Effect.succeed([]),
             readMcpResource: () => Effect.die("unexpected MCP resource read"),
             callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+            mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+            reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
             listPermissionRules: Effect.die("unexpected permission rules read"),
             stopTask: () => Effect.void,
             interrupt: Effect.die("an effort change must not interrupt the turn"),
@@ -875,6 +855,9 @@ const renamedClaudeSessionTitles = (options: { readonly renameDuringStartup: boo
             mcpServerStatus: Effect.succeed([]),
             readMcpResource: () => Effect.die("unexpected MCP resource read"),
             callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+            mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+            reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
             listPermissionRules: Effect.die("unexpected permission rules read"),
             stopTask: () => Effect.void,
             interrupt: Effect.die("a rename must not interrupt the turn"),
@@ -1101,6 +1084,9 @@ it.effect("offers a continuation for a later wake after a queued continuation is
                 mcpServerStatus: Effect.succeed([]),
                 readMcpResource: () => Effect.die("unexpected MCP resource read"),
                 callMcpTool: () => Effect.die("unexpected MCP tool call"),
+                mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+                mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+                reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
                 listPermissionRules: Effect.die("unexpected permission rules read"),
                 stopTask: () => Effect.void,
                 interrupt: Effect.void,
@@ -1271,7 +1257,7 @@ it.effect("offers a continuation for a later wake after a queued continuation is
 );
 
 it.effect(
-  "steers an automation and a cross-thread message into a busy Claude turn 60 to 90 s after each queues, past a pile of completion wakes",
+  "steers an automation at once and a cross-thread message 60 to 90 s after it queues into a busy Claude turn, past a pile of completion wakes",
   () =>
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace("claude-auto-send-now");
@@ -1305,6 +1291,9 @@ it.effect(
               mcpServerStatus: Effect.succeed([]),
               readMcpResource: () => Effect.die("unexpected MCP resource read"),
               callMcpTool: () => Effect.die("unexpected MCP tool call"),
+              mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+              mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+              reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
               listPermissionRules: Effect.die("unexpected permission rules read"),
               stopTask: () => Effect.void,
               interrupt: Effect.die("automatic delivery must never interrupt"),
@@ -1422,53 +1411,20 @@ it.effect(
             },
           ]),
         });
-        yield* Effect.gen(function* () {
-          const service = yield* ScheduledTaskService.ScheduledTaskService;
-          const { task } = yield* service.upsert(
-            yield* decodeScheduledTask({
-              title: "Status check",
-              prompt: "Report the build status.",
-              enabled: true,
-              schedule: { type: "interval", everyMs: 3_600_000 },
-              projectId,
-              threadId,
-              workspaceStrategy: { type: "root" },
-              modelSelection,
-              runtimeMode: "full-access",
-              interactionMode: "default",
-            }),
-          );
-          const ran = yield* service.runNow({ id: task.id });
-          assert.equal(ran.task.lastRunStatus, "succeeded");
-        }).pipe(
-          Effect.provide(
-            ScheduledTaskService.layer.pipe(
-              Layer.provide(ThreadManagementService.layer),
-              Layer.provide(ServerSettings.layerTest()),
-              Layer.provide(
-                Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
-                  ensureTranscript: () =>
-                    Effect.succeed({ importedThreadCount: 0, importedMessageCount: 0 }),
-                }),
-              ),
-              Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
-              Layer.provide(ManagedPolicy.layerTest()),
-              Layer.provide(
-                Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
-                  namedProjectsRoot: "/projects",
-                  isScratchProject: () => Effect.succeed(false),
-                }),
-              ),
-              Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
-              Layer.provide(
-                CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
-              ),
-              Layer.provide(
-                Layer.mergeAll(NodeCrypto.layer, Scheduler.layer, SqlitePersistence.layerMemory),
-              ),
-            ),
-          ),
-        );
+        // The automation's prompt queued behind the turn. A bound automation's own run steers a live
+        // turn at once where the steer leaves its tools running (the scheduled-message row above).
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("automation"),
+          threadId,
+          messageId: MessageId.make("automation"),
+          text: "Report the build status.",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          scheduledTaskId: ScheduledTaskId.make("task:status-check"),
+          createdBy: "user",
+          creationSource: "web",
+        });
         const queued = yield* orchestrator.getThreadProjection(threadId);
         assert.deepEqual(
           queued.runs.filter((run) => run.status === "queued").map((run) => run.queuePosition),
@@ -1485,8 +1441,9 @@ it.effect(
           ["Report the build status.", "Peer thread finished the migration."].find((text) =>
             JSON.stringify(offer.message.message).includes(text),
           );
-        assert.lengthOf(yield* steersAfter(55), 0);
-        const [automationSteer] = yield* steersAfter(35);
+        // A scheduled prompt steers at the next tick wherever the steer leaves tools running, as
+        // Claude's "next" steer does: it does not wait out the 60 s grace.
+        const [automationSteer] = yield* steersAfter(5);
         assert.equal(steerText(automationSteer!), "Report the build status.");
         const peerQueuedAt = yield* DateTime.now;
         yield* orchestrator.dispatch({
@@ -1507,14 +1464,10 @@ it.effect(
           "Report the build status.",
           "Peer thread finished the migration.",
         ]);
-        const sinceQueued = [
-          steers[0]!.at - DateTime.toEpochMillis(queuedAt),
-          steers[1]!.at - DateTime.toEpochMillis(peerQueuedAt),
-        ];
-        for (const delay of sinceQueued) {
-          assert.isAtLeast(delay, 60_000);
-          assert.isAtMost(delay, 90_000);
-        }
+        assert.isAtMost(steers[0]!.at - DateTime.toEpochMillis(queuedAt), 5_000);
+        const peerDelay = steers[1]!.at - DateTime.toEpochMillis(peerQueuedAt);
+        assert.isAtLeast(peerDelay, 60_000);
+        assert.isAtMost(peerDelay, 90_000);
         const after = yield* orchestrator.getThreadProjection(threadId);
         assert.deepEqual(
           after.runs.filter((run) => run.status === "queued").map((run) => run.id),
@@ -1624,6 +1577,9 @@ it.effect.each([
             mcpServerStatus: Effect.succeed([]),
             readMcpResource: () => Effect.die("unexpected MCP resource read"),
             callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+            mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+            reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
             listPermissionRules: Effect.die("unexpected permission rules read"),
             stopTask: () => Effect.void,
             interrupt: Effect.void,
@@ -1744,6 +1700,460 @@ it.effect.each([
       Effect.provide(
         ProviderReplayHarness.layerWithRegistry(
           { name },
+          ProviderAdapterRegistry.layerSingle(adapter),
+          { runEffectWorker: false },
+        ),
+      ),
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        IdAllocator.layer,
+        McpProviderSessions.layer,
+        NodeServices.layer,
+        NodeCrypto.layer,
+      ),
+    ),
+  ),
+);
+
+// A steer Claude never read runs as the next turn, between the messages sent before and after
+// it, even when they share a millisecond and the later one picks another model.
+it.effect.each([
+  "Claude cancels it twice",
+  "the Claude process exits",
+  "the server restarts",
+  "Claude cancels it and the user stops",
+] as const)("handles an unread steer when %s", (outcome) =>
+  Effect.gen(function* () {
+    const cwd = yield* checkpointWorkspace("claude-unread-steer");
+    const sdkMessages = yield* Queue.unbounded<SDKMessage>();
+    const offers: SDKUserMessage[] = [];
+    const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+      instanceId: modelSelection.instanceId,
+      settings,
+      environment: {},
+      attachmentsDir: cwd,
+      fileSystem: yield* FileSystem.FileSystem,
+      path: yield* Path.Path,
+      random: yield* SecureRandom.SecureRandom,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      queryRunner: {
+        allocateSessionId: Effect.succeed(sessionId),
+        open: () =>
+          Effect.succeed({
+            messages: Stream.fromQueue(sdkMessages),
+            offer: (message) => Effect.sync(() => void offers.push(message)),
+            setModel: () => Effect.void,
+            applyFlagSettings: () => Effect.void,
+            setPermissionMode: () => Effect.void,
+            renameSession: () => Effect.void,
+            backgroundTasks: () => Effect.succeed(false),
+            mcpServerStatus: Effect.succeed([]),
+            readMcpResource: () => Effect.die("unexpected MCP resource read"),
+            callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+            mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+            reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
+            listPermissionRules: Effect.die("unexpected permission rules read"),
+            stopTask: () => Effect.void,
+            interrupt: Queue.shutdown(sdkMessages),
+            close: Effect.void,
+          }),
+        forkSession: () => Effect.die("unused"),
+        subagentLaunchToolUseId: () => Effect.succeed(null),
+        subagentModel: () => Effect.succeed(null),
+        assertComplete: Effect.void,
+      },
+    });
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const threadId = ThreadId.make("thread:unread-steer");
+      const steerId = MessageId.make("steer");
+      const watch = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
+        orchestrator.streamDomainEvents.pipe(
+          Stream.filter(predicate),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+      const settled = (runId: RunId, status: "waiting") =>
+        watch(
+          (event) =>
+            event.type === "run.updated" &&
+            event.payload.id === runId &&
+            event.payload.status === status,
+        );
+      const pending = () =>
+        watch(
+          (event) =>
+            event.type === "turn-item.updated" &&
+            event.payload.type === "user_message" &&
+            event.payload.messageId === steerId &&
+            event.payload.status === "pending",
+        );
+      const answer = (offer: SDKUserMessage) =>
+        Queue.offer(
+          sdkMessages,
+          frame({
+            ...(result(`result-${offer.uuid}`, false) as object),
+            user_message_uuid: offer.uuid,
+          }),
+        );
+      const cancel = (offer: SDKUserMessage) =>
+        Queue.offer(
+          sdkMessages,
+          frame({
+            type: "command_lifecycle",
+            command_uuid: offer.uuid,
+            state: "cancelled",
+            uuid: `cancelled-${offer.uuid}`,
+            session_id: sessionId,
+          }),
+        );
+      const offeredText = (offer: SDKUserMessage | undefined) =>
+        JSON.stringify(offer?.message.content ?? null);
+      const queued = Effect.map(orchestrator.getThreadProjection(threadId), (projection) =>
+        projection.runs
+          .filter((run) => run.status === "queued")
+          .toSorted(
+            (left, right) =>
+              (left.queuePosition ?? left.ordinal) - (right.queuePosition ?? right.ordinal),
+          ),
+      );
+      const queuedOrder = Effect.map(queued, (runs) =>
+        runs.map((run) => [run.userMessageId, run.queueHeld === true]),
+      );
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create"),
+        threadId,
+        projectId: ProjectId.make("project:unread-steer"),
+        title: "Unread steer",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: cwd,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const running = yield* watch(
+        (event) => event.type === "provider-turn.updated" && event.payload.status === "running",
+      );
+      const send = (
+        id: string,
+        dispatchMode:
+          | { readonly type: "start_immediately" | "queue_after_active" }
+          | { readonly type: "steer_active"; readonly targetRunId: RunId },
+        model?: string,
+      ) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(id),
+          threadId,
+          messageId: MessageId.make(id),
+          text: `Message ${id}`,
+          attachments: [],
+          ...(model === undefined ? {} : { modelSelection: { ...modelSelection, model } }),
+          dispatchMode,
+          createdBy: "user",
+          creationSource: "web",
+        });
+      yield* send("first", { type: "start_immediately" });
+      yield* worker.drain();
+      yield* Fiber.join(running);
+      const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      yield* send("before", { type: "queue_after_active" });
+      const unread = yield* pending();
+      yield* send("steer", { type: "steer_active", targetRunId: parent.id });
+      yield* worker.drain();
+      yield* Fiber.join(unread);
+      yield* send("after", { type: "queue_after_active" }, "claude-opus-4-1");
+      assert.deepEqual(
+        offers.map((offer) => offer.priority),
+        [undefined, "next"],
+      );
+
+      if (outcome === "Claude cancels it twice") {
+        const ended = yield* settled(parent.id, "waiting");
+        const nextRunning = yield* watch(
+          (event) =>
+            event.type === "provider-turn.updated" &&
+            event.payload.status === "running" &&
+            event.payload.runAttemptId !== parent.activeAttemptId,
+        );
+        yield* answer(offers[0]!);
+        yield* cancel(offers[1]!);
+        yield* Fiber.join(ended);
+        yield* worker.drain();
+        yield* Fiber.join(nextRunning);
+        // The older message runs first; the steer waits right behind it on its own model.
+        const behind = yield* queued;
+        assert.deepEqual(
+          behind.map((run) => run.userMessageId),
+          [steerId, MessageId.make("after")],
+        );
+        assert.deepEqual(behind[0]?.modelSelection, modelSelection);
+        assert.include(offeredText(offers[2]), "Message before");
+        // Promoted into that run, Claude drops it again; it is queued again, then reaches Claude.
+        const before = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+          (run) => run.userMessageId === MessageId.make("before"),
+        )!;
+        yield* orchestrator.dispatch({
+          type: "queued-message.promote-to-steer",
+          commandId: CommandId.make("promote"),
+          threadId,
+          queuedRunId: behind[0]!.id,
+          targetRunId: before.id,
+        });
+        yield* worker.drain();
+        assert.equal(offers[3]?.priority, "next");
+        const beforeEnded = yield* settled(before.id, "waiting");
+        yield* answer(offers[2]!);
+        yield* cancel(offers[3]!);
+        yield* Fiber.join(beforeEnded);
+        yield* worker.drain();
+        assert.deepEqual(yield* queuedOrder, [[MessageId.make("after"), false]]);
+        assert.equal(offers.length, 5);
+        assert.equal(offers[4]?.priority, undefined);
+        assert.include(offeredText(offers[4]), "Message steer");
+        return;
+      }
+
+      if (outcome === "the Claude process exits") {
+        const requeued = yield* watch(
+          (event) =>
+            event.type === "run.updated" &&
+            event.payload.userMessageId === steerId &&
+            event.payload.status === "queued",
+        );
+        yield* Queue.shutdown(sdkMessages);
+        yield* Fiber.join(requeued);
+        yield* worker.drain();
+        // The provider failure holds the queue, the follow-up included, until someone resumes it.
+        assert.deepEqual(yield* queuedOrder, [
+          [MessageId.make("before"), true],
+          [steerId, true],
+          [MessageId.make("after"), true],
+        ]);
+        assert.equal(offers.length, 2);
+        return;
+      }
+
+      if (outcome === "Claude cancels it and the user stops") {
+        yield* cancel(offers[1]!);
+        const dropped = yield* watch(
+          (event) =>
+            event.type === "turn-item.updated" &&
+            event.payload.type === "user_message" &&
+            event.payload.messageId === steerId &&
+            event.payload.status === "cancelled",
+        );
+        yield* orchestrator.dispatch({
+          type: "run.interrupt",
+          commandId: CommandId.make("stop"),
+          threadId,
+          runId: parent.id,
+          holdQueue: true,
+        });
+        yield* worker.drain();
+        yield* Fiber.join(dropped);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(
+          after.turnItems.find((item) => item.type === "user_message" && item.messageId === steerId)
+            ?.status,
+          "cancelled",
+        );
+        assert.isTrue(
+          after.turnItems.some(
+            (item) => item.type === "system_notice" && item.message?.includes("Message steer"),
+          ),
+        );
+        assert.deepEqual(yield* queuedOrder, [
+          [MessageId.make("before"), true],
+          [MessageId.make("after"), true],
+        ]);
+        return;
+      }
+
+      // Recovery cancels the run, holds the queue and leaves the unread steer pending.
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      const now = yield* DateTime.now;
+      yield* (yield* EventSink.EventSinkV2).write({
+        commandId: CommandId.make("command:runtime-reconcile:startup:unread-steer"),
+        events: projection.runs.map((run, index) => ({
+          id: EventId.make(`recovered-run-${index}`),
+          type: "run.updated" as const,
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload:
+            run.id === parent.id
+              ? { ...run, status: "cancelled" as const, completedAt: now }
+              : { ...run, queueHeld: true },
+        })),
+      });
+      yield* orchestrator.recoverDelegatedTasks;
+      yield* worker.drain();
+      assert.deepEqual(yield* queuedOrder, [
+        [MessageId.make("before"), true],
+        [steerId, true],
+        [MessageId.make("after"), true],
+      ]);
+      assert.equal(offers.length, 2);
+    }).pipe(
+      Effect.provide(
+        ProviderReplayHarness.layerWithRegistry(
+          { name: "claude-unread-steer" },
+          ProviderAdapterRegistry.layerSingle(adapter),
+          { runEffectWorker: false },
+        ),
+      ),
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        IdAllocator.layer,
+        McpProviderSessions.layer,
+        NodeServices.layer,
+        NodeCrypto.layer,
+      ),
+    ),
+  ),
+);
+
+// Automatic Send now merges due messages into one steer. When Claude never reads it, every message
+// it carried goes back to the queue, each once and in the order it was sent.
+it.effect("requeues every message of a merged steer Claude never read", () =>
+  Effect.gen(function* () {
+    const cwd = yield* checkpointWorkspace("claude-unread-merged-steer");
+    const sdkMessages = yield* Queue.unbounded<SDKMessage>();
+    const offers: SDKUserMessage[] = [];
+    const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+      instanceId: modelSelection.instanceId,
+      settings,
+      environment: {},
+      attachmentsDir: cwd,
+      fileSystem: yield* FileSystem.FileSystem,
+      path: yield* Path.Path,
+      random: yield* SecureRandom.SecureRandom,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      queryRunner: {
+        allocateSessionId: Effect.succeed(sessionId),
+        open: () =>
+          Effect.succeed({
+            messages: Stream.fromQueue(sdkMessages),
+            offer: (message) => Effect.sync(() => void offers.push(message)),
+            setModel: () => Effect.void,
+            applyFlagSettings: () => Effect.void,
+            setPermissionMode: () => Effect.void,
+            renameSession: () => Effect.void,
+            backgroundTasks: () => Effect.succeed(false),
+            mcpServerStatus: Effect.succeed([]),
+            readMcpResource: () => Effect.die("unexpected MCP resource read"),
+            callMcpTool: () => Effect.die("unexpected MCP tool call"),
+            mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+            mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+            reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
+            listPermissionRules: Effect.die("unexpected permission rules read"),
+            stopTask: () => Effect.void,
+            interrupt: Queue.shutdown(sdkMessages),
+            close: Effect.void,
+          }),
+        forkSession: () => Effect.die("unused"),
+        subagentLaunchToolUseId: () => Effect.succeed(null),
+        subagentModel: () => Effect.succeed(null),
+        assertComplete: Effect.void,
+      },
+    });
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const threadId = ThreadId.make("thread:unread-merged-steer");
+      const watch = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
+        orchestrator.streamDomainEvents.pipe(
+          Stream.filter(predicate),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create"),
+        threadId,
+        projectId: ProjectId.make("project:unread-merged-steer"),
+        title: "Unread merged steer",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: cwd,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const running = yield* watch(
+        (event) => event.type === "provider-turn.updated" && event.payload.status === "running",
+      );
+      const send = (id: string, type: "start_immediately" | "queue_after_active") =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(id),
+          threadId,
+          messageId: MessageId.make(id),
+          text: `Message ${id}`,
+          attachments: [],
+          dispatchMode: { type },
+          createdBy: "user",
+          creationSource: "web",
+        });
+      yield* send("first", "start_immediately");
+      yield* worker.drain();
+      yield* Fiber.join(running);
+      yield* send("one", "queue_after_active");
+      yield* send("two", "queue_after_active");
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      const [parent, one, two] = projection.runs;
+      yield* orchestrator.dispatch({
+        type: "queued-message.promote-to-steer",
+        commandId: CommandId.make(`${QUEUED_DELIVERY_PROMOTION_COMMAND_PREFIX}merged`),
+        threadId,
+        queuedRunId: one!.id,
+        mergedQueuedRunIds: [two!.id],
+        targetRunId: parent!.id,
+      });
+      yield* worker.drain();
+      assert.lengthOf(offers, 2);
+      assert.equal(offers[1]?.priority, "next");
+
+      // Claude exits before it reads the steer: both messages go back, in order, once each. The
+      // run-end reaction places them one after another, each committing before the next.
+      const requeued = yield* watch(
+        (event) =>
+          event.type === "run.created" &&
+          event.payload.userMessageId === MessageId.make("two") &&
+          event.payload.status === "queued",
+      );
+      yield* Queue.shutdown(sdkMessages);
+      yield* Fiber.join(requeued);
+      yield* worker.drain();
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(
+        after.runs
+          .filter((run) => run.status === "queued")
+          .toSorted(
+            (left, right) =>
+              (left.queuePosition ?? left.ordinal) - (right.queuePosition ?? right.ordinal),
+          )
+          .map((run) => run.userMessageId),
+        [MessageId.make("one"), MessageId.make("two")],
+      );
+      assert.lengthOf(offers, 2);
+    }).pipe(
+      Effect.provide(
+        ProviderReplayHarness.layerWithRegistry(
+          { name: "claude-unread-merged-steer" },
           ProviderAdapterRegistry.layerSingle(adapter),
           { runEffectWorker: false },
         ),

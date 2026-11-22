@@ -8,12 +8,19 @@ import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as IngestLag from "./IngestLag.ts";
 
 const MAX_EVENTS = 64;
 const MAX_BYTES = 1024 * 1024;
+// While another write waits, a shared transaction stops taking jobs after this long.
+const MAX_HOLD_NANOS = 100_000_000n;
+// A stream waiting this long ranks like a main thread, so subagents cannot starve.
+const STARVATION_MILLIS = 30_000;
+// Bounds snapshots held across stream queues; a full backlog makes streams wait to read more.
+const MAX_QUEUED = 4 * MAX_EVENTS;
 const encodeQueue = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 export const enabled = Config.Boolean("T3CODE_PROVIDER_COMMIT_BATCHING").pipe(
@@ -27,12 +34,50 @@ export const perJobSavepoints = Config.Boolean("T3CODE_PROVIDER_COMMIT_JOB_SAVEP
   Effect.orDie,
 );
 
+type Snapshot =
+  | {
+      readonly type: "node.updated";
+      readonly node: { readonly id: string; readonly threadId: string };
+    }
+  | {
+      readonly type: "message.updated";
+      readonly message: { readonly id: string; readonly threadId: string };
+    }
+  | {
+      readonly type: "turn_item.updated";
+      readonly turnItem: { readonly id: string; readonly threadId: string };
+    }
+  | {
+      readonly type: "plan.updated";
+      readonly plan: { readonly id: string; readonly threadId: string };
+    };
 /** Provider snapshots, which a consumer batches unless it says otherwise. */
-export const isSnapshot = (event: { readonly type: string }) =>
+export const isSnapshot = (event: { readonly type: string }): event is Snapshot =>
   event.type === "node.updated" ||
   event.type === "message.updated" ||
   event.type === "turn_item.updated" ||
   event.type === "plan.updated";
+// Undefined for an item that names no entity, such as a consumer's own item under a snapshot type.
+const snapshotEntity = (event: Snapshot) => {
+  const entity: { readonly id?: unknown; readonly threadId?: unknown } | undefined =
+    event.type === "node.updated"
+      ? event.node
+      : event.type === "message.updated"
+        ? event.message
+        : event.type === "turn_item.updated"
+          ? event.turnItem
+          : event.plan;
+  return typeof entity?.id === "string" && typeof entity.threadId === "string"
+    ? { key: `${event.type}:${entity.id}`, threadId: entity.threadId }
+    : undefined;
+};
+
+/** Who a provider stream writes for; ranks its snapshots against other streams'. */
+export interface StreamPriority {
+  readonly threadId: string;
+  /** A subagent or delegated task, which yields to main threads. */
+  readonly delegated: boolean;
+}
 
 export class CommitBatchError extends Schema.TaggedError<CommitBatchError>()("CommitBatchError", {
   cause: Schema.Defect(),
@@ -42,57 +87,79 @@ export const isCommitBatchError = Schema.is(CommitBatchError);
 const WAIT_SITE = "ProviderCommitBatch.queue";
 const BATCH_SITE = "ProviderCommitBatch.batch";
 
-/** A provider snapshot a consumer batched, or a write's barrier: a command's or a control's. */
-type JobKind = "snapshot" | "barrier";
-
-interface Job {
+interface StreamState {
   readonly owner: { active: boolean };
-  readonly kind: JobKind;
+  readonly priority: StreamPriority | undefined;
+  /** Queued snapshots not yet taken into a batch, in stream order. */
+  readonly jobs: Array<Job>;
+  unsettled: number;
+  servedAt: number;
+  /** A control, failure or EOF of this stream waits for its queued snapshots. */
+  finishing: boolean;
+}
+interface Job {
+  readonly stream: StreamState;
+  /** Still in its stream's queue, holding one of the backlog's `MAX_QUEUED` slots. */
+  queued: boolean;
+  readonly key: string;
+  /** The thread its writes are for; undefined when unknown, and then every barrier waits for it. */
+  readonly threadId: string | undefined;
   readonly queuedAt: number;
   readonly queuedNs: bigint;
-  /** The caller's operation, and the job flushing when this one queued; only while observed. */
+  /** The caller's operation, and the batch flushing when this one queued; only while observed. */
   readonly operation: string | undefined;
   readonly queuedBehind: string | undefined;
-  readonly snapshot: boolean;
   readonly bytes: number;
   readonly execute: Effect.Effect<void, CommitBatchError>;
   readonly settle: (
     exit: Exit.Exit<void, CommitBatchError>,
     preserveFailure: boolean,
   ) => Effect.Effect<void>;
+  /** Settles a job a later snapshot of the same entity replaced, with that snapshot's outcome. */
+  readonly skip: (exit: Exit.Exit<void, CommitBatchError>) => Effect.Effect<void>;
   readonly cancel: Effect.Effect<void>;
+  readonly settled: Effect.Effect<void>;
+}
+interface Unit {
+  readonly job: Job;
+  readonly superseded: ReadonlyArray<Job>;
 }
 interface Batch {
-  readonly events: ReadonlyArray<Job>;
-  readonly bytes: number;
-  readonly reason: "ready" | "limit" | "control";
+  readonly units: ReadonlyArray<Unit>;
+  readonly reason: "ready" | "limit";
+  readonly dequeued: number;
 }
 
-function collect(queue: Queue.Queue<Job>) {
-  return Stream.fromEffectRepeat(Queue.takeBetween(queue, 1, MAX_EVENTS)).pipe(
-    Stream.flatMap((ready) => {
-      const batches: Array<Batch> = [];
-      let events: Array<Job> = [];
-      let bytes = 0;
-      const flush = (reason: Batch["reason"]) => {
-        if (events.length > 0) batches.push({ events, bytes, reason });
-        events = [];
-        bytes = 0;
-      };
-      for (const job of ready) {
-        if (!job.snapshot) {
-          flush("control");
-          batches.push({ events: [job], bytes: 0, reason: "control" });
-        } else {
-          if (events.length > 0 && bytes + job.bytes > MAX_BYTES) flush("limit");
-          events.push(job);
-          bytes += job.bytes;
-          if (events.length >= MAX_EVENTS || bytes >= MAX_BYTES) flush("limit");
-        }
-      }
-      flush("ready");
-      return Stream.fromArray(batches);
-    }),
+/**
+ * Snapshots carry an entity's full state, so an earlier one is dropped when a later one of the
+ * same entity follows it in this stream with no first appearance of another entity in between.
+ * Kept jobs stay in stream order, and entities first appear in the same order as before.
+ */
+function coalesce(jobs: ReadonlyArray<Job>): Array<Unit> {
+  const firstSeen = new Map<string, number>();
+  jobs.forEach((job, index) => {
+    if (!firstSeen.has(job.key)) firstSeen.set(job.key, index);
+  });
+  const survivor: Array<number> = Array.from({ length: jobs.length }, (_, index) => index);
+  const nextOfKey = new Map<string, number>();
+  for (let index = jobs.length - 1; index >= 0; index--) {
+    const job = jobs[index]!;
+    const next = nextOfKey.get(job.key);
+    nextOfKey.set(job.key, index);
+    if (next === undefined) continue;
+    let replaced = true;
+    for (let between = index + 1; replaced && between < next; between++) {
+      if (firstSeen.get(jobs[between]!.key)! > index) replaced = false;
+    }
+    if (replaced) survivor[index] = survivor[next]!;
+  }
+  const superseded = new Map<number, Array<Job>>();
+  jobs.forEach((job, index) => {
+    const kept = survivor[index]!;
+    if (kept !== index) superseded.set(kept, [...(superseded.get(kept) ?? []), job]);
+  });
+  return jobs.flatMap((job, index) =>
+    survivor[index] === index ? [{ job, superseded: superseded.get(index) ?? [] }] : [],
   );
 }
 
@@ -166,44 +233,73 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
   commit: (work: Effect.Effect<void, CommitBatchError>) => Effect.Effect<void, CommitBatchError>,
   enabled: boolean,
   isolation: Isolation = noIsolation,
+  /** Whether a client has the thread open; its streams rank first. */
+  isViewed: (threadId: string) => boolean = () => false,
+  /**
+   * Whether a later snapshot of an entity replaces an earlier one still queued, whose `process`
+   * then never runs. Off unless asked: a run's ingestion folds its backlog in
+   * its own mailbox first and must see every item it hands over processed.
+   */
+  coalesceSnapshots = false,
 ) {
-  const queue = yield* Queue.bounded<Job>(MAX_EVENTS);
+  const wake = yield* Queue.sliding<void>(1);
+  const backlog = yield* Semaphore.make(MAX_QUEUED);
+  const streams = new Set<StreamState>();
   const pending = new Set<Job>();
+  let closed = false;
+  let servings = 0;
+  // Writes in `barrier` that have not finished; they wait on the batch or the writer it holds.
+  let waitingWriters = 0;
+  // Batched items that name no snapshot entity each keep a key of their own: none replaces another.
+  let unkeyed = 0;
   const observer = yield* CurrentWaitObserver;
-  // The operation of the batch the worker is flushing, named to the jobs that queue behind it.
+  // The operation of the batch the worker is flushing, named to the writes that wait behind it.
   let flushing: string | undefined;
   if (enabled && observer !== undefined) {
-    const unregister = observer.register("ProviderCommitBatch.depth", "gauge", () => pending.size);
+    const unregister = observer.register(
+      "ProviderCommitBatch.depth",
+      "gauge",
+      () => pending.size + waitingWriters,
+    );
     yield* Effect.addFinalizer(() => Effect.sync(unregister));
   }
-  let closed = false;
   const shutdown = Effect.gen(function* () {
     closed = true;
-    yield* Queue.shutdown(queue);
+    yield* Queue.shutdown(wake);
     for (const job of pending) yield* job.cancel;
+    yield* backlog.releaseAll;
   });
   yield* Effect.addFinalizer(() => shutdown);
+  const entityOf = (event: { readonly type: string }) =>
+    (isSnapshot(event) ? snapshotEntity(event) : undefined) ?? {
+      key: `${event.type}#${++unkeyed}`,
+      threadId: undefined,
+    };
   // These helpers run once per raw event; the shared transaction owns the tracing span.
   const enqueue = Effect.fnUntraced(function* <A, E, R>(
     effect: Effect.Effect<A, E, R>,
-    token: { active: boolean },
-    kind: JobKind,
+    stream: StreamState,
+    entity: { readonly key: string; readonly threadId: string | undefined },
     bytes: number,
+    skipped: A,
   ) {
-    const snapshot = kind === "snapshot";
     const caller = yield* Effect.context<R>();
     const reply = yield* Deferred.make<A, E | CommitBatchError>();
     let ownFailure: Cause.Cause<E> | undefined;
     let result: A;
+    const release = () => {
+      if (pending.delete(job)) stream.unsettled--;
+    };
     observer?.depth(WAIT_SITE, pending.size);
     const job: Job = {
-      owner: token,
-      kind,
+      stream,
+      queued: false,
+      key: entity.key,
+      threadId: entity.threadId,
       queuedAt: yield* Clock.currentTimeMillis,
       queuedNs: observer === undefined ? 0n : yield* Clock.monotonicTimeNanos,
       operation: observer === undefined ? undefined : (operationName(caller) ?? "(untraced)"),
       queuedBehind: flushing,
-      snapshot,
       bytes,
       execute: effect.pipe(
         Effect.tapCause((cause) =>
@@ -224,211 +320,335 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
         exit: Exit.Exit<void, CommitBatchError>,
         preserveFailure: boolean,
       ) {
-        pending.delete(job);
+        release();
         if (Exit.isFailure(exit)) {
-          token.active = false;
+          stream.owner.active = false;
           yield* Deferred.failCause(
             reply,
             preserveFailure && ownFailure !== undefined ? ownFailure : exit.cause,
           );
         } else yield* Deferred.succeed(reply, result);
       }),
-      cancel: Effect.gen(function* () {
-        pending.delete(job);
-        yield* Deferred.interrupt(reply);
+      skip: (exit) =>
+        Exit.isFailure(exit)
+          ? job.settle(exit, false)
+          : Effect.suspend(() => {
+              release();
+              return Deferred.succeed(reply, skipped);
+            }),
+      cancel: Effect.suspend(() => {
+        release();
+        const dequeued = job.queued;
+        job.queued = false;
+        return Deferred.interrupt(reply).pipe(
+          Effect.andThen(dequeued ? backlog.release(1) : Effect.void),
+        );
       }),
+      settled: Deferred.await(reply).pipe(Effect.exit, Effect.asVoid),
     };
     yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
+        if (closed) return yield* Deferred.interrupt(reply);
+        yield* restore(backlog.take(1));
+        if (closed) {
+          yield* backlog.release(1);
+          return yield* Deferred.interrupt(reply);
+        }
+        job.queued = true;
         pending.add(job);
-        const accepted = yield* restore(Queue.offer(queue, job)).pipe(
-          Effect.onError(() => job.cancel),
-        );
-        if (!accepted) yield* job.cancel;
+        stream.unsettled++;
+        stream.jobs.push(job);
+        yield* Queue.offer(wake, undefined);
       }),
     );
     return Deferred.await(reply);
   });
-  // A savepoint per job, as the batch must behave; a lone job fails its transaction instead.
-  const perJob = (
-    jobs: ReadonlyArray<Job>,
-    outcomes: Map<Job, Exit.Exit<void, CommitBatchError>>,
-  ) =>
-    Effect.forEach(
-      jobs,
-      (job) =>
-        Effect.gen(function* () {
-          if (!job.owner.active) return yield* job.cancel;
-          const isolated = jobs.length > 1 && job.bytes > 0;
-          const recording = isolated ? yield* isolation.record : undefined;
-          const outcome = yield* (isolated ? isolation.segment(job.execute) : job.execute).pipe(
-            Effect.exit,
-          );
-          outcomes.set(job, outcome);
-          if (Exit.isFailure(outcome)) {
-            if (recording !== undefined) yield* recording.discard;
-            job.owner.active = false;
-            if (jobs.length === 1) return yield* Effect.failCause(outcome.cause);
+  const rank = (stream: StreamState, now: number) => {
+    const tier =
+      stream.priority === undefined
+        ? 1
+        : isViewed(stream.priority.threadId)
+          ? 0
+          : stream.priority.delegated
+            ? 2
+            : 1;
+    const starved = now - stream.jobs[0]!.queuedAt >= STARVATION_MILLIS;
+    return [starved ? Math.min(tier, 1) : tier, stream.finishing ? 0 : 1, stream.servedAt];
+  };
+  // Viewed streams first, then main threads, then subagents; within a tier, streams finishing a
+  // control first, then the stream served longest ago.
+  const nextBatch = (now: number): Batch | undefined => {
+    const ready = Array.from(streams, (stream) =>
+      stream.jobs.length === 0 ? [] : [{ stream, rank: rank(stream, now) }],
+    )
+      .flat()
+      .sort((left, right) => {
+        for (let index = 0; index < left.rank.length; index++) {
+          const order = left.rank[index]! - right.rank[index]!;
+          if (order !== 0) return order;
+        }
+        return 0;
+      });
+    if (ready.length === 0) return undefined;
+    const units: Array<Unit> = [];
+    let bytes = 0;
+    let dequeued = 0;
+    let reason: Batch["reason"] = "ready";
+    for (const { stream } of ready) {
+      let take = 0;
+      while (take < stream.jobs.length && take < MAX_EVENTS - units.length) {
+        const next = stream.jobs[take]!.bytes;
+        if (units.length + take > 0 && bytes + next > MAX_BYTES) break;
+        bytes += next;
+        take++;
+      }
+      if (take < stream.jobs.length) reason = "limit";
+      if (take === 0) break;
+      const taken = stream.jobs.splice(0, take);
+      for (const job of taken) job.queued = false;
+      dequeued += take;
+      units.push(
+        ...(coalesceSnapshots ? coalesce(taken) : taken.map((job) => ({ job, superseded: [] }))),
+      );
+      stream.servedAt = ++servings;
+      if (units.length >= MAX_EVENTS || bytes >= MAX_BYTES) break;
+    }
+    return { units, reason, dequeued };
+  };
+  const cancelUnit = Effect.fnUntraced(function* ({ job, superseded }: Unit) {
+    yield* job.cancel;
+    for (const replaced of superseded) yield* replaced.cancel;
+  });
+  // Commits a prefix of `units` in one transaction and returns how many it took.
+  const commitPrefix = (units: ReadonlyArray<Unit>, reason: Batch["reason"]) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const outcomes = new Map<Job, Exit.Exit<void, CommitBatchError>>();
+        let taken = 0;
+        let startedAt = 0n;
+        let held = false;
+        // Whether the transaction stops taking units: it has held the writer long enough while
+        // another write waits. Checked before each unit but the first.
+        const holdEnds = Effect.gen(function* () {
+          if (held) return true;
+          held =
+            taken > 0 &&
+            waitingWriters > 0 &&
+            (yield* Clock.monotonicTimeNanos) - startedAt >= MAX_HOLD_NANOS;
+          return held;
+        });
+        // A savepoint per unit, as the batch must behave; a lone unit fails its transaction instead.
+        const perJob = Effect.gen(function* () {
+          for (const unit of units) {
+            if (yield* holdEnds) return;
+            taken++;
+            const { job } = unit;
+            if (!job.stream.owner.active) {
+              yield* cancelUnit(unit);
+              continue;
+            }
+            const isolated = units.length > 1;
+            const recording = isolated ? yield* isolation.record : undefined;
+            const outcome = yield* (isolated ? isolation.segment(job.execute) : job.execute).pipe(
+              Effect.exit,
+            );
+            outcomes.set(job, outcome);
+            if (Exit.isFailure(outcome)) {
+              if (recording !== undefined) yield* recording.discard;
+              job.stream.owner.active = false;
+              if (units.length === 1) return yield* Effect.failCause(outcome.cause);
+            }
           }
-        }),
-      { discard: true },
-    );
-  // One consumer's consecutive jobs, recorded; stops at a failure, after which its later jobs cancel.
-  const runSegment = Effect.fnUntraced(function* (
-    segment: ReadonlyArray<Job>,
-    outcomes: Map<Job, Exit.Exit<void, CommitBatchError>>,
-  ) {
-    const applied: Array<Recording> = [];
-    let failed: Recording | undefined;
-    for (const job of segment) {
-      if (!job.owner.active) {
-        yield* job.cancel;
-        continue;
-      }
-      const recording = yield* isolation.record;
-      const outcome = yield* recording.around(job.execute).pipe(Effect.exit);
-      outcomes.set(job, outcome);
-      if (Exit.isSuccess(outcome)) applied.push(recording);
-      else {
-        job.owner.active = false;
-        failed = recording;
-      }
-    }
-    return { applied, failed };
-  });
-  const optimistic = Effect.fnUntraced(function* (
-    jobs: ReadonlyArray<Job>,
-    outcomes: Map<Job, Exit.Exit<void, CommitBatchError>>,
-  ) {
-    const segments: Array<Array<Job>> = [];
-    for (const job of jobs) {
-      const last = segments.at(-1);
-      if (last !== undefined && last[0]!.owner === job.owner) last.push(job);
-      else segments.push([job]);
-    }
-    if (segments.length === 1) {
-      const { applied, failed } = yield* runSegment(segments[0]!, outcomes);
-      if (failed === undefined) return;
-      yield* failed.discard;
-      yield* isolation.restart;
-      for (const recording of applied) yield* recording.reapply;
-      return;
-    }
-    for (const segment of segments) {
-      // A consumer's end writes nothing, so it needs no savepoint.
-      if (segment.every((job) => job.bytes === 0)) {
-        yield* runSegment(segment, outcomes);
-        continue;
-      }
-      const rolledBack = yield* isolation
-        .segment(
-          Effect.flatMap(runSegment(segment, outcomes), ({ applied, failed }) =>
-            failed === undefined
-              ? Effect.undefined
-              : Effect.andThen(failed.discard, Effect.fail(new SegmentFailed(applied))),
-          ),
-        )
-        .pipe(
-          Effect.catchIf(
-            (error): error is SegmentFailed => error instanceof SegmentFailed,
-            (error) => Effect.succeed(error),
-          ),
-        );
-      if (rolledBack !== undefined)
-        for (const recording of rolledBack.applied) yield* recording.reapply;
-    }
-  });
-  if (enabled) {
-    yield* collect(queue).pipe(
-      Stream.runForEach((batch) =>
-        Effect.uninterruptibleMask((restore) =>
-          Effect.gen(function* () {
-            const jobs = batch.events.filter((job) => job.owner.active);
-            for (const job of batch.events) if (!job.owner.active) yield* job.cancel;
-            if (jobs.length === 0) return;
-            if (observer !== undefined) {
-              const flushNs = yield* Clock.monotonicTimeNanos;
-              for (const job of jobs) {
-                const waitNs = Number(flushNs - job.queuedNs);
-                observer.wait(WAIT_SITE, waitNs, job.queuedBehind);
-                observer.wait(`${WAIT_SITE}.${job.kind}`, waitNs, undefined);
-              }
-              observer.depth(BATCH_SITE, jobs.length);
-              flushing = jobs[0]!.operation;
+        });
+        // One stream's consecutive units, recorded; stops at a failure, after which the stream's
+        // later units cancel.
+        const runSegment = Effect.fnUntraced(function* (segment: ReadonlyArray<Unit>) {
+          const applied: Array<Recording> = [];
+          let failed: Recording | undefined;
+          for (const unit of segment) {
+            if (yield* holdEnds) break;
+            taken++;
+            const { job } = unit;
+            if (!job.stream.owner.active) {
+              yield* cancelUnit(unit);
+              continue;
             }
-            yield* Effect.annotateCurrentSpan({
-              "orchestration_v2.work_item_count": jobs.length,
-              "orchestration_v2.consumer_count": new Set(jobs.map((job) => job.owner)).size,
-              "orchestration_v2.raw_json_bytes": batch.bytes,
-              "orchestration_v2.batch_flush_reason": batch.reason,
-              "orchestration_v2.backlog_batching": true,
-              "orchestration_v2.batch_wait_ms":
-                (yield* Clock.currentTimeMillis) - Math.min(...jobs.map((job) => job.queuedAt)),
-            });
-            const outcomes = new Map<Job, Exit.Exit<void, CommitBatchError>>();
-            const work =
-              jobs.length === 1 || isolation.perJobSavepoints === true
-                ? perJob(jobs, outcomes)
-                : optimistic(jobs, outcomes);
-            const exit = yield* restore(
-              (jobs.every((job) => job.bytes === 0) ? work : commit(work)).pipe(
-                Effect.provideService(CurrentWorker, yield* Effect.fiberId),
-              ),
-            ).pipe(Effect.exit);
-            for (const job of jobs) {
-              const outcome = outcomes.get(job) ?? Exit.void;
-              yield* job.settle(
-                Exit.isSuccess(exit) ? outcome : exit,
-                Exit.isSuccess(exit) ||
-                  (Exit.isFailure(exit) &&
-                    Exit.isFailure(outcome) &&
-                    Cause.squash(exit.cause) === Cause.squash(outcome.cause)),
+            const recording = yield* isolation.record;
+            const outcome = yield* recording.around(job.execute).pipe(Effect.exit);
+            outcomes.set(job, outcome);
+            if (Exit.isSuccess(outcome)) applied.push(recording);
+            else {
+              job.stream.owner.active = false;
+              failed = recording;
+            }
+          }
+          return { applied, failed };
+        });
+        const optimistic = Effect.gen(function* () {
+          const segments: Array<Array<Unit>> = [];
+          for (const unit of units) {
+            const last = segments.at(-1);
+            if (last !== undefined && last[0]!.job.stream === unit.job.stream) last.push(unit);
+            else segments.push([unit]);
+          }
+          if (segments.length === 1) {
+            const { applied, failed } = yield* runSegment(segments[0]!);
+            if (failed === undefined) return;
+            yield* failed.discard;
+            yield* isolation.restart;
+            for (const recording of applied) yield* recording.reapply;
+            return;
+          }
+          for (const segment of segments) {
+            if (yield* holdEnds) return;
+            const rolledBack = yield* isolation
+              .segment(
+                Effect.flatMap(runSegment(segment), ({ applied, failed }) =>
+                  failed === undefined
+                    ? Effect.undefined
+                    : Effect.andThen(failed.discard, Effect.fail(new SegmentFailed(applied))),
+                ),
+              )
+              .pipe(
+                Effect.catchIf(
+                  (error): error is SegmentFailed => error instanceof SegmentFailed,
+                  (error) => Effect.succeed(error),
+                ),
               );
+            if (rolledBack !== undefined)
+              for (const recording of rolledBack.applied) yield* recording.reapply;
+          }
+        });
+        const work = Effect.gen(function* () {
+          // A retried transaction runs this again from the first unit.
+          outcomes.clear();
+          taken = 0;
+          held = false;
+          startedAt = yield* Clock.monotonicTimeNanos;
+          yield* units.length === 1 || isolation.perJobSavepoints === true ? perJob : optimistic;
+        });
+        const exit = yield* restore(
+          commit(work).pipe(Effect.provideService(CurrentWorker, yield* Effect.fiberId)),
+        ).pipe(Effect.exit);
+        const committed = taken === 0 ? units : units.slice(0, taken);
+        const jobs = committed.flatMap((unit) => [unit.job, ...unit.superseded]);
+        // Events per commit.
+        observer?.depth(BATCH_SITE, jobs.length);
+        yield* Effect.annotateCurrentSpan({
+          "orchestration_v2.work_item_count": committed.length,
+          "orchestration_v2.coalesced_work_item_count": jobs.length - committed.length,
+          "orchestration_v2.deferred_work_item_count": units.length - committed.length,
+          "orchestration_v2.consumer_count": new Set(jobs.map((job) => job.stream)).size,
+          "orchestration_v2.raw_json_bytes": jobs.reduce((bytes, job) => bytes + job.bytes, 0),
+          "orchestration_v2.batch_flush_reason": reason,
+          "orchestration_v2.backlog_batching": true,
+          "orchestration_v2.batch_wait_ms":
+            (yield* Clock.currentTimeMillis) - Math.min(...jobs.map((job) => job.queuedAt)),
+        });
+        for (const { job, superseded } of committed) {
+          const outcome = outcomes.get(job) ?? Exit.void;
+          const final = Exit.isSuccess(exit) ? outcome : exit;
+          yield* job.settle(
+            final,
+            Exit.isSuccess(exit) ||
+              (Exit.isFailure(exit) &&
+                Exit.isFailure(outcome) &&
+                Cause.squash(exit.cause) === Cause.squash(outcome.cause)),
+          );
+          for (const replaced of superseded) yield* replaced.skip(final);
+        }
+        return committed.length;
+      }),
+    ).pipe(Effect.withSpan("orchestrationV2.ProviderCommitBatch.flush"));
+  if (enabled) {
+    yield* Effect.forever(
+      Effect.gen(function* () {
+        const batch = nextBatch(yield* Clock.currentTimeMillis);
+        if (batch === undefined) return yield* Queue.take(wake);
+        yield* backlog.release(batch.dequeued);
+        if (observer !== undefined) {
+          const flushNs = yield* Clock.monotonicTimeNanos;
+          for (const { job, superseded } of batch.units) {
+            for (const queued of [job, ...superseded]) {
+              const waitNs = Number(flushNs - queued.queuedNs);
+              observer.wait(WAIT_SITE, waitNs, queued.queuedBehind);
+              observer.wait(`${WAIT_SITE}.snapshot`, waitNs, undefined);
             }
+          }
+          flushing = batch.units[0]?.job.operation;
+        }
+        let units = batch.units;
+        while (units.length > 0) units = units.slice(yield* commitPrefix(units, batch.reason));
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            flushing = undefined;
           }),
-        ).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              flushing = undefined;
-            }),
-          ),
-          Effect.withSpan("orchestrationV2.ProviderCommitBatch.flush"),
         ),
       ),
-      Effect.ensuring(shutdown),
-      Effect.forkScoped,
-    );
+    ).pipe(Effect.ensuring(shutdown), Effect.forkScoped);
   }
-  const barrier = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+  /**
+   * Runs `effect` after queued snapshots for `threadIds` commit; omitted, after every queued
+   * snapshot. Other threads' snapshots never delay it.
+   */
+  const barrier = Effect.fnUntraced(function* <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    threadIds?: ReadonlyArray<string>,
+  ) {
     if (closed) return yield* Effect.interrupt;
     if (!enabled || (yield* CurrentWorker) === (yield* Effect.fiberId)) return yield* effect;
-    if (pending.size === 0) {
-      observer?.depth(WAIT_SITE, 0);
+    const awaited = Array.from(pending).filter(
+      (job) =>
+        threadIds === undefined || job.threadId === undefined || threadIds.includes(job.threadId),
+    );
+    // A write counts as waiting until it ends, also one with no snapshot to wait for: it may wait
+    // on the writer the batch holds, so the batch stops taking jobs after its hold limit.
+    const counted = <B, E2, R2>(write: Effect.Effect<B, E2, R2>) =>
+      Effect.uninterruptibleMask((restore) => {
+        waitingWriters++;
+        return restore(write).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              waitingWriters--;
+            }),
+          ),
+        );
+      });
+    observer?.depth(WAIT_SITE, awaited.length);
+    if (awaited.length === 0) {
       observer?.wait(WAIT_SITE, 0, undefined);
       observer?.wait(`${WAIT_SITE}.barrier`, 0, undefined);
-      return yield* effect;
+      return yield* counted(effect);
     }
-    const token = { active: true };
-    const queued = enqueue(Effect.exit(effect), token, "barrier", 0).pipe(
-      Effect.flatten,
-      Effect.orDie,
-      Effect.flatten,
-      Effect.ensuring(
-        Effect.sync(() => {
-          token.active = false;
-        }),
-      ),
-    );
+    const holder = flushing;
+    const waitStartNs = observer === undefined ? 0n : yield* Clock.monotonicTimeNanos;
+    const wait = Effect.gen(function* () {
+      for (const job of awaited) yield* job.settled;
+      if (observer !== undefined) {
+        const waitNs = Number((yield* Clock.monotonicTimeNanos) - waitStartNs);
+        observer.wait(WAIT_SITE, waitNs, holder);
+        observer.wait(`${WAIT_SITE}.barrier`, waitNs, undefined);
+      }
+    });
     const lent = yield* CurrentLaneWait;
-    // The slot is out from before the write may wait for room in the queue until it settles; taking
-    // it back never waits, so this runs on every exit.
-    return yield* lent?.owner === (yield* Effect.fiberId)
-      ? Effect.acquireUseRelease(
-          lent.suspend,
-          () => queued,
-          () => lent.resume,
-        )
-      : queued;
+    // The slot is out while the write waits for the snapshots before it, and back before the write
+    // runs; taking it back never waits, so this runs on every exit.
+    const waited =
+      lent?.owner === (yield* Effect.fiberId)
+        ? Effect.acquireUseRelease(
+            lent.suspend,
+            () => wait,
+            () => lent.resume,
+          )
+        : wait;
+    return yield* counted(
+      Effect.gen(function* () {
+        yield* waited;
+        if (closed) return yield* Effect.interrupt;
+        return yield* effect;
+      }),
+    );
   });
   const consume = Effect.fnUntraced(function* <A extends { readonly type: string }, E, R, E2, R2>(
     source: Stream.Stream<A, E, R>,
@@ -436,6 +656,7 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
     after: Effect.Effect<boolean, E2, R2>,
     canBatch: (event: A) => Effect.Effect<boolean, never, R2> = (event) =>
       Effect.succeed(isSnapshot(event)),
+    priority?: StreamPriority,
   ) {
     if (!enabled)
       return yield* source.pipe(
@@ -452,38 +673,63 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
         Stream.takeUntil(Boolean),
         Stream.runDrain,
       );
-    const token = { active: true };
+    const stream: StreamState = {
+      owner: { active: true },
+      priority,
+      jobs: [],
+      unsettled: 0,
+      servedAt: 0,
+      finishing: false,
+    };
+    streams.add(stream);
     const signals = source.pipe(
       Stream.map((event) => ({ _tag: "Event" as const, event })),
       Stream.catchCause((cause) => Stream.succeed({ _tag: "Failure" as const, cause })),
       Stream.concat(Stream.succeed({ _tag: "End" as const })),
     );
     let resume: Effect.Effect<void> = Effect.void;
+    // Replies run in order, so EOF, failures and controls follow this stream's earlier snapshots
+    // without waiting for other streams' work.
     yield* signals.pipe(
       Stream.mapEffect((signal) =>
         Effect.gen(function* () {
           yield* resume;
           const processed = yield* Deferred.make<void>();
-          const event = signal._tag === "Event" ? signal.event : undefined;
-          // EOF only acknowledges prior work; it can share a commit with other consumers.
-          const snapshot =
-            signal._tag === "End" || (event !== undefined && (yield* canBatch(event)));
-          const bytes =
-            snapshot && event !== undefined ? Buffer.byteLength(yield* encodeQueue(event)) : 0;
           const ingest = { persisted: false };
-          const work: Effect.Effect<boolean, E | E2, R2> =
-            signal._tag === "Failure"
-              ? Effect.failCause(signal.cause)
-              : event === undefined
-                ? Effect.succeed(true)
-                : process(event).pipe(
-                    Effect.provideService(IngestLag.CurrentIngest, ingest),
-                    Effect.as(false),
-                  );
-          // A control runs after the replies before it settle, so only its own writes queue.
-          const reply = snapshot ? yield* enqueue(work, token, "snapshot", bytes) : work;
-          if (!snapshot) resume = Deferred.await(processed);
-          return { reply, processed, check: !snapshot, event, ingest };
+          const event = signal._tag === "Event" ? signal.event : undefined;
+          let reply: Effect.Effect<boolean, E | E2 | CommitBatchError, R2>;
+          let check = false;
+          if (event !== undefined && (yield* canBatch(event))) {
+            const bytes = Buffer.byteLength(yield* encodeQueue(event));
+            reply = yield* enqueue(
+              process(event).pipe(
+                Effect.provideService(IngestLag.CurrentIngest, ingest),
+                Effect.as(false),
+              ),
+              stream,
+              entityOf(event),
+              bytes,
+              false,
+            );
+          } else {
+            if (stream.unsettled > 0) stream.finishing = true;
+            if (signal._tag === "End") reply = Effect.succeed(true);
+            else if (signal._tag === "Failure") reply = Effect.failCause(signal.cause);
+            else {
+              const control = signal.event;
+              reply = Effect.sync(() => {
+                stream.finishing = false;
+              }).pipe(
+                Effect.andThen(
+                  process(control).pipe(Effect.provideService(IngestLag.CurrentIngest, ingest)),
+                ),
+                Effect.as(false),
+              );
+              check = true;
+              resume = Deferred.await(processed);
+            }
+          }
+          return { reply, processed, check, event, ingest };
         }),
       ),
       Stream.buffer({ capacity: MAX_EVENTS }),
@@ -500,7 +746,7 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
           ),
           Effect.tap((stop) =>
             Effect.sync(() => {
-              if (stop) token.active = false;
+              if (stop) stream.owner.active = false;
             }),
           ),
           Effect.ensuring(Deferred.succeed(processed, undefined)),
@@ -509,8 +755,10 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
       Stream.takeUntil(Boolean),
       Stream.runDrain,
       Effect.ensuring(
-        Effect.sync(() => {
-          token.active = false;
+        Effect.gen(function* () {
+          stream.owner.active = false;
+          streams.delete(stream);
+          for (const job of stream.jobs.splice(0)) yield* job.cancel;
         }),
       ),
     );

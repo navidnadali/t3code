@@ -34,6 +34,11 @@ it.layer(NodeServices.layer)("checkpointWorkspace", (it) => {
     { runner: "a git hook", selectors: ["GIT_DIR", "GIT_INDEX_FILE"] },
   ])("keeps to its own repository when run under $runner", ({ selectors }) =>
     Effect.gen(function* () {
+      yield* Effect.addFinalizer(() => Effect.sync(() => vi.unstubAllEnvs()));
+      // These commits use the contributor's global config, which must not require a signing key.
+      vi.stubEnv("GIT_CONFIG_COUNT", "1");
+      vi.stubEnv("GIT_CONFIG_KEY_0", "commit.gpgsign");
+      vi.stubEnv("GIT_CONFIG_VALUE_0", "false");
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-replay-workspace-decoy-" });
@@ -46,8 +51,6 @@ it.layer(NodeServices.layer)("checkpointWorkspace", (it) => {
         "user.name=Decoy",
         "-c",
         "user.email=decoy@example.com",
-        "-c",
-        "commit.gpgsign=false",
         "commit",
         "--allow-empty",
         "-m",
@@ -63,7 +66,6 @@ it.layer(NodeServices.layer)("checkpointWorkspace", (it) => {
         GIT_INDEX_FILE: worktreeIndex,
       };
       for (const name of selectors) vi.stubEnv(name, inherited[name]);
-      yield* Effect.addFinalizer(() => Effect.sync(() => vi.unstubAllEnvs()));
       const workspace = yield* checkpointWorkspace("decoy-guard", { "src/a.txt": "a\n" });
       vi.unstubAllEnvs();
 

@@ -84,14 +84,6 @@ const GIT_PROCESS_CORES_SHARE = 4;
 // hold no git permit, so a forge call never delays a git command.
 const FORGE_PROCESS_CONCURRENCY = 4;
 
-/**
- * Set by background work that reads a forge on a schedule (the pull request sync sweep): its CLI
- * calls take at most all but one forge permit, so a read someone is waiting for always has one.
- */
-export const ForgeBackground = Context.Reference<boolean>("t3/vcs/VcsProcess/ForgeBackground", {
-  defaultValue: () => false,
-});
-
 /** Git processes allowed at once on a machine with `parallelism` cores and a cgroup CPU quota. */
 export const gitProcessConcurrency = (parallelism: number, cpuQuota: number | null): number => {
   const cores = cpuQuota === null ? parallelism : Math.min(parallelism, cpuQuota);
@@ -211,6 +203,14 @@ export interface VcsProcessPools {
   readonly parallelism?: number;
   readonly cpuQuota?: number | null;
 }
+
+/**
+ * Set by background work that reads a forge on a schedule (the pull request sync sweep): its CLI
+ * calls take at most all but one forge permit, so a read someone is waiting for always has one.
+ */
+export const Background = Context.Reference<boolean>("t3/vcs/VcsProcess/Background", {
+  defaultValue: () => false,
+});
 
 /** Shown to users when a Git command fails because another process holds the index lock. */
 export const GIT_INDEX_LOCKED_DETAIL =
@@ -529,7 +529,7 @@ export const makeWith = Effect.fn("VcsProcess.makeWith")(function* (pools: VcsPr
 
   const run = Effect.fn("VcsProcess.run")(function* (input: VcsProcessInput) {
     // Each command waits only for its own pool: git's, sized by the machine, or the forge CLIs'.
-    const background = input.command !== "git" && (yield* ForgeBackground);
+    const background = input.command !== "git" && (yield* Background);
     const pool =
       input.command === "git"
         ? { name: "git", processes: gitProcesses }

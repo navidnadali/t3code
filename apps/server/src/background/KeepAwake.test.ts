@@ -97,7 +97,7 @@ describe("KeepAwake.layer", () => {
         ),
       );
       expect(yield* Deferred.await(started)).toBe("server");
-    }).pipe(Effect.scoped),
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   // The spawner process starts only commands whose stdio are all piped; others fall back.

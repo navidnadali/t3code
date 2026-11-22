@@ -5,10 +5,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import Migration0001 from "./PerfForkMigrations/001_ProjectionTurnItemCounts.ts";
 import Migration0002 from "./PerfForkMigrations/002_TurnItemMessageOrdinalIndex.ts";
-import Migration0003, {
-  THREAD_ITEM_TOTALS,
-  THREAD_ITEM_TOTALS_TRIGGERS,
-} from "./PerfForkMigrations/003_ThreadItemTotals.ts";
+import Migration0003 from "./PerfForkMigrations/003_ThreadItemTotals.ts";
+import Migration0005 from "./PerfForkMigrations/005_RetireThreadItemTotals.ts";
 import * as EventLogPruneState from "./PerfForkMigrations/EventLogPruneState.ts";
 
 /**
@@ -34,16 +32,8 @@ const perfForkMigrationEntries = [
   [1, "ProjectionTurnItemCounts", Migration0001, []],
   // Upstream's migration 94 owns the message-ordinal index now.
   [2, "TurnItemMessageOrdinalIndex", Migration0002, []],
-  // The shell's item count starts from these totals instead of summing a thread's runs.
-  [
-    3,
-    "ThreadItemTotals",
-    Migration0003,
-    [
-      ["table", THREAD_ITEM_TOTALS, THREAD_ITEM_TOTALS],
-      ...THREAD_ITEM_TOTALS_TRIGGERS.map(([name, table]) => ["trigger", name, table] as const),
-    ],
-  ],
+  // Upstream's migration 102 owns the shell's per-thread item totals now; 5 drops this one's.
+  [3, "ThreadItemTotals", Migration0003, []],
   // The event-log compaction's state. Its id is set here only; a renumber is this line.
   // 4, after the shell's ThreadItemTotals (3) in ship order.
   [
@@ -52,6 +42,8 @@ const perfForkMigrationEntries = [
     EventLogPruneState.default,
     [["table", EventLogPruneState.TABLE, EventLogPruneState.TABLE]],
   ],
+  // Fork migration 3's totals table and triggers, which upstream's migration 102 replaced.
+  [5, "RetireThreadItemTotals", Migration0005, []],
 ] as const satisfies ReadonlyArray<
   readonly [
     number,

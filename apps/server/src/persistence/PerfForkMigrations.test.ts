@@ -46,6 +46,7 @@ const FORK_CHAIN: Array<[number, string]> = [
   [2, "TurnItemMessageOrdinalIndex"],
   [3, "ThreadItemTotals"],
   [4, EventLogPruneState.NAME],
+  [5, "RetireThreadItemTotals"],
 ];
 // The fork's first builds recorded its chain in upstream's ledger, under upstream's next ids.
 const EARLY_FORK_IDS: Record<number, number> = { 1: 77, 2: 78 };

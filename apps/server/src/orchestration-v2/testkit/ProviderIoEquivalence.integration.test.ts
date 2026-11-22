@@ -16,6 +16,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -37,6 +38,7 @@ import {
   NoStoreControlRecorder,
   type NoStoreControl,
 } from "./SupersededItemStates.ts";
+import { FX_SUPPORTED_RUNTIME_MODES } from "@t3tools/provider-fx/testing";
 import { FxOrchestratorReplayHarness } from "../Adapters/FxAdapterV2.testkit.ts";
 import { GrokOrchestratorReplayHarness } from "../Adapters/GrokAdapterV2.testkit.ts";
 import * as ClaudeAdapterV2 from "../Adapters/ClaudeAdapterV2.ts";
@@ -45,6 +47,7 @@ import { CodexOrchestratorReplayHarness } from "../Adapters/CodexAdapterV2.testk
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import { ORCHESTRATOR_REPLAY_FIXTURES } from "./fixtures/index.ts";
 import { ReplayStdoutChunking, seededStdoutChunking } from "./ReplayStdoutChunking.ts";
+import { providerRuntimeMode } from "../RuntimePolicy.ts";
 import { runReplayFixture, type ReplayFixtureCase } from "./ProviderReplayFixtures.ts";
 import {
   makeReplayServerConfig,
@@ -104,6 +107,8 @@ interface AdapterRow {
   readonly fixtures?: ReadonlySet<string>;
   /** Compared with 0 workers. */
   readonly modes: ReadonlyArray<WorkerMode>;
+  /** The fixture input as the provider's own replay suite runs it. */
+  readonly adaptInput?: (input: ReplayFixtureCase) => ReplayFixtureCase;
   readonly capture: (input: ReplayFixtureCase, mode: WorkerMode) => Effect.Effect<CaptureRun>;
 }
 
@@ -383,6 +388,7 @@ const adapterRow = <
   readonly logs?: false;
   readonly fixtures?: ReadonlySet<string>;
   readonly modes: AdapterRow["modes"];
+  readonly adaptInput?: AdapterRow["adaptInput"];
   readonly freshIds?: boolean;
   /** Writes the native log through the real store instead of the synchronous capture. */
   readonly realLogStore?: true;
@@ -400,6 +406,10 @@ const adapterRow = <
     transcript: ProviderReplayTranscript,
     workspace: string,
   ) => Effect.Effect<ProviderReplayTranscript, WorkspaceError>;
+  /** The recording as the provider's own replay suite plays it for this fixture. */
+  readonly transformTranscript?: (
+    input: ReplayFixtureCase,
+  ) => ((transcript: ProviderReplayTranscript) => ProviderReplayTranscript) | undefined;
 }): AdapterRow => ({
   driver: row.driver,
   path: row.path,
@@ -408,6 +418,7 @@ const adapterRow = <
   logs: row.logs !== false,
   ...(row.fixtures === undefined ? {} : { fixtures: row.fixtures }),
   modes: row.modes,
+  ...(row.adaptInput === undefined ? {} : { adaptInput: row.adaptInput }),
   capture: (input, mode) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -518,6 +529,7 @@ const adapterRow = <
       const harness = yield* row.harness(Layer.succeedContext(services), input);
       const adapterEvents: Array<Array<unknown>> = [];
       const controls: Array<NoStoreControl> = [];
+      const transformTranscript = row.transformTranscript?.(input);
       const result = yield* runReplayFixture({
         ...input,
         ...(row.checkOutput === false
@@ -536,6 +548,7 @@ const adapterRow = <
         ...(row.materializeWorkspace === undefined
           ? {}
           : { materializeWorkspace: row.materializeWorkspace }),
+        ...(transformTranscript === undefined ? {} : { transformTranscript }),
       }).pipe(Effect.provide(services), Effect.provideService(NoStoreControlRecorder, controls));
       if (store !== undefined) {
         yield* store.close();
@@ -688,6 +701,29 @@ const GROK_FIXTURES = new Set(
   ).map((fixture) => fixture.name),
 );
 
+// Codex names its thread after the T3 thread, so a fixture that plays another scenario's
+// recording expects that scenario's name renamed to its own, as the Codex replay suite plays it.
+const renameRecordedCodexThread =
+  (recordedScenario: string, scenario: string) =>
+  (transcript: ProviderReplayTranscript): ProviderReplayTranscript => ({
+    ...transcript,
+    entries: transcript.entries.map((entry) =>
+      entry.type === "expect_outbound" &&
+      Predicate.isObject(entry.frame) &&
+      entry.frame.method === "thread/name/set" &&
+      Predicate.isObject(entry.frame.params) &&
+      entry.frame.params.name === `Replay fixture: ${recordedScenario}`
+        ? {
+            ...entry,
+            frame: {
+              ...entry.frame,
+              params: { ...entry.frame.params, name: `Replay fixture: ${scenario}` },
+            },
+          }
+        : entry,
+    ),
+  });
+
 const ROWS: ReadonlyArray<AdapterRow> = [
   adapterRow({
     driver: "codex",
@@ -699,6 +735,10 @@ const ROWS: ReadonlyArray<AdapterRow> = [
     harness: replayHarness(CodexOrchestratorReplayHarness),
     materializeWorkspace: (transcript, workspace) =>
       Effect.succeed(materializeReplayTranscriptWorkspace(transcript, workspace)),
+    transformTranscript: (input) =>
+      input.driver.recordedScenario === undefined
+        ? undefined
+        : renameRecordedCodexThread(input.driver.recordedScenario, input.fixtureName),
   }),
   adapterRow({
     driver: "acpRegistry",
@@ -738,6 +778,21 @@ const ROWS: ReadonlyArray<AdapterRow> = [
     stage: "acp",
     logs: false,
     modes: LINE_OFFLOAD_MODES,
+    // The fixtures were recorded where fx offers no Full access, so a thread set to it runs as
+    // RuntimePolicy resolves it there, as fx's own replay suite runs them.
+    adaptInput: (input) => ({
+      ...input,
+      buildInput: () => {
+        const fixtureInput = input.buildInput();
+        return {
+          ...fixtureInput,
+          runtimeMode: providerRuntimeMode(
+            fixtureInput.runtimeMode ?? "full-access",
+            FX_SUPPORTED_RUNTIME_MODES,
+          ),
+        };
+      },
+    }),
     harness: replayHarness(FxOrchestratorReplayHarness),
   }),
   adapterRow({
@@ -759,11 +814,18 @@ const CASES = ROWS.flatMap((row) =>
     fixture.providers
       .filter((provider) => provider.driver === row.driver)
       .filter(() => row.fixtures === undefined || row.fixtures.has(fixture.name))
-      .map((provider) => ({
-        name: `${row.driver} ${row.path} ${fixture.name}`,
-        row,
-        input: { fixtureName: fixture.name, buildInput: fixture.buildInput, driver: provider },
-      })),
+      .map((provider) => {
+        const input = {
+          fixtureName: fixture.name,
+          buildInput: fixture.buildInput,
+          driver: provider,
+        };
+        return {
+          name: `${row.driver} ${row.path} ${fixture.name}`,
+          row,
+          input: row.adaptInput === undefined ? input : row.adaptInput(input),
+        };
+      }),
   ),
 );
 

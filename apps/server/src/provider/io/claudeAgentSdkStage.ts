@@ -328,6 +328,8 @@ export const claudeAgentSdkStage: ProviderIoStage<
           return started().mcpServerStatus();
         case "readMcpResource":
           return started().readMcpResource(request.server, request.uri);
+        case "reconnectMcpServer":
+          return started().reconnectMcpServer(request.server);
         case "controlRequest": {
           const runtime = started();
           const send: unknown = Reflect.get(runtime, "request");

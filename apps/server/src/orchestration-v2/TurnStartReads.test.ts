@@ -354,9 +354,9 @@ it.effect.each(["sqlite"] as const)(
         occurredAt: now,
         payload: marker,
       });
-      // Another run's /compact is read only for a run a handoff targets; turn start reads the
-      // ones its restart note turns on by key.
-      assert.notInclude(
+      // Every /compact and /goal message of the thread is read through migration 100's partial index
+      //, not only another run's that a handoff targets.
+      assert.include(
         (yield* store.getTurnStartContext(threadId, runId)).messages.map((m) => m.id),
         marker.id,
       );
@@ -998,10 +998,12 @@ it.effect(
         "contextTransfers",
         "contextHandoffs",
       ]);
+      // Only the routable tasks, completed provider-native ones, through migration 100's partial
+      // index; delegated children run their own runs.
       assert.deepStrictEqual(
         context.subagentThreads,
         whole.subagents
-          .filter((task) => !["interrupted", "failed", "cancelled"].includes(task.status))
+          .filter((task) => task.origin === "provider_native" && task.status === "completed")
           .map(({ status, origin, childThreadId, providerThreadId }) => ({
             status,
             origin,

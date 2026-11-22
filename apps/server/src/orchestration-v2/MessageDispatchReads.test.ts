@@ -1401,7 +1401,11 @@ it.effect("a delegated result queues behind the active run with its task's repor
     const message = projection.messages.find(
       (candidate) => candidate.id === delivery.command.messageId,
     );
-    assert.equal(message?.text, `Delegated task ${delivery.taskId} (Look) [completed]:\nFound it.`);
+    // A delegated completion wake names its child thread.
+    assert.equal(
+      message?.text,
+      `Delegated task ${delivery.taskId} (Look) in child thread thread:${threadId}:delivered-task [completed]:\nFound it.`,
+    );
     assert.deepEqual(message?.delegatedCompletion, delivery.command.delegatedCompletion);
     const run = projection.runs.find((candidate) => candidate.userMessageId === message?.id);
     assert.deepEqual(

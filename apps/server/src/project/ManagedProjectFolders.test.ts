@@ -11,6 +11,7 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -27,6 +28,7 @@ import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as RuntimeLayer from "../orchestration-v2/runtimeLayer.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import { PROCESS_SPAWNER_ENV } from "../process/workerChildProcessSpawner.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -543,7 +545,11 @@ it.effect("says Git is not installed when a named project cannot start Git", () 
         );
       }),
     {
+      // The failing spawner is the subject: keep Git on it rather than on the spawner process.
       git: GitVcsDriver.layer.pipe(
+        Layer.provide(
+          ConfigProvider.layer(ConfigProvider.fromUnknown({ [PROCESS_SPAWNER_ENV]: "default" })),
+        ),
         Layer.provide(
           Layer.succeed(
             ChildProcessSpawner.ChildProcessSpawner,

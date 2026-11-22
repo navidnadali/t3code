@@ -15,6 +15,7 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type OrchestrationV2Subagent,
+  withMessageSenderNote,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -137,6 +138,9 @@ it.effect.each(["a user message", "an automation"] as const)(
               mcpServerStatus: Effect.succeed([]),
               readMcpResource: () => Effect.die("unexpected MCP resource read"),
               callMcpTool: () => Effect.die("unexpected MCP tool call"),
+              mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+              mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+              reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
               listPermissionRules: Effect.die("unexpected permission rules read"),
               stopTask: () => Effect.void,
               interrupt: Effect.die("delivery to a waiting run must never interrupt"),
@@ -334,6 +338,8 @@ it.effect.each(["a user message", "an automation"] as const)(
         const sentAt = yield* DateTime.now;
         const visibleText =
           sender === "a user message" ? "Change of plan: stop at the review." : "Status check";
+        // An automation's prompt reaches the provider marked as the task's.
+        let offeredText = visibleText;
         const visibleRunning = yield* watch(
           (event) =>
             event.type === "run.updated" &&
@@ -370,6 +376,10 @@ it.effect.each(["a user message", "an automation"] as const)(
                 interactionMode: "default",
               }),
             );
+            offeredText = withMessageSenderNote(
+              { createdBy: "user", creationSource: "web", scheduledTaskId: task.id },
+              visibleText,
+            );
             const ran = yield* service.runNow({ id: task.id });
             assert.equal(ran.task.lastRunStatus, "succeeded");
           }).pipe(Effect.provide(scheduledTasks));
@@ -391,7 +401,7 @@ it.effect.each(["a user message", "an automation"] as const)(
         const visibleTurn = yield* turnRunning(visible.id);
         yield* worker.drain();
         yield* Fiber.join(visibleTurn);
-        assert.deepEqual(offers.map(offerText).slice(1), [visibleText]);
+        assert.deepEqual(offers.map(offerText).slice(1), [offeredText]);
         assert.notEqual(offers[1]?.priority, "now");
         assert.isAtMost(
           Duration.toMillis(DateTime.distance(sentAt, yield* DateTime.now)),

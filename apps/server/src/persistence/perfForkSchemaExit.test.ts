@@ -161,6 +161,7 @@ const FORK_CHAIN = [
   [2, "TurnItemMessageOrdinalIndex"],
   [3, "ThreadItemTotals"],
   [4, EventLogPruneState.NAME],
+  [5, "RetireThreadItemTotals"],
 ];
 
 const countsAsStored = (db: NodeSqlite.DatabaseSync, key = "run_key") =>

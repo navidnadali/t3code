@@ -150,6 +150,7 @@ function layerExecutorFor(input: {
         detach: () => record("detach"),
         otherWorkingThreads: () => Effect.succeed([]),
         releaseUnlessBusy: () => Effect.succeed(true),
+        forgetLoadedProviderThread: () => Effect.void,
         subscribePromptSuggestion: () => Stream.empty,
       }),
     ),
@@ -1773,7 +1774,11 @@ it.effect("lets another turn start run while a gated one waits on the commit lan
     const releaseLane = yield* Deferred.make<void>();
     yield* lane
       .consume(
-        Stream.make({ type: "node.updated" }),
+        // A snapshot names its entity: the lane keys and coalesces snapshots by it.
+        Stream.make({
+          type: "node.updated",
+          node: { id: "node:lane-held", threadId: "lane-held" },
+        }),
         () =>
           Deferred.succeed(laneHeld, undefined).pipe(Effect.andThen(Deferred.await(releaseLane))),
         Effect.succeed(false),

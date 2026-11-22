@@ -17,6 +17,7 @@ import {
   type TurnItemId,
 } from "@t3tools/contracts";
 import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
+import * as ThreadViewers from "./ThreadViewers.ts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -79,12 +80,22 @@ export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
 interface ProviderBatchPublication {
   readonly publish: Array<Effect.Effect<void>>;
+  readonly projection: ProjectionStore.ProviderBatchProjection;
+  /** The projection high-water mark, recorded once before the batch commits. */
+  projectedSequence: number | undefined;
   eventCount: number;
 }
 const CurrentProviderBatch = Context.Reference<ProviderBatchPublication | undefined>(
   "t3/orchestration-v2/EventSink/CurrentProviderBatch",
   { defaultValue: () => undefined },
 );
+// Projecting `provider-thread.updated` also rewrites its app thread's row.
+const projectedThreadIds = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
+  events.flatMap((event) =>
+    event.type === "provider-thread.updated" && event.payload.appThreadId !== null
+      ? [event.threadId, event.payload.appThreadId]
+      : [event.threadId],
+  );
 
 export interface EventSinkV2Shape {
   /**
@@ -96,6 +107,7 @@ export interface EventSinkV2Shape {
     process: (event: A) => Effect.Effect<void, E2, R2>,
     after: Effect.Effect<boolean, E2, R2>,
     canBatch: (event: A) => Effect.Effect<boolean, never, R2>,
+    priority?: ProviderCommitBatch.StreamPriority,
   ) => Effect.Effect<
     void,
     E | E2 | ProviderCommitBatch.CommitBatchError | Schema.SchemaError,
@@ -307,10 +319,12 @@ const layerBase: Layer.Layer<
   | ProjectStore.ProjectStoreV2
   | SqlClient.SqlClient
   | TurnItemPositionStore.TurnItemPositionStoreV2
+  | ThreadViewers.ThreadViewers
 > = Layer.effect(
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const threadViewers = yield* ThreadViewers.ThreadViewers;
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -518,6 +532,30 @@ const layerBase: Layer.Layer<
       );
     };
 
+    // The enclosing write or commit span already traces this projection bookkeeping.
+    const recordProjectedSequence = Effect.fnUntraced(function* (sequence: number) {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_metadata (
+          projection_name,
+          schema_version,
+          last_sequence,
+          updated_at
+        )
+        VALUES (
+          'thread-projections',
+          ${ProjectionStore.ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION},
+          ${sequence},
+          ${now}
+        )
+        ON CONFLICT(projection_name)
+        DO UPDATE SET
+          schema_version = excluded.schema_version,
+          last_sequence = excluded.last_sequence,
+          updated_at = excluded.updated_at
+      `.pipe(NodeSqliteClient.deferredWrite);
+    });
+
     // The projection rows, thread touches and head share one round trip to the writer, flushed before the
     // lineage read below, which tolerates its own failure and so must not carry them.
     const applyStoredEvents = Effect.fnUntraced(function* (
@@ -535,26 +573,9 @@ const layerBase: Layer.Layer<
         });
         const sequence = storedEvents.at(-1)?.sequence;
         if (sequence !== undefined) {
-          const now = DateTime.formatIso(yield* DateTime.now);
-          yield* sql`
-            INSERT INTO orchestration_v2_projection_metadata (
-              projection_name,
-              schema_version,
-              last_sequence,
-              updated_at
-            )
-            VALUES (
-              'thread-projections',
-              ${ProjectionStore.ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION},
-              ${sequence},
-              ${now}
-            )
-            ON CONFLICT(projection_name)
-            DO UPDATE SET
-              schema_version = excluded.schema_version,
-              last_sequence = excluded.last_sequence,
-              updated_at = excluded.updated_at
-          `.pipe(NodeSqliteClient.deferredWrite);
+          const batch = yield* CurrentProviderBatch;
+          if (batch !== undefined) batch.projectedSequence = sequence;
+          else yield* recordProjectedSequence(sequence);
         }
       });
 
@@ -592,6 +613,7 @@ const layerBase: Layer.Layer<
       const batch = yield* CurrentProviderBatch;
       if (batch !== undefined) batch.eventCount += input.events.length;
       const { committed } = yield* commitThenPublish(
+        projectedThreadIds(input.events),
         Effect.gen(function* () {
           // Check ownership in the same transaction that claims the native session.
           const imported = input.unlessNativeThreadOwned;
@@ -646,6 +668,7 @@ const layerBase: Layer.Layer<
         });
 
         return yield* commitThenPublish(
+          [input.threadId, ...projectedThreadIds(input.events)],
           Effect.gen(function* () {
             const rows = yield* sql<{
               readonly status: string;
@@ -743,6 +766,7 @@ const layerBase: Layer.Layer<
       });
 
       return yield* commitThenPublish(
+        projectedThreadIds(input.events),
         Effect.gen(function* () {
           const rows = yield* sql<{
             readonly active_attempt_id: string | null;
@@ -798,6 +822,7 @@ const layerBase: Layer.Layer<
       });
 
       return yield* commitThenPublish(
+        projectedThreadIds([input.event]),
         Effect.gen(function* () {
           // The run that claimed the row attaches at its turn start, which stores it running.
           const rows = yield* sql<{ readonly payload_json: string }>`
@@ -851,6 +876,7 @@ const layerBase: Layer.Layer<
       events: ReadonlyArray<OrchestrationV2DomainEvent>,
     ) =>
       commitThenPublish(
+        projectedThreadIds(events),
         Effect.gen(function* () {
           const rows = yield* readStoredPayload;
           if (rows[0]?.payload_json !== expectedJson) {
@@ -951,6 +977,7 @@ const layerBase: Layer.Layer<
       input: Parameters<EventSinkV2Shape["commitCommand"]>[0],
     ) {
       const result = yield* commitThenPublish(
+        [input.threadId, ...projectedThreadIds(input.events)],
         Effect.gen(function* () {
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
@@ -1096,6 +1123,7 @@ const layerBase: Layer.Layer<
     const commitProjectCommandEffect = Effect.fn("orchestrationV2.EventSink.commitProjectCommand")(
       function* (input: Parameters<EventSinkV2Shape["commitProjectCommand"]>[0]) {
         const result = yield* commitThenPublish(
+          [],
           Effect.gen(function* () {
             const reserved: CommandReceiptStore.ProjectCommandReceiptV2 = {
               commandId: input.commandId,
@@ -1235,7 +1263,9 @@ const layerBase: Layer.Layer<
       );
     };
 
+    // Waits only for queued provider snapshots of `threadIds`, the threads this write touches.
     const commitThenPublish = <A, E, R>(
+      threadIds: ReadonlyArray<ThreadId>,
       transaction: Effect.Effect<A, E, R>,
       publish: (committed: A) => Effect.Effect<void>,
     ) =>
@@ -1244,7 +1274,7 @@ const layerBase: Layer.Layer<
           ? Effect.flatMap(Effect.serviceOption(sql.transactionService), (existing) =>
               Option.isSome(existing)
                 ? commitThenPublishNow(transaction, publish)
-                : coordinator.barrier(commitThenPublishNow(transaction, publish)),
+                : commitBatch.barrier(commitThenPublishNow(transaction, publish), threadIds),
             )
           : transaction.pipe(
               Effect.tap((committed) =>
@@ -1259,12 +1289,45 @@ const layerBase: Layer.Layer<
       "orchestrationV2.EventSink.providerBatch",
     )(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
       if ((yield* CurrentProviderBatch) !== undefined) return yield* effect;
-      const batch: ProviderBatchPublication = { publish: [], eventCount: 0 };
+      const batch: ProviderBatchPublication = {
+        publish: [],
+        eventCount: 0,
+        projection: { nodeReads: new Map(), threadTouches: new Map() },
+        projectedSequence: undefined,
+      };
       let started = false;
+      // Opened here, the transaction commits right after the thread touches and the projection head:
+      // its COMMIT carries them to the writer, so they cost no round trip of their own.
+      const ownsTransaction = Option.isNone(yield* Effect.serviceOption(sql.transactionService));
+      const writeBookkeeping = ProjectionStore.writeThreadTouches(
+        sql,
+        batch.projection.threadTouches,
+      ).pipe(
+        Effect.andThen(
+          Effect.suspend(() =>
+            batch.projectedSequence === undefined
+              ? Effect.void
+              : recordProjectedSequence(batch.projectedSequence),
+          ),
+        ),
+        NodeSqliteClient.deferredWrite,
+      );
       const result = yield* commitThenPublishNow(
         Effect.sync(() => {
           started = true;
-        }).pipe(Effect.andThen(Effect.provideService(effect, CurrentProviderBatch, batch))),
+        }).pipe(
+          Effect.andThen(
+            effect.pipe(
+              Effect.provideService(CurrentProviderBatch, batch),
+              Effect.provideService(ProjectionStore.ProviderBatchProjectionState, batch.projection),
+              Effect.tap(() =>
+                ownsTransaction
+                  ? NodeSqliteClient.withWritesCarriedByCommit(sql)(writeBookkeeping)
+                  : writeBookkeeping,
+              ),
+            ),
+          ),
+        ),
         () => Effect.forEach(batch.publish, (publish) => publish, { discard: true }),
       ).pipe(
         // Normalization mutates run-local state, so only retry before its transaction body starts.
@@ -1290,7 +1353,7 @@ const layerBase: Layer.Layer<
       ProviderCommitBatch.isCommitBatchError(cause)
         ? cause
         : new ProviderCommitBatch.CommitBatchError({ cause });
-    const coordinator = yield* ProviderCommitBatch.make(
+    const commitBatch = yield* ProviderCommitBatch.make(
       (work) => withProviderBatch(work).pipe(Effect.mapError(toBatchError)),
       yield* ProviderCommitBatch.enabled,
       {
@@ -1304,11 +1367,14 @@ const layerBase: Layer.Layer<
                 SqlError.isSqlError(cause) ? toBatchError(cause) : cause,
               ),
             ),
-        // The deferred publications and event count a job queues are marked at its start, and its
-        // statements are kept, so the job can be applied again, or dropped, without running it.
+        // The deferred publications, event count, projection mark and thread touches a job queues
+        // are marked at its start, and its statements are kept, so the job can be applied again, or
+        // dropped, without running it.
         record: Effect.map(CurrentProviderBatch, (batch) => {
           const publicationCount = batch?.publish.length ?? 0;
           const eventCount = batch?.eventCount ?? 0;
+          const projectedSequence = batch?.projectedSequence;
+          const threadTouches = new Map(batch?.projection.threadTouches);
           const statements: Array<NodeSqliteClient.RecordedStatement> = [];
           return {
             around: NodeSqliteClient.recordStatements(statements),
@@ -1319,6 +1385,12 @@ const layerBase: Layer.Layer<
               if (batch !== undefined) {
                 batch.publish.length = publicationCount;
                 batch.eventCount = eventCount;
+                batch.projectedSequence = projectedSequence;
+                // Reads the rolled-back job cached may no longer hold.
+                batch.projection.nodeReads.clear();
+                batch.projection.threadTouches.clear();
+                for (const [threadId, updatedAt] of threadTouches)
+                  batch.projection.threadTouches.set(threadId, updatedAt);
               }
             }),
           };
@@ -1326,10 +1398,15 @@ const layerBase: Layer.Layer<
         restart: NodeSqliteClient.restartTransaction(sql).pipe(Effect.mapError(toBatchError)),
         perJobSavepoints: yield* ProviderCommitBatch.perJobSavepoints,
       },
+      threadViewers.isViewed,
+      // A run's ingestion folds its backlog in its own mailbox before the lane, each item once at its
+      // first arrival with its newest state, and settles its count as each item is processed: the
+      // lane must process every item it is handed, so it supersedes none.
+      /* coalesceSnapshots */ false,
     );
 
     return EventSinkV2.of({
-      consumeProviderEvents: coordinator.consume,
+      consumeProviderEvents: commitBatch.consume,
       withProviderBatch,
       write: (input) =>
         writeEffect({ ...input, effects: [] }).pipe(
@@ -1483,6 +1560,7 @@ export const layer: Layer.Layer<
       EffectOutbox.layer,
       ProjectStore.layer,
       TurnItemPositionStore.layer,
+      ThreadViewers.layer,
     ),
   ),
 );

@@ -502,11 +502,7 @@ export const layer: Layer.Layer<
           switch (input.event.type) {
             case "app_thread.created": {
               const offered = input.event.appThread;
-              const existing = yield* projections.getThread(offered.id).pipe(
-                Effect.catchTags({
-                  ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
-                }),
-              );
+              const existing = yield* projections.findThread(offered.id);
               if (
                 existing !== null &&
                 (input.event.createOnly === true ||
@@ -681,12 +677,9 @@ export const layer: Layer.Layer<
                 threadId: input.event.threadId,
                 itemId: idAllocator.derive.userTurnItem({ messageId: input.event.messageId }),
               });
-              // A steer the provider never ran is cancelled and marked for the thread to queue again.
-              const returned = input.event.status === "returned";
-              const status = returned ? "cancelled" : input.event.status;
               if (
                 item?.type !== "user_message" ||
-                (item.status === status && (!returned || item.returnedToQueue === true)) ||
+                item.status === input.event.status ||
                 (item.status !== "pending" && item.status !== "completed")
               ) {
                 return [];
@@ -698,9 +691,8 @@ export const layer: Layer.Layer<
                   threadId: item.threadId,
                   payload: {
                     ...item,
-                    status,
-                    ...(returned ? { returnedToQueue: true as const } : {}),
-                    completedAt: status === "pending" ? null : occurredAt,
+                    status: input.event.status,
+                    completedAt: input.event.status === "pending" ? null : occurredAt,
                     updatedAt: occurredAt,
                   },
                   runId: item.runId,

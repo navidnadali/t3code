@@ -70,6 +70,7 @@ export type ClaudeQueryControl = Pick<
   | "stopTask"
   | "mcpServerStatus"
   | "readMcpResource"
+  | "reconnectMcpServer"
   | "backgroundTasks"
   | "interrupt"
   | "close"
@@ -659,6 +660,7 @@ export const startClaudeQueryInWorker = Effect.fnUntraced(function* <E>(input: {
     backgroundTasks: (toolUseId) => request({ type: "backgroundTasks", toolUseId }),
     mcpServerStatus: () => request({ type: "mcpServerStatus" }),
     readMcpResource: (server, uri) => request({ type: "readMcpResource", server, uri }),
+    reconnectMcpServer: (server) => request({ type: "reconnectMcpServer", server }),
     request: (payload) => request({ type: "controlRequest", payload }),
     interrupt: () => request({ type: "interrupt" }),
     // After the stdout main has read, so the worker's SDK closes where in-thread it would have. A

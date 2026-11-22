@@ -1,3 +1,4 @@
+// Mirrors the server's set in apps/server/src/vcs/VcsProcess.ts, which shared cannot import.
 const REPOSITORY_SELECTORS = new Set([
   "GIT_DIR",
   "GIT_WORK_TREE",

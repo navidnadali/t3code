@@ -1,8 +1,9 @@
 // Rolling back to perf.12 after the compaction's fork migration ran. perf.12's start
 // and service preflight refuse a fork ledger id they do not know. This build ships fork migrations 3
-// (ThreadItemTotals) and 4 (this one): the rollback takes them out newest first, so this down step
-// must leave the chain 1..3 (a prefix, which the ledger guard accepts), and after 003's down script
-// perf.12's chain exactly. The operator's form, scripts/perf-fork-004-down.sql, must leave the same.
+// (ThreadItemTotals), 4 (this one) and 5 (RetireThreadItemTotals): the rollback takes them out newest
+// first, so after 005's down script this down step must leave the chain 1..3 (a prefix, which the
+// ledger guard accepts), and after 003's down script perf.12's chain exactly. The operator's form,
+// scripts/perf-fork-004-down.sql, must leave the same.
 // @effect-diagnostics nodeBuiltinImport:off - runs the down scripts as an operator would, on the file.
 import * as NodeFS from "node:fs";
 import * as NodeSqlite from "node:sqlite";
@@ -31,7 +32,7 @@ const PERF_12_CHAIN = [
   [1, "ProjectionTurnItemCounts"],
   [2, "TurnItemMessageOrdinalIndex"],
 ] as const;
-// This build's chain without fork migration 4: what this down step leaves.
+// This build's chain without fork migrations 5 and 4: what this down step leaves after 005's.
 const BEFORE_004_CHAIN = [...PERF_12_CHAIN, [3, "ThreadItemTotals"]] as const;
 const script = (name: string) =>
   NodeFS.readFileSync(new URL(`../../../../scripts/${name}`, import.meta.url), "utf8");
@@ -64,6 +65,9 @@ it.effect("the compaction state's down step leaves a ledger and schema perf.12 s
         `;
       }
 
+      yield* sql.unsafe(
+        `DELETE FROM ${PERF_FORK_MIGRATIONS_TABLE} WHERE migration_id = 5 AND name = 'RetireThreadItemTotals'`,
+      );
       yield* EventLogPruneState.down;
 
       assert.lengthOf(yield* objects(), 0);
@@ -128,9 +132,21 @@ it.effect("the operator's 004 down script leaves exactly what the down step leav
         }).pipe(Effect.provide(Sqlite.layerFromPath(dbPath)));
         return dbPath;
       });
+    // 005's down first, as the operator runs it: in the same session as the down step, since
+    // opening the database runs this build's migrations, 5 included.
     const viaEffect = yield* prepared("effect.sqlite");
-    yield* EventLogPruneState.down.pipe(Effect.provide(Sqlite.layerFromPath(viaEffect)));
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql.unsafe(
+        `DELETE FROM ${PERF_FORK_MIGRATIONS_TABLE} WHERE migration_id = 5 AND name = 'RetireThreadItemTotals'`,
+      );
+      yield* EventLogPruneState.down;
+    }).pipe(Effect.provide(Sqlite.layerFromPath(viaEffect)));
     const viaScript = yield* prepared("script.sqlite");
+    {
+      using db = new NodeSqlite.DatabaseSync(viaScript);
+      db.exec(script("perf-fork-005-down.sql"));
+    }
     {
       using db = new NodeSqlite.DatabaseSync(viaScript);
       db.exec(script("perf-fork-004-down.sql"));

@@ -482,26 +482,37 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
     }),
   );
 
+  // A fresh session retries once, under a new session id, before the open fails.
   it.effect("kills the CLI and disposes the worker's query when MCP registration times out", () =>
     Effect.gen(function* () {
       const run = (mode: Mode) =>
         withRunner(mode, ({ runner, recorded }) =>
           Effect.gen(function* () {
-            const cli = new FakeClaudeCli({
-              control: (request) =>
-                request.subtype === "mcp_set_servers" ? new Promise(() => {}) : undefined,
+            const never = (request: { readonly subtype: string }) =>
+              request.subtype === "mcp_set_servers" ? new Promise<never>(() => {}) : undefined;
+            const clis = [
+              new FakeClaudeCli({ control: never }),
+              new FakeClaudeCli({ control: never }),
+            ];
+            let spawned = 0;
+            const input = openInput(clis[0]!, {
+              mcpServers: { "t3-code": { type: "http", url: "http://localhost:3773/mcp" } },
             });
             const opening = yield* runner
-              .open(
-                openInput(cli, {
-                  mcpServers: { "t3-code": { type: "http", url: "http://localhost:3773/mcp" } },
-                }),
-              )
+              .open({
+                ...input,
+                options: {
+                  ...input.options,
+                  spawnClaudeCodeProcess: (options) => clis[spawned++]!.spawn(options),
+                },
+              })
               .pipe(Effect.flip, Effect.forkChild);
-            yield* Effect.promise(() => cli.waitForControl("mcp_set_servers"));
-            yield* TestClock.adjust("90 seconds");
+            for (const cli of clis) {
+              yield* Effect.promise(() => cli.waitForControl("mcp_set_servers"));
+              yield* TestClock.adjust("90 seconds");
+            }
             const error = yield* Fiber.join(opening);
-            return { error, kills: cli.kills, recorded };
+            return { error, kills: clis.map((cli) => cli.kills), recorded };
           }),
         );
       const inThread = yield* run("thread");
@@ -514,7 +525,7 @@ describe("Claude Agent SDK query in a provider I/O worker", () => {
           (error.cause as { readonly _tag: string })._tag,
           "ClaudeMcpRegistrationTimeoutError",
         );
-        assert.deepStrictEqual(kills, ["SIGKILL"]);
+        assert.deepStrictEqual(kills, [["SIGKILL"], ["SIGKILL"]]);
       }
     }),
   );

@@ -1577,7 +1577,8 @@ describe("content blanking", () => {
       model: "claude-sonnet-4-6",
       exitCode: 0,
       input: JSON.stringify({ command: "cat ~/.netrc", cwd: "/Users/someone/project" }),
-      env: { DB_PASSWORD: "plain", "/odd key": "value" },
+      // Neither value is a contract literal (a known literal is kept even under a credential key).
+      env: { DB_PASSWORD: "hunter2", "/odd key": "value" },
       token: "completed",
       tokenId: "abc",
     });

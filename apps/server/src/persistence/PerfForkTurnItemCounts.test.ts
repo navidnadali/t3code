@@ -12,6 +12,7 @@ const FORK_CHAIN: Array<[number, string]> = [
   [2, "TurnItemMessageOrdinalIndex"],
   [3, "ThreadItemTotals"],
   [4, "EventLogPruneState"],
+  [5, "RetireThreadItemTotals"],
 ];
 const PERF5_RAN_AT = "2026-11-04 00:00:00";
 const UPSTREAM_COUNTS_ID = 85;

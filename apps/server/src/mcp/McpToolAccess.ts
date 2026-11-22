@@ -27,7 +27,12 @@ import {
 } from "../orchestration-v2/DispatchModeLimit.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
-import { assertNotLinked, assertSameLink, callerLinkOrigin } from "./linkOrigin.ts";
+import {
+  assertFullAccessNamingLink,
+  assertNotLinked,
+  assertSameLink,
+  callerLinkOrigin,
+} from "./linkOrigin.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./delegatedTaskModes.ts";
 import {
@@ -407,6 +412,7 @@ export const afterForwarding = <P, A, E, R, E2, R2>(
 
 const fullAccessRequired =
   "Changing projects or environment settings needs a live full-access/default calling thread or a full-access client.";
+const changesEnvironment = "change projects or environment settings";
 
 /** Recheck after waits before writing; caller modes may have changed. */
 export const writesEnvironment = <P, A, E, R>(
@@ -426,9 +432,11 @@ export const writesEnvironment = <P, A, E, R>(
     Effect.tap((caller) =>
       options?.linkedCallers === "allowed"
         ? Effect.void
-        : assertNotLinked(caller, "change projects or environment settings"),
+        : assertNotLinked(caller, changesEnvironment),
     ),
-    Effect.tap((caller) => assertFullAccess(caller, fullAccessRequired)),
+    Effect.tap((caller) =>
+      assertFullAccessNamingLink(caller, fullAccessRequired, changesEnvironment),
+    ),
   );
   // `check` reruns under handlers' thread locks, so only the first one waits for a wake turn.
   return declareLive(
@@ -494,6 +502,11 @@ const linksUnavailable = new OrchestratorMcpFailure({
   message: "This environment cannot reach linked environments.",
 });
 
+const THREAD_ONLY = new Set<unknown>([
+  McpInvocationContext.hiddenFromOutsideClients,
+  McpInvocationContext.hiddenWithoutBackgroundWait,
+]);
+
 /**
  * Every tool that takes a linked environment runs there the same way: its
  * declaration checks the caller here, and the same call goes to the other
@@ -514,8 +527,7 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
     const remote = remoteCheckOf(declaration);
     if (
       remote === undefined &&
-      Context.getOrUndefined(tool.annotations, McpSchema.EnabledWhen) !==
-        McpInvocationContext.hiddenFromOutsideClients
+      !THREAD_ONLY.has(Context.getOrUndefined(tool.annotations, McpSchema.EnabledWhen))
     )
       return yield* Effect.die(
         `${name} acts as its calling thread, so outside clients must not be offered it.`,

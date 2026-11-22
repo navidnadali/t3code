@@ -1,7 +1,4 @@
-import {
-  orchestrationV2WorktreePending,
-  runRanAfter,
-} from "@t3tools/shared/orchestrationV2ThreadError";
+import { orchestrationV2WorktreePending } from "@t3tools/shared/orchestrationV2ThreadError";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   CommandId,
@@ -45,6 +42,7 @@ import {
   cancelledRosterTaskWork,
   cancelledTurnItemWork,
   mergeRestartCancelledBackgroundWork,
+  latestStartedRun,
   neverStarted,
 } from "./RestartBackgroundNote.ts";
 
@@ -176,23 +174,6 @@ const cancelledItem = (
         completedAt: now,
         updatedAt: now,
       };
-
-function latestStartedRun(
-  projection: ProjectionStore.ProjectionRuntimeRecoveryState,
-  providerThreadId: ProviderThreadId,
-) {
-  return projection.runs.reduce<OrchestrationV2ThreadProjection["runs"][number] | undefined>(
-    (latest, run) =>
-      run.providerThreadId === providerThreadId &&
-      run.status !== "queued" &&
-      run.status !== "rolled_back" &&
-      !neverStarted(run) &&
-      (latest === undefined || runRanAfter(run, latest))
-        ? run
-        : latest,
-    undefined,
-  );
-}
 
 export const make = Effect.gen(function* () {
   const settings = yield* ServerSettings.ServerSettingsService;
@@ -819,6 +800,13 @@ export const make = Effect.gen(function* () {
             !isAppOwnedDelegationItem(candidate) &&
             // A link card waits on the user, not the run, and answers by message.
             candidate.type !== "link_request" &&
+            // The orchestrator queues a steer the provider never reported reading.
+            !(
+              candidate.type === "user_message" &&
+              candidate.status === "pending" &&
+              (candidate.inputIntent === "steer" ||
+                candidate.inputIntent === "promoted_queued_to_steer")
+            ) &&
             (candidate.status === "pending" ||
               candidate.status === "running" ||
               candidate.status === "waiting"),
@@ -1017,7 +1005,7 @@ export const make = Effect.gen(function* () {
         });
       }
       for (const [providerThreadId, work] of cancelledBackgroundWork) {
-        const noteRun = latestStartedRun(projection, providerThreadId);
+        const noteRun = latestStartedRun(projection.runs, providerThreadId);
         if (noteRun === undefined) continue;
         // Use a separate event; stale run snapshots can overwrite intervening lifecycle changes.
         events.push({

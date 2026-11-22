@@ -2,6 +2,29 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.11-perf.16 (2026-11-22)
+
+Upstream main merged, its steer design kept with two fixes, and the fork's per-thread totals retired for upstream's
+
+Upstream base: 426b5a688852.
+
+Upstream main of 2026-11-22 (apps/server 0.1.11); upstream migrations 97 to 105 run after 96, and fork migration 5.
+
+- Upstream main merged: the release carries upstream main as of 2026-11-22 (426b5a6888). Where upstream fixed what the fork had fixed, upstream's version is kept; the fork's performance work and fixes stay where upstream lacks them.
+- Claude steers use upstream's design: a steer Claude has not read stays pending and is queued again as the thread's next message once the run ends. Two additions: a steer Claude holds after the turn's result and never starts or drops goes back to the thread after 30 seconds of quiet (its process closes, so it cannot also run it), unless that process still runs background work; and a failure Claude reports while such a process holds a steer no longer cancels it.
+- Per-thread item totals: upstream's migration 102 keeps the same total the fork kept since 0.1.9-perf.13. Fork migration 5 drops the fork's table and triggers, so an item write maintains one total. scripts/thread-item-counts-check.sql and -repair.sql check and rebuild upstream's table.
+- Rolling back to a build at upstream migration 96 (0.1.9-perf.13 or perf.14): restore the database copy taken before the upgrade, or, to keep later writes, run scripts/upstream-097-105-down.sql and scripts/perf-fork-005-down.sql on the stopped server's database first (issue-tracker bindings and task folders written since are dropped).
+- A merged steer keeps every message's state; a steer's result-only reply is kept, and a streamed one is published once.
+- A failed turn's own unread steer stays held with the queue; a steer its provider never received starts.
+- Git status answers from the config snapshot where one exists, including an unconfigured branch's base.
+- The commit lane keeps its round-trip budget on upstream's scheduler.
+
+Behaviour changes:
+
+- An automation's prompt steers into a running Claude turn at once instead of waiting 60 seconds, since a Claude steer leaves the running tools alone; messages from other threads still wait 60 to 90 seconds.
+- An agent's automatic send waits only behind its own sender's queued messages, not every agent's.
+- After a Stop, a steer re-sent because it missed its turn stays held with the rest of the queue until you resume, in its place ahead of later messages.
+
 ## v0.1.9-perf.14 (2026-11-21)
 
 Steers that keep Claude's tool calls and background work, and general fixes

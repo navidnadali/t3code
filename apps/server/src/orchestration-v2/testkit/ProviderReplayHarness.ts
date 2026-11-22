@@ -37,6 +37,7 @@ import * as ContextHandoffService from "../ContextHandoffService.ts";
 import * as EffectOutbox from "../EffectOutbox.ts";
 import * as EffectWorker from "../EffectWorker.ts";
 import * as EventSink from "../EventSink.ts";
+import * as ThreadViewers from "../ThreadViewers.ts";
 import * as EventStore from "../EventStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "../Orchestrator.ts";
@@ -63,6 +64,8 @@ import * as RunExecutionService from "../RunExecutionService.ts";
 import * as RunFinalizationService from "../RunFinalizationService.ts";
 import * as ThreadTitleRegenerationService from "../ThreadTitleRegenerationService.ts";
 import * as RuntimePolicy from "../RuntimePolicy.ts";
+import * as WorkspaceFolders from "../../workspace/WorkspaceFolders.ts";
+import * as TaskFolderStore from "../../workspace/TaskFolderStore.ts";
 import * as TurnItemPositionStore from "../TurnItemPositionStore.ts";
 import * as RuntimeRequestService from "../RuntimeRequestService.ts";
 import * as ThreadCommandExecutor from "../ThreadCommandExecutor.ts";
@@ -211,6 +214,9 @@ export function runOrchestratorV2ProviderReplayScenario<
     readonly wrapProjectionStore?: (
       store: ProjectionStore.ProjectionStoreV2Shape,
     ) => ProjectionStore.ProjectionStoreV2Shape;
+    readonly providerInstances?: Partial<
+      ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]
+    >;
   } = {},
 ): Effect.Effect<
   OrchestratorV2ScenarioResult,
@@ -258,6 +264,9 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
     readonly wrapProjectionStore?: (
       store: ProjectionStore.ProjectionStoreV2Shape,
     ) => ProjectionStore.ProjectionStoreV2Shape;
+    readonly providerInstances?: Partial<
+      ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]
+    >;
   } = {},
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
@@ -288,6 +297,10 @@ interface LayerWithRegistryOptions {
     store: ProjectionStore.ProjectionStoreV2Shape,
   ) => ProjectionStore.ProjectionStoreV2Shape;
   readonly managedPolicy?: ManagedPolicyDocument;
+  /** The instances the ingestor reads snapshots from, such as an endpoint behind a hub. */
+  readonly providerInstances?: Partial<
+    ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]
+  >;
 }
 
 type ReplayRuntime =
@@ -398,7 +411,7 @@ function makeReplayRuntime<Error>(
     TurnItemPositionStore.layer,
   ).pipe(Layer.provide(layerDatabase));
   const layerEventSinkProvided = EventSink.layerFromStores.pipe(
-    Layer.provide(Layer.mergeAll(layerStores, layerDatabase)),
+    Layer.provide(Layer.mergeAll(layerStores, layerDatabase, ThreadViewers.layer)),
   );
   const layerRuntime = RuntimePolicy.layerEnforcingCeiling.pipe(
     Layer.provide(Layer.merge(layerRuntimeBase, layerServerSettings)),
@@ -419,9 +432,9 @@ function makeReplayRuntime<Error>(
     Layer.provide(ProviderEventIngestor.layer),
     Layer.provide(
       Layer.mergeAll(
-        Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
-          getInstance: () => Effect.undefined,
-        }),
+        Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)(
+          options.providerInstances ?? { getInstance: () => Effect.undefined },
+        ),
         layerStores,
         layerEventSinkProvided,
         IdAllocator.layer,
@@ -443,7 +456,18 @@ function makeReplayRuntime<Error>(
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
   const layerCheckpointServiceProvided = CheckpointService.layer.pipe(
-    Layer.provide(Layer.mergeAll(layerCheckpointStore, IdAllocator.layer, NodeServices.layer)),
+    Layer.provide(
+      Layer.mergeAll(
+        layerCheckpointStore,
+        IdAllocator.layer,
+        NodeServices.layer,
+        WorkspaceFolders.layer.pipe(
+          Layer.provide(layerStores),
+          Layer.provide(TaskFolderStore.layer.pipe(Layer.provide(layerDatabase))),
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
   );
   const layerContextHandoffServiceProvided = ContextHandoffService.layer.pipe(
     Layer.provide(IdAllocator.layer),
@@ -514,7 +538,12 @@ function makeReplayRuntime<Error>(
   );
   const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
     Layer.provide(
-      Layer.mergeAll(layerEventSinkProvided, layerStores, layerProviderSessionManagerProvided),
+      Layer.mergeAll(
+        layerEventSinkProvided,
+        McpAppModelContext.layerEmpty,
+        layerStores,
+        layerProviderSessionManagerProvided,
+      ),
     ),
   );
   const layerRuntimeRequestServiceProvided = RuntimeRequestService.layer.pipe(
@@ -570,6 +599,7 @@ function makeReplayRuntime<Error>(
         layerProviderSwitchServiceProvided,
         layerRunExecutionServiceProvided,
         layerServerSettings,
+        TaskFolderStore.layer.pipe(Layer.provide(layerDatabase)),
         ThreadForkService.layer,
       ),
     ),

@@ -594,7 +594,7 @@ describe("VcsProcess.run", () => {
           })
           .pipe(Effect.forkChild({ startImmediately: true }));
       const background = yield* Effect.forEach(Array.from({ length: 6 }), (_, index) =>
-        forge(`background-${index}`).pipe(Effect.provideService(VcsProcess.ForgeBackground, true)),
+        forge(`background-${index}`).pipe(Effect.provideService(VcsProcess.Background, true)),
       );
       const first = yield* Queue.takeN(starts, 3);
       const foreground = yield* Effect.forEach(["foreground-0", "foreground-1"], forge);

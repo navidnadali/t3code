@@ -496,12 +496,15 @@ it.effect("keeps the results of the reads that hold reader transactions", () =>
         turnStart.messages.map((message) => message.id),
         [MessageId.make("message:results:fork:user")],
       );
-      // Turn start reads its tasks' threads, not their prompts and results, and only the transfers
-      // it looks at: a handoff's, any into the run, and the fork into a run fork.
+      // Turn start reads its routable tasks' threads (completed provider-native), not their prompts and
+      // results, and only the transfers it looks at: a handoff's and the fork into the thread
+      // (upstream's design, through migration 100's partial indexes).
       assert.deepStrictEqual(
         turnStart.subagentThreads,
         projection.subagents
-          .filter((subagent) => !["interrupted", "failed", "cancelled"].includes(subagent.status))
+          .filter(
+            (subagent) => subagent.origin === "provider_native" && subagent.status === "completed",
+          )
           .map(({ status, origin, childThreadId, providerThreadId }) => ({
             status,
             origin,
@@ -514,7 +517,6 @@ it.effect("keeps the results of the reads that hold reader transactions", () =>
         projection.contextTransfers.filter(
           (transfer) =>
             projection.contextHandoffs.some((handoff) => handoff.transferId === transfer.id) ||
-            transfer.targetRunId === fixture.forkRunId ||
             (transfer.type === "fork" && transfer.targetThreadId === fixture.fork),
         ),
       );

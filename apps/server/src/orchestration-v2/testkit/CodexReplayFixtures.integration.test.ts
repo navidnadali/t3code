@@ -2,8 +2,10 @@ import { assert, describe, it } from "@effect/vitest";
 import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 import * as Tracer from "effect/Tracer";
 
+import type { ProviderReplayTranscript } from "@t3tools/contracts";
 import { materializeReplayTranscriptWorkspace } from "@t3tools/provider-testing/replayTranscript";
 import { CodexOrchestratorReplayHarness } from "../Adapters/CodexAdapterV2.testkit.ts";
 import {
@@ -12,6 +14,28 @@ import {
   runReplayFixture,
 } from "./ProviderReplayFixtures.ts";
 
+/** A transcript borrowed from another scenario names the thread after that scenario's title. */
+const renameRecordedThread =
+  (recordedScenario: string, scenario: string) =>
+  (transcript: ProviderReplayTranscript): ProviderReplayTranscript => ({
+    ...transcript,
+    entries: transcript.entries.map((entry) =>
+      entry.type === "expect_outbound" &&
+      Predicate.isObject(entry.frame) &&
+      entry.frame.method === "thread/name/set" &&
+      Predicate.isObject(entry.frame.params) &&
+      entry.frame.params.name === `Replay fixture: ${recordedScenario}`
+        ? {
+            ...entry,
+            frame: {
+              ...entry.frame,
+              params: { ...entry.frame.params, name: `Replay fixture: ${scenario}` },
+            },
+          }
+        : entry,
+    ),
+  });
+
 describe("Codex replay fixtures", () => {
   itRunsReplayFixtures("codex", (input) =>
     runReplayFixture({
@@ -19,6 +43,14 @@ describe("Codex replay fixtures", () => {
       harness: CodexOrchestratorReplayHarness,
       materializeWorkspace: (transcript, workspace) =>
         Effect.succeed(materializeReplayTranscriptWorkspace(transcript, workspace)),
+      ...(input.driver.recordedScenario === undefined
+        ? {}
+        : {
+            transformTranscript: renameRecordedThread(
+              input.driver.recordedScenario,
+              input.fixtureName,
+            ),
+          }),
     }),
   );
 });
@@ -107,16 +139,27 @@ it.effect(
         // In this one-thread fixture a provider transaction never spans a run boundary.
         assert.equal(new Set(events.map((event) => event.runId)).size, 1);
       }
-      // Both turns' item snapshots (node, message, turn item) go through provider transactions.
-      // A later change added each turn's running usage report there too (8 writes). Since coalescing, that
-      // report, arriving in the same backlog as the turn's first report with no control between,
-      // replaces it in place: one provider turn's whole state, newest wins.
-      assert.equal(
-        [...batches.values()].reduce((total, events) => total + events.length, 0),
-        6,
-      );
-      // (ii) Each turn's running state is stored once, before the turn's end, and it is the newest
-      // report: the usage the provider sent after the turn's text is kept, not the bare first report.
+      // Both turns' item snapshots (node, message, turn item) go through provider transactions, each
+      // once.
+      const inProviderTransaction = (event: OrchestrationV2DomainEvent) => {
+        const key = transactionOf.get(event.id);
+        return key !== undefined && providerTransactions.has(key);
+      };
+      const itemSnapshots = [...batches.values()]
+        .flat()
+        .flatMap((event) =>
+          event.type === "node.updated" ||
+          event.type === "message.updated" ||
+          event.type === "turn-item.updated" ||
+          event.type === "plan.updated"
+            ? [`${event.type}:${event.payload.id}`]
+            : [],
+        );
+      assert.lengthOf(itemSnapshots, 6);
+      assert.equal(new Set(itemSnapshots).size, 6, "an item snapshot was stored twice");
+      // (ii) Each turn's newest running state, with its usage, is the last stored before the turn's
+      // end. The mailbox folds the bare first report into it only while both wait there; a first
+      // report the consumer takes alone is stored on its own, outside any provider transaction.
       const turnStates = new Map<
         string,
         Array<{ sequence: number; event: OrchestrationV2DomainEvent }>
@@ -128,27 +171,62 @@ it.effect(
             { sequence, event },
           ]);
       assert.equal(turnStates.size, 2);
+      const usageOf = (event: OrchestrationV2DomainEvent) =>
+        event.type === "provider-turn.updated" ? (event.payload.tokenUsage?.usedTokens ?? 0) : 0;
       for (const [turn, states] of turnStates) {
         const running = states.filter(
           ({ event }) =>
             event.type === "provider-turn.updated" && event.payload.status === "running",
         );
-        const ended = states.find(
+        const ended = states.filter(
           ({ event }) =>
             event.type === "provider-turn.updated" && event.payload.status === "completed",
         );
-        assert.equal(running.length, 1, `${turn}: running state stored ${running.length} times`);
-        assert.isDefined(ended);
-        assert.isBelow(running[0]!.sequence, ended!.sequence);
-        const usage =
-          running[0]!.event.type === "provider-turn.updated"
-            ? running[0]!.event.payload.tokenUsage
-            : undefined;
-        assert.isAbove(
-          usage?.usedTokens ?? 0,
-          0,
-          `${turn}: the stored running state lost its usage`,
+        assert.equal(ended.length, 1, `${turn}: end stored ${ended.length} times`);
+        assert.oneOf(
+          running.length,
+          [1, 2],
+          `${turn}: running state stored ${running.length} times`,
         );
+        const newest = running.at(-1)!;
+        assert.isBelow(newest.sequence, ended[0]!.sequence);
+        assert.isAbove(
+          usageOf(newest.event),
+          0,
+          `${turn}: the newest running state lost its usage`,
+        );
+        assert.isAtMost(
+          running.filter(({ event }) => inProviderTransaction(event)).length,
+          1,
+          `${turn}: more than one running state in provider transactions`,
+        );
+        if (running.length === 2) {
+          const [bare] = running;
+          assert.equal(
+            usageOf(bare!.event),
+            0,
+            `${turn}: the first running state is not the bare one`,
+          );
+          assert.isFalse(
+            inProviderTransaction(bare!.event),
+            `${turn}: the bare report was batched`,
+          );
+          // The usage report is stored with the turn's items or after them.
+          const runId = newest.event.runId;
+          const items = stored.filter(
+            ({ event }) =>
+              event.runId === runId &&
+              event.type !== "provider-turn.updated" &&
+              inProviderTransaction(event),
+          );
+          assert.isNotEmpty(items);
+          for (const item of items)
+            assert.isBelow(
+              item.sequence,
+              newest.sequence,
+              `${turn}: usage stored before its items`,
+            );
+        }
       }
       // (iii) Per run, every snapshot from its provider commits before the run settles, and per
       // item the stored order is the provider's: no item goes back from a settled status.

@@ -236,7 +236,7 @@ describe("fork migration 5 retires fork migration 3's totals for upstream's migr
 it.layer(NodeServices.layer)(
   "the down path to a build at upstream 96 with fork chain 1-4",
   (it) => {
-    // The rollback that does not restore a snapshot: upstream's 97-105 and fork 5 taken out by the
+    // The rollback that does not restore a snapshot: upstream's 97-110 and fork 5 taken out by the
     // operator's scripts, so perf.14's preflight passes; perf.14's start then runs fork 3's body again
     // (recorded, objects missing), and the totals come back exact. This build's next start upgrades it
     // again to the same state.
@@ -268,6 +268,19 @@ it.layer(NodeServices.layer)(
 
           {
             using db = new NodeSqlite.DatabaseSync(databasePath);
+            // First to a build at upstream 105 (0.1.11-perf.16), then on to 96.
+            db.exec(script("upstream-106-110-down.sql"));
+            assert.deepEqual(
+              (recordedMigrations(databasePath) ?? []).filter(({ id }) => id > 105),
+              [],
+            );
+            // perf.16's turn-start read spells migration 100's condition, which its index has again.
+            const deferred = db
+              .prepare("SELECT sql FROM sqlite_master WHERE name = ?")
+              .get("orchestration_v2_projection_messages_deferred_command_idx") as
+              | { readonly sql: string }
+              | undefined;
+            assert.include(deferred?.sql ?? "", "GLOB '/goal*'");
             db.exec(script("upstream-097-105-down.sql"));
             db.exec(script("perf-fork-005-down.sql"));
           }
@@ -310,7 +323,7 @@ it.layer(NodeServices.layer)(
           );
           assert.deepEqual(restored, perf14);
 
-          // This build again: upstream's 97-105 and fork 5 run once more, to the upgraded state.
+          // This build again: upstream's 97-110 and fork 5 run once more, to the upgraded state.
           yield* onFile(
             Effect.gen(function* () {
               yield* runMigrations();

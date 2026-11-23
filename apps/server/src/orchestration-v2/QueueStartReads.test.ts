@@ -861,14 +861,17 @@ const seedFixture = Effect.fn("seedFixture")(function* (threadId: ThreadId, inpu
   }
 });
 
-// Context transfers and handoffs take random ids; name each by its first appearance.
+// Context transfers and handoffs take random ids; name each by its first appearance. A thread
+// without a worktree runs in its runtime's own scratch workspace, which the two runtimes name apart.
 const withoutRandomIds = <A>(value: A): A => {
   const seen = new Map<string, string>();
   return JSON.parse(
-    JSON.stringify(value).replace(
-      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,
-      (id) => seen.get(id) ?? (seen.set(id, `random-${seen.size}`), `random-${seen.size - 1}`),
-    ),
+    JSON.stringify(value)
+      .replace(
+        /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,
+        (id) => seen.get(id) ?? (seen.set(id, `random-${seen.size}`), `random-${seen.size - 1}`),
+      )
+      .replace(/t3-orchestrator-v2-queue-start-(?:whole|bounded)-\w+/g, "queue-start-workspace"),
   );
 };
 

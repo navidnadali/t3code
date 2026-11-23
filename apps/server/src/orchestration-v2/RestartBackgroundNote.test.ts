@@ -6,6 +6,7 @@ import {
   RunAttemptId,
   RunId,
   type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
@@ -17,8 +18,10 @@ import {
   isRestartNoteContinuation,
   latestRanFirst,
   pendingRestartCancelledBackgroundWork,
+  pendingStoppedDelegatedTasks,
   restartContinuationNote,
   restartNoteCompactionCandidates,
+  stoppedDelegatedTasksNote,
   mergeRestartCancelledBackgroundWork,
   planRestartNote,
 } from "./RestartBackgroundNote.ts";
@@ -649,6 +652,113 @@ it("takes every compaction candidate of a thread no run prompted in bounded read
   assert.isAtMost(
     counter.reads,
     UNPROMPTED_DRAIN_READS_PER_RECORD * records,
+    `${counter.reads} reads of ${records} records`,
+  );
+});
+
+// regression: #34401 Stop interrupted a parent's delegated tasks without telling its agent
+it("tells the next completed turn about delegated tasks its Stop interrupted, once", () => {
+  const at = (minute: number) => DateTime.makeUnsafe(`2026-10-03T10:0${minute}:00.000Z`);
+  const spawning = run(1, claudeThread, {
+    requestedAt: at(0),
+    delegatedCompletion: { disposition: "stopped", nextGeneration: 1, delivery: null },
+  });
+  const task = (id: string, extra: Partial<OrchestrationV2Subagent> = {}) =>
+    ({
+      id: NodeId.make(id),
+      runId: spawning.id,
+      origin: "app_owned",
+      prompt: `Run ${id}.`,
+      title: null,
+      status: "interrupted",
+      completionDelivery: { state: "disposed", observedByRunId: null },
+      completedAt: at(1),
+      ...extra,
+    }) as OrchestrationV2Subagent;
+  const stopped = task("stopped", { title: "Build A" });
+  const subagents = [
+    stopped,
+    task("cancelled", { cancelledRunId: RunId.make("run:child") }),
+    task("finished", { status: "completed" }),
+    task("delivered", { completionDelivery: { state: "delivered", observedByRunId: null } }),
+  ];
+  const pending = (runs: ReadonlyArray<OrchestrationV2Run>, providerThreadId = claudeThread) =>
+    pendingStoppedDelegatedTasks({
+      providerThreadId,
+      runs,
+      providerTurns: runs.map(turnFor),
+      attempts: runs.map((source) => ({ id: source.activeAttemptId!, runId: source.id })),
+      subagents,
+      compactionMessageIds: new Set(),
+    });
+
+  assert.deepEqual(pending([spawning]), [stopped]);
+  // A /clear turn starts a fresh provider thread that never saw the stopped tasks.
+  assert.deepEqual(pending([spawning], codexThread), []);
+  assert.equal(stoppedDelegatedTasksNote([stopped]).split("\n")[1], "- Build A (task stopped)");
+  // Requested while the task was still settling, so its turn start could not see it.
+  const racing = run(2, claudeThread, { requestedAt: at(0), startedAt: at(2) });
+  assert.deepEqual(pending([spawning, racing]), [stopped]);
+  assert.deepEqual(pending([spawning, racing, run(3, claudeThread, { requestedAt: at(2) })]), []);
+  // A fresh-context turn on another provider thread never carried the note.
+  assert.deepEqual(pending([spawning, run(3, codexThread, { requestedAt: at(2) })]), [stopped]);
+});
+
+// A Stop that disposed delegated tasks stays in its run, so every later turn start on the thread
+// asks which of them the agent has not been told about. On a long thread that must stay linear:
+// about 4 reads per record, against hundreds when each run looks through every attempt.
+const STOPPED_TASK_READS_PER_RECORD = 6;
+
+it("finds the stopped tasks not yet told reading each run, attempt and turn a bounded number of times", () => {
+  const history = hugeHistory(2_000, 27_029);
+  const counter = { reads: 0 };
+  const stoppedOrdinal = history.runs.length - 10;
+  const runs = countReads(
+    history.runs.map(
+      (source) =>
+        ({
+          ...source,
+          requestedAt: source.startedAt,
+          ...(source.ordinal === stoppedOrdinal
+            ? {
+                delegatedCompletion: { disposition: "stopped", nextGeneration: 1, delivery: null },
+              }
+            : {}),
+        }) as OrchestrationV2Run,
+    ),
+    counter,
+  );
+  const attempts = countReads(history.attempts, counter);
+  const providerTurns = countReads(history.providerTurns, counter);
+  // The task ended after every run's request, so no completed turn has told the agent yet.
+  const task = {
+    id: NodeId.make("node:stopped-on-a-long-thread"),
+    runId: history.runs[stoppedOrdinal - 1]!.id,
+    origin: "app_owned",
+    prompt: "Build it.",
+    title: null,
+    status: "interrupted",
+    completionDelivery: { state: "disposed", observedByRunId: null },
+    completedAt: DateTime.makeUnsafe(Date.UTC(2026, 9, 1) + (history.runs.length + 1) * 60_000),
+  } as OrchestrationV2Subagent;
+
+  const pending = pendingStoppedDelegatedTasks({
+    providerThreadId: history.providerThreadId,
+    runs,
+    providerTurns,
+    attempts,
+    subagents: [task],
+    compactionMessageIds: history.compactionMessageIds,
+  });
+
+  assert.deepEqual(
+    pending.map((source) => source.id),
+    [task.id],
+  );
+  const records = runs.length + attempts.length + providerTurns.length;
+  assert.isAtMost(
+    counter.reads,
+    STOPPED_TASK_READS_PER_RECORD * records,
     `${counter.reads} reads of ${records} records`,
   );
 });

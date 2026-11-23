@@ -21,6 +21,19 @@ const stalled: EventLoopMonitor.EventLoopReadings = {
   elapsedMs: 30_000,
   loadAverage: 219.43,
   cpuCount: 18,
+  mainThreadSchedStat: { available: true, cpuMs: 412.6, runQueueWaitMs: 4870.4 },
+};
+
+// What the stall record held before the main thread's scheduler numbers were added.
+const earlierFields = {
+  delayMaxMs: 4_950,
+  utilization: 0.18,
+  cpuUserMs: 310,
+  cpuSystemMs: 96,
+  majorPageFaults: 8_412,
+  minorPageFaults: 20_031,
+  involuntaryContextSwitches: 57,
+  rssMb: 1536,
 };
 
 describe("EventLoopMonitor", () => {
@@ -32,5 +45,26 @@ describe("EventLoopMonitor", () => {
     };
     assert.isUndefined(EventLoopMonitor.stallMs(asleep));
     assert.strictEqual(EventLoopMonitor.stallMs({ ...asleep, activeMs: 600_000 }), 599_000);
+  });
+
+  it("records the main thread's run-queue wait and CPU over the stall's window", () => {
+    // Waiting for a CPU, not busy: host starvation.
+    assert.deepStrictEqual(EventLoopMonitor.stallRecord(stalled, 4_950), {
+      ...earlierFields,
+      mainThreadRunQueueWaitMs: 4_870,
+      mainThreadCpuMs: 413,
+    });
+  });
+
+  it("says why the main thread's scheduler numbers are missing, and keeps every earlier field", () => {
+    for (const reason of ["platform", "unreadable", "malformed"] as const) {
+      assert.deepStrictEqual(
+        EventLoopMonitor.stallRecord(
+          { ...stalled, mainThreadSchedStat: { available: false, reason } },
+          4_950,
+        ),
+        { ...earlierFields, mainThreadSchedStatUnavailable: reason },
+      );
+    }
   });
 });

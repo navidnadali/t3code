@@ -79,7 +79,8 @@ applies only to multiline messages when you choose the multiline send option.
 
 A queued message does not always wait for the turn to end. If the agent is still
 working 60 seconds later, T3 Code steers it into the running turn. Messages from other
-threads are sent the same way. An automation's prompt steers into a running Claude turn
+threads are sent the same way, and so are outside agents' (`t3 thread send`), with other
+threads', where a steer leaves the running tools alone. An automation's prompt steers into a running Claude turn
 at once, since a steer there leaves the running tools alone. Queued messages go together in
 one steer, at most one a minute: yours first, then automations, then other
 threads'. A message can join such a steer before its 60 seconds are up, so edit or

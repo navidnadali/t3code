@@ -153,6 +153,82 @@ export function restartCancelledBackgroundWorkNote(
   ].join("\n");
 }
 
+/**
+ * Delegated tasks a Stop on this provider thread interrupted, until a turn requested after they
+ * ended completes. A run's turn start reads tasks after its request, but can record startedAt
+ * later. A fresh context starts a new provider thread, so it never inherits the note.
+ */
+export function pendingStoppedDelegatedTasks(input: {
+  readonly providerThreadId: OrchestrationV2Run["providerThreadId"];
+  readonly runs: ReadonlyArray<OrchestrationV2Run>;
+  readonly providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>;
+  readonly attempts: ReadonlyArray<Attempt>;
+  readonly subagents: ReadonlyArray<OrchestrationV2Subagent>;
+  readonly compactionMessageIds: ReadonlySet<string>;
+}): ReadonlyArray<OrchestrationV2Subagent> {
+  const stoppedRunIds = new Set(
+    input.runs
+      .filter(
+        (run) =>
+          run.providerThreadId === input.providerThreadId &&
+          run.delegatedCompletion?.disposition === "stopped",
+      )
+      .map((run) => run.id),
+  );
+  if (stoppedRunIds.size === 0) return [];
+  const completedAttemptIds = new Set(
+    input.providerTurns
+      .filter((turn) => turn.status === "completed")
+      .map((turn) => turn.runAttemptId),
+  );
+  // One pass over the attempts, not one per run: a long thread has thousands of each.
+  const completedRunIds = new Set(
+    input.attempts.flatMap((attempt) =>
+      completedAttemptIds.has(attempt.id) ? [attempt.runId] : [],
+    ),
+  );
+  // Only the latest request among the turns that told the agent decides which tasks it heard of.
+  let latestToldRequest = Number.NEGATIVE_INFINITY;
+  for (const run of input.runs) {
+    if (
+      run.providerThreadId === input.providerThreadId &&
+      !input.compactionMessageIds.has(run.userMessageId) &&
+      completedRunIds.has(run.id)
+    ) {
+      latestToldRequest = Math.max(latestToldRequest, DateTime.toEpochMillis(run.requestedAt));
+    }
+  }
+  return input.subagents.filter(
+    (task) =>
+      task.origin === "app_owned" &&
+      task.runId !== null &&
+      stoppedRunIds.has(task.runId) &&
+      task.status === "interrupted" &&
+      task.cancelledRunId === undefined &&
+      task.completionDelivery?.state === "disposed" &&
+      task.completedAt !== null &&
+      latestToldRequest <= DateTime.toEpochMillis(task.completedAt),
+  );
+}
+
+export function stoppedDelegatedTasksNote(tasks: ReadonlyArray<OrchestrationV2Subagent>): string {
+  const omitted = tasks.length - MAX_NOTE_ENTRIES;
+  return [
+    "Note: Stop on this thread also stopped these delegated tasks before they finished. They will not report back on their own, so check them with task_status and start again what you still need:",
+    ...tasks
+      .slice(0, MAX_NOTE_ENTRIES)
+      .map(
+        (task) =>
+          `- ${labelWithId(
+            compactLabel(task.title) === undefined ? task.prompt : task.title,
+            "delegated task",
+            ` (task ${task.id})`,
+          )}`,
+      ),
+    ...(omitted > 0 ? [`- and ${omitted} more`] : []),
+  ].join("\n");
+}
+
 type ProviderTurnState = Pick<
   OrchestrationV2ProviderTurn,
   "runAttemptId" | "providerThreadId" | "status" | "promptDropped"

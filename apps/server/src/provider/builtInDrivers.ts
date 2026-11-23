@@ -56,7 +56,8 @@ const withSpawner =
 /**
  * Sessions and checks of a provider verified on hand-off (real CLI, socket stdio, survives the
  * spawner's death) start from the server's provider launcher. Claude and Codex pick their spawners
- * themselves; the others stay on Node's spawner (docs/operations/observability.md says why).
+ * themselves; the others stay on Node's spawner (docs/operations/perf-fork-observability.md says
+ * why).
  */
 const launchedByServer = withSpawner(WorkerChildProcessSpawner.providerSpawner);
 

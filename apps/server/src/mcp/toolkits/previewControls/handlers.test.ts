@@ -61,6 +61,9 @@ it.effect.each([
       ),
     );
     const tab = yield* manager.open({ threadId, url: "http://localhost:3000" });
+    // A tab the server closed on its own stays listed, with why, so the agent need not guess.
+    const idle = yield* manager.open({ threadId, url: "http://localhost:4000" });
+    yield* manager.close({ threadId, tabId: idle.tabId }, { reason: "idle" });
     const layerDependencies = Layer.mergeAll(
       PreviewAutomationBroker.layer.pipe(
         Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
@@ -86,7 +89,11 @@ it.effect.each([
       .handle("t3_preview_close", { tabId: tab.tabId })
       .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(layerDependencies));
     if (projectAccess) {
-      expect(listed.at(-1)?.result).toMatchObject({ sessions: [tab], nextCursor: null });
+      expect(listed.at(-1)?.result).toMatchObject({
+        sessions: [tab],
+        closedTabs: [{ tabId: idle.tabId, reason: "idle" }],
+        nextCursor: null,
+      });
       expect(closed.at(-1)?.result).toEqual({});
       expect((yield* manager.list({ threadId })).sessions).toEqual([]);
     } else {

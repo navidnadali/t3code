@@ -2621,14 +2621,15 @@ it.effect.each([
         const now = yield* DateTime.now;
         if (kind === "a released session") {
           const providerThread = before.providerThreads[0]!;
-          // The release ends the run's turn through its event consumer, after release returns;
-          // the gap below is written once that has landed, or it would be overwritten.
+          // The release ends the run's turn, interrupted, through its event consumer after
+          // release returns; the gap below is written once that has landed, or it would be
+          // overwritten.
           const runEnded = yield* sink.stream({ afterSequence: 0 }).pipe(
             Stream.filter(
               (stored) =>
                 stored.event.type === "run.updated" &&
                 stored.event.payload.id === run.id &&
-                stored.event.payload.status === "failed",
+                stored.event.payload.status === "interrupted",
             ),
             Stream.take(1),
             Stream.runDrain,
@@ -2912,6 +2913,27 @@ it.effect("restarts the turn for an image when native steering takes text only",
       const before = yield* orchestrator.getThreadProjection(threadId);
       const originalStart = before.runs[0]!.startedAt;
       assert.isNotNull(originalStart);
+      // A feedback card the run showed before the restart, still waiting for the user.
+      const card = {
+        type: "feedback_request.record" as const,
+        threadId,
+        runId: before.runs[0]!.id,
+        nodeId: before.runs[0]!.rootNodeId!,
+        turnItemId: TurnItemId.make("turn-item:feedback-request:steer"),
+        preview: {
+          kind: "bug" as const,
+          subject: "general",
+          expected: "a",
+          actual: "b",
+          workaround: "",
+          trace: null,
+        },
+      };
+      yield* orchestrator.dispatch({
+        ...card,
+        commandId: CommandId.make("feedback-pending"),
+        feedbackStatus: "pending",
+      });
       yield* TestClock.adjust("10 seconds");
       yield* orchestrator.dispatch({
         type: "message.dispatch",
@@ -2952,6 +2974,21 @@ it.effect("restarts the turn for an image when native steering takes text only",
           ["look at this", 1],
         ],
       );
+      // The restart replaced the root, and the user's answer can still close the card.
+      assert.notEqual(after.runs[0]?.rootNodeId, card.nodeId);
+      yield* orchestrator.dispatch({
+        ...card,
+        commandId: CommandId.make("feedback-sent"),
+        feedbackStatus: "sent",
+      });
+      const closed = (yield* orchestrator.getThreadProjection(threadId)).turnItems.find(
+        (item) => item.id === card.turnItemId,
+      );
+      assert.deepInclude(closed, {
+        status: "completed",
+        feedbackStatus: "sent",
+        nodeId: card.nodeId,
+      });
     }).pipe(Effect.provide(layer));
   }),
 );
@@ -3971,6 +4008,56 @@ it.effect("keeps send order per linked sender, not across linked senders", () =>
       yield* send("DELTA", {}, true);
       assert.deepEqual(steeredTexts(), ["BRAVO"]);
       assert.deepEqual(yield* queuedTexts, ["ALPHA", "CHARLIE", "DELTA"]);
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+// regression: #41455 one sender's queued message holds back another sender's automatic steer
+it.effect("an agent's automatic send steers past another sender's queued message", () =>
+  Effect.gen(function* () {
+    const { started, steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
+      "agent-steer-past-other-sender",
+    );
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const threadId = yield* startFirstTurn;
+      const active = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+        (run) => run.status === "running",
+      )!;
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("send-first"),
+        threadId,
+        messageId: MessageId.make("message:queued-first"),
+        text: "queued first",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "mcp",
+        senderThreadId: ThreadId.make("thread:sender-a"),
+      });
+      yield* worker.drain();
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("send-urgent"),
+        threadId,
+        messageId: MessageId.make("message:urgent"),
+        text: "urgent",
+        attachments: [],
+        dispatchMode: { type: "steer_active", targetRunId: active.id },
+        deliveryIntent: "auto",
+        createdBy: "agent",
+        creationSource: "mcp",
+        senderThreadId: ThreadId.make("thread:sender-c"),
+      });
+      yield* worker.drain();
+
+      assert.lengthOf(started, 1);
+      assert.deepEqual(
+        steered.map((text) => text.split("\n").at(-1)),
+        ["urgent"],
+      );
     }).pipe(Effect.provide(layer));
   }),
 );
@@ -12021,7 +12108,17 @@ it.effect("keeps a not-delivered steer's follow-up ahead of what was queued afte
             event.payload.status === "running" &&
             event.payload.runAttemptId !== started[0]!.attemptId,
         );
+        // The next run starts from an async reaction to the run's capture, which drain does not await.
+        const beforeStarting = yield* watch(
+          threadId,
+          (event) =>
+            event.type === "run.updated" &&
+            event.payload.userMessageId === MessageId.make(`message:${name}-before`) &&
+            event.payload.status === "starting",
+        );
         yield* settleTurn(threadId, 0);
+        yield* worker.drain();
+        yield* Fiber.join(beforeStarting);
         yield* worker.drain();
         yield* Fiber.join(beforeRunning);
         yield* TestClock.adjust("5 seconds");

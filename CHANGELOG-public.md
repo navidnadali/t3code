@@ -2,6 +2,36 @@
 
 Public release notes of this performance fork of T3 Code. Each release is one commit whose parents are the previous release and the upstream commit it is based on.
 
+## v0.1.11-perf.17 (2026-11-23)
+
+Upstream main merged again, ten fixes from production and the perf work queued since perf.16
+
+Upstream base: 1bc44f2732ce.
+
+Upstream main of 2026-11-23 (apps/server 0.1.11); upstream migrations 106 to 110 run after 105.
+
+- Upstream main merged: the release carries upstream main as of 2026-11-23 (1bc44f2732), merged twice while the release was built. Where upstream fixed what the fork had fixed (the shared Claude process poll, checkpoint capture under the thread lock, per-sender auto-send order, the chunked thread snapshot, the commit batch's cut rule), upstream's version is kept and the fork's guarantees stay where upstream lacks them.
+- An agent's browser tab the idle sweep closes is reported closed, with the reason, in the preview list and status, instead of disappearing silently.
+- A message an outside agent sends with `t3 thread send` steers into the running turn like a person's; a wait for the run it was sent to follows the message to the run that answers it.
+- An event-loop stall record carries the main thread's run-queue wait and CPU time (Linux), so a stall can be told apart from a busy host.
+- A finished delegate's session release no longer cuts a run that is still live on it.
+- Built on the fleet line first and ported here: a delegated child's run that fails with no task to report it (such as a Claude Monitor wake after its task settled) wakes its parent once with the failure, also when the server stopped before the failure was reported.
+- Provider retry budgets are configurable per provider (default 10 minutes each).
+- A compaction or a manual continuation keeps its provider session busy like a turn, so the 2-minute idle release cannot drop it mid-run.
+- A finished run no longer keeps receiving its process's events for hours to days after an earlier failed run's delegated task, and the "provider event ingestion failed" warnings at idle releases stop.
+- A Claude wake turn that streams before its continuation run attaches keeps its message id, live streaming and running usage; the reply text was never lost.
+- The process spawner executable builds byte-identically from one source.
+- Claude process tracking uses upstream's shared poll of working CLIs; an idle CLI whose jobs still run stays polled, and a process that reuses an exited CLI's pid is never treated as its child.
+- A turn start on a long thread finds the delegated tasks a Stop interrupted in one pass instead of one per run.
+- `t3 feedback` and `t3 workflow` start without the server's young-generation relaunch.
+- Rolling back: restore the database copy taken before the upgrade, or, to keep later writes, run on the stopped server's database, in this order: scripts/upstream-106-110-down.sql (to a build at upstream 105, 0.1.11-perf.16), then scripts/upstream-097-105-down.sql and scripts/perf-fork-005-down.sql (to a build at upstream 96, 0.1.9-perf.13 or perf.14). Workflow runs, agent feedback and added issue-tracker accounts written since are dropped.
+
+Behaviour changes:
+
+- An outside agent's message (`t3 thread send`) steers into a running turn when it is due, as a person's does, instead of always waiting for the run to end.
+- A wait for a run whose message moved into another run ends with that run's answer; a wait whose message comes back to a run it already left reports itself unfinished.
+- The fork's observability notes (fast SQL spans, span minutes, the process spawner, SQLite memory) moved to docs/operations/perf-fork-observability.md, beside upstream's renamed guides.
+
 ## v0.1.11-perf.16 (2026-11-22)
 
 Upstream main merged, its steer design kept with two fixes, and the fork's per-thread totals retired for upstream's

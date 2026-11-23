@@ -2214,6 +2214,26 @@ describe("AcpSessionRuntime", () => {
     },
   );
 
+  it.effect("fails startup when the agent never answers initialize", () =>
+    Effect.gen(function* () {
+      const initializeSent = yield* Deferred.make<void>();
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        // A live child that reads stdin and never replies, like one stuck in disk sleep.
+        spawn: { command: "node", args: ["-e", "process.stdin.resume()"] },
+        requestLogger: (event) =>
+          event.method === "initialize" && event.status === "started"
+            ? Deferred.succeed(initializeSent, undefined)
+            : Effect.void,
+      });
+      const startup = yield* runtime.start().pipe(Effect.forkChild);
+      yield* Deferred.await(initializeSent);
+      yield* TestClock.adjust("30 minutes");
+      const exit = yield* Fiber.await(startup);
+      expect(Exit.isFailure(exit)).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
   it.effect("fails a request that settles after its runtime closed", () =>
     Effect.gen(function* () {
       const runtimeScope = yield* Scope.make();

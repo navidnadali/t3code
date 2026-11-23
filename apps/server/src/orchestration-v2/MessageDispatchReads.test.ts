@@ -1427,6 +1427,8 @@ it.effect("a message waits, held, behind a worktree setup that failed", () =>
         {
           shown: true,
           status: "failed",
+          // Its worktree setup failed, so it never started.
+          startedAt: null,
           tasks: 0,
           workspacePreparation: { type: "worktree", baseRef: "main" },
         },

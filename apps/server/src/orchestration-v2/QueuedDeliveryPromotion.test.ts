@@ -55,7 +55,9 @@ type Origin =
   | "user"
   | "completion"
   | "notification"
-  | "follow-up";
+  | "follow-up"
+  /** An MCP client that is no thread, such as `t3 thread send`: an agent with no sender. */
+  | "outside";
 
 const run = (
   name: string,
@@ -99,7 +101,8 @@ const message = (
   createdAt: at,
   updatedAt: at,
   createdBy: origin === "user" || origin === "follow-up" ? "user" : "agent",
-  creationSource: origin === "user" || origin === "follow-up" ? "web" : "server",
+  creationSource:
+    origin === "user" || origin === "follow-up" ? "web" : origin === "outside" ? "mcp" : "server",
   ...(origin === "automation" ? { scheduledTaskId: ScheduledTaskId.make("task:check") } : {}),
   ...(origin === "cross-thread" ? { senderThreadId: ThreadId.make("thread:sender") } : {}),
   ...(origin === "linked"
@@ -348,6 +351,65 @@ it.effect.each(["automation", "cross-thread", "linked", "user"] as const)(
         commandId: "command:auto-send-now:run:incoming:run:active:provider-turn:run:active",
       } as never);
     }),
+);
+
+it.effect(
+  "steers an outside agent's message into a live turn that keeps its tools, after 60 s",
+  () =>
+    Effect.gen(function* () {
+      const start = yield* DateTime.now;
+      const claude = { activeSteeringInterruptsTools: false };
+      const scenario: Scenario = {
+        capabilities: claude,
+        queued: [{ name: "cli", origin: "outside" }],
+      };
+      yield* TestClock.adjust("59 seconds");
+      assert.isNull(yield* decide(scenario, start));
+      yield* TestClock.adjust("1 second");
+      assert.equal(promotedRun(yield* decide(scenario, start)), "run:cli");
+      // Where a steer cancels the turn's running tools, it waits for the turn to end instead.
+      yield* TestClock.adjust("1 hour");
+      assert.isNull(yield* decide({ queued: [{ name: "cli", origin: "outside" }] }, start));
+      // It rides with other threads' messages, after the user's own, in queue order.
+      assert.deepEqual(
+        steeredRuns(
+          yield* decide(
+            {
+              capabilities: claude,
+              queued: [
+                { name: "cli", origin: "outside" },
+                { name: "cross-thread", origin: "cross-thread" },
+                { name: "user", origin: "user" },
+              ],
+            },
+            start,
+          ),
+        ),
+        ["run:user", "run:cli", "run:cross-thread"] as never,
+      );
+    }),
+);
+
+it.effect("never steers a message that asks for a result, before or after plain ones", () =>
+  Effect.gen(function* () {
+    const start = yield* DateTime.now;
+    const claude = { activeSteeringInterruptsTools: false };
+    const structured = {
+      name: "structured",
+      origin: "outside" as const,
+      run: { outputSchema: { type: "object" } },
+    };
+    const plain = { name: "plain", origin: "outside" as const };
+    yield* TestClock.adjust("1 hour");
+    // Steering joins a turn not asked for its result, so it keeps a turn of its own.
+    for (const queued of [
+      [structured, plain],
+      [plain, structured],
+    ])
+      assert.deepEqual(steeredRuns(yield* decide({ capabilities: claude, queued }, start)), [
+        "run:plain",
+      ] as never);
+  }),
 );
 
 it.effect("never promotes a hidden wake or an agent's message to its own thread", () =>

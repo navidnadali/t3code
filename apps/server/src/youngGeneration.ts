@@ -59,6 +59,7 @@ export const NON_SERVER_COMMANDS: ReadonlySet<string> = new Set([
   "connect",
   "doctor",
   "environment",
+  "feedback",
   "help",
   "install",
   "pair",
@@ -73,6 +74,7 @@ export const NON_SERVER_COMMANDS: ReadonlySet<string> = new Set([
   "up",
   "update",
   "uninstall",
+  "workflow",
 ]);
 /** Root flags that print and exit; every other root flag (`--port`, `--no-browser`, `--base-dir`…) runs the server. */
 const NON_SERVER_ROOT_FLAGS = new Set([

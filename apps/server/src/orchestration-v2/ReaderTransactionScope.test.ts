@@ -886,7 +886,8 @@ const consistencyCases: ReadonlyArray<ConsistencyCase> = [
   {
     name: "turn start context",
     read: (store, fixture) => store.getTurnStartContext(fixture.fork, fixture.forkRunId),
-    pauseBefore: (query) => query.includes("GLOB '/goal*'"),
+    // The deferred slash-command message read (DEFERRED_COMMAND_MESSAGE_CONDITION).
+    pauseBefore: (query) => query.includes("GLOB '/*'"),
     // The run's own message, which the message read reads by key.
     write: (fixture) => [
       event("event:snapshot:fork:compact", {

@@ -2,7 +2,9 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { type PreviewEvent, ThreadId } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import { expect } from "vite-plus/test";
@@ -253,5 +255,81 @@ it.layer(layer)("PreviewManager", (it) => {
       const list = yield* manager.list({ threadId });
       expect(list.sessions.map((s) => s.tabId)).toEqual([b.tabId]);
     }),
+  );
+
+  it.effect(
+    "a tab the server closes for a reason says why, in the event and the thread's list",
+    () =>
+      Effect.gen(function* () {
+        const threadId = freshThreadId();
+        const manager = yield* PreviewManager.PreviewManager;
+        const idle = yield* manager.open({ threadId, url: "http://localhost:5173" });
+        const asked = yield* manager.open({ threadId, url: "http://localhost:3000" });
+        const kept = yield* manager.open({ threadId, url: "http://localhost:4000" });
+        const collector = yield* collectEvents;
+
+        yield* manager.close({ threadId, tabId: idle.tabId }, { reason: "idle" });
+        yield* manager.close({ threadId, tabId: asked.tabId });
+
+        const events = yield* collector.drain;
+        expect(
+          events.map((event) => [event.type, event.tabId, "reason" in event && event.reason]),
+        ).toEqual([
+          ["closed", idle.tabId, "idle"],
+          ["closed", asked.tabId, false],
+        ]);
+        const list = yield* manager.list({ threadId });
+        expect(list.sessions.map((s) => s.tabId)).toEqual([kept.tabId]);
+        // Only a close the server made on its own is listed: a client's close needs no explaining.
+        expect(list.closedTabs).toEqual([
+          { tabId: idle.tabId, reason: "idle", closedAt: expect.any(String) },
+        ]);
+        expect((yield* manager.list({ threadId: freshThreadId() })).closedTabs).toBeUndefined();
+      }),
+  );
+
+  it.effect("a thread lists only its latest few server-closed tabs, newest first", () =>
+    Effect.gen(function* () {
+      const threadId = freshThreadId();
+      const manager = yield* PreviewManager.PreviewManager;
+      const closed: Array<string> = [];
+      for (let index = 0; index < 8; index++) {
+        const tab = yield* manager.open({ threadId, url: "http://localhost:5173" });
+        yield* manager.close({ threadId, tabId: tab.tabId }, { reason: "idle" });
+        closed.push(tab.tabId);
+      }
+      const { closedTabs } = yield* manager.list({ threadId });
+      expect(closedTabs?.map((tab) => tab.tabId)).toEqual(closed.toReversed().slice(0, 5));
+
+      // Closing the whole thread (it was deleted or archived) forgets them.
+      yield* manager.close({ threadId });
+      expect((yield* manager.list({ threadId })).closedTabs).toBeUndefined();
+    }),
+  );
+
+  it.effect("a thread's cleanup forgets an idle close that lands while it waits on its pages", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const threadId = freshThreadId();
+        const manager = yield* PreviewManager.PreviewManager;
+        const idle = yield* manager.open({ threadId, url: "http://localhost:5173" });
+        yield* manager.open({ threadId, url: "http://localhost:3000" });
+        const cleanupWaits = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        yield* manager.registerBeforeClose((snapshots) =>
+          snapshots.length > 1
+            ? Deferred.succeed(cleanupWaits, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+              )
+            : Effect.void,
+        );
+        const cleanup = yield* manager.close({ threadId }).pipe(Effect.forkScoped);
+        yield* Deferred.await(cleanupWaits);
+        yield* manager.close({ threadId, tabId: idle.tabId }, { reason: "idle" });
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(cleanup);
+        expect((yield* manager.list({ threadId })).closedTabs).toBeUndefined();
+      }),
+    ),
   );
 });

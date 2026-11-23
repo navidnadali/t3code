@@ -24,6 +24,32 @@ import {
 } from "./CommandPolicy.ts";
 import { isHiddenWake, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 
+/**
+ * An agent's message sent through MCP by a client that is no thread (`t3 thread send`, a script):
+ * it has no sender, so it is neither the thread's own agent's nor another thread's.
+ */
+function isOutsideAgentMessage(
+  message: Pick<
+    OrchestrationV2ConversationMessage,
+    | "createdBy"
+    | "creationSource"
+    | "senderThreadId"
+    | "linkedSender"
+    | "scheduledTaskId"
+    | "delegatedCompletion"
+    | "notification"
+  >,
+): boolean {
+  return (
+    message.createdBy === "agent" &&
+    message.creationSource === "mcp" &&
+    message.senderThreadId === undefined &&
+    message.linkedSender === undefined &&
+    message.scheduledTaskId === undefined &&
+    !isHiddenWake(message)
+  );
+}
+
 /** How long a queued message from the user, an automation or another thread waits before it steers. */
 export const QUEUED_DELIVERY_PROMOTION_GRACE = Duration.seconds(60);
 /** A due message steers within one tick; a tick sends at most one steer per thread. */
@@ -96,7 +122,14 @@ function queuedDeliveryDueAt(
   target: { readonly id: RunId; readonly liveTurnStartedAt: DateTime.Utc | null },
   turns: OrchestrationV2TurnCapabilities,
 ): DateTime.Utc | null {
-  if (run.status !== "queued" || run.queueHeld === true || run.freshContext === true) return null;
+  // A message that asks for a result needs a turn of its own: a steer would lose its schema.
+  if (
+    run.status !== "queued" ||
+    run.queueHeld === true ||
+    run.freshContext === true ||
+    run.outputSchema !== undefined
+  )
+    return null;
   if (
     isHiddenWake(message) ||
     isNativeMaintenanceCommand(message) ||
@@ -120,6 +153,11 @@ function queuedDeliveryDueAt(
   // Where a scheduled prompt would have steered at dispatch, it need not wait.
   if (message.scheduledTaskId !== undefined && scheduledPromptSteersLiveTurn(turns))
     return run.requestedAt;
+  // An outside agent's message waits like another thread's, but never cancels the running tools.
+  if (isOutsideAgentMessage(message))
+    return scheduledPromptSteersLiveTurn(turns)
+      ? DateTime.addDuration(run.requestedAt, QUEUED_DELIVERY_PROMOTION_GRACE)
+      : null;
   return message.createdBy === "user" ||
     message.scheduledTaskId !== undefined ||
     (message.senderThreadId !== undefined && message.senderThreadId !== run.threadId) ||
@@ -136,12 +174,16 @@ export interface QueuedDeliveryPromotion {
   readonly targetRunId: RunId;
 }
 
-/** The user's own messages go first in a merged steer, then automations, then other threads'. */
+/**
+ * The user's own messages go first in a merged steer, then automations, then other threads' and
+ * outside agents'.
+ */
 function deliveryClass(message: OrchestrationV2ConversationMessage): number {
   if (message.scheduledTaskId !== undefined) return 1;
   if (
     (message.senderThreadId !== undefined && message.senderThreadId !== message.threadId) ||
-    message.linkedSender !== undefined
+    message.linkedSender !== undefined ||
+    isOutsideAgentMessage(message)
   )
     return 2;
   return message.createdBy === "user" &&

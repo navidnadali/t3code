@@ -1,8 +1,10 @@
-// @effect-diagnostics nodeBuiltinImport:off - only node:perf_hooks exposes the event loop delay histogram, and node:os the load average.
+// @effect-diagnostics nodeBuiltinImport:off - only node:perf_hooks exposes the event loop delay histogram, node:os the load average, and a sync node:fs read the main thread's scheduler numbers.
+import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePerfHooks from "node:perf_hooks";
 
 import type { ServerEventLoopStall } from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { RotatingFileSink, RotatingFileSinkError } from "@t3tools/shared/logging";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -16,6 +18,7 @@ import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../config.ts";
+import { makeMainThreadSchedStatSampler, type MainThreadSchedStat } from "./MainThreadSchedStat.ts";
 import * as Metrics from "./Metrics.ts";
 
 // Subtract the histogram's timer resolution; this can undercount stalls by up to RESOLUTION_MS.
@@ -58,6 +61,8 @@ export interface EventLoopReadings {
   /** One-minute load average, undefined on Windows. */
   readonly loadAverage: number | undefined;
   readonly cpuCount: number;
+  /** The main thread's CPU and run-queue wait over the window: Linux only. */
+  readonly mainThreadSchedStat: MainThreadSchedStat;
 }
 
 // Node skips the first gap after a reset, so a stall right at a sample boundary can be missed.
@@ -73,6 +78,12 @@ const makeNodeSampler = Effect.gen(function* () {
   let elu = NodePerfHooks.performance.eventLoopUtilization();
   let usage = process.resourceUsage();
   let sampledAt = NodePerfHooks.performance.now();
+  // A small sync read each sample; it starts its first window here, with the others.
+  const sampleSchedStat = makeMainThreadSchedStatSampler({
+    platform: yield* HostProcess.Platform,
+    pid: process.pid,
+    readFile: (path) => NodeFS.readFileSync(path, "utf8"),
+  });
 
   return Effect.sync(() => {
     const nextElu = NodePerfHooks.performance.eventLoopUtilization();
@@ -98,6 +109,7 @@ const makeNodeSampler = Effect.gen(function* () {
       // Windows has no load average and reports 0, which a running process never sees elsewhere.
       loadAverage: NodeOS.loadavg()[0] || undefined,
       cpuCount: NodeOS.availableParallelism(),
+      mainThreadSchedStat: sampleSchedStat(),
     };
     histogram.reset();
     elu = nextElu;
@@ -106,6 +118,31 @@ const makeNodeSampler = Effect.gen(function* () {
     return readings;
   });
 });
+
+/**
+ * What the stall span and the stall log record. Waiting on a run queue for most of a stall means
+ * the host gave T3 no CPU; CPU time for most of it means T3 was busy; neither, blocked in the
+ * kernel or asleep.
+ */
+export const stallRecord = (readings: EventLoopReadings, delayMaxMs: number) => {
+  const { utilization, usage, rssBytes, mainThreadSchedStat: schedStat } = readings;
+  return {
+    delayMaxMs,
+    utilization: Math.round(utilization * 100) / 100,
+    cpuUserMs: Math.round(usage.userCPUTime / 1000),
+    cpuSystemMs: Math.round(usage.systemCPUTime / 1000),
+    majorPageFaults: usage.majorPageFault,
+    minorPageFaults: usage.minorPageFault,
+    involuntaryContextSwitches: usage.involuntaryContextSwitches,
+    rssMb: Math.round(rssBytes / 1024 / 1024),
+    ...(schedStat.available
+      ? {
+          mainThreadRunQueueWaitMs: Math.round(schedStat.runQueueWaitMs),
+          mainThreadCpuMs: Math.round(schedStat.cpuMs),
+        }
+      : { mainThreadSchedStatUnavailable: schedStat.reason }),
+  };
+};
 
 export const stallMs = ({ delayMaxNs, activeMs }: EventLoopReadings) => {
   const delayMs = Math.round(delayMaxNs / 1e6) - RESOLUTION_MS;
@@ -176,7 +213,7 @@ const layerWith = (
         yield* recordGauges(readings);
         const delayMaxMs = stallMs(readings);
         if (delayMaxMs === undefined) return;
-        const { utilization, usage, rssBytes, loadAverage, cpuCount } = readings;
+        const { loadAverage, cpuCount } = readings;
         const now = yield* DateTime.now;
         const detectedAt = DateTime.formatIso(now);
         if (delayMaxMs >= NOTICEABLE_STALL_MS) {
@@ -192,16 +229,7 @@ const layerWith = (
             },
           });
         }
-        const attributes = {
-          delayMaxMs,
-          utilization: Math.round(utilization * 100) / 100,
-          cpuUserMs: Math.round(usage.userCPUTime / 1000),
-          cpuSystemMs: Math.round(usage.systemCPUTime / 1000),
-          majorPageFaults: usage.majorPageFault,
-          minorPageFaults: usage.minorPageFault,
-          involuntaryContextSwitches: usage.involuntaryContextSwitches,
-          rssMb: Math.round(rssBytes / 1024 / 1024),
-        };
+        const attributes = stallRecord(readings, delayMaxMs);
         yield* Effect.logWarning(`event loop stalled for ${delayMaxMs} ms`).pipe(
           Effect.withSpan("server.eventLoop.stall", { root: true, level: "Warn", attributes }),
         );

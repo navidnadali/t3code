@@ -120,6 +120,34 @@ describe("process spawner single executable", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // Two builds of one source must give one executable: Node embeds the SEA main script's path, and the build
+  // writes that script to a fresh temporary directory, so an absolute main path made every build differ.
+  it.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+    "builds the same bytes from the same source, wherever its temporary directory is",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-spawner-sea-same-" });
+        // The same file name in two places (a macOS ad hoc signature names the file).
+        const build = (dir: string) =>
+          Effect.gen(function* () {
+            yield* fs.makeDirectory(path.join(directory, dir));
+            yield* buildProcessSpawnerSea({
+              source: SpawnerSources.spawnerProcessSource,
+              outputPath: path.join(directory, dir, PROCESS_SPAWNER_EXECUTABLE),
+              nodeVersion: process.versions.node,
+              verbose: false,
+            });
+            return yield* fs.readFile(path.join(directory, dir, PROCESS_SPAWNER_EXECUTABLE));
+          });
+        const first = yield* build("first");
+        const second = yield* build("second");
+        expect(Buffer.compare(Buffer.from(first), Buffer.from(second))).toBe(0);
+        expect(Buffer.from(first).includes("t3-process-spawner-sea-")).toBe(false);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   // A release check, run on request as youngGenerationSea.test.ts is (T3_SEA_TEST=1). A packager
   // stamps the server with APP_VERSION; the spawner beside it must announce that build too, or
   // the server refuses it and runs its spawner from the whole bundle, without provider hand-off.

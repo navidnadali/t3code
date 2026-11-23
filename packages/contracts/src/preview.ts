@@ -237,8 +237,22 @@ export const PreviewListInput = Schema.Struct({
 });
 export type PreviewListInput = typeof PreviewListInput.Type;
 
+/** Why the server closed a tab on its own. `idle`: an agent's tab went 30 minutes without a browser call. */
+export const PreviewCloseReason = Schema.Literals(["idle"]);
+export type PreviewCloseReason = typeof PreviewCloseReason.Type;
+
+/** A tab the server closed on its own, and why. */
+export const PreviewClosedTab = Schema.Struct({
+  tabId: PreviewTabId,
+  reason: PreviewCloseReason,
+  closedAt: Schema.String,
+});
+export type PreviewClosedTab = typeof PreviewClosedTab.Type;
+
 export const PreviewListResult = Schema.Struct({
   sessions: Schema.Array(PreviewSessionSnapshot),
+  /** The thread's latest tabs the server closed on its own, newest first. Absent when there are none. */
+  closedTabs: Schema.optional(Schema.Array(PreviewClosedTab)),
   /** Identifies the current server process so revision resets are safe. */
   serverEpoch: TrimmedNonEmptyString,
   revision: NonNegativeInt,
@@ -291,6 +305,8 @@ const PreviewFailedEvent = Schema.Struct({
 const PreviewClosedEvent = Schema.Struct({
   ...PreviewEventBaseSchema.fields,
   type: Schema.Literal("closed"),
+  /** Set when the server closed the tab on its own. */
+  reason: Schema.optional(PreviewCloseReason),
 });
 
 export const PreviewEvent = Schema.Union([

@@ -248,8 +248,9 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
   const pending = new Set<Job>();
   let closed = false;
   let servings = 0;
-  // Writes in `barrier` that have not finished; they wait on the batch or the writer it holds.
-  let waitingWriters = 0;
+  // The snapshots each unfinished `barrier` write waits on (none: it may wait on the writer the
+  // batch holds).
+  const waitingWrites = new Set<ReadonlySet<Job>>();
   // Batched items that name no snapshot entity each keep a key of their own: none replaces another.
   let unkeyed = 0;
   const observer = yield* CurrentWaitObserver;
@@ -259,7 +260,7 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
     const unregister = observer.register(
       "ProviderCommitBatch.depth",
       "gauge",
-      () => pending.size + waitingWriters,
+      () => pending.size + waitingWrites.size,
     );
     yield* Effect.addFinalizer(() => Effect.sync(unregister));
   }
@@ -428,13 +429,21 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
         let startedAt = 0n;
         let held = false;
         // Whether the transaction stops taking units: it has held the writer long enough while
-        // another write waits. Checked before each unit but the first.
+        // another write waits that needs none of the units still to run (cutting helps no other).
+        // Checked before each unit but the first.
         const holdEnds = Effect.gen(function* () {
           if (held) return true;
           held =
             taken > 0 &&
-            waitingWriters > 0 &&
-            (yield* Clock.monotonicTimeNanos) - startedAt >= MAX_HOLD_NANOS;
+            waitingWrites.size > 0 &&
+            (yield* Clock.monotonicTimeNanos) - startedAt >= MAX_HOLD_NANOS &&
+            Array.from(waitingWrites).some((jobs) =>
+              units
+                .slice(taken)
+                .every(
+                  (unit) => !jobs.has(unit.job) && !unit.superseded.some((job) => jobs.has(job)),
+                ),
+            );
           return held;
         });
         // A savepoint per unit, as the batch must behave; a lone unit fails its transaction instead.
@@ -604,13 +613,14 @@ export const make = Effect.fn("ProviderCommitBatch.make")(function* (
     );
     // A write counts as waiting until it ends, also one with no snapshot to wait for: it may wait
     // on the writer the batch holds, so the batch stops taking jobs after its hold limit.
+    const waitsOn: ReadonlySet<Job> = new Set(awaited);
     const counted = <B, E2, R2>(write: Effect.Effect<B, E2, R2>) =>
       Effect.uninterruptibleMask((restore) => {
-        waitingWriters++;
+        waitingWrites.add(waitsOn);
         return restore(write).pipe(
           Effect.ensuring(
             Effect.sync(() => {
-              waitingWriters--;
+              waitingWrites.delete(waitsOn);
             }),
           ),
         );

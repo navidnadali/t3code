@@ -51,3 +51,15 @@ it("preview_open accepts a target while preserving open input constraints", () =
   expect(() => decode({ target: { ...target, port: 0 } })).toThrow();
   expect(() => decode({ target, tabId: "tab-1", reuseExistingTab: false })).toThrow();
 });
+
+it("an agent learns how long its tab lives where it opens and checks tabs", () => {
+  const { preview_open, preview_status } = PreviewToolkit.tools;
+  // The server closes an agent's tab 30 minutes after its last browser call; a person viewing it
+  // counts, a list read does not, and the browser profile's sign-ins outlive the tab.
+  expect(preview_open.description).toMatch(/30 minutes without a `preview_\*` call/);
+  expect(preview_open.description).toMatch(/person viewing it/);
+  expect(preview_open.description).toMatch(/`t3_preview_list` does not count/);
+  expect(preview_open.description).toMatch(/sign-ins/);
+  expect(preview_status.description).toMatch(/`closedTabs`/);
+  expect(preview_status.description).toMatch(/Without `tabId` it reads your current tab/);
+});

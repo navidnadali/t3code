@@ -73,6 +73,7 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimit.ts";
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import { cancelledBeforeStart } from "./RestartBackgroundNote.ts";
+import { contextBoundaryOrdinal } from "./contextBoundary.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { ThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
@@ -96,6 +97,7 @@ export function withCreationProvenance(
         linkOrigin: _linkOrigin,
         delegatedFrom: _delegatedFrom,
         initialMessage: _initialMessage,
+        workflowRun: _workflowRun,
         ...rest
       } = command;
       return { ...rest, ...provenance };
@@ -1157,18 +1159,44 @@ const make = Effect.gen(function* () {
     "ThreadManagementService.submitRunOutput",
   )(function* (input) {
     const records = yield* orchestrator.getThreadRecords(input.threadId, ["runs"]);
+    // A retry of a submission already taken answers for the run it went to, which a run asked for
+    // a result since may have followed. Replaying the receipt ignores the command's run and value.
+    const receipt = yield* receipts
+      .getByCommandId(input.commandId)
+      .pipe(Effect.orElseSucceed(() => Option.none()));
+    const anyRun = records.runs[0];
+    if (Option.isSome(receipt) && receipt.value.status === "accepted" && anyRun !== undefined) {
+      const replayed = yield* orchestrator.dispatch({
+        type: "run.output.submit",
+        commandId: input.commandId,
+        threadId: input.threadId,
+        runId: anyRun.id,
+        value: null,
+      });
+      const runId = replayed.storedEvents.find(({ event }) => event.type === "run.output-submitted")
+        ?.event.runId;
+      if (runId !== undefined) return { runId };
+    }
     const active = latestActiveRun(records);
     // A turn that ended without its result still owes it: the agent may have ended it to wait
-    // for something, and answer from the turn that woke it.
-    // Only an ended turn can owe one; a queued or running turn asked for one answers for itself.
-    const owed = records.runs
+    // for something, and answer from the turn that woke it. Only the newest started run asked for
+    // one can owe it, and only while the agent's conversation still reaches it.
+    const asked = records.runs
       .filter(
         (candidate) =>
           candidate.outputSchema !== undefined &&
-          candidate.output === undefined &&
-          candidate.status === "completed",
+          candidate.status !== "queued" &&
+          !cancelledBeforeStart(candidate),
       )
       .toSorted((left, right) => right.ordinal - left.ordinal)[0];
+    const owing = asked?.status === "completed" && asked.output === undefined ? asked : undefined;
+    const forgotten =
+      owing !== undefined &&
+      records.runs.some((later) => later.freshContext === true && later.ordinal > owing.ordinal) &&
+      contextBoundaryOrdinal(
+        yield* orchestrator.getThreadRecords(input.threadId, ["runs", "turnItems"]),
+      ) > owing.ordinal;
+    const owed = forgotten ? undefined : owing;
     const run = active?.outputSchema !== undefined ? active : owed;
     if (active === undefined || run?.outputSchema === undefined) {
       return yield* new ThreadManagementRunOutputRejectedError({
@@ -1194,9 +1222,146 @@ const make = Effect.gen(function* () {
     return { runId: run.id };
   });
 
+  type MessageAfterRun =
+    | { readonly type: "answered" }
+    | { readonly type: "unread" }
+    | { readonly type: "moved"; readonly runId: OrchestrationV2Run["id"] };
+
+  /**
+   * Where the waited message stands once `run` ended. The automatic steer cancels a queued run and
+   * sends its message into the busy run; a steer that run never read is re-sent as its follow-up by
+   * the run-end reaction, a moment after the run ends ("unread" until then).
+   */
+  const messageAfterRun = Effect.fnUntraced(function* (
+    input: Parameters<ThreadManagementServiceShape["waitForThread"]>[0],
+    run: OrchestrationV2Run,
+    messageId: OrchestrationV2Run["userMessageId"],
+  ) {
+    const answered: MessageAfterRun = { type: "answered" };
+    // Whatever way the run ended (cancelled, completed, failed), the message may have gone on.
+    if (!isTerminalRunStatus(run.status)) return answered;
+    // A steer is recorded before its delivery effect runs; a turn that ended first gets the
+    // message re-sent by that effect, so its outcome is only known once the effect settled.
+    yield* orchestrator.awaitMessageSteersSettled(input.threadId, messageId);
+    // One read: a re-send moves the message and its steer together.
+    const { messages, turnItems } = yield* getProjectThreadRecords(
+      input,
+      ["messages", "turnItems"],
+      { messageIds: [messageId], turnItemMessageIds: [messageId] },
+    );
+    const carrierId = messages.find((message) => message.id === messageId)?.runId ?? null;
+    if (carrierId === null) return answered;
+    if (carrierId === run.id) {
+      const unread = turnItems.some(
+        (item) =>
+          item.type === "user_message" &&
+          item.runId === run.id &&
+          item.messageId === messageId &&
+          item.status === "pending" &&
+          (item.inputIntent === "steer" || item.inputIntent === "promoted_queued_to_steer"),
+      );
+      return unread ? ({ type: "unread" } satisfies MessageAfterRun) : answered;
+    }
+    const { runs } = yield* getProjectThreadRecords(input, ["runs"], {
+      runWithContinuations: carrierId,
+    });
+    // A restart continues a run as a new one; the message staying with the cut run is no move.
+    for (let id = run.restartContinuationOfRunId; id !== undefined;) {
+      if (id === carrierId) return answered;
+      id = runs.find((candidate) => candidate.id === id)?.restartContinuationOfRunId;
+    }
+    // Elsewhere now: steered into a busy run, re-sent after a turn missed it, or both in turn.
+    return { type: "moved", runId: carrierId } satisfies MessageAfterRun;
+  });
+
+  /** Waits, within `timeoutMs`, until an unread steer was re-sent or settled; none if it never was. */
+  const awaitUnreadSettled = Effect.fnUntraced(function* (
+    input: Parameters<ThreadManagementServiceShape["waitForThread"]>[0],
+    run: OrchestrationV2Run,
+    messageId: OrchestrationV2Run["userMessageId"],
+    timeoutMs: number,
+  ) {
+    const loadError = (cause: unknown) =>
+      new ThreadManagementProjectionLoadError({
+        projectId: input.projectId,
+        threadId: input.threadId,
+        cause,
+      });
+    const afterSequence = yield* orchestrator
+      .getThreadEventSequence(input.threadId)
+      .pipe(Effect.mapError(loadError));
+    const settled = Effect.gen(function* () {
+      const now = yield* messageAfterRun(input, run, messageId);
+      if (now.type !== "unread") return Option.some(now);
+      return yield* Stream.mergeAll(
+        (["run.updated", "turn-item.updated"] as const).map((eventType) =>
+          orchestrator.streamStoredEventsFrom({
+            threadId: input.threadId,
+            afterSequence,
+            eventType,
+          }),
+        ),
+        { concurrency: "unbounded" },
+      ).pipe(
+        Stream.mapError(loadError),
+        Stream.mapEffect(() => messageAfterRun(input, run, messageId)),
+        Stream.filter((next) => next.type !== "unread"),
+        Stream.runHead,
+      );
+    });
+    // The whole wait, the steer's settling included, keeps to the caller's time.
+    return yield* settled.pipe(
+      Effect.timeoutOption(Duration.millis(Math.max(1, timeoutMs))),
+      Effect.map(Option.flatten),
+    );
+  });
+
+  // Each hop is a steer that moved the message, which the wait follows within its own time. A run
+  // the message already left cannot carry it again; reaching one, or this many hops, the wait
+  // reports itself unfinished rather than answered.
+  const MAX_MESSAGE_HOPS = 256;
+
   const waitForThread: ThreadManagementServiceShape["waitForThread"] = Effect.fn(
     "ThreadManagementService.waitForThread",
   )(function* (input) {
+    // A waiter asked for its message's answer, so it follows the message to the run that gives it.
+    const startedAt = yield* Clock.currentTimeMillis;
+    const remainingMs = Effect.map(Clock.currentTimeMillis, (now) =>
+      Math.max(1, input.timeoutMs - (now - startedAt)),
+    );
+    let current = input;
+    // The message the waited run carried, wherever it goes: after a hop, a run's own is another.
+    let messageId: OrchestrationV2Run["userMessageId"] | undefined;
+    const left = new Set<string>();
+    for (let hop = 0; ; hop++) {
+      const result = yield* waitForRunOnce(current);
+      if (result.timedOut || result.run === null) return result;
+      // Without a run id the wait took the thread's latest run; it is the waited run from here.
+      const waitedRunId = input.runId ?? result.run.id;
+      // A run that ran with its own message answered it: only a queued run the steer cancelled
+      // lost its message, so an ordinary wait reads nothing more.
+      if (hop === 0 && result.run.id === waitedRunId && result.run.status !== "cancelled")
+        return result;
+      messageId ??=
+        result.run.id === waitedRunId
+          ? result.run.userMessageId
+          : (yield* getProjectThreadRecords(input, ["runs"], {
+              runWithContinuations: waitedRunId,
+            })).runs.find((candidate) => candidate.id === waitedRunId)?.userMessageId;
+      if (messageId === undefined) return result;
+      const next = yield* awaitUnreadSettled(current, result.run, messageId, yield* remainingMs);
+      if (Option.isNone(next)) return { ...result, timedOut: true };
+      if (next.value.type !== "moved") return result;
+      left.add(result.run.id);
+      if (left.has(next.value.runId) || hop + 1 >= MAX_MESSAGE_HOPS)
+        return { ...result, timedOut: true };
+      current = { ...input, runId: next.value.runId, timeoutMs: yield* remainingMs };
+    }
+  });
+
+  const waitForRunOnce = Effect.fn("ThreadManagementService.waitForRunOnce")(function* (
+    input: Parameters<ThreadManagementServiceShape["waitForThread"]>[0],
+  ) {
     const loadError = (cause: unknown) =>
       new ThreadManagementProjectionLoadError({
         projectId: input.projectId,
@@ -1349,7 +1514,8 @@ const make = Effect.gen(function* () {
     "orchestrationV2.threadManagement.settleAfterRun",
   )(function* (input) {
     const requestedAt = yield* DateTime.now;
-    const { run } = yield* waitForThread({ ...input, timeoutMs: SETTLE_AFTER_RUN_WAIT_MS });
+    // The agent's own run, not a sent message: it settles after that run, wherever messages went.
+    const { run } = yield* waitForRunOnce({ ...input, timeoutMs: SETTLE_AFTER_RUN_WAIT_MS });
     if (run?.status !== "completed") return;
     const afterSequence = yield* orchestrator.getThreadEventSequence(input.threadId);
     const trySettle = Effect.gen(function* () {
@@ -1493,6 +1659,15 @@ const make = Effect.gen(function* () {
           readonly status: ThreadManagementTerminalRunStatus;
         },
       } as const;
+    }
+    if (explicitRun?.status === "queued") {
+      const dispatch = yield* orchestrator.dispatch({
+        type: "queued-run.cancel",
+        commandId: input.commandId,
+        threadId: input.threadId,
+        runId: explicitRun.id,
+      });
+      return { type: "interrupt_requested", run: explicitRun, dispatch } as const;
     }
     const interruptibleRun = latestActiveRun(target);
     if (interruptibleRun === undefined) {

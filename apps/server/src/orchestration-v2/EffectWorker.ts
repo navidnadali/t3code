@@ -202,6 +202,7 @@ export const layerExecutor: Layer.Layer<
                 ...(effect.request.revokeMcpCredential === undefined
                   ? {}
                   : { revokeMcpCredential: effect.request.revokeMcpCredential }),
+                ...(effect.request.unlessBusy === true ? { unlessBusy: true } : {}),
               })
               .pipe(
                 Effect.mapError(

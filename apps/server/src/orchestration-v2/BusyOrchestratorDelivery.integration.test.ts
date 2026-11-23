@@ -105,7 +105,8 @@ const scheduledTaskLayer = ScheduledTaskService.layer.pipe(
   Layer.provide(Layer.mergeAll(NodeCrypto.layer, Scheduler.layer, SqlitePersistence.layerMemory)),
 );
 
-type Source = "user" | "automation" | "cross-thread";
+/** `outside`: an MCP client that is no thread, such as `t3 thread send`, so the message has no sender. */
+type Source = "user" | "automation" | "cross-thread" | "outside";
 
 interface Probe {
   readonly source: Source;
@@ -277,12 +278,14 @@ const busyOrchestrator = (input: {
           dispatchMode: { type: "queue_after_active" },
           ...(source === "user"
             ? { createdBy: "user" as const, creationSource: "web" as const }
-            : {
-                createdBy: "agent" as const,
-                creationSource: "mcp" as const,
-                senderThreadId: ThreadId.make(`thread:sender-${index % 4}`),
-                deliveryIntent: "auto" as const,
-              }),
+            : source === "outside"
+              ? { createdBy: "agent" as const, creationSource: "mcp" as const }
+              : {
+                  createdBy: "agent" as const,
+                  creationSource: "mcp" as const,
+                  senderThreadId: ThreadId.make(`thread:sender-${index % 4}`),
+                  deliveryIntent: "auto" as const,
+                }),
         });
       });
       const startedAt = yield* Clock.currentTimeMillis;
@@ -328,6 +331,13 @@ const busyOrchestrator = (input: {
         steerTexts,
         stillQueued: projection.runs.filter((run) => run.status === "queued").length,
         longRunStatus: projection.runs.find((run) => run.ordinal === 1)?.status,
+        providerTurns: projection.providerTurns.length,
+        // The long turn's two tools, as the projection last saw them.
+        toolStatuses: projection.turnItems.flatMap((item) =>
+          item.nativeItemRef?.nativeId === "build" || item.nativeItemRef?.nativeId === "watch"
+            ? [item.status]
+            : [],
+        ),
       };
     }).pipe(
       Effect.provide(
@@ -450,4 +460,29 @@ it.effect("carries messages that come due just after an automatic steer in that 
     assert.deepEqual(deliveredAt, [deliveredAt[0], deliveredAt[0], deliveredAt[0]]);
     assert.lengthOf(result.automaticSteerGapsMs, 0);
   }),
+);
+
+it.effect(
+  "steers outside agents' messages into a busy Claude turn: few steers, no new turn, no cancelled tool",
+  () =>
+    Effect.gen(function* () {
+      // An outside agent's pattern: `t3 thread send`, twelve times in a minute.
+      const result = yield* busyOrchestrator({
+        name: "busy-orchestrator-outside",
+        probeAt: (second) => (second < 60 ? ["outside"] : []),
+        probeForSeconds: 60,
+        settleForSeconds: 180,
+      });
+      assert.lengthOf(result.delays, 12);
+      assert.deepEqual(late(result.delays, SATURATED_DELIVERY_BOUND_MS), []);
+      assert.isAtMost(result.steerTexts.length, 2);
+      assert.equal(result.providerTurns, 1);
+      assert.equal(result.stillQueued, 0);
+      assert.equal(result.longRunStatus, "running");
+      assert.isTrue(
+        result.toolStatuses.length >= 2 &&
+          result.toolStatuses.every((status) => status === "running"),
+        result.toolStatuses.join(", "),
+      );
+    }),
 );

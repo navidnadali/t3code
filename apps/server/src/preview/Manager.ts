@@ -1,5 +1,7 @@
 import {
   type PreviewCloseInput,
+  type PreviewCloseReason,
+  type PreviewClosedTab,
   type PreviewEvent,
   type PreviewError,
   PreviewInvalidUrlError,
@@ -59,7 +61,11 @@ export class PreviewManager extends Context.Service<
     readonly adjust: (
       input: PreviewAdjustInput,
     ) => Effect.Effect<PreviewSessionSnapshot, PreviewError>;
-    readonly close: (input: PreviewCloseInput) => Effect.Effect<void, PreviewError>;
+    /** A `reason` marks a close the server made on its own: the event carries it and `list` names the tab. */
+    readonly close: (
+      input: PreviewCloseInput,
+      options?: { readonly reason?: PreviewCloseReason },
+    ) => Effect.Effect<void, PreviewError>;
     /** Runs before closed events publish, while clients still own their page surfaces. */
     readonly registerBeforeClose: (
       handler: (snapshots: ReadonlyArray<PreviewSessionSnapshot>) => Effect.Effect<void>,
@@ -125,11 +131,23 @@ const normalizeUrl = (rawUrl: string): Effect.Effect<string, PreviewInvalidUrlEr
 
 const currentIsoTimestamp = DateTime.now.pipe(Effect.map(DateTime.formatIso));
 
+/** Server-closed tabs a thread's list keeps, newest first, and how many threads keep them. */
+const CLOSED_TABS_PER_THREAD = 5;
+const CLOSED_TABS_THREADS = 256;
+
 /** @public */
 export const make = Effect.gen(function* PreviewManagerMake() {
   const random = yield* SecureRandom.SecureRandom;
   const serverEpoch = yield* random.uuidV4();
   const stateRef = yield* SynchronizedRef.make<ManagerState>(initialState);
+  // Map order is recency: a thread's entry moves to the end when it changes.
+  const closedTabs = new Map<string, ReadonlyArray<PreviewClosedTab>>();
+  const recordClosedTabs = (threadId: string, recent: ReadonlyArray<PreviewClosedTab>) => {
+    const kept = [...recent, ...(closedTabs.get(threadId) ?? [])].slice(0, CLOSED_TABS_PER_THREAD);
+    closedTabs.delete(threadId);
+    closedTabs.set(threadId, kept);
+    if (closedTabs.size > CLOSED_TABS_THREADS) closedTabs.delete(closedTabs.keys().next().value!);
+  };
   const eventsPubSub = yield* PubSub.unbounded<PreviewEvent>();
   const events: Stream.Stream<PreviewEvent> = Stream.fromPubSub(eventsPubSub);
   const beforeClose = new Set<
@@ -406,7 +424,8 @@ export const make = Effect.gen(function* PreviewManagerMake() {
   );
 
   const close: PreviewManager["Service"]["close"] = Effect.fn("PreviewManager.close")(
-    function* (input) {
+    function* (input, options) {
+      const reason = options?.reason;
       // Unload runs outside the state lock; tabs opened meanwhile belong to a later close.
       const current = yield* SynchronizedRef.get(stateRef);
       const targets = input.tabId
@@ -434,16 +453,32 @@ export const make = Effect.gen(function* PreviewManagerMake() {
             createdAt,
             serverEpoch,
             revision,
+            ...(reason === undefined ? {} : { reason }),
           });
         }
+        // Under the state lock, after the pages unloaded: closing a whole thread (deleted or
+        // archived) forgets what the server closed in it, even a close that landed meanwhile.
+        // Listed before the events publish, so a subscriber that lists on one finds the tab.
+        const listClosed = Effect.sync(() => {
+          if (input.tabId === undefined && reason === undefined) closedTabs.delete(input.threadId);
+          else if (reason !== undefined && eventsToEmit.length > 0)
+            recordClosedTabs(
+              input.threadId,
+              eventsToEmit
+                .map((event) => ({ tabId: event.tabId, reason, closedAt: createdAt }))
+                .reverse(),
+            );
+        });
         if (eventsToEmit.length === 0) {
-          return Effect.succeed([undefined, state] as const);
+          return listClosed.pipe(Effect.as([undefined, state] as const));
         }
-        return Effect.as(
-          Effect.forEach(eventsToEmit, (event) => PubSub.publish(eventsPubSub, event), {
-            discard: true,
-          }),
-          [undefined, { sessions, revision }] as const,
+        return listClosed.pipe(
+          Effect.andThen(
+            Effect.forEach(eventsToEmit, (event) => PubSub.publish(eventsPubSub, event), {
+              discard: true,
+            }),
+          ),
+          Effect.as([undefined, { sessions, revision }] as const),
         );
       });
     },
@@ -452,13 +487,17 @@ export const make = Effect.gen(function* PreviewManagerMake() {
   const list: PreviewManager["Service"]["list"] = Effect.fn("PreviewManager.list")(
     function* (input) {
       return yield* SynchronizedRef.get(stateRef).pipe(
-        Effect.map((state): PreviewListResult => ({
-          sessions: sessionsForThread(state, input.threadId)
-            .map((s) => s.snapshot)
-            .toSorted((a, b) => a.updatedAt.localeCompare(b.updatedAt)),
-          serverEpoch,
-          revision: state.revision,
-        })),
+        Effect.map((state): PreviewListResult => {
+          const closed = closedTabs.get(input.threadId);
+          return {
+            sessions: sessionsForThread(state, input.threadId)
+              .map((s) => s.snapshot)
+              .toSorted((a, b) => a.updatedAt.localeCompare(b.updatedAt)),
+            ...(closed === undefined || closed.length === 0 ? {} : { closedTabs: closed }),
+            serverEpoch,
+            revision: state.revision,
+          };
+        }),
       );
     },
   );

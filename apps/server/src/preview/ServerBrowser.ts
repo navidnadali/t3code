@@ -40,6 +40,7 @@ import {
   type PreviewAutomationUploadInput,
   type PreviewAutomationWaitForInput,
   PreviewClearProfileError,
+  type PreviewCloseReason,
   type PreviewEvent,
   type PreviewNavStatus,
   type PreviewSessionSnapshot,
@@ -51,6 +52,7 @@ import {
 import { AgentScope, agentScopeLauncherScript } from "@t3tools/shared/AgentScope";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { appLinkUrl } from "@t3tools/shared/appLinks";
 import { normalizePreviewUrl } from "@t3tools/shared/preview";
 import { resolvePreviewViewport } from "@t3tools/shared/previewViewport";
 import * as NodeCrypto from "node:crypto";
@@ -666,7 +668,7 @@ const make = Effect.gen(function* () {
           })
           .pipe(Effect.ignore),
       );
-      dropTab(tab, false, true);
+      dropTab(tab, false, { reopening: true });
       // A context that is still closing would take the new page down with it.
       if (tab.isolatedContext) await tab.page.context().close().catch(constVoid);
       const { sessions } = await runPromise(manager.list({ threadId: tab.threadId }));
@@ -1010,7 +1012,17 @@ const make = Effect.gen(function* () {
     }),
   );
 
-  const dropTab = (tab: ServerTab, closeSession: boolean, reopening = false) => {
+  /** Why the server is closing a tab, while unloading its page may close it first. */
+  const closingReasons = new Map<ServerTab, PreviewCloseReason>();
+
+  const dropTab = (
+    tab: ServerTab,
+    closeSession: boolean,
+    options: { readonly reopening?: boolean; readonly reason?: PreviewCloseReason } = {},
+  ) => {
+    const reopening = options.reopening === true;
+    // A close the server started on its own keeps its reason when the page's own close gets here first.
+    const reason = options.reason ?? closingReasons.get(tab);
     const key = tabKey(tab.threadId, tab.tabId);
     if (tabs.get(key) !== tab) return;
     tabs.delete(key);
@@ -1044,7 +1056,14 @@ const make = Effect.gen(function* () {
     void NodeFSP.rm(downloadDir(tab), { recursive: true, force: true }).catch(constVoid);
     reportLiveTabs();
     if (closeSession) {
-      runFork(manager.close({ threadId: tab.threadId, tabId: tab.tabId }).pipe(Effect.ignore));
+      runFork(
+        manager
+          .close(
+            { threadId: tab.threadId, tabId: tab.tabId },
+            reason === undefined ? undefined : { reason },
+          )
+          .pipe(Effect.ignore),
+      );
     }
   };
 
@@ -1245,15 +1264,31 @@ const make = Effect.gen(function* () {
     }
     // Playwright's `request.frame()` throws for a request issued before its frame exists, and a
     // throw from a page listener is uncaught, so such a request is not a main-frame navigation.
-    const isMainNavigation = (request: { isNavigationRequest(): boolean; frame(): unknown }) => {
+    const isMainFrameNavigation = (request: {
+      isNavigationRequest(): boolean;
+      frame(): unknown;
+    }) => {
       try {
         return request.isNavigationRequest() && request.frame() === page.mainFrame();
       } catch {
         return false;
       }
     };
+    // Chromium aborts an app link's request and keeps the page, so it is no navigation.
+    const isMainNavigation = (request: {
+      isNavigationRequest(): boolean;
+      url(): string;
+      frame(): unknown;
+    }) => appLinkUrl(request.url()) === null && isMainFrameNavigation(request);
     const navigationGenerations = new WeakMap<object, number>();
     page.on("request", (request) => {
+      if (appLinkUrl(request.url()) !== null && isMainFrameNavigation(request)) {
+        // A redirect into an app link ends the navigation that led there.
+        const redirectedFrom = request.redirectedFrom();
+        const generation = redirectedFrom && navigationGenerations.get(redirectedFrom);
+        if (generation) settleAbortedNavigation(tab, generation, request.url(), undefined);
+        return;
+      }
       if (!isMainNavigation(request)) return;
       // Playwright can deliver the first request after Stop has already settled its navigation.
       const stoppedInitialRequest =
@@ -1800,6 +1835,21 @@ const make = Effect.gen(function* () {
   const isVisible = (tab: ServerTab) =>
     tab.viewers.size > 0 || (tab.desktop !== null && desktopChannel.isShown(tab));
 
+  // The owner sees the close and its reason (the closed event, `closedTabs`); the log keeps how idle it was.
+  const logIdleClose = (tab: ServerTab) => {
+    const attributes = {
+      threadId: tab.threadId,
+      tabId: tab.tabId,
+      idleMs: Date.now() - tab.usedAt,
+      reason: "idle",
+    };
+    runFork(
+      Effect.logInfo("ServerBrowser.closeIdleTab", attributes).pipe(
+        Effect.withSpan("ServerBrowser.closeIdleTab", { attributes }),
+      ),
+    );
+  };
+
   const reclaimingTabs = new Set<ServerTab>();
   const idleAgentTabs = () => {
     const cutoff = Date.now() - AGENT_TAB_IDLE_MS;
@@ -1820,13 +1870,19 @@ const make = Effect.gen(function* () {
     const longestIdle = idleAgentTabs().sort((left, right) => left.usedAt - right.usedAt)[0];
     if (longestIdle) {
       reclaimingTabs.add(longestIdle);
+      closingReasons.set(longestIdle, "idle");
       try {
+        logIdleClose(longestIdle);
         await runPromise(
-          manager.close({ threadId: longestIdle.threadId, tabId: longestIdle.tabId }),
+          manager.close(
+            { threadId: longestIdle.threadId, tabId: longestIdle.tabId },
+            { reason: "idle" },
+          ),
         );
         dropTab(longestIdle, false);
       } finally {
         reclaimingTabs.delete(longestIdle);
+        closingReasons.delete(longestIdle);
       }
     }
   };
@@ -1891,7 +1947,11 @@ const make = Effect.gen(function* () {
   // Desktop browsing bypasses streamed viewers and server input tracking,
   // so these idle signals only apply to headless tabs.
   const closeIdleAgentTabs = () => {
-    for (const tab of idleAgentTabs()) if (tab.desktop === null) dropTab(tab, true);
+    for (const tab of idleAgentTabs()) {
+      if (tab.desktop !== null) continue;
+      logIdleClose(tab);
+      dropTab(tab, true, { reason: "idle" });
+    }
   };
 
   const latestThreadTab = (threadId: string, agentSessionId?: string) => {
@@ -2097,6 +2157,23 @@ const make = Effect.gen(function* () {
     return Promise.race([read, deadline]).finally(() => clearTimeout(timer));
   };
 
+  const threadTabSummaries = (threadId: string, agentSessionId?: string) =>
+    [...tabs.values()]
+      .filter((candidate) => candidate.threadId === threadId)
+      .map((candidate) => ({
+        tabId: candidate.tabId,
+        url:
+          candidate.page.url() === "about:blank"
+            ? null
+            : (loadErrorOf(candidate)?.url ??
+              ServerBrowserPage.withoutDataPayload(candidate.page.url())),
+        ...(candidate.openerTabId === undefined ? {} : { openerTabId: candidate.openerTabId }),
+        owner: tabOwner(candidate),
+        ownedByCaller: candidate.control.agentId === agentSessionId,
+        visible: isVisible(candidate),
+        ...(candidate.profileId === undefined ? {} : { profileId: candidate.profileId }),
+      }));
+
   const statusWithTitle = async (
     tab: ServerTab | undefined,
     agentSessionId?: string,
@@ -2146,21 +2223,7 @@ const make = Effect.gen(function* () {
         : null,
       viewportSetting: tab.setting,
       ...(viewport ? { viewport } : {}),
-      tabs: [...tabs.values()]
-        .filter((candidate) => candidate.threadId === tab.threadId)
-        .map((candidate) => ({
-          tabId: candidate.tabId,
-          url:
-            candidate.page.url() === "about:blank"
-              ? null
-              : (loadErrorOf(candidate)?.url ??
-                ServerBrowserPage.withoutDataPayload(candidate.page.url())),
-          ...(candidate.openerTabId === undefined ? {} : { openerTabId: candidate.openerTabId }),
-          owner: tabOwner(candidate),
-          ownedByCaller: candidate.control.agentId === agentSessionId,
-          visible: isVisible(candidate),
-          ...(candidate.profileId === undefined ? {} : { profileId: candidate.profileId }),
-        })),
+      tabs: threadTabSummaries(tab.threadId, agentSessionId),
       ...profileStatus(),
       downloads: tab.downloads.map(({ fileName, path, sizeBytes, url, completedAt }) => ({
         fileName,
@@ -2527,6 +2590,11 @@ const make = Effect.gen(function* () {
     return tab;
   };
 
+  // A person viewing a tab is using it: attaching, leaving and their input restart its idle clock.
+  const markViewed = (tab: ServerTab) => {
+    tab.usedAt = Date.now();
+  };
+
   const markUsed = (request: PreviewAutomationRequest) => {
     const now = Date.now();
     for (const tab of tabs.values()) {
@@ -2544,13 +2612,25 @@ const make = Effect.gen(function* () {
   ): Promise<unknown> => {
     const input = request.input;
     switch (request.operation) {
-      case "status":
-        return statusWithTitle(
+      case "status": {
+        const tab =
           request.tabId === undefined
             ? latestThreadTab(request.threadId, request.agentSessionId)
-            : tabs.get(tabKey(request.threadId, request.tabId)),
-          request.agentSessionId,
+            : tabs.get(tabKey(request.threadId, request.tabId));
+        const status = await statusWithTitle(tab, request.agentSessionId);
+        // With its tab gone, the answer names the thread's open tabs for the next call's `tabId`,
+        // and the tabs the server closed on its own, with why.
+        const open =
+          tab === undefined ? threadTabSummaries(request.threadId, request.agentSessionId) : [];
+        const { closedTabs } = await runPromise(
+          manager.list({ threadId: ThreadId.make(request.threadId) }),
         );
+        return {
+          ...status,
+          ...(open.length === 0 ? {} : { tabs: open }),
+          ...(closedTabs === undefined ? {} : { closedTabs }),
+        };
+      }
       case "open": {
         if (!request.agentSessionId)
           throw new BrowserControlInterrupted({
@@ -2928,10 +3008,14 @@ const make = Effect.gen(function* () {
         return recordAction(tab, "upload", () =>
           uploadFiles(tab, input as PreviewAutomationUploadInput),
         );
-      case "type":
-        return recordAction(tab, "type", () =>
-          ServerBrowserPage.type(tab.page, input as PreviewAutomationTypeInput),
-        );
+      case "type": {
+        // As for click: typing stops at the broker's deadline instead of running on after the reply.
+        const typeInput = {
+          ...(input as PreviewAutomationTypeInput),
+          timeoutMs: Math.max(1, Math.floor(deadlineMs - performance.now())),
+        };
+        return recordAction(tab, "type", () => ServerBrowserPage.type(tab.page, typeInput));
+      }
       case "press":
         return recordAction(tab, "press", () =>
           ServerBrowserPage.press(tab.page, input as PreviewAutomationPressInput),
@@ -3302,6 +3386,7 @@ const make = Effect.gen(function* () {
     yield* Effect.acquireRelease(
       Effect.sync(() => {
         tab.viewers.add(viewer);
+        markViewed(tab);
         tab.viewerAttached?.resolve();
         tab.viewerAttached = null;
         reportLiveTabs();
@@ -3310,6 +3395,7 @@ const make = Effect.gen(function* () {
         Effect.promise(async () => {
           await tab.control.disconnect(viewer.id, () => releaseViewerInput(viewer, session));
           tab.viewers.delete(viewer);
+          markViewed(tab);
           broadcastControl(tab);
           reportLiveTabs();
         }),
@@ -3398,6 +3484,7 @@ const make = Effect.gen(function* () {
           if (!viewer.canOperate) return;
           const message = asRecord(raw);
           if (!message) return;
+          markViewed(tab);
           try {
             if (message.type === "takeControl") {
               const taking = tab.control.take(viewer.id);

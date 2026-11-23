@@ -38,10 +38,12 @@ import * as CheckpointCaptureService from "./CheckpointCaptureService.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as WorkspaceFolders from "../workspace/WorkspaceFolders.ts";
 
 const layerProjectionStoreTest = Layer.mergeAll(
+  ThreadCommandExecutor.layer,
   ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
   SqlitePersistence.layerMemory,
 );
@@ -708,9 +710,10 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
   );
 
   // A run that ended its wait early completed before its capture ran, as a stopped run did, or
-  // while the capture read the workspace.
+  // while the capture read the workspace; a Stop can also commit while Git captures.
   it.effect.each([
     { endedStatus: "cancelled", duringCapture: false },
+    { endedStatus: "cancelled", duringCapture: true },
     { endedStatus: "completed", duringCapture: false },
     { endedStatus: "completed", duringCapture: true },
   ] as const)(
@@ -719,6 +722,7 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
       Effect.gen(function* () {
         const key = duringCapture ? `${endedStatus}-during-capture` : endedStatus;
         const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
         const now = yield* DateTime.now;
         const cancelledAt = DateTime.add(now, { seconds: 1 });
         const cancelledThreadId = ThreadId.make(`thread:checkpoint-capture-${key}`);
@@ -868,34 +872,36 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
         });
         const statuses = [
           ["running", null],
-          ...(endedStatus === "completed" ? [["waiting", null] as const] : []),
+          ...(endedStatus === "completed" || duringCapture ? [["waiting", null] as const] : []),
           ...(duringCapture ? [] : [[endedStatus, cancelledAt] as const]),
         ] as const;
-        const applyStatus = Effect.fnUntraced(function* (
+        // Status changes commit under the thread's lock, as Stop's do.
+        const applyStatus = (
           status: (typeof statuses)[number][0] | typeof endedStatus,
           completedAt: DateTime.Utc | null,
-        ) {
-          yield* projectionStore.apply({
-            id: EventId.make(`event:checkpoint-capture-${key}:run-${status}`),
-            type: "run.updated",
-            threadId: cancelledThreadId,
-            runId: cancelledRunId,
-            nodeId: cancelledRootNodeId,
-            providerInstanceId,
-            occurredAt: completedAt ?? now,
-            payload: { ...runningRun, status, completedAt },
-          });
-          yield* projectionStore.apply({
-            id: EventId.make(`event:checkpoint-capture-${key}:node-${status}`),
-            type: "node.updated",
-            threadId: cancelledThreadId,
-            runId: cancelledRunId,
-            nodeId: cancelledRootNodeId,
-            providerInstanceId,
-            occurredAt: completedAt ?? now,
-            payload: { ...runningRootNode, status, completedAt },
-          });
-        });
+        ) =>
+          Effect.gen(function* () {
+            yield* projectionStore.apply({
+              id: EventId.make(`event:checkpoint-capture-${key}:run-${status}`),
+              type: "run.updated",
+              threadId: cancelledThreadId,
+              runId: cancelledRunId,
+              nodeId: cancelledRootNodeId,
+              providerInstanceId,
+              occurredAt: completedAt ?? now,
+              payload: { ...runningRun, status, completedAt },
+            });
+            yield* projectionStore.apply({
+              id: EventId.make(`event:checkpoint-capture-${key}:node-${status}`),
+              type: "node.updated",
+              threadId: cancelledThreadId,
+              runId: cancelledRunId,
+              nodeId: cancelledRootNodeId,
+              providerInstanceId,
+              occurredAt: completedAt ?? now,
+              payload: { ...runningRootNode, status, completedAt },
+            });
+          }).pipe((effect) => threadCommands.withLock(cancelledThreadId, effect));
         for (const [status, completedAt] of statuses) yield* applyStatus(status, completedAt);
 
         const captured = {
@@ -986,6 +992,23 @@ it.layer(layerProjectionStoreTest)("CheckpointCaptureServiceV2", (it) => {
           scopeId: cancelledScopeId,
         });
         assert.deepEqual(afterRewind.preservedCheckpointOrdinals, [0]);
+
+        // A failed capture still records which run ended there; the next capture must keep that link.
+        yield* projectionStore.apply({
+          id: EventId.make(`event:checkpoint-capture-${key}:captured-error`),
+          type: "checkpoint.captured",
+          threadId: cancelledThreadId,
+          runId: cancelledRunId,
+          nodeId: cancelledRootNodeId,
+          providerInstanceId,
+          occurredAt: cancelledAt,
+          payload: { ...captured, status: "error" },
+        });
+        const afterFailedCapture = yield* projectionStore.getCheckpointCaptureContext(
+          cancelledThreadId,
+          { runId: cancelledRunId, scopeId: cancelledScopeId },
+        );
+        assert.deepEqual([...afterFailedCapture.preservedCheckpointOrdinals].toSorted(), [0, 1]);
       }),
   );
 

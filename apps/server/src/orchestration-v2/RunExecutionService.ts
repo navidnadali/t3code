@@ -154,6 +154,8 @@ export function selectInheritedBackgroundTurnItems(input: {
     turnItem.runId !== null &&
     settledPriorRunIds.has(turnItem.runId) &&
     backgroundCapableTurnItemTypes.has(turnItem.type) &&
+    // A delegated task's child settles it; no provider event ever ends it.
+    !(turnItem.type === "subagent" && turnItem.origin === "app_owned") &&
     !isSettledTurnItemStatus(turnItem.status)
       ? [{ id: turnItem.id, runId: turnItem.runId }]
       : [],
@@ -465,6 +467,8 @@ export function routeProviderEvent(
         },
       ];
     }
+    case "thread_model_selection.updated":
+      return [event.threadId === input.threadId, state];
     case "provider_thread.updated": {
       const belongs =
         state.ownedProviderThreadIds.has(event.providerThread.id) ||
@@ -592,9 +596,10 @@ export function routeProviderEvent(
       ];
     case "background_work.updated":
       return [state.ownedProviderTurns.has(event.providerTurnId), state];
+    case "background_work.lost":
     case "command_output.delta":
     case "prompt_suggestion.updated":
-      // The session manager serves these to clients directly; runs never see them.
+      // The session manager handles these itself; runs never see them.
       return [false, state];
     case "turn.terminal":
       return event.providerTurnId === state.rootProviderTurnId
@@ -690,6 +695,7 @@ export class RunExecutionStartError extends Schema.TaggedError<RunExecutionStart
 }
 
 const isProviderEventStreamError = Schema.is(ProviderAdapter.ProviderAdapterEventStreamError);
+const isProviderSessionClosedByT3 = Schema.is(ProviderAdapter.ProviderSessionClosedByT3Error);
 
 export class RunExecutionIngestError extends Schema.TaggedError<RunExecutionIngestError>()(
   "RunExecutionIngestError",
@@ -1079,6 +1085,9 @@ export const layer: Layer.Layer<
                     providerInstanceId: input.run.providerInstanceId,
                     occurredAt: completedAt,
                     payload: makeProviderFailureTurnItem({
+                      ...(input.terminal.failureItemId === undefined
+                        ? {}
+                        : { id: input.terminal.failureItemId }),
                       driver: input.terminal.driver,
                       threadId: input.run.threadId,
                       runId: input.run.id,
@@ -2347,19 +2356,77 @@ export const layer: Layer.Layer<
                       return;
                     }
                   }
+                  const streamError =
+                    isRunExecutionIngestError(squashed) &&
+                    isProviderEventStreamError(squashed.cause)
+                      ? squashed.cause
+                      : undefined;
+                  const rootFinalized = yield* Ref.get(rootRunFinalized);
+                  // A finished run whose stream T3 ended, releasing or detaching its session, writes nothing.
+                  if (rootFinalized && streamError?.raisedByT3 === true) {
+                    yield* Effect.logDebug("orchestration V2 provider event ingestion ended", {
+                      runId: input.run.id,
+                      cause,
+                    });
+                    return;
+                  }
                   yield* Effect.logWarning("orchestration V2 provider event ingestion failed", {
                     runId: input.run.id,
                     cause,
                   });
                   // An adapter fails its stream when its runtime is gone. A failed write, or a session T3
                   // released or saw end, leaves work that can still report or that the releaser settles.
-                  const runtimeLost =
-                    isRunExecutionIngestError(squashed) &&
-                    isProviderEventStreamError(squashed.cause) &&
-                    squashed.cause.raisedByT3 !== true;
-                  if (yield* Ref.get(rootRunFinalized)) {
+                  const runtimeLost = streamError !== undefined && streamError.raisedByT3 !== true;
+                  if (rootFinalized) {
                     if (runtimeLost) yield* endWorkLostAfterRootRun(completedAt);
                     return;
+                  }
+                  // T3 closed the session under the run (a detach, a logout, a close): the turn
+                  // was stopped, not lost, so it ends interrupted with T3's reason. The process is
+                  // gone, so there is no turn left to interrupt, and its tool calls died with it.
+                  if (
+                    isRunExecutionIngestError(squashed) &&
+                    isProviderEventStreamError(squashed.cause) &&
+                    squashed.cause.raisedByT3 === true &&
+                    isProviderSessionClosedByT3(squashed.cause.cause)
+                  ) {
+                    const droppedPrompt =
+                      (yield* Ref.get(terminalEvent))?.promptDropped === true ||
+                      rootProviderTurn?.promptDropped === true;
+                    const stopped = yield* finalizeRootRun(
+                      {
+                        type: "turn.terminal",
+                        driver: input.providerThread.driver,
+                        providerThreadId: input.providerThread.id,
+                        providerTurnId: routing.rootProviderTurnId ?? failedProviderTurnId,
+                        runOrdinal: input.run.ordinal,
+                        status: "interrupted",
+                        failure: null,
+                        // Bounded and redacted like any failure text: a detach's reason can
+                        // come from a client.
+                        reason: makeProviderFailure({ cause: squashed }).message,
+                        threadDisposition: "reusable",
+                        ...(droppedPrompt ? { promptDropped: true as const } : {}),
+                      },
+                      rootProviderTurn === null ||
+                        isTerminalProviderTurnStatus(rootProviderTurn.status)
+                        ? undefined
+                        : { ...rootProviderTurn, status: "interrupted", completedAt },
+                    ).pipe(
+                      Effect.as(true),
+                      Effect.catchCauseIf(
+                        (settleCause) => !Cause.hasInterruptsOnly(settleCause),
+                        (settleCause) =>
+                          Effect.logWarning(
+                            "orchestration V2 failed to settle a run T3 stopped by closing its session",
+                            { runId: input.run.id, cause: settleCause },
+                          ).pipe(Effect.as(false)),
+                      ),
+                    );
+                    if (stopped) {
+                      yield* endWorkLostAfterRootRun(completedAt);
+                      return;
+                    }
                   }
                   const providerThread = yield* Ref.get(latestProviderThread);
                   // Stop background work too; the failed consumer cannot persist terminal events.

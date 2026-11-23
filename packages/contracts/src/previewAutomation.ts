@@ -3,6 +3,7 @@ import { Schema } from "effect";
 import { EnvironmentId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   PREVIEW_VIEWPORT_MAX_AREA,
+  PreviewClosedTab,
   PreviewRenderedViewportSize,
   PreviewTabId,
   PreviewViewportPresetId,
@@ -138,6 +139,8 @@ export const PreviewAutomationStatus = Schema.Struct({
   ),
   profiles: Schema.optional(Schema.Array(PreviewAutomationProfile)),
   defaultProfileId: Schema.optional(BrowserProfileId),
+  /** This thread's latest tabs the server closed on its own, newest first, and why. */
+  closedTabs: Schema.optional(Schema.Array(PreviewClosedTab)),
 });
 export type PreviewAutomationStatus = typeof PreviewAutomationStatus.Type;
 

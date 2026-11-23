@@ -17,10 +17,15 @@ class LinuxArm64SeaError extends Schema.TaggedError<LinuxArm64SeaError>()("Linux
 
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
-const run = Effect.fn("LinuxArm64Sea.run")(function* (args: Array<string>, verbose: boolean) {
+const run = Effect.fn("LinuxArm64Sea.run")(function* (
+  args: Array<string>,
+  verbose: boolean,
+  cwd?: string,
+) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const child = yield* spawner.spawn(
     ChildProcess.make(process.execPath, args, {
+      ...(cwd === undefined ? {} : { cwd }),
       stdout: verbose ? "inherit" : "ignore",
       stderr: "inherit",
     }),
@@ -55,6 +60,8 @@ export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (
   /** What to bake and how options may extend it: the server's cap and cli mode, or nothing for the spawner. */
   readonly sea: Partial<SeaBuildOptions> & Pick<SeaBuildOptions, "execArgvExtension">;
   bundlePath: string;
+  /** Where a relative bundlePath is resolved: Node embeds the main path, so a relative one builds the same bytes. */
+  cwd?: string;
   cliAssetPath?: string;
   outputPath: string;
   nodeVersion: string;
@@ -89,7 +96,7 @@ export const injectLinuxArm64Sea = Effect.fn("LinuxArm64Sea.inject")(function* (
           }),
     }),
   );
-  yield* run(["--experimental-sea-config", configPath], input.verbose);
+  yield* run(["--experimental-sea-config", configPath], input.verbose, input.cwd);
   yield* fs.copyFile(process.execPath, input.outputPath);
   yield* fs.chmod(input.outputPath, 0o755);
   const require = NodeModule.createRequire(import.meta.url);

@@ -29,10 +29,15 @@ const run = Effect.fn("ProcessSpawnerSea.run")(function* (
   command: string,
   args: Array<string>,
   verbose: boolean,
+  cwd?: string,
 ) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const child = yield* spawner.spawn(
-    ChildProcess.make(command, args, { stdout: verbose ? "inherit" : "ignore", stderr: "inherit" }),
+    ChildProcess.make(command, args, {
+      ...(cwd === undefined ? {} : { cwd }),
+      stdout: verbose ? "inherit" : "ignore",
+      stderr: "inherit",
+    }),
   );
   const exitCode = yield* child.exitCode;
   if (exitCode !== 0) {
@@ -62,13 +67,18 @@ export const buildProcessSpawnerSea = Effect.fn("ProcessSpawnerSea.build")(funct
   const path = yield* Path.Path;
   const platform = yield* HostProcess.Platform;
   const temp = yield* fs.makeTempDirectoryScoped({ prefix: "t3-process-spawner-sea-" });
-  const mainPath = path.join(temp, "process-spawner.cjs");
-  yield* fs.writeFileString(mainPath, input.source);
+  // Node embeds the main script's path in the executable. A path relative to the temporary directory, resolved
+  // from it, keeps that directory's random name out, so builds of one source give the same bytes.
+  const mainFile = "process-spawner.cjs";
+  yield* fs.writeFileString(path.join(temp, mainFile), input.source);
+  // Node runs from the temporary directory now: resolve the output from where the build was asked.
+  const outputPath = path.resolve(input.outputPath);
   // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
   if (platform === "linux" && (yield* HostProcess.Architecture) === "arm64") {
     return yield* injectLinuxArm64Sea({
-      bundlePath: mainPath,
-      outputPath: input.outputPath,
+      bundlePath: mainFile,
+      cwd: temp,
+      outputPath,
       nodeVersion: input.nodeVersion,
       verbose: input.verbose,
       mainFormat: "commonjs",
@@ -80,8 +90,8 @@ export const buildProcessSpawnerSea = Effect.fn("ProcessSpawnerSea.build")(funct
   yield* fs.writeFileString(
     configPath,
     yield* encodeJson({
-      main: mainPath,
-      output: input.outputPath,
+      main: mainFile,
+      output: outputPath,
       mainFormat: "commonjs",
       disableExperimentalSEAWarning: true,
       useCodeCache: false,
@@ -89,9 +99,9 @@ export const buildProcessSpawnerSea = Effect.fn("ProcessSpawnerSea.build")(funct
       execArgvExtension: "none",
     }),
   );
-  yield* run(process.execPath, ["--build-sea", configPath], input.verbose);
+  yield* run(process.execPath, ["--build-sea", configPath], input.verbose, temp);
   // Apple Silicon runs only signed binaries; the archive signs it again with the release identity.
   if (platform === "darwin") {
-    yield* run("codesign", ["--force", "--sign", "-", input.outputPath], input.verbose);
+    yield* run("codesign", ["--force", "--sign", "-", outputPath], input.verbose);
   }
 }, Effect.scoped);

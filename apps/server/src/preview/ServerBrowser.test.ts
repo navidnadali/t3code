@@ -17,6 +17,7 @@ import {
   type PreviewAutomationResizeResult,
   type PreviewAutomationSnapshot,
   type PreviewAutomationStatus,
+  type PreviewEvent,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -1735,6 +1736,34 @@ it.effect(
     ).pipe(Effect.provide(layer)),
 );
 
+it.effect("stops typing long text at the request's deadline and says how far it got", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker, tabId } = yield* ready;
+      const page = contexts[0]!.page;
+      page.evaluate.mockImplementation(async () => true as never);
+      let now = 1_700_000_000_000;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      yield* Effect.addFinalizer(() => Effect.sync(() => clock.mockRestore()));
+      // Each piece of keys takes 10 seconds here: over the request's 5, under the 15-second default.
+      const type = vi.fn(async (_text: string) => void (now += 10_000));
+      Object.assign(page, { keyboard: { type } });
+      const failure = yield* broker
+        .invoke<void>({
+          scope,
+          tabId,
+          operation: "type",
+          input: { text: "a".repeat(200) },
+          timeoutMs: 5_000,
+        })
+        .pipe(Effect.flip);
+      expect(failure._tag).toBe("PreviewAutomationTimeoutError");
+      expect(failure.message).toMatch(/after 64 of 200 characters/);
+      expect(type.mock.calls).toEqual([["a".repeat(64)]]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
 it.effect("reports a pending dialog without evaluating the page and resolves it explicitly", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -2140,6 +2169,41 @@ it.effect("a request whose frame is not available yet is not a main navigation",
         input: {},
       });
       expect(status.loading).toBe(false);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.effect("an app link's aborted request leaves the page it was clicked on", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker, tabId } = yield* ready;
+      const page = contexts[0]!.page;
+      const navigation = (url: string, redirectedFrom: unknown = null) => ({
+        url: () => url,
+        method: () => "GET",
+        isNavigationRequest: () => true,
+        redirectedFrom: () => redirectedFrom,
+        frame: () => page,
+        failure: () => ({ errorText: "net::ERR_ABORTED" }),
+      });
+      const loading = Effect.map(
+        broker.invoke<PreviewAutomationStatus>({ scope, tabId, operation: "status", input: {} }),
+        (status) => status.loading,
+      );
+      // Chromium hands the link to the OS, aborts the request and keeps the current page.
+      const direct = navigation("obsidian://open?vault=notes");
+      page.emit("request", direct);
+      page.emit("requestfailed", direct);
+      expect(yield* loading).toBe(false);
+
+      // A page that redirects to an app link ends its navigation there; the redirect itself finished.
+      const open = navigation("https://example.com/open");
+      page.emit("request", open);
+      expect(yield* loading).toBe(true);
+      const redirected = navigation("obsidian://open?vault=notes", open);
+      page.emit("request", redirected);
+      page.emit("requestfailed", redirected);
+      expect(yield* loading).toBe(false);
     }),
   ).pipe(Effect.provide(layer)),
 );
@@ -3997,12 +4061,17 @@ it.effect("a full server takes back the slot of the longest idle agent tab nobod
         "pagehide",
         "visibilitychange",
       ]);
-      yield* Stream.fromSubscription(events).pipe(
+      // Unloading the page closes it too; that close must not lose why the slot was taken back.
+      const reclaimed = yield* Stream.fromSubscription(events).pipe(
         Stream.filter((event) => event.type === "closed" && event.tabId === opened[2]),
         Stream.runHead,
       );
+      expect(reclaimed).toEqual(Option.some(expect.objectContaining({ reason: "idle" })));
       expect(releasedDesktopTabs).toEqual([opened[2]]);
-      const { sessions } = yield* manager.list({ threadId: scope.thread.threadId });
+      const { sessions, closedTabs } = yield* manager.list({ threadId: scope.thread.threadId });
+      expect(closedTabs).toEqual([
+        { tabId: opened[2], reason: "idle", closedAt: expect.any(String) },
+      ]);
       expect(sessions.map((session) => session.tabId).toSorted()).toEqual(
         [...opened.filter((tabId) => tabId !== opened[2]), fresh.tabId!].toSorted(),
       );
@@ -4054,6 +4123,184 @@ it.effect("a full server takes back the slot of the longest idle agent tab nobod
       expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(32);
       expect(remaining.some((session) => session.tabId === opened[3])).toBe(false);
       expect(remaining.some((session) => session.tabId === opened[4])).toBe(false);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+const IDLE_MS = 30 * 60 * 1000;
+/**
+ * The thread's tabs as another agent session reads them in the background: a read that is no use of
+ * any tab (with no current tab of its own, it names none).
+ */
+const observedTabIds = Effect.gen(function* () {
+  const broker = yield* Broker.PreviewAutomationBroker;
+  const status = yield* broker.invoke<PreviewAutomationStatus>({
+    scope: asSession("agent-observer"),
+    operation: "status",
+    input: {},
+    updateCurrentTab: false,
+  });
+  return (status.tabs ?? []).map((tab) => tab.tabId);
+});
+const closedEventFor = (
+  events: PubSub.Subscription<PreviewEvent>,
+  tabId: string,
+): Effect.Effect<Option.Option<PreviewEvent>> =>
+  Stream.fromSubscription(events).pipe(
+    Stream.filter((event) => event.type === "closed" && event.tabId === tabId),
+    Stream.runHead,
+  );
+
+it.effect(
+  "an agent's tab nobody uses or views closes at the first sweep past 30 minutes idle",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const now = vi.spyOn(Date, "now").mockReturnValue(0);
+        yield* Effect.addFinalizer(() => Effect.sync(() => now.mockRestore()));
+        const { tabId } = yield* ready;
+        const events = yield* (yield* Manager.PreviewManager).subscribeEvents;
+
+        now.mockReturnValue(IDLE_MS - 1);
+        yield* TestClock.adjust("1 minute");
+        expect(yield* observedTabIds).toEqual([tabId]);
+
+        now.mockReturnValue(IDLE_MS + 1);
+        yield* TestClock.adjust("1 minute");
+        expect(Option.isSome(yield* closedEventFor(events, tabId))).toBe(true);
+        expect(yield* observedTabIds).toEqual([]);
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+const idleCloseLog: Array<string> = [];
+const loggedLayer = ServerBrowser.layer.pipe(
+  Layer.provide(
+    Logger.layer([Logger.make(({ message }) => void idleCloseLog.push(JSON.stringify(message)))], {
+      mergeWithExisting: false,
+    }),
+  ),
+  Layer.provideMerge(dependencies),
+);
+
+it.effect("an agent's tab closed for idleness tells its owner why", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      idleCloseLog.length = 0;
+      const now = vi.spyOn(Date, "now").mockReturnValue(0);
+      yield* Effect.addFinalizer(() => Effect.sync(() => now.mockRestore()));
+      const { broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const events = yield* manager.subscribeEvents;
+
+      now.mockReturnValue(IDLE_MS + 30_000);
+      yield* TestClock.adjust("1 minute");
+      const closed = yield* closedEventFor(events, tabId);
+      expect(closed).toEqual(
+        Option.some(expect.objectContaining({ type: "closed", reason: "idle" })),
+      );
+
+      const closedTab = { tabId, reason: "idle", closedAt: expect.any(String) };
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).closedTabs).toEqual([
+        closedTab,
+      ]);
+      // The owner's next status names the tab and why it went, instead of only "unavailable".
+      const status = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "status",
+        input: {},
+      });
+      expect(status).toMatchObject({ available: false, closedTabs: [closedTab] });
+      expect(idleCloseLog.filter((line) => line.includes("ServerBrowser.closeIdleTab"))).toEqual([
+        expect.stringContaining(tabId),
+      ]);
+      expect(idleCloseLog.find((line) => line.includes("ServerBrowser.closeIdleTab"))).toContain(
+        `"idleMs":${IDLE_MS + 30_000}`,
+      );
+    }),
+  ).pipe(Effect.provide(loggedLayer)),
+);
+
+it.effect("a person viewing an agent's tab restarts its idle clock", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const now = vi.spyOn(Date, "now").mockReturnValue(0);
+      yield* Effect.addFinalizer(() => Effect.sync(() => now.mockRestore()));
+      const { browser, tabId } = yield* ready;
+      const events = yield* (yield* Manager.PreviewManager).subscribeEvents;
+
+      now.mockReturnValue(25 * 60 * 1000);
+      const viewing = yield* Scope.make();
+      yield* browser.attachViewer(viewerInput(tabId, false)).pipe(Scope.provide(viewing));
+      now.mockReturnValue(40 * 60 * 1000);
+      yield* Scope.close(viewing, Exit.void);
+
+      // The person left a minute ago: the tab has the whole idle window again.
+      now.mockReturnValue(41 * 60 * 1000);
+      yield* TestClock.adjust("1 minute");
+      expect(yield* observedTabIds).toEqual([tabId]);
+      now.mockReturnValue(40 * 60 * 1000 + IDLE_MS - 1);
+      yield* TestClock.adjust("1 minute");
+      expect(yield* observedTabIds).toEqual([tabId]);
+
+      // Unused and unviewed for a whole window after that, it still closes.
+      now.mockReturnValue(40 * 60 * 1000 + IDLE_MS + 1);
+      yield* TestClock.adjust("1 minute");
+      expect(Option.isSome(yield* closedEventFor(events, tabId))).toBe(true);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "a bare status after the current tab closed lists the thread's open tabs to pick from",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { broker, tabId: first } = yield* ready;
+        const second = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { reuseExistingTab: false, show: false },
+        });
+        // The closed tab stays the session's current one, as when an agent closes the tab it used last.
+        yield* broker.invoke({
+          scope,
+          operation: "close",
+          tabId: PreviewTabId.make(second.tabId!),
+          input: {},
+        });
+
+        const status = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "status",
+          input: {},
+        });
+        // The current tab is gone, so nothing is current; the open ones are named for the next call.
+        expect(status).toMatchObject({ available: false, tabId: null });
+        expect(status.tabs?.map((tab) => tab.tabId)).toEqual([first]);
+        expect(second.tabId).not.toBe(first);
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.effect("any preview call from the session that opened a tab counts as use of all its tabs", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const now = vi.spyOn(Date, "now").mockReturnValue(0);
+      yield* Effect.addFinalizer(() => Effect.sync(() => now.mockRestore()));
+      const { broker, tabId: first } = yield* ready;
+      const second = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "open",
+        input: { reuseExistingTab: false, show: false },
+      });
+
+      // A bare status reads only the current tab, yet it is a call from the tabs' own session.
+      now.mockReturnValue(20 * 60 * 1000);
+      yield* broker.invoke({ scope, operation: "status", input: {} });
+      now.mockReturnValue(IDLE_MS + 60_000);
+      yield* TestClock.adjust("1 minute");
+      expect((yield* observedTabIds).toSorted()).toEqual([first, second.tabId].toSorted());
     }),
   ).pipe(Effect.provide(layer)),
 );

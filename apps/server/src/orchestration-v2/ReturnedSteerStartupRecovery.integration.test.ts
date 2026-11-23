@@ -23,21 +23,18 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
-import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 
 import * as ClaudeAdapterV2 from "./Adapters/ClaudeAdapterV2.ts";
-import * as EffectWorker from "./EffectWorker.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 
-// Startup recovery of steers that a 0.1.9-perf.14 or 0.1.9-perf.15 build (or one of its fleet builds) returned to
-// the thread: those builds marked a steer Claude queued and never ran as returned (cancelled, returnedToQueue) and
-// queued it again at the run's end. A server stopped between the two leaves it attached to its ended run; startup
-// queues it again, exactly once. This build's adapter returns no steer (an unread steer stays pending and
-// requeueUnreadSteers sends it), so these rows seed the older builds' state directly.
+// Older builds (0.1.9-perf.14 and perf.15) returned a steer Claude queued and never ran, then queued it again
+// at the run's end; a server stopped between the two leaves it on its ended run, and startup queues it again
+// exactly once. This build returns no steer (requeueUnreadSteers sends an unread one), so these rows seed the
+// older builds' state directly.
 const sessionId = "queued-steer-session";
 const settings = Schema.decodeSync(ClaudeSettings)({});
 const modelSelection = {
